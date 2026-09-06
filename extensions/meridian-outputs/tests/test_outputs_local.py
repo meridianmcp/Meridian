@@ -5834,6 +5834,134 @@ class TestDuckDBMemoryLimit:
             idx.close()
 
 
+class TestReadConnectIsolation:
+    """fa600e42 follow-up (architecture review): search()/get_annotations_
+    for_path()/resolve_output()/get_content() used to run their SELECT on
+    the exact same connection object (self._con) Phase 2's write
+    transaction runs on, guarded only by self._read_lock (a plain
+    in-process RLock) -- NOT self._write_lock. _read_connect() gives those
+    pure-read paths a dedicated connection instead."""
+
+    @duckdb_required
+    def test_read_connect_returns_separate_connection_for_file_backed_db(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            write_con = idx._connect()
+            read_con = idx._read_connect()
+            assert read_con is not write_con
+            # Calling it again must return the SAME cached connection, not
+            # open a new one every time.
+            assert idx._read_connect() is read_con
+        finally:
+            idx.close()
+
+    def test_read_connect_falls_back_to_shared_connection_for_memory_db(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two independent duckdb.connect(':memory:') calls are two
+        entirely separate, unrelated in-memory databases (confirmed live)
+        -- there is no way to share state across a second :memory:
+        connection, so this mode must keep using the single shared
+        connection exactly like every query path did before this fix."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            write_con = idx._connect()
+            read_con = idx._read_connect()
+            assert read_con is write_con
+            assert idx._read_con is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_read_connect_isolated_from_in_flight_write_transaction(
+        self, tmp_path: Path,
+    ) -> None:
+        """The actual race this fix closes: a query on a separate
+        connection must never observe a Phase 2 write's uncommitted,
+        in-flight transaction on self._con -- confirmed live this is
+        DuckDB's real, correct MVCC behaviour for two same-process
+        connections to the same file, not just an assumption."""
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            write_con = idx._connect()
+            idx._ensure_schema(write_con)
+            write_con.execute(
+                "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                "size, generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys) VALUES "
+                "('a', 'body', 1.0, 'x', 4, NULL, 'text_content', false, "
+                "NULL, NULL, NULL)"
+            )
+            read_con = idx._read_connect()
+
+            write_con.execute("BEGIN TRANSACTION")
+            write_con.execute(
+                "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                "size, generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys) VALUES "
+                "('b', 'body2', 1.0, 'y', 5, NULL, 'text_content', false, "
+                "NULL, NULL, NULL)"
+            )
+            mid_txn_count = read_con.execute(
+                "SELECT COUNT(*) FROM outputs_index"
+            ).fetchone()[0]
+            assert mid_txn_count == 1, (
+                "the read connection must not see the writer's uncommitted "
+                f"row, saw count={mid_txn_count}"
+            )
+            write_con.execute("COMMIT")
+            after_commit_count = read_con.execute(
+                "SELECT COUNT(*) FROM outputs_index"
+            ).fetchone()[0]
+            assert after_commit_count == 2
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_close_cleans_up_read_connection(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx._connect()
+        read_con = idx._read_connect()
+        idx.close()
+        assert idx._read_con is None
+        with pytest.raises(Exception):  # noqa: B017 -- a closed connection must error, not silently no-op
+            read_con.execute("SELECT 1")
+
+    @duckdb_required
+    def test_search_and_resolve_output_and_get_content_use_read_connection(
+        self, tmp_path: Path,
+    ) -> None:
+        """Integration check: the actual public methods route through
+        _read_connect(), not just a unit test of the helper in isolation."""
+        (tmp_path / "a.csv").write_text("col\nvalue", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=str(tmp_path / "index.duckdb"))
+        try:
+            idx.rebuild()
+            calls: list[Any] = []
+            real_read_connect = idx._read_connect
+
+            def _spy_read_connect():
+                con = real_read_connect()
+                calls.append(con)
+                return con
+
+            with patch.object(idx, "_read_connect", side_effect=_spy_read_connect):
+                idx.search("value")
+                target = str(tmp_path / "a.csv")
+                idx.resolve_output(target)
+                idx.get_content(target)
+                idx.get_annotations_for_path(str(tmp_path))
+            assert len(calls) == 4
+            assert all(c is idx._read_con for c in calls)
+        finally:
+            idx.close()
+
+
 class TestTantivyMigration:
     """8163816e -- a pre-Tantivy (pure-DuckDB-FTS) install's outputs_index
     table can already hold rows that predate this migration. Those rows

@@ -2719,6 +2719,16 @@ class OutputsFtsIndex:
         self.last_lock_error: str | None = None
         self._con = connection
         self._owns_con = connection is None
+        # fa600e42 follow-up (architecture review) -- dedicated connection
+        # for pure-read query paths (search(), get_annotations_for_path(),
+        # resolve_output(), get_content()), lazily created by
+        # _read_connect(). See that method's docstring for why this exists:
+        # those methods used to run their SELECT on the SAME connection
+        # object (self._con) Phase 2's write transaction runs on, guarded
+        # only by an unrelated in-process lock (self._read_lock, not
+        # self._write_lock) -- a real same-process race if the host ever
+        # threads a query call concurrently with a rebuild() call.
+        self._read_con: Any = None
         self._fts_built = False
         # b1789c0d — set when _rebuild_fts() is deferred because the overall
         # deadline expired before Phase 2 could reach it (includes the cold/
@@ -3085,6 +3095,62 @@ class OutputsFtsIndex:
                     "rehydration failed", exc_info=True,
                 )
         return self._con
+
+    def _read_connect(self) -> Any:
+        """Return a connection dedicated to pure-read query paths
+        (search()'s enrichment SELECT, get_annotations_for_path(),
+        resolve_output(), get_content()) -- separate from ``self._con``,
+        the connection Phase 2's write transaction (BEGIN TRANSACTION ...
+        COMMIT, see rebuild()) runs on.
+
+        fa600e42 follow-up (architecture review) -- confirmed live: DuckDB
+        gives correct MVCC isolation between two same-process connections
+        to the same real file (a second connection never observes an
+        in-flight, uncommitted transaction from the first), but those
+        query methods used to execute their SELECT literally on ``self._con``
+        itself, guarded only by ``self._read_lock`` (a plain in-process
+        ``threading.RLock``) -- NOT ``self._write_lock``. Nothing in this
+        class makes the two locks mutually exclusive, so if the host ever
+        threads a query call concurrently with a rebuild() call, the query
+        could run on the exact same connection object mid-transaction.
+        This connection removes that race for the common case (this
+        process's own concurrent threads) -- it does NOT, and structurally
+        cannot, fix a genuinely separate OS process trying to open its own
+        connection to the same on-disk file (DuckDB's own file-level
+        exclusivity governs that; confirmed live it fails to open at all,
+        for either read-only or read-write, cross-process, while any
+        connection from another process is open -- see the module's
+        architecture-review notes).
+
+        ``:memory:`` mode has no separate-connection option at all -- two
+        independent ``duckdb.connect(":memory:")`` calls are two entirely
+        separate, unrelated in-memory databases (confirmed live), so for
+        that mode this falls back to the single shared connection exactly
+        like every query path did before this fix; the race this method
+        closes only exists for a real on-disk ``db_path`` in the first
+        place (an in-memory instance is inherently single-connection).
+
+        Lazily created once and cached for this instance's lifetime,
+        mirroring ``self._con``'s own caching. Does NOT re-run
+        ``self._con``'s one-time schema-version/Tantivy-migration/cache-
+        rehydration bookkeeping -- callers already call :meth:`_connect`
+        first (establishing the schema durably on disk), and
+        :meth:`_ensure_schema` here is purely a defensive, idempotent
+        ``CREATE TABLE IF NOT EXISTS`` safety net, not a substitute for it.
+        """
+        if self._db_path == ":memory:":
+            return self._connect()
+        if self._read_con is None:
+            import duckdb  # noqa: PLC0415
+            self._read_con = duckdb.connect(self._db_path)
+            try:
+                self._ensure_schema(self._read_con)
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._read_connect: _ensure_schema failed",
+                    exc_info=True,
+                )
+        return self._read_con
 
     def _rehydrate_cache_from_disk(self) -> None:
         """Populate ``_manifest``/``_row_cache`` from any pre-existing rows in
@@ -4136,8 +4202,10 @@ class OutputsFtsIndex:
                 candidates.add(parent)
         with self._read_lock:
             try:
-                con = self._connect()
-                self._ensure_schema(con)
+                # fa600e42 follow-up (architecture review) -- dedicated
+                # read connection, not self._con (see _read_connect's
+                # docstring): a pure-read query, never a write.
+                con = self._read_connect()
                 relation = con.execute(
                     "SELECT path, note, run_params_json, created_at, "
                     "updated_at, source FROM annotations"
@@ -5838,7 +5906,14 @@ class OutputsFtsIndex:
                     "kind, is_archival, canonical_path, csv_columns, json_keys "
                     f"FROM outputs_index WHERE path IN ({placeholders})"
                 )
-                relation = con.execute(sql, list(bm25_by_path.keys()))
+                # fa600e42 follow-up (architecture review) -- the
+                # enrichment SELECT is a pure read (the write above, when it
+                # happens at all, is the rare lazy FTS build) -- use the
+                # dedicated read connection, not `con`/self._con, so this
+                # never executes on the same connection object a live
+                # Phase 2 write transaction is using (see _read_connect's
+                # docstring).
+                relation = self._read_connect().execute(sql, list(bm25_by_path.keys()))
                 columns = [c[0] for c in relation.description]
                 fetched = relation.fetchall()
             except Exception:  # noqa: BLE001
@@ -6355,8 +6430,10 @@ class OutputsFtsIndex:
         import sys as _sys
         with self._read_lock:
             try:
-                con = self._connect()
-                self._ensure_schema(con)
+                # fa600e42 follow-up (architecture review) -- dedicated
+                # read connection (see _read_connect's docstring): a
+                # pure-read lookup, never a write.
+                con = self._read_connect()
                 if _sys.platform == "win32":
                     # stored paths have backslashes + mixed case; target is
                     # already forward-slash + lowercase from normcase.
@@ -6447,8 +6524,10 @@ class OutputsFtsIndex:
         import sys as _sys
         with self._read_lock:
             try:
-                con = self._connect()
-                self._ensure_schema(con)
+                # fa600e42 follow-up (architecture review) -- dedicated
+                # read connection (see _read_connect's docstring): a
+                # pure-read lookup, never a write.
+                con = self._read_connect()
                 if _sys.platform == "win32":
                     sql = (
                         "SELECT content FROM outputs_index "
@@ -6473,6 +6552,21 @@ class OutputsFtsIndex:
             if self._owns_con:
                 self._con = None
                 self._fts_built = False
+            # fa600e42 follow-up (architecture review) -- _read_con is
+            # always owned/opened internally by this instance (never
+            # caller-supplied, unlike `connection`), so it's cleaned up
+            # unconditionally, mirroring the Tantivy writer below. None in
+            # :memory: mode (see _read_connect's docstring), so this is a
+            # no-op there.
+            if self._read_con is not None:
+                try:
+                    self._read_con.close()
+                except Exception:  # noqa: BLE001
+                    _log.debug(
+                        "OutputsFtsIndex.close: _read_con cleanup failed",
+                        exc_info=True,
+                    )
+                self._read_con = None
             # 77443d83 -- the Tantivy writer is always owned by this instance
             # (never passed in via the constructor, unlike `connection`), so
             # it's cleaned up unconditionally.
