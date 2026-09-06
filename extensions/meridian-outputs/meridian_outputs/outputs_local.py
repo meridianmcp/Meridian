@@ -1296,6 +1296,18 @@ _PDF_MAX_BYTES = 10 * 1024 * 1024
 _PDF_MAX_PAGES = 200
 _PDF_TIMEOUT_SECONDS = 5.0
 
+# fa600e42 follow-up (perf/memory) -- _analyse_file's single-read fast path
+# (below) reads a whole file into one in-memory buffer to derive hash +
+# fingerprint from one pass. That's a real win for the common case (a
+# handful of MB), but unbounded above this size it reproduces the same
+# per-item memory-spike class that caused a real MemoryError crash in this
+# project's own B1 baseline (large .npz-style files clustered into one
+# batch). Above this threshold, _analyse_file instead takes the streaming
+# fallback path (_sha256_file/_xxh3_file already chunk-read in 1 MiB
+# pieces; file_fingerprint's own text/PDF paths are already byte-capped),
+# which never holds more than one chunk of a large file in memory at once.
+_LARGE_FILE_STREAM_THRESHOLD_BYTES = 64 * 1024 * 1024
+
 _SCRIPT_HINT_KEYS: tuple[str, ...] = (
     "generating_script", "generated_by", "source_script", "script",
     "producer", "producer_script", "generator",
@@ -1934,6 +1946,11 @@ def _analyse_file(
     file that DID still need one. Callers decide ``needs_hash`` from a
     size-count map built once per rebuild() call, not from anything in
     this function -- it stays a pure per-path decision here.
+
+    fa600e42 follow-up -- the single-read fast path above is only taken for
+    files at or below ``_LARGE_FILE_STREAM_THRESHOLD_BYTES``. Larger files
+    fall through to the streaming fallback path below instead, which never
+    materialises the whole file in memory at once.
     """
     captured_mtime, captured_size = (
         stat_signature if stat_signature is not None else (None, None)
@@ -1962,7 +1979,10 @@ def _analyse_file(
         except OSError:
             size = mtime = None
 
-    if hasher is _sha256_file or hasher is _xxh3_file:
+    if (
+        (hasher is _sha256_file or hasher is _xxh3_file)
+        and (size is None or size <= _LARGE_FILE_STREAM_THRESHOLD_BYTES)
+    ):
         try:
             with open(path, "rb", buffering=0) as fh:
                 data = fh.read()
@@ -2820,6 +2840,31 @@ class OutputsFtsIndex:
                 _log.warning(
                     "OutputsFtsIndex._connect: could not disable "
                     "preserve_insertion_order", exc_info=True,
+                )
+            # fa600e42 follow-up (perf) -- DuckDB's default
+            # checkpoint_threshold (16MB) meant Phase 2's own bulk writes
+            # (autocommitted, unwrapped statements -- see the write path
+            # below) silently accumulated WAL across a call, and whichever
+            # COMMIT happened to cross the threshold paid the full
+            # "stop-the-world" checkpoint cost -- confirmed live, this was
+            # near-always the tiny walk-state-persist commit at the tail of
+            # rebuild(), making a 9-row key/value write look like it cost
+            # up to 30+ seconds (23% of an entire 8-call, 385K-file run) for
+            # a checkpoint that actually belonged to Phase 2's real data.
+            # Raising the threshold doesn't skip durability (every commit is
+            # still WAL-fsynced regardless of checkpointing) -- it just lets
+            # more work accumulate before paying one, larger, less frequent
+            # checkpoint instead of many small ones landing on whatever
+            # commit happens to be unlucky. See DuckDB's CHECKPOINT docs
+            # (checkpoint_threshold, default 16MB) and the "Analytics-
+            # Optimized Concurrent Transactions" blog post (checkpoints lock
+            # all clients and apply the WAL) for the underlying mechanism.
+            try:
+                self._con.execute("PRAGMA checkpoint_threshold='1GB'")
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "OutputsFtsIndex._connect: could not raise "
+                    "checkpoint_threshold", exc_info=True,
                 )
             # 77443d83 -- a fresh instance always assumed _fts_built started
             # False. With Tantivy this is now cheap either way (_rebuild_fts
@@ -3992,12 +4037,29 @@ class OutputsFtsIndex:
         ))
         return rows
 
-    def _ingest_meridian_notes(self, paths: list[str]) -> int:
+    def _ingest_meridian_notes(
+        self, paths: list[str], deadline: float | None = None,
+    ) -> int:
         """Only ever called from within :meth:`rebuild`'s ``with self._write_lock:``
         block -- uses ``_add_annotation_locked`` (not ``add_annotation``) to avoid
-        re-acquiring the non-reentrant write lock."""
+        re-acquiring the non-reentrant write lock.
+
+        fa600e42 follow-up (perf) -- ``paths`` must be ``newly_seen`` (the
+        walk's THIS-call discoveries), not ``all_paths``: the latter re-scans
+        every file in the whole corpus, every single rebuild() call, purely
+        to find basename matches, confirmed to cost real unaccounted time on
+        a 385K-file tree. The walk resets and re-discovers everything on
+        every full pass (see ``walk_complete`` above), so an edited notes
+        file is still picked up -- just bounded to once per pass instead of
+        every call. Also deadline-aware like every other per-file Phase 1/2
+        loop in this method (see ``phase1_deadline``'s own reasoning above)
+        so a huge cold ``newly_seen`` batch can't consume the whole rebuild()
+        budget before Phase 2 gets a chance to run at all.
+        """
         ingested = 0
         for p in paths:
+            if deadline is not None and time.monotonic() > deadline:
+                break
             if os.path.basename(p) != MERIDIAN_NOTES_FILENAME:
                 continue
             directory = os.path.dirname(p)
@@ -4804,7 +4866,11 @@ class OutputsFtsIndex:
             self.last_rebuild_metrics["legacy_migration_seconds"] = round(
                 time.monotonic() - _legacy_migration_started, 6,
             )
-            self._ingest_meridian_notes(all_paths)
+            _notes_ingest_started = time.monotonic()
+            self._ingest_meridian_notes(newly_seen, deadline)
+            self.last_rebuild_metrics["notes_ingest_seconds"] = round(
+                time.monotonic() - _notes_ingest_started, 6,
+            )
             _apply_precomputed_started = time.monotonic()
             rows, changed, paths_to_delete, new_rows = (
                 self._apply_precomputed(

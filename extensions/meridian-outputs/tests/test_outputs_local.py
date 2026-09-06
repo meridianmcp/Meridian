@@ -16,6 +16,7 @@ Covers:
 """
 from __future__ import annotations
 
+import builtins
 import contextlib
 import hashlib
 import io
@@ -1539,6 +1540,98 @@ class TestOutputsFtsIndex:
             idx.close()
 
     @duckdb_required
+    def test_ingest_meridian_notes_respects_deadline(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up: _ingest_meridian_notes is now called with
+        `newly_seen` (this call's own walk discoveries) instead of the whole
+        corpus's `all_paths`, so -- like every other per-file Phase 1/2 loop
+        in rebuild() -- it must be deadline-aware: a huge cold `newly_seen`
+        batch must not be able to consume the entire rebuild() budget before
+        Phase 2 (_apply_precomputed) gets a chance to run at all."""
+        notes_path = str(tmp_path / OL.MERIDIAN_NOTES_FILENAME)
+        (tmp_path / OL.MERIDIAN_NOTES_FILENAME).write_text("hello", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            already_expired = time.monotonic() - 1.0
+            assert idx._ingest_meridian_notes([notes_path], already_expired) == 0
+            assert idx._ingest_meridian_notes([notes_path], time.monotonic() + 60) == 1
+            # No deadline (the default) behaves exactly as before this fix.
+            (tmp_path / "sub").mkdir()
+            other_notes = tmp_path / "sub" / OL.MERIDIAN_NOTES_FILENAME
+            other_notes.write_text("world", encoding="utf-8")
+            assert idx._ingest_meridian_notes([str(other_notes)]) == 1
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_rebuild_records_notes_ingest_seconds_metric(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up: notes ingestion now has its own timed metric
+        (mirroring legacy_migration_seconds/apply_precomputed_seconds right
+        next to it), so previously-unaccounted time in Phase 2's write block
+        is directly attributable rather than silently folded into whatever
+        metric happened to be timed next."""
+        (tmp_path / OL.MERIDIAN_NOTES_FILENAME).write_text("hello", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert "notes_ingest_seconds" in idx.last_rebuild_metrics
+            assert idx.last_rebuild_metrics["notes_ingest_seconds"] >= 0
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_rebuild_ingests_notes_once_not_every_call_mid_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up: the old call rescanned the cumulative
+        `all_paths` (every file discovered so far THIS walk pass,
+        re-derived fresh on every call) to find MERIDIAN_NOTES.md, so an
+        already-ingested, unchanged notes file got re-read and
+        re-annotated on EVERY subsequent call of the same still-in-progress
+        pass -- confirmed to cost real unaccounted time on a 385K-file
+        tree. Scoping to `newly_seen` means a given file is only
+        (re-)ingested on the call that actually (re-)discovers it."""
+        (tmp_path / OL.MERIDIAN_NOTES_FILENAME).write_text("note", encoding="utf-8")
+        for i in range(20):
+            (tmp_path / f"zzz_filler_{i:03d}.csv").write_text("a\n1", encoding="utf-8")
+
+        TestRebuildWalkDeadlineAwareness._install_slow_walk(monkeypatch, 0.05)
+
+        captured: list[list[str]] = []
+        real_ingest = OL.OutputsFtsIndex._ingest_meridian_notes
+
+        def spy(self: Any, paths: list[str], deadline: Any = None) -> int:
+            captured.append(list(paths))
+            return real_ingest(self, paths, deadline)
+
+        monkeypatch.setattr(OL.OutputsFtsIndex, "_ingest_meridian_notes", spy)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            for _ in range(15):
+                idx.rebuild(max_seconds=0.15)
+                if idx.last_rebuild_metrics.get("walk_complete"):
+                    break
+            assert len(captured) >= 2, (
+                "expected the slow walk to force this pass across multiple "
+                f"rebuild() calls, only got {len(captured)}"
+            )
+            calls_seeing_notes = sum(
+                1 for paths in captured
+                if any(
+                    os.path.basename(p) == OL.MERIDIAN_NOTES_FILENAME for p in paths
+                )
+            )
+            assert calls_seeing_notes == 1, (
+                "expected the notes file to land in exactly one call's "
+                f"newly_seen batch, got {calls_seeing_notes} of {len(captured)} calls"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
     def test_incremental_rebuild(self, tmp_path: Path) -> None:
         f = tmp_path / "data.json"
         f.write_text('{"key": "value1"}', encoding="utf-8")
@@ -2769,6 +2862,81 @@ class TestAnalyseFile:
             a = results[path]
             assert a.fingerprint.csv_columns is not None
             assert expected_col in a.fingerprint.csv_columns
+
+    def test_large_file_streams_instead_of_single_unbounded_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf/memory): the fast path used to read a
+        whole file into one in-memory buffer (`fh.read()`, no size arg)
+        regardless of size, reproducing the same per-item memory-spike
+        class that caused a real MemoryError crash in this project's own
+        B1 baseline (large clustered files, unbounded per-item reads).
+        Above `_LARGE_FILE_STREAM_THRESHOLD_BYTES`, _analyse_file must take
+        the streaming fallback path instead (`_sha256_file`/`_xxh3_file`
+        already chunk-read in bounded pieces) -- verified here by asserting
+        every `.read()` call against the large file passed an explicit
+        chunk size, never an unbounded `fh.read()`."""
+        monkeypatch.setattr(OL, "_LARGE_FILE_STREAM_THRESHOLD_BYTES", 100)
+        f = tmp_path / "big.bin"
+        content = b"x" * 1000
+        f.write_bytes(content)
+
+        real_open = builtins.open
+        read_calls: list[tuple[Any, ...]] = []
+
+        def spy_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+            fh = real_open(path, *args, **kwargs)
+            if os.fspath(path) == str(f):
+                real_read = fh.read
+
+                def spy_read(*a: Any, **kw: Any) -> Any:
+                    read_calls.append(a)
+                    return real_read(*a, **kw)
+
+                fh.read = spy_read
+            return fh
+
+        monkeypatch.setattr(OL, "open", spy_open, raising=False)
+        analysis = OL._analyse_file(str(f), OL._sha256_file)
+        assert analysis.sha256 == hashlib.sha256(content).hexdigest()
+        assert read_calls, "expected at least one read() call against the large file"
+        assert all(a for a in read_calls), (
+            f"expected only bounded, explicit-size read() calls, got: {read_calls!r}"
+        )
+
+    def test_small_file_still_uses_fast_single_read_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Companion to the large-file streaming test: a file at or below
+        the threshold must still take the single-read fast path (an
+        unbounded `fh.read()`), so the streaming fix doesn't regress the
+        documented common-case performance win (e1fd4182)."""
+        monkeypatch.setattr(OL, "_LARGE_FILE_STREAM_THRESHOLD_BYTES", 100)
+        f = tmp_path / "small.bin"
+        content = b"y" * 50
+        f.write_bytes(content)
+
+        real_open = builtins.open
+        read_calls: list[tuple[Any, ...]] = []
+
+        def spy_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+            fh = real_open(path, *args, **kwargs)
+            if os.fspath(path) == str(f):
+                real_read = fh.read
+
+                def spy_read(*a: Any, **kw: Any) -> Any:
+                    read_calls.append(a)
+                    return real_read(*a, **kw)
+
+                fh.read = spy_read
+            return fh
+
+        monkeypatch.setattr(OL, "open", spy_open, raising=False)
+        analysis = OL._analyse_file(str(f), OL._sha256_file)
+        assert analysis.sha256 == hashlib.sha256(content).hexdigest()
+        assert any(not a for a in read_calls), (
+            f"expected an unbounded fh.read() call on the fast path, got: {read_calls!r}"
+        )
 
 
 @duckdb_required
@@ -5183,6 +5351,44 @@ class TestDuckDBMemoryLimit:
         matches = [sql for sql in captured if "preserve_insertion_order" in sql.lower()]
         assert matches, f"expected a preserve_insertion_order PRAGMA, got: {captured!r}"
         assert "false" in matches[0].lower()
+
+    @duckdb_required
+    def test_connect_raises_checkpoint_threshold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): DuckDB's default checkpoint_threshold
+        (16MB) let Phase 2's own autocommitted bulk writes silently
+        accumulate WAL across a call -- confirmed live, whichever COMMIT
+        happened to cross the threshold paid the full stop-the-world
+        checkpoint cost, near-always the tiny walk-state-persist commit at
+        the tail of rebuild() (up to 30+s, 23% of an entire 385K-file run).
+        Must be raised on every connect, same as preserve_insertion_order."""
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _ExecuteSpyCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._connect()
+        finally:
+            idx.close()
+        matches = [sql for sql in captured if "checkpoint_threshold" in sql.lower()]
+        assert matches, f"expected a checkpoint_threshold PRAGMA, got: {captured!r}"
 
     def test_connect_tantivy_passes_resolved_heap_size_to_writer(
         self, tmp_path: Path,
