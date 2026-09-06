@@ -434,6 +434,52 @@ that has opted into this capability, route your prospecting through
 gets written, rather than assuming the existing prose guidance above is
 enough.
 
+### Handoff-provenance receipts at claim time — WARN-ONLY (1b7eb437, follow-up to 833649f1)
+
+`meridian/code_intel_receipt.py` (above) proved out the pattern: a durable,
+server-written `action_audit_log` receipt, checked only for a project that
+opted in via `set_capability_manifest`. `meridian/handoff_receipt.py`
+applies the same pattern to the OTHER structural gap 833649f1 flagged:
+calling `verify_handoff_token`/`accept_handoff` after a failed verification
+never stopped `claim_sprint_item` from succeeding anyway, because nothing
+wrote or checked a receipt for it.
+
+In short: `verify_handoff_token` and `accept_handoff` now accept an
+**optional** `session_id` argument, used only to attribute a durable
+receipt (`event_type="handoff_provenance_receipt"`) to that call when it
+genuinely succeeds (`valid=true` / `accepted=true`) — omitting it changes
+nothing about either tool's behavior or return shape. `claim_sprint_item`,
+for a project that has declared the `handoff_provenance_verification`
+capability, looks up a receipt attributed to its own (already-existing)
+`session_id` argument and surfaces `handoff_provenance_warning` (no
+matching receipt) or `handoff_provenance_receipt` (found) on the claimed
+item.
+
+**This is WARN-ONLY in this pass, deliberately** — unlike the code-intel
+gate, it never blocks a claim, for any declared `availability_policy`,
+including `required`. A fail-closed path and an
+`override_handoff_provenance_receipt` escape hatch (mirroring
+`override_code_intel_receipt`) are explicitly **DEFERRED**, not shipped:
+building both the write side AND the check side from scratch in one pass,
+on the single most heavily-used claim path in the codebase, with a hard
+block, was judged too much untested surface for one change. See
+`meridian/handoff_receipt.py`'s module docstring for the full rationale.
+
+**Known, load-bearing limit — read this before treating a missing receipt
+as suspicious:** a receipt proves "a genuine verification call succeeded for
+this project"; it does **not** prove that call is the one that produced a
+given claim. Binding requires the CALLER to pass `session_id` on the
+verification call — a non-compliant client that never does, or a perfectly
+legitimate executor that came in through the TRUSTED
+`pending_goal`/`load_handoff` channel (which correctly has nothing to
+verify, since it was never a pasted `/goal` in the first place), will both
+simply never accrue an attributable receipt. `handoff_provenance_warning`
+on a claimed item means exactly that — "no receipt found" — never "this
+claim is spoofed." Do not read absence of a receipt as a spoofing signal
+any more than AGENTS.md already tells you to read `already_consumed`/
+`expired` that way (see "Handoff delivery & trust" above); it is weaker
+evidence than either of those, by construction.
+
 ---
 
 ## Tests & coverage

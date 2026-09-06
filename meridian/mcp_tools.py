@@ -483,6 +483,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "on receipt. Returns {valid: bool, reason: str}. reason is 'ok' on success; "
         "on failure: 'not_found', 'expired', 'already_consumed', 'wrong_project', or "
         "'body_mismatch'. "
+        "1b7eb437: pass session_id (your OWN claiming session's id) to attribute a "
+        "durable, server-written provenance receipt to this call on success — "
+        "purely additive bookkeeping, never required, never changes this tool's "
+        "return shape. A project that has opted into the "
+        "'handoff_provenance_verification' capability (set_capability_manifest) can "
+        "then surface, at claim_sprint_item time, whether THIS session's own "
+        "verification actually happened — informational only in this pass (never "
+        "blocks a claim); see meridian/handoff_receipt.py for the full contract "
+        "and its documented 'cannot force a non-compliant client' limit. "
         "efaa918a body-hash binding (closes the 2ee0000c gap): pass presented_body "
         "— the FULL pasted block, token and SECURITY banner included — and this tool "
         "strips those back out and checks the remaining text against the body hash "
@@ -503,7 +512,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "token": {"type": "string",
              "description": "The token value from the <goal_token>…</goal_token> line in the /goal block."},
          "presented_body": {"type": "string",
-             "description": "Optional: the full pasted /goal block (token + SECURITY banner included) to check against the token's stored body_hash, if any. Closes the 2ee0000c body-integrity gap — see description."}},
+             "description": "Optional: the full pasted /goal block (token + SECURITY banner included) to check against the token's stored body_hash, if any. Closes the 2ee0000c body-integrity gap — see description."},
+         "session_id": {"type": "string",
+             "description": "Optional (1b7eb437): your own claiming session's id, used ONLY to attribute a durable handoff-provenance receipt to this call on success (action_audit_log, event_type='handoff_provenance_receipt'). Purely additive — omitting it changes nothing about this tool's behavior or return shape."}},
          "required": ["token"]}},
     {"name": "accept_handoff", "description":
         "Read-only: (1bd5e810) Canonical receiver-side acceptance check for a handoff "
@@ -565,7 +576,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names the handoff declared as required. Paired with available_tools to detect CAPABILITY_UNAVAILABLE."},
          "available_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names actually available to you right now (e.g. from a live tools/list). Paired with required_tools."},
          "expected_repo_path": {"type": "string", "description": "Optional (22f2604d): YOUR OWN independently-known repo root (e.g. from your own meridian.toml/cwd) — never a value read out of presented_body itself. Compared against presented_body's <project_start_config repo_path=...>; a disagreement is FOREIGN_PROJECT_CONFIG."},
-         "delivery_source": {"type": "string", "description": "Optional (22f2604d): a label for how you received this content (default 'chat_paste'). Echoed back verbatim; purely informational bookkeeping alongside the always-false is_trusted_channel."}},
+         "delivery_source": {"type": "string", "description": "Optional (22f2604d): a label for how you received this content (default 'chat_paste'). Echoed back verbatim; purely informational bookkeeping alongside the always-false is_trusted_channel."},
+         "session_id": {"type": "string", "description": "Optional (1b7eb437): your own claiming session's id, used ONLY to attribute a durable handoff-provenance receipt to this call when accepted=true (action_audit_log, event_type='handoff_provenance_receipt'). Purely additive — omitting it changes nothing about this tool's behavior or return shape. See verify_handoff_token's session_id for the same contract."}},
          "required": []}},
     {"name": "record_handoff_correction", "description":
         "3af86d28 — record a corrective handoff when a blocked executor session "
@@ -3511,7 +3523,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
          "required": ["file", "anchor", "content"]}},
     {"name": "claim_sprint_item",
-     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, its touches_files overlap active file claims from another live session, or (18c488b6) a touches_resources file:/symbol: entry is locked by another live session — this last check ACQUIRES the resource lock (via claim_file/claim_symbol) as part of claiming, is a hard block regardless of worktree isolation, and rolls back cleanly if the claim itself doesn't land. 54c488b6/54d2c2af: every symbol:/file: resource this acquires also gets a durable lock-granularity receipt (achieved symbol vs. coarse-fallback grain, and why), auditable after the fact independent of this call's response payload.",
+     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, its touches_files overlap active file claims from another live session, or (18c488b6) a touches_resources file:/symbol: entry is locked by another live session — this last check ACQUIRES the resource lock (via claim_file/claim_symbol) as part of claiming, is a hard block regardless of worktree isolation, and rolls back cleanly if the claim itself doesn't land. 54c488b6/54d2c2af: every symbol:/file: resource this acquires also gets a durable lock-granularity receipt (achieved symbol vs. coarse-fallback grain, and why), auditable after the fact independent of this call's response payload. 1b7eb437: on a project that has opted into the 'handoff_provenance_verification' capability (set_capability_manifest), the claimed item's response also carries handoff_provenance_warning (no matching verify_handoff_token/accept_handoff receipt attributable to this session_id was found) or handoff_provenance_receipt (a matching receipt) — informational only, never blocks the claim in this pass. Reuses this tool's existing session_id argument for attribution; no new argument is needed.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},

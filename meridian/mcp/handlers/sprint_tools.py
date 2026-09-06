@@ -1294,6 +1294,34 @@ async def handle_claim_sprint_item(
         item = dict(item)
         item["touches_resources_code_notes"] = _resource_code_notes
 
+    # 1b7eb437 (follow-up to 833649f1) — HANDOFF-PROVENANCE receipt gate.
+    # Opt-in via the PROJECT's capability manifest (mirrors a8c0f3b7's
+    # code-intel-prospecting gate contract exactly): a no-op — zero behavior
+    # change, zero extra I/O beyond one cheap manifest read (see
+    # meridian.handoff_receipt's module docstring, point 3) — unless the
+    # project has declared "handoff_provenance_verification" via
+    # set_capability_manifest. When declared, this surfaces whether a
+    # verify_handoff_token/accept_handoff call attributable to THIS claiming
+    # session (its session_id) actually happened, rather than trusting a
+    # pasted /goal's self-report — WARN-ONLY in this pass, never blocks the
+    # claim regardless of the declared availability_policy; a fail-closed
+    # required path + an override_handoff_provenance_receipt escape hatch
+    # are explicitly deferred (see meridian.handoff_receipt module docstring
+    # "Deliberate scope reduction" for the full rationale).
+    try:
+        from meridian.handoff_receipt import verify_handoff_provenance  # noqa: PLC0415
+        _hp_check = await verify_handoff_provenance(
+            db, tenant, args["project_id"], session_id=args.get("session_id"),
+        )
+    except Exception:  # noqa: BLE001 — this advisory check must never block a claim
+        _hp_check = None
+    if _hp_check and _hp_check.get("applicable"):
+        item = dict(item)
+        if _hp_check.get("degraded"):
+            item["handoff_provenance_warning"] = _hp_check.get("warning")
+        elif _hp_check.get("receipt"):
+            item["handoff_provenance_receipt"] = _hp_check.get("receipt")
+
     return item
 
 

@@ -3811,9 +3811,31 @@ async def _handle_task_tools(
             if isinstance(_presented_body, str)
             else None
         )
-        return await handoff_module_local.verify_handoff_token(
+        _vht_result = await handoff_module_local.verify_handoff_token(
             db, _token, _pid, body=_body_for_check
         )
+        if _vht_result.get("valid"):
+            # 1b7eb437 (follow-up to 833649f1) — best-effort, purely-additive
+            # handoff-provenance receipt: a durable, server-written record
+            # that a genuine verify_handoff_token call succeeded for this
+            # project, attributable to the CALLING session when it supplies
+            # session_id (a new, optional, attribution-only field — see this
+            # tool's schema in mcp_tools.py). Written ONLY on valid=True —
+            # never for a failed verification, which is already visible via
+            # the returned reason. Never raises and never changes the
+            # returned dict (see handoff_receipt.record_handoff_provenance_
+            # receipt's own best-effort contract, mirroring
+            # code_intel_receipt.record_prospect_receipt exactly) — the
+            # dict returned below is byte-identical to before this change,
+            # pinned by tests/test_dd07ece0_handoff_token.py.
+            from .. import handoff_receipt as _handoff_receipt_local  # noqa: PLC0415
+            await _handoff_receipt_local.record_handoff_provenance_receipt(
+                db,
+                tenant_id=(tenant or {}).get("id") if tenant else None,
+                project_id=_pid, session_id=args.get("session_id"),
+                tool_name="verify_handoff_token", outcome="valid",
+            )
+        return _vht_result
     if name == "accept_handoff":
         # 1bd5e810 — canonical receiver-side acceptance check, shared by
         # MCP/stdio/HTTP (see meridian.handoff.accept_handoff_envelope's own
@@ -3827,7 +3849,7 @@ async def _handle_task_tools(
             else None
         )
         _ah_live_items = args.get("live_items")
-        return await handoff_module_local.accept_handoff_envelope(
+        _ah_result = await handoff_module_local.accept_handoff_envelope(
             db,
             args.get("project_id") or "",
             goal_token=args.get("goal_token"),
@@ -3850,6 +3872,19 @@ async def _handle_task_tools(
             # untrusted-by-default posture requirement 4 asks for.
             delivery_source=args.get("delivery_source") or "chat_paste",
         )
+        if _ah_result.get("accepted"):
+            # 1b7eb437 — same best-effort, purely-additive receipt as the
+            # verify_handoff_token branch above; see its comment for the
+            # full contract. Written only on a genuine accepted=True.
+            from .. import handoff_receipt as _handoff_receipt_local  # noqa: PLC0415
+            await _handoff_receipt_local.record_handoff_provenance_receipt(
+                db,
+                tenant_id=(tenant or {}).get("id") if tenant else None,
+                project_id=args.get("project_id") or "",
+                session_id=args.get("session_id"),
+                tool_name="accept_handoff", outcome="accepted",
+            )
+        return _ah_result
     if name == "export_ai_log":
         # c0168425 — implementation follow-up to ea972129's design: read-only,
         # receipted export of ai_log_events. See db.ai_log.export_events for
