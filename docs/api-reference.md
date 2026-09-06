@@ -885,6 +885,7 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/hooks/diagnostics` | 34f76536 — live hook-configuration diagnostics for the active repo |
 | `POST` | `/hooks/session-start` | Claude Code / Codex SessionStart hook |
 | `POST` | `/hooks/stop` | Claude Code / Codex Stop hook |
 

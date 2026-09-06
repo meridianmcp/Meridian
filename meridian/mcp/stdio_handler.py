@@ -2512,6 +2512,18 @@ def build_mcp_server():
                     and not _handoff_selection_blocked
                     and not _handoff_scope_non_executable_blocked
                 ):
+                    # c6015316 — machine-readable board-context-state signal,
+                    # mirroring handler.py's HTTP MCP dispatch (this transport
+                    # was previously missing this field entirely — closes part
+                    # of the pre-existing stdio field-parity gap documented on
+                    # build_board_context_state_for_handoff itself). Fully
+                    # guarded — a failure degrades to None, never breaks this
+                    # mandatory handoff result.
+                    _stdio_board_context_state = (
+                        await handoff_module.build_board_context_state_for_handoff(
+                            db, arguments["project_id"], version=_stdio_version,
+                        )
+                    )
                     # a5e8aa74 — return content EXACTLY as generate_handoff rendered
                     # it, via the shared helper meridian/mcp/handler.py and
                     # meridian/routes/handoff.py also use, so all transports emit a
@@ -2539,6 +2551,10 @@ def build_mcp_server():
                             not _stdio_board_stale
                             and handoff_module.handoff_mode_is_retrievable(mode)
                         ),
+                        # c6015316 — see build_board_context_state_for_handoff's
+                        # own docstring. None only if the best-effort lookup
+                        # itself failed.
+                        "board_context_state": _stdio_board_context_state,
                     }
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.

@@ -132,6 +132,17 @@ pyarrow = ">=14.0"
 # constant recalibration. Declared here (not just in the semantic feature)
 # so the default environment gets the real adaptive path.
 psutil = ">=5.9"
+# aa423c7e -- same class of gap as tantivy/xxhash/pyarrow/psutil above:
+# extensions/meridian-outputs/pyproject.toml declares pypdf as a real,
+# non-optional dependency backing outputs_local.py's PDF body-content
+# extraction (_extract_pdf_text, feeding the new "pdf_content" classify_
+# suffix kind), but that extension's tests import the module straight off
+# sys.path (no pip install of the package), so nothing previously pulled
+# pypdf into THIS pixi env either. Declared here so a fresh clone/worktree
+# actually exercises real PDF extraction in tests instead of silently
+# falling back to the (also-correct, but untested-by-default) missing-
+# dependency degrade path.
+pypdf = ">=4.0"
 mcp = ">=1.0"
 anthropic = ">=0.40"
 python-dotenv = ">=1.0"

@@ -145,6 +145,34 @@ _DOC_XML_WITH_CITATION = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+# A paragraph holding TWO independent CSL_CITATION fields (as opposed to one
+# multi-item field) -- e.g. "(Original, 2019) and (Marker, 2025)" cited
+# together in one sentence as two separate complex fields.
+_DOC_XML_WITH_TWO_CITATIONS_ONE_PARAGRAPH = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="FF000001">
+      <w:r><w:t xml:space="preserve">This paragraph already discusses prior work </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {"citationID":"orig1","properties":{"formattedCitation":"(Original, 2019)"},"citationItems":[{"id":"original2019","uris":[],"itemData":{"id":"original2019","type":"article"}}],"schema":"x"} </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>(Original, 2019)</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t xml:space="preserve"> and also </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {"citationID":"mark1","properties":{"formattedCitation":"(Marker, 2025)"},"citationItems":[{"id":"markerkey2025","uris":[],"itemData":{"id":"markerkey2025","type":"article"}}],"schema":"x"} </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>(Marker, 2025)</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t xml:space="preserve">.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
 def _zip_docx(xml: str) -> bytes:
     """Build a minimal .docx ZIP containing only word/document.xml."""
     buf = io.BytesIO()
@@ -693,6 +721,41 @@ class TestEditCitation:
         assert "error" in res
         assert open(docx, "rb").read() == original
 
+    def test_edit_citation_two_fields_no_disambiguator_is_refused(self, tmp_path):
+        """Same fix as remove_citation -- edit_citation shared the identical
+        first-field-wins bug."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_TWO_CITATIONS_ONE_PARAGRAPH)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.edit_citation(
+            docx_path=docx,
+            anchor_para_id="FF000001",
+            new_formatted_text="(Whatever)",
+        )
+
+        assert "error" in res
+        assert res["reason"] == "ambiguous_citation_fields"
+        assert open(docx, "rb").read() == original
+
+    def test_edit_citation_two_fields_disambiguated_edits_the_right_one(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_TWO_CITATIONS_ONE_PARAGRAPH)
+
+        res = docs_intel.edit_citation(
+            docx_path=docx,
+            anchor_para_id="FF000001",
+            new_formatted_text="(Marker, Revised 2025)",
+            match_display_text="Marker, 2025",
+        )
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        xml_after = _read_doc_xml(docx)
+        assert "(Marker, Revised 2025)" in xml_after
+        # The OTHER citation must survive untouched.
+        assert "original2019" in xml_after
+        assert "(Original, 2019)" in xml_after
+
 
 # ---------------------------------------------------------------------------
 # Citation: remove
@@ -748,6 +811,95 @@ class TestRemoveCitation:
         )
         assert "error" in res
         assert open(docx, "rb").read() == original
+
+    def test_remove_citation_two_fields_no_disambiguator_is_refused(self, tmp_path):
+        """9d749639 follow-up (2026-09-05) -- found live via a hand-authored
+        PAPER-S7 fixture: a paragraph with a pre-existing citation plus a
+        separately-inserted one caused remove_citation to delete the WRONG
+        (pre-existing) field while leaving the intended one in place, since
+        it always acted on whichever field came first. Now it must refuse
+        rather than guess when more than one field is present and no
+        match_display_text is given."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_TWO_CITATIONS_ONE_PARAGRAPH)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.remove_citation(
+            docx_path=docx,
+            anchor_para_id="FF000001",
+        )
+
+        assert "error" in res
+        assert res["reason"] == "ambiguous_citation_fields"
+        assert set(res["candidate_display_texts"]) == {"(Original, 2019)", "(Marker, 2025)"}
+        assert open(docx, "rb").read() == original, "file was mutated despite refusing"
+
+    def test_remove_citation_two_fields_disambiguated_removes_the_right_one(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_TWO_CITATIONS_ONE_PARAGRAPH)
+
+        res = docs_intel.remove_citation(
+            docx_path=docx,
+            anchor_para_id="FF000001",
+            match_display_text="Marker, 2025",
+        )
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        xml_after = _read_doc_xml(docx)
+        # The targeted field is gone...
+        assert "markerkey2025" not in xml_after
+        assert "(Marker, 2025)" not in xml_after
+        # ...but the OTHER, pre-existing citation must survive untouched.
+        assert "original2019" in xml_after
+        assert "(Original, 2019)" in xml_after
+
+    def test_remove_citation_disambiguator_matching_zero_fields_is_an_error(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_TWO_CITATIONS_ONE_PARAGRAPH)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.remove_citation(
+            docx_path=docx,
+            anchor_para_id="FF000001",
+            match_display_text="Nonexistent, 1999",
+        )
+
+        assert "error" in res
+        assert res["reason"] == "ambiguous_citation_fields"
+        assert open(docx, "rb").read() == original
+
+    def test_remove_citation_disambiguator_matching_both_fields_is_an_error(self, tmp_path):
+        """A substring loose enough to match more than one field must also
+        be refused, not resolved to "the first match"."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_TWO_CITATIONS_ONE_PARAGRAPH)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.remove_citation(
+            docx_path=docx,
+            anchor_para_id="FF000001",
+            match_display_text=", 20",  # matches both "2019" and "2025"
+        )
+
+        assert "error" in res
+        assert res["reason"] == "ambiguous_citation_fields"
+        assert open(docx, "rb").read() == original
+
+    def test_remove_citation_disambiguator_ignored_when_only_one_field(self, tmp_path):
+        """match_display_text is only needed for genuine ambiguity -- a
+        single-field paragraph must still work exactly as before, even with
+        a (non-matching) value passed."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_CITATION)
+
+        res = docs_intel.remove_citation(
+            docx_path=docx,
+            anchor_para_id="EEFF0001",
+            match_display_text="this text does not appear anywhere",
+        )
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        assert res["status"] == "removed"
 
 
 # ---------------------------------------------------------------------------

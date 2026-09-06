@@ -3473,6 +3473,17 @@ async def _handle_task_tools(
         _profile_binding = await handoff_module_local.build_effective_profile_binding(
             db, args["project_id"], session_id=session_id,
         )
+        # c6015316 — machine-readable board-context-state signal, emitted on
+        # every generate_handoff mode alongside the fields above. Distinguishes
+        # a genuinely-empty project from one with pinned decisions/notes but
+        # zero executable sprint items ("context_only") — see
+        # build_board_context_state_for_handoff's own docstring for the exact
+        # contract. Fully guarded — a failure degrades to no field rather than
+        # breaking the mandatory handoff. Never touches `content`/quick_start_goal
+        # itself (goal-mode text stays byte-for-byte identical).
+        _board_context_state = await handoff_module_local.build_board_context_state_for_handoff(
+            db, args["project_id"], version=_effective_version,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -3581,6 +3592,11 @@ async def _handle_task_tools(
             "continuation_status": _continuation_status,
             "checkpoint": _checkpoint,
             "strict_continuation": _strict_continuation,
+            # c6015316 — {"state": "empty"|"context_only"|"has_pending_items",
+            # pending_item_count, in_progress_item_count, pinned_decision_count,
+            # note_count, hint?} — see build_board_context_state_for_handoff's
+            # own docstring. None only if the best-effort lookup itself failed.
+            "board_context_state": _board_context_state,
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project
@@ -4151,6 +4167,7 @@ async def _handle_notes_decisions(
         handle_get_workspace_proposals,
         handle_advance_proposal_status,
         handle_promote_proposal,
+        handle_add_proposal,
         handle_preview_proposal_promotion,
         handle_commit_proposal_promotion,
     )
@@ -4213,6 +4230,7 @@ async def _handle_notes_decisions(
         "get_workspace_proposals": handle_get_workspace_proposals,
         "advance_proposal_status": handle_advance_proposal_status,
         "promote_proposal": handle_promote_proposal,
+        "add_proposal": handle_add_proposal,
         "preview_proposal_promotion": handle_preview_proposal_promotion,
         "commit_proposal_promotion": handle_commit_proposal_promotion,
     }
