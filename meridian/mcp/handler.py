@@ -4699,7 +4699,7 @@ async def _handle_file_claims(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics, claim_docx_region, get_docx_region_claims, release_docx_region_claims, list_active_worktrees, list_worktrees_pending_cleanup."""
+    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics, claim_docx_region, get_docx_region_claims, release_docx_region_claims, acquire_docx_document_lease, get_docx_document_lease, release_docx_document_lease, find_orphaned_docx_staged_files, list_active_worktrees, list_worktrees_pending_cleanup."""
     if name == "claim_file":
         # 4bac57ff — symbol-level claim when both `symbol` and `content` are
         # supplied; otherwise the coarse whole-file lock. Falls back to a
@@ -4852,9 +4852,44 @@ async def _handle_file_claims(
             "file_path": args.get("file_path"),
             "element_id": args.get("element_id"),
         }
+    if name == "acquire_docx_document_lease":
+        # 6507e83a — whole-document cross-process lease.
+        return await db_module.acquire_docx_document_lease(
+            db, args["session_id"], args["file_path"],
+        )
+    if name == "get_docx_document_lease":
+        # 6507e83a — read-only: the live whole-document lease, if any.
+        return {
+            "file_path": args["file_path"],
+            "lease": await db_module.get_docx_document_lease(db, args["file_path"]),
+        }
+    if name == "release_docx_document_lease":
+        # 6507e83a — release a session's whole-document lease.
+        released = await db_module.release_docx_document_lease(
+            db, args["session_id"], args["file_path"],
+        )
+        return {
+            "released": released,
+            "session_id": args["session_id"],
+            "file_path": args["file_path"],
+        }
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
         return {"released": released, "file_path": args["file_path"]}
+    if name == "find_orphaned_docx_staged_files":
+        # 6507e83a — maintenance diagnostic: staged-DOCX temp files left
+        # behind by a process that crashed between STAGE and PROMOTE inside
+        # meridian.doc_store's own write transaction. Pure filesystem scan,
+        # no DB/tenant dependency — lazy-imported like every other doc_store
+        # access point in this module (see _resolve_ingest_doc_store above).
+        from ..doc_store import find_orphaned_docx_staged_files as _find_orphans  # noqa: PLC0415
+        return {
+            "directory": args["directory"],
+            "staged_files": _find_orphans(
+                args["directory"],
+                max_age_seconds=float(args.get("max_age_seconds", 3600.0)),
+            ),
+        }
     return _MISS
 
 

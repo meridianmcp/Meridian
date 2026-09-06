@@ -12571,6 +12571,11 @@ from .locks import (  # noqa: F401
     get_docx_region_claims,
     release_docx_region_claims,
     check_docx_region_write_conflict,
+    # 6507e83a — whole-document cross-process lease functions
+    DOCX_WHOLE_DOCUMENT_ELEMENT,
+    acquire_docx_document_lease,
+    get_docx_document_lease,
+    release_docx_document_lease,
     # Session file claims view
     get_session_file_claims,
     # 356d6ac8 — structural-degradation signal

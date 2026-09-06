@@ -1994,6 +1994,41 @@ def scan_stale_notes(docx_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def find_orphaned_docx_staged_files(
+    directory: str, max_age_seconds: float = 3600.0,
+) -> list[dict[str, Any]]:
+    """6507e83a (C84-W3, category 8 follow-up) — Detect staged-DOCX temp files
+    left behind by a process that crashed between STAGE and PROMOTE inside a
+    write transaction (see docs_intel._atomic_write_docx_bytes).
+
+    A crash mid-write leaves an orphaned ``.meridian-docx-stage-*.tmp`` file
+    in the destination document's own directory forever — nothing scanned for
+    or cleaned these up before this tool existed (the detection function
+    itself, ``docs_intel.find_orphaned_docx_staged_files``, predates this
+    wiring but had zero real callers — this is the first one). Run this
+    against a document's directory after a suspected crash, or periodically
+    as a maintenance check, to surface what a crashed process left behind.
+
+    Args:
+      directory: Directory to scan (typically the .docx's own parent — the
+        same directory _atomic_write_docx_bytes always stages into).
+      max_age_seconds: A staged file younger than this is far more likely an
+        ACTIVE, in-flight promotion (a legitimate concurrent write) than a
+        crash artifact — it is still reported but with likely_orphan=False.
+        Default 3600 (1 hour).
+
+    Returns a list of {path, size_bytes, age_seconds, likely_orphan} dicts,
+    oldest (most suspicious) first. Never raises — an unreadable/missing
+    directory returns an empty list. Purely a DETECTION utility: it never
+    deletes or otherwise touches anything it finds; removal is a deliberate,
+    separate, caller-driven decision.
+    """
+    return docs_intel.find_orphaned_docx_staged_files(
+        directory, max_age_seconds=max_age_seconds
+    )
+
+
+@mcp.tool()
 def renumber_sequences(
     docx_path: str,
     index_db_path: str | None = None,

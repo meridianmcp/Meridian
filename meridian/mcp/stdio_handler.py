@@ -2298,6 +2298,20 @@ def build_mcp_server():
                     arguments["session_id"],
                 )
                 result = {"released": released, "file_path": arguments["file_path"]}
+            elif name == "find_orphaned_docx_staged_files":
+                # 6507e83a — maintenance diagnostic: staged-DOCX temp files
+                # left behind by a crash between STAGE and PROMOTE inside
+                # meridian.doc_store's own write transaction.
+                from ..doc_store import (  # noqa: PLC0415
+                    find_orphaned_docx_staged_files as _find_orphans,
+                )
+                result = {
+                    "directory": arguments["directory"],
+                    "staged_files": _find_orphans(
+                        arguments["directory"],
+                        max_age_seconds=float(arguments.get("max_age_seconds", 3600.0)),
+                    ),
+                }
             elif name == "claim_docx_region":
                 # f7ee1ba7 — Model B scoped docx-region claim.
                 result = await db_module.claim_docx_region(
@@ -2326,6 +2340,29 @@ def build_mcp_server():
                     "session_id": arguments["session_id"],
                     "file_path": arguments.get("file_path"),
                     "element_id": arguments.get("element_id"),
+                }
+            elif name == "acquire_docx_document_lease":
+                # 6507e83a — whole-document cross-process lease.
+                result = await db_module.acquire_docx_document_lease(
+                    db, arguments["session_id"], arguments["file_path"],
+                )
+            elif name == "get_docx_document_lease":
+                # 6507e83a — read-only: the live whole-document lease, if any.
+                result = {
+                    "file_path": arguments["file_path"],
+                    "lease": await db_module.get_docx_document_lease(
+                        db, arguments["file_path"]
+                    ),
+                }
+            elif name == "release_docx_document_lease":
+                # 6507e83a — release a session's whole-document lease.
+                released = await db_module.release_docx_document_lease(
+                    db, arguments["session_id"], arguments["file_path"],
+                )
+                result = {
+                    "released": released,
+                    "session_id": arguments["session_id"],
+                    "file_path": arguments["file_path"],
                 }
             elif name == "idle_until_session_done":
                 _idle_kwargs = {}

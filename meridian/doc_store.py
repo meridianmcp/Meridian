@@ -86,6 +86,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 import hashlib
 import logging
@@ -1638,6 +1639,78 @@ def _check_artifact_provenance(artifact_provenance: "dict[str, Any] | None") -> 
                 "rejected_bindings": rejected,
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# 6507e83a (C84-W3, category 8 residual) -- orphaned staged-file detection,
+# mirroring extensions/meridian-docs/meridian_docs/docs_intel.py's
+# find_orphaned_docx_staged_files (MDE-3) for THIS module's own write path.
+#
+# _write_docx_transaction above (like docs_intel.py's _atomic_write_docx_bytes)
+# stages to ``tempfile.mkstemp(prefix=".meridian-docx-stage-", suffix=".tmp",
+# dir=parent)`` before ever touching ``dest`` -- a crash between that STAGE
+# step and the PROMOTE swap leaves an orphaned staged file in the destination
+# document's own directory forever. docs_intel.py already has a detection
+# function for its own (textually identical) naming convention; doc_store.py
+# had none of its own -- a crash during a doc_store.py-driven write was
+# invisible to every existing tool. Deliberately NOT a shared import: this
+# mirrors the SAME no-cross-import duplication pattern dccc2311 already
+# established for _docx_promotion_lock between these two modules (each half
+# of this dual-writer architecture owns its own copy of shared conventions
+# rather than depending on the other at import time).
+# ---------------------------------------------------------------------------
+
+#: Must match _write_docx_transaction's own tempfile.mkstemp prefix/suffix
+#: exactly (see its STAGE step below).
+_DOCX_STAGE_PREFIX = ".meridian-docx-stage-"
+_DOCX_STAGE_SUFFIX = ".tmp"
+
+
+def find_orphaned_docx_staged_files(
+    directory: str, *, max_age_seconds: float = 3600.0,
+) -> list[dict[str, Any]]:
+    """Detect staged-DOCX temp files left behind by a process that crashed
+    between STAGE and PROMOTE inside :func:`_write_docx_transaction`.
+
+    Returns one ``{"path", "size_bytes", "age_seconds", "likely_orphan"}``
+    dict per file in *directory* matching the staging naming convention,
+    sorted OLDEST (largest age) first, so the most suspicious candidates
+    surface first. ``likely_orphan`` is ``True`` only once the file's age
+    exceeds *max_age_seconds* (default 1 hour) -- a staged file only seconds
+    old is far more likely an ACTIVE, in-flight promotion than a crash
+    artifact, and is reported but not flagged.
+
+    Never raises: an unreadable/missing *directory*, or a file that
+    disappears between the listing and the stat call (a real race -- e.g.
+    the in-flight writer's own ``finally: os.unlink(staged_path)`` cleanup
+    winning the race), is simply skipped rather than surfaced as an error.
+    Purely a DETECTION utility -- it never deletes or otherwise touches
+    anything it finds; removal is a deliberate, separate, caller-driven
+    decision (mirrors docs_intel.find_orphaned_docx_staged_files exactly).
+    """
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return []
+    now = time.time()
+    results: list[dict[str, Any]] = []
+    for name in entries:
+        if not (name.startswith(_DOCX_STAGE_PREFIX) and name.endswith(_DOCX_STAGE_SUFFIX)):
+            continue
+        full_path = os.path.join(directory, name)
+        try:
+            st = os.stat(full_path)
+        except OSError:
+            continue
+        age = max(0.0, now - st.st_mtime)
+        results.append({
+            "path": full_path,
+            "size_bytes": st.st_size,
+            "age_seconds": age,
+            "likely_orphan": age > max_age_seconds,
+        })
+    results.sort(key=lambda r: r["age_seconds"], reverse=True)
+    return results
 
 
 def _write_docx_transaction(

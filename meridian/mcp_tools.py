@@ -3345,6 +3345,51 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "file_path": {"type": "string", "description": "Optional: scope release to one file."},
          "element_id": {"type": "string", "description": "Optional: scope release to one element (requires file_path)."}},
          "required": ["session_id"]}},
+    {"name": "acquire_docx_document_lease", "description":
+        "6507e83a — Whole-document cross-process lease for .docx files, the "
+        "counterpart claim_docx_region never provided (that tool hard-requires a "
+        "specific element_id). Use this when a session needs to rewrite an ENTIRE "
+        "document (a bulk restructure, a canonical-merge promotion) and must block "
+        "out every other writer, not just one element. Blocked by another live "
+        "session's whole-file lock (claim_file) OR ANY other live session's claim "
+        "on the file (lease or scoped element) — a whole-document lease requires the "
+        "document be free of every other session's claims first. Once held, blocks "
+        "every other session's writes (via check_docx_region_write_conflict, the "
+        "same gate update_paragraph and the meridian-docs tunnel relay already "
+        "enforce) and new claim_docx_region attempts on this file until released or "
+        "expired (same TTL as every other claim in this module). Returns "
+        "{leased: true, file_path, session_id} on success or {leased: false, "
+        "reason, message, ...} on conflict — never raises.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string", "description": "The calling session."},
+         "file_path": {"type": "string", "description": "The .docx source path."}},
+         "required": ["session_id", "file_path"]}},
+    {"name": "get_docx_document_lease", "description":
+        "6507e83a — Read-only: the live whole-document lease on a .docx file, if "
+        "any (who holds it). Use before acquire_docx_document_lease or a bulk "
+        "rewrite to see whether the document is already leased by someone else.",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string", "description": "The .docx source path."}},
+         "required": ["file_path"]}},
+    {"name": "release_docx_document_lease", "description":
+        "6507e83a — Release a session's whole-document lease on a .docx file, if "
+        "held. Returns {released: <0 or 1>, session_id, file_path}.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string", "description": "The session releasing its lease."},
+         "file_path": {"type": "string", "description": "The .docx source path."}},
+         "required": ["session_id", "file_path"]}},
+    {"name": "find_orphaned_docx_staged_files", "description":
+        "6507e83a — Maintenance diagnostic: detect staged-DOCX temp files "
+        "(.meridian-docx-stage-*.tmp) left behind by a process that crashed "
+        "between STAGE and PROMOTE inside meridian.doc_store's write transaction. "
+        "Purely a detection utility — never deletes or touches anything it finds. "
+        "Returns a list of {path, size_bytes, age_seconds, likely_orphan}, oldest "
+        "first. A file younger than max_age_seconds is reported but not flagged "
+        "likely_orphan (it may be an active, in-flight promotion).",
+     "inputSchema": {"type": "object", "properties": {
+         "directory": {"type": "string", "description": "Directory to scan (typically a .docx's own parent directory)."},
+         "max_age_seconds": {"type": "number", "description": "Age threshold in seconds for likely_orphan=true. Default 3600 (1 hour)."}},
+         "required": ["directory"]}},
     {"name": "list_plugins", "description":
         "Read-only: Lightweight index of active tunnel plugins — name, description, "
         "enabled state, and tool_count. Does NOT return full tool schemas (use "
@@ -3845,6 +3890,10 @@ _TOOL_CATEGORY: dict[str, str] = {
     "claim_docx_region":        "file-locking",
     "get_docx_region_claims":   "file-locking",
     "release_docx_region_claims": "file-locking",
+    "acquire_docx_document_lease": "file-locking",
+    "get_docx_document_lease":     "file-locking",
+    "release_docx_document_lease": "file-locking",
+    "find_orphaned_docx_staged_files": "file-locking",
     "list_active_worktrees":       "file-locking",
     "list_worktrees_pending_cleanup": "file-locking",
     # parallel coordination
@@ -3916,6 +3965,10 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "claim_docx_region":         "executor",
     "get_docx_region_claims":    "executor",
     "release_docx_region_claims": "executor",
+    "acquire_docx_document_lease": "executor",
+    "get_docx_document_lease":     "executor",
+    "release_docx_document_lease": "executor",
+    "find_orphaned_docx_staged_files": "executor",
     # dffcde86 — "both": unlike get_file_claims/get_symbol_claims (executor-only
     # above), a planner session legitimately wants to see what worktrees are
     # checked out / pending cleanup too (e.g. before fanning out a wave), not
@@ -4299,6 +4352,10 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "claim_docx_region":          "maintenance-only",
     "get_docx_region_claims":     "maintenance-only",
     "release_docx_region_claims": "maintenance-only",
+    "acquire_docx_document_lease": "maintenance-only",
+    "get_docx_document_lease":     "maintenance-only",
+    "release_docx_document_lease": "maintenance-only",
+    "find_orphaned_docx_staged_files": "maintenance-only",
     "get_citation_edges":         "maintenance-only",
     "resolve_citations":          "maintenance-only",
     "link_flag_to_section":       "maintenance-only",

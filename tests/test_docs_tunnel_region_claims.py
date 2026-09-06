@@ -239,6 +239,84 @@ async def test_read_only_docs_tool_never_gated(db):
 
 
 # ---------------------------------------------------------------------------
+# 6507e83a — whole-document lease enforcement over the tunnel relay.
+#
+# check_docs_write_conflict delegates STRAIGHT to
+# meridian.db.locks.check_docx_region_write_conflict (see its docstring
+# above) -- so extending that ONE function in locks.py with a whole-document
+# lease check automatically protects EVERY tool in tunnel.py's
+# _DOCS_WRITE_TOOLS map (insert_image, insert_figure_block, move_section,
+# relocate_table, ... 27 mutating tools), with ZERO changes to this file.
+# These tests prove that inherited protection actually holds for the tunnel
+# relay path specifically, not just for the underlying locks.py unit tests.
+# ---------------------------------------------------------------------------
+
+async def test_whole_document_lease_blocks_every_docs_write_tool_over_the_tunnel(db):
+    """A whole-document lease (acquire_docx_document_lease) blocks a
+    DIFFERENT session's write through the tunnel relay for several
+    different _DOCS_WRITE_TOOLS entries -- not just one -- with no changes
+    to check_docs_write_conflict or call_tunnel_tool themselves."""
+    leaser = await _mk_session(db, "docs-lease-tunnel-owner")
+    other = await _mk_session(db, "docs-lease-tunnel-other")
+    doc = "leased-over-tunnel.docx"
+
+    lease = await db_module.acquire_docx_document_lease(db, leaser, doc)
+    assert lease["leased"] is True
+
+    for tool_name, arguments in (
+        ("insert_equation", {"docx_path": doc, "anchor_para_id": "ANY", "payload": "x"}),
+        ("relocate_table", {"docx_path": doc, "table_index": 0}),
+        ("highlight_document", {"docx_path": doc, "target_text": "x"}),
+        ("move_section", {"docx_path": doc, "section_id": "SEC1"}),
+    ):
+        verdict = await tun.check_docs_write_conflict(
+            db, "tenant-1", tool_name, arguments, session_id=other,
+        )
+        assert verdict is not None, f"{tool_name} was not blocked by the whole-document lease"
+        assert verdict["blocked"] is True
+        assert verdict["reason"] == "document_leased"
+        assert verdict["holder"] == leaser
+
+
+async def test_whole_document_lease_holders_own_tunnel_writes_are_not_blocked(db):
+    """The lease holder's OWN writes through the tunnel relay proceed
+    unblocked -- a lease must never lock its own holder out."""
+    leaser = await _mk_session(db, "docs-lease-tunnel-self")
+    doc = "self-leased-over-tunnel.docx"
+    await db_module.acquire_docx_document_lease(db, leaser, doc)
+
+    verdict = await tun.check_docs_write_conflict(
+        db, "tenant-1", "insert_equation",
+        {"docx_path": doc, "anchor_para_id": "ANY", "payload": "x"},
+        session_id=leaser,
+    )
+    assert verdict is None
+
+
+async def test_whole_document_lease_release_unblocks_tunnel_writes(db):
+    leaser = await _mk_session(db, "docs-lease-tunnel-release")
+    other = await _mk_session(db, "docs-lease-tunnel-release-other")
+    doc = "released-over-tunnel.docx"
+    await db_module.acquire_docx_document_lease(db, leaser, doc)
+
+    blocked = await tun.check_docs_write_conflict(
+        db, "tenant-1", "insert_caption",
+        {"docx_path": doc, "anchor_para_id": "A", "kind": "Figure", "label_text": "l"},
+        session_id=other,
+    )
+    assert blocked is not None and blocked["blocked"] is True
+
+    await db_module.release_docx_document_lease(db, leaser, doc)
+
+    clear = await tun.check_docs_write_conflict(
+        db, "tenant-1", "insert_caption",
+        {"docx_path": doc, "anchor_para_id": "A", "kind": "Figure", "label_text": "l"},
+        session_id=other,
+    )
+    assert clear is None
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: call_tunnel_tool raises on a conflicting docs write, and only for
 # the docs slot / mutating tools — and the underlying file is provably untouched.
 # ---------------------------------------------------------------------------
