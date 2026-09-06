@@ -2272,6 +2272,84 @@ def _resolve_max_workers(explicit: int | None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# fa600e42 follow-up (architecture review) -- walk-restart cooldown
+# ---------------------------------------------------------------------------
+# Confirmed live against a real 385,064-file/257GB corpus: once walk_complete
+# fires, self._walk_state resets to None with no "did anything actually
+# change since the last full pass" check -- the very next call whose backlog
+# happens to dip back under the adaptive analysis_limit threshold starts an
+# ENTIRE fresh full-tree re-enumeration, even though nothing on disk changed.
+# That corpus paid this 3 separate times in a row at the tail of one cold
+# index (calls 13/14/15), ~35-59s each, ~8% of the run's total wall-clock
+# time, purely re-verifying an unchanged tree.
+#
+# DEFAULT IS 0 (DISABLED) -- OPT-IN ONLY. A blanket wall-clock cooldown
+# cannot distinguish "genuinely nothing changed" from "a caller just
+# modified a file and expects the very next rebuild() call to notice" --
+# confirmed the hard way: a first attempt at a >0 default (60s) broke 14
+# existing tests, all of the shape "write file, rebuild(), modify file,
+# rebuild() again, assert the change was detected" -- an extremely common
+# and previously-guaranteed usage pattern this module's whole staleness
+# contract depends on. A real research-output tree can legitimately be
+# rewritten by a rerun within seconds of the last index, so silently
+# delaying re-discovery by any default nonzero window is a correctness
+# regression for that caller, not just a test artifact. This must stay
+# opt-in (a caller that KNOWS it's doing many rapid rebuild() calls with no
+# real on-disk changes expected in between -- e.g. a long qualification/
+# benchmark harness cycling through a huge tree -- sets this explicitly),
+# never a default that changes behaviour for every other caller. When
+# enabled, it only DELAYS the start of the next pass, never blocks eventual
+# re-discovery of genuinely new/changed files once the cooldown elapses --
+# unlike a directory-mtime-based skip (rejected: doesn't detect an existing
+# file overwritten in place, a routine research-pipeline rerun pattern,
+# since staleness here is only ever checked for paths the walk actually
+# revisits).
+_WALK_COOLDOWN_SECONDS_DEFAULT = 0.0
+_WALK_COOLDOWN_ENV_VAR = "MERIDIAN_OUTPUTS_WALK_COOLDOWN_SECONDS"
+
+
+def _default_walk_cooldown_seconds() -> float:
+    """Resolve the default walk-restart cooldown from the environment.
+
+    Checked fresh on every call (a cheap env lookup), mirroring
+    _default_max_workers's rationale. Invalid overrides are logged rather
+    than silently ignored.
+    """
+    raw = os.environ.get(_WALK_COOLDOWN_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _WALK_COOLDOWN_SECONDS_DEFAULT
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        _log.warning(
+            "%s=%r is not a valid float -- falling back to default (%s)",
+            _WALK_COOLDOWN_ENV_VAR, raw, _WALK_COOLDOWN_SECONDS_DEFAULT,
+        )
+        return _WALK_COOLDOWN_SECONDS_DEFAULT
+    if value < 0:
+        _log.warning(
+            "%s=%r must be >= 0 -- falling back to default (%s)",
+            _WALK_COOLDOWN_ENV_VAR, raw, _WALK_COOLDOWN_SECONDS_DEFAULT,
+        )
+        return _WALK_COOLDOWN_SECONDS_DEFAULT
+    return value
+
+
+def _resolve_walk_cooldown_seconds(explicit: float | None) -> float:
+    """Precedence: explicit constructor arg > env var > 60s default."""
+    if explicit is not None:
+        if explicit >= 0:
+            return explicit
+        _log.warning(
+            "OutputsFtsIndex: walk_cooldown_seconds=%r must be >= 0 -- "
+            "falling back to default (%s)",
+            explicit, _WALK_COOLDOWN_SECONDS_DEFAULT,
+        )
+        return _WALK_COOLDOWN_SECONDS_DEFAULT
+    return _default_walk_cooldown_seconds()
+
+
+# ---------------------------------------------------------------------------
 # c73c0dd7 -- configurable Tantivy writer heap_size
 # ---------------------------------------------------------------------------
 # Measured live against a real 16k-file batch: Tantivy's own default
@@ -2561,6 +2639,7 @@ class OutputsFtsIndex:
         duckdb_memory_limit_bytes: int | None = None,
         max_batch: int | None = None,
         write_chunk: int | None = None,
+        walk_cooldown_seconds: float | None = None,
         session_id: str | None = None,
         initial_scan_boundary: str | None = None,
         initial_row_cache: dict[str, "OutputRow"] | None = None,
@@ -2611,6 +2690,14 @@ class OutputsFtsIndex:
         self._max_batch_overridden = (
             max_batch is not None
             or bool(os.environ.get(_ResumableFileWalk._MAX_BATCH_ENV_VAR, "").strip())
+        )
+        # fa600e42 follow-up (architecture review) -- minimum interval
+        # between full walk passes: explicit param > MERIDIAN_OUTPUTS_WALK_
+        # COOLDOWN_SECONDS env var > 60s default. See
+        # _WALK_COOLDOWN_SECONDS_DEFAULT's module comment for the confirmed
+        # redundant-re-walk incident this closes.
+        self._walk_cooldown_seconds = _resolve_walk_cooldown_seconds(
+            walk_cooldown_seconds,
         )
         self._adaptive_batch = self._initial_adaptive_batch()
         # 1bce8c41 -- DB write-chunk size: explicit param > MERIDIAN_OUTPUTS_
@@ -2690,6 +2777,14 @@ class OutputsFtsIndex:
         # that sets this per-pass, and the walk_complete branch below that
         # consults it.
         self._walk_pass_resumed_from_boundary: bool = False
+        # fa600e42 follow-up (architecture review) -- wall-clock (time.time(),
+        # NOT time.monotonic() -- this must remain comparable across a
+        # process restart) timestamp of the last time a full walk pass was
+        # CONFIRMED complete. None until the first pass in this instance's
+        # lifetime (or a prior process's, once rehydrated) finishes. Gates
+        # the walk-restart cooldown in rebuild()'s Phase 0 -- see
+        # _WALK_COOLDOWN_SECONDS_DEFAULT's module comment.
+        self._walk_last_full_pass_completed_at: float | None = None
         # fa600e42 follow-up (write_seconds diagnostics) -- set True the
         # first time Phase 2's bulk-insert pyarrow import fails at runtime
         # this process, so the one-time WARNING log (see that call site)
@@ -4310,8 +4405,33 @@ class OutputsFtsIndex:
         #                       intake" further down).
         walk_batch = self._max_batch
         analysis_limit = self._adaptive_batch_limit()
+        # fa600e42 follow-up (architecture review) -- default False so the
+        # walk-complete reconciliation block below (which must NOT run its
+        # "full pass just finished" removed-path detection off an empty
+        # self._walk_accumulated during a cooldown-skipped call) has a
+        # defined value even when os.path.isdir() is False below.
+        in_walk_cooldown = False
         if os.path.isdir(self.outputs_dir):
-            if self._walk_state is None:
+            # fa600e42 follow-up (architecture review) -- see
+            # _WALK_COOLDOWN_SECONDS_DEFAULT's module comment: a confirmed
+            # live incident (385,064-file/257GB corpus) showed 3 separate
+            # redundant full-tree re-enumerations back to back, ~35-59s
+            # each, purely because walk_complete resetting self._walk_state
+            # to None had no "did anything actually change / how long since
+            # the last pass" gate. Skipping the start of a new pass here
+            # only DELAYS it -- walk_complete is still reported True below
+            # (the tree IS fully converged as of the last completed pass),
+            # and eventual re-discovery of genuinely new/changed files is
+            # never blocked, only deferred past this cooldown window.
+            in_walk_cooldown = (
+                self._walk_state is None
+                and self._walk_last_full_pass_completed_at is not None
+                and (
+                    time.time() - self._walk_last_full_pass_completed_at
+                    < self._walk_cooldown_seconds
+                )
+            )
+            if self._walk_state is None and not in_walk_cooldown:
                 # A brand-new pass is starting (either the very first one,
                 # or the one after a prior pass completed) -- bump the
                 # durable epoch counter (see _persist_walk_state_locked)
@@ -4385,13 +4505,15 @@ class OutputsFtsIndex:
                 # the first instance's already-durably-indexed rows the
                 # moment its own (now much shorter) remaining walk exhausted.
                 self._walk_pass_resumed_from_boundary = self._scan_boundary is not None
-            else:
+            elif self._walk_state is not None:
                 # The walk persists across calls; discovery capacity is
                 # static (own knob), so this only re-applies it in case a
                 # constructor/env override changed between instances -- it
                 # is NOT re-derived from adaptive analysis pressure.
                 self._walk_state.max_batch = walk_batch
-            if len(self._pending_stale) < analysis_limit:
+            # in_walk_cooldown with self._walk_state is None falls through
+            # here (neither branch above ran): no new pass, no drain.
+            if self._walk_state is not None and len(self._pending_stale) < analysis_limit:
                 newly_seen = self._walk_state.drain(phase1_deadline)
                 self._walk_accumulated.extend(newly_seen)
                 if newly_seen:
@@ -4399,7 +4521,12 @@ class OutputsFtsIndex:
                     # the walk has gotten this pass, in its own deterministic
                     # sorted-DFS order (see _subtree_scanned_past).
                     self._scan_boundary = newly_seen[-1]
-            walk_complete = self._walk_state.exhausted
+            if in_walk_cooldown:
+                walk_complete = True
+            else:
+                walk_complete = self._walk_state.exhausted
+                if walk_complete:
+                    self._walk_last_full_pass_completed_at = time.time()
         else:
             self._walk_state = None
             self._walk_accumulated = []
@@ -4414,7 +4541,17 @@ class OutputsFtsIndex:
         # it before ever calling rebuild() itself.
         self._walk_pass_confirmed_complete = walk_complete
 
-        if walk_complete:
+        # fa600e42 follow-up (architecture review) -- a cooldown-skipped
+        # call reports walk_complete=True (the tree IS still converged, as
+        # of the last real pass) but self._walk_accumulated is empty this
+        # call (no walk actually ran) -- NOT "the walk just confirmed the
+        # whole tree is exactly this". Running the removed-path
+        # reconciliation below off that empty list would treat every
+        # already-indexed path as removed and delete the entire index.
+        # Route the cooldown-skip case through the SAME optimistic
+        # "assume still present, defer removal detection" branch a
+        # still-in-progress walk already uses instead.
+        if walk_complete and not in_walk_cooldown:
             # A full pass just finished (or outputs_dir doesn't exist) -- this
             # is now the authoritative on-disk picture, so removed-file
             # detection is safe. Reset resumable state so the NEXT rebuild()
@@ -4457,13 +4594,14 @@ class OutputsFtsIndex:
             self._expected_count = len(all_paths)
             self._scan_boundary = None
         else:
-            # Walk pass still in progress -- we only know about the files
-            # revisited so far THIS pass, not the full tree. Optimistically
-            # keep every previously-indexed path in the picture (assume still
-            # present until the walk actually gets around to confirming
-            # otherwise) so the reported row count and search index never
-            # regress mid-pass. Removed-file detection is deferred until the
-            # pass completes.
+            # Walk pass still in progress, OR (fa600e42 follow-up) this
+            # call was a cooldown-skip -- either way we only know about the
+            # files revisited so far (possibly none, this call), not a
+            # freshly-reconfirmed full tree. Optimistically keep every
+            # previously-indexed path in the picture (assume still present
+            # until the walk actually gets around to confirming otherwise)
+            # so the reported row count and search index never regress.
+            # Removed-file detection is deferred until a real pass completes.
             # During an incomplete pass, preserve the cache's insertion order
             # and append only newly discovered paths. Sorting and rebuilding a
             # second set here is O(n log n) work on every continuation call,

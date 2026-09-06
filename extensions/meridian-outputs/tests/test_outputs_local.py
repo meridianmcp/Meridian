@@ -4727,6 +4727,115 @@ class TestRebuildWalkDeadlineAwareness:
 
 
 # ---------------------------------------------------------------------------
+# Walk-restart cooldown (architecture review follow-up, fa600e42)
+# ---------------------------------------------------------------------------
+
+class TestWalkRestartCooldown:
+    """Confirmed live on a real 385,064-file corpus: once walk_complete
+    fires, self._walk_state resets to None with no "did anything change /
+    how long since the last pass" check -- the next call whose backlog dips
+    back under analysis_limit re-walks the ENTIRE tree from scratch, 3 times
+    in a row at the tail of one run (~35-59s each, ~8% of total wall-clock).
+    The fix (an opt-in cooldown) must (a) default to disabled so it never
+    changes the existing "rebuild() again immediately notices a change"
+    contract every other caller/test relies on, (b) actually skip a
+    redundant pass when explicitly enabled, (c) still eventually discover
+    new files once the cooldown window elapses, and (d) never mark existing
+    rows as falsely removed while skipped (the near-miss this fix's own
+    first draft caught: an empty self._walk_accumulated during a
+    cooldown-skip must NOT feed the "full pass just finished, anything not
+    in this list was removed" reconciliation path)."""
+
+    @duckdb_required
+    def test_cooldown_disabled_by_default_detects_new_file_immediately(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._walk_cooldown_seconds == 0.0
+            count1 = idx.rebuild()
+            assert count1 == 1
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            count2 = idx.rebuild()
+            assert count2 == 2, (
+                "a new file must be discovered on the very next rebuild() "
+                "call by default -- the cooldown must never engage unless "
+                "explicitly opted into"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_opt_in_cooldown_skips_redundant_full_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=3600.0)
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 0, (
+                "a call within the cooldown window must not re-walk the "
+                "tree at all"
+            )
+            # walk_complete must still read True during a cooldown-skip --
+            # the tree IS still converged as of the last real pass.
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_cooldown_skip_never_falsely_marks_existing_rows_removed(
+        self, tmp_path: Path,
+    ) -> None:
+        """The critical correctness guard: a cooldown-skipped call's empty
+        self._walk_accumulated must never be treated as "the walk just
+        confirmed the whole tree is exactly this" -- that would delete
+        every previously-indexed row on the very next call after a real
+        pass completed."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=3600.0)
+        try:
+            count1 = idx.rebuild()
+            assert count1 == 2
+            count2 = idx.rebuild()
+            assert count2 == 2, (
+                "existing rows must survive a cooldown-skipped call "
+                f"unchanged, got count={count2}"
+            )
+            hits = idx.search("col")
+            assert len(hits) == 2, (
+                "a cooldown-skipped call must not have deleted any "
+                "previously-indexed row from the DB/FTS index"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_opt_in_cooldown_still_discovers_after_window_elapses(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=0.05)
+        try:
+            idx.rebuild()
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            time.sleep(0.1)
+            count2 = idx.rebuild()
+            assert count2 == 2, (
+                "a new file must still be discovered once the cooldown "
+                "window has elapsed -- the cooldown only delays, never "
+                "blocks, re-discovery"
+            )
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
 # Archival-classification hash persistence (sprint item 7a6a278f)
 # ---------------------------------------------------------------------------
 
