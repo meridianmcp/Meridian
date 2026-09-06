@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 from typing import Any
 
 from .structural_parser import StructuralParser
@@ -260,6 +261,203 @@ def _expand_source(source: str, base_dir: str | None) -> tuple[str, list[str]]:
     return source, unexpanded
 
 
+def _expand_source_with_provenance(
+    source: str,
+    base_dir: str,
+    source_file: str,
+    *,
+    _seen: set[str] | None = None,
+    _depth: int = 0,
+    _unexpanded: list[str] | None = None,
+    _graph: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Expand inputs while retaining source-origin segments and file edges.
+
+    The ordinary expander above remains the compatibility path for citation
+    parsing.  This companion is used by structural analysis to make each
+    heading span traceable to the file that supplied it, without attempting to
+    be a TeX engine.  Every file edge is content-hashed and cycles are
+    fail-closed in the same way as ``_expand_inputs``.
+    """
+
+    seen = _seen if _seen is not None else set()
+    unexpanded = _unexpanded if _unexpanded is not None else []
+    graph = _graph if _graph is not None else []
+    if _depth > _MAX_INPUT_DEPTH:
+        return source, unexpanded, [{
+            "expanded_start": 0,
+            "expanded_end": len(source),
+            "source_file": source_file,
+            "source_start": 0,
+            "source_end": len(source),
+            "source_text": source,
+        }], graph
+
+    pieces: list[str] = []
+    segments: list[dict[str, Any]] = []
+    cursor = 0
+    expanded_length = 0
+
+    def append_literal(start: int, end: int) -> None:
+        nonlocal expanded_length
+        if end <= start:
+            return
+        text = source[start:end]
+        expanded_start = expanded_length
+        pieces.append(text)
+        expanded_length += len(text)
+        segments.append(
+            {
+                "expanded_start": expanded_start,
+                "expanded_end": expanded_start + len(text),
+                "source_file": source_file,
+                "source_start": start,
+                "source_end": end,
+                "source_text": source,
+            }
+        )
+
+    try:
+        for match in _INPUT_RE.finditer(source):
+            append_literal(cursor, match.start())
+            name = match.group(1).strip()
+            macro = match.group(0).lstrip("\\").split("{", 1)[0].strip()
+            if not name:
+                append_literal(match.start(), match.end())
+                cursor = match.end()
+                continue
+            candidate = name if name.lower().endswith(".tex") else name + ".tex"
+            path = candidate if os.path.isabs(candidate) else os.path.join(base_dir, candidate)
+            real = os.path.abspath(path)
+            if real in seen:
+                graph.append(
+                    {
+                        "from": source_file,
+                        "to": real,
+                        "kind": macro,
+                        "name": name,
+                        "status": "cycle",
+                    }
+                )
+                if name not in unexpanded:
+                    unexpanded.append(name)
+                append_literal(match.start(), match.end())
+                cursor = match.end()
+                continue
+            if _depth >= _MAX_INPUT_DEPTH:
+                graph.append(
+                    {
+                        "from": source_file,
+                        "to": real,
+                        "kind": macro,
+                        "name": name,
+                        "status": "depth_limited",
+                    }
+                )
+                if name not in unexpanded:
+                    unexpanded.append(name)
+                append_literal(match.start(), match.end())
+                cursor = match.end()
+                continue
+            try:
+                if os.path.isfile(real):
+                    with open(real, "rb") as handle:
+                        raw_inner = handle.read()
+                    inner = raw_inner.decode("utf-8", errors="replace")
+                    seen.add(real)
+                    graph.append(
+                        {
+                            "from": source_file,
+                            "to": real,
+                            "kind": macro,
+                            "name": name,
+                            "sha256": hashlib.sha256(raw_inner).hexdigest(),
+                            "status": "resolved",
+                        }
+                    )
+                    offset = expanded_length
+                    expanded_inner, _inner_unexpanded, inner_segments, _ = _expand_source_with_provenance(
+                        inner,
+                        os.path.dirname(real),
+                        real,
+                        _seen=seen,
+                        _depth=_depth + 1,
+                        _unexpanded=unexpanded,
+                        _graph=graph,
+                    )
+                    pieces.append(expanded_inner)
+                    expanded_length += len(expanded_inner)
+                    for segment in inner_segments:
+                        segment["expanded_start"] += offset
+                        segment["expanded_end"] += offset
+                        segments.append(segment)
+                    seen.discard(real)
+                    cursor = match.end()
+                    continue
+            except Exception:  # noqa: BLE001 — malformed include must not raise
+                pass
+            if name not in unexpanded:
+                unexpanded.append(name)
+            append_literal(match.start(), match.end())
+            cursor = match.end()
+        append_literal(cursor, len(source))
+        expanded_before_aliases = "".join(pieces)
+        # Preserve the existing alias behavior.  If an alias rewrites offsets,
+        # discard origin segments rather than attributing shifted positions to
+        # the wrong file; the span helper then reports logical expanded-source
+        # coordinates explicitly.
+        expanded = _expand_section_macros(expanded_before_aliases)
+        if expanded != expanded_before_aliases:
+            segments = []
+        return expanded, unexpanded, segments, graph
+    except Exception:  # noqa: BLE001 — structural analysis is best-effort
+        return source, unexpanded, [{
+            "expanded_start": 0,
+            "expanded_end": len(source),
+            "source_file": source_file,
+            "source_start": 0,
+            "source_end": len(source),
+            "source_text": source,
+        }], graph
+
+
+def _line_for_offset(source: str, offset: int) -> int:
+    return source.count("\n", 0, max(0, min(offset, len(source)))) + 1
+
+
+def _source_span(
+    node: Any,
+    expanded_source: str,
+    provenance: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Convert a latexwalker node position into a stable source span."""
+
+    start = getattr(node, "pos", None)
+    length = getattr(node, "len", None)
+    if not isinstance(start, int) or not isinstance(length, int) or length < 0:
+        return None
+    end = start + length
+    for segment in provenance or []:
+        if segment["expanded_start"] <= start and end <= segment["expanded_end"]:
+            source_start = segment["source_start"] + start - segment["expanded_start"]
+            source_end = segment["source_start"] + end - segment["expanded_start"]
+            source_text = segment.get("source_text", "")
+            return {
+                "source_file": segment["source_file"],
+                "start_offset": source_start,
+                "end_offset": source_end,
+                "start_line": _line_for_offset(source_text, source_start),
+                "end_line": _line_for_offset(source_text, max(source_start, source_end - 1)),
+            }
+    return {
+        "source_file": "<expanded>",
+        "start_offset": start,
+        "end_offset": end,
+        "start_line": _line_for_offset(expanded_source, start),
+        "end_line": _line_for_offset(expanded_source, max(start, end - 1)),
+    }
+
+
 def _node_text(node2text: Any, nodes: list[Any]) -> str:
     """Render a list of latexwalker nodes to plain text, best-effort."""
     try:
@@ -315,7 +513,15 @@ def _macro_title(node2text: Any, macro_node: Any, siblings: list[Any], idx: int)
     return ""
 
 
-def _iter_headings(latexwalker: Any, node2text: Any, nodes: list[Any], out: list[dict]) -> None:
+def _iter_headings(
+    latexwalker: Any,
+    node2text: Any,
+    nodes: list[Any],
+    out: list[dict],
+    *,
+    span_source: str | None = None,
+    provenance: list[dict[str, Any]] | None = None,
+) -> None:
     """Walk the node tree depth-first, appending an ordered flat heading list.
 
     Recurses into environments (and group bodies) so ``\\section`` commands nested
@@ -325,17 +531,27 @@ def _iter_headings(latexwalker: Any, node2text: Any, nodes: list[Any], out: list
     for i, node in enumerate(siblings):
         macroname = getattr(node, "macroname", None)
         if macroname in _SECTION_LEVELS:
-            out.append(
-                {
-                    "level": _SECTION_LEVELS[macroname],
-                    "kind": macroname,
-                    "text": _macro_title(node2text, node, siblings, i),
-                }
-            )
+            heading = {
+                "level": _SECTION_LEVELS[macroname],
+                "kind": macroname,
+                "text": _macro_title(node2text, node, siblings, i),
+            }
+            if span_source is not None:
+                span = _source_span(node, span_source, provenance)
+                if span is not None:
+                    heading["source_span"] = span
+            out.append(heading)
         # Recurse into containers so deeply-nested sectioning is not missed.
         child_nodes = getattr(node, "nodelist", None)
         if child_nodes:
-            _iter_headings(latexwalker, node2text, child_nodes, out)
+            _iter_headings(
+                latexwalker,
+                node2text,
+                child_nodes,
+                out,
+                span_source=span_source,
+                provenance=provenance,
+            )
         nodeargd = getattr(node, "nodeargd", None)
         if nodeargd is not None:
             for arg in getattr(nodeargd, "argnlist", None) or []:
@@ -344,7 +560,14 @@ def _iter_headings(latexwalker: Any, node2text: Any, nodes: list[Any], out: list
                 arg_nodes = getattr(arg, "nodelist", None)
                 if arg_nodes and macroname not in _SECTION_LEVELS:
                     # Don't re-descend a section's own title group (already read).
-                    _iter_headings(latexwalker, node2text, arg_nodes, out)
+                    _iter_headings(
+                        latexwalker,
+                        node2text,
+                        arg_nodes,
+                        out,
+                        span_source=span_source,
+                        provenance=provenance,
+                    )
 
 
 def _citation_keys(macro_node: Any) -> list[str]:
@@ -476,7 +699,12 @@ def _build_tree(headings: list[dict]) -> list[dict]:
     return StructuralParser.build_tree(headings)
 
 
-def parse_latex_structure(source: str, base_dir: str | None = None) -> dict[str, Any]:
+def parse_latex_structure(
+    source: str,
+    base_dir: str | None = None,
+    *,
+    source_file: str | None = None,
+) -> dict[str, Any]:
     """Parse a LaTeX ``source`` string into a document structure tree.
 
     Returns ``{heading_count, headings, tree, unexpanded_inputs}`` where:
@@ -503,7 +731,37 @@ def parse_latex_structure(source: str, base_dir: str | None = None) -> dict[str,
         return dict(empty)
     # da9815ef + fae29498 — splice \input/\include and rewrite section-alias
     # macros BEFORE the heading walk so the tree reflects the whole document.
-    source, unexpanded = _expand_source(source, base_dir)
+    resolved_input_graph: list[dict[str, Any]] = []
+    if base_dir:
+        root_file = "<root>"
+        seen: set[str] = set()
+        if source_file:
+            try:
+                root_file = os.path.abspath(os.fspath(source_file))
+                if os.path.isfile(root_file):
+                    seen.add(root_file)
+            except (TypeError, ValueError, OSError):
+                root_file = "<root>"
+        source, unexpanded, provenance, resolved_input_graph = _expand_source_with_provenance(
+            source,
+            base_dir,
+            root_file,
+            _seen=seen,
+        )
+    else:
+        raw_source = source
+        source, unexpanded = _expand_source(source, base_dir)
+        provenance_source = source if source != raw_source else raw_source
+        provenance = [
+            {
+                "expanded_start": 0,
+                "expanded_end": len(source),
+                "source_file": (source_file or "<raw>") if source == raw_source else "<expanded>",
+                "source_start": 0,
+                "source_end": len(source),
+                "source_text": provenance_source,
+            }
+        ]
     latexwalker, node2text = _lazy_latexwalker()
     if latexwalker is None:
         return dict(empty)
@@ -515,16 +773,26 @@ def parse_latex_structure(source: str, base_dir: str | None = None) -> dict[str,
 
     headings: list[dict] = []
     try:
-        _iter_headings(latexwalker, node2text, nodelist, headings)
+        _iter_headings(
+            latexwalker,
+            node2text,
+            nodelist,
+            headings,
+            span_source=source,
+            provenance=provenance,
+        )
     except Exception:  # noqa: BLE001 — partial outline beats a crash
         pass
 
-    return {
+    result = {
         "heading_count": len(headings),
         "headings": headings,
         "tree": _build_tree(headings),
         "unexpanded_inputs": unexpanded,
     }
+    if base_dir:
+        result["resolved_input_graph"] = resolved_input_graph
+    return result
 
 
 # --- Bibliography -----------------------------------------------------------
@@ -726,7 +994,13 @@ def analyze_latex(path_or_source: str) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         source, base_dir = (path_or_source if isinstance(path_or_source, str) else ""), None
 
-    structure = parse_latex_structure(source, base_dir=base_dir)
+    source_file = None
+    try:
+        if base_dir and os.path.isfile(path_or_source):
+            source_file = os.path.abspath(path_or_source)
+    except (TypeError, ValueError):
+        source_file = None
+    structure = parse_latex_structure(source, base_dir=base_dir, source_file=source_file)
     bibliography = get_bibliography(source, base_dir=base_dir)
     # In-text citation markers (fefb596a). parse_latex_citations never raises, but
     # guard defensively so a regression there can never break analyze_latex.

@@ -43,9 +43,12 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from . import docs_intel
+from . import analysis_receipt
 from . import document_workspace
+from . import equation_comparison
 from . import equation_graph
 from . import latex_bridge
+from . import latex_compile_receipt
 from . import local_ingest
 from . import nomenclature
 from . import notation_manifest as notation_manifest_module
@@ -3014,6 +3017,156 @@ def convert_equation(
     rather than silently flattened. This tool never edits a document.
     """
     return latex_bridge.convert_equation(source, source_format, target_format).as_dict()
+
+
+@mcp.tool()
+def compare_equation_artifacts(
+    word_omml: str,
+    latex_source: str,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compare native OMML with LaTeX before any proposed mutation.
+
+    This is a read-only gate.  It compares the existing neutral IR and reports
+    semantic, typography, placement, punctuation, and loss findings.  It never
+    repairs either source and never writes a DOCX or TeX file.
+    """
+    return equation_comparison.compare_equation_artifacts(
+        word_omml,
+        latex_source,
+        profile,
+    ).as_dict()
+
+
+@mcp.tool()
+def make_equation_artifact(
+    source: str,
+    source_format: str,
+    equation_id: str,
+    document_id: str,
+    placement: str,
+    punctuation_ownership: str = "none",
+    punctuation: str | None = None,
+    typography_roles: dict[str, list[str]] | None = None,
+    source_span: dict[str, Any] | None = None,
+    paragraph_anchor: str | None = None,
+    supersedes: list[str] | None = None,
+    superseded_by: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create one immutable equation artifact through the existing bridge."""
+    return latex_bridge.source_to_equation_artifact(
+        source,
+        source_format,
+        equation_id=equation_id,
+        document_id=document_id,
+        placement=placement,
+        punctuation_ownership=punctuation_ownership,
+        punctuation=punctuation,
+        typography_roles=typography_roles or {},
+        source_span=source_span,
+        paragraph_anchor=paragraph_anchor,
+        supersedes=tuple(supersedes or ()),
+        superseded_by=tuple(superseded_by or ()),
+    ).as_dict()
+
+
+@mcp.tool()
+def build_latex_compile_receipt(
+    root_tex: str,
+    status: str = "unavailable",
+    compiler_status: str = "unknown",
+    engine: str | None = None,
+    toolchain_versions: dict[str, str] | None = None,
+    command: str | None = None,
+    compiler_log: str | None = None,
+    warnings: list[str] | None = None,
+    errors: list[str] | None = None,
+    pdf_path: str | None = None,
+    page_count: int | None = None,
+    profile: dict[str, Any] | None = None,
+    equation_manifest_sha256: str | None = None,
+    reference_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Build a hash-bound LaTeX receipt without compiling or writing files."""
+    return latex_compile_receipt.build_latex_compile_receipt(
+        root_tex,
+        status=status,
+        compiler_status=compiler_status,
+        engine=engine,
+        toolchain_versions=toolchain_versions or {},
+        command=command,
+        compiler_log=compiler_log,
+        warnings=warnings or [],
+        errors=errors or [],
+        pdf_path=pdf_path,
+        page_count=page_count,
+        profile=profile,
+        equation_manifest_sha256=equation_manifest_sha256,
+        reference_manifest_sha256=reference_manifest_sha256,
+    ).to_dict()
+
+
+@mcp.tool()
+def build_analysis_receipt(
+    source_path: str,
+    equation_graph: dict[str, Any] | None = None,
+    notation_audit: dict[str, Any] | None = None,
+    integrity: dict[str, Any] | None = None,
+    workspace_lineage: dict[str, Any] | None = None,
+    outputs_evidence: dict[str, Any] | None = None,
+    render_receipt: dict[str, Any] | None = None,
+    artifacts: list[dict[str, Any]] | None = None,
+    relations: list[dict[str, Any]] | None = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compose hash-bound analysis evidence without writing or rendering."""
+    return analysis_receipt.build_analysis_receipt(
+        source_path,
+        equation_graph=equation_graph,
+        notation_audit=notation_audit,
+        integrity=integrity,
+        workspace_lineage=workspace_lineage,
+        outputs_evidence=outputs_evidence,
+        render_receipt=render_receipt,
+        artifacts=artifacts or [],
+        relations=relations or [],
+        profile=profile,
+    ).to_dict()
+
+
+@mcp.tool()
+def build_docx_analysis_receipt(
+    document_path: str,
+    notation_manifest: dict[str, Any] | None = None,
+    workspace_lineage: dict[str, Any] | None = None,
+    outputs_evidence: dict[str, Any] | None = None,
+    render_receipt: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the existing read-only DOCX analyzers and bind one receipt."""
+    return analysis_receipt.build_docx_analysis_receipt(
+        document_path,
+        notation_manifest=notation_manifest,
+        workspace_lineage=workspace_lineage,
+        outputs_evidence=outputs_evidence,
+        render_receipt=render_receipt,
+        profile=profile,
+    ).to_dict()
+
+
+@mcp.tool()
+def evaluate_analysis_promotion_gate(
+    receipt: dict[str, Any],
+    required_components: list[str] | None = None,
+    allow_degraded: bool = False,
+) -> dict[str, Any]:
+    """Evaluate an analysis receipt without repairing or promoting a document."""
+    parsed = analysis_receipt.AnalysisReceipt.from_dict(receipt)
+    return analysis_receipt.evaluate_analysis_gate(
+        parsed,
+        required_components=required_components or ("equation_graph", "notation_audit", "integrity"),
+        allow_degraded=allow_degraded,
+    )
 
 
 @mcp.tool()

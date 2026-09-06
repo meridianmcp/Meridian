@@ -36,6 +36,33 @@ DEFAULT_DOCUMENT_PROFILE: dict[str, Any] = {
     "style": {},
 }
 
+# Declarative venue profile from the LaTeX/OMML bridge handoff.  It contains
+# only document/equation policy; rights clearance and visual pagination remain
+# separate release gates.  Keep this as data so callers can merge it with a
+# project profile without introducing a second policy engine.
+JCSHM_DOCUMENT_PROFILE: dict[str, Any] = {
+    "version": "jcshm-1",
+    "equations": {
+        "representation": "native_omml",
+        "numbering": "section",
+        "number_format": "parenthesized",
+        "allow_unnumbered": True,
+        "punctuation_owned_by_prose": True,
+    },
+    "render": {
+        "required_for_release": False,
+        "preferred_backends": ["word-com", "libreoffice-soffice"],
+    },
+    "tables": {
+        "equation_layout_tables_excluded": True,
+    },
+    "style": {
+        "math_font": "Cambria Math",
+        "require_explicit_operator_roles": True,
+        "require_explicit_script_roles": True,
+    },
+}
+
 
 def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(base)
@@ -112,6 +139,9 @@ def normalize_document_profile(profile: dict[str, Any] | None = None) -> dict[st
         not isinstance(item, str) or not item.strip() for item in merged["render"]["preferred_backends"]
     ):
         raise DocumentProfileError("render.preferred_backends must be a list of strings")
+    for key in ("require_explicit_operator_roles", "require_explicit_script_roles"):
+        if key in merged["style"] and not isinstance(merged["style"][key], bool):
+            raise DocumentProfileError(f"profile.style.{key} must be boolean")
     return merged
 
 
@@ -132,6 +162,7 @@ def merge_document_profiles(
 
 __all__ = [
     "DEFAULT_DOCUMENT_PROFILE",
+    "JCSHM_DOCUMENT_PROFILE",
     "DocumentProfileError",
     "merge_document_profiles",
     "normalize_document_profile",

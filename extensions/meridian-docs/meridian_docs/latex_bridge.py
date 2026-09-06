@@ -14,11 +14,20 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import docs_intel
-from .math_ir import MathNode, from_dict, make_node, opaque, sequence
+from .math_ir import (
+    EquationArtifact,
+    MathNode,
+    from_dict,
+    make_node,
+    normalize_math_tree,
+    opaque,
+    sequence,
+)
 
 
 _MATHML_NS = "http://www.w3.org/1998/Math/MathML"
 _OMML_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+_NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
 
 
 def _local(tag: str) -> str:
@@ -131,7 +140,7 @@ def _mathml_to_ir(
         )
     if tag in {"munder", "mover", "munderover"}:
         converted = [_mathml_to_ir(child, warnings, unsupported) for child in kids]
-        operator = "".join(child.itertext()).strip() if kids else ""
+        operator = "".join("".join(child.itertext()) for child in kids).strip() if kids else ""
         if tag == "mover" and len(converted) == 2 and operator in {"^", "~", "¯", "→", "⃗", "ˆ"}:
             return make_node("accent", converted[0], accent=operator)
         return make_node("nary", *converted, operator=operator or "unknown")
@@ -226,6 +235,13 @@ class _LatexParser:
 
     def _parse_required(self) -> MathNode:
         self._skip_space()
+        if (
+            self.pos >= len(self.source)
+            or self.source[self.pos] == "}"
+            or self.source.startswith(r"\right", self.pos)
+        ):
+            self.warnings.append("missing required LaTeX operand")
+            return opaque("missing required LaTeX operand", source_format="latex")
         if self.pos < len(self.source) and self.source[self.pos] == "{":
             return self._parse_group()
         return self._parse_atom_with_scripts()
@@ -381,7 +397,7 @@ def latex_to_ir(latex: str) -> ConversionResult:
     warnings.extend(f"IR validation: {issue}" for issue in ir.validate())
     canonical = ir.canonical_json()
     return ConversionResult(
-        "latex", "ir", not parser.unsupported and not any(issue.startswith("IR validation:") for issue in warnings),
+        "latex", "ir", not parser.unsupported and not warnings,
         value=ir.to_dict(), warnings=tuple(dict.fromkeys(warnings)),
         unsupported=tuple(dict.fromkeys(parser.unsupported)), source_sha256=source_sha,
         result_sha256=_digest(canonical), ir_sha256=ir.digest(),
@@ -483,6 +499,9 @@ def ir_to_latex(ir: MathNode | dict[str, Any]) -> ConversionResult:
         node = from_dict(ir) if isinstance(ir, dict) else ir
         if not isinstance(node, MathNode):
             raise TypeError("ir must be a MathNode or dictionary")
+        issues = node.validate()
+        if issues:
+            raise ValueError("; ".join(issues))
     except (TypeError, ValueError) as exc:
         return ConversionResult("ir", "latex", False, warnings=(f"invalid IR: {exc}",))
     warnings: list[str] = []
@@ -612,6 +631,9 @@ def ir_to_omml(ir: MathNode | dict[str, Any]) -> ConversionResult:
         node = from_dict(ir) if isinstance(ir, dict) else ir
         if not isinstance(node, MathNode):
             raise TypeError("ir must be a MathNode or dictionary")
+        issues = node.validate()
+        if issues:
+            raise ValueError("; ".join(issues))
     except (TypeError, ValueError) as exc:
         return ConversionResult("ir", "omml", False, warnings=(f"invalid IR: {exc}",))
     warnings: list[str] = []
@@ -636,7 +658,11 @@ def _omml_to_ir(node: ET.Element, warnings: list[str], unsupported: list[str]) -
         return sequence(_omml_to_ir(child, warnings, unsupported) for child in node if _local(child.tag) not in {"rPr", "ctrlPr"})
     if tag == "r":
         text = _omml_text(node)
-        return make_node("operator" if text in _OPERATOR_LATEX or text in {"=", "+", "-", "/", "(" , ")"} else "symbol", text=text)
+        if _NUMBER_RE.fullmatch(text):
+            kind = "number"
+        else:
+            kind = "operator" if text in _OPERATOR_LATEX or text in {"=", "+", "-", "/", "(" , ")"} else "symbol"
+        return make_node(kind, text=text)
     if tag == "t":
         return make_node("symbol", text=node.text or "")
     if tag == "f":
@@ -759,10 +785,11 @@ def omml_to_ir(omml: str) -> ConversionResult:
             return ConversionResult("omml", "ir", False, warnings=tuple(warnings), source_sha256=source_sha)
     ir = _omml_to_ir(root, warnings, unsupported)
     warnings.extend(f"IR validation: {issue}" for issue in ir.validate())
+    normalized_tree = normalize_math_tree(ir)
     return ConversionResult(
         "omml", "ir", not any(issue.startswith("IR validation:") for issue in warnings), value=ir.to_dict(),
         warnings=tuple(dict.fromkeys(warnings)), unsupported=tuple(dict.fromkeys(unsupported)),
-        source_sha256=source_sha, result_sha256=_digest(ir.canonical_json()), ir_sha256=ir.digest(),
+        source_sha256=source_sha, result_sha256=_digest(ir.canonical_json()), ir_sha256=normalized_tree.digest(),
     )
 
 
@@ -842,6 +869,86 @@ def convert_equation(source: Any, source_format: str, target_format: str) -> Con
     )
 
 
+def source_to_equation_artifact(
+    source: str,
+    source_format: str,
+    *,
+    equation_id: str,
+    document_id: str,
+    placement: str,
+    punctuation_ownership: str = "none",
+    punctuation: str | None = None,
+    typography_roles: dict[str, list[str] | tuple[str, ...]] | None = None,
+    source_span: dict[str, Any] | None = None,
+    paragraph_anchor: str | None = None,
+    supersedes: tuple[str, ...] = (),
+    superseded_by: tuple[str, ...] = (),
+) -> ConversionResult:
+    """Wrap one loss-aware conversion in the versioned equation envelope.
+
+    This is an immutable analysis operation.  It never writes a source or
+    document and it deliberately retains conversion warnings/loss flags so a
+    caller cannot mistake an opaque or unsupported conversion for a promotable
+    artifact.
+    """
+
+    normalized_format = source_format.casefold().strip()
+    if normalized_format == "latex":
+        converted = latex_to_ir(source)
+    elif normalized_format == "omml":
+        converted = omml_to_ir(source)
+    else:
+        return ConversionResult(
+            normalized_format,
+            "artifact",
+            False,
+            warnings=(f"unsupported source format: {normalized_format}",),
+        )
+    if not isinstance(converted.value, dict):
+        return ConversionResult(
+            normalized_format,
+            "artifact",
+            False,
+            warnings=converted.warnings,
+            unsupported=converted.unsupported,
+            source_sha256=converted.source_sha256,
+            ir_sha256=converted.ir_sha256,
+        )
+    tree = from_dict(converted.value)
+    loss_flags = tuple(dict.fromkeys((*converted.unsupported, *converted.warnings)))
+    artifact = EquationArtifact(
+        equation_id=equation_id,
+        document_id=document_id,
+        source_format=normalized_format,
+        source_hash=converted.source_sha256 or _digest(source),
+        semantic_tree=tree,
+        placement=placement,
+        punctuation_ownership=punctuation_ownership,
+        punctuation=punctuation,
+        typography_roles=typography_roles or {},
+        source_span=source_span,
+        paragraph_anchor=paragraph_anchor,
+        warnings=converted.warnings,
+        loss_flags=loss_flags,
+        supersedes=supersedes,
+        superseded_by=superseded_by,
+    )
+    artifact_issues = artifact.validate()
+    warnings = tuple(dict.fromkeys((*converted.warnings, *artifact_issues)))
+    success = converted.success and not converted.warnings and not converted.unsupported and not artifact_issues
+    return ConversionResult(
+        normalized_format,
+        "artifact",
+        success,
+        value=artifact.to_dict(),
+        warnings=warnings,
+        unsupported=converted.unsupported,
+        source_sha256=converted.source_sha256 or _digest(source),
+        result_sha256=artifact.digest(),
+        ir_sha256=artifact.semantic_tree.digest(),
+    )
+
+
 __all__ = [
     "ConversionResult",
     "convert_equation",
@@ -851,4 +958,5 @@ __all__ = [
     "latex_to_omml",
     "omml_to_ir",
     "omml_to_latex",
+    "source_to_equation_artifact",
 ]

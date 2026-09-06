@@ -32,6 +32,23 @@ DEFAULT_NOTATION_RULES: dict[str, Any] = {
     "notation_manifest_missing": "error",
 }
 
+JCSHM_NOTATION_RULES: dict[str, Any] = {
+    "version": "jcshm-1",
+    "case_mismatch": "error",
+    "alias_used": "warning",
+    "declared_symbol_unused": "warning",
+    "missing_symbol": "error",
+    "flattened_subscript": "error",
+    "flattened_subscript_occurrence": "error",
+    "symbol_role_collision": "error",
+    "ambiguous_symbol_occurrence": "error",
+    "unqualified_symbol_occurrence": "warning",
+    "symbol_scope_mismatch": "warning",
+    "scoped_symbol_reuse": "warning",
+    "omml_invalid": "error",
+    "notation_manifest_missing": "error",
+}
+
 
 def normalize_notation_rules(rules: dict[str, Any] | None = None) -> dict[str, Any]:
     if rules is None:
@@ -64,7 +81,9 @@ def apply_notation_rules(
     for finding in findings:
         copied = dict(finding)
         finding_type = str(copied.get("type", ""))
-        level = normalized.get(finding_type, copied.get("severity", "warning"))
+        # Future finding types must be explicitly classified before they can
+        # be advisory; inheriting producer severity would fail open.
+        level = normalized.get(finding_type, "error")
         if level == "ignore":
             continue
         copied["severity"] = level
@@ -74,6 +93,7 @@ def apply_notation_rules(
 
 __all__ = [
     "DEFAULT_NOTATION_RULES",
+    "JCSHM_NOTATION_RULES",
     "NotationRulesError",
     "apply_notation_rules",
     "normalize_notation_rules",
