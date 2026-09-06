@@ -85,6 +85,23 @@ def _grid_col_count(tbl) -> int:
     return len(grid.findall(docs_intel._q(_W, "gridCol")))
 
 
+def _cell_alignments(tbl) -> list[list[str | None]]:
+    """4544bbe5 -- per-cell w:jc value (None when no pPr/jc is present at all),
+    one row of the returned list per w:tr, one entry per w:tc."""
+    rows = []
+    for tr in tbl.findall(docs_intel._q(_W, "tr")):
+        row = []
+        for tc in tr.findall(docs_intel._q(_W, "tc")):
+            aligns = []
+            for p in tc.findall(docs_intel._q(_W, "p")):
+                pPr = p.find(docs_intel._q(_W, "pPr"))
+                jc = pPr.find(docs_intel._q(_W, "jc")) if pPr is not None else None
+                aligns.append(jc.get(docs_intel._q(_W, "val")) if jc is not None else None)
+            row.append(aligns[0] if aligns else None)
+        rows.append(row)
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -969,6 +986,81 @@ def test_insert_table_new_cells_have_fresh_unique_para_ids(tmp_path, monkeypatch
     ]
     assert all(ids)
     assert len(set(ids)) == len(ids)
+
+
+def test_insert_table_no_style_policy_adds_no_jc(tmp_path, monkeypatch):
+    """4544bbe5 -- default (no style_policy) reproduces pre-4544bbe5 output
+    exactly: no w:jc at all on any new cell paragraph."""
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    docs_intel.insert_table(path, anchor_para_id="p0", rows=2, cols=3)
+
+    tbl = _table(path, 1)
+    assert _cell_alignments(tbl) == [[None, None, None], [None, None, None]]
+
+
+def test_insert_table_style_policy_sets_label_and_data_column_alignment(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    docs_intel.insert_table(
+        path, anchor_para_id="p0", rows=2, cols=3,
+        style_policy={
+            "table_label_column_alignment": "left",
+            "table_data_column_alignment": "center",
+        },
+    )
+
+    tbl = _table(path, 1)
+    assert _cell_alignments(tbl) == [
+        ["left", "center", "center"],
+        ["left", "center", "center"],
+    ]
+
+
+def test_insert_table_style_policy_label_only_leaves_data_columns_unset(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    docs_intel.insert_table(
+        path, anchor_para_id="p0", rows=1, cols=2,
+        style_policy={"table_label_column_alignment": "right"},
+    )
+
+    tbl = _table(path, 1)
+    assert _cell_alignments(tbl) == [["right", None]]
+
+
+def test_insert_table_rejects_bad_style_policy_without_mutating_file(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+    with open(path, "rb") as fh:
+        original_bytes = fh.read()
+
+    result = docs_intel.insert_table(
+        path, anchor_para_id="p0", rows=1, cols=1,
+        style_policy={"table_label_column_alignment": "diagonal"},
+    )
+    assert "error" in result
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes
+
+
+def test_insert_table_server_wrapper_passes_through_style_policy(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    result = server.insert_table(
+        path, anchor_para_id="p0", rows=1, cols=2,
+        style_policy={
+            "table_label_column_alignment": "left",
+            "table_data_column_alignment": "center",
+        },
+    )
+    assert result["status"] == "inserted"
+    tbl = _table(path, result["table_index"])
+    assert _cell_alignments(tbl) == [["left", "center"]]
 
 
 def test_insert_table_after_heading_lands_after_whole_section(tmp_path, monkeypatch):

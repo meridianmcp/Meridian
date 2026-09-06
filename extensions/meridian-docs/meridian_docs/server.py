@@ -1697,6 +1697,34 @@ def audit_equation_style(
 
 
 @mcp.tool()
+def get_journal_style_preset(journal: str) -> dict[str, Any]:
+    """4544bbe5 — Look up a named publishing-convention style-policy preset
+    (a "document profile" shorthand) instead of hand-writing a full
+    style_policy override dict.
+
+    The returned dict is the FULLY RESOLVED policy (every
+    resolve_style_policy key populated), ready to pass straight through as
+    style_policy= to insert_figure_block, insert_caption,
+    audit_equation_style, insert_equation, insert_highlighted_note,
+    write_section, or insert_table.
+
+    Args:
+      journal: Preset name — currently "default" (built-in defaults, named
+        for explicit selection) or "jcshm" (a representative academic-
+        journal convention: centered captions/equations, no terminal
+        punctuation on headings, label-left/data-center table columns).
+
+    Returns:
+      The resolved style policy dict for journal, or {error: <message>} if
+      journal names no known preset.
+    """
+    try:
+        return docs_intel.get_journal_style_preset(journal)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
 def scan_citation_keys(docx_path: str) -> list[str]:
     """1258794a — Return all citation keys present in a .docx (in appearance order).
 
@@ -2159,6 +2187,7 @@ def write_section(
     anchor_para_id: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """82d22824 — Create a whole new section (heading + body + figure/table
@@ -2191,6 +2220,12 @@ def write_section(
       anchor_para_id:  w14:paraId (or p{N}) of the paragraph/table to anchor on.
       position:        "before" or "after" (default) the anchor.
       index_db_path:   If supplied, sidecar is invalidated after the write.
+      style_policy:    4544bbe5 — optional document-profile override dict
+                       (see resolve_style_policy / get_journal_style_preset).
+                       Only heading_terminal_punctuation is consulted here:
+                       when not None, strips any trailing .,:;!? from
+                       heading_text and appends this value instead. Omitted
+                       (default None), heading_text is used exactly as given.
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -2210,6 +2245,7 @@ def write_section(
         anchor_para_id=anchor_para_id,
         position=position,
         index_db_path=index_db_path,
+        style_policy=style_policy,
     )
 
 
@@ -2553,6 +2589,7 @@ def insert_table(
     index_db_path: str | None = None,
     allow_degraded_render: bool = False,
     degraded_render_reason: str | None = None,
+    style_policy: dict[str, Any] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """0a1e9c22 — Insert a brand-new bare <w:tbl> at a position relative to an
@@ -2591,6 +2628,12 @@ def insert_table(
                        degraded_render_reason.
       degraded_render_reason: Required, non-empty when
                        allow_degraded_render is True.
+      style_policy:    4544bbe5 — optional document-profile override dict
+                       (see resolve_style_policy / get_journal_style_preset).
+                       table_label_column_alignment sets w:jc on column 0 of
+                       every new cell; table_data_column_alignment sets it on
+                       every column after that. Both default to None (no
+                       w:jc added — same output as before this change).
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -2613,6 +2656,7 @@ def insert_table(
         index_db_path=index_db_path,
         allow_degraded_render=allow_degraded_render,
         degraded_render_reason=degraded_render_reason,
+        style_policy=style_policy,
     )
 
 

@@ -8451,6 +8451,15 @@ def _style_policy_defaults() -> dict[str, Any]:
     existing test asserts an inserted equation paragraph has no ``pPr``, and
     keeping the audit's "expected" alignment and the writer's actual output
     in sync (one policy, two consumers) is the whole point of this feature.
+
+    4544bbe5 -- ``heading_terminal_punctuation``, ``table_label_column_alignment``,
+    and ``table_data_column_alignment`` extend this same mechanism to the
+    sections/tables domains as part of the broader "declarative document
+    profile" surface. All three default to ``None`` ("no policy -- leave the
+    writer's pre-existing behavior exactly as it was") so every caller that
+    never passes ``style_policy`` (the overwhelming majority of existing call
+    sites and tests) sees byte-identical output to before this change; a
+    caller opts into the new behavior only by supplying a non-``None`` value.
     """
     return {
         "caption_centered": False,
@@ -8460,6 +8469,9 @@ def _style_policy_defaults() -> dict[str, Any]:
         "equation_punctuation_chars": ".,;:",
         "note_style": _INTERNAL_NOTE_STYLE_DEFAULT,
         "note_highlight_color": _INTERNAL_NOTE_HIGHLIGHT_COLOR,
+        "heading_terminal_punctuation": None,
+        "table_label_column_alignment": None,
+        "table_data_column_alignment": None,
     }
 
 
@@ -8494,6 +8506,30 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
                                     mode) writes for new notes.
       note_highlight_color (str):  ``<w:highlight>`` value (must be a valid
                                     OOXML highlight color) for new notes.
+      heading_terminal_punctuation (str | None): 4544bbe5 -- when not
+                                    ``None``, :func:`write_section` strips any
+                                    trailing character in
+                                    ``.,:;!?`` from a new heading's text and
+                                    appends this string instead (``""``
+                                    enforces "no terminal punctuation on
+                                    headings", a common publishing
+                                    convention; a non-empty value like ``":"``
+                                    enforces a specific terminal character).
+                                    ``None`` (the default) leaves heading text
+                                    exactly as authored, matching pre-4544bbe5
+                                    behavior.
+      table_label_column_alignment (str | None): 4544bbe5 -- when not
+                                    ``None``, one of "left"/"center"/"right"/
+                                    "both" -- the ``w:jc`` :func:`insert_table`
+                                    writes into column 0 ("label column") of a
+                                    newly inserted table. ``None`` (the
+                                    default) adds no ``w:jc`` at all, matching
+                                    pre-4544bbe5 behavior (Word's own default,
+                                    effectively left-aligned).
+      table_data_column_alignment (str | None): 4544bbe5 -- same as
+                                    ``table_label_column_alignment`` but for
+                                    every column after column 0 ("data
+                                    columns") of a newly inserted table.
 
     Raises:
       ValueError: an unknown key, or a value of the wrong type/out of range.
@@ -8539,7 +8575,117 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
             f"{sorted(_VALID_HIGHLIGHT_COLORS)}"
         )
 
+    heading_punct = policy["heading_terminal_punctuation"]
+    if heading_punct is not None and not isinstance(heading_punct, str):
+        raise ValueError(
+            "style policy 'heading_terminal_punctuation' must be a string or None"
+        )
+
+    for key in ("table_label_column_alignment", "table_data_column_alignment"):
+        value = policy[key]
+        if value is not None and value not in _VALID_EQUATION_ALIGNMENTS:
+            raise ValueError(
+                f"style policy {key!r} must be one of "
+                f"{sorted(_VALID_EQUATION_ALIGNMENTS)} or None"
+            )
+
     return policy
+
+
+# 4544bbe5 -- terminal punctuation characters a heading is normalized away
+# from before (optionally) appending the policy's configured replacement.
+# Deliberately narrow (matches the closing-punctuation set an English-prose
+# heading could plausibly end with) rather than reusing
+# ``equation_punctuation_chars`` -- the two are conceptually unrelated policy
+# knobs (one governs display-equation trailing punctuation, the other
+# section-heading trailing punctuation) that happen to share a similar shape.
+_HEADING_TERMINAL_PUNCT_CHARS = ".,:;!?"
+
+
+def _apply_heading_terminal_punctuation(heading_text: str, policy: dict[str, Any]) -> str:
+    """4544bbe5 -- normalize ``heading_text``'s trailing punctuation per
+    ``policy["heading_terminal_punctuation"]``.
+
+    ``None`` (the default) is a no-op -- returns ``heading_text`` unchanged,
+    which is what every pre-4544bbe5 caller of :func:`write_section` still
+    gets. A non-``None`` string strips any existing trailing character in
+    :data:`_HEADING_TERMINAL_PUNCT_CHARS` (repeatedly, so "Results..." ->
+    "Results") and appends the configured string -- ``""`` enforces "no
+    terminal punctuation at all", a non-empty value enforces that exact
+    terminal character/string.
+    """
+    replacement = policy.get("heading_terminal_punctuation")
+    if replacement is None:
+        return heading_text
+    stripped = heading_text.rstrip(_HEADING_TERMINAL_PUNCT_CHARS)
+    return stripped + replacement
+
+
+# ---------------------------------------------------------------------------
+# 4544bbe5 -- named "journal style" presets: publishing-convention bundles of
+# style-policy overrides a caller can look up by name instead of hand-writing
+# a full override dict. Each preset is validated through the SAME
+# resolve_style_policy() fail-closed path as any hand-written override dict
+# (see get_journal_style_preset below) -- there is no separate/parallel
+# validation surface to keep in sync.
+# ---------------------------------------------------------------------------
+JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
+    # The built-in resolve_style_policy() defaults, addressable by name so a
+    # caller can request "default" explicitly instead of omitting style
+    # entirely -- useful when a document_profile's journal= comes from
+    # user-facing config where "no opinion" needs its own explicit value.
+    "default": {},
+    # A representative academic-journal convention bundle: centered
+    # figure/table captions, centered display equations with required
+    # trailing punctuation, headings with no terminal punctuation, and a
+    # label-left/data-center table layout.
+    "jcshm": {
+        "caption_centered": True,
+        "equation_alignment": "center",
+        "equation_punctuation_required": True,
+        "equation_punctuation_chars": ".,;",
+        "heading_terminal_punctuation": "",
+        "table_label_column_alignment": "left",
+        "table_data_column_alignment": "center",
+    },
+}
+
+
+def get_journal_style_preset(journal: str) -> dict[str, Any]:
+    """4544bbe5 -- look up a named publishing-convention style-policy preset.
+
+    This is the "shorthand" half of the document-profile surface: instead of
+    a caller hand-writing a full ``style_policy`` override dict for a common
+    convention, they pass a short name here and get back a ready-to-use,
+    already-validated policy dict suitable for ``style_policy=`` on
+    :func:`insert_figure_block`, :func:`insert_caption`,
+    :func:`audit_equation_style`, :func:`insert_equation_local`,
+    :func:`insert_highlighted_note`, :func:`write_section`, or
+    :func:`insert_table`.
+
+    The returned dict is the FULLY RESOLVED policy (every key populated,
+    unset keys filled from :func:`_style_policy_defaults`) -- not the raw
+    preset overrides -- so it round-trips cleanly back through
+    :func:`resolve_style_policy` with no further merging needed.
+
+    Args:
+      journal: One of the keys in :data:`JOURNAL_STYLE_PRESETS` (currently
+        ``"default"`` or ``"jcshm"``).
+
+    Returns:
+      The resolved style policy dict for ``journal``.
+
+    Raises:
+      ValueError: ``journal`` is not a known preset name, or (should the
+        preset itself ever be malformed) the preset fails
+        :func:`resolve_style_policy` validation.
+    """
+    if journal not in JOURNAL_STYLE_PRESETS:
+        raise ValueError(
+            f"unknown journal style preset {journal!r}; known presets: "
+            f"{sorted(JOURNAL_STYLE_PRESETS)}"
+        )
+    return resolve_style_policy(JOURNAL_STYLE_PRESETS[journal])
 
 
 def _paragraph_alignment(para_elem: ET.Element) -> str | None:
@@ -12259,6 +12405,7 @@ def write_section(
     anchor_para_id: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """82d22824 -- create a whole new section (heading + body + figure/table
     references) as ONE atomic operation from a structured spec.
@@ -12325,13 +12472,25 @@ def write_section(
                         "after" a non-heading anchor -- both remain a literal
                         splice at that exact position.
         index_db_path:  If supplied, sidecar is invalidated after the write.
+        style_policy:   4544bbe5 -- optional document-profile override dict,
+                        same validated shape :func:`resolve_style_policy`
+                        accepts. Currently only ``heading_terminal_punctuation``
+                        is consulted here: when not ``None``, the new
+                        heading's text has any trailing character in
+                        ``.,:;!?`` stripped and this value appended in its
+                        place before the heading paragraph is built (see
+                        :func:`_apply_heading_terminal_punctuation`).
+                        Omitted (the default), heading text is used exactly
+                        as given -- byte-identical to pre-4544bbe5 behavior.
 
     Returns:
         ``{status, heading_para_id, heading_text, level, block_para_ids,
         docx_path}`` where ``block_para_ids`` is a list parallel to
         ``content_spec`` (``{"type": "paragraph", "para_id": ...}`` or
         ``{"type": "caption", "kind", "para_id", "seq_number",
-        "ref_bookmark"}``).
+        "ref_bookmark"}``). ``heading_text`` in the response reflects the
+        text actually written (post ``heading_terminal_punctuation``
+        normalization, if any).
 
         ``{"error": <message>}`` on any validation or write failure (file
         NOT mutated on error -- validation happens before the file is
@@ -12361,6 +12520,10 @@ def write_section(
                 return {"error": f"content_spec[{i}] (caption) requires kind='Figure' or 'Table'"}
             if not str(block.get("label_text", "")).strip():
                 return {"error": f"content_spec[{i}] (caption) requires a non-empty 'label_text'"}
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -12403,6 +12566,8 @@ def write_section(
         ref_seed[0] += 1
         return name
 
+    heading_text_final = _apply_heading_terminal_punctuation(heading_text.strip(), policy)
+
     heading_id = _new_para_id(taken_ids)
     heading_p = ET.Element(_q(_W, "p"))
     heading_p.set(_q(_W14, "paraId"), heading_id)
@@ -12411,7 +12576,7 @@ def write_section(
     hStyle.set(_q(_W, "val"), f"Heading{level_int}")
     hr = ET.SubElement(heading_p, _q(_W, "r"))
     ht = ET.SubElement(hr, _q(_W, "t"))
-    ht.text = heading_text.strip()
+    ht.text = heading_text_final
 
     new_elements: list[ET.Element] = [heading_p]
     block_para_ids: list[dict[str, Any]] = []
@@ -12530,7 +12695,7 @@ def write_section(
     return {
         "status": "inserted",
         "heading_para_id": heading_id,
-        "heading_text": heading_text.strip(),
+        "heading_text": heading_text_final,
         "level": level_int,
         "block_para_ids": block_para_ids,
         "docx_path": docx_path,
@@ -14473,6 +14638,7 @@ def insert_table(
     index_db_path: str | None = None,
     allow_degraded_render: bool = False,
     degraded_render_reason: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """0a1e9c22 -- Insert a brand-new bare ``<w:tbl>`` at a position relative
     to an anchor paragraph, atomically.
@@ -14526,6 +14692,15 @@ def insert_table(
                          environment. Requires degraded_render_reason.
         degraded_render_reason: Required, non-empty when
                          allow_degraded_render is True.
+        style_policy:    4544bbe5 -- optional document-profile override
+                         dict, same validated shape
+                         :func:`resolve_style_policy` accepts.
+                         ``table_label_column_alignment`` sets ``w:jc`` on
+                         column 0 ("label column") of every new cell
+                         paragraph; ``table_data_column_alignment`` sets it
+                         on every column after column 0 ("data columns").
+                         Both default to ``None`` (no ``w:jc`` added at all
+                         -- byte-identical to pre-4544bbe5 behavior).
 
     Returns:
         ``{status, table_index, row_count, col_count, anchor_para_id,
@@ -14555,6 +14730,10 @@ def insert_table(
         for row_texts in cell_texts:
             if not isinstance(row_texts, list) or len(row_texts) != cols:
                 return {"error": f"each cell_texts row must have {cols} entr(y/ies)"}
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -14595,6 +14774,12 @@ def insert_table(
     for _ in range(cols):
         ET.SubElement(tblGrid, _W_GRIDCOL).set(_q(_W, "w"), str(col_width))
 
+    # 4544bbe5 -- column-level alignment from the (optional) style policy.
+    # None (the default for both keys) means "add no w:jc at all", so the
+    # common case of no style_policy reproduces pre-4544bbe5 output exactly.
+    label_col_align = policy["table_label_column_alignment"]
+    data_col_align = policy["table_data_column_alignment"]
+
     for row_idx in range(rows):
         tr = ET.SubElement(tbl, _W_TR)
         for col_idx in range(cols):
@@ -14604,6 +14789,10 @@ def insert_table(
             tcPr.find(_q(_W, "tcW")).set(_q(_W, "type"), "dxa")
             p = ET.SubElement(tc, _q(_W, "p"))
             p.set(_q(_W14, "paraId"), _new_para_id(taken_ids))
+            col_align = label_col_align if col_idx == 0 else data_col_align
+            if col_align is not None:
+                pPr = ET.SubElement(p, _q(_W, "pPr"))
+                ET.SubElement(pPr, _q(_W, "jc")).set(_q(_W, "val"), col_align)
             text = None
             if cell_texts is not None:
                 text = cell_texts[row_idx][col_idx]

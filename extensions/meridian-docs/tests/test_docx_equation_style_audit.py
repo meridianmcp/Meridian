@@ -31,7 +31,7 @@ _EXT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _EXT_PATH not in sys.path:
     sys.path.insert(0, _EXT_PATH)
 
-from meridian_docs import docs_intel  # noqa: E402
+from meridian_docs import docs_intel, server  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -201,6 +201,9 @@ def test_resolve_style_policy_defaults():
         "equation_punctuation_chars": ".,;:",
         "note_style": "MeridianInternalNote",
         "note_highlight_color": "yellow",
+        "heading_terminal_punctuation": None,
+        "table_label_column_alignment": None,
+        "table_data_column_alignment": None,
     }
 
 
@@ -273,6 +276,107 @@ def test_resolve_style_policy_rejects_bad_note_highlight_color():
 def test_resolve_style_policy_accepts_valid_note_highlight_color():
     policy = docs_intel.resolve_style_policy({"note_highlight_color": "cyan"})
     assert policy["note_highlight_color"] == "cyan"
+
+
+# ---------------------------------------------------------------------------
+# resolve_style_policy -- 4544bbe5 document-profile keys (heading terminal
+# punctuation, table column alignment)
+# ---------------------------------------------------------------------------
+
+def test_resolve_style_policy_heading_terminal_punctuation_defaults_none():
+    assert docs_intel.resolve_style_policy()["heading_terminal_punctuation"] is None
+
+
+def test_resolve_style_policy_accepts_empty_heading_terminal_punctuation():
+    policy = docs_intel.resolve_style_policy({"heading_terminal_punctuation": ""})
+    assert policy["heading_terminal_punctuation"] == ""
+
+
+def test_resolve_style_policy_accepts_string_heading_terminal_punctuation():
+    policy = docs_intel.resolve_style_policy({"heading_terminal_punctuation": ":"})
+    assert policy["heading_terminal_punctuation"] == ":"
+
+
+@pytest.mark.parametrize("bad_value", [1, True, [], {}])
+def test_resolve_style_policy_rejects_non_string_heading_terminal_punctuation(bad_value):
+    with pytest.raises(ValueError, match="heading_terminal_punctuation"):
+        docs_intel.resolve_style_policy({"heading_terminal_punctuation": bad_value})
+
+
+@pytest.mark.parametrize(
+    "key", ["table_label_column_alignment", "table_data_column_alignment"]
+)
+def test_resolve_style_policy_table_column_alignment_defaults_none(key):
+    assert docs_intel.resolve_style_policy()[key] is None
+
+
+@pytest.mark.parametrize(
+    "key", ["table_label_column_alignment", "table_data_column_alignment"]
+)
+@pytest.mark.parametrize("valid_alignment", ["left", "center", "right", "both"])
+def test_resolve_style_policy_accepts_valid_table_column_alignments(key, valid_alignment):
+    policy = docs_intel.resolve_style_policy({key: valid_alignment})
+    assert policy[key] == valid_alignment
+
+
+@pytest.mark.parametrize(
+    "key", ["table_label_column_alignment", "table_data_column_alignment"]
+)
+def test_resolve_style_policy_rejects_bad_table_column_alignment(key):
+    with pytest.raises(ValueError, match=key):
+        docs_intel.resolve_style_policy({key: "diagonal"})
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset -- 4544bbe5 publishing-convention shorthand
+# ---------------------------------------------------------------------------
+
+def test_get_journal_style_preset_default_matches_resolve_style_policy_defaults():
+    assert docs_intel.get_journal_style_preset("default") == docs_intel.resolve_style_policy()
+
+
+def test_get_journal_style_preset_jcshm_is_fully_resolved():
+    preset = docs_intel.get_journal_style_preset("jcshm")
+    # Every resolve_style_policy key is present (fully resolved, not raw overrides).
+    assert set(preset) == set(docs_intel.resolve_style_policy())
+    assert preset["caption_centered"] is True
+    assert preset["heading_terminal_punctuation"] == ""
+    assert preset["table_label_column_alignment"] == "left"
+    assert preset["table_data_column_alignment"] == "center"
+
+
+def test_get_journal_style_preset_jcshm_round_trips_through_resolve_style_policy():
+    preset = docs_intel.get_journal_style_preset("jcshm")
+    # A fully-resolved policy must be idempotent under re-resolution.
+    assert docs_intel.resolve_style_policy(preset) == preset
+
+
+def test_get_journal_style_preset_rejects_unknown_name():
+    with pytest.raises(ValueError, match="unknown journal style preset"):
+        docs_intel.get_journal_style_preset("not-a-real-journal")
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset -- MCP tool boundary (server.py wrapper)
+# ---------------------------------------------------------------------------
+
+def test_server_get_journal_style_preset_delegates_to_docs_intel():
+    assert server.get_journal_style_preset("jcshm") == docs_intel.get_journal_style_preset("jcshm")
+
+
+def test_server_get_journal_style_preset_unknown_name_returns_error_dict():
+    """The MCP boundary never raises -- an unknown preset name comes back as
+    a structured {"error": ...} dict, same convention as every other tool."""
+    result = server.get_journal_style_preset("not-a-real-journal")
+    assert "error" in result
+    assert "not-a-real-journal" in result["error"]
+
+
+def test_server_get_journal_style_preset_result_usable_as_style_policy(tmp_path):
+    """The preset returned at the MCP boundary round-trips straight into
+    another tool's style_policy= parameter with no further transformation."""
+    preset = server.get_journal_style_preset("jcshm")
+    assert docs_intel.resolve_style_policy(preset) == preset
 
 
 # ---------------------------------------------------------------------------
