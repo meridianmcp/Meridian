@@ -8891,6 +8891,62 @@ async def build_effective_capability_contract(
         return None
 
 
+async def resolve_closure_items_for_scope(
+    db: Any, selected_scope_outcome: "dict[str, Any] | None",
+) -> "list[dict[str, Any]] | None":
+    """fd5871a5 — resolve the FULL sprint_item dicts for a
+    ``selected_scope_outcome``'s ``closure_item_ids`` (see
+    :func:`_resolve_selected_item_scope`), for a caller
+    (``mcp/handler.py``'s ``generate_handoff`` dispatch,
+    ``routes/handoff.py``'s general handoff endpoint) that wants to pass
+    ``items=`` into :func:`build_effective_capability_contract` using the
+    SAME selected-item-scope closure a ``generate_handoff`` call already
+    validated and resolved.
+
+    This closes the genuine remaining gap this item's discovery brief
+    identified: ``selected_item_ids`` scoping already narrows ``content``
+    (the rendered /goal text) correctly, but the two structured auxiliary
+    fields emitted ALONGSIDE it — ``capability_contract`` and
+    ``proposal_evidence`` — were built with no scope awareness at all, so a
+    "scoped" handoff could still balloon back up to project-wide size from
+    those two fields alone (the item's own ~400KB repro). ``_resolve_selected_
+    item_scope`` already fetches every closure item into its own internal
+    ``by_id`` while validating/closing the scope, but does not return those
+    dicts (only the ids/hash — see its own docstring) since embedding full
+    item dicts into the PUBLIC ``selected_scope`` response field would
+    reproduce the exact bloat this fix exists to prevent. This function
+    re-fetches by id instead, bounded by the (typically tiny) closure size,
+    not the board size — a deliberate, small, extra round-trip in exchange
+    for keeping ``selected_scope``'s own response shape byte-for-byte
+    unchanged for every existing caller/test.
+
+    Returns ``None`` when ``selected_scope_outcome`` is falsy or carries no
+    ``closure_item_ids`` (``selected_item_ids`` was never passed for this
+    call, or resolution never reached that point) — the caller's existing
+    unscoped call is then completely unchanged, zero behavior change for
+    every pre-existing request. Also returns ``None`` (never an empty list)
+    on any resolution failure, or when every closure id fails to resolve —
+    a transient DB hiccup degrades to the prior unscoped-but-still-correct
+    behavior rather than silently emitting a misleadingly-empty scoped
+    contract. Never raises — best-effort, exactly like the sibling wrappers
+    in this module.
+    """
+    if not selected_scope_outcome:
+        return None
+    _closure_ids = selected_scope_outcome.get("closure_item_ids")
+    if not _closure_ids:
+        return None
+    try:
+        _items: list[dict[str, Any]] = []
+        for _cid in _closure_ids:
+            _it = await db_module.get_sprint_item(db, _cid)
+            if _it is not None:
+                _items.append(_it)
+        return _items or None
+    except Exception:  # noqa: BLE001 — best-effort, mirrors sibling wrappers
+        return None
+
+
 async def build_effective_profile_binding(
     db: Any, project_id: str, *, session_id: "str | None" = None,
 ) -> "dict[str, Any] | None":
@@ -9097,6 +9153,7 @@ async def build_board_context_state_for_handoff(
 
 async def build_proposal_evidence_for_handoff(
     db: Any, project_id: str, *, limit: int = 10,
+    item_ids: "list[str] | None" = None,
 ) -> "list[dict[str, Any]] | None":
     """6cdc5df3 — machine-readable proposal-to-evidence linkage, emitted
     alongside every ``generate_handoff`` mode (mirrors
@@ -9106,18 +9163,42 @@ async def build_proposal_evidence_for_handoff(
     for a proposal-id prefix (see ``meridian.db.proposal_links`` module
     docstring for that history).
 
+    ``item_ids`` (fd5871a5) — optional scope filter: when given (a
+    non-empty list), only proposals with at least one ``sprint_item``
+    evidence link INTO this set are considered (see
+    :func:`meridian.db.proposal_links.get_proposal_ids_for_items`), instead
+    of this function's own unscoped default of "the project's top
+    ``limit`` most-recently-linked proposals regardless of which items they
+    touch". Pass the SAME resolved ``selected_item_ids`` dependency-closure
+    a ``generate_handoff`` call used (see
+    ``handoff._resolve_selected_item_scope``'s ``closure_item_ids``) so a
+    scoped handoff's ``proposal_evidence`` field agrees with its own
+    ``content``/``capability_contract`` scope instead of independently
+    falling back to a project-wide view — this was the genuine remaining
+    gap this item's discovery brief identified (a "scoped" handoff still
+    embedding every other proposal's full hydrated evidence, unbounded by
+    the requested selection). Omit (or pass ``None``/an empty list) for the
+    exact pre-existing unscoped behavior — zero change for every caller that
+    never passes ``selected_item_ids`` in the first place.
+
     Returns one entry per proposal id that currently has at least one
     evidence link in this project (most-recently-linked first, capped at
     ``limit``), each entry being the full hydrated
     :func:`meridian.db.proposal_links.get_proposal_evidence` result for that
     id. An empty list means the project has no linked proposals yet (not an
-    error). ``None`` only when the lookup itself failed — best-effort, never
-    breaks the mandatory handoff.
+    error) — for a scoped call, this also correctly means "no proposal
+    touches any item in this closure", not a failure. ``None`` only when the
+    lookup itself failed — best-effort, never breaks the mandatory handoff.
     """
     try:
-        proposal_ids = await db_module.get_proposal_ids_for_project(
-            db, project_id, limit=limit,
-        )
+        if item_ids:
+            proposal_ids = await db_module.get_proposal_ids_for_items(
+                db, project_id, item_ids, limit=limit,
+            )
+        else:
+            proposal_ids = await db_module.get_proposal_ids_for_project(
+                db, project_id, limit=limit,
+            )
         return [
             await db_module.get_proposal_evidence(db, project_id, pid)
             for pid in proposal_ids

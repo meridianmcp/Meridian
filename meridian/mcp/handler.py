@@ -3464,9 +3464,27 @@ async def _handle_task_tools(
         # LARGER than what a compact render already omits) — never a silent
         # drop: every item_*_truncated marker still reports the full
         # candidate count when a board exceeds this.
+        #
+        # fd5871a5 — when this call was scoped via selected_item_ids,
+        # _selected_scope_outcome (populated by generate_handoff above) now
+        # carries the resolved dependency-closure ids. Resolve those to full
+        # item dicts and pass them as `items=` so item_tool_requirements/
+        # item_sprint_item_pointers/item_artifact_pointer_findings/
+        # item_executor_contracts/item_routing_summary all narrow to the
+        # SAME closure `content` was already scoped to, instead of each
+        # silently self-fetching the full project-wide pending-item list
+        # regardless of the caller's requested scope (the item's own repro:
+        # a 1-item-scoped handoff still emitting a ~400KB capability_contract
+        # built from the OTHER ~150 unrelated pending items on the board).
+        # None (unscoped) for every pre-existing call that never passes
+        # selected_item_ids — zero behavior change for that case.
+        _selected_closure_items = await handoff_module_local.resolve_closure_items_for_scope(
+            db, _selected_scope_outcome,
+        )
         _capability_contract = await handoff_module_local.build_effective_capability_contract(
             db, args["project_id"], board_stale=_handoff_degraded,
             version=_effective_version,
+            items=_selected_closure_items,
             max_executor_contracts=handoff_module_local._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
             max_contract_list_items=handoff_module_local._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
         )
@@ -3474,8 +3492,16 @@ async def _handle_task_tools(
         # every generate_handoff mode alongside the capability contract above.
         # Fully guarded — a failure degrades to no field rather than breaking
         # the mandatory handoff.
+        #
+        # fd5871a5 — same selected-item-scope narrowing as capability_contract
+        # just above: pass the closure ids so only proposals actually linked
+        # to an item in THIS scope are considered, instead of always falling
+        # back to the project's top-10 most-recently-linked proposals
+        # regardless of scope. None (unscoped) when this call was never
+        # selected_item_ids-scoped — zero behavior change for that case.
         _proposal_evidence = await handoff_module_local.build_proposal_evidence_for_handoff(
             db, args["project_id"],
+            item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
         )
         # d09c29fe — machine-readable DOCX-integrity gate, emitted on every
         # generate_handoff mode alongside the two fields above. Tied to the

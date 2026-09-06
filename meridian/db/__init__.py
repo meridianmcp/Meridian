@@ -12719,6 +12719,7 @@ from .proposal_links import (  # noqa: F401
     get_proposal_links,
     get_proposal_evidence,
     get_proposal_ids_for_project,
+    get_proposal_ids_for_items,
 )
 
 

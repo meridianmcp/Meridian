@@ -388,3 +388,49 @@ async def get_proposal_ids_for_project(
         if pid:
             out.append(pid)
     return out
+
+
+async def get_proposal_ids_for_items(
+    db: aiosqlite.Connection, project_id: str, item_ids: list[str], limit: int = 20,
+) -> list[str]:
+    """fd5871a5 — SCOPED sibling of :func:`get_proposal_ids_for_project`:
+    distinct proposal ids with >=1 ``sprint_item`` evidence link to ONE OF
+    ``item_ids`` in this project, most-recently-linked first.
+
+    Exists so a ``generate_handoff`` call scoped to an explicit
+    ``selected_item_ids`` closure (see
+    ``meridian.handoff._resolve_selected_item_scope``) can narrow
+    ``proposal_evidence`` to only the proposals actually relevant to that
+    closure, instead of :func:`build_proposal_evidence_for_handoff` always
+    falling back to :func:`get_proposal_ids_for_project`'s project-wide
+    most-recently-linked-top-``limit`` view regardless of scope — the exact
+    gap this item's discovery brief flagged (a "scoped" handoff still
+    pulling in every other proposal's full hydrated evidence, unbounded by
+    the requested item selection).
+
+    Returns ``[]`` (never queries) for an empty/falsy ``item_ids`` — mirrors
+    every other "no ids given" short-circuit in this module rather than
+    running a query that would otherwise degrade to "no WHERE-clause
+    filter" (which would silently widen back to project-wide).
+    """
+    if not item_ids:
+        return []
+    _ids = [str(i) for i in item_ids if i]
+    if not _ids:
+        return []
+    placeholders = ", ".join("?" for _ in _ids)
+    async with db.execute(
+        "SELECT proposal_id, MAX(created_at) AS last_at FROM proposal_evidence_links "
+        "WHERE project_id = ? AND entity_type = 'sprint_item' "
+        f"AND entity_id IN ({placeholders}) "
+        "GROUP BY proposal_id ORDER BY last_at DESC LIMIT ?",
+        (project_id, *_ids, int(limit)),
+    ) as cur:
+        rows = await cur.fetchall()
+    out: list[str] = []
+    for r in rows:
+        d = _row_to_dict(r) or {}
+        pid = d.get("proposal_id")
+        if pid:
+            out.append(pid)
+    return out

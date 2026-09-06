@@ -331,8 +331,21 @@ async def generate_handoff_endpoint(
     # rationale: this REST endpoint was previously getting
     # build_capability_contract's generous 25/200 defaults, unbounded on a
     # large board, for every mode this endpoint serves.
+    #
+    # fd5871a5 — when this call was scoped via selected_item_ids,
+    # _selected_scope_outcome (populated by generate_handoff above) carries
+    # the resolved dependency-closure ids. Resolve those to full item dicts
+    # and pass them as `items=` so this REST endpoint's capability_contract
+    # narrows to the SAME closure `content` was already scoped to — the
+    # exact transport-parity gap the MCP dispatch (mcp/handler.py) fixes for
+    # itself alongside this same change. None (unscoped) for every
+    # pre-existing call that never passes selected_item_ids.
+    _selected_closure_items = await handoff_module.resolve_closure_items_for_scope(
+        db, _selected_scope_outcome,
+    )
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id, board_stale=_board_stale,
+        items=_selected_closure_items,
         max_executor_contracts=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
         max_contract_list_items=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
     )
@@ -346,8 +359,14 @@ async def generate_handoff_endpoint(
     )
     # 6cdc5df3 — machine-readable proposal-to-evidence linkage; best-effort,
     # never breaks the mandatory handoff.
+    #
+    # fd5871a5 — same selected-item-scope narrowing as capability_contract
+    # just above: only proposals linked to an item in THIS scope are
+    # considered when this call was selected_item_ids-scoped. None
+    # (unscoped) otherwise — zero behavior change for that case.
     proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
         db, project_id,
+        item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
     )
     # d09c29fe — machine-readable DOCX-integrity gate; best-effort, never
     # breaks the mandatory handoff. Tied to the proposal evidence above so a
