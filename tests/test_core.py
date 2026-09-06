@@ -5661,6 +5661,89 @@ async def test_workspace_note_move_to_project(db):
 
 
 @pytest.mark.asyncio
+async def test_move_workspace_note_to_project_destination_tenant_note_untouched(db):
+    """84f77597 — destination side: a caller passing a DIFFERENT tenant_id
+    than the source note's owner must fail closed (source ownership is real
+    tenant enforcement here; see the function's own docstring for why the
+    destination *project* check is existence-only and enforcement for it
+    lives at the MCP layer instead — this proves the source-ownership half,
+    which mirrors test_delete_workspace_note_respects_tenant's shape)."""
+    p = await db_module.create_project(db, "move-target-tenant")
+    note = await db_module.add_workspace_note(
+        db, "tenant-a-note", "body", tenant_id="tenant-a"
+    )
+    # Wrong tenant: fails closed, nothing created, nothing removed.
+    assert await db_module.move_workspace_note_to_project(
+        db, note["id"], p["id"], tenant_id="tenant-b"
+    ) is None
+    assert await db_module.get_project_notes(db, p["id"]) == []
+    a_titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-a")}
+    assert a_titles == {"tenant-a-note"}
+    # Right tenant: succeeds.
+    moved = await db_module.move_workspace_note_to_project(
+        db, note["id"], p["id"], tenant_id="tenant-a"
+    )
+    assert moved is not None
+    assert moved["project_id"] == p["id"]
+
+
+@pytest.mark.asyncio
+async def test_move_workspace_note_to_project_race_compensates_duplicate(db, monkeypatch):
+    """84f77597 — if the workspace note is deleted (or moved) by a concurrent
+    caller between the initial read and the guarded delete, the just-created
+    project note must be compensated away (deleted) rather than left as a
+    silent duplicate, and the call must return None."""
+    from meridian.db import workspace as workspace_module
+
+    p = await db_module.create_project(db, "move-race-target")
+    note = await db_module.add_workspace_note(db, "race note", "body", "t1")
+
+    real_add_project_note = db_module.add_project_note
+
+    async def _add_project_note_then_concurrent_delete(*args, **kwargs):
+        # Simulate a sibling session deleting the same workspace note right
+        # after this function created the project note but before it could
+        # guard-delete the workspace note itself.
+        created = await real_add_project_note(*args, **kwargs)
+        await db_module.delete_workspace_note(db, note["id"])
+        return created
+
+    monkeypatch.setattr(
+        workspace_module, "add_project_note", _add_project_note_then_concurrent_delete
+    )
+
+    result = await db_module.move_workspace_note_to_project(db, note["id"], p["id"])
+
+    assert result is None
+    # The compensating delete must have removed the just-created project note
+    # — no duplicate left behind.
+    assert await db_module.get_project_notes(db, p["id"]) == []
+    # The workspace note is gone too (the simulated concurrent delete), but
+    # never duplicated back.
+    assert await db_module.get_workspace_notes(db) == []
+
+
+@pytest.mark.asyncio
+async def test_move_workspace_note_to_project_secret_body_leaves_source_intact(db):
+    """84f77597 — failure-path atomicity: if add_project_note's
+    check_for_secrets rejects the body (secret-shaped content), the raise
+    must propagate and the workspace note must remain exactly as it was —
+    nothing partially applied. add_project_note's check runs before its own
+    INSERT, so this is true by construction; this test proves it end to end
+    through move_workspace_note_to_project specifically."""
+    p = await db_module.create_project(db, "move-secret-target")
+    secret_body = "AKIAABCDEFGHIJKLMNOP"  # matches the aws-access-key-id pattern
+    note = await db_module.add_workspace_note(db, "secret note", secret_body)
+
+    with pytest.raises(ValueError, match="secret"):
+        await db_module.move_workspace_note_to_project(db, note["id"], p["id"])
+
+    # Nothing partially applied: workspace note intact, no project note created.
+    assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"secret note"}
+    assert await db_module.get_project_notes(db, p["id"]) == []
+
+
+@pytest.mark.asyncio
 async def test_workspace_decisions_isolated_by_tenant(db):
     """A decision pinned by tenant A must not be visible to tenant B."""
     await db_module.pin_workspace_decision(db, "A-arch", "A body", tenant_id="tenant-a")

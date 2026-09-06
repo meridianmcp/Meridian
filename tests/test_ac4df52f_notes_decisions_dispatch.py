@@ -81,6 +81,7 @@ EXPECTED_HANDLER_NAMES = [
     "handle_capture_research_finding",
     "handle_add_workspace_note",
     "handle_get_workspace_notes",
+    "handle_move_workspace_note_to_project",
     "handle_pin_workspace_decision",
     "handle_get_workspace_decisions",
     "handle_get_workspace_settings",
@@ -132,6 +133,7 @@ ALL_TOOL_NAMES = [
     "capture_research_finding",
     "add_workspace_note",
     "get_workspace_notes",
+    "move_workspace_note_to_project",
     "pin_workspace_decision",
     "get_workspace_decisions",
     "get_workspace_settings",
@@ -635,6 +637,36 @@ async def test_get_workspace_notes_handler_direct(db):
         db, _DATA_DIR, None, "t1",
     )
     assert isinstance(result, list)
+
+
+@pytest.mark.asyncio
+async def test_move_workspace_note_to_project_dispatch(db, project):
+    note = await db_module.add_workspace_note(db, "WS move note", "body")
+    result = await mh._handle_notes_decisions(
+        "move_workspace_note_to_project",
+        {"note_id": note["id"], "project_id": project["id"]},
+        db, _DATA_DIR, None, None,
+    )
+    assert result["project_id"] == project["id"]
+    assert await db_module.get_workspace_notes(db) == []
+
+
+@pytest.mark.asyncio
+async def test_move_workspace_note_to_project_handler_direct(db, project):
+    note = await db_module.add_workspace_note(db, "WS move note direct", "body")
+    result = await nd_mod.handle_move_workspace_note_to_project(
+        {"note_id": note["id"], "project_id": project["id"]},
+        db, _DATA_DIR, None, None,
+    )
+    assert result["project_id"] == project["id"]
+
+
+@pytest.mark.asyncio
+async def test_move_workspace_note_to_project_handler_direct_missing_args(db):
+    result = await nd_mod.handle_move_workspace_note_to_project(
+        {}, db, _DATA_DIR, None, None,
+    )
+    assert "error" in result
 
 
 # ---------------------------------------------------------------------------
@@ -1222,7 +1254,7 @@ async def test_link_table_caption_missing_doc(db, project):
 
 def test_handler_names_match_all_tools():
     """Sanity: EXPECTED_HANDLER_NAMES and ALL_TOOL_NAMES must be same length."""
-    assert len(EXPECTED_HANDLER_NAMES) == len(ALL_TOOL_NAMES) == 47
+    assert len(EXPECTED_HANDLER_NAMES) == len(ALL_TOOL_NAMES) == 48
 
 
 # ---------------------------------------------------------------------------

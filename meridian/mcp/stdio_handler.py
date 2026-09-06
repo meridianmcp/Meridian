@@ -1576,6 +1576,10 @@ def build_mcp_server():
                     "required": [],
                 },
             ),
+            # 84f77597 — _shared_tool() pulls the exact same schema HTTP/MCP
+            # advertises, so stdio can't drift out of sync with it (same
+            # pattern as get_workspace_proposals below).
+            _shared_tool("move_workspace_note_to_project"),
             _shared_tool("get_workspace_proposals"),
             Tool(
                 name="pin_workspace_decision",
@@ -2645,6 +2649,7 @@ def build_mcp_server():
                 "execute_batch",
                 "batch_read", "batch_mutate",
                 "add_workspace_note", "get_workspace_notes",
+                "move_workspace_note_to_project",
                 "get_workspace_proposals",
                 "pin_workspace_decision", "get_workspace_decisions",
                 # dffcde86 — dispatches to the _handle_file_claims group's

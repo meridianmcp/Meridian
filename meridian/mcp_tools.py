@@ -71,6 +71,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
+    "move_workspace_note_to_project": 'move_workspace_note_to_project(note_id="note-uuid", project_id="abc-123")',
     "add_workspace_proposal": 'add_workspace_proposal(title="IDEA: expose auth as plugin", body="Could ship auth as a separate optional plugin so self-hosters can swap it out", tags="arch")',
     "add_proposal": 'add_proposal(project_id="proj-uuid", title="Cache the parser output", body="Re-parsing on every call is slow; memoize by content hash", tags="perf")',
     "get_workspace_proposals": 'get_workspace_proposals(status="investigating")',
@@ -1889,6 +1890,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "tag": {"type": "string"}},
          "required": []}},
+    {"name": "move_workspace_note_to_project", "description":
+        "Reclassify a workspace-level note (visible across ALL projects) into a "
+        "single project's notes: copies title/body/tags to a new project note "
+        "then removes the workspace note. Tenant-safe on the source note "
+        "(scoped like every other workspace-note tool) and atomic-in-effect on "
+        "the write (a concurrent move/delete of the same note is detected and "
+        "compensated rather than silently duplicated). Returns the new project "
+        "note, or {error} if note_id is unknown/not yours, the destination "
+        "project doesn't exist, or a race already claimed the note.",
+     "inputSchema": {"type": "object", "properties": {
+         "note_id": {"type": "string", "description": "The workspace note's id, as returned by get_workspace_notes/add_workspace_note."},
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": ["note_id"]}},
     {"name": "pin_workspace_decision", "description":
         "Pin a workspace-level decision that applies across ALL projects (shared "
         "architecture, org-wide standards). Injected at the top of every project's "
@@ -3834,6 +3849,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     # workspace-level
     "add_workspace_note":              "workspace",
     "get_workspace_notes":             "workspace",
+    "move_workspace_note_to_project":  "workspace",
     "pin_workspace_decision":          "workspace",
     "get_workspace_decisions":         "workspace",
     "get_workspace_settings":          "workspace",
@@ -4101,6 +4117,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_workspace_decisions":   "both",
     "get_workspace_notes":       "both",
     "add_workspace_note":        "both",
+    "move_workspace_note_to_project": "both",
     "get_workspace_settings":    "both",
     "get_blog_posts":            "both",
     "request_hitl":              "both",
@@ -4363,6 +4380,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # workspace management (cross-project admin)
     "add_workspace_note":              "maintenance-only",
     "get_workspace_notes":             "maintenance-only",
+    "move_workspace_note_to_project":  "maintenance-only",
     "pin_workspace_decision":          "maintenance-only",
     "get_workspace_decisions":         "maintenance-only",
     "get_workspace_settings":          "maintenance-only",
@@ -4419,6 +4437,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "pin_workspace_decision": "Pin Workspace Decision",
     "get_workspace_notes": "Get Workspace Notes",
     "add_workspace_note": "Add Workspace Note",
+    "move_workspace_note_to_project": "Move Workspace Note to Project",
     "get_workspace_proposals": "Get Workspace Proposals",
     "add_workspace_proposal": "Add Workspace Proposal",
     "add_proposal": "Add Proposal",

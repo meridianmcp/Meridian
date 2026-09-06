@@ -2208,6 +2208,45 @@ async def handle_get_workspace_notes(
     )
 
 
+async def handle_move_workspace_note_to_project(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: move_workspace_note_to_project (84f77597).
+
+    Reclassifies a workspace-level note (visible across all projects) into a
+    single project's notes. The destination is deliberately named
+    ``project_id`` (with a ``project_name`` alternative, resolved to
+    ``project_id`` upstream in ``_dispatch_mcp_tool`` before this handler
+    runs) so it flows through the generic project-scope gate in
+    ``mcp/handler.py`` like every other project-scoped write tool — source
+    ownership is enforced by ``tenant_id`` inside
+    ``db_module.move_workspace_note_to_project`` itself; see that function's
+    docstring for the full tenant-safety and atomicity-in-effect rationale.
+    """
+    note_id = (args.get("note_id") or "").strip()
+    if not note_id:
+        return {"error": "note_id is required"}
+    project_id = (args.get("project_id") or "").strip()
+    if not project_id:
+        return {"error": "project_id (or project_name) is required"}
+    result = await db_module.move_workspace_note_to_project(
+        db, note_id, project_id, tenant_id=_mcp_tenant_id,
+    )
+    if result is None:
+        return {
+            "error": (
+                "could not move workspace note: note_id not found "
+                "(or not owned by this tenant), destination project not "
+                "found, or a concurrent move/delete already claimed it"
+            )
+        }
+    return result
+
+
 async def handle_pin_workspace_decision(
     args: dict[str, Any],
     db: Any,
