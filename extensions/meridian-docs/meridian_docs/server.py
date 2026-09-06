@@ -3025,6 +3025,114 @@ def apply_and_merge_batch_transform(
 
 
 @mcp.tool()
+def build_prose_edit_packet(
+    document_path: str,
+    anchor_query: dict[str, Any],
+    replacement_text: str,
+    section_role: str | None = None,
+    source_provenance: dict[str, Any] | str | None = None,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """4c992e91 -- build ONE reviewable, typed prose-edit packet for a
+    single anchor. READ-ONLY: resolves anchor_query the same way
+    locate_anchor does, against a fresh parse of document_path; never
+    mutates it.
+
+    Refuses (status="refused", no packet built) when replacement_text/
+    anchor_query are malformed, the anchor does not resolve cleanly, or the
+    resolved element is not prose (paragraph/heading only -- an equation,
+    caption, or table is refused so it can never be routed through the
+    plain-text prose writer).
+
+    Args:
+      document_path:                Document to build the packet against.
+                                    Never opened for writing.
+      anchor_query:                  A locate_anchor-style query dict.
+      replacement_text:              The new visible text for this anchor.
+      section_role:                  Optional caller classification of this
+                                    anchor's role (e.g. "abstract", "main")
+                                    -- carried through unchanged, not
+                                    validated here.
+      source_provenance:             Optional free-form metadata describing
+                                    where replacement_text came from --
+                                    hashed into source_provenance_hash,
+                                    never stored verbatim on the packet.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard (a prior locate_anchor/
+                                    read_document_snapshot result's
+                                    source_fingerprint).
+
+    Returns ``{packet_kind: "prose_edit", status: "built", document_path,
+    target_para_id, anchor_query, element_type, section_path, section_role,
+    expected_context_hash, replacement_text, source_provenance_hash,
+    base_docx_hash, built_at_source_fingerprint}`` on success, or
+    ``{packet_kind: "prose_edit", status: "refused", reason, anchor?}`` on
+    refusal. Pass the returned packet to apply_prose_edit_packets to
+    actually write it -- this call never touches disk beyond reading
+    document_path.
+    """
+    return docs_intel.build_prose_edit_packet(
+        document_path, anchor_query, replacement_text,
+        section_role=section_role,
+        source_provenance=source_provenance,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
+def apply_prose_edit_packets(
+    document_path: str,
+    packets: list[dict[str, Any]],
+    draft_output_path: str,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """4c992e91 -- re-resolve and apply a batch of build_prose_edit_packet
+    packets to an ISOLATED draft. document_path is opened read-only
+    throughout and is never the write target -- draft_output_path is.
+
+    ALL-OR-NOTHING: every packet's anchor is re-resolved fresh against
+    document_path's CURRENT content (the packet's own stored anchor/hashes
+    are never trusted blindly); if even one packet fails re-resolution or
+    drift-checking, NOTHING is written -- draft_output_path is never
+    created or partially written.
+
+    Drift is rejected with one of two distinguishable reasons:
+    "context_hash_mismatch" (this anchor's own text changed since the
+    packet was built -- checked first) vs. "base_docx_hash_mismatch" (this
+    anchor's text is unchanged, but the wider document changed). An anchor
+    that no longer resolves gets "anchor_unresolved"; two packets targeting
+    the same live anchor in one call get "duplicate_target_in_batch" on the
+    second. The prose-only element-type gate (paragraph/heading) is
+    re-checked here too, against the freshly resolved element_type --
+    defense in depth against a hand-edited packet or a document whose
+    element kind changed since the packet was built.
+
+    Args:
+      document_path:                The document to transform. Read-only.
+      packets:                       Non-empty list of build_prose_edit_
+                                    packet results (each must have
+                                    status="built").
+      draft_output_path:             Where to stage the transformed draft.
+                                    Must differ from document_path.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard checked before any packet is even
+                                    inspected.
+
+    Returns ``{applied: True, draft_output_path, source_fingerprint,
+    applied_packets, write_transaction}`` on success, or ``{applied: False,
+    reason: "batch_has_conflicts", conflicts, packet_count, ready_count}``
+    on failure (conflicts lists every failing packet, not just the first).
+    See docs_intel.apply_prose_edit_packets for the full contract. This is
+    a LOCAL staging step only -- pair with merge_docx_draft for the actual
+    promotion to a canonical document.
+    """
+    return docs_intel.apply_prose_edit_packets(
+        document_path, packets, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
 def audit_equation_integrity(document_path: str) -> dict[str, Any]:
     """3d0769ab (MDE-B1) -- read-only raw-OOXML equation INTEGRITY audit.
 

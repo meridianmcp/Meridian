@@ -19501,6 +19501,667 @@ def apply_and_merge_batch_transform(
 
 
 # ---------------------------------------------------------------------------
+# 4c992e91 (BE4ED581-W1) -- typed, reviewable PROSE-EDIT PACKETS with anchor
+# re-resolution and drift rejection.
+#
+# Builds ON TOP OF the declarative batch-transform layer directly above
+# (982f8564) rather than reimplementing anchor resolution, fingerprinting,
+# or staleness detection: every resolve/stale-check in this section
+# delegates to the SAME _resolve_anchor_query / _source_fingerprint /
+# _set_paragraph_text / _save_docx_xml_stdlib primitives locate_anchor and
+# the batch layer already use. No second anchor-resolution or XML-write
+# code path is introduced here.
+#
+# What this section adds that the generic batch layer does not have:
+#   * a distinct, TYPED packet (not a bag-of-dicts operation) for one
+#     specific case -- replacing the visible text of a PROSE element --
+#     with a named, reviewable field set instead of positional dict keys;
+#   * expected_context_hash: a sha256 digest of the anchor's live
+#     quoted_text at build time, in place of the batch layer's raw-text
+#     expected_quoted_text precondition -- a fixed-size, non-content-
+#     leaking value suitable for an audit log or a review UI;
+#   * base_docx_hash: a named alias of the same whole-document
+#     source_fingerprint the rest of this module already produces;
+#   * section_role and source_provenance_hash: caller-supplied review
+#     metadata this contract carries end-to-end but does not itself
+#     interpret.
+#
+# Deliberate scope decision (flagged during discovery, confirmed here): a
+# prose packet's mutable-element allow-list (_PROSE_MUTABLE_ELEMENT_TYPES)
+# is DELIBERATELY NARROWER than the generic batch layer's
+# _BATCH_MUTABLE_ELEMENT_TYPES. A caption or table is a labeled,
+# structurally-owned object, not "prose" in the sense this item means
+# (running text a reviewer reads and edits) -- so figure_caption/
+# table_caption/table are excluded here even though the generic batch layer
+# permits them. Equations are refused for the same reason the batch layer
+# refuses them: _set_paragraph_text is a plain-text writer that would
+# silently destroy <m:oMath> content if it ever ran against an
+# equation-typed anchor (see _validate_omml_structure /
+# test_omml_contract_semantics.py for the invariant this protects). The
+# equation/element-type exclusion is enforced TWICE -- once in
+# build_prose_edit_packet, again in apply_prose_edit_packets -- so a caller
+# who hand-edits a packet dict after building it, or a document whose
+# element kind changed out from under a stale packet, can never reach
+# _set_paragraph_text through this contract.
+#
+# IMPORTANT gating subtlety discovered while testing this item (see
+# _prose_effective_element_type's own docstring for the full trace): a
+# paragraph that contains ONLY an <m:oMath> equation and no <w:t> runs is
+# classified by _resolve_anchor_query's direct para_id lookup as an
+# ordinary, empty-text "paragraph" -- NOT "equation" -- because that lookup
+# checks the plain paragraph/heading/caption/table records before ever
+# consulting the separately-walked equations list. Gating on element_type
+# alone would therefore MISS exactly the case this item cares most about.
+# This is a real, PRE-EXISTING gap in the generic batch-transform layer
+# above too (confirmed live: an unmodified apply_batch_transform targeting
+# such a paragraph by para_id DOES flatten its OMML to plain text) -- out
+# of scope to fix here (it is a different, already-shipped function with
+# its own dedicated test suite and a shared-resolver blast radius well
+# beyond this item), but this contract must not inherit it, so both gates
+# below cross-reference target_para_id against the live equations list
+# directly via _prose_effective_element_type, never trusting element_type
+# by itself.
+#
+# Drift rejection reports TWO DISTINCT, machine-checkable reasons rather
+# than one generic "stale" (see apply_prose_edit_packets's docstring):
+# context_hash_mismatch (this specific anchor's own text changed) vs.
+# base_docx_hash_mismatch (the document changed somewhere else, but this
+# anchor's text is untouched). Note these are not symmetric: because
+# base_docx_hash is a whole-FILE byte hash, any edit to the anchor's own
+# text necessarily also changes it -- so context_hash_mismatch is checked
+# and reported FIRST (the more specific, actionable cause), and
+# base_docx_hash_mismatch is only reported when context_hash still matches
+# but the wider document moved anyway.
+# ---------------------------------------------------------------------------
+
+PROSE_PACKET_KIND = "prose_edit"
+
+PROSE_PACKET_STATUS_BUILT = "built"
+PROSE_PACKET_STATUS_REFUSED = "refused"
+PROSE_PACKET_STATUSES: tuple[str, ...] = (PROSE_PACKET_STATUS_BUILT, PROSE_PACKET_STATUS_REFUSED)
+
+# Deliberately narrower than _BATCH_MUTABLE_ELEMENT_TYPES -- see module
+# comment above. Equations are never in this set.
+_PROSE_MUTABLE_ELEMENT_TYPES: frozenset[str] = frozenset({"paragraph", "heading"})
+
+PROSE_APPLY_REASON_INVALID_PACKET = "invalid_packet"
+PROSE_APPLY_REASON_ANCHOR_UNRESOLVED = "anchor_unresolved"
+PROSE_APPLY_REASON_UNSUPPORTED_ELEMENT_TYPE = "unsupported_element_type"
+PROSE_APPLY_REASON_CONTEXT_HASH_MISMATCH = "context_hash_mismatch"
+PROSE_APPLY_REASON_BASE_DOCX_HASH_MISMATCH = "base_docx_hash_mismatch"
+PROSE_APPLY_REASON_DUPLICATE_TARGET = "duplicate_target_in_batch"
+
+
+def _prose_context_hash(text: "str | None") -> str:
+    """Deterministic sha256 hex digest of an anchor's exact quoted_text.
+
+    Hashing (rather than storing the raw string the way the older
+    ``expected_quoted_text`` batch precondition does) keeps a prose-edit
+    packet's reviewable manifest a fixed size regardless of paragraph
+    length, and gives per-anchor content the same tamper-evidence property
+    ``_source_fingerprint`` already gives the whole document.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _prose_provenance_hash(source_provenance: "dict[str, Any] | str | None") -> "str | None":
+    """Deterministic sha256 over caller-supplied replacement-text provenance.
+
+    ``source_provenance`` is free-form caller metadata describing WHERE the
+    replacement text came from (e.g. ``{"origin": "human_edit", "author":
+    "..."}`` or ``{"origin": "llm_generated", "model": "..."}`` or a plain
+    descriptive string) -- this module does not prescribe its schema, only
+    that it hashes deterministically so two packets built from identically-
+    sourced text produce an identical hash, and the hash can be compared or
+    audited without re-transmitting the (possibly large) source text
+    itself. A dict is canonicalized via sort_keys JSON before hashing so
+    key order never affects the digest. Returns ``None`` (no provenance
+    claimed) when ``source_provenance`` is ``None`` -- provenance is
+    optional review metadata, not a required precondition for applying a
+    packet.
+    """
+    if source_provenance is None:
+        return None
+    if isinstance(source_provenance, dict):
+        payload = json.dumps(source_provenance, sort_keys=True, default=str).encode("utf-8")
+    else:
+        payload = str(source_provenance).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _prose_effective_element_type(
+    element_type: "str | None",
+    target_para_id: "str | None",
+    equations: "list[dict[str, Any]]",
+) -> "str | None":
+    """The element type to actually GATE prose-edit packets on -- ``"equation"``
+    whenever ``target_para_id`` carries an OMML equation, regardless of what
+    ``_resolve_anchor_query``'s own generic record classification reported
+    for it.
+
+    This closes a real, PRE-EXISTING gap shared with the generic
+    batch-transform layer above (982f8564): a paragraph containing ONLY
+    ``<m:oMath>`` (no ``<w:t>`` runs) is classified as an ordinary,
+    empty-text ``"paragraph"`` by ``_iter_anchor_records``'s own walk --
+    it is ``parse_docx_equations_local``'s SEPARATE walk that actually
+    knows this paragraph is math. ``_resolve_anchor_query``'s direct
+    ``para_id`` lookup checks ``records`` (paragraphs/headings/captions/
+    tables) BEFORE ever falling back to the equations list, so querying
+    ``{"para_id": "<the equation paragraph's id>"}`` resolves with
+    ``element_type="paragraph"`` and empty ``quoted_text"`` -- gating on
+    ``element_type`` alone would silently miss this case. Confirmed live
+    against the existing, unmodified ``apply_batch_transform``: targeting
+    such a paragraph by ``para_id`` currently DOES flatten its OMML to a
+    plain-text run (a latent defect in the pre-existing batch layer,
+    flagged separately for its own fix -- out of this item's scope, which
+    is this NEW prose-edit contract only). This contract must not inherit
+    that hole, so it is closed here independently by cross-referencing
+    ``target_para_id`` against the equations list directly, never trusting
+    ``element_type`` alone.
+    """
+    if target_para_id is not None and any(
+        eq.get("para_id") == target_para_id for eq in equations
+    ):
+        return "equation"
+    return element_type
+
+
+def build_prose_edit_packet(
+    document_path: str,
+    anchor_query: "dict[str, Any]",
+    replacement_text: str,
+    *,
+    section_role: "str | None" = None,
+    source_provenance: "dict[str, Any] | str | None" = None,
+    expected_source_fingerprint: "str | None" = None,
+) -> dict[str, Any]:
+    """Build ONE reviewable, typed prose-edit packet for a single anchor.
+
+    READ-ONLY: resolves ``anchor_query`` via the exact same
+    :func:`_resolve_anchor_query` that :func:`locate_anchor` and the
+    declarative batch-transform layer already use, against a fresh parse of
+    ``document_path``. Never opens the document for writing, never mutates
+    it.
+
+    Args:
+      document_path:                Document to build the packet against.
+                                    Never opened for writing.
+      anchor_query:                  A ``locate_anchor``-style query dict
+                                    (``para_id`` / ``section_path`` /
+                                    ``section_text`` / ``caption_label`` /
+                                    ``text``, optionally ``element_types``).
+      replacement_text:              The new visible text for this anchor.
+                                    Must be a ``str``.
+      section_role:                  Optional caller-supplied classification
+                                    of this anchor's role in the document
+                                    (e.g. ``"abstract"``, ``"main"``,
+                                    ``"appendix"``) -- carried through to the
+                                    packet and back out of
+                                    ``apply_prose_edit_packets``'s
+                                    ``applied_packets`` unchanged; this
+                                    function does not itself validate or
+                                    classify it.
+      source_provenance:             Optional free-form metadata describing
+                                    where ``replacement_text`` came from
+                                    (see :func:`_prose_provenance_hash`).
+                                    Hashed, never stored verbatim on the
+                                    packet.
+      expected_source_fingerprint:   Optional whole-document staleness guard
+                                    (a prior ``locate_anchor``/
+                                    ``read_document_snapshot`` result's
+                                    ``source_fingerprint``) -- checked
+                                    before any anchor resolution is even
+                                    attempted, so a caller building a
+                                    packet against an already-known-stale
+                                    document gets an explicit refusal
+                                    instead of a packet built against
+                                    unexpected content.
+
+    Refuses (returns ``{"packet_kind": "prose_edit", "status": "refused",
+    "reason": ...}``, no packet built -- and no expensive hashing performed)
+    when:
+      * ``replacement_text`` is not a ``str``, or ``anchor_query`` is not a
+        non-empty dict;
+      * the anchor does not resolve cleanly (``not_found``/``ambiguous``/
+        ``stale`` -- the anchor's own result is echoed back under
+        ``"anchor"`` so the caller sees exactly why);
+      * the resolved ``element_type`` is not in
+        :data:`_PROSE_MUTABLE_ELEMENT_TYPES` -- most importantly this means
+        an ``"equation"`` anchor is refused immediately, before any hash is
+        computed, so a caller can never build a packet whose apply step
+        would find a route to overwrite OMML with plain text.
+
+    On success returns:
+    ``{"packet_kind": "prose_edit", "status": "built", "document_path",
+    "target_para_id", "anchor_query", "element_type", "section_path",
+    "section_role", "expected_context_hash", "replacement_text",
+    "source_provenance_hash", "base_docx_hash",
+    "built_at_source_fingerprint"}``. ``base_docx_hash`` and
+    ``built_at_source_fingerprint`` are the same value (both are the
+    document's ``source_fingerprint`` at build time) -- the first name
+    matches this item's own vocabulary, the second matches the rest of this
+    module's ``locate_anchor``/batch-transform naming; both are kept so a
+    caller can match on either.
+    """
+    if not isinstance(replacement_text, str):
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": "replacement_text must be a string",
+        }
+    if not isinstance(anchor_query, dict) or not anchor_query:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": "anchor_query must be a non-empty locate_anchor-style query dict",
+        }
+
+    # Own fresh parse (rather than delegating to locate_anchor) so this
+    # function has direct access to the equations list -- required for the
+    # equation-bearing cross-check in _prose_effective_element_type above,
+    # which locate_anchor's own return value does not expose.
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": str(exc),
+        }
+
+    source_fingerprint = _source_fingerprint(raw)
+    if expected_source_fingerprint and expected_source_fingerprint != source_fingerprint:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": "source_fingerprint_mismatch",
+            "anchor": {
+                "status": "stale",
+                "document_path": document_path,
+                "reason": "source_fingerprint_mismatch",
+                "expected_source_fingerprint": expected_source_fingerprint,
+                "source_fingerprint": source_fingerprint,
+                "candidates": [],
+            },
+        }
+
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": str(exc),
+        }
+
+    anchor = _resolve_anchor_query(
+        records, equations, anchor_query,
+        document_path=document_path, source_fingerprint=source_fingerprint,
+    )
+    if anchor.get("status") != "resolved":
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": (
+                anchor.get("reason")
+                or f"anchor did not resolve (status={anchor.get('status')!r})"
+            ),
+            "anchor": anchor,
+        }
+
+    target_para_id = anchor["target_para_id"]
+    effective_element_type = _prose_effective_element_type(
+        anchor.get("element_type"), target_para_id, equations,
+    )
+    if effective_element_type not in _PROSE_MUTABLE_ELEMENT_TYPES:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": (
+                f"unsupported_element_type: {effective_element_type!r} is not "
+                f"prose -- prose-edit packets are scoped to "
+                f"{sorted(_PROSE_MUTABLE_ELEMENT_TYPES)} only; an equation, "
+                "caption, or table must never be routed through the "
+                "plain-text prose writer"
+            ),
+            "effective_element_type": effective_element_type,
+            "anchor": anchor,
+        }
+
+    return {
+        "packet_kind": PROSE_PACKET_KIND,
+        "status": PROSE_PACKET_STATUS_BUILT,
+        "document_path": document_path,
+        "target_para_id": target_para_id,
+        "anchor_query": dict(anchor_query),
+        "element_type": effective_element_type,
+        "section_path": anchor.get("section_path"),
+        "section_role": section_role,
+        "expected_context_hash": _prose_context_hash(anchor.get("quoted_text")),
+        "replacement_text": replacement_text,
+        "source_provenance_hash": _prose_provenance_hash(source_provenance),
+        "base_docx_hash": anchor["source_fingerprint"],
+        "built_at_source_fingerprint": anchor["source_fingerprint"],
+    }
+
+
+def _prose_packet_structural_error(packet: "dict[str, Any]") -> "str | None":
+    """Structural validation only -- no document access. Returns an error
+    string when ``packet`` is not a well-formed, successfully-built prose
+    packet; ``None`` when it is well-formed enough to attempt resolution."""
+    if not isinstance(packet, dict):
+        return "packet must be a dict"
+    if packet.get("packet_kind") != PROSE_PACKET_KIND:
+        return f"packet_kind must be {PROSE_PACKET_KIND!r}"
+    if packet.get("status") != PROSE_PACKET_STATUS_BUILT:
+        return (
+            f"packet.status must be {PROSE_PACKET_STATUS_BUILT!r} "
+            "(this packet was refused at build time and was never "
+            "buildable in the first place)"
+        )
+    if not isinstance(packet.get("anchor_query"), dict) or not packet["anchor_query"]:
+        return "packet.anchor_query must be a non-empty dict"
+    if not isinstance(packet.get("replacement_text"), str):
+        return "packet.replacement_text must be a string"
+    if not isinstance(packet.get("expected_context_hash"), str) or not packet["expected_context_hash"]:
+        return "packet.expected_context_hash must be a non-empty string"
+    if not isinstance(packet.get("base_docx_hash"), str) or not packet["base_docx_hash"]:
+        return "packet.base_docx_hash must be a non-empty string"
+    return None
+
+
+def apply_prose_edit_packets(
+    document_path: str,
+    packets: "list[dict[str, Any]]",
+    draft_output_path: str,
+    *,
+    expected_source_fingerprint: "str | None" = None,
+) -> dict[str, Any]:
+    """Re-resolve and apply a batch of :func:`build_prose_edit_packet`
+    packets to an ISOLATED draft.
+
+    ``document_path`` is opened READ-ONLY throughout this call and is NEVER
+    the write target -- ``draft_output_path`` is. ALL-OR-NOTHING, exactly
+    like :func:`apply_batch_transform`: if even ONE packet fails
+    re-resolution or drift-checking, NOTHING is written --
+    ``draft_output_path`` is never created or partially written -- and this
+    returns a rejection manifest naming every failing packet.
+
+    Every packet's anchor is RE-RESOLVED fresh against the CURRENT on-disk
+    content of ``document_path`` (the packet's own stored anchor/hashes are
+    never trusted blindly) via the same :func:`_resolve_anchor_query`
+    ``locate_anchor``/``plan_batch_transform`` already use. The prose-only
+    element-type gate (:data:`_PROSE_MUTABLE_ELEMENT_TYPES`) is re-checked
+    here too, against the FRESHLY resolved ``element_type`` -- defense in
+    depth against a caller who hand-edited a packet dict after
+    :func:`build_prose_edit_packet` returned it, or against the document
+    having changed an element's kind out from under a stale packet.
+
+    Drift is rejected with one of two DISTINGUISHABLE reasons (see the
+    module comment above this section for why they are not symmetric):
+      * ``"context_hash_mismatch"`` -- this specific anchor's own text
+        changed since the packet was built (checked first: the more
+        specific, actionable cause);
+      * ``"base_docx_hash_mismatch"`` -- this anchor's text is unchanged,
+        but the wider document changed since the packet was built.
+    A packet whose anchor no longer resolves at all (deleted paragraph) or
+    resolves ambiguously gets ``"anchor_unresolved"``; two packets in the
+    same call targeting the same live anchor get
+    ``"duplicate_target_in_batch"`` on the second one.
+
+    Args:
+      document_path:                The document to transform. Read-only.
+      packets:                       Non-empty list of
+                                    :func:`build_prose_edit_packet` results
+                                    (each must have
+                                    ``status == "built"``).
+      draft_output_path:             Where to stage the transformed draft.
+                                    MUST differ from ``document_path``.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard checked BEFORE any packet is even
+                                    inspected -- a mismatch here short-
+                                    circuits with
+                                    ``"document_changed_before_apply"``
+                                    rather than a per-packet conflict list.
+
+    Returns on success: ``{"applied": True, "draft_output_path",
+    "source_fingerprint" (pre-apply), "applied_packets": [...one entry per
+    paragraph actually rewritten, {"index", "target_para_id",
+    "section_role"}...], "write_transaction" (the ``_save_docx_xml_stdlib``
+    transaction dict for the DRAFT write itself)}``.
+
+    Returns on failure: ``{"applied": False, "reason": "batch_has_conflicts",
+    "conflicts": [{"index", "reason", "detail", "anchor"}, ...],
+    "packet_count", "ready_count"}`` -- ``draft_output_path`` untouched. A
+    malformed ``draft_output_path``, an unreadable ``document_path``, or a
+    whole-document staleness mismatch returns ``{"applied": False,
+    "error"/"reason": ...}`` before any packet is inspected.
+    """
+    if not isinstance(packets, list) or not packets:
+        return {"applied": False, "error": "packets must be a non-empty list"}
+    if not draft_output_path or not str(draft_output_path).strip():
+        return {"applied": False, "error": "draft_output_path is required"}
+    if os.path.normcase(os.path.abspath(draft_output_path)) == os.path.normcase(os.path.abspath(document_path)):
+        return {
+            "applied": False,
+            "error": (
+                "draft_output_path must differ from document_path -- a "
+                "prose-edit packet's output must be an isolated draft "
+                "artifact, never the source document itself"
+            ),
+        }
+
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"applied": False, "error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    if expected_source_fingerprint and expected_source_fingerprint != source_fingerprint:
+        return {
+            "applied": False,
+            "reason": "document_changed_before_apply",
+            "error": (
+                "document_path has changed since expected_source_fingerprint "
+                "was captured -- refusing to even attempt re-resolution "
+                "against content this call was not invoked against"
+            ),
+            "expected_source_fingerprint": expected_source_fingerprint,
+            "source_fingerprint": source_fingerprint,
+        }
+
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {"applied": False, "error": str(exc)}
+
+    conflicts: "list[dict[str, Any]]" = []
+    ready: "list[dict[str, Any]]" = []
+    seen_targets: "dict[str, int]" = {}
+
+    for index, packet in enumerate(packets):
+        structural_error = _prose_packet_structural_error(packet)
+        if structural_error:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_INVALID_PACKET,
+                "detail": structural_error,
+                "anchor": None,
+            })
+            continue
+
+        anchor = _resolve_anchor_query(
+            records, equations, packet["anchor_query"],
+            document_path=document_path, source_fingerprint=source_fingerprint,
+        )
+        if anchor.get("status") != "resolved":
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_ANCHOR_UNRESOLVED,
+                "detail": anchor.get("reason") or f"status={anchor.get('status')!r}",
+                "anchor": anchor,
+            })
+            continue
+
+        target_para_id = anchor["target_para_id"]
+        effective_element_type = _prose_effective_element_type(
+            anchor.get("element_type"), target_para_id, equations,
+        )
+        if effective_element_type not in _PROSE_MUTABLE_ELEMENT_TYPES:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_UNSUPPORTED_ELEMENT_TYPE,
+                "detail": (
+                    f"{effective_element_type!r} is not prose-mutable "
+                    f"({sorted(_PROSE_MUTABLE_ELEMENT_TYPES)}) -- refusing "
+                    "to route this packet through the plain-text prose "
+                    "writer"
+                ),
+                "effective_element_type": effective_element_type,
+                "anchor": anchor,
+            })
+            continue
+
+        if target_para_id in seen_targets:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_DUPLICATE_TARGET,
+                "detail": (
+                    f"target_para_id {target_para_id!r} is also targeted by "
+                    f"the packet at index {seen_targets[target_para_id]} "
+                    "earlier in this same apply call -- two packets may "
+                    "never target the same live anchor in one apply"
+                ),
+                "anchor": anchor,
+            })
+            continue
+
+        # Content-level drift, checked BEFORE whole-document drift -- see
+        # the module comment above for why these two are not symmetric.
+        live_context_hash = _prose_context_hash(anchor.get("quoted_text"))
+        if live_context_hash != packet["expected_context_hash"]:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_CONTEXT_HASH_MISMATCH,
+                "detail": (
+                    "this anchor's live text no longer matches the context "
+                    "this packet was built against -- the paragraph itself "
+                    "was edited since build_prose_edit_packet ran"
+                ),
+                "anchor": anchor,
+            })
+            continue
+
+        # Whole-document drift: this anchor's own content is untouched, but
+        # something ELSE in the document changed since this packet was
+        # built -- reject conservatively rather than assume an unrelated
+        # change is safe to ignore.
+        if anchor["source_fingerprint"] != packet["base_docx_hash"]:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_BASE_DOCX_HASH_MISMATCH,
+                "detail": (
+                    "document_path's whole-file content has changed since "
+                    "this packet was built, even though this specific "
+                    "anchor's own text is unchanged -- refusing to apply "
+                    "against a document state this packet was not built "
+                    "against"
+                ),
+                "anchor": anchor,
+            })
+            continue
+
+        seen_targets[target_para_id] = index
+        ready.append({
+            "index": index, "packet": packet, "anchor": anchor,
+            "target_para_id": target_para_id,
+        })
+
+    if conflicts:
+        return {
+            "applied": False,
+            "reason": "batch_has_conflicts",
+            "conflicts": conflicts,
+            "packet_count": len(packets),
+            "ready_count": len(ready),
+        }
+
+    try:
+        raw_for_write, root = _load_docx_xml_stdlib(document_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"applied": False, "error": str(exc)}
+
+    if _source_fingerprint(raw_for_write) != source_fingerprint:
+        return {
+            "applied": False,
+            "reason": "document_changed_during_apply",
+            "error": (
+                "document_path changed on disk between resolution and "
+                "write -- refusing to apply against content that was not "
+                "just re-resolved; re-run apply_prose_edit_packets"
+            ),
+        }
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"applied": False, "error": f"{document_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+
+    def _find_paragraph(target_id: str) -> "ET.Element | None":
+        for p in body:
+            if p.tag == w_p and p.get(w14_para_id) == target_id:
+                return p
+        return None
+
+    applied: "list[dict[str, Any]]" = []
+    for entry in ready:
+        target_para_id = entry["target_para_id"]
+        el = _find_paragraph(target_para_id)
+        if el is None:
+            return {
+                "applied": False,
+                "reason": "element_vanished_during_apply",
+                "error": (
+                    f"packet at index {entry['index']}'s target "
+                    f"{target_para_id!r} could not be re-located in the "
+                    "live XML tree during apply -- aborting the whole "
+                    "batch, draft_output_path is untouched"
+                ),
+            }
+        _set_paragraph_text(el, entry["packet"]["replacement_text"])
+        applied.append({
+            "index": entry["index"],
+            "target_para_id": target_para_id,
+            "section_role": entry["packet"].get("section_role"),
+        })
+
+    try:
+        write_transaction = _save_docx_xml_stdlib(raw_for_write, root, draft_output_path)
+    except DocxWriteVerificationError as exc:
+        return {
+            "applied": False,
+            "reason": "draft_write_verification_failed",
+            "error": str(exc),
+        }
+    except OSError as exc:
+        return {"applied": False, "error": f"could not write {draft_output_path}: {exc}"}
+
+    return {
+        "applied": True,
+        "draft_output_path": draft_output_path,
+        "source_fingerprint": source_fingerprint,
+        "applied_packets": applied,
+        "write_transaction": write_transaction,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 3d0769ab (MDE-B1 P0) -- raw-OOXML equation integrity auditor + golden
 # fixtures.
 #
