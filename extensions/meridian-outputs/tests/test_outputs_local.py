@@ -8853,3 +8853,121 @@ class TestScaleTelemetry:
             assert idx._current_process_rss_bytes() is None
         finally:
             idx.close()
+
+
+# ---------------------------------------------------------------------------
+# compact_to() -- DuckDB's own VACUUM does not reclaim space (fa600e42)
+# ---------------------------------------------------------------------------
+
+@duckdb_required
+class TestCompactTo:
+    """confirmed live before implementing: DuckDB's VACUUM is a no-op for
+    file size in this version -- the only verified-working compaction
+    mechanism is ATTACH + COPY FROM DATABASE to a fresh file."""
+
+    def test_compact_to_produces_a_readable_copy_with_same_rows(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+        new_path = str(tmp_path / "compacted.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            count = idx.rebuild()
+            assert count == 2
+            idx.compact_to(new_path)
+            assert os.path.exists(new_path)
+
+            import duckdb
+            con = duckdb.connect(new_path, read_only=True)
+            try:
+                assert con.execute(
+                    "SELECT COUNT(*) FROM outputs_index"
+                ).fetchone()[0] == 2
+            finally:
+                con.close()
+        finally:
+            idx.close()
+
+    def test_compact_to_leaves_original_db_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+        new_path = str(tmp_path / "compacted.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx.rebuild()
+            idx.compact_to(new_path)
+            # The original instance/connection must still work normally --
+            # compact_to must never repoint or invalidate it.
+            assert idx.search("col") or idx.resolve_output(
+                str(tmp_path / "a.csv")
+            ) is not None
+            assert idx._db_path == db_path
+        finally:
+            idx.close()
+
+    def test_compact_to_rejects_memory_mode(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            with pytest.raises(ValueError, match=":memory:"):
+                idx.compact_to(str(tmp_path / "compacted.duckdb"))
+        finally:
+            idx.close()
+
+    def test_compact_to_rejects_same_path_as_source(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx.rebuild()
+            with pytest.raises(ValueError):
+                idx.compact_to(db_path)
+        finally:
+            idx.close()
+
+    def test_compact_to_actually_reclaims_space_after_heavy_churn(
+        self, tmp_path: Path,
+    ) -> None:
+        """The actual point of this method: verified end to end, not just
+        that it runs without error. Large content churned via repeated
+        rebuild()s (each rewriting the same paths) must leave the ORIGINAL
+        file bloated relative to live content, while the COMPACTED copy is
+        substantially smaller."""
+        big = "x" * 200_000
+        paths = [tmp_path / f"f{i}.csv" for i in range(20)]
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            for p in paths:
+                p.write_text(f"col\n{big}", encoding="utf-8")
+            idx.rebuild()
+            idx._connect().execute("CHECKPOINT")
+            # Churn: rewrite every file's content several times, CHECKPOINTing
+            # after each rebuild() so every old version is actually durably
+            # persisted to on-disk row-group storage before Phase 2's
+            # DELETE+INSERT-OR-REPLACE write path replaces it -- otherwise
+            # (confirmed live) DuckDB can coalesce same-call overwrites
+            # within one WAL cycle with nothing left to reclaim, and a
+            # single checkpoint_threshold=1GB deferred final checkpoint
+            # (see the earlier fa600e42 fix) makes the raw file size an
+            # unrelated, misleadingly-small artifact of checkpoint timing
+            # rather than a measurement of the churn this test cares about.
+            for _ in range(5):
+                for i, p in enumerate(paths):
+                    p.write_text(f"col\n{big}{i}", encoding="utf-8")
+                idx.rebuild()
+                idx._connect().execute("CHECKPOINT")
+            original_size = os.path.getsize(db_path)
+
+            new_path = str(tmp_path / "compacted.duckdb")
+            idx.compact_to(new_path)
+            compacted_size = os.path.getsize(new_path)
+
+            assert compacted_size < original_size, (
+                f"expected compaction to shrink the file "
+                f"(original={original_size}, compacted={compacted_size})"
+            )
+        finally:
+            idx.close()
