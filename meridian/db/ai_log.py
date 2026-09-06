@@ -52,6 +52,20 @@ Large opaque blobs (a full tool result, an LLM body) referenced FROM a
 payload rather than inlined into it are handled by the sibling module
 :mod:`meridian.artifact_store` — see its own docstring for the local-first,
 content-addressed design (and the Redis-read-acceleration design note).
+
+d26b9943 (R2-B) — EXACT-FIRST SCOPED SEARCH
+--------------------------------------------
+:func:`search_events` adds a bounded, cursor-paginated, exact-match query
+over ``ai_log_events`` (session/tenant/correlation/parent/actor-kind/
+actor-id/event-type equality plus an inclusive ``occurred_at`` range) — see
+its own docstring for the full filter/pagination/``index_status`` contract.
+This ships the "exact-first" half of Round 1 proposal e143949d's design
+investigation (item 14009d86); the lexical (DuckDB/BM25) and semantic
+rerank layers that design also sketched (an ``AiLogFtsIndex`` module, a
+``meridian/retrieval.py`` orchestrator) are deliberately DEFERRED to a
+future item — nothing in this codebase indexes these rows today, so
+``search_events`` never claims otherwise (its ``index_status`` is always
+the honest ``"exact_only"``). Read-only; adds no new write path.
 """
 from __future__ import annotations
 
@@ -314,6 +328,159 @@ async def list_events(
 
 
 # ---------------------------------------------------------------------------
+# d26b9943 (R2-B) — exact-first scoped search
+# ---------------------------------------------------------------------------
+
+async def search_events(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    session_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+    correlation_id: "str | None" = None,
+    parent_event_id: "str | None" = None,
+    actor_kind: "str | None" = None,
+    actor_id: "str | None" = None,
+    event_type: "str | None" = None,
+    since_occurred_at: "str | None" = None,
+    until_occurred_at: "str | None" = None,
+    cursor: int = 0,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """d26b9943 (R2-B) — EXACT-MATCH scoped search over ``ai_log_events``,
+    with bounded, deterministic, cursor-based pagination.
+
+    SCOPE — read this before adding a fuzzy/semantic parameter here. Every
+    filter this function accepts is a plain SQL equality (or, for the two
+    ``occurred_at`` bounds, a plain inequality) predicate against a real
+    column on ``ai_log_events`` — the same ``col = ?`` idiom
+    :func:`list_events` already uses, chosen deliberately over
+    ``LIKE``/``ILIKE`` because every one of these fields (project/session/
+    correlation/actor/event-type identity) is an exact-identity value, never
+    free text. There is no lexical (FTS/BM25) or semantic (embedding)
+    layer anywhere in this codebase today — see this module's own docstring
+    and :mod:`meridian.ai_log`'s SCOPE note — so ``index_status`` in the
+    returned envelope is always the honest, static value ``"exact_only"``.
+    It exists as a forward-compatible signal for a future indexed layer
+    (proposed, NOT built, by sprint item 14009d86's design investigation):
+    when that lands, it would report a real state (e.g. ``"building"`` /
+    ``"ready"`` / ``"degraded"``) for a project catching up on a backlog,
+    and any new ranking parameter it adds MUST compose as an additional
+    narrowing filter/re-rank on top of these exact predicates — it must
+    never widen a result past what these exact filters already matched, and
+    must never replace one of these exact predicates with a fuzzy one. This
+    function accepting only exact-match keyword arguments (no ``**kwargs``
+    passthrough) is itself part of that guard: there is no way to smuggle a
+    fuzzy parameter through this signature without a deliberate, reviewed
+    change to it.
+
+    Filters (all optional except ``project_id``, all AND-ed together —
+    adding more filters only ever narrows the result set):
+      ``session_id``, ``tenant_id``, ``correlation_id``, ``parent_event_id``,
+      ``actor_kind``, ``actor_id``, ``event_type`` — exact equality, same
+      columns :func:`list_events`/:func:`build_run_timeline` already filter
+      on (plus ``tenant_id``/``actor_kind``/``actor_id``, which those two
+      don't expose).
+      ``since_occurred_at`` / ``until_occurred_at`` — inclusive bounds on
+      the envelope's ``occurred_at`` column (an ISO-8601 ``...Z`` string,
+      lexicographically comparable — see :mod:`meridian.ai_log`'s docs and
+      :func:`build_run_timeline`'s own ``since_occurred_at`` note).
+
+    Ordering: ``recorded_at DESC, id DESC`` — identical newest-recorded-
+    first, deterministically-tiebroken contract :func:`list_events` already
+    promises (this is a scoped SEARCH/browse over stored events, not
+    :func:`build_run_timeline`'s causal-replay reconstruction, so it
+    deliberately shares list_events' ordering semantics, not that
+    function's).
+
+    Pagination: an integer OFFSET cursor into that fully-ordered result set
+    — the same contract as ``db.get_project_notes_page`` /
+    ``db.get_sprint_items_page`` (pass a prior response's ``next_cursor``
+    back in). One extra row is fetched internally to compute ``has_more``
+    without a second query. ``limit`` is clamped to 1..500 (mirrors
+    :func:`list_events`'s UI-oriented ceiling — this is a browsing search,
+    not :func:`export_events`'s as-complete-as-practical bulk read).
+
+    Returns ``{project_id, filters, events, total_count, has_more,
+    next_cursor, index_status}``. ``filters`` echoes back exactly what was
+    applied (omitting keys left at their default ``None``) so a caller can
+    tell "no session_id filter" apart from a session_id that matched
+    nothing.
+
+    Raises ``ValueError`` if ``project_id`` is falsy (mirrors
+    :func:`export_events`/:func:`purge_events_before` — every durable ai_log
+    read/write in this module is explicitly project-scoped).
+    """
+    if not project_id:
+        raise ValueError("project_id is required")
+    limit = max(1, min(int(limit or 50), 500))
+    cursor = max(0, int(cursor or 0))
+
+    clauses = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    applied_filters: dict[str, Any] = {}
+    for col, value in (
+        ("session_id", session_id),
+        ("tenant_id", tenant_id),
+        ("correlation_id", correlation_id),
+        ("parent_event_id", parent_event_id),
+        ("actor_kind", actor_kind),
+        ("actor_id", actor_id),
+        ("event_type", event_type),
+    ):
+        if value is not None:
+            clauses.append(f"{col} = ?")
+            params.append(value)
+            applied_filters[col] = value
+    if since_occurred_at is not None:
+        clauses.append("occurred_at >= ?")
+        params.append(since_occurred_at)
+        applied_filters["since_occurred_at"] = since_occurred_at
+    if until_occurred_at is not None:
+        clauses.append("occurred_at <= ?")
+        params.append(until_occurred_at)
+        applied_filters["until_occurred_at"] = until_occurred_at
+
+    where = " AND ".join(clauses)
+
+    async with db.execute(
+        f"SELECT COUNT(*) AS c FROM ai_log_events WHERE {where}", tuple(params),
+    ) as ccur:
+        crow = await ccur.fetchone()
+    total_count = int(crow["c"] if isinstance(crow, dict) else crow[0]) if crow else 0
+
+    # Fetch limit+1 (the get_project_notes_page probe-row technique) so
+    # has_more is known without a second COUNT-with-offset query.
+    page_sql = (
+        f"SELECT * FROM ai_log_events WHERE {where} "
+        "ORDER BY recorded_at DESC, id DESC LIMIT ? OFFSET ?"
+    )
+    async with db.execute(page_sql, (*params, limit + 1, cursor)) as cur:
+        rows = await cur.fetchall()
+    decoded: list[dict[str, Any]] = []
+    for r in rows:
+        d = _deserialize_event_row(_row_to_dict(r))
+        if d is not None:
+            decoded.append(d)
+    has_more = len(decoded) > limit
+    events = decoded[:limit]
+    next_cursor = cursor + len(events) if has_more else None
+
+    return {
+        "project_id": project_id,
+        "filters": applied_filters,
+        "events": events,
+        "total_count": total_count,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        # No FTS/semantic index exists anywhere in this codebase today (see
+        # this function's own docstring) — "exact_only" is the honest
+        # current state, not a placeholder for "in progress".
+        "index_status": "exact_only",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 79491e26 — deterministic run-timeline reconstruction
 # ---------------------------------------------------------------------------
 
@@ -520,7 +687,8 @@ class AiLogStore:
     Adds NO new storage behavior beyond what
     :func:`append_event`/:func:`get_event`/:func:`list_events`/
     :func:`purge_events_before`/:func:`export_events` (c0168425)/
-    :func:`build_run_timeline` (79491e26) already provide — this class
+    :func:`build_run_timeline` (79491e26)/:func:`search_events` (d26b9943)
+    already provide — this class
     exists purely so a caller doing several operations against ONE project
     (e.g. a retention sweep, an export job, a run-timeline reconstruction)
     does not have to repeat ``project_id`` on every call. The module-level
@@ -547,6 +715,10 @@ class AiLogStore:
     async def list(self, **kwargs: Any) -> list[dict[str, Any]]:
         """See :func:`list_events` (``project_id`` is already bound)."""
         return await list_events(self._db, self.project_id, **kwargs)
+
+    async def search(self, **kwargs: Any) -> dict[str, Any]:
+        """See :func:`search_events` (``project_id`` is already bound)."""
+        return await search_events(self._db, self.project_id, **kwargs)
 
     async def purge_older_than(self, cutoff_recorded_at: str) -> int:
         """See :func:`purge_events_before` (``project_id`` is already bound)."""

@@ -98,6 +98,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "export_ai_log": 'export_ai_log(project_id="abc-123", event_type="tool.invoked", limit=500)',
     "export_ai_log_artifacts": 'export_ai_log_artifacts(project_id="abc-123", content_hashes=["sha256:..."])',
     "purge_ai_log": 'purge_ai_log(project_id="abc-123", cutoff="2025-01-01T00:00:00Z")',
+    "search_ai_log": 'search_ai_log(project_id="abc-123", correlation_id="run-42", event_type="tool.invoked", limit=50)',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -667,6 +668,32 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "cutoff": {"type": "string", "description": "ISO-8601 UTC datetime, e.g. '2025-01-01T00:00:00Z'. Events/artifacts recorded strictly before this are deleted."}},
          "required": ["cutoff"]}},
+    {"name": "search_ai_log", "description":
+        "d26b9943 (R2-B) — Read-only: EXACT-MATCH scoped search over "
+        "ai_log_events, bounded and cursor-paginated. Every filter is a plain "
+        "SQL equality (session_id/tenant_id/correlation_id/parent_event_id/"
+        "actor_kind/actor_id/event_type) or an inclusive occurred_at range "
+        "(since_occurred_at/until_occurred_at) — there is no lexical (FTS) or "
+        "semantic index anywhere in this codebase yet, so the response's "
+        "index_status field always honestly reports 'exact_only', never a "
+        "fabricated 'complete'/'resolving' state. Filters are AND-ed together "
+        "(more filters only ever narrow the result). Ordered newest-recorded-"
+        "first (recorded_at DESC, id DESC — same contract as list_events), "
+        "with a stable integer OFFSET cursor (pass a prior response's "
+        "next_cursor back in — same contract as get_project_notes_page). "
+        "Returns {project_id, filters, events, total_count, has_more, "
+        "next_cursor, index_status}. limit defaults to 50, capped at 500.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"}, "tenant_id": {"type": "string"},
+         "correlation_id": {"type": "string"}, "parent_event_id": {"type": "string"},
+         "actor_kind": {"type": "string", "description": "One of: session, system, human, tool, model."},
+         "actor_id": {"type": "string"}, "event_type": {"type": "string"},
+         "since_occurred_at": {"type": "string", "description": "ISO-8601 UTC datetime, inclusive lower bound on occurred_at."},
+         "until_occurred_at": {"type": "string", "description": "ISO-8601 UTC datetime, inclusive upper bound on occurred_at."},
+         "cursor": {"type": "integer", "description": "Offset into the ordered result set. Pass a prior response's next_cursor. Default 0."},
+         "limit": {"type": "integer", "description": "Default 50, capped at 500."}},
+         "required": []}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions) "
@@ -3688,7 +3715,7 @@ _READ_ONLY_TOOLS = {
     "search_server_logs", "get_server_log_checkpoint",
     "idle_until_session_done", "generate_handoff", "load_handoff",
     "verify_handoff_token",
-    "export_ai_log", "export_ai_log_artifacts",
+    "export_ai_log", "export_ai_log_artifacts", "search_ai_log",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_blog_posts",
@@ -3771,6 +3798,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "export_ai_log":           "notes",
     "export_ai_log_artifacts": "notes",
     "purge_ai_log":            "notes",
+    "search_ai_log":           "notes",
     "checkpoint":              "session",
     "get_session_brief":       "session",
     "get_context_block":       "session",
@@ -4073,6 +4101,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "export_ai_log":             "both",
     "export_ai_log_artifacts":   "both",
     "purge_ai_log":              "executor",
+    "search_ai_log":             "both",
     "refresh_context":           "both",
     "get_context_block":         "both",
     "get_session_brief":         "both",
@@ -4359,6 +4388,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "export_ai_log":              "maintenance-only",
     "export_ai_log_artifacts":    "maintenance-only",
     "purge_ai_log":               "maintenance-only",
+    "search_ai_log":              "maintenance-only",
     # sprint item pointer cleanup
     "delete_sprint_item_pointer": "maintenance-only",
     # note cleanup
@@ -4476,6 +4506,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "export_ai_log": "Export AI Log",
     "export_ai_log_artifacts": "Export AI Log Artifacts",
     "purge_ai_log": "Purge AI Log",
+    "search_ai_log": "Search AI Log",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

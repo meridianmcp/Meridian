@@ -3095,7 +3095,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log, search_ai_log."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -3897,6 +3897,28 @@ async def _handle_task_tools(
             correlation_id=args.get("correlation_id"),
             parent_event_id=args.get("parent_event_id"),
             limit=int(_limit_raw) if _limit_raw is not None else 5000,
+        )
+    if name == "search_ai_log":
+        # d26b9943 (R2-B) — read-only, exact-first scoped search over
+        # ai_log_events. See db.ai_log.search_events for the full filter/
+        # pagination/index_status contract. All filter kwargs forwarded
+        # 1:1, no extra business logic here (matches this dispatch group's
+        # established export_ai_log/purge_ai_log pattern above).
+        _sal_limit_raw = args.get("limit")
+        _sal_cursor_raw = args.get("cursor")
+        return await db_module.search_events(
+            db, args["project_id"],
+            session_id=args.get("session_id"),
+            tenant_id=args.get("tenant_id"),
+            correlation_id=args.get("correlation_id"),
+            parent_event_id=args.get("parent_event_id"),
+            actor_kind=args.get("actor_kind"),
+            actor_id=args.get("actor_id"),
+            event_type=args.get("event_type"),
+            since_occurred_at=args.get("since_occurred_at"),
+            until_occurred_at=args.get("until_occurred_at"),
+            cursor=int(_sal_cursor_raw) if _sal_cursor_raw is not None else 0,
+            limit=int(_sal_limit_raw) if _sal_limit_raw is not None else 50,
         )
     if name == "export_ai_log_artifacts":
         # c0168425 — read-only, receipted export of stored ai_log artifacts

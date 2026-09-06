@@ -12897,6 +12897,9 @@ from meridian.proposal_gates import (  # noqa: F401
 # see meridian.db.ai_log's module docstring's "ea972129 ... RETENTION" note.
 # c0168425 additionally adds export_events (implementation follow-up to
 # ea972129's design — see meridian.db.ai_log's "c0168425 — export" note).
+# d26b9943 (R2-B) additionally adds search_events — bounded, cursor-paginated,
+# exact-match search (see meridian.db.ai_log's "d26b9943 — EXACT-FIRST SCOPED
+# SEARCH" note).
 from .ai_log import (  # noqa: F401
     AiLogStore,
     _migrate_ai_log_events_table,
@@ -12905,6 +12908,7 @@ from .ai_log import (  # noqa: F401
     get_event,
     list_events,
     purge_events_before,
+    search_events,
 )
 
 
