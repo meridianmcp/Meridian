@@ -2347,6 +2347,7 @@ async def complete_sprint_item(
         # so it runs under a bounded budget and can never turn an
         # already-successful commit into a hung or misleading response.
         _completion_outcome = "committed"
+        _advisory_deferred = False
         # 7d71d6bc — RESCUE-R2: best-effort wave-run child terminal-outcome
         # bookkeeping, INCLUDING the real subprocess exit code (see the
         # docstring's exit_code paragraph). Only on a genuine fresh commit —
@@ -2354,20 +2355,22 @@ async def complete_sprint_item(
         # this function's own "no duplicate side effects on retry"
         # discipline. Lazy import + fully swallowed: must never turn an
         # already-successful completion into a failure.
+        #
+        # dcf78192 — this step used to be the one post-commit block in this
+        # function with no wall-clock bound at all (every sibling advisory
+        # step below already ran under _ADVISORY_PHASE_TIMEOUT_S). A slow
+        # wave_runs DB round-trip could eat unbounded time here before the
+        # response was ever built. Now bounded the same way as its siblings:
+        # a timeout sets advisory_work_deferred=True instead of stalling.
         try:
-            from meridian.db import wave_runs as _wave_runs_module  # noqa: PLC0415
-            _wr_child = await _wave_runs_module.find_active_wave_run_child_for_item(
-                db, project_id, item_id,
+            await asyncio.wait_for(
+                _record_wave_run_completion(db, project_id, item_id, exit_code, actor),
+                timeout=_ADVISORY_PHASE_TIMEOUT_S,
             )
-            if _wr_child is not None:
-                await _wave_runs_module.record_wave_run_child_outcome(
-                    db, _wr_child["wave_run_id"], item_id,
-                    status="succeeded", exit_code=exit_code,
-                    actor=actor, agent_id=actor,
-                )
+        except asyncio.TimeoutError:
+            _advisory_deferred = True
         except Exception:  # noqa: BLE001 — wave-run bookkeeping must never wedge completion
             pass
-        _advisory_deferred = False
         try:
             await asyncio.wait_for(
                 _run_post_commit_side_effects(db, project_id, item_id),
@@ -2436,6 +2439,39 @@ async def complete_sprint_item(
         result["correlation_id"] = _correlation_id
         result["phase_timings_ms"] = dict(_phase_ms)
     return result
+
+
+async def _record_wave_run_completion(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    exit_code: int | None,
+    actor: str | None,
+) -> None:
+    """7d71d6bc / dcf78192 — best-effort wave-run child terminal-outcome
+    bookkeeping (INCLUDING the real subprocess exit code), split out so the
+    caller can await it under its own bounded ``asyncio.wait_for`` budget,
+    mirroring :func:`_run_post_commit_side_effects`. A project that never
+    calls ``start_wave_run`` sees zero behavior change (``find_active_wave_
+    run_child_for_item`` returns ``None`` and this is a no-op).
+
+    Deliberately has NO internal try/except: the caller (``complete_sprint_
+    item``) already treats any exception raised here — and, as of dcf78192,
+    any timeout — as fail-open, so double-swallowing here would only hide
+    the classification. Module-level lookup (not a top-of-file import) to
+    avoid an import cycle, matching the pre-existing call site this was
+    extracted from.
+    """
+    from meridian.db import wave_runs as _wave_runs_module  # noqa: PLC0415
+    _wr_child = await _wave_runs_module.find_active_wave_run_child_for_item(
+        db, project_id, item_id,
+    )
+    if _wr_child is not None:
+        await _wave_runs_module.record_wave_run_child_outcome(
+            db, _wr_child["wave_run_id"], item_id,
+            status="succeeded", exit_code=exit_code,
+            actor=actor, agent_id=actor,
+        )
 
 
 async def _run_post_commit_side_effects(

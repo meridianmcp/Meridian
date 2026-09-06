@@ -42,6 +42,24 @@ from meridian._deps import validate_input_size, _hosted_mode
 # deferred; the response records that fact below.
 _COMPLETION_ADVISORY_TIMEOUT_S = 5.0
 
+# dcf78192 — pre-commit worktree merge-validation gate (up to three
+# sequential 20s-timeout git subprocess calls inside validate_worktree_merge,
+# f291bb24/eb2e44f8) had no outer bound at all: worst case it alone could
+# consume more wall time than the entire 45s complete_sprint_item dispatch
+# budget (_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S in handler.py). Unlike
+# _COMPLETION_ADVISORY_TIMEOUT_S above, this gate runs BEFORE the commit and
+# is a genuine gate, not advisory work — pinned decision f983b41f explicitly
+# distinguishes "active-worktree validation and strict merge approval remain
+# genuine gates" from the advisory work that gets a fail-open/deferred
+# treatment. So a timeout here fails CLOSED (see WORKTREE_MERGE_VALIDATION_
+# TIMEOUT below), the same direction validate_worktree_merge itself already
+# takes for every other "couldn't verify" case it can hit (HEAD_UNRESOLVABLE,
+# DIRTY_CHECK_FAILED, ANCESTRY_UNRESOLVABLE all block rather than skip) —
+# this extends that existing philosophy to "couldn't verify in time" instead
+# of inventing a new one. 10s leaves ample headroom under the 45s budget
+# while still comfortably covering a real (non-degenerate) git call.
+_MERGE_VALIDATION_TIMEOUT_S = 10.0
+
 
 async def _run_bounded_completion_advisory(
     name: str,
@@ -1524,9 +1542,34 @@ async def handle_complete_sprint_item(
                         from meridian.worktree_merge_guard import (  # noqa: PLC0415
                             validate_worktree_merge,
                         )
-                        _validation = await validate_worktree_merge(
-                            db, _server._REPO_ROOT, _wt["id"]
-                        )
+                        try:
+                            _validation = await asyncio.wait_for(
+                                validate_worktree_merge(db, _server._REPO_ROOT, _wt["id"]),
+                                timeout=_MERGE_VALIDATION_TIMEOUT_S,
+                            )
+                        except asyncio.TimeoutError:
+                            # dcf78192 — see _MERGE_VALIDATION_TIMEOUT_S above
+                            # for why this fails closed instead of silently
+                            # proceeding: this is a genuine gate (f983b41f),
+                            # not advisory work, and the underlying gate
+                            # already fails closed on every other
+                            # "couldn't verify" outcome it can produce.
+                            return {
+                                "error": "WORKTREE_MERGE_VALIDATION_TIMEOUT",
+                                "item_id": args["item_id"],
+                                "worktree_id": _wt["id"],
+                                "message": (
+                                    "Refusing to complete: pre-merge worktree "
+                                    "validation (git HEAD/dirty/ancestry checks) did "
+                                    f"not finish within {_MERGE_VALIDATION_TIMEOUT_S:.0f}s. "
+                                    "This is a genuine gate, not advisory work, so it "
+                                    "fails closed rather than skipping the check under "
+                                    "load. Call get_sprint_items to confirm this item "
+                                    "is still not 'done' first, then retry — if git "
+                                    "itself is slow or contended on this host, a brief "
+                                    "wait before retrying may help."
+                                ),
+                            }
                         if not _validation.get("ok"):
                             return {
                                 "error": "WORKTREE_MERGE_BLOCKED",

@@ -224,7 +224,24 @@ async def validate_worktree_merge(
 
     head_sha: str | None = None
     if repo_root is not None:
-        head_sha = await get_worktree_head(repo_root, wt["path"])
+        # dcf78192 — get_worktree_head and is_worktree_dirty are independent
+        # git calls: is_worktree_dirty only needs repo_root/wt["path"], never
+        # head_sha's VALUE, so it never had to wait for get_worktree_head to
+        # finish first — that sequencing was an accident of write order, not
+        # a real dependency. Only is_ancestor genuinely depends on head_sha
+        # (it's an argument), so it still runs after. Running the first two
+        # concurrently cuts this gate's worst case from up to three
+        # sequential 20s-timeout git calls to two concurrent + one
+        # sequential, without changing what fires: dirty's RESULT is still
+        # only consulted (DIRTY_CHECK_FAILED/DIRTY_WORKTREE only appended)
+        # when head_sha resolved, exactly matching the prior sequential
+        # branching below — a head-resolution failure still short-circuits
+        # to HEAD_UNRESOLVABLE alone, discarding the concurrently-fetched
+        # dirty result unused, same as before.
+        head_sha, _dirty_result = await asyncio.gather(
+            get_worktree_head(repo_root, wt["path"]),
+            is_worktree_dirty(repo_root, wt["path"]),
+        )
         if head_sha is None:
             errors.append(
                 {
@@ -233,7 +250,7 @@ async def validate_worktree_merge(
                 }
             )
         else:
-            dirty = await is_worktree_dirty(repo_root, wt["path"])
+            dirty = _dirty_result
             if dirty is None:
                 errors.append(
                     {
