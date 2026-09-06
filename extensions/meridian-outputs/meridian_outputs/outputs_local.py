@@ -4307,7 +4307,33 @@ class OutputsFtsIndex:
             return self._max_batch
         target = self._adaptive_batch
         metrics = self.last_rebuild_metrics
-        if (
+        # fa600e42 follow-up (architecture review) -- _initial_adaptive_batch
+        # only ever checks psutil.virtual_memory() ONCE, at construction.
+        # self._row_cache/self._manifest grow O(total corpus) with no
+        # eviction ceiling (edc84500 only evicts the heavy `content` field,
+        # not the row itself) -- on a long-running process, available
+        # system memory can fall into the "low" band purely from THIS
+        # process's own growth over many hours, with commit latency
+        # (fts_seconds/write_seconds, the only signals this method checked
+        # before this fix) staying completely normal throughout, since a
+        # slow commit and a shrinking memory budget are two different
+        # failure modes. Without this, the batch size would keep DOUBLING
+        # toward _ADAPTIVE_MAX_BATCH for as long as commits stayed fast,
+        # even while RSS climbed toward the ceiling
+        # _DUCKDB_MEMORY_RESERVE_BYTES assumes never gets crossed. Re-
+        # checked here with the SAME thresholds _initial_adaptive_batch
+        # already uses -- one cheap psutil call per rebuild(), not per file.
+        try:
+            import psutil  # noqa: PLC0415
+            available = int(psutil.virtual_memory().available)
+        except (ImportError, OSError, AttributeError):
+            available = None
+        if available is not None and available < self._ADAPTIVE_LOW_AVAILABLE_BYTES:
+            # Hard floor: memory pressure overrides whatever commit
+            # latency says, exactly like _initial_adaptive_batch's own
+            # "low" band does at construction time.
+            target = self._ADAPTIVE_MIN_BATCH
+        elif (
             float(metrics.get("fts_seconds", 0) or 0) > self._ADAPTIVE_MAX_FTS_SECONDS
             or float(metrics.get("write_seconds", 0) or 0) > self._ADAPTIVE_MAX_WRITE_SECONDS
         ):
@@ -4315,6 +4341,11 @@ class OutputsFtsIndex:
         elif metrics and (
             float(metrics.get("fts_seconds", 0) or 0) < 3.0
             and float(metrics.get("write_seconds", 0) or 0) < 8.0
+            # Growth also requires healthy memory, not just fast commits --
+            # this is the specific gap the fix above closes: previously a
+            # fast-committing process would keep doubling its batch size
+            # forever regardless of how little system memory remained.
+            and (available is None or available >= self._ADAPTIVE_HEALTHY_AVAILABLE_BYTES)
         ):
             target = min(self._ADAPTIVE_MAX_BATCH, target * 2)
         self._adaptive_batch = target

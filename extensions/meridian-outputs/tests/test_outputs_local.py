@@ -6729,6 +6729,80 @@ class TestAdaptiveBatchPolicy:
         finally:
             idx.close()
 
+    def test_low_memory_forces_floor_even_with_fast_commits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (architecture review): before this fix,
+        _adaptive_batch_limit() only ever checked commit latency -- with
+        fast commits, the batch would keep DOUBLING toward
+        _ADAPTIVE_MAX_BATCH regardless of how little system memory
+        remained (self._row_cache/_manifest grow unboundedly with corpus
+        size and don't show up as slow commits at all). Low memory must
+        override fast-commit growth, exactly like _initial_adaptive_batch's
+        own "low" band does at construction time."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 32_768
+            idx.last_rebuild_metrics = {"fts_seconds": 0.5, "write_seconds": 1.0}
+            monkeypatch.setitem(
+                sys.modules, "psutil",
+                TestAdaptiveBatchMemoryProbe._fake_psutil(1 * 1024**3),
+            )
+            assert idx._adaptive_batch_limit() == OL.OutputsFtsIndex._ADAPTIVE_MIN_BATCH
+        finally:
+            idx.close()
+
+    def test_growth_requires_healthy_memory_not_just_fast_commits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Memory in the middle band (not low, not healthy) with fast
+        commits must NOT grow the batch -- growth requires BOTH signals
+        to agree, not commit latency alone."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 8_192
+            idx.last_rebuild_metrics = {"fts_seconds": 0.5, "write_seconds": 1.0}
+            monkeypatch.setitem(
+                sys.modules, "psutil",
+                TestAdaptiveBatchMemoryProbe._fake_psutil(3 * 1024**3),
+            )
+            assert idx._adaptive_batch_limit() == 8_192
+        finally:
+            idx.close()
+
+    def test_healthy_memory_and_fast_commits_still_grows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The legitimate growth path must still work when memory really
+        is healthy -- this fix must not accidentally freeze the batch size
+        forever."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 8_192
+            idx.last_rebuild_metrics = {"fts_seconds": 0.5, "write_seconds": 1.0}
+            monkeypatch.setitem(
+                sys.modules, "psutil",
+                TestAdaptiveBatchMemoryProbe._fake_psutil(8 * 1024**3),
+            )
+            assert idx._adaptive_batch_limit() == 16_384
+        finally:
+            idx.close()
+
+    def test_missing_psutil_falls_back_to_commit_latency_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Graceful degradation: without psutil, behaviour must match the
+        pre-fix commit-latency-only logic exactly (fast commits still grow
+        the batch when memory can't be checked at all)."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 8_192
+            idx.last_rebuild_metrics = {"fts_seconds": 0.5, "write_seconds": 1.0}
+            monkeypatch.setitem(sys.modules, "psutil", None)
+            assert idx._adaptive_batch_limit() == 16_384
+        finally:
+            idx.close()
+
     @duckdb_required
     def test_replacement_writes_use_upsert_without_delete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
