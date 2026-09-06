@@ -2226,6 +2226,28 @@ async def handle_move_workspace_note_to_project(
     ownership is enforced by ``tenant_id`` inside
     ``db_module.move_workspace_note_to_project`` itself; see that function's
     docstring for the full tenant-safety and atomicity-in-effect rationale.
+
+    Round-2 security fix (verifier-reported bypass, 84f77597): the generic
+    gate in ``_handle_mcp_request`` checks ``args["project_id"]`` BEFORE
+    ``_dispatch_mcp_tool``'s project_name -> project_id resolver runs, and
+    that resolver unconditionally overwrites ``args["project_id"]`` with
+    whatever ``project_name`` resolves to, with no re-check. A caller could
+    pass an in-scope ``project_id`` (satisfies the early gate) together with
+    an out-of-scope ``project_name`` (silently wins the resolver, never
+    re-validated) and land the note in a project outside their scope. By the
+    time THIS handler runs, ``args["project_id"]`` is whatever the
+    dispatcher finally settled on regardless of which of the two args
+    "won" — so re-checking that final, resolved value here, right before the
+    destination write, closes the gap independent of arrival order.
+    ``_scoped_project_ids`` is threaded straight through from
+    ``mcp/handler.py``'s ``_handle_mcp_request`` (the exact list object the
+    generic gate already computed for this request — see the call site
+    immediately before ``_dispatch_mcp_tool``) and reused as-is here, never
+    recomputed, so this check can never disagree with the gate about what
+    the caller's scope actually is. Absent/None means scoping doesn't apply
+    (self-hosted, unauthenticated, or an unscoped/owner caller) — same
+    semantics as the generic gate's own ``scoped_project_ids is not None``
+    condition.
     """
     note_id = (args.get("note_id") or "").strip()
     if not note_id:
@@ -2233,6 +2255,17 @@ async def handle_move_workspace_note_to_project(
     project_id = (args.get("project_id") or "").strip()
     if not project_id:
         return {"error": "project_id (or project_name) is required"}
+    _scoped_project_ids = args.get("_scoped_project_ids")
+    if _scoped_project_ids is not None and project_id not in _scoped_project_ids:
+        # Refuse before touching the db layer at all — the workspace note
+        # must be left completely untouched (no partial mutation).
+        return {
+            "error": (
+                "project is outside your access scope: destination project "
+                f"'{project_id}' is not one of the projects this caller is "
+                "scoped to"
+            )
+        }
     result = await db_module.move_workspace_note_to_project(
         db, note_id, project_id, tenant_id=_mcp_tenant_id,
     )

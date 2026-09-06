@@ -215,6 +215,157 @@ async def test_scoped_project_ids_allows_in_scope_destination(db):
 
 
 # ---------------------------------------------------------------------------
+# 3b. Round-2 regression: project_id/project_name combined bypass
+# (verifier-reported, 84f77597 round 2). The generic scoped_project_ids gate
+# in _handle_mcp_request checks the RAW args["project_id"] before
+# _dispatch_mcp_tool's project_name resolver runs; that resolver then
+# unconditionally overwrites args["project_id"] with whatever project_name
+# resolves to, with no re-check against scoped_project_ids. A caller who
+# supplies an in-scope project_id (passes the early gate) together with an
+# out-of-scope project_name (silently wins the resolver) could land the note
+# in a project outside their scope. handle_move_workspace_note_to_project
+# now re-validates the FINAL resolved project_id itself, order-independently.
+# ---------------------------------------------------------------------------
+
+
+async def test_scoped_project_ids_blocks_project_id_project_name_bypass(db):
+    """Exact adversarial repro from the round-1 verifier's FAIL finding:
+    scoped_project_ids=[in_scope_id], arguments={project_id: in_scope_id,
+    project_name: <out-of-scope>} must now be refused, not silently moved
+    into the out-of-scope project."""
+    in_scope = await db_module.create_project(db, "84f77597-bypass-in-scope")
+    out_of_scope = await db_module.create_project(db, "84f77597-bypass-out-of-scope")
+    note = await db_module.add_workspace_note(db, "bypass-target", "body text", "tag1")
+
+    resp = await mh._handle_mcp_request(
+        _req("tools/call", {
+            "name": TOOL,
+            "arguments": {
+                "note_id": note["id"],
+                # Passes the early gate on its own (it IS in scope)...
+                "project_id": in_scope["id"],
+                # ...but this silently overwrites project_id post-gate in the
+                # unpatched dispatcher, with no re-check.
+                "project_name": "84f77597-bypass-out-of-scope",
+            },
+        }),
+        db=db, data_dir="/tmp",
+        scoped_project_ids=[in_scope["id"]],  # out_of_scope deliberately excluded
+    )
+
+    # Must NOT succeed as a top-level JSON-RPC error (the protocol-level gate
+    # never fires here, by design — project_id alone is in scope) NOR as a
+    # silent success. It must come back as a tool-level {"error": ...} refusal
+    # from inside the handler itself.
+    assert "error" not in resp, (
+        "expected a normal JSON-RPC envelope with a tool-level error, not a "
+        f"protocol-level error: {resp}"
+    )
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert "error" in payload, f"bypass succeeded silently: {payload}"
+    assert "access scope" in payload["error"]
+
+    # The workspace note must be completely untouched — no partial mutation,
+    # not moved into EITHER project.
+    ws_notes = await db_module.get_workspace_notes(db)
+    assert {n["title"] for n in ws_notes} == {"bypass-target"}
+    assert await db_module.get_project_notes(db, in_scope["id"]) == []
+    assert await db_module.get_project_notes(db, out_of_scope["id"]) == []
+
+
+async def test_scoped_project_ids_bypass_blocked_regardless_of_dispatch_order(db):
+    """Same adversarial shape as above, but with project_name listed first in
+    the arguments dict — proves the fix does not depend on key iteration
+    order, only on the final resolved project_id."""
+    in_scope = await db_module.create_project(db, "84f77597-bypass-order-in-scope")
+    out_of_scope = await db_module.create_project(db, "84f77597-bypass-order-out")
+    note = await db_module.add_workspace_note(db, "order-target", "body")
+
+    resp = await mh._handle_mcp_request(
+        _req("tools/call", {
+            "name": TOOL,
+            "arguments": {
+                "project_name": "84f77597-bypass-order-out",
+                "note_id": note["id"],
+                "project_id": in_scope["id"],
+            },
+        }),
+        db=db, data_dir="/tmp",
+        scoped_project_ids=[in_scope["id"]],
+    )
+    assert "error" not in resp
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert "error" in payload
+    assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"order-target"}
+
+
+async def test_handler_direct_denies_when_resolved_project_id_out_of_scope(db):
+    """Unit-level check on the handler itself (bypassing full MCP dispatch):
+    whatever ended up in args["project_id"] by the time the handler runs, if
+    it's not in the threaded _scoped_project_ids, refuse and leave the note
+    untouched."""
+    from meridian.mcp.handlers import notes_decisions as nd_mod
+
+    in_scope = await db_module.create_project(db, "84f77597-direct-in-scope")
+    out_of_scope = await db_module.create_project(db, "84f77597-direct-out-of-scope")
+    note = await db_module.add_workspace_note(db, "direct-target", "body")
+
+    result = await nd_mod.handle_move_workspace_note_to_project(
+        {
+            "note_id": note["id"],
+            # Simulates the dispatcher having already resolved project_name
+            # to this (out-of-scope) id by the time the handler runs.
+            "project_id": out_of_scope["id"],
+            "_scoped_project_ids": [in_scope["id"]],
+        },
+        db, "/tmp", None, None,
+    )
+    assert "error" in result
+    assert "access scope" in result["error"]
+    assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"direct-target"}
+
+
+async def test_handler_direct_allows_when_resolved_project_id_in_scope(db):
+    """Positive control: the same threaded key, but the resolved project_id
+    IS in scope — the move proceeds normally."""
+    from meridian.mcp.handlers import notes_decisions as nd_mod
+
+    in_scope = await db_module.create_project(db, "84f77597-direct-allow")
+    note = await db_module.add_workspace_note(db, "direct-allow-target", "body")
+
+    result = await nd_mod.handle_move_workspace_note_to_project(
+        {
+            "note_id": note["id"],
+            "project_id": in_scope["id"],
+            "_scoped_project_ids": [in_scope["id"]],
+        },
+        db, "/tmp", None, None,
+    )
+    assert "error" not in result
+    assert result["project_id"] == in_scope["id"]
+    assert await db_module.get_workspace_notes(db) == []
+
+
+async def test_handler_direct_no_scoped_ids_key_is_unrestricted(db):
+    """Backward compatibility: when the dispatcher does not thread
+    _scoped_project_ids at all (self-hosted / unauthenticated / unscoped
+    owner caller — the overwhelmingly common case, and every pre-existing
+    call site in this test file and test_ac4df52f_notes_decisions_dispatch.py
+    that predates this fix), behaviour is unchanged: no restriction."""
+    from meridian.mcp.handlers import notes_decisions as nd_mod
+
+    p = await db_module.create_project(db, "84f77597-no-scoping-key")
+    note = await db_module.add_workspace_note(db, "unrestricted-target", "body")
+
+    result = await nd_mod.handle_move_workspace_note_to_project(
+        {"note_id": note["id"], "project_id": p["id"]},
+        db, "/tmp", None, None,
+    )
+    assert "error" not in result
+    assert result["project_id"] == p["id"]
+
+
+# ---------------------------------------------------------------------------
 # 4. stdio transport parity + real dispatch (mirrors
 #    tests/test_dffcde86_worktree_mcp_exposure.py section 3).
 # ---------------------------------------------------------------------------

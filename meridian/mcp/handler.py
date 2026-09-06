@@ -1493,7 +1493,23 @@ async def _handle_mcp_request(
             if _is_github:
                 result = await _dispatch_github_tool(name, args, tenant, db)
             else:
-                result = await _dispatch_mcp_tool(name, args, db, data_dir, tenant=tenant)
+                # 84f77597 round-2 (security fix) — move_workspace_note_to_project
+                # re-validates its OWN resolved destination project_id against
+                # the caller's scope from inside the handler itself (see that
+                # handler's docstring), because _dispatch_mcp_tool's
+                # project_name -> project_id resolver runs AFTER the generic
+                # scoped_project_ids gate above and is not itself re-checked.
+                # Thread the exact list this gate already computed straight
+                # through as a private args key so the handler can reuse it
+                # without recomputing it a different way. Scoped to this one
+                # tool's args only — no other tool's dispatch is affected, and
+                # the resolver itself is untouched. The systemic version of
+                # this pattern for every project_id-bearing tool is tracked
+                # separately (sprint item a9c041d7-9dea-4e13-83e0-599ac198b56c).
+                _dispatch_args = args
+                if name == "move_workspace_note_to_project" and scoped_project_ids is not None:
+                    _dispatch_args = {**args, "_scoped_project_ids": scoped_project_ids}
+                result = await _dispatch_mcp_tool(name, _dispatch_args, db, data_dir, tenant=tenant)
                 # 4b698ea5 — implicit last_seen bump on the HOSTED path, mirroring
                 # the stdio handler. Previously ONLY stdio tool calls refreshed a
                 # session's last_seen; a hosted/tunnel executor's session went
