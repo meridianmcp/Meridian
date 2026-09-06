@@ -4835,6 +4835,290 @@ class TestWalkRestartCooldown:
             idx.close()
 
 
+class TestWalkCooldownSafetyFactorResolver:
+    """fa600e42 follow-up (adaptive cooldown) -- pure resolver tests for the
+    safety-factor knob, same style as TestTantivyHeapSize etc."""
+
+    def test_default_is_half(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, raising=False)
+        assert OL._default_walk_cooldown_safety_factor() == 0.5
+
+    def test_env_var_overrides_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, "1.5")
+        assert OL._default_walk_cooldown_safety_factor() == 1.5
+
+    def test_invalid_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, "not-a-number")
+        assert OL._default_walk_cooldown_safety_factor() == 0.5
+
+    def test_negative_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, "-1")
+        assert OL._default_walk_cooldown_safety_factor() == 0.5
+
+    def test_zero_is_a_valid_explicit_opt_out(self) -> None:
+        assert OL._resolve_walk_cooldown_safety_factor(0.0) == 0.0
+
+    def test_explicit_constructor_arg_takes_precedence_over_env_var(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, "1.5")
+        assert OL._resolve_walk_cooldown_safety_factor(0.25) == 0.25
+
+    def test_negative_explicit_arg_falls_back_to_default(self) -> None:
+        assert OL._resolve_walk_cooldown_safety_factor(-0.5) == 0.5
+
+
+class TestWalkCooldownMaxSecondsResolver:
+    """fa600e42 follow-up (adaptive cooldown) -- pure resolver tests for the
+    ceiling knob, same style as TestTantivyHeapSize etc."""
+
+    def test_default_is_1800(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, raising=False)
+        assert OL._default_walk_cooldown_max_seconds() == 1800.0
+
+    def test_env_var_overrides_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, "600")
+        assert OL._default_walk_cooldown_max_seconds() == 600.0
+
+    def test_invalid_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, "not-a-number")
+        assert OL._default_walk_cooldown_max_seconds() == 1800.0
+
+    def test_negative_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, "-1")
+        assert OL._default_walk_cooldown_max_seconds() == 1800.0
+
+    def test_explicit_constructor_arg_takes_precedence_over_env_var(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, "600")
+        assert OL._resolve_walk_cooldown_max_seconds(120.0) == 120.0
+
+    def test_negative_explicit_arg_falls_back_to_default(self) -> None:
+        assert OL._resolve_walk_cooldown_max_seconds(-5.0) == 1800.0
+
+
+class TestAdaptiveWalkCooldown:
+    """fa600e42 follow-up (adaptive cooldown) -- confirmed live on an
+    85-call, 385,064-file rerun with a flat 60s cooldown: 73/85 calls were
+    correctly suppressed, but ~7 full-pass restarts still cost ~776s (20.5%
+    of total wall-clock), because completing one full pass over that corpus
+    itself took several minutes -- the flat 60s window had always already
+    expired by the time rebuild() next checked it. These tests use direct
+    field injection to simulate a slow-corpus pass's observed duration
+    rather than a real multi-minute sleep; the walk/corpus itself stays
+    trivial in every test, only the recorded duration is faked."""
+
+    @duckdb_required
+    def test_first_pass_ever_effective_cooldown_equals_flat_floor(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=60.0)
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 60.0, (
+                "with no prior pass duration observed yet, scaling must not "
+                "apply -- byte-identical to the pre-scaling flat window"
+            )
+            assert idx.last_rebuild_metrics["walk_last_full_pass_duration_seconds"] is not None, (
+                "the just-completed first pass's own duration must now be recorded"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_disabled_cooldown_effective_seconds_always_zero(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))  # walk_cooldown_seconds defaults to 0.0
+        try:
+            idx.rebuild()
+            idx._walk_last_full_pass_duration_seconds = 10_000.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 0.0, (
+                "the disabled (default) case must never scale up from 0.0, "
+                "regardless of any recorded pass duration"
+            )
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 2, (
+                "disabled cooldown means every rebuild() starts a brand-new "
+                "full pass from the top -- it re-discovers both files, not "
+                "just the newly added one"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_scaled_cooldown_extends_protection_past_flat_floor_for_slow_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """The actual gap this fix closes: a corpus whose full pass takes
+        much longer than the flat floor gets a correspondingly longer
+        effective cooldown, not just the floor."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=60.0)
+        try:
+            idx.rebuild()
+            # Simulate a corpus whose real full pass takes 300s (default
+            # safety_factor 0.5 -> scaled component = 150s, above the flat
+            # 60s floor).
+            idx._walk_last_full_pass_duration_seconds = 300.0
+            idx._walk_last_full_pass_completed_at = time.time() - 100.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 150.0
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 0, (
+                "100s after the last pass, a flat 60s floor would already "
+                "have expired and restarted a full re-walk -- the scaled "
+                "150s window must still be suppressing it"
+            )
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_ceiling_bounds_scaling_from_an_anomalously_slow_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=60.0)
+        try:
+            idx.rebuild()
+            # Simulate an anomalously slow pass (e.g. a transient
+            # network-filesystem stall): scaled component would be
+            # 10000*0.5=5000s, far past the default 1800s ceiling.
+            idx._walk_last_full_pass_duration_seconds = 10_000.0
+            idx._walk_last_full_pass_completed_at = time.time() - 1900.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 1800.0
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 2, (
+                "1900s after the last pass exceeds the 1800s ceiling, so "
+                "the walk must resume (re-discovering the whole tree from "
+                "the top) even though the naive scaled value (5000s) would "
+                "still have blocked it"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_floor_never_shrunk_by_a_smaller_misconfigured_ceiling(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path), walk_cooldown_seconds=3600.0,
+            walk_cooldown_max_seconds=100.0,  # explicitly smaller than the floor
+        )
+        try:
+            idx.rebuild()
+            # A huge duration would push the ceiling-bounded scaled term
+            # (min(100000*0.5, 100) == 100) BELOW the floor if the outer
+            # max() were missing or wrong.
+            idx._walk_last_full_pass_duration_seconds = 100_000.0
+            idx._walk_last_full_pass_completed_at = time.time() - 500.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 3600.0, (
+                "the explicit floor must always win via the outer max(), "
+                "even when a misconfigured ceiling is smaller than it"
+            )
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 0
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_safety_factor_zero_disables_duration_scaling(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path), walk_cooldown_seconds=60.0,
+            walk_cooldown_safety_factor=0.0,
+        )
+        try:
+            idx.rebuild()
+            idx._walk_last_full_pass_duration_seconds = 10_000.0
+            idx._walk_last_full_pass_completed_at = time.time() - 100.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 60.0
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 2, (
+                "safety_factor=0.0 must fully opt out of duration-based "
+                "scaling -- the flat 60s floor alone governs, and 100s has "
+                "already elapsed past it, so the walk must resume"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_boundary_resumed_pass_does_not_update_observed_duration(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pass resumed from a scan boundary only re-walks the remainder
+        of the tree a prior (possibly now-gone) process didn't finish -- its
+        own elapsed time doesn't represent a FULL pass's cost, so it must
+        never overwrite the previously observed full-pass duration the
+        cooldown scaling above relies on."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=60.0)
+        try:
+            idx.rebuild()
+            first_duration = idx._walk_last_full_pass_duration_seconds
+            assert first_duration is not None
+            # Use the REAL canonical path key the walk itself just recorded
+            # for "a.csv" (not a synthetic bare filename) as the resume
+            # boundary -- resume_after must match the same path format the
+            # walker's own sort order compares against.
+            real_boundary = next(iter(idx._manifest))
+            # Force the next call to both bypass cooldown (long-elapsed) and
+            # simulate a boundary-resumed pass (as if a prior process's scan
+            # boundary had been rehydrated).
+            idx._walk_last_full_pass_completed_at = time.time() - 9999.0
+            idx._scan_boundary = real_boundary
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+            assert idx._walk_last_full_pass_duration_seconds == first_duration, (
+                "a boundary-resumed pass's own elapsed time must not "
+                "overwrite the last FULL pass's observed duration"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_outage_mid_pass_resets_start_marker_without_recording_duration(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(5):
+            (outputs_dir / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(
+            str(outputs_dir), walk_cooldown_seconds=60.0, max_batch=1,
+        )
+        try:
+            idx.rebuild()
+            assert idx._walk_state is not None, (
+                "walk must still be mid-pass with max_batch=1 and 5 files"
+            )
+            assert idx._walk_last_full_pass_started_at is not None
+            assert idx._walk_last_full_pass_duration_seconds is None
+            for f in outputs_dir.iterdir():
+                f.unlink()
+            outputs_dir.rmdir()
+            idx.rebuild()
+            assert idx._walk_last_full_pass_started_at is None, (
+                "an outage mid-pass must reset the in-flight start marker "
+                "so it never leaks into a future pass's measured duration"
+            )
+            assert idx._walk_last_full_pass_duration_seconds is None
+        finally:
+            idx.close()
+
+
 # ---------------------------------------------------------------------------
 # Archival-classification hash persistence (sprint item 7a6a278f)
 # ---------------------------------------------------------------------------
