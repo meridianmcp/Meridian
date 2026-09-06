@@ -4455,7 +4455,9 @@ async def _handle_session_tools(
     """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log,
     get_session_activity, get_agent_instructions, set_agent_instructions,
     set_executor_config, idle_until_session_done, search_all, search_synthesis,
-    paper_search, social_search, github_search, get_session_brief.
+    paper_search, social_search, github_search, get_session_brief,
+    save_watchlist_query, list_watchlist_queries, run_watchlist_query,
+    delete_watchlist_query.
 
     81abd31f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4485,6 +4487,16 @@ async def _handle_session_tools(
         handle_get_session_brief,
     )
     from .handlers.research_tools import handle_github_search  # noqa: PLC0415
+    # b924fd7c — recurring research watchlist, a new sibling module in the same
+    # Research Module family as research_tools.py (see that module's own
+    # docstring for why the family gets its own handlers modules rather than
+    # growing session_tools.py further).
+    from .handlers.research_watchlist import (  # noqa: PLC0415
+        handle_save_watchlist_query,
+        handle_list_watchlist_queries,
+        handle_run_watchlist_query,
+        handle_delete_watchlist_query,
+    )
 
     # Tools that need no extra context beyond the standard five parameters.
     _standard_dispatch: dict[str, Any] = {
@@ -4506,6 +4518,10 @@ async def _handle_session_tools(
         "social_search": handle_social_search,
         "github_search": handle_github_search,
         "get_session_brief": handle_get_session_brief,
+        "save_watchlist_query": handle_save_watchlist_query,
+        "list_watchlist_queries": handle_list_watchlist_queries,
+        "run_watchlist_query": handle_run_watchlist_query,
+        "delete_watchlist_query": handle_delete_watchlist_query,
     }
 
     if name in _standard_dispatch:

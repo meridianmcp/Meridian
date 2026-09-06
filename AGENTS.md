@@ -151,6 +151,51 @@ for higher rate limits and usage tracking (pass as `CONTEXT7_API_KEY` env var).
 Per the research-routing protocol in executor rules: if Context7 is in your tool list,
 call `resolve-library-id` then `get-library-docs` FIRST for framework/library questions.
 
+### Research watchlists — recurring checks (b924fd7c)
+
+`save_watchlist_query` / `run_watchlist_query` / `list_watchlist_queries` /
+`delete_watchlist_query` let a session track a `paper_search`/`github_search`/
+`social_search`-shaped query over time instead of re-running it from memory:
+
+```python
+wl = save_watchlist_query(
+    project_id=PROJECT_ID, source_type="arxiv", query="mechanistic interpretability",
+)
+run_watchlist_query(project_id=PROJECT_ID, watchlist_id=wl["watchlist_id"])
+```
+
+Each `run_watchlist_query` call diffs the fresh results against everything
+already captured for that watchlist (by the source's own stable id —
+arxiv_id/openalex_id/s2_id/pmid/sha/repo/hn_id) and auto-captures only the
+newly-seen ones through the same durable path `capture_research_finding` uses,
+so a second manual save is never needed. `source_type` covers every source in
+the Research family, including the three (`semantic_scholar`, `pubmed`,
+`github_repo` is covered too alongside `github_code`) that aren't wired into
+the `paper_search`/`github_search` MCP tools' own `source`/`type` enums —
+`run_watchlist_query` calls the underlying search functions directly.
+
+**Meridian intentionally has no in-repo scheduler** — it is a coordination
+store, not a cron daemon. For an actually-recurring check (daily, weekly),
+pair `run_watchlist_query` with a scheduling mechanism your own client/host
+provides:
+
+- **Claude Code / Claude with the `schedule` skill or `CronCreate` tool**: if
+  either is in your tool list, create a recurring task whose body is
+  effectively "call `start_session`, then `run_watchlist_query(project_id=...,
+  watchlist_id=...)` for each watchlist you're tracking, then report any
+  `new_count > 0`." This is the same host-level primitive documented for
+  Meridian's own recurring maintenance sessions elsewhere in this repo — no
+  new Meridian server code is involved.
+- **Any other host with its own cron/task-scheduler equivalent**: the same
+  pattern applies — the scheduled trigger lives in your environment, not in
+  Meridian; Meridian only tracks the saved query and diffs results when asked.
+
+Cross-project aggregation (a single view of every project's watchlist hits) is
+explicitly NOT built by this mechanism — each watchlist is scoped to one
+project's notes, matching every other `project_notes`-backed tool. A
+workspace-level aggregated view is a natural follow-up but a bigger, separate
+change (it would need a `get_workspace_notes`-style cross-project query).
+
 ---
 
 ## Session protocol (every session)

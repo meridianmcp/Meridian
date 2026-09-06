@@ -2820,6 +2820,51 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "type": {"type": "string", "enum": ["code", "repo"], "description": "Which keyless GitHub endpoint to search (default 'code')."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently indexed/updated first)."}},
          "required": ["query"]}},
+    {"name": "save_watchlist_query", "description":
+        "b924fd7c — save a recurring research query so it can be re-run and "
+        "diffed over time via run_watchlist_query. Persisted as a project note "
+        "(no separate table); the returned watchlist_id addresses it. Sources "
+        "beyond paper_search's own 'arxiv'/'openalex' are reachable here by "
+        "calling the underlying search function directly: 'semantic_scholar' "
+        "and 'pubmed' (meridian.paper_search), 'github_code'/'github_repo' "
+        "(meridian.github_search), and 'hn' (meridian.social_search).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "source_type": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "github_code", "github_repo", "hn"], "description": "Which keyless source this watchlist re-runs against."},
+         "query": {"type": "string", "description": "The search terms to re-run each time."},
+         "limit": {"type": "integer", "description": "Max results per run (default 10, max 50)."},
+         "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order for each run (default relevance)."},
+         "name": {"type": "string", "description": "Optional short label for the watchlist note's title (defaults to the query text)."}},
+         "required": ["source_type", "query"]}},
+    {"name": "list_watchlist_queries", "description":
+        "Read-only: list saved research watchlist queries for a project "
+        "(optionally filtered by source_type), each with its watchlist_id, "
+        "query, source_type, limit, and sort_by.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "source_type": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "github_code", "github_repo", "hn"], "description": "Optional filter."}},
+         "required": []}},
+    {"name": "run_watchlist_query", "description":
+        "b924fd7c — re-run a saved watchlist query and diff its results against "
+        "everything already captured for it. Every newly-seen result (matched "
+        "by a per-source stable id — arxiv_id/openalex_id/s2_id/pmid/sha/repo/"
+        "hn_id, falling back to url) is auto-captured via the same durable "
+        "path as capture_research_finding/save_finding, tagged so the NEXT run "
+        "recognizes it as already-seen. Returns {new_count, already_seen_count, "
+        "new_results, captured, total_results}. Never raises — an unresolvable "
+        "watchlist_id or a network/parse failure from the underlying search "
+        "both degrade to {error}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "watchlist_id": {"type": "string", "description": "id returned by save_watchlist_query / list_watchlist_queries."}},
+         "required": ["watchlist_id"]}},
+    {"name": "delete_watchlist_query", "description":
+        "Delete a saved research watchlist query. Scoped to project_id + the "
+        "watchlist tag, so it never deletes an unrelated note.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "watchlist_id": {"type": "string", "description": "id returned by save_watchlist_query / list_watchlist_queries."}},
+         "required": ["watchlist_id"]}},
     {"name": "get_agent_instructions", "description":
         "Read-only: Return the custom agent_instructions for a project. "
         "These are injected automatically by start_session so every session picks them up. "
@@ -3555,6 +3600,7 @@ _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
     "paper_search", "social_search", "github_search",
+    "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
@@ -3595,7 +3641,7 @@ _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete
 # rather than only reading Meridian's own state.  Keep this separate from the
 # read-only set: a GitHub/paper/social search can be read-only for Meridian
 # while still operating in an external open world.
-_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search"}
+_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search", "run_watchlist_query"}
 
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
@@ -3828,6 +3874,10 @@ _TOOL_CATEGORY: dict[str, str] = {
     "paper_search": "research",
     "social_search": "research",
     "github_search": "research",
+    "save_watchlist_query": "research",
+    "list_watchlist_queries": "research",
+    "run_watchlist_query": "research",
+    "delete_watchlist_query": "research",
 }
 
 _TOOL_ROLE_RELEVANCE: dict[str, str] = {
@@ -3908,6 +3958,10 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "paper_search":              "planner",
     "social_search":             "planner",
     "github_search":             "planner",
+    "save_watchlist_query":      "planner",
+    "list_watchlist_queries":    "planner",
+    "run_watchlist_query":       "planner",
+    "delete_watchlist_query":    "planner",
     "capture_research_finding":  "planner",
     "add_insight":               "planner",
     "get_insights":              "planner",
@@ -4150,6 +4204,10 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "paper_search":               "common-support",
     "social_search":              "common-support",
     "github_search":              "common-support",
+    "save_watchlist_query":       "common-support",
+    "list_watchlist_queries":     "common-support",
+    "run_watchlist_query":        "common-support",
+    "delete_watchlist_query":     "common-support",
     "capture_research_finding":   "common-support",
     "save_finding":               "common-support",
     # workspace proposals workflow arc
