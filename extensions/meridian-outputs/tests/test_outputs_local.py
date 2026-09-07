@@ -6500,6 +6500,104 @@ class TestFatalConnectionRecovery:
             idx.close()
 
 
+class TestConvergenceStateStaleErrorHonesty:
+    """fa600e42 follow-up (MO-IMP-06, honesty gap; confirmed live at the
+    660,153-file/466GiB full-corpus qualification): last_db_write_error /
+    last_lock_error only reset at the TOP of the next rebuild() call. A
+    fatal-connection self-heal (a21411b5) can leave one of these set after
+    its own call already succeeded end-to-end -- if that was the run's LAST
+    call, there is no next call to clear it, so get_convergence_state()
+    reported converged=False with a stale error on an index that was
+    otherwise genuinely, fully converged (indexed_count exactly matched
+    expected_count). The fix: gate last_db_write_error/last_lock_error's
+    effect on self._pending_stale being non-empty -- the field that
+    already, authoritatively, tracks whether an error still has a real,
+    unresolved consequence."""
+
+    @duckdb_required
+    def test_stale_write_error_with_empty_backlog_does_not_block_convergence(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert len(idx._pending_stale) == 0
+            # Simulate a write error whose failed rows were already
+            # retried and confirmed (pending_stale empty), but whose error
+            # field was never cleared because no FURTHER rebuild() call
+            # happened to reset it at its own top -- exactly what a
+            # fatal-connection self-heal on a run's last call leaves behind.
+            idx.last_db_write_error = "FatalException: simulated stale error"
+            state = idx.get_convergence_state()
+            assert state.converged is True, (
+                "a lingering write error with zero pending consequences "
+                "must not block convergence"
+            )
+            assert state.last_error is None, (
+                "a stale, already-resolved write error must not be "
+                "reported as the current last_error"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_write_error_with_real_pending_backlog_still_blocks_convergence(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            idx.last_db_write_error = "FatalException: simulated ongoing error"
+            idx._pending_stale["b.csv"] = (None, None)
+            state = idx.get_convergence_state()
+            assert state.converged is False, (
+                "a write error with a genuinely unresolved pending "
+                "consequence must still block convergence"
+            )
+            assert state.last_error == "FatalException: simulated ongoing error"
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_stale_lock_error_with_empty_backlog_does_not_block_convergence(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert len(idx._pending_stale) == 0
+            idx.last_lock_error = "IndexLockAcquireError: simulated stale lock error"
+            state = idx.get_convergence_state()
+            assert state.converged is True
+            assert state.last_error is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_walk_error_still_blocks_convergence_regardless_of_backlog(
+        self, tmp_path: Path,
+    ) -> None:
+        """_last_walk_error is deliberately NOT gated on pending_stale --
+        it reflects a directory-listing failure (already covered by its
+        own reset-on-fresh-pass-start fix, MO-IMP-02), not a row-
+        persistence one, so an empty backlog says nothing about whether
+        it's stale."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert len(idx._pending_stale) == 0
+            idx._last_walk_error = "could not list directory 'x': simulated"
+            state = idx.get_convergence_state()
+            assert state.converged is False
+            assert state.last_error == "could not list directory 'x': simulated"
+        finally:
+            idx.close()
+
+
 class TestReadConnectIsolation:
     """fa600e42 follow-up (architecture review): search()/get_annotations_
     for_path()/resolve_output()/get_content() used to run their SELECT on
@@ -8156,6 +8254,13 @@ class TestConvergenceState:
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
             idx.last_db_write_error = "simulated write failure"
+            # fa600e42 follow-up (MO-IMP-06) -- a write error only surfaces
+            # while it still has a real, unresolved consequence (a path
+            # left in self._pending_stale); see
+            # TestConvergenceStateStaleErrorHonesty for the counterpart
+            # (an empty backlog means the error is stale and must NOT
+            # block convergence).
+            idx._pending_stale["some/file.csv"] = (None, None)
             state = idx.get_convergence_state()
             assert state.last_error == "simulated write failure"
             assert state.converged is False
