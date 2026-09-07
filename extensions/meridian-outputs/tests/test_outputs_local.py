@@ -6172,6 +6172,195 @@ class TestDuckDBMemoryLimit:
             idx.close()
 
 
+class TestDuckDBMemoryLimitRetuning:
+    """fa600e42 follow-up (OOM crash, confirmed live during the adaptive
+    walk-cooldown validation rerun): self._duckdb_memory_limit_bytes was
+    resolved ONCE at construction from a single memory snapshot and never
+    revisited, even though a live DuckDB connection accepts `PRAGMA
+    memory_limit=...` changes at any time (confirmed empirically -- not
+    assumed) and self._row_cache's own growth over a long run is exactly
+    the signal the row_count_hint reserve-widening mechanism (see
+    TestDuckDBMemoryLimit.test_row_count_hint_widens_reserve_and_shrinks_
+    limit) was already built for. A real 385,064-file rerun crashed with a
+    Python-level MemoryError because neither of those facts was being used
+    after construction."""
+
+    @staticmethod
+    def _fake_psutil(available_bytes: int) -> MagicMock:
+        fake = MagicMock()
+        fake.virtual_memory.return_value = MagicMock(available=available_bytes)
+        fake.cpu_count.return_value = 4  # also consulted by _physical_core_count()
+        return fake
+
+    def test_no_retune_before_first_connect(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        original = idx._duckdb_memory_limit_bytes
+        assert idx._con is None
+        idx._maybe_retune_duckdb_memory_limit()  # must not raise
+        assert idx._duckdb_memory_limit_bytes == original
+
+    @duckdb_required
+    def test_retune_shrinks_limit_as_available_memory_drops(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            healthy_limit = idx._duckdb_memory_limit_bytes
+            assert healthy_limit > OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES
+            # Simulate available memory collapsing between calls -- exactly
+            # what a long-running, growing process does to its OWN
+            # environment even without any other process's interference.
+            fake.virtual_memory.return_value = MagicMock(available=100 * 1024 * 1024)
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx._duckdb_memory_limit_bytes == OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES, (
+                "the ceiling must shrink to reflect newly-low available "
+                "memory on the very next call, not stay pinned to the "
+                "construction-time snapshot"
+            )
+            assert (
+                idx.last_rebuild_metrics["duckdb_memory_limit_bytes"]
+                == OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_retune_widens_reserve_as_row_cache_grows(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """Same fixed available-memory reading throughout -- only
+        self._row_cache's length changes -- isolates the row_count_hint
+        wiring from the available-memory wiring tested above."""
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            baseline_limit = idx._duckdb_memory_limit_bytes
+            # Cheap stand-ins for a huge accumulated corpus -- only len()
+            # matters to the method under test, so real OutputRow values
+            # are unnecessary (and would make this test far slower).
+            idx._row_cache.update({f"__fake_{i}__": 0 for i in range(500_000)})
+            idx._maybe_retune_duckdb_memory_limit()
+            expected = OL._default_duckdb_memory_limit_bytes(
+                idx._tantivy_heap_bytes, row_count_hint=len(idx._row_cache),
+            )
+            assert idx._duckdb_memory_limit_bytes == expected
+            assert idx._duckdb_memory_limit_bytes < baseline_limit, (
+                "a much larger accumulated row_cache must widen the reserve "
+                "and therefore shrink the effective limit, exactly like the "
+                "construction-time initial_row_cache path already does"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_explicit_override_never_retuned(self, monkeypatch, tmp_path: Path) -> None:
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path), duckdb_memory_limit_bytes=2048 * 1024 * 1024,
+        )
+        try:
+            idx.rebuild()
+            assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
+            # Swing available memory wildly in both directions -- an
+            # explicit caller value must never move regardless.
+            fake.virtual_memory.return_value = MagicMock(available=50 * 1024 * 1024)
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
+            fake.virtual_memory.return_value = MagicMock(available=200 * 1024**3)
+            idx._row_cache.update({f"__fake_{i}__": 0 for i in range(500_000)})
+            idx._maybe_retune_duckdb_memory_limit()
+            assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_retune_skips_pragma_when_value_unchanged(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._connect()
+            # First call establishes whatever the resolved value is under
+            # these exact conditions (may or may not differ from the
+            # construction-time value -- irrelevant here).
+            idx._maybe_retune_duckdb_memory_limit()
+
+            # Nothing changes between here and the next call -- same fixed
+            # psutil reading, same (empty) self._row_cache -- so THIS call
+            # must be a true no-op.
+            captured: list[str] = []
+            real_con = idx._con
+
+            class _ExecuteSpyCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    captured.append(sql)
+                    return real_con.execute(sql, *a, **kw)
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _ExecuteSpyCon()
+            idx._maybe_retune_duckdb_memory_limit()
+            pragma_calls = [s for s in captured if "memory_limit" in s.lower()]
+            assert not pragma_calls, (
+                "identical conditions must not re-issue a no-op PRAGMA "
+                f"every call, got: {pragma_calls!r}"
+            )
+        finally:
+            idx._con = real_con
+            idx.close()
+
+    @duckdb_required
+    def test_retune_survives_pragma_failure(self, monkeypatch, tmp_path: Path) -> None:
+        """Mirrors _connect()'s own contract: a PRAGMA failure here must
+        never propagate, and must leave the previous (still-applied) limit
+        in place rather than updating the tracked value to one that was
+        never actually set on the live connection."""
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            previous_limit = idx._duckdb_memory_limit_bytes
+            real_con = idx._con
+
+            class _FailingPragmaCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    if "memory_limit" in sql.lower():
+                        raise RuntimeError("simulated PRAGMA failure")
+                    return real_con.execute(sql, *a, **kw)
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _FailingPragmaCon()
+            fake.virtual_memory.return_value = MagicMock(available=100 * 1024 * 1024)
+            idx._maybe_retune_duckdb_memory_limit()  # must not raise
+            assert idx._duckdb_memory_limit_bytes == previous_limit, (
+                "a failed PRAGMA must not update the tracked limit -- that "
+                "would desync self._duckdb_memory_limit_bytes from what "
+                "DuckDB actually has configured"
+            )
+        finally:
+            idx._con = real_con
+            idx.close()
+
+
 class TestReadConnectIsolation:
     """fa600e42 follow-up (architecture review): search()/get_annotations_
     for_path()/resolve_output()/get_content() used to run their SELECT on
