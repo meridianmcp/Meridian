@@ -3931,6 +3931,85 @@ def test_ensure_running_no_double_spawn_under_concurrent_requests(monkeypatch):
     assert spawn_count[0] == 1, f"expected 1 spawn, got {spawn_count[0]}"
 
 
+def test_ensure_running_slow_spawn_on_one_slot_does_not_starve_another(monkeypatch):
+    """b71e0960 stress test for the 31de9cf7 fix's core property: two
+    INDEPENDENT SlotProxy instances (their own separate asyncio.Lock -- see
+    the class docstring's "Thread-safety" note) must not share any resource
+    that lets one slot's slow spawn block another slot's concurrent spawn.
+
+    31de9cf7's own inline comment documents the real incident this guards:
+    "a plain synchronous call here froze the ENTIRE event loop for up to ~5s
+    while one slot's spawn was stuck, which starved every other slot's
+    WebSocket handshake/keepalive coroutine on the same loop -- the observed
+    'one slot's cold-spawn miss cascades into all 7 slots disconnecting
+    simultaneously'." The fix routes the blocking spawn chain through
+    ``asyncio.to_thread`` precisely so a slow/wedged spawn never blocks the
+    event loop. This test proves that holds: slot A's spawn does a REAL
+    blocking ``time.sleep`` (not an awaited asyncio.sleep -- the whole point
+    is to prove the event loop stays free even when the WORKER call blocks),
+    while slot B's spawn is instant and fired concurrently. If the fix ever
+    regresses back to a synchronous in-loop call, slot B's spawn would be
+    forced to wait behind slot A's sleep and this test would fail."""
+    import asyncio as _asyncio
+    import time as _time
+
+    def _slow_spawn(cmd, env, label, diagnostics=None, extra_popen_kwargs=None):
+        _time.sleep(0.5)  # genuinely blocking -- proves worker-thread isolation
+        return _FakeProc()
+
+    def _fast_spawn(cmd, env, label, diagnostics=None, extra_popen_kwargs=None):
+        return _FakeProc()
+
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    # Isolate the test to the SPAWN call's own blocking behavior -- the
+    # post-spawn cold-spawn readiness probe (_probe_slot_health) does real
+    # network probing with its own multi-second attempts/delay budget
+    # regardless of how the spawn went, which would otherwise dominate both
+    # proxies' elapsed time and mask the property under test.
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    slow_proxy = tc.SlotProxy(["mcp-proxy", "--port", "9220"], 9220, "fs", client_id="cl-slow")
+    fast_proxy = tc.SlotProxy(["mcp-proxy", "--port", "9221"], 9221, "code", client_id="cl-fast")
+
+    async def _run_both():
+        # Route each proxy's spawn through its own fake -- monkeypatch the
+        # shared module function per-call via a dispatcher keyed on label,
+        # since both proxies call the SAME module-level _spawn_with_cache_retry.
+        def _dispatch(cmd, env, label, diagnostics=None, extra_popen_kwargs=None):
+            if label == "fs":
+                return _slow_spawn(cmd, env, label, diagnostics, extra_popen_kwargs)
+            return _fast_spawn(cmd, env, label, diagnostics, extra_popen_kwargs)
+
+        monkeypatch.setattr(tc, "_spawn_with_cache_retry", _dispatch)
+
+        start = _time.monotonic()
+        slow_task = _asyncio.ensure_future(slow_proxy.ensure_running())
+        fast_task = _asyncio.ensure_future(fast_proxy.ensure_running())
+
+        done, pending = await _asyncio.wait(
+            {slow_task, fast_task}, return_when=_asyncio.FIRST_COMPLETED, timeout=5.0,
+        )
+        fast_elapsed = _time.monotonic() - start
+        assert fast_task in done, "the fast 'code' slot must finish before the slow 'fs' slot"
+        assert slow_task in pending, "the slow 'fs' slot must still be spawning"
+        assert fast_elapsed < 0.3, (
+            f"fast slot's ensure_running took {fast_elapsed:.2f}s -- it was "
+            "blocked behind the slow slot's spawn instead of running "
+            "concurrently on its own worker thread"
+        )
+        await slow_task  # let the slow one finish so nothing leaks into another test
+
+    loop = _asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_run_both())
+    finally:
+        loop.close()
+
+    assert slow_proxy.is_running is True
+    assert fast_proxy.is_running is True
+
+
 def test_ensure_running_noop_when_already_running(monkeypatch):
     """105b5aa9 / regression — a slot that is_running skips the port check and
     Popen entirely (no spurious kills on a healthy slot)."""

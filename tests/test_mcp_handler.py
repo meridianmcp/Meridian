@@ -235,3 +235,39 @@ def test_concurrent_tools_list_requests_stay_consistent(monkeypatch):
     rev1 = resp1["result"]["_meta"]["meridian/toolManifest"]["revision"]
     rev2 = resp2["result"]["_meta"]["meridian/toolManifest"]["revision"]
     assert rev1 == rev2  # same underlying tool set → same deterministic hash
+
+
+# ---------------------------------------------------------------------------
+# b71e0960 -- "manifest generation/hash refresh after deploy" stress addition:
+# the WRITE-side counterpart to test_concurrent_tools_list_requests_stay_consistent
+# above (which only covers concurrent READS via tools/list). Nothing existing
+# exercises concurrent refresh_tool_manifest (the FORCED synchronous
+# re-aggregation path) calls racing each other.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_concurrent_refresh_tool_manifest_calls_stay_consistent(db, monkeypatch):
+    """Two callers force a synchronous tunnel manifest rebuild
+    (refresh_tool_manifest) for the SAME tenant at the same time. Both must
+    complete successfully (no exception from racing the invalidate-then-
+    rebuild sequence in meridian.routes.tunnel.refresh_tunnel_manifest) and
+    both must observe the SAME final manifest_hash/tool_count -- a truthful,
+    convergent tools/list state rather than one caller seeing a half-rebuilt
+    snapshot."""
+    tenant = {"id": "t-concurrent-refresh", "plan": "pro"}
+
+    async def fake_fetch(tid, label):
+        if label == "fs":
+            return label, [{"name": "read_file", "description": "d"}]
+        return label, []
+
+    monkeypatch.setattr(tn, "_fetch_slot_tools", fake_fetch)
+
+    results = await asyncio.gather(
+        mh._dispatch_mcp_tool("refresh_tool_manifest", {}, db, "/tmp", tenant=tenant),
+        mh._dispatch_mcp_tool("refresh_tool_manifest", {}, db, "/tmp", tenant=tenant),
+    )
+    assert all(r["list_changed_refired"] is True for r in results)
+    assert all(r["tunnel"]["tool_count"] == 1 for r in results)
+    hashes = {r["tunnel"]["manifest_hash"] for r in results}
+    assert len(hashes) == 1, f"concurrent refreshes disagreed on manifest_hash: {hashes}"
