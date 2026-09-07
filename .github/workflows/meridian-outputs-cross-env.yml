@@ -1,0 +1,54 @@
+name: Meridian-Outputs cross-environment qualification
+
+# Gap register MO-LIM-03 (meridian-outputs-research/docs/meridian-outputs-
+# gap-register.md): cross-machine replay was untested -- same-machine
+# environment tampering had been tested, but not a genuinely different
+# OS/filesystem/hardware environment. This workflow is that second declared
+# environment: a GitHub-hosted ubuntu-latest runner, as different from the
+# project's Windows dev machine as is practical to get for free.
+#
+# Also closes a standing gap on its own merits: extensions/meridian-outputs
+# has never run in CI at all (test.yml's test-core job only runs the root
+# tests/ directory; the extension-dependency-preflight job there only
+# verifies it IMPORTS, never runs its actual suite). Path-filtered push
+# trigger, scoped to dev, so this fires automatically whenever the
+# extension actually changes -- not on every unrelated dev push -- and
+# stays a real, ongoing regression gate rather than a one-off check.
+#
+# workflow_dispatch is also declared for manual re-runs, but note GitHub
+# only allows dispatching a workflow once its definition exists on the
+# repo's DEFAULT branch (main here, not dev) -- see this repo's own
+# never-push-to-main rule; the push trigger below is what makes this
+# actually runnable before/without that promotion. Intentionally separate
+# from test.yml's "Test (dev branch)" job: adding this must never change
+# what merges to main (see that file's own promotion-gate contract
+# comment).
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "extensions/meridian-outputs/**"
+      - ".github/workflows/meridian-outputs-cross-env.yml"
+  workflow_dispatch: {}
+
+env:
+  PYTHONDONTWRITEBYTECODE: 1
+
+jobs:
+  cross-env-qualification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install meridian-outputs (editable) + test deps
+        run: |
+          pip install -e extensions/meridian-outputs
+          pip install pytest pytest-timeout
+      - name: Full extensions/meridian-outputs test suite (not part of the tests/-only test-core job)
+        run: python -m pytest extensions/meridian-outputs/tests -q --tb=short --timeout=120
+      - name: Cross-environment qualification smoke test (MO-LIM-03)
+        run: python extensions/meridian-outputs/scripts/cross_env_qualification_smoke.py
