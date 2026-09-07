@@ -2846,6 +2846,15 @@ class OutputsFtsIndex:
             duckdb_memory_limit_bytes, self._tantivy_heap_bytes,
             row_count_hint=len(initial_row_cache) if initial_row_cache else 0,
         )
+        # fa600e42 follow-up (OOM crash, adaptive cooldown validation run) --
+        # an explicit caller-supplied value is a deliberate choice that must
+        # never be silently overwritten by _maybe_retune_duckdb_memory_limit
+        # below (mirrors self._max_batch_overridden's contract exactly). The
+        # env-var path is NOT included here: _default_duckdb_memory_limit_
+        # bytes checks the env var before touching psutil/row_count_hint at
+        # all, so re-resolving on that path is already idempotent -- only an
+        # explicit constructor arg needs this guard.
+        self._duckdb_memory_limit_overridden = duckdb_memory_limit_bytes is not None
         # 3535b9ad -- walk batch cap: explicit param > MERIDIAN_OUTPUTS_MAX_BATCH
         # env var > class default (1bce8c41: an effectively-unbounded default,
         # time-primary -- see _ResumableFileWalk._MAX_BATCH). This value feeds
@@ -3290,6 +3299,59 @@ class OutputsFtsIndex:
                     "rehydration failed", exc_info=True,
                 )
         return self._con
+
+    def _maybe_retune_duckdb_memory_limit(self) -> None:
+        """fa600e42 follow-up (OOM crash, confirmed live during the adaptive
+        walk-cooldown validation rerun) -- re-resolve and re-apply the
+        DuckDB `memory_limit` PRAGMA against CURRENT conditions, instead of
+        the one-time snapshot taken at construction (see
+        self._duckdb_memory_limit_bytes's own __init__ comment, which
+        previously claimed this couldn't be cheaply re-tuned mid-session --
+        empirically false: `PRAGMA memory_limit=...` applies immediately on
+        a live connection with existing tables/data, confirmed via a direct
+        DuckDB script before this fix was written).
+
+        Root cause this closes: a real 385,064-file rerun crashed with a
+        Python-level MemoryError (preceded by a DuckDB "Out of Memory
+        Error: Allocation failure / Rollback Error") after 10 calls. The
+        adaptive batch-size throttle (_adaptive_batch_limit) DID correctly
+        react to falling available memory, shrinking batches from 32768 to
+        4096 -- but that only bounds NEW intake per call; it does nothing
+        about DuckDB's own buffer-pool/working-set requirement, which grows
+        with the ACCUMULATED on-disk table size (confirmed: index_db_bytes
+        had reached ~3.68GB, right at the edge of the ~3.78GB ceiling
+        resolved once at construction from a healthier-at-the-time 6GB-free
+        snapshot). self._row_cache's live length is exactly the signal
+        _ESTIMATED_ROW_CACHE_BYTES_PER_ENTRY's reserve-widening was already
+        built for (see _default_duckdb_memory_limit_bytes's own docstring)
+        -- it was just never being fed anything but a construction-time
+        initial_row_cache hint, so a COLD start (the common case) never
+        benefited from it as the corpus actually grew during the run.
+
+        Never touches an explicit caller override (self.
+        _duckdb_memory_limit_overridden) -- an explicit value is a
+        deliberate choice, never second-guessed. No-ops before the first
+        real connection exists (nothing to re-tune yet).
+        """
+        if self._duckdb_memory_limit_overridden or self._con is None:
+            return
+        new_limit = _default_duckdb_memory_limit_bytes(
+            self._tantivy_heap_bytes, row_count_hint=len(self._row_cache),
+        )
+        old_mb = max(1, self._duckdb_memory_limit_bytes // (1024 * 1024))
+        new_mb = max(1, new_limit // (1024 * 1024))
+        if new_mb == old_mb:
+            return
+        try:
+            self._con.execute(f"PRAGMA memory_limit='{new_mb}MB'")
+        except Exception:  # noqa: BLE001
+            _log.warning(
+                "OutputsFtsIndex._maybe_retune_duckdb_memory_limit: could "
+                "not re-apply memory_limit=%dMB (kept previous %dMB)",
+                new_mb, old_mb, exc_info=True,
+            )
+            return
+        self._duckdb_memory_limit_bytes = new_limit
 
     def _read_connect(self) -> Any:
         """Return a connection dedicated to pure-read query paths
@@ -5345,6 +5407,15 @@ class OutputsFtsIndex:
             # constructor defaults when the throttle decision below reads
             # them, making the persisted state just written pointless.
             self._connect()
+            # fa600e42 follow-up (OOM crash) -- re-check the DuckDB memory
+            # ceiling against CURRENT available memory and CURRENT corpus
+            # scale (self._row_cache's live length) every call, instead of
+            # trusting the one-time construction-time snapshot for the rest
+            # of this process's life. See _maybe_retune_duckdb_memory_limit's
+            # own docstring for the confirmed incident this closes. Cheap
+            # (one PRAGMA statement, only issued when the value actually
+            # changes) and must run before any of Phase 2's write work below.
+            self._maybe_retune_duckdb_memory_limit()
             # Repair caches written by pre-canonicalization versions before
             # the normal staleness pass. This runs under the write lease so a
             # repair cannot race another process's row update.
@@ -5918,6 +5989,13 @@ class OutputsFtsIndex:
                 "rows_deleted": len(paths_to_delete),
                 "partial": bool(self.last_rebuild_partial),
                 "fts_pending": bool(self._fts_pending),
+                # fa600e42 follow-up (OOM crash) -- observational surface for
+                # _maybe_retune_duckdb_memory_limit: the ceiling actually in
+                # effect for THIS call, so a future incident is diagnosable
+                # from the metrics history alone instead of requiring the
+                # same manual event-log archaeology this fix's own root
+                # cause needed.
+                "duckdb_memory_limit_bytes": self._duckdb_memory_limit_bytes,
             })
             # 89612890 -- bounded-scale-run telemetry: files examined/re-
             # analyzed, queue depth, checkpoint/recovery state, index size,
