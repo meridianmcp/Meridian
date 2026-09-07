@@ -96,6 +96,7 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from lxml import etree as _LET
 
+from . import fallbacks
 from .zotero_client import resolve_citation_ref
 
 _log = logging.getLogger(__name__)
@@ -1401,6 +1402,30 @@ class DocxPostWriteVerificationError(OSError):
     didn't verify" apart from "someone else's write landed after mine and I
     backed off rather than clobber it." Subclasses ``OSError`` for the same
     broad-except compatibility as :class:`DocxWriteVerificationError`.
+    """
+
+    def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.manifest = manifest or {}
+
+
+class DocxRenderVerificationError(OSError):
+    """8d2ef784 (DOCS-R2-A) -- fail-closed rejection when a promoted write's
+    render-gate check (:func:`meridian.fallbacks.check_render_capability`)
+    reports ``"failed"`` or ``"unavailable-with-reason"`` and the caller did
+    not opt into ``allow_degraded_render``.
+
+    Distinct from :class:`DocxPostWriteVerificationError`: that error means
+    the intended TEXT edit could not be confirmed on disk; this one means the
+    text landed and verified fine, but the resulting document either failed
+    to render (a real backend was available and errored) or could not be
+    render-checked at all (no backend in this environment) -- and canonical/
+    production promotion fails closed on either outcome by default. A
+    best-effort restore from ``dest + ".bak"`` is attempted first (subject to
+    the same compare-and-swap safety check as
+    :func:`_safe_restore_after_verification_failure`) -- check
+    ``.manifest.get("restored")`` for whether it succeeded. Subclasses
+    ``OSError`` for the same broad-except compatibility as its siblings.
     """
 
     def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
@@ -4537,6 +4562,9 @@ class DocStructureStore:
         draft_output_path: str | None = None,
         wave_run_id: str | None = None,
         session_id: str | None = None,
+        check_render: bool = False,
+        allow_degraded_render: bool = False,
+        degraded_render_reason: str | None = None,
     ) -> dict[str, Any]:
         """ID-addressable docx WRITE — the write counterpart of ``get_element_by_id``.
 
@@ -4584,6 +4612,28 @@ class DocStructureStore:
         * ``session_id`` — required together with the two draft-mode
           parameters (the isolated draft's manifest/anchor rows are keyed on
           a real session identity); unused otherwise.
+        * ``check_render`` / ``allow_degraded_render`` / ``degraded_render_reason``
+          (8d2ef784, DOCS-R2-A -- all OPT-IN; every existing caller that omits
+          all three gets BYTE-IDENTICAL behavior to before this change:
+          ``check_render`` defaults to ``False`` and no render check runs at
+          all) -- when ``check_render=True``, after post-write text
+          verification passes, :func:`meridian.fallbacks.check_render_capability`
+          is run against ``write_dest`` and gates the write on its tri-state
+          result: ``"rendered"`` attaches ``render_status``/
+          ``render_verified=True``/``render_backend`` to the result;
+          ``"failed"`` or ``"unavailable-with-reason"`` fails closed by
+          default -- restores from backup (subject to the same compare-and-
+          swap safety check as the text-verification path) and raises
+          :class:`DocxRenderVerificationError` -- UNLESS
+          ``allow_degraded_render=True`` is passed together with a non-empty
+          ``degraded_render_reason``, the only audited opt-in: the write
+          stands, but ``render_verified`` stays ``False`` and
+          ``render_degraded``/``degraded_render_reason`` are stamped onto the
+          result. ``allow_degraded_render=True`` with an empty/missing
+          ``degraded_render_reason`` raises ``ValueError`` before anything is
+          read or mutated, regardless of ``check_render``. Draft-mode writes
+          (``write_dest`` != canonical ``source_path``) are render-gated the
+          same way, against the draft file, when requested.
 
         Mandatory post-write verification (5988a5bb, part A) now runs after
         every promoted write, draft or direct: the written file is re-read
@@ -4610,17 +4660,24 @@ class DocStructureStore:
         Returns ``{document_id, para_id, new_text, elements_resynced,
         source_path, manifest_hash, pre_counts, post_counts}`` (draft mode
         additionally carries ``draft_path``, ``wave_run_id``, ``is_draft:
-        True`` and omits ``elements_resynced``). Raises ``ValueError`` for an
-        unknown document, an unresolvable/missing source path, a stale
-        ``expected_content_hash``, a rejected draft claim, or a ``para_id``
-        not present in the document; raises
-        :class:`AmbiguousParagraphIdError` (827b6bdc, a ``ValueError``
+        True`` and omits ``elements_resynced``). ``check_render=True``
+        additionally adds ``render_status``, ``render_verified``,
+        ``render_backend`` (and, for a degraded-accepted render,
+        ``render_degraded: True`` plus ``degraded_render_reason``) — omitted
+        entirely when ``check_render`` is left at its default ``False``.
+        Raises ``ValueError`` for an unknown document, an unresolvable/missing
+        source path, a stale ``expected_content_hash``, an
+        ``allow_degraded_render=True`` with no ``degraded_render_reason``, a
+        rejected draft claim, or a ``para_id`` not present in the document;
+        raises :class:`AmbiguousParagraphIdError` (827b6bdc, a ``ValueError``
         subclass) when ``para_id`` matches MORE than one paragraph — a
         duplicated native ``w14:paraId`` in the source .docx — instead of
         silently writing whichever match the resolver reached first; raises
         :class:`DocxPostWriteVerificationError` when the promoted write
         cannot be confirmed on disk and it was safe to restore, or
-        :class:`DocxConcurrentWriteConflictError` when it could not be
+        :class:`DocxRenderVerificationError` when the promoted write's
+        render-gate check fails/is unavailable and it was safe to restore, or
+        :class:`DocxConcurrentWriteConflictError` when either could not be
         safely auto-corrected because a different writer's promotion landed
         after this one's — never fabricates a silent no-op success.
         """
@@ -4630,6 +4687,16 @@ class DocStructureStore:
         if not isinstance(para_id, str) or not para_id.strip():
             raise ValueError("para_id is required")
         para_id = para_id.strip()
+        # 8d2ef784 (DOCS-R2-A) -- validated BEFORE any read/mutation, same as
+        # expected_content_hash below: an audited opt-in with no reason is a
+        # caller error, not something to silently ignore or default away.
+        if allow_degraded_render and not (
+            isinstance(degraded_render_reason, str) and degraded_render_reason.strip()
+        ):
+            raise ValueError(
+                "degraded_render_reason must be a non-empty string when "
+                "allow_degraded_render=True"
+            )
 
         doc_row = await self.get_document(project_id, src)
         if doc_row is None:
@@ -4740,6 +4807,8 @@ class DocStructureStore:
         # module-level comment for why it cannot (and does not need to)
         # close the cross-process window by itself — that's what the
         # compare-and-swap check just below is for.
+        render_check: dict[str, Any] | None = None
+        render_degraded = False
         with _docx_promotion_lock(write_dest):
             # Canonical _save_docx_xml serializes ``root`` and rewrites only
             # the document part into a copy of the original ZIP (``raw``) at
@@ -4787,6 +4856,54 @@ class DocStructureStore:
                     manifest={**transaction, "restored": restored},
                 )
 
+            # 8d2ef784 (DOCS-R2-A) — OPT-IN render-gate check (check_render=
+            # True only; every existing caller that omits it never reaches
+            # this block at all, so behavior is byte-identical to before this
+            # change), held under the SAME promotion lock as the text
+            # verification just above and for the same reason: closes the
+            # same-process race window between promotion and this check's
+            # own conditional restore. Only reached once text verification
+            # has already passed (the branch above always raises otherwise).
+            if check_render:
+                render_check = fallbacks.check_render_capability(write_dest)
+                if render_check["status"] != fallbacks.RENDERED:
+                    if allow_degraded_render:
+                        render_degraded = True
+                    else:
+                        safe_to_restore, restored = _safe_restore_after_verification_failure(
+                            write_dest, transaction.get("promoted_sha256"),
+                        )
+                        if not safe_to_restore:
+                            raise DocxConcurrentWriteConflictError(
+                                f"render verification for para_id={para_id!r} in "
+                                f"{write_dest} did not pass (status="
+                                f"{render_check['status']!r}) — AND a different writer's "
+                                "promotion has landed on this file since ours, so this "
+                                "could not be safely auto-corrected: restoring from our "
+                                f"own backup would destroy that writer's already-promoted "
+                                f"work. {write_dest} was left untouched, exactly as that "
+                                "other writer left it — investigate manually.",
+                                manifest={
+                                    **transaction,
+                                    "restored": False,
+                                    "concurrent_write_detected": True,
+                                    "render_check": render_check,
+                                },
+                            )
+                        raise DocxRenderVerificationError(
+                            f"render verification for para_id={para_id!r} in {write_dest} "
+                            f"did not pass (status={render_check['status']!r}): "
+                            f"{render_check.get('reason', '(no reason given)')}"
+                            + (
+                                " — restored from backup, the file reflects its PRE-write state"
+                                if restored
+                                else " — WARNING: could not restore from backup (no .bak "
+                                "found or restore failed); the file may be left in an "
+                                "unverified state"
+                            ),
+                            manifest={**transaction, "restored": restored, "render_check": render_check},
+                        )
+
         result = {
             "document_id": doc_row["id"],
             "para_id": para_id,
@@ -4800,6 +4917,15 @@ class DocStructureStore:
             "pre_counts": transaction.get("pre_counts"),
             "post_counts": transaction.get("post_counts"),
         }
+        if render_check is not None:
+            # 8d2ef784 (DOCS-R2-A) — tri-state render-gate evidence for this
+            # write, present only when check_render=True was actually requested.
+            result["render_status"] = render_check["status"]
+            result["render_verified"] = render_check["status"] == fallbacks.RENDERED
+            result["render_backend"] = render_check.get("backend")
+            if render_degraded:
+                result["render_degraded"] = True
+                result["degraded_render_reason"] = degraded_render_reason
         if draft_dest is not None:
             # Draft mode: source_path (canonical) was never touched, so the
             # doc_elements index — which reflects the CANONICAL file — must
