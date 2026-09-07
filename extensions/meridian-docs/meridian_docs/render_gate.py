@@ -275,6 +275,11 @@ def _soffice_unavailable_reason() -> str | None:
 # waiting out a real 60s timeout to exercise the timeout-classification path.
 _SOFFICE_TIMEOUT_SECONDS = 60.0
 
+# d4a1f2c8 -- module-level so tests can monkeypatch this to 0 instead of
+# actually sleeping to exercise the retry-backoff path. See its use in
+# check_render_capability's retry loop for why a delay (not zero) matters.
+_RENDER_RETRY_BACKOFF_SECONDS = 2.0
+
 # Substrings (lowercased) in soffice's stderr that indicate the SOURCE
 # document itself is the problem (a genuinely corrupt/unreadable .docx),
 # as opposed to a transient environment hiccup (profile lock contention,
@@ -985,6 +990,20 @@ def check_render_capability(
             detail = backend.render(docx_path)
         except RenderCapabilityError as exc:
             if exc.retryable and attempts <= max_retries:
+                # d4a1f2c8 -- a retryable failure is, by definition, a
+                # transient resource race (e.g. soffice contending with
+                # another concurrent instance for a shared resource), not a
+                # property of this document. Retrying with zero delay gives
+                # whatever's contending no time to clear, so it tends to hit
+                # the identical race again -- confirmed live, 2026-09-07: a
+                # real confirmatory benchmark run showed the immediate,
+                # zero-delay retry failing on effectively every attempt for
+                # the same transient-crash signature. A short backoff before
+                # the retry (not before the FIRST attempt -- only successful
+                # or genuinely non-retryable calls skip this entirely) costs
+                # nothing on the common case and gives a real chance for
+                # transient contention to resolve on the uncommon one.
+                time.sleep(_RENDER_RETRY_BACKOFF_SECONDS)
                 continue
             return _tag(_result(
                 FAILED,

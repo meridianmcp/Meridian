@@ -801,6 +801,7 @@ def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp
     REAL _soffice_render backend (not a fake stand-in)."""
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+    monkeypatch.setattr(render_gate, "_RENDER_RETRY_BACKOFF_SECONDS", 0)
 
     calls: list[int] = []
 
@@ -820,6 +821,85 @@ def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp
     assert result["status"] == render_gate.RENDERED
     assert result["detail"]["converted_via"] == "soffice"
     assert len(calls) == 2
+
+
+def test_check_render_capability_sleeps_before_a_retry_not_before_the_first_attempt(tmp_path, monkeypatch):
+    """d4a1f2c8 -- a retryable failure means a transient resource race (e.g.
+    soffice contending with another concurrent instance for a shared
+    resource), not a property of this document. Confirmed live, 2026-09-07:
+    a real confirmatory benchmark run showed the OLD zero-delay retry
+    failing on effectively every attempt for the same transient-crash
+    signature -- immediate retry gives whatever's contending no time to
+    clear. A backoff must run before the retry, but never before the first
+    attempt (that would slow down the overwhelmingly common success case
+    for no reason)."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(render_gate.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    calls: list[int] = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("transient spawn failure")
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+
+    assert result["status"] == render_gate.RENDERED
+    assert sleep_calls == [render_gate._RENDER_RETRY_BACKOFF_SECONDS]
+
+
+def test_check_render_capability_does_not_sleep_when_the_first_attempt_succeeds(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(render_gate.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def _fake_run(cmd, **kwargs):
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+
+    assert result["status"] == render_gate.RENDERED
+    assert sleep_calls == []
+
+
+def test_check_render_capability_does_not_sleep_after_the_final_non_retryable_failure(tmp_path, monkeypatch):
+    """A timeout is never retryable (see _soffice_render's own reasoning), so
+    it must fail straight through with no backoff delay -- there is no
+    retry coming, so sleeping first would only slow down a result that was
+    already decided."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+    monkeypatch.setattr(render_gate, "_SOFFICE_TIMEOUT_SECONDS", 0.01)
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(render_gate.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def _fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"), output=b"", stderr=b"stuck")
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+
+    assert result["status"] == render_gate.FAILED
+    assert sleep_calls == []
 
 
 # --- _word_com_render: bounded timeout, owned-process cleanup, COM error ---
