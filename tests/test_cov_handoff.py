@@ -1835,18 +1835,19 @@ async def test_generate_handoff_starter_and_compact(db, tmp_path):
         assert f'start_session(project_name="{p["name"]}"' in content  # 11a91d31
         assert f'project_id (fallback): {p["id"]}' in content
         assert it2["id"][:8] in content
-        assert "Done:" in content
+        assert "Done in this handoff scope:" in content  # 943786c9
         assert path.endswith(f"{handoff_module.handoff_file_stem(p['id'])}_starter.md")
 
 
 @pytest.mark.asyncio
 async def test_generate_handoff_starter_no_completed(db, tmp_path):
-    """Starter renders 'Done: (none)' and 'Pending (none)' when empty."""
+    """Starter renders 'Done in this handoff scope: (none)' and 'Pending
+    (none)' when empty (943786c9 — label made explicit about its scope)."""
     p = await db_module.create_project(db, "alpha-starter-empty")
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), mode="starter"
     )
-    assert "Done: (none)" in content
+    assert "Done in this handoff scope: (none)" in content
     assert "(none)" in content
 
 

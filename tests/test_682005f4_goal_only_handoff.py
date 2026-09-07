@@ -10,6 +10,14 @@ separate L1 markdown section, which a goal-only mode strips away).
 
 Also covers (c): the starter-mode preview line now honestly reflects "top 3
 of N" instead of silently implying only 3 pending items exist.
+
+943786c9 (follow-up to 524e73e6) since rewrote this preview line's exact
+wording to "N pending in this handoff scope; previewing M" — see
+test_943786c9_starter_preview_scope_clarity.py for that follow-up's own
+dedicated coverage (five-item dependency-chain fixture, wave-scope split,
+"Done in this handoff scope" labeling). The two tests below are updated in
+place to the new wording rather than duplicated there, since they already
+exist to pin exactly this preview-honesty contract.
 """
 
 from __future__ import annotations
@@ -507,6 +515,11 @@ def test_build_quick_start_goal_include_pointer_lines_opt_in():
 # ---------------------------------------------------------------------------
 # (c) starter-mode preview honestly reflects "top 3 of N" instead of implying
 # only 3 pending items exist.
+#
+# 943786c9 (follow-up to 524e73e6) rewrote the exact wording of this header
+# to "N pending in this handoff scope; previewing M" — the assertions below
+# are updated in place to that new phrasing rather than left pinning the
+# superseded "# Pending (top 3 of N ...)" text.
 # ---------------------------------------------------------------------------
 
 
@@ -522,7 +535,7 @@ async def test_starter_preview_honestly_labels_top_3_of_n(db, tmp_path):
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter"
     )
-    assert "# Pending (top 3 of 5" in content
+    assert "5 pending in this handoff scope; previewing 3" in content
     # The full batch (with every id) is covered by the next test.
 
 
@@ -533,7 +546,7 @@ async def test_starter_preview_plain_header_when_three_or_fewer(db, tmp_path):
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter"
     )
-    assert "\n# Pending\n" in content
+    assert "1 pending in this handoff scope; previewing 1" in content
     assert "top 3 of" not in content
     assert it1["id"][:8] in content
 
