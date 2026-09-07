@@ -383,21 +383,23 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
             # machine, satisfying "clean only Meridian-owned processes"
             # without any extra process-sweeping logic.
             #
-            # d4a1f2c8 -- retryable=True as of 2026-09-07 (was False). The
-            # original reasoning here ("a render that hung once is likely to
-            # hang again") was sound for the OLD shared-profile-lock design:
-            # every call fought over the SAME lock, so an immediate retry
-            # hit the identical stuck resource and was guaranteed to fail
-            # the same way. That's no longer true now that each call gets
-            # its own isolated profile (this function, above) -- a timeout
-            # now most plausibly means real, transient host-wide contention
-            # (confirmed live: 25 concurrent `claude` processes and 40
-            # `python` processes running at the time a real confirmatory
-            # benchmark chain took 5 separate ~60s-timeout attempts, ~65s
-            # apart, before giving up), which a fresh isolated attempt a
-            # couple of seconds later has a real chance of avoiding. Bounded
-            # by the same max_retries as every other retryable class, and
-            # by the same backoff before the retry.
+            # d4a1f2c8 -- retryable=False, REVERTED back from a same-day
+            # True (2026-09-07). The reasoning for True was sound in
+            # isolation (each call now gets its own profile, so a timeout no
+            # longer means "the identical stuck lock" the way it did under
+            # the old shared-profile design) but wrong in practice: making a
+            # single render attempt retryable roughly doubles its own
+            # worst-case latency (60s -> 60s + backoff + 60s), and the
+            # CALLING agent already retries the whole tool call itself
+            # (observed consistently, 2-3x per trial) -- confirmed live,
+            # immediately after shipping retryable=True, that this pushed
+            # real confirmatory-benchmark trials past the harness's OUTER
+            # 300s subprocess timeout with zero JSON output at all (killed
+            # mid-flight, no transcript) -- strictly worse than the original
+            # clean, informative render-gate failure message every one of
+            # these trials produced before. Reverted rather than layering
+            # another mitigation on top of a change that measurably made
+            # things worse under real load.
             stderr = None
             if exc.stderr:
                 stderr = (
@@ -411,7 +413,7 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
                 error_class=TIMEOUT_ERROR,
                 timed_out=True,
                 stderr=stderr,
-                retryable=True,
+                retryable=False,
             ) from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise RenderCapabilityError(

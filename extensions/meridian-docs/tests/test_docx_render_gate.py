@@ -795,14 +795,19 @@ def test_soffice_render_profile_dir_ignores_a_long_redirected_temp(tmp_path, mon
 
 
 def test_soffice_render_timeout_is_classified_and_carries_stderr(tmp_path, monkeypatch):
-    """d4a1f2c8 -- retryable is True as of 2026-09-07 (was False). The
-    original "a render that hung once is likely to hang again" reasoning
-    held for the OLD shared-profile-lock design, where a retry fought over
-    the identical stuck lock. Now that each call gets its own isolated
-    profile, a timeout most plausibly means real, transient host-wide
-    contention (confirmed live against a real confirmatory benchmark run)
-    that a fresh attempt a couple of seconds later has a real chance of
-    avoiding."""
+    """d4a1f2c8 -- retryable is False, same day it was briefly flipped to
+    True and reverted. True was well-reasoned in isolation (each call now
+    gets its own profile, so a timeout no longer means "the identical stuck
+    lock" the way it did under the old shared-profile design) but wrong in
+    practice: it roughly doubles a single attempt's worst-case latency (60s
+    -> 60s + backoff + 60s), and the CALLING agent already retries the
+    whole tool call itself (observed consistently, 2-3x per trial) --
+    confirmed live that this combination pushed real confirmatory-benchmark
+    trials past the harness's OUTER 300s subprocess timeout with zero JSON
+    output at all (killed mid-flight, no transcript), strictly worse than
+    the clean, informative render-gate failure every one of these trials
+    produced before. Reverted rather than layering another mitigation on
+    top of a change that measurably made things worse under real load."""
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
 
@@ -817,7 +822,7 @@ def test_soffice_render_timeout_is_classified_and_carries_stderr(tmp_path, monke
     exc = excinfo.value
     assert exc.error_class == render_gate.TIMEOUT_ERROR
     assert exc.timed_out is True
-    assert exc.retryable is True
+    assert exc.retryable is False
     assert exc.stderr == "stuck"
 
 
@@ -883,12 +888,14 @@ def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp
     assert len(calls) == 2
 
 
-def test_soffice_timeout_recovers_on_retry_through_check_render_capability(tmp_path, monkeypatch):
-    """d4a1f2c8 -- end-to-end: a soffice timeout on the first attempt,
-    followed by a successful conversion on the retry, now recovers via
-    check_render_capability's retry -- confirming timeouts are genuinely
-    retryable (not just classified as such in isolation), exercising the
-    REAL _soffice_render backend."""
+def test_soffice_timeout_is_not_retried_through_check_render_capability(tmp_path, monkeypatch):
+    """d4a1f2c8 -- end-to-end, exercising the REAL _soffice_render backend:
+    a soffice timeout must fail straight through check_render_capability
+    with exactly one attempt, not retry. (This was briefly made retryable
+    the same day and reverted -- see test_soffice_render_timeout_is_
+    classified_and_carries_stderr for why: it measurably made real
+    confirmatory-benchmark trials worse by pushing them past the harness's
+    outer 300s subprocess timeout.)"""
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
     monkeypatch.setattr(render_gate, "_RENDER_RETRY_BACKOFF_SECONDS", 0)
@@ -897,19 +904,17 @@ def test_soffice_timeout_recovers_on_retry_through_check_render_capability(tmp_p
 
     def _fake_run(cmd, **kwargs):
         calls.append(1)
-        if len(calls) == 1:
-            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"), output=b"", stderr=b"stuck")
-        out_dir = cmd[cmd.index("--outdir") + 1]
-        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
-            fh.write(b"%PDF-1.4 fake")
-        return _FakeCompletedProcess(0)
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"), output=b"", stderr=b"stuck")
 
     monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
 
-    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+    result = render_gate.check_render_capability(
+        docx_path, backends=[render_gate._SOFFICE_BACKEND], max_retries=5,
+    )
 
-    assert result["status"] == render_gate.RENDERED
-    assert len(calls) == 2
+    assert result["status"] == render_gate.FAILED
+    assert result["detail"]["error_class"] == render_gate.TIMEOUT_ERROR
+    assert len(calls) == 1
 
 
 def test_check_render_capability_sleeps_before_a_retry_not_before_the_first_attempt(tmp_path, monkeypatch):
