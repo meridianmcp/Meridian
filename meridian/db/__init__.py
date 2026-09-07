@@ -1149,6 +1149,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_experiment_model(db)
     await _migrate_external_job_register(db)
     await _migrate_paper_contract(db)
+    await _migrate_paper_strategy_graph(db)
     return db
 
 
@@ -13004,4 +13005,24 @@ from .paper_contract import (  # noqa: F401
     get_paper_contract_revision,
     list_paper_contract_revisions,
     approve_paper_contract_revision,
+)
+
+# 81b5491b — SCHEMA: paper_strategy_graph — argument-layer nodes and
+# rhetorical edges for the manuscript/paper editorial tooling line. Imported
+# LAST (after everything above, including research_graph/experiment_model) —
+# a two-table, versioned-with-approval-gate shape with no dependency on any
+# other db/*.py submodule at import time. See meridian.paper_strategy for the
+# closed NODE_TYPES/EDGE_TYPES vocabularies and meridian.db.paper_strategy_graph's
+# own module docstring for the full schema/versioning/approval-gate contract.
+from .paper_strategy_graph import (  # noqa: F401
+    _migrate_paper_strategy_graph,
+    create_strategy_node,
+    get_strategy_node,
+    list_strategy_node_versions,
+    get_current_strategy_node,
+    approve_strategy_node,
+    reject_strategy_node,
+    supersede_strategy_node,
+    create_strategy_edge,
+    get_strategy_edges_for_node,
 )

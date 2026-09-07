@@ -980,6 +980,7 @@ class AttemptTransitionRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+
 class PaperContractContent(BaseModel):
     """The editorial-intent payload carried by one revision — what an
     editorial session (human or AI) is and is not allowed to assume about a
@@ -1082,6 +1083,93 @@ class PaperContractRevision(BaseModel):
     created_at: str
 
 
+# ---------------------------------------------------------------------------
+# 81b5491b — SCHEMA: paper_strategy_graph — argument-layer nodes and
+# rhetorical edges for the manuscript/paper editorial tooling line. See
+# meridian.paper_strategy (closed vocabularies) and
+# meridian.db.paper_strategy_graph (persistence, versioning, human-approval
+# gate) for the full contract these wire-format shapes describe.
+# ---------------------------------------------------------------------------
+
+_PAPER_STRATEGY_NODE_TYPE = Literal[
+    "thesis", "claim", "counter_claim", "evidence", "warrant",
+    "rebuttal", "concession", "motivation", "framing_note",
+]
+
+_PAPER_STRATEGY_EDGE_KIND = Literal[
+    "supports", "rebuts", "concedes", "qualifies", "motivates",
+    "contrasts", "elaborates", "restates",
+]
+
+
+class PaperStrategyNodeCreate(BaseModel):
+    """Body for creating a brand-new argument-layer node (always starts a
+    new node family at version 1, status 'draft' — see
+    ``meridian.db.paper_strategy_graph.create_strategy_node``)."""
+
+    project_id: str = Field(..., min_length=1)
+    node_type: _PAPER_STRATEGY_NODE_TYPE
+    statement: str = Field(..., min_length=1)
+    document_ref: str | None = None
+    rationale: str | None = None
+    created_by: str | None = None
+
+
+class PaperStrategyNode(BaseModel):
+    """One versioned argument-layer node row. ``family_id``/``version``
+    together identify this node's place in its append-only revision history
+    (mirrors ``meridian.db.research_graph``'s identity/seq convention);
+    ``status`` carries the human-approval gate (``draft`` ->
+    ``approved``/``rejected``; ``superseded`` when a later version replaced
+    this row) — see ``meridian.db.paper_strategy_graph`` for the full
+    contract."""
+
+    id: str
+    project_id: str
+    family_id: str
+    version: int
+    node_type: _PAPER_STRATEGY_NODE_TYPE
+    document_ref: str | None = None
+    statement: str
+    rationale: str | None = None
+    status: Literal["draft", "approved", "rejected", "superseded"] = "draft"
+    approved_by: str | None = None
+    approved_at: str | None = None
+    rejection_reason: str | None = None
+    supersedes_id: str | None = None
+    superseded_by: str | None = None
+    created_by: str | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
+class PaperStrategyEdgeCreate(BaseModel):
+    """Body for creating one rhetorical edge between two EXACT, already-
+    existing argument-layer node ids (see
+    ``meridian.db.paper_strategy_graph.create_strategy_edge`` for the
+    self-loop / missing-endpoint rejection rules)."""
+
+    project_id: str = Field(..., min_length=1)
+    edge_kind: _PAPER_STRATEGY_EDGE_KIND
+    from_node_id: str = Field(..., min_length=1)
+    to_node_id: str = Field(..., min_length=1)
+    label: str | None = None
+    created_by: str | None = None
+
+
+class PaperStrategyEdge(BaseModel):
+    """One rhetorical edge row linking two argument-layer nodes by exact id."""
+
+    id: str
+    project_id: str
+    edge_kind: _PAPER_STRATEGY_EDGE_KIND
+    from_node_id: str
+    to_node_id: str
+    label: str | None = None
+    created_by: str | None = None
+    created_at: str
+
+
 class PaperContractRevisionApproval(BaseModel):
     """Args for the human-approval gate: approving a pending revision pins
     it as the contract's ``current_revision_id`` and supersedes the
@@ -1090,5 +1178,3 @@ class PaperContractRevisionApproval(BaseModel):
 
     revision_id: str = Field(..., min_length=1)
     approved_by_human_id: str = Field(..., min_length=1)
-
-

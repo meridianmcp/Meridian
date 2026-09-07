@@ -8546,10 +8546,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_experiment_model",
         "_migrate_pg_external_job_register",
         "_migrate_pg_paper_contract",
+        "_migrate_pg_paper_strategy_graph",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 159
+    assert len(allnames) == len(set(allnames)) == 160
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

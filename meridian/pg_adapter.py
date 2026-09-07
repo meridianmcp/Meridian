@@ -4952,6 +4952,72 @@ async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_paper_strategy_graph(conn: PostgresConnection) -> None:
+    """81b5491b — paper_strategy_nodes / paper_strategy_edges: SCHEMA:
+    paper_strategy_graph — argument-layer nodes and rhetorical edges for the
+    manuscript/paper editorial tooling line. Mirrors
+    db.paper_strategy_graph._migrate_paper_strategy_graph exactly — see that
+    module's docstring (and meridian.paper_strategy's) for the full schema,
+    versioning (family_id/version), and human-approval-gate (status) contract.
+    Not present in the base CREATE_TABLES_CORE literal — this guarded
+    migration is the only creation path on Postgres, matching
+    _migrate_pg_research_graph's identical shape.
+
+    The unique index on (project_id, family_id, version) is what makes the
+    version-numbering in create_strategy_node/supersede_strategy_node safe
+    against a duplicate version being inserted for the same family. The
+    unique index on paper_strategy_edges makes create_strategy_edge
+    idempotent on its natural (project, edge_kind, from, to) key, mirroring
+    research_edges' identical technique.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS paper_strategy_nodes ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    family_id TEXT NOT NULL,"
+        "    version INTEGER NOT NULL DEFAULT 1,"
+        "    node_type TEXT NOT NULL CHECK (node_type IN ("
+        "        'thesis', 'claim', 'counter_claim', 'evidence', 'warrant',"
+        "        'rebuttal', 'concession', 'motivation', 'framing_note')),"
+        "    document_ref TEXT,"
+        "    statement TEXT NOT NULL,"
+        "    rationale TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ("
+        "        'draft', 'approved', 'rejected', 'superseded')),"
+        "    approved_by TEXT,"
+        "    approved_at TEXT,"
+        "    rejection_reason TEXT,"
+        "    supersedes_id TEXT,"
+        "    superseded_by TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    updated_at TEXT"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_strategy_nodes_family_version "
+        "ON paper_strategy_nodes(project_id, family_id, version);"
+        "CREATE INDEX IF NOT EXISTS idx_paper_strategy_nodes_project "
+        "ON paper_strategy_nodes(project_id, status);"
+        "CREATE TABLE IF NOT EXISTS paper_strategy_edges ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    edge_kind TEXT NOT NULL CHECK (edge_kind IN ("
+        "        'supports', 'rebuts', 'concedes', 'qualifies', 'motivates',"
+        "        'contrasts', 'elaborates', 'restates')),"
+        "    from_node_id TEXT NOT NULL,"
+        "    to_node_id TEXT NOT NULL,"
+        "    label TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_strategy_edges_unique "
+        "ON paper_strategy_edges(project_id, edge_kind, from_node_id, to_node_id);"
+        "CREATE INDEX IF NOT EXISTS idx_paper_strategy_edges_from "
+        "ON paper_strategy_edges(project_id, from_node_id);"
+        "CREATE INDEX IF NOT EXISTS idx_paper_strategy_edges_to "
+        "ON paper_strategy_edges(project_id, to_node_id);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -5077,4 +5143,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_experiment_model,
     _migrate_pg_external_job_register,
     _migrate_pg_paper_contract,
+    _migrate_pg_paper_strategy_graph,
 )
