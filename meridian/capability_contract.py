@@ -620,6 +620,43 @@ _DEFAULT_MAX_EXECUTOR_CONTRACTS = 25
 # exists to bound the WORST case, not to shrink the common case.
 _DEFAULT_MAX_CONTRACT_LIST_ITEMS = 200
 
+# 537a7cef — item_routing_summary (de4d4293) was never threaded through
+# _cap_contract_list at all: build_routing_summary emits one entry per
+# PENDING item that has a resolvable hint (explicit or inferred), same
+# unbounded-with-board-size shape item_executor_contracts needed de4d4293's
+# cap for and the three sections above needed 248c0bb9's cap for -- this
+# section just never got the same treatment. Confirmed live: on a real
+# project's compact start_session response, item_routing_summary alone was
+# ~25KB of a ~30KB capability_contract (83%) at 96 pending items, ~265 bytes/
+# entry -- the single largest contributor observed, and the dominant driver
+# on a much larger board (the item's own repro: a 2000+-item board pushing
+# generate_handoff's capability_contract to ~440KB). Reuses
+# max_contract_list_items (the SAME cap already applied to the sibling
+# item_tool_requirements/item_sprint_item_pointers/
+# item_artifact_pointer_findings sections) rather than inventing a fourth
+# knob -- these sections are drawn from the identical candidate list and
+# should truncate at the identical point. See _cap_contract_list's own
+# {truncated, total_candidates, included} marker shape, applied here as
+# item_routing_summary_truncated.
+
+# 537a7cef — root cause B: requested.capabilities / effective.capabilities
+# embed the FULL manifest/resolved-profile capability list verbatim, with NO
+# cap of any kind -- not even start_session's own 0/0 max_executor_contracts/
+# max_contract_list_items compact caps touch these two fields, since neither
+# cap was ever wired to them. Each capability carries required_tools/
+# fallback_chain/verification_command/provenance (capability_manifest.py's
+# schema), so a project with a large declared capability profile pays for
+# every one of those on every start_session/generate_handoff call regardless
+# of any other cap in play. Threshold-based (never unconditional
+# summarization) so every existing small-manifest test -- which asserts
+# BYTE-IDENTICAL equality against the raw saved manifest -- stays untouched:
+# default is well above any manifest exercised by this codebase's own tests
+# or any realistically-sized real project's declared capability count.
+# Preserves original list order (no re-sort) so truncation is a plain
+# prefix-take, matching _cap_contract_list's own slicing behavior and never
+# disturbing the order-sensitive equality assertions below the cap.
+_DEFAULT_MAX_CAPABILITY_LIST_ITEMS = 50
+
 
 def _cap_contract_list(
     entries: list[dict[str, Any]], max_items: int,
@@ -651,8 +688,23 @@ async def build_capability_contract(
     items: "list[dict[str, Any]] | None" = None,
     max_executor_contracts: int = _DEFAULT_MAX_EXECUTOR_CONTRACTS,
     max_contract_list_items: int = _DEFAULT_MAX_CONTRACT_LIST_ITEMS,
+    max_capability_list_items: int = _DEFAULT_MAX_CAPABILITY_LIST_ITEMS,
 ) -> dict[str, Any]:
     """Build the effective capability contract for ``project_id``.
+
+    ``max_capability_list_items`` (537a7cef) — caps the EMBEDDED
+    ``requested.capabilities`` / ``effective.capabilities`` lists the same
+    threshold+marker way ``max_contract_list_items`` caps the per-item
+    sections below: applied to a COPY used only for the final serialized
+    contract, never to the lists this function itself computes
+    executable/missing_required/manifest_hash from (those always see the
+    full, uncapped capability list — truncating them would silently change
+    executability). A sibling ``requested.capabilities_truncated`` /
+    ``effective.capabilities_truncated`` dict (``_cap_contract_list``'s own
+    ``{truncated, total_candidates, included}`` shape) records whether
+    anything was actually cut. A manifest at or under the cap (every
+    existing test's manifest, and any realistically-sized real project) is
+    byte-identical to the pre-cap output.
 
     ``max_contract_list_items`` (248c0bb9) — caps ``item_tool_requirements``,
     ``item_sprint_item_pointers``, and ``item_artifact_pointer_findings``
@@ -856,9 +908,11 @@ async def build_capability_contract(
     # (the full version-scoped pending inventory — NOT the narrower
     # claimable-batch scope the /goal text's own <executor_routing> clause
     # deliberately uses; see that clause's docstring for why the text stays
-    # narrower). This is cheap and bounded by construction — no DB, no
-    # per-item async work, one short entry per item — never the size risk
-    # item_executor_contracts above needed an explicit cap for.
+    # narrower). Cheap and bounded per-entry (no DB, no per-item async work,
+    # one short dict per item) but NOT bounded in COUNT — it scales linearly
+    # with the pending-item inventory the same way item_executor_contracts
+    # did before de4d4293's cap; see the explicit cap applied right below
+    # (537a7cef) for why this needed the same treatment.
     try:
         from . import executor_contract as _executor_contract_routing  # noqa: PLC0415
 
@@ -871,6 +925,19 @@ async def build_capability_contract(
     except Exception:  # noqa: BLE001 — routing summary is best-effort enrichment
         item_routing_summary = []
         item_routing_summary_hash = None
+
+    # 537a7cef — cap the EMBEDDED routing summary the SAME way the three
+    # sibling per-item sections are capped above (item_routing_summary was
+    # never wired to max_contract_list_items at all -- see
+    # _DEFAULT_MAX_CAPABILITY_LIST_ITEMS's neighboring comment for why this
+    # was the single largest contributor observed on a real board). The hash
+    # is computed over the FULL (pre-cap) summary above, preserving its
+    # documented parity semantics with an independent build_routing_summary
+    # call over the same live items -- only the embedded list itself is
+    # truncated for size, never the hash's input.
+    item_routing_summary, item_routing_summary_truncated = _cap_contract_list(
+        item_routing_summary, max_contract_list_items,
+    )
 
     effective_capabilities, effective_source = await _resolve_effective_capabilities(
         db, project_id, requested_capabilities, resolver=effective_resolver,
@@ -932,17 +999,37 @@ async def build_capability_contract(
         effective_capabilities if isinstance(effective_capabilities, list) else []
     )
 
+    # 537a7cef — cap the EMBEDDED requested/effective capability lists for
+    # display only, on copies taken AFTER every executable/missing_required/
+    # manifest_hash computation above already consumed the full, uncapped
+    # lists (see max_capability_list_items's own docstring on why this must
+    # never feed back into those computations).
+    requested_capabilities_embedded, requested_capabilities_truncated = (
+        _cap_contract_list(
+            requested_capabilities if isinstance(requested_capabilities, list) else [],
+            max_capability_list_items,
+        )
+    )
+    effective_capabilities_embedded, effective_capabilities_truncated = (
+        _cap_contract_list(
+            effective_capabilities if isinstance(effective_capabilities, list) else [],
+            max_capability_list_items,
+        )
+    )
+
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     contract: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "project_id": project_id,
         "requested": {
-            "capabilities": requested_capabilities,
+            "capabilities": requested_capabilities_embedded,
+            "capabilities_truncated": requested_capabilities_truncated,
             "manifest_version": manifest.get("manifest_version"),
             "manifest_hash": manifest.get("manifest_hash"),
         },
         "effective": {
-            "capabilities": effective_capabilities,
+            "capabilities": effective_capabilities_embedded,
+            "capabilities_truncated": effective_capabilities_truncated,
             "source": effective_source,
         },
         "availability": {
@@ -962,6 +1049,7 @@ async def build_capability_contract(
         "item_executor_contracts": item_executor_contracts,
         "item_executor_contracts_truncated": item_executor_contracts_truncated,
         "item_routing_summary": item_routing_summary,
+        "item_routing_summary_truncated": item_routing_summary_truncated,
         "item_routing_summary_hash": item_routing_summary_hash,
         "board_stale": bool(board_stale),
         "executable": executable,

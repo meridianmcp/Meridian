@@ -542,6 +542,18 @@ class TestMissingToolsDegradation:
     @pytest.mark.parametrize("filename", [
         "output_provenance_gate.py",
         "docx_completion_gate.py",
+        # db63385b (W31-B): figure_invariant_gate.py is a pure-stdlib
+        # comparator over already-extracted payload dicts (see its own
+        # module docstring) -- it genuinely qualifies for this same guard,
+        # not merely exempt by omission.
+        "figure_invariant_gate.py",
+        # 5cc3d745 (W31-C): figure_slot_manifest.py is likewise pure stdlib
+        # (dataclasses/json/argparse/collections/typing only -- see its own
+        # module docstring's "Stdlib only" section) over already-decided
+        # classification data -- it never reads a .docx or calls into
+        # meridian-docs/meridian-outputs, so it qualifies for this same
+        # guard too.
+        "figure_slot_manifest.py",
     ])
     def test_module_has_no_hard_top_level_import_on_the_extension_it_falls_back_for(self, filename):
         source = (_PKG_DIR / filename).read_text(encoding="utf-8")

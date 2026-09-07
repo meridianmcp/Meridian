@@ -31,6 +31,7 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -892,3 +893,181 @@ async def test_fan_out_sprint_items_strict_empty_entries_raises(db, project):
         await db_module.fan_out_sprint_items(
             db, project["id"], [], strict=True, idempotency_key="fo-strict-empty-1",
         )
+
+
+# ---------------------------------------------------------------------------
+# b71e0960 -- TRUE concurrency stress: duplicate request coalescing under a
+# real asyncio.gather race (not the sequential/monkeypatched simulations
+# above). Mirrors the established racing pattern in
+# tests/test_workspace_proposals.py (advance_workspace_proposal_status /
+# promote_workspace_proposal concurrent races against the shared aiosqlite
+# `db` fixture) -- confirms execute_batch's own "Idempotency, honestly"
+# winner-refetch design (module docstring) actually holds under genuine
+# interleaved-coroutine concurrency, not just a synchronous two-call replay.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "b71e0960 stress-test finding: execute_batch's own module docstring "
+        "('Idempotency, honestly') claims the deterministic-receipt-id "
+        "PRIMARY KEY collision makes idempotency 'race-safe for TRUE "
+        "concurrent duplicate calls, not merely sequential retries'. This "
+        "test proves that claim does NOT hold for genuinely SIMULTANEOUS "
+        "callers: _load_batch_receipt (the idempotency_key existence check) "
+        "runs for every racing caller BEFORE any of them has written a "
+        "receipt, so all N callers pass the check and all N independently "
+        "validate+apply (creating N duplicate sprint items) before the "
+        "receipt-write collision at the very end dedupes only the RECEIPT "
+        "ROW, not the underlying work already done. batch_management.py's "
+        "own _write_batch_receipt has an inline comment that already admits "
+        "the narrower truth ('only a SUBSEQUENT retry ... will observe the "
+        "winner's result') -- this xfail makes that admitted gap a tracked, "
+        "visible regression guard instead of a doc-only footnote. See "
+        "test_concurrent_staggered_idempotency_key_does_dedupe below for the "
+        "case that DOES work (a retry that starts after the first call's "
+        "receipt is already committed). Fixing this for real requires "
+        "reserving the deterministic receipt id BEFORE doing the work "
+        "(write a pending receipt first, only the winner proceeds) -- an "
+        "architectural change intentionally NOT made here since this item's "
+        "scope is coverage-only ('no product-code fixes unless a test "
+        "reveals a genuine bug' -- this IS that bug, flagged rather than "
+        "silently patched under time pressure in a shared, high-contention "
+        "engine)."
+    ),
+)
+@pytest.mark.asyncio
+async def test_concurrent_identical_idempotency_key_never_duplicates(db, project):
+    """N callers submit the SAME idempotency_key at the exact same time via
+    asyncio.gather (no caller waits for any other to finish first). Per the
+    module docstring, exactly one should create the sprint item and every
+    other caller should observe the SAME result. See the xfail reason above
+    for why this currently fails -- a genuine, confirmed gap this stress
+    test surfaced, not a test-authoring mistake."""
+    entries = [{"action": "create", "title": "Concurrent race item", "version": "v1"}]
+    n = 6
+
+    results = await asyncio.gather(*[
+        bm.execute_batch(
+            db, project_id=project["id"], entry_kind="sprint_item",
+            entries=entries, mode="all_or_nothing",
+            idempotency_key="concurrent-race-key",
+        )
+        for _ in range(n)
+    ])
+
+    # No exception surfaced from any racing caller (asyncio.gather would have
+    # raised on the first one otherwise) -- every result is a real BatchResult.
+    assert all(isinstance(r, bm.BatchResult) for r in results)
+
+    id_sets = {tuple(r.ordered_ids()) for r in results}
+    assert len(id_sets) == 1, f"concurrent callers disagreed on the result: {id_sets}"
+    assert all(r.status == "ok" for r in results)
+
+    items = await db_module.get_sprint_items(db, project["id"])
+    matching = [i for i in items if i["title"] == "Concurrent race item"]
+    assert len(matching) == 1, (
+        f"expected exactly ONE sprint item from the racing batch, got "
+        f"{len(matching)} -- duplicate request coalescing failed under true "
+        "concurrency"
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_staggered_idempotency_key_does_dedupe(db, project):
+    """The case that DOES work today (and is the realistic "client retried
+    after a dropped response" shape 342dd15f/86e4ae44 actually target): the
+    first call is allowed to fully complete (and commit its receipt) BEFORE
+    the retries fire. Once a receipt is durable, every subsequent caller --
+    even several fired concurrently via asyncio.gather -- replays the exact
+    same stored result and no additional sprint item is created. This is the
+    genuine, working half of the idempotency contract; contrast with
+    test_concurrent_identical_idempotency_key_never_duplicates (xfail) above,
+    which covers the callers-race-from-the-very-start case that does not."""
+    entries = [{"action": "create", "title": "Staggered race item", "version": "v1"}]
+
+    first = await bm.execute_batch(
+        db, project_id=project["id"], entry_kind="sprint_item",
+        entries=entries, mode="all_or_nothing", idempotency_key="staggered-key",
+    )
+    assert first.idempotent_replay is False
+
+    retries = await asyncio.gather(*[
+        bm.execute_batch(
+            db, project_id=project["id"], entry_kind="sprint_item",
+            entries=entries, mode="all_or_nothing", idempotency_key="staggered-key",
+        )
+        for _ in range(4)
+    ])
+    assert all(r.idempotent_replay is True for r in retries)
+    assert all(r.ordered_ids() == first.ordered_ids() for r in retries)
+
+    items = await db_module.get_sprint_items(db, project["id"])
+    matching = [i for i in items if i["title"] == "Staggered race item"]
+    assert len(matching) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_distinct_idempotency_keys_do_not_cross_talk(db, project):
+    """Concurrent callers using DIFFERENT idempotency keys (the "independent
+    ops actually run concurrently, without interfering with each other"
+    half of the contract) must each get their OWN item created -- racing on
+    the shared connection must never merge or drop an unrelated caller's
+    entry."""
+    async def _submit(i: int) -> bm.BatchResult:
+        return await bm.execute_batch(
+            db, project_id=project["id"], entry_kind="sprint_item",
+            entries=[{"action": "create", "title": f"Independent item {i}", "version": "v1"}],
+            mode="all_or_nothing", idempotency_key=f"independent-key-{i}",
+        )
+
+    results = await asyncio.gather(*[_submit(i) for i in range(5)])
+    assert all(r.status == "ok" and r.idempotent_replay is False for r in results)
+    assert len({r.ordered_ids()[0] for r in results}) == 5  # five distinct ids
+
+    items = await db_module.get_sprint_items(db, project["id"])
+    titles = {i["title"] for i in items}
+    assert titles == {f"Independent item {i}" for i in range(5)}
+
+
+@pytest.mark.asyncio
+async def test_best_effort_partial_never_reports_success_without_per_item_evidence(db, project):
+    """Explicit contract check the sprint item calls out by name: "mutation
+    batches never partially report success without per-item evidence".
+    Every entry in a best_effort result must be UNAMBIGUOUS -- an "ok" entry
+    always carries a real id, an "error" entry always carries both
+    error_code and error_message. No entry is ever left in a state a caller
+    could misread as success."""
+    await db_module.add_sprint_item(db, project["id"], "v1", "Existing dup-guard target")
+    result = await bm.execute_batch(
+        db, project_id=project["id"], entry_kind="sprint_item",
+        entries=[
+            {"action": "create", "title": "Existing dup-guard target", "correlation_key": "will-fail"},
+            # Deliberately dissimilar titles (no shared words with each other or
+            # with the pre-seeded item) so the 60%-word-overlap duplicate guard
+            # can't accidentally fire between the two "should succeed" entries
+            # once the first one is actually inserted mid-batch (add_sprint_item
+            # re-checks live DB state at apply time, not just at Phase-1 validate).
+            {"action": "create", "title": "Ship the onboarding revamp", "correlation_key": "will-pass-1"},
+            {"action": "create"},  # missing title -> validation error, will-fail-2
+            {"action": "create", "title": "Refactor payments retry logic", "correlation_key": "will-pass-2"},
+        ],
+        mode="best_effort",
+    )
+    assert result.status == "partial"
+    assert len(result.results) == 4
+    for r in result.results:
+        if r.status == "ok":
+            assert r.id, f"entry {r.index} reports ok with no id: {r}"
+            assert r.error_code is None and r.error_message is None
+        elif r.status == "error":
+            assert r.id is None, f"entry {r.index} reports error but also carries an id: {r}"
+            assert r.error_code, f"entry {r.index} reports error with no error_code: {r}"
+            assert r.error_message, f"entry {r.index} reports error with no error_message: {r}"
+        else:
+            pytest.fail(f"entry {r.index} has an unexpected status {r.status!r} in best_effort mode")
+    ok_count = sum(1 for r in result.results if r.status == "ok")
+    error_count = sum(1 for r in result.results if r.status == "error")
+    assert ok_count == 2 and error_count == 2
+    assert result.created_count == ok_count
+    assert result.error_count == error_count

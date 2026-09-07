@@ -39,8 +39,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
+from .figure_slot_manifest import MANIFEST_COMPLETE
 from .patch_manifest import PatchManifest, PatchOperation
 from .safe_image_insert import compute_image_insert_parts
 from .safe_ooxml_writer import (
@@ -295,6 +296,80 @@ def apply_patch_manifest(
         validation=write_result.validation,
         error=None,
         dry_run=False,
+    )
+
+
+def promote(
+    manifest: PatchManifest,
+    reconciliation: "Mapping[str, Any]",
+    *,
+    payloads: dict[str, bytes] | None = None,
+    writer: SafeOoxmlWriter | None = None,
+    appliers: dict[str, Applier] | None = None,
+    allow_stale_base: bool = False,
+    dry_run: bool = False,
+    required_parts: tuple[str, ...] = REQUIRED_PARTS,
+) -> MergeResult:
+    """Promote a batch of figure-slot assets: apply ``manifest`` via
+    :func:`apply_patch_manifest`, but ONLY when ``reconciliation`` -- the
+    dict returned by
+    :func:`~tools.meridian_fallbacks.figure_slot_manifest.
+    reconcile_slot_manifest` -- reports a complete
+    promoted/held/skipped/ambiguous manifest (sprint item 5cc3d745, "W31-C").
+
+    This is the literal enforcement point for "no asset promotion without a
+    complete slot manifest": ``apply_patch_manifest`` is never even called
+    when ``reconciliation["verdict"]`` is anything other than
+    :data:`~tools.meridian_fallbacks.figure_slot_manifest.MANIFEST_COMPLETE`
+    (i.e. :data:`~tools.meridian_fallbacks.figure_slot_manifest.
+    MANIFEST_INCOMPLETE` or :data:`~tools.meridian_fallbacks.
+    figure_slot_manifest.MANIFEST_CONTRADICTORY`). This module imports only
+    the ``MANIFEST_COMPLETE`` constant by name from ``figure_slot_manifest``
+    -- it never re-derives or second-guesses that module's own
+    slot-by-slot logic, and never reaches into any other module's
+    internals to build the reconciliation itself; a caller is expected to
+    have already built ``reconciliation`` (typically via
+    ``reconcile_slot_manifest``) before calling this function.
+
+    A refusal returns a :class:`MergeResult` with ``success=False`` and a
+    descriptive ``error`` -- it does NOT mutate ``manifest.status`` (the
+    manifest itself may be perfectly fine; it is the caller-supplied
+    reconciliation that is incomplete), mirroring
+    :func:`apply_patch_manifest`'s own "a dry run/precondition failure never
+    burns a manifest that could be retried" discipline. Every other keyword
+    argument is forwarded verbatim to :func:`apply_patch_manifest` once the
+    manifest verdict check passes, so a caller that already knows its
+    manifest is complete sees IDENTICAL behavior to calling
+    :func:`apply_patch_manifest` directly.
+
+    Raises :class:`TypeError` only when ``reconciliation`` is not a mapping
+    at all (a caller programming error, not a promotion-content problem).
+    """
+    if not isinstance(reconciliation, Mapping):
+        raise TypeError(
+            f"reconciliation must be a mapping (e.g. the dict returned by "
+            f"figure_slot_manifest.reconcile_slot_manifest), got "
+            f"{type(reconciliation).__name__!r}"
+        )
+
+    verdict = reconciliation.get("verdict")
+    if verdict != MANIFEST_COMPLETE:
+        reasons = reconciliation.get("reasons") or []
+        reason_text = "; ".join(str(r) for r in reasons) if reasons else "no reasons recorded"
+        error = (
+            f"refusing to promote manifest {manifest.manifest_id}: figure-slot "
+            f"manifest verdict is {verdict!r}, not {MANIFEST_COMPLETE!r} -- {reason_text}"
+        )
+        return _empty_result(manifest, error=error, dry_run=dry_run)
+
+    return apply_patch_manifest(
+        manifest,
+        payloads=payloads,
+        writer=writer,
+        appliers=appliers,
+        allow_stale_base=allow_stale_base,
+        dry_run=dry_run,
+        required_parts=required_parts,
     )
 
 

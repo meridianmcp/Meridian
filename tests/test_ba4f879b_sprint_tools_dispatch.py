@@ -1032,10 +1032,23 @@ async def test_add_sprint_item_pointer_handler_direct(db, project, sprint_item):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_get_sprint_item_pointers_missing_id(db):
+async def test_get_sprint_item_pointers_missing_project(db, sprint_item):
+    # efea329f — project_id is now required (cross-project isolation fix);
+    # previously this tool had no project scoping check at all.
     result = await mh._handle_sprint_tools(
         "get_sprint_item_pointers",
-        {},
+        {"sprint_item_id": sprint_item["id"]},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+    assert "project_id" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_item_pointers_missing_id(db, project):
+    result = await mh._handle_sprint_tools(
+        "get_sprint_item_pointers",
+        {"project_id": project["id"]},
         db, _DATA_DIR, None, None
     )
     assert "error" in result
@@ -1047,7 +1060,7 @@ async def test_get_sprint_item_pointers_dispatch(db, project, sprint_item):
     iid = sprint_item["id"]
     result = await mh._handle_sprint_tools(
         "get_sprint_item_pointers",
-        {"sprint_item_id": iid},
+        {"project_id": project["id"], "sprint_item_id": iid},
         db, _DATA_DIR, None, None
     )
     assert result is not mh._MISS
@@ -1057,13 +1070,26 @@ async def test_get_sprint_item_pointers_dispatch(db, project, sprint_item):
 
 
 @pytest.mark.asyncio
-async def test_get_sprint_item_pointers_handler_direct(db, sprint_item):
+async def test_get_sprint_item_pointers_handler_direct(db, project, sprint_item):
     iid = sprint_item["id"]
     result = await st_mod.handle_get_sprint_item_pointers(
-        {"sprint_item_id": iid},
+        {"project_id": project["id"], "sprint_item_id": iid},
         db, _DATA_DIR, None, None
     )
     assert "pointers" in result
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_item_pointers_cross_project_rejected(db, sprint_item):
+    """efea329f — a sprint_item_id from a DIFFERENT project must never leak
+    its pointers, even when the caller supplies a project_id of their own."""
+    other_project = await db_module.create_project(db, "sprint-test-proj-other")
+    result = await st_mod.handle_get_sprint_item_pointers(
+        {"project_id": other_project["id"], "sprint_item_id": sprint_item["id"]},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+    assert "pointers" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -1116,6 +1142,21 @@ async def test_resolve_sprint_item_pointers_handler_direct(db, project, sprint_i
     )
     assert "sprint_item_id" in result
     assert "pointers" in result
+
+
+@pytest.mark.asyncio
+async def test_resolve_sprint_item_pointers_cross_project_rejected(db, sprint_item):
+    """efea329f — resolve_sprint_item_pointers already required project_id
+    but never checked it against the item's real project; a caller scoped
+    to a different project must never resolve/read a foreign item's
+    pointer targets (file paths, symbols, node/citation ids)."""
+    other_project = await db_module.create_project(db, "sprint-test-proj-other-2")
+    result = await st_mod.handle_resolve_sprint_item_pointers(
+        {"project_id": other_project["id"], "sprint_item_id": sprint_item["id"]},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+    assert "pointers" not in result
 
 
 # ---------------------------------------------------------------------------

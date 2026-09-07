@@ -42,6 +42,7 @@ import pytest
 import pytest_asyncio
 
 from meridian import db as db_module
+from meridian import enqueue as enqueue_module
 from meridian.dispatcher import Dispatcher
 from meridian.enqueue import _run_worker, enqueue_claude_task
 
@@ -936,3 +937,75 @@ async def test_dispatch_once_unhandled_run_worker_exception_releases_active_leas
     assert len(second) == 1  # capacity was freed: a new dispatch can fill this slot
     assert "i2" in disp._active_leases
     assert "i1" not in disp._active_leases
+
+
+# ---------------------------------------------------------------------------
+# 4d13cdd8 (Wave-2 reconciliation gate) — cross-item-feature composition:
+# 769e24a7 (active-lease capacity accounting) x 49e06bcb (lightweight
+# deterministic worker routing). The two features are orthogonal by
+# construction (dispatch_once never branches on worker class -- see
+# dispatcher.py:867's single _worker_prompt() call site, used unconditionally
+# for every item), but until this test nothing actually drove a
+# VERIFY:/CHECK:-prefixed item through a REAL Dispatcher.dispatch_once()
+# pass: 49e06bcb's own suite (tests/test_49e06bcb_lightweight_workers.py)
+# stops at the _run_worker/_worker_prompt unit level, and every dispatch_once
+# composition test in THIS file (above) uses a plain session-class prompt.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_composes_with_deterministic_worker_class(db, project):
+    """Prove active-lease accounting and deterministic-class routing compose
+    through one real dispatch_once round trip, not just independently at
+    their own unit level.
+
+    (i)   record_worker_lease / reconcile_active_leases behave identically
+          regardless of worker class -- the deterministic item's lease is
+          registered and released exactly like a session item's.
+    (ii)  the deterministic prompt's marker line reaches _run_worker via the
+          REAL enqueue_claude_task path (not a direct _run_worker call) and
+          produces the deterministic result prefix in the persisted task
+          row, with the marker itself never leaking into it.
+    (iii) capacity/frontier accounting composes correctly: releasing the
+          deterministic item's lease frees the exact slot (max_in_flight=1)
+          that a plain SESSION_WORKER item then reuses -- proving capacity
+          is tracked by len(_active_leases) alone, never partitioned by
+          worker class.
+    """
+    groups_round1 = [[
+        {"id": "det-1", "title": "VERIFY: rerun the focused suite", "resources": ["file:a"]},
+    ]]
+    spy = _RealEnqueueSpy(_OK_WORKER, wait=True)
+    disp = Dispatcher(
+        db, project, enqueue_fn=spy, get_groups_fn=_groups_fn(groups_round1), max_in_flight=1,
+    )
+
+    first = await disp.dispatch_once()
+    assert len(first) == 1
+    task1 = await db_module.get_task(db, first[0]["id"])
+    assert task1["status"] == "done"
+    # (ii) deterministic prefix reached the persisted row; marker never leaked.
+    assert task1["description"].startswith(enqueue_module.DETERMINISTIC_RESULT_PREFIX)
+    assert "[worker-class:" not in task1["description"]
+    # (i) lease accounting is class-agnostic: registered like any other item.
+    assert len(disp._active_leases) == 1
+    assert "det-1" in disp._dispatched
+
+    groups_round2 = [[
+        {"id": "sess-1", "title": "I2 (ordinary session item)", "resources": ["file:b"]},
+    ]]
+    disp._get_groups = _groups_fn(groups_round2)
+    second = await disp.dispatch_once()
+
+    # (iii) releasing det-1's lease freed the ONLY slot (max_in_flight=1), and
+    # a plain SESSION_WORKER item reused it: the two classes share one
+    # capacity formula, unaffected by worker-class routing.
+    assert len(second) == 1
+    task2 = await db_module.get_task(db, second[0]["id"])
+    assert task2["status"] == "done"
+    assert task2["description"].startswith(enqueue_module.RESULT_PREFIX)
+    assert len(disp._active_leases) == 1
+    assert "sess-1" in disp._active_leases
+    assert "det-1" not in disp._active_leases
+    # det-1 remains permanently deduped even though its lease is gone.
+    assert "det-1" in disp._dispatched

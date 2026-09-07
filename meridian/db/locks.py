@@ -1696,6 +1696,20 @@ async def claim_docx_region(
     elem = (element_id or "").strip()
     if not elem:
         return {"claimed": False, "reason": "invalid", "message": "element_id is required"}
+    if elem == DOCX_WHOLE_DOCUMENT_ELEMENT:
+        # 6507e83a — the sentinel is reserved for acquire_docx_document_lease's
+        # stronger conflict rule (blocked by ANY other claim, not just a
+        # matching element_id). Redirect rather than silently accepting a
+        # weaker check under the reserved name.
+        return {
+            "claimed": False,
+            "reason": "invalid",
+            "message": (
+                f"{DOCX_WHOLE_DOCUMENT_ELEMENT!r} is a reserved element_id for "
+                "whole-document leases — call acquire_docx_document_lease(session_id, "
+                "file_path) instead of claim_docx_region for a whole-document lease."
+            ),
+        }
 
     # Check for a whole-file write lock held by another session.
     await expire_file_locks(db)
@@ -1720,6 +1734,32 @@ async def claim_docx_region(
 
     # Check for another session's claim on the same element_id.
     others = await _live_docx_region_claims_for_file(db, normalized, session_id)
+
+    # 6507e83a — another session's whole-document lease blocks ANY new
+    # element-scoped claim on this file, regardless of which element_id is
+    # requested (the lease holder may rewrite the entire package).
+    lease_holder = next(
+        (c for c in others if c.get("element_id") == DOCX_WHOLE_DOCUMENT_ELEMENT),
+        None,
+    )
+    if lease_holder is not None:
+        holder_name = (
+            lease_holder.get("session_name")
+            or (lease_holder.get("session_id") or "unknown")[:8]
+        )
+        return {
+            "claimed": False,
+            "reason": "document_leased",
+            "file_path": normalized,
+            "element_id": elem,
+            "holder_session_id": lease_holder.get("session_id"),
+            "message": (
+                f"Cannot claim element {elem!r} in {normalized}: session "
+                f"{holder_name} holds a whole-document lease on it. Wait for "
+                "it to release, or coordinate."
+            ),
+        }
+
     conflicts = [c for c in others if c.get("element_id") == elem]
     if conflicts:
         holder = conflicts[0]
@@ -1826,6 +1866,161 @@ async def release_docx_region_claims(
     return cur.rowcount
 
 
+# ---------------------------------------------------------------------------
+# 6507e83a (C84-W3, category 3) — whole-document cross-process lease.
+#
+# ``claim_docx_region`` hard-requires a non-empty ``element_id`` (see its own
+# validation above) — there was no whole-document analog: a durable,
+# cross-process, TTL-bound lease over an ENTIRE .docx. The closest existing
+# primitive, ``_docx_promotion_lock`` (docs_intel.py / doc_store.py), is a
+# process-local ``threading.RLock`` — it cannot protect against a SECOND
+# process (a second hosted worker, a second self-hosted executor) racing the
+# same destination file.
+#
+# Design: reuse the EXISTING ``file_docx_region_claims`` table (same schema,
+# same cross-process TTL/session-liveness semantics as an element claim) with
+# a reserved sentinel ``element_id`` rather than a new table/migration — this
+# is a deliberate, additive, minimal-risk choice: no SQLite migration, no
+# Postgres migration (meridian/pg_adapter.py's mirror of this table already
+# exists and needs no schema change either).
+#
+# A whole-document lease composes with, rather than replaces, the existing
+# Model B element-scoped claim system:
+#
+# * Acquiring a lease is blocked by another session's whole-file lock
+#   (file_locks) — same Rule 1 claim_docx_region already enforces.
+# * Acquiring a lease is blocked by ANY other live session's claim on the
+#   file — whole-document lease OR element-scoped — because "I may rewrite
+#   the entire package" is incompatible with anyone else holding ANY claim
+#   on ANY part of it. This is the one place a "different element" is
+#   treated as a conflict rather than a coexistence, because the semantics
+#   genuinely differ from ordinary element-vs-element claims.
+# * Once held, the lease blocks EVERY other session's write attempt through
+#   ``check_docx_region_write_conflict`` — regardless of element_id — and
+#   blocks every other session's NEW ``claim_docx_region`` attempt on that
+#   file, until released or expired (``_CLAIM_LIVE_HOURS``, the same TTL
+#   every other claim in this module uses).
+# ---------------------------------------------------------------------------
+
+#: Reserved element_id representing a whole-document lease inside
+#: ``file_docx_region_claims``. Not a value a real w14:paraId/p{index} anchor
+#: can ever collide with (OOXML paraIds are hex-ish tokens; ``p{N}`` fallback
+#: ids are digits) — namespaced and unicode-underscored defensively anyway.
+DOCX_WHOLE_DOCUMENT_ELEMENT = "__meridian_whole_document_lease__"
+
+
+async def acquire_docx_document_lease(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+) -> dict[str, Any]:
+    """Acquire a cross-process, TTL-bound lease over an ENTIRE .docx.
+
+    Never raises. Returns ``{"leased": True, "file_path", "session_id"}`` on
+    success, or ``{"leased": False, "reason", "message", ...}`` on conflict —
+    see the module comment above for the exact conflict rules. Re-acquiring
+    your own already-held lease is idempotent (refreshes it).
+    """
+    normalized = _normalize_file_path(file_path)
+    if not normalized:
+        return {"leased": False, "reason": "invalid", "message": "file_path is required"}
+    sid = (session_id or "").strip()
+    if not sid:
+        return {"leased": False, "reason": "invalid", "message": "session_id is required"}
+
+    # Rule 1 (mirrors claim_docx_region): another session's whole-file write
+    # lock blocks a document lease outright.
+    await expire_file_locks(db)
+    async with db.execute(
+        "SELECT session_id FROM file_locks WHERE file_path = ?",
+        (normalized,),
+    ) as cur:
+        fl_row = await cur.fetchone()
+    fl = _row_to_dict(fl_row)
+    if fl and fl.get("session_id") and fl.get("session_id") != sid:
+        return {
+            "leased": False,
+            "reason": "file_locked",
+            "file_path": normalized,
+            "holder_session_id": fl.get("session_id"),
+            "message": (
+                f"Cannot lease {normalized}: another live session holds a "
+                "whole-file write lock on it. Wait for it to release, or coordinate."
+            ),
+        }
+
+    # Rule 2: ANY other live session's claim on this file — lease or scoped
+    # element — blocks a new whole-document lease.
+    others = await _live_docx_region_claims_for_file(db, normalized, sid)
+    if others:
+        holder = others[0]
+        holder_name = holder.get("session_name") or (holder.get("session_id") or "unknown")[:8]
+        distinct_elements = sorted({c["element_id"] for c in others})
+        return {
+            "leased": False,
+            "reason": "region_claims_active",
+            "file_path": normalized,
+            "holder_session_id": holder.get("session_id"),
+            "holder_session_name": holder_name,
+            "conflicting_elements": distinct_elements,
+            "message": (
+                f"Cannot lease the whole document {normalized}: session "
+                f"{holder_name} already holds {len(distinct_elements)} live "
+                "claim(s) on it. A whole-document lease requires the "
+                "document to be free of every other session's claims first."
+            ),
+        }
+
+    await db.execute(
+        "DELETE FROM file_docx_region_claims "
+        "WHERE session_id = ? AND file_path = ? AND element_id = ?",
+        (sid, normalized, DOCX_WHOLE_DOCUMENT_ELEMENT),
+    )
+    await db.execute(
+        "INSERT INTO file_docx_region_claims (id, session_id, file_path, element_id) "
+        "VALUES (?, ?, ?, ?)",
+        (_new_id(), sid, normalized, DOCX_WHOLE_DOCUMENT_ELEMENT),
+    )
+    await db.commit()
+    return {"leased": True, "file_path": normalized, "session_id": sid}
+
+
+async def get_docx_document_lease(
+    db: aiosqlite.Connection,
+    file_path: str,
+) -> "dict[str, Any] | None":
+    """Read-only: the live whole-document lease on ``file_path``, if any.
+
+    "Live" uses the exact same join/staleness rule as every other claim in
+    this module (:func:`_live_docx_region_claims_for_file`: ``released_at IS
+    NULL`` and the holder session's own ``last_seen`` is within
+    ``_CLAIM_LIVE_HOURS``) — a crashed lease-holder's session times out the
+    same way a crashed element-claim holder's does.
+    """
+    normalized = _normalize_file_path(file_path)
+    # No real session id ever equals "" — passing it as exclude_session_id
+    # excludes nobody, so this returns every live holder.
+    claims = await _live_docx_region_claims_for_file(db, normalized, "")
+    for c in claims:
+        if c.get("element_id") == DOCX_WHOLE_DOCUMENT_ELEMENT:
+            return c
+    return None
+
+
+async def release_docx_document_lease(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+) -> int:
+    """Release ``session_id``'s whole-document lease on ``file_path``, if
+    held. Returns the number of rows released (0 or 1) — same soft-release
+    (``released_at`` set, never deleted) semantics as
+    :func:`release_docx_region_claims`."""
+    return await release_docx_region_claims(
+        db, session_id, file_path=file_path, element_id=DOCX_WHOLE_DOCUMENT_ELEMENT,
+    )
+
+
 async def check_docx_region_write_conflict(
     db: "Any",
     session_id: str | None,
@@ -1843,14 +2038,24 @@ async def check_docx_region_write_conflict(
     1. Whole-file lock: if another session holds a whole-file write lock on
        ``file_path``, BLOCK (regardless of element_id). The file owner controls
        every element.
-    2. Scoped-claim enforcement: if ANY session holds a scoped claim on
-       ``file_path`` AND ``session_id`` is NOT the holder AND ``element_id``
-       is NOT in the caller's own scoped claims for this file → BLOCK.
-       - If the write is for an element another session has claimed → BLOCK
-         (element owned by someone else).
+    2. Scoped-claim enforcement: if ANY session holds a LIVE scoped claim on
+       ``file_path`` (see ``_live_docx_region_claims_for_file`` — same
+       ``_CLAIM_LIVE_HOURS`` staleness cutoff ``claim_docx_region`` itself uses)
+       AND ``session_id`` is NOT the holder AND ``element_id`` is NOT in the
+       caller's own live scoped claims for this file → BLOCK.
+       - If the write is for an element another (live) session has claimed →
+         BLOCK (element owned by someone else).
        - If the write is for an element the caller DOES own → ALLOW (owner
          writes their own region).
-       - If no scoped claims exist at all → ALLOW (unscoped/unclaimed).
+       - If no LIVE scoped claims exist at all → ALLOW (unscoped/unclaimed, or
+         every claimant has gone stale/crashed past ``_CLAIM_LIVE_HOURS``).
+       40937a21 — this must stay liveness-filtered, matching the acquire path
+       (``claim_docx_region``'s own conflict check already uses the same live
+       read): a crashed session's ``released_at IS NULL`` row must not wedge
+       this gate shut past its own nominal TTL merely because nobody called
+       ``release_docx_region_claims``. Do NOT swap this back to the raw
+       ``get_docx_region_claims`` read — that one is deliberately unfiltered
+       for its own callers (see its docstring) and is a different contract.
     3. Fail-open: a DB error, missing db, or unidentifiable element degrades
        to None (no block). The gate surfaces conflicts; claim_docx_region is
        the real primitive.
@@ -1889,9 +2094,57 @@ async def check_docx_region_write_conflict(
         # Rule 2: scoped-claim enforcement.
         # Any scoped claim on this file means the file is in "region-partitioned"
         # mode — edits without owning the target element are rejected.
-        all_claims = await get_docx_region_claims(db, normalized)
+        #
+        # 40937a21 — use the LIVENESS-FILTERED read (_live_docx_region_claims_for_file),
+        # not the raw get_docx_region_claims(). get_docx_region_claims is intentionally
+        # unfiltered (its own docstring: "Expired claims ... are NOT pruned here —
+        # read-only so it never writes") because it also backs the public
+        # get_docx_region_claims MCP read tool and a dashboard's raw claim history.
+        # But reusing that same unfiltered read for this ENFORCEMENT gate meant a
+        # stale/crashed session's element claim (released_at still NULL, but the
+        # owning session's heartbeat is well past _CLAIM_LIVE_HOURS) was treated as
+        # live here even though claim_docx_region's own acquire-path conflict check
+        # (which already goes through _live_docx_region_claims_for_file) would let a
+        # new session reclaim that exact element — i.e. the write gate could stay
+        # wedged shut past its own nominal TTL while the acquire path had already
+        # moved on. Passing exclude_session_id="" excludes nobody (no real session id
+        # is ever the empty string), so the caller's own live claims still appear
+        # (required for the caller_owns check just below) while claims held by
+        # sessions that are gone/closed or whose last_seen is stale are correctly
+        # dropped — making this gate consistent with claim_docx_region's own notion
+        # of "who currently holds this element."
+        all_claims = await _live_docx_region_claims_for_file(db, normalized, "")
         if not all_claims:
             return None  # No scoped claims — unguarded, allow.
+
+        # 6507e83a — Rule 1.5: another session's whole-document lease blocks
+        # EVERY write to this file, regardless of element_id — a lease means
+        # "I may rewrite the entire package," which no narrower write (scoped
+        # or unscoped) can safely run alongside. The lease holder's OWN
+        # writes are unaffected (excluded by session_id below) and fall
+        # through to the ordinary element-ownership rules underneath, which
+        # already allow an unclaimed element through unchanged.
+        lease_row = next(
+            (
+                c for c in all_claims
+                if c.get("element_id") == DOCX_WHOLE_DOCUMENT_ELEMENT
+                and c.get("session_id") != _sid
+            ),
+            None,
+        )
+        if lease_row is not None:
+            holder = lease_row.get("session_id", "unknown")
+            return {
+                "blocked": True,
+                "reason": "document_leased",
+                "file_path": normalized,
+                "element_id": _elem or None,
+                "holder": holder,
+                "message": (
+                    f"Cannot write to {normalized}: session {holder} holds a "
+                    "whole-document lease on it. Wait for it to release, or coordinate."
+                ),
+            }
 
         # Check whether the caller owns the target element.
         if _elem:

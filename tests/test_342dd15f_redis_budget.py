@@ -442,6 +442,79 @@ def test_cost_gate_is_not_fail_open_when_columns_exist(monkeypatch):
     asyncio.run(_run())
 
 
+# ---------------------------------------------------------------------------
+# 2cf57fde -- Redis runtime diagnostics: budget tier reporting + fallback
+# counter, sharing this same 342dd15f tier system (no new untracked counter).
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostics_publish_fallback_budget_counter_increments_on_tier2_block(monkeypatch):
+    fake = _FakeRedisClient()
+
+    async def _fake_get_client():
+        return fake
+
+    monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_get_client)
+
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        try:
+            await db.execute(
+                "INSERT INTO tenants (id, email, plan, redis_commands_used, notification_prefs) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("t-diag-over", "diag-over@test.com", "standard",
+                 REDIS_BUDGET_DISABLE_COMMANDS, "{}"),
+            )
+            await db.commit()
+
+            ok = await redis_bridge.publish_session_message(
+                "session-diag", {"id": "m1"}, tenant_id="t-diag-over", db=db,
+            )
+            assert ok is False
+            diag = redis_bridge.get_redis_runtime_diagnostics()
+            assert diag["pubsub"]["fallback_budget_count"] == 1
+            # Distinct from the "never configured" fallback bucket.
+            assert diag["pubsub"]["fallback_unconfigured_count"] == 0
+            assert diag["pubsub"]["publish_attempts"] == 0
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize(
+    "used,expected_tier",
+    [
+        (0, "ok"),
+        (REDIS_BUDGET_WARN_COMMANDS, "warn"),
+        (REDIS_BUDGET_DISABLE_COMMANDS, "disabled"),
+        (2_000_000, "admin_alert"),
+    ],
+)
+def test_diagnostics_reports_per_tenant_budget_tier(used, expected_tier):
+    tenant = _tenant(used=used)
+    diag = redis_bridge.get_redis_runtime_diagnostics(tenant)
+    assert diag["budget"]["commands_used"] == used
+    assert diag["budget"]["tier"] == expected_tier
+    assert diag["budget"]["warn_threshold"] == REDIS_BUDGET_WARN_COMMANDS
+    assert diag["budget"]["disable_threshold"] == REDIS_BUDGET_DISABLE_COMMANDS
+
+
+def test_diagnostics_budget_is_none_without_tenant():
+    """Self-hosted / no-tenant callers get budget: None, not a fabricated
+    zero-usage tier -- there is no tenant row to read commands_used from."""
+    diag = redis_bridge.get_redis_runtime_diagnostics(None)
+    assert diag["budget"] is None
+
+
+def test_diagnostics_budget_defaults_missing_column_to_zero_used():
+    """A tenant dict without redis_commands_used (e.g. a pre-342dd15f row
+    shape in a test fixture) must not raise -- treated as 0 used, tier ok."""
+    diag = redis_bridge.get_redis_runtime_diagnostics({"id": "t-no-col"})
+    assert diag["budget"]["commands_used"] == 0
+    assert diag["budget"]["tier"] == "ok"
+
+
 @pytest.mark.asyncio
 async def test_pg_migration_adds_redis_columns_to_tenants(db_pg):
     """Postgres path: _migrate_pg_redis_overage_fields (in _PG_MIGRATIONS_HOSTED)

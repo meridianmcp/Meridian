@@ -9,12 +9,14 @@ both surfaces that call it.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
 
 import meridian.server  # noqa: F401 — load through the normal path (avoids a
 # circular import between meridian.mcp.handler and meridian.server).
+from meridian import redis_bridge
 from meridian.mcp.handler import _dispatch_mcp_tool
 from meridian.routes import tunnel as tn
 
@@ -23,8 +25,14 @@ _TENANT = {"id": "tenant-f1e0df55", "plan": "pro"}
 
 
 @pytest.fixture(autouse=True)
-def _clean_diag_state():
-    """Reset per-process tunnel registries so tests never leak state."""
+def _clean_diag_state(monkeypatch):
+    """Reset per-process tunnel registries so tests never leak state.
+
+    2cf57fde — also resets meridian.redis_bridge's runtime-diagnostics
+    counters (now embedded in build_tunnel_diagnostics's "redis" key) and
+    ensures MERIDIAN_REDIS_URL is unset by default, so every test here is
+    hermetic regardless of real-environment env vars or leftover counters
+    from other test modules."""
     def _reset():
         for d in (
             tn._tunnel_sockets, tn._tunnel_code_sockets, tn._tunnel_extract_sockets,
@@ -36,6 +44,8 @@ def _clean_diag_state():
             tn._tenant_owner_instance,
         ):
             d.clear()
+        redis_bridge.reset_redis_client_cache()
+    monkeypatch.delenv("MERIDIAN_REDIS_URL", raising=False)
     _reset()
     yield
     _reset()
@@ -420,6 +430,78 @@ def test_build_diagnostics_all_credentials_redacted_end_to_end():
     result = tn.build_tunnel_diagnostics(tenant)
     blob = json.dumps(result)
     assert "sk_live_verysecret" not in blob
+
+
+# ---------------------------------------------------------------------------
+# 2cf57fde — redis section wired into build_tunnel_diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_build_diagnostics_includes_redis_section_unauthenticated():
+    """Self-hosted/no-tenant callers still get a redis section — usually
+    MERIDIAN_REDIS_URL is unset there, and that truth is itself the point."""
+    result = tn.build_tunnel_diagnostics(None)
+    assert "redis" in result
+    assert result["redis"]["configured"] is False
+    assert result["redis"]["availability"] == "unconfigured"
+    assert result["redis"]["budget"] is None
+
+
+def test_build_diagnostics_includes_redis_section_authenticated_reports_tenant_budget():
+    tenant = dict(_TENANT, redis_commands_used=750_000)
+    result = tn.build_tunnel_diagnostics(tenant)
+    assert result["redis"]["budget"]["commands_used"] == 750_000
+    assert result["redis"]["budget"]["tier"] == "warn"
+
+
+def test_build_diagnostics_redis_section_distinguishes_pubsub_from_cache():
+    """The item's explicit requirement: pub/sub push and read-through caching
+    must be reported as separate, non-conflated sections."""
+    result = tn.build_tunnel_diagnostics(_TENANT)
+    redis_diag = result["redis"]
+    assert "pubsub" in redis_diag
+    assert "cache" in redis_diag
+    assert "redis_cache" in redis_diag["cache"]
+    assert "local_process_cache" in redis_diag["cache"]
+    # No Redis-backed cache exists yet -- must not overclaim savings.
+    assert redis_diag["cache"]["redis_cache"]["active"] is False
+
+
+def test_build_diagnostics_redis_section_never_leaks_configured_url(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_REDIS_URL", "redis://user:supersecretpassword@example.invalid:6379/0")
+    result = tn.build_tunnel_diagnostics(_TENANT)
+    blob = json.dumps(result)
+    assert "supersecretpassword" not in blob
+    assert result["redis"]["configured"] is True
+
+
+def test_build_diagnostics_redis_section_reports_publish_activity(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_REDIS_URL", "redis://example.invalid:6379/0")
+
+    class _FakeClient:
+        async def publish(self, channel, data):
+            return 1
+
+    async def _fake_get_client():
+        return _FakeClient()
+
+    monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_get_client)
+
+    asyncio.run(redis_bridge.publish_session_message("s1", {"id": "m1"}))
+
+    result = tn.build_tunnel_diagnostics(_TENANT)
+    assert result["redis"]["pubsub"]["publish_successes"] == 1
+    assert result["redis"]["availability"] == "reachable"
+
+
+def test_build_diagnostics_redis_section_local_process_cache_present():
+    from meridian.db import sprint_items as sprint_items_module
+
+    sprint_items_module.reset_sprint_items_cache_diagnostics()
+    result = tn.build_tunnel_diagnostics(_TENANT)
+    local = result["redis"]["cache"]["local_process_cache"]
+    assert local["available"] is True
+    assert "hits" in local and "misses" in local
 
 
 # ---------------------------------------------------------------------------

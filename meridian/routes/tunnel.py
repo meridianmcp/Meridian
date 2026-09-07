@@ -40,6 +40,7 @@ from fastapi.responses import Response
 from .. import db as db_module
 from .. import process_registry as process_registry_module
 from .. import profile_contract as profile_contract_module
+from .. import redis_bridge as _redis_bridge  # 2cf57fde — runtime diagnostics
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
@@ -2447,7 +2448,15 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
     :func:`_local_process_lease_summary`). Included even in the
     unauthenticated/no-tenant branch because that is exactly the shape
     self-hosted callers get — the case where this field is actually most
-    useful."""
+    useful.
+
+    2cf57fde — both branches also include ``redis``: Redis runtime health,
+    pub/sub-vs-cache effectiveness, and Neon-avoidance diagnostics (see
+    :func:`meridian.redis_bridge.get_redis_runtime_diagnostics`). Present
+    even unauthenticated/self-hosted, since MERIDIAN_REDIS_URL usually is
+    NOT set there and that "configured: false" truth is itself the useful
+    signal for that caller. Purely synchronous/in-process — never performs a
+    live Redis round-trip, so it cannot add latency or block this call."""
     run_id = uuid.uuid4().hex
     generated_at = time.time()
     if tenant is None:
@@ -2466,6 +2475,7 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
                 "tools_list_stale": False,
             },
             "process_leases": _local_process_lease_summary(),
+            "redis": _redis_bridge.get_redis_runtime_diagnostics(None),
         }
 
     tid = tenant.get("id")
@@ -2537,6 +2547,7 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
             "tools_list_stale": tid in _tools_list_changed_pending,
         },
         "process_leases": _local_process_lease_summary(),
+        "redis": _redis_bridge.get_redis_runtime_diagnostics(tenant),
     }
 
 
@@ -4508,6 +4519,24 @@ async def check_word_write_conflict(
 # whole-document check instead. index_document / index_document_structure /
 # index_equations write only a local sidecar SQLite cache, never the .docx
 # itself, so they are intentionally excluded (not writers of the target file).
+#
+# 0d62f067 round 2 — apply_reviewable_edit_transaction (added in a2449ffa)
+# was, until this fix, MISSING from this map entirely. Every other MUTATING
+# meridian-docs tool is entered here the moment it's added; this one shipped
+# without that step, which meant `_docs_write_target()` returned None for it
+# unconditionally and `check_docs_write_conflict` (below) never even looked
+# up a claim for it — a second, non-compliant session calling this tool
+# against a document another session had claim_docx_region'd or whole-file-
+# locked was never blocked, regardless of session_id. The tool's own
+# docstring in extensions/meridian-docs/meridian_docs/server.py claimed the
+# opposite (that session_id "identifies the calling Meridian session to the
+# tunnel-layer DOCX region-claim guard") — that claim was false as shipped;
+# this entry is what makes it true. Registered like merge_docx_draft
+# (canonical_path, no anchor): the transaction can touch an arbitrary mix of
+# sections/tables/figures/paragraphs across its whole steps list, so there is
+# no single element_id that would honestly describe its scope — it gets the
+# same "whole-document fallback" tier every other no-natural-anchor tool
+# above does, not a narrower scoped-element check.
 _DOCS_WRITE_TOOLS: "dict[str, tuple[str, str | None]]" = {
     "insert_image": ("docx_path", "anchor_para_id"),
     "insert_figure_block": ("docx_path", "anchor_para_id"),
@@ -4536,6 +4565,7 @@ _DOCS_WRITE_TOOLS: "dict[str, tuple[str, str | None]]" = {
     "relocate_table": ("docx_path", None),
     "highlight_document": ("docx_path", None),
     "merge_docx_draft": ("canonical_path", None),
+    "apply_reviewable_edit_transaction": ("canonical_path", None),
 }
 
 
@@ -4707,6 +4737,26 @@ async def check_docs_write_conflict(
 #: produced by the other three. Deliberately not the full _DOCS_WRITE_TOOLS
 #: map, which would multiply the surface area (and test burden) of an
 #: already-hardened relay path well past what the gap asks for.
+#:
+#: 0d62f067 round 2 — apply_reviewable_edit_transaction (a2449ffa) is now
+#: registered in _DOCS_WRITE_TOOLS above (the fix this round makes), but is
+#: DELIBERATELY NOT added here. Its own final step is functionally a
+#: merge_docx_draft promotion (it calls merge_draft_into_canonical exactly
+#: once, after every prior step already succeeded, per its own docstring),
+#: so the same shape of registration COULD apply — but doing so would also
+#: pull in _required_claim_lookup_gate's FAIL-CLOSED posture and the full
+#: docx_merge PREPARED->RELEASED state-machine tracking for a multi-step
+#: batch tool that has never been exercised against that machinery, and
+#: whose own step-failure/rollback semantics (see docs_intel.py's
+#: apply_reviewable_edit_transaction) were designed and tested independently
+#: of it. That is a real, separately-scoped MDE-3-style hardening pass, not
+#: the gap this round was asked to close (the sprint item's tool_requirements
+#: asks specifically for claim_docx_region / single-writer-region
+#: enforcement, which _DOCS_WRITE_TOOLS + check_docs_write_conflict already
+#: gives this tool as of this fix — see the FAIL-OPEN posture note on
+#: check_docs_write_conflict's own docstring below). Extending
+#: _PRIMARY_DOCX_RELEASE_TOOLS to cover it is a legitimate follow-up but
+#: needs its own dedicated test pass, not a rider on this fix.
 _PRIMARY_DOCX_RELEASE_TOOLS = frozenset({
     "move_section", "copy_section", "relocate_table", "merge_docx_draft",
 })

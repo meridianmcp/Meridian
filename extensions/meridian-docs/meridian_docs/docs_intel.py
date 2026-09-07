@@ -8451,6 +8451,15 @@ def _style_policy_defaults() -> dict[str, Any]:
     existing test asserts an inserted equation paragraph has no ``pPr``, and
     keeping the audit's "expected" alignment and the writer's actual output
     in sync (one policy, two consumers) is the whole point of this feature.
+
+    4544bbe5 -- ``heading_terminal_punctuation``, ``table_label_column_alignment``,
+    and ``table_data_column_alignment`` extend this same mechanism to the
+    sections/tables domains as part of the broader "declarative document
+    profile" surface. All three default to ``None`` ("no policy -- leave the
+    writer's pre-existing behavior exactly as it was") so every caller that
+    never passes ``style_policy`` (the overwhelming majority of existing call
+    sites and tests) sees byte-identical output to before this change; a
+    caller opts into the new behavior only by supplying a non-``None`` value.
     """
     return {
         "caption_centered": False,
@@ -8460,6 +8469,9 @@ def _style_policy_defaults() -> dict[str, Any]:
         "equation_punctuation_chars": ".,;:",
         "note_style": _INTERNAL_NOTE_STYLE_DEFAULT,
         "note_highlight_color": _INTERNAL_NOTE_HIGHLIGHT_COLOR,
+        "heading_terminal_punctuation": None,
+        "table_label_column_alignment": None,
+        "table_data_column_alignment": None,
     }
 
 
@@ -8494,6 +8506,30 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
                                     mode) writes for new notes.
       note_highlight_color (str):  ``<w:highlight>`` value (must be a valid
                                     OOXML highlight color) for new notes.
+      heading_terminal_punctuation (str | None): 4544bbe5 -- when not
+                                    ``None``, :func:`write_section` strips any
+                                    trailing character in
+                                    ``.,:;!?`` from a new heading's text and
+                                    appends this string instead (``""``
+                                    enforces "no terminal punctuation on
+                                    headings", a common publishing
+                                    convention; a non-empty value like ``":"``
+                                    enforces a specific terminal character).
+                                    ``None`` (the default) leaves heading text
+                                    exactly as authored, matching pre-4544bbe5
+                                    behavior.
+      table_label_column_alignment (str | None): 4544bbe5 -- when not
+                                    ``None``, one of "left"/"center"/"right"/
+                                    "both" -- the ``w:jc`` :func:`insert_table`
+                                    writes into column 0 ("label column") of a
+                                    newly inserted table. ``None`` (the
+                                    default) adds no ``w:jc`` at all, matching
+                                    pre-4544bbe5 behavior (Word's own default,
+                                    effectively left-aligned).
+      table_data_column_alignment (str | None): 4544bbe5 -- same as
+                                    ``table_label_column_alignment`` but for
+                                    every column after column 0 ("data
+                                    columns") of a newly inserted table.
 
     Raises:
       ValueError: an unknown key, or a value of the wrong type/out of range.
@@ -8539,7 +8575,117 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
             f"{sorted(_VALID_HIGHLIGHT_COLORS)}"
         )
 
+    heading_punct = policy["heading_terminal_punctuation"]
+    if heading_punct is not None and not isinstance(heading_punct, str):
+        raise ValueError(
+            "style policy 'heading_terminal_punctuation' must be a string or None"
+        )
+
+    for key in ("table_label_column_alignment", "table_data_column_alignment"):
+        value = policy[key]
+        if value is not None and value not in _VALID_EQUATION_ALIGNMENTS:
+            raise ValueError(
+                f"style policy {key!r} must be one of "
+                f"{sorted(_VALID_EQUATION_ALIGNMENTS)} or None"
+            )
+
     return policy
+
+
+# 4544bbe5 -- terminal punctuation characters a heading is normalized away
+# from before (optionally) appending the policy's configured replacement.
+# Deliberately narrow (matches the closing-punctuation set an English-prose
+# heading could plausibly end with) rather than reusing
+# ``equation_punctuation_chars`` -- the two are conceptually unrelated policy
+# knobs (one governs display-equation trailing punctuation, the other
+# section-heading trailing punctuation) that happen to share a similar shape.
+_HEADING_TERMINAL_PUNCT_CHARS = ".,:;!?"
+
+
+def _apply_heading_terminal_punctuation(heading_text: str, policy: dict[str, Any]) -> str:
+    """4544bbe5 -- normalize ``heading_text``'s trailing punctuation per
+    ``policy["heading_terminal_punctuation"]``.
+
+    ``None`` (the default) is a no-op -- returns ``heading_text`` unchanged,
+    which is what every pre-4544bbe5 caller of :func:`write_section` still
+    gets. A non-``None`` string strips any existing trailing character in
+    :data:`_HEADING_TERMINAL_PUNCT_CHARS` (repeatedly, so "Results..." ->
+    "Results") and appends the configured string -- ``""`` enforces "no
+    terminal punctuation at all", a non-empty value enforces that exact
+    terminal character/string.
+    """
+    replacement = policy.get("heading_terminal_punctuation")
+    if replacement is None:
+        return heading_text
+    stripped = heading_text.rstrip(_HEADING_TERMINAL_PUNCT_CHARS)
+    return stripped + replacement
+
+
+# ---------------------------------------------------------------------------
+# 4544bbe5 -- named "journal style" presets: publishing-convention bundles of
+# style-policy overrides a caller can look up by name instead of hand-writing
+# a full override dict. Each preset is validated through the SAME
+# resolve_style_policy() fail-closed path as any hand-written override dict
+# (see get_journal_style_preset below) -- there is no separate/parallel
+# validation surface to keep in sync.
+# ---------------------------------------------------------------------------
+JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
+    # The built-in resolve_style_policy() defaults, addressable by name so a
+    # caller can request "default" explicitly instead of omitting style
+    # entirely -- useful when a document_profile's journal= comes from
+    # user-facing config where "no opinion" needs its own explicit value.
+    "default": {},
+    # A representative academic-journal convention bundle: centered
+    # figure/table captions, centered display equations with required
+    # trailing punctuation, headings with no terminal punctuation, and a
+    # label-left/data-center table layout.
+    "jcshm": {
+        "caption_centered": True,
+        "equation_alignment": "center",
+        "equation_punctuation_required": True,
+        "equation_punctuation_chars": ".,;",
+        "heading_terminal_punctuation": "",
+        "table_label_column_alignment": "left",
+        "table_data_column_alignment": "center",
+    },
+}
+
+
+def get_journal_style_preset(journal: str) -> dict[str, Any]:
+    """4544bbe5 -- look up a named publishing-convention style-policy preset.
+
+    This is the "shorthand" half of the document-profile surface: instead of
+    a caller hand-writing a full ``style_policy`` override dict for a common
+    convention, they pass a short name here and get back a ready-to-use,
+    already-validated policy dict suitable for ``style_policy=`` on
+    :func:`insert_figure_block`, :func:`insert_caption`,
+    :func:`audit_equation_style`, :func:`insert_equation_local`,
+    :func:`insert_highlighted_note`, :func:`write_section`, or
+    :func:`insert_table`.
+
+    The returned dict is the FULLY RESOLVED policy (every key populated,
+    unset keys filled from :func:`_style_policy_defaults`) -- not the raw
+    preset overrides -- so it round-trips cleanly back through
+    :func:`resolve_style_policy` with no further merging needed.
+
+    Args:
+      journal: One of the keys in :data:`JOURNAL_STYLE_PRESETS` (currently
+        ``"default"`` or ``"jcshm"``).
+
+    Returns:
+      The resolved style policy dict for ``journal``.
+
+    Raises:
+      ValueError: ``journal`` is not a known preset name, or (should the
+        preset itself ever be malformed) the preset fails
+        :func:`resolve_style_policy` validation.
+    """
+    if journal not in JOURNAL_STYLE_PRESETS:
+        raise ValueError(
+            f"unknown journal style preset {journal!r}; known presets: "
+            f"{sorted(JOURNAL_STYLE_PRESETS)}"
+        )
+    return resolve_style_policy(JOURNAL_STYLE_PRESETS[journal])
 
 
 def _paragraph_alignment(para_elem: ET.Element) -> str | None:
@@ -8576,6 +8722,22 @@ def _trailing_text_after_omath(para_elem: ET.Element, omath_el: ET.Element) -> s
     return "".join(
         "".join(t.text or "" for t in sib.iter(w_t)) for sib in siblings[idx + 1:]
     )
+
+
+# Zero-width markup that can legally sit as a direct child of <w:p> anywhere
+# in document order but renders nothing and carries no prose -- a bookmark or
+# comment anchor placed right before a display equation (e.g. Word's own
+# "Insert Cross-reference"/"Insert Comment" commands) must not be mistaken
+# for the equation being mixed into running prose. See the `preceding` check
+# in audit_equation_style.
+_EQUATION_NON_CONTENT_MARKUP_TAGS = frozenset({
+    _q(_W, "pPr"),
+    _q(_W, "bookmarkStart"),
+    _q(_W, "bookmarkEnd"),
+    _q(_W, "commentRangeStart"),
+    _q(_W, "commentRangeEnd"),
+    _q(_W, "proofErr"),
+})
 
 
 _EQ_LEADING_INT_RE = re.compile(r"^\(\s*(\d+)")
@@ -8688,7 +8850,9 @@ def audit_equation_style(
             continue
         omath_el = direct_omaths[0]
 
-        # "Display equation" = nothing but pPr precedes the equation in the
+        # "Display equation" = nothing but pPr and zero-width markup
+        # (bookmarks, comment anchors, proofErr -- see
+        # _EQUATION_NON_CONTENT_MARKUP_TAGS) precedes the equation in the
         # paragraph. Content AFTER the equation -- e.g. a trailing
         # punctuation run written by append_text_run_after_math -- is
         # expected and does NOT disqualify it (that's exactly what the
@@ -8699,7 +8863,10 @@ def audit_equation_style(
         # that merely contains an equation.
         siblings = list(para_elem)
         top_idx = siblings.index(top_level_el)
-        preceding = [c for c in siblings[:top_idx] if c.tag != _q(_W, "pPr")]
+        preceding = [
+            c for c in siblings[:top_idx]
+            if c.tag not in _EQUATION_NON_CONTENT_MARKUP_TAGS
+        ]
         if preceding:
             continue  # inline equation mixed with prose -- no alignment/punctuation check
 
@@ -9318,6 +9485,362 @@ def edit_equation_local(
         "omml": omml,
         "docx_path": docx_path,
     }
+
+
+def _build_numbered_equation_table(
+    omml_raw: str, number: str, eq_para_id: str, num_para_id: str,
+) -> ET.Element:
+    """DOCS-R2-D — build a borderless, 2-column, 1-row <w:tbl> matching the
+    EXACT structure :func:`parse_docx_equations_local` recognizes as
+    ``pattern="table-numbered"``: cell 1 holds the equation (OMML), cell 2
+    holds the parenthesized number (matching ``_EQ_NUMBER_RE``).
+
+    Column widths are a fixed 8500/1000 dxa split (roughly matching a
+    6.5in text-width page with a narrow right-hand number column) — no
+    caller override is exposed since the item's own contract keeps this a
+    single, predictable layout; widths are recorded on the conversion
+    manifest so a caller can inspect what landed.
+    """
+    tbl = ET.Element(_q(_W, "tbl"))
+    tblPr = ET.SubElement(tbl, _q(_W, "tblPr"))
+    ET.SubElement(tblPr, _q(_W, "tblStyle"), {_q(_W, "val"): "TableNormal"})
+    ET.SubElement(tblPr, _q(_W, "tblW"), {_q(_W, "w"): "0", _q(_W, "type"): "auto"})
+    borders = ET.SubElement(tblPr, _q(_W, "tblBorders"))
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        ET.SubElement(
+            borders, _q(_W, edge),
+            {_q(_W, "val"): "none", _q(_W, "sz"): "0", _q(_W, "space"): "0"},
+        )
+    ET.SubElement(tblPr, _q(_W, "tblLook"), {
+        _q(_W, "val"): "0000", _q(_W, "firstRow"): "0", _q(_W, "lastRow"): "0",
+        _q(_W, "firstColumn"): "0", _q(_W, "lastColumn"): "0",
+        _q(_W, "noHBand"): "0", _q(_W, "noVBand"): "0",
+    })
+
+    grid = ET.SubElement(tbl, _q(_W, "tblGrid"))
+    ET.SubElement(grid, _q(_W, "gridCol"), {_q(_W, "w"): "8500"})
+    ET.SubElement(grid, _q(_W, "gridCol"), {_q(_W, "w"): "1000"})
+
+    tr = ET.SubElement(tbl, _q(_W, "tr"))
+
+    tc1 = ET.SubElement(tr, _q(_W, "tc"))
+    tc1Pr = ET.SubElement(tc1, _q(_W, "tcPr"))
+    ET.SubElement(tc1Pr, _q(_W, "tcW"), {_q(_W, "w"): "8500", _q(_W, "type"): "dxa"})
+    p1 = ET.SubElement(tc1, _q(_W, "p"))
+    p1.set(_q(_W14, "paraId"), eq_para_id)
+    pPr1 = ET.SubElement(p1, _q(_W, "pPr"))
+    ET.SubElement(pPr1, _q(_W, "jc"), {_q(_W, "val"): "center"})
+    p1.append(ET.fromstring(omml_raw))
+
+    tc2 = ET.SubElement(tr, _q(_W, "tc"))
+    tc2Pr = ET.SubElement(tc2, _q(_W, "tcPr"))
+    ET.SubElement(tc2Pr, _q(_W, "tcW"), {_q(_W, "w"): "1000", _q(_W, "type"): "dxa"})
+    p2 = ET.SubElement(tc2, _q(_W, "p"))
+    p2.set(_q(_W14, "paraId"), num_para_id)
+    pPr2 = ET.SubElement(p2, _q(_W, "pPr"))
+    ET.SubElement(pPr2, _q(_W, "jc"), {_q(_W, "val"): "right"})
+    r2 = ET.SubElement(p2, _q(_W, "r"))
+    t2 = ET.SubElement(r2, _q(_W, "t"))
+    t2.text = number
+    t2.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+    return tbl
+
+
+def _verify_numbered_equation_conversion(
+    docx_path: str, expected_number: str, expected_flat_text: str,
+) -> dict[str, Any] | None:
+    """Post-write structural verification for
+    :func:`convert_equation_to_numbered_row` — re-reads ``docx_path`` FRESH
+    FROM DISK (never the in-memory tree just serialized) and confirms:
+
+    1. exactly one ``pattern="table-numbered"`` equation now carries
+       ``expected_number``, and
+    2. its OMML content (via the same flatten-to-text dedup key
+       :func:`parse_docx_equations_local` already computes) is BYTE-
+       IDENTICAL to what was converted — the conversion must never silently
+       alter the equation's actual mathematical content.
+
+    Returns ``None`` on success, or ``{"error": ...}`` describing exactly
+    what failed to verify.
+    """
+    try:
+        equations = parse_docx_equations_local(docx_path)
+    except (OSError, ET.ParseError, zipfile.BadZipFile) as exc:
+        return {"error": f"post-write verification could not re-parse {docx_path}: {exc}"}
+
+    matches = [
+        eq for eq in equations
+        if eq["pattern"] == "table-numbered" and eq["number"] == expected_number
+    ]
+    if not matches:
+        return {
+            "error": (
+                f"post-write verification found no table-numbered equation with "
+                f"number={expected_number!r} in {docx_path} after conversion"
+            )
+        }
+    if len(matches) > 1:
+        return {
+            "error": (
+                f"post-write verification found {len(matches)} table-numbered "
+                f"equations with number={expected_number!r} in {docx_path} — "
+                "expected exactly one; refusing to guess which one is ours"
+            )
+        }
+    if matches[0]["flat_text"] != expected_flat_text:
+        return {
+            "error": (
+                "post-write verification found the converted equation's content "
+                "does not match the original — the conversion must never alter "
+                "equation content"
+            )
+        }
+    return None
+
+
+def convert_equation_to_numbered_row(
+    docx_path: str,
+    equation_para_id: str,
+    number: str,
+    index_db_path: str | None = None,
+    dry_run: bool = False,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """DOCS-R2-D — convert a standalone display equation into a numbered,
+    borderless two-column table row: cell 1 holds the OMML equation, cell 2
+    holds the parenthesized number — the EXACT ``pattern="table-numbered"``
+    structure :func:`parse_docx_equations_local` and :func:`audit_equation_style`
+    already recognize and validate elsewhere in this module.
+
+    This is a SAFE, DISPOSABLE-COPY operation: it never edits the paragraph
+    in place text-by-text and never guesses at surrounding prose. It only
+    accepts a paragraph whose sole meaningful content is the display
+    equation itself (no mixed prose text) — a paragraph with any other text
+    is refused with a clear error rather than silently split or rewrapped.
+    Call this against a disposable working copy of a document, never
+    directly against a canonical/production file the caller cares about
+    preserving untouched on any failure path other than the documented
+    backup-restore below.
+
+    ``dry_run=True`` returns the planned conversion manifest (new paraIds,
+    equation content hash, target body position) WITHOUT writing anything —
+    inspect this before committing to the real write.
+
+    ddd79188-style contract (mirrors :func:`insert_equation_local` /
+    :func:`insert_figure_block` exactly): after the write is staged and
+    promoted, TWO independent checks gate success —
+
+      1. Structural re-parse (:func:`_verify_numbered_equation_conversion`):
+         the new table-numbered equation exists with the expected number and
+         byte-identical OMML content.
+      2. Real render-capability verification
+         (:func:`_enforce_render_verification`): ``"rendered"`` succeeds with
+         evidence attached; ``"failed"`` or ``"unavailable-with-reason"``
+         fails closed (restore from backup + error) unless the caller passes
+         ``allow_degraded_render=True`` with a non-empty
+         ``degraded_render_reason`` — the only audited opt-in.
+
+    Both checks run under the SAME promotion lock as the write itself, and
+    any failure attempts a compare-and-swap-safe restore from the pre-write
+    ``.bak`` backup (never blind — a concurrent writer's already-promoted
+    work is never clobbered).
+
+    Args:
+        docx_path:         Absolute path to the .docx file (mutated in
+                            place — pass a disposable copy, see above).
+        equation_para_id:  w14:paraId / synth id / p{N} of the paragraph
+                            holding the standalone equation to convert.
+        number:            The equation number text, e.g. ``"(1)"`` or
+                            ``"(2a)"`` — must match the same format
+                            :func:`parse_docx_equations_local` already
+                            requires for a table-numbered equation.
+        index_db_path:      If supplied, sidecar is invalidated after write.
+        dry_run:            Return the planned manifest without writing.
+        allow_degraded_render: Explicit, audited opt-in to accept this write
+                            when no render backend is available in this
+                            environment. Requires degraded_render_reason.
+        degraded_render_reason: Required, non-empty when
+                            allow_degraded_render is True; carried onto the
+                            result as an audit trail.
+
+    Returns:
+        ``{status: "dry_run", ...manifest}`` for a dry run;
+        ``{status: "converted", equation_para_id, number, omml_sha256,
+        new_equation_cell_para_id, new_number_cell_para_id, docx_path,
+        render_status, render_verified, render_backend, render_detail}``
+        on success; ``{"error": <message>}`` on failure (file restored from
+        backup on a structural- or render-verification failure; left
+        completely untouched on any earlier validation failure).
+    """
+    if not number or not str(number).strip():
+        return {"error": "number must be a non-empty string"}
+    number = number.strip()
+    if not _EQ_NUMBER_RE.match(number):
+        return {
+            "error": (
+                f"number {number!r} does not match the expected equation-number "
+                "format, e.g. '(1)' or '(2a)'"
+            )
+        }
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, equation_para_id)
+    if result is None:
+        return {"error": f"para_id {equation_para_id!r} not found in {docx_path}"}
+    body, para_elem, child_idx = result
+
+    m_omath_tag = _qm("oMath")
+    omath_els = para_elem.findall(f".//{m_omath_tag}")
+    if not omath_els:
+        return {"error": f"paragraph {equation_para_id!r} contains no <m:oMath> equation"}
+    if len(omath_els) > 1:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} contains {len(omath_els)} equations "
+                "-- convert_equation_to_numbered_row only supports a single-equation "
+                "paragraph; disambiguate manually"
+            )
+        }
+
+    # Fail closed on mixed prose (never guess how to split/rewrap it): any
+    # <w:t> found under the paragraph is Word running text OUTSIDE the OMML
+    # subtree (equations carry their own text as <m:t>, a different tag in a
+    # different namespace, so this can never false-positive on the
+    # equation's own content).
+    prose_runs = para_elem.findall(f".//{_q(_W, 't')}")
+    if any((t.text or "").strip() for t in prose_runs):
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} contains surrounding prose text "
+                "in addition to the equation -- convert_equation_to_numbered_row "
+                "only supports a standalone display-equation paragraph (no mixed "
+                "text); split the prose out into its own paragraph first"
+            )
+        }
+
+    omath_el = omath_els[0]
+    omml_raw = ET.tostring(omath_el, encoding="unicode")
+    expected_flat_text = _omml_flatten_text_local(omml_raw)
+    omml_sha256 = hashlib.sha256(omml_raw.encode("utf-8")).hexdigest()
+
+    taken_ids = {
+        el.get(_q(_W14, "paraId"))
+        for el in root.iter(_q(_W, "p"))
+        if el.get(_q(_W14, "paraId"))
+    }
+    eq_cell_para_id = _new_para_id(taken_ids)
+    num_cell_para_id = _new_para_id(taken_ids)
+
+    manifest = {
+        "docx_path": docx_path,
+        "equation_para_id": equation_para_id,
+        "number": number,
+        "omml_sha256": omml_sha256,
+        "new_equation_cell_para_id": eq_cell_para_id,
+        "new_number_cell_para_id": num_cell_para_id,
+        "body_child_index": child_idx,
+        "column_widths_dxa": [8500, 1000],
+    }
+    if dry_run:
+        return {"status": "dry_run", **manifest}
+
+    table_el = _build_numbered_equation_table(
+        omml_raw, number, eq_cell_para_id, num_cell_para_id,
+    )
+
+    # Replace the standalone-equation paragraph with the new table at the
+    # SAME body position -- position 100% preserved, surrounding prose
+    # elsewhere in the document is never touched.
+    body.remove(para_elem)
+    body.insert(child_idx, table_el)
+
+    # Mirrors insert_equation_local exactly: hold docx_path's promotion lock
+    # across stage+promote THROUGH structural verify, any conditional
+    # restore, and the render-capability gate -- closing the same-process
+    # promotion/verify window entirely.
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_numbered_equation_conversion(
+            docx_path, expected_number=number, expected_flat_text=expected_flat_text,
+        )
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["equation_para_id"] = equation_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["equation_para_id"] = equation_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "converted",
+        "equation_para_id": equation_para_id,
+        "number": number,
+        "omml_sha256": omml_sha256,
+        "new_equation_cell_para_id": eq_cell_para_id,
+        "new_number_cell_para_id": num_cell_para_id,
+        "docx_path": docx_path,
+        **render_info,
+    }
+
 
 def append_text_run_after_math(
     docx_path: str,
@@ -12259,6 +12782,7 @@ def write_section(
     anchor_para_id: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """82d22824 -- create a whole new section (heading + body + figure/table
     references) as ONE atomic operation from a structured spec.
@@ -12325,13 +12849,25 @@ def write_section(
                         "after" a non-heading anchor -- both remain a literal
                         splice at that exact position.
         index_db_path:  If supplied, sidecar is invalidated after the write.
+        style_policy:   4544bbe5 -- optional document-profile override dict,
+                        same validated shape :func:`resolve_style_policy`
+                        accepts. Currently only ``heading_terminal_punctuation``
+                        is consulted here: when not ``None``, the new
+                        heading's text has any trailing character in
+                        ``.,:;!?`` stripped and this value appended in its
+                        place before the heading paragraph is built (see
+                        :func:`_apply_heading_terminal_punctuation`).
+                        Omitted (the default), heading text is used exactly
+                        as given -- byte-identical to pre-4544bbe5 behavior.
 
     Returns:
         ``{status, heading_para_id, heading_text, level, block_para_ids,
         docx_path}`` where ``block_para_ids`` is a list parallel to
         ``content_spec`` (``{"type": "paragraph", "para_id": ...}`` or
         ``{"type": "caption", "kind", "para_id", "seq_number",
-        "ref_bookmark"}``).
+        "ref_bookmark"}``). ``heading_text`` in the response reflects the
+        text actually written (post ``heading_terminal_punctuation``
+        normalization, if any).
 
         ``{"error": <message>}`` on any validation or write failure (file
         NOT mutated on error -- validation happens before the file is
@@ -12361,6 +12897,10 @@ def write_section(
                 return {"error": f"content_spec[{i}] (caption) requires kind='Figure' or 'Table'"}
             if not str(block.get("label_text", "")).strip():
                 return {"error": f"content_spec[{i}] (caption) requires a non-empty 'label_text'"}
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -12403,6 +12943,8 @@ def write_section(
         ref_seed[0] += 1
         return name
 
+    heading_text_final = _apply_heading_terminal_punctuation(heading_text.strip(), policy)
+
     heading_id = _new_para_id(taken_ids)
     heading_p = ET.Element(_q(_W, "p"))
     heading_p.set(_q(_W14, "paraId"), heading_id)
@@ -12411,7 +12953,7 @@ def write_section(
     hStyle.set(_q(_W, "val"), f"Heading{level_int}")
     hr = ET.SubElement(heading_p, _q(_W, "r"))
     ht = ET.SubElement(hr, _q(_W, "t"))
-    ht.text = heading_text.strip()
+    ht.text = heading_text_final
 
     new_elements: list[ET.Element] = [heading_p]
     block_para_ids: list[dict[str, Any]] = []
@@ -12530,7 +13072,7 @@ def write_section(
     return {
         "status": "inserted",
         "heading_para_id": heading_id,
-        "heading_text": heading_text.strip(),
+        "heading_text": heading_text_final,
         "level": level_int,
         "block_para_ids": block_para_ids,
         "docx_path": docx_path,
@@ -14473,6 +15015,7 @@ def insert_table(
     index_db_path: str | None = None,
     allow_degraded_render: bool = False,
     degraded_render_reason: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """0a1e9c22 -- Insert a brand-new bare ``<w:tbl>`` at a position relative
     to an anchor paragraph, atomically.
@@ -14526,6 +15069,15 @@ def insert_table(
                          environment. Requires degraded_render_reason.
         degraded_render_reason: Required, non-empty when
                          allow_degraded_render is True.
+        style_policy:    4544bbe5 -- optional document-profile override
+                         dict, same validated shape
+                         :func:`resolve_style_policy` accepts.
+                         ``table_label_column_alignment`` sets ``w:jc`` on
+                         column 0 ("label column") of every new cell
+                         paragraph; ``table_data_column_alignment`` sets it
+                         on every column after column 0 ("data columns").
+                         Both default to ``None`` (no ``w:jc`` added at all
+                         -- byte-identical to pre-4544bbe5 behavior).
 
     Returns:
         ``{status, table_index, row_count, col_count, anchor_para_id,
@@ -14555,6 +15107,10 @@ def insert_table(
         for row_texts in cell_texts:
             if not isinstance(row_texts, list) or len(row_texts) != cols:
                 return {"error": f"each cell_texts row must have {cols} entr(y/ies)"}
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -14595,6 +15151,12 @@ def insert_table(
     for _ in range(cols):
         ET.SubElement(tblGrid, _W_GRIDCOL).set(_q(_W, "w"), str(col_width))
 
+    # 4544bbe5 -- column-level alignment from the (optional) style policy.
+    # None (the default for both keys) means "add no w:jc at all", so the
+    # common case of no style_policy reproduces pre-4544bbe5 output exactly.
+    label_col_align = policy["table_label_column_alignment"]
+    data_col_align = policy["table_data_column_alignment"]
+
     for row_idx in range(rows):
         tr = ET.SubElement(tbl, _W_TR)
         for col_idx in range(cols):
@@ -14604,6 +15166,10 @@ def insert_table(
             tcPr.find(_q(_W, "tcW")).set(_q(_W, "type"), "dxa")
             p = ET.SubElement(tc, _q(_W, "p"))
             p.set(_q(_W14, "paraId"), _new_para_id(taken_ids))
+            col_align = label_col_align if col_idx == 0 else data_col_align
+            if col_align is not None:
+                pPr = ET.SubElement(p, _q(_W, "pPr"))
+                ET.SubElement(pPr, _q(_W, "jc")).set(_q(_W, "val"), col_align)
             text = None
             if cell_texts is not None:
                 text = cell_texts[row_idx][col_idx]
@@ -19498,6 +20064,1512 @@ def apply_and_merge_batch_transform(
         "render_verified": merge_result.get("render_verified"),
     }
     return {**merge_result, "batch_receipt": batch_receipt}
+
+
+# ---------------------------------------------------------------------------
+# 4c992e91 (BE4ED581-W1) -- typed, reviewable PROSE-EDIT PACKETS with anchor
+# re-resolution and drift rejection.
+#
+# Builds ON TOP OF the declarative batch-transform layer directly above
+# (982f8564) rather than reimplementing anchor resolution, fingerprinting,
+# or staleness detection: every resolve/stale-check in this section
+# delegates to the SAME _resolve_anchor_query / _source_fingerprint /
+# _set_paragraph_text / _save_docx_xml_stdlib primitives locate_anchor and
+# the batch layer already use. No second anchor-resolution or XML-write
+# code path is introduced here.
+#
+# What this section adds that the generic batch layer does not have:
+#   * a distinct, TYPED packet (not a bag-of-dicts operation) for one
+#     specific case -- replacing the visible text of a PROSE element --
+#     with a named, reviewable field set instead of positional dict keys;
+#   * expected_context_hash: a sha256 digest of the anchor's live
+#     quoted_text at build time, in place of the batch layer's raw-text
+#     expected_quoted_text precondition -- a fixed-size, non-content-
+#     leaking value suitable for an audit log or a review UI;
+#   * base_docx_hash: a named alias of the same whole-document
+#     source_fingerprint the rest of this module already produces;
+#   * section_role and source_provenance_hash: caller-supplied review
+#     metadata this contract carries end-to-end but does not itself
+#     interpret.
+#
+# Deliberate scope decision (flagged during discovery, confirmed here): a
+# prose packet's mutable-element allow-list (_PROSE_MUTABLE_ELEMENT_TYPES)
+# is DELIBERATELY NARROWER than the generic batch layer's
+# _BATCH_MUTABLE_ELEMENT_TYPES. A caption or table is a labeled,
+# structurally-owned object, not "prose" in the sense this item means
+# (running text a reviewer reads and edits) -- so figure_caption/
+# table_caption/table are excluded here even though the generic batch layer
+# permits them. Equations are refused for the same reason the batch layer
+# refuses them: _set_paragraph_text is a plain-text writer that would
+# silently destroy <m:oMath> content if it ever ran against an
+# equation-typed anchor (see _validate_omml_structure /
+# test_omml_contract_semantics.py for the invariant this protects). The
+# equation/element-type exclusion is enforced TWICE -- once in
+# build_prose_edit_packet, again in apply_prose_edit_packets -- so a caller
+# who hand-edits a packet dict after building it, or a document whose
+# element kind changed out from under a stale packet, can never reach
+# _set_paragraph_text through this contract.
+#
+# IMPORTANT gating subtlety discovered while testing this item (see
+# _prose_effective_element_type's own docstring for the full trace): a
+# paragraph that contains ONLY an <m:oMath> equation and no <w:t> runs is
+# classified by _resolve_anchor_query's direct para_id lookup as an
+# ordinary, empty-text "paragraph" -- NOT "equation" -- because that lookup
+# checks the plain paragraph/heading/caption/table records before ever
+# consulting the separately-walked equations list. Gating on element_type
+# alone would therefore MISS exactly the case this item cares most about.
+# This is a real, PRE-EXISTING gap in the generic batch-transform layer
+# above too (confirmed live: an unmodified apply_batch_transform targeting
+# such a paragraph by para_id DOES flatten its OMML to plain text) -- out
+# of scope to fix here (it is a different, already-shipped function with
+# its own dedicated test suite and a shared-resolver blast radius well
+# beyond this item), but this contract must not inherit it, so both gates
+# below cross-reference target_para_id against the live equations list
+# directly via _prose_effective_element_type, never trusting element_type
+# by itself.
+#
+# Drift rejection reports TWO DISTINCT, machine-checkable reasons rather
+# than one generic "stale" (see apply_prose_edit_packets's docstring):
+# context_hash_mismatch (this specific anchor's own text changed) vs.
+# base_docx_hash_mismatch (the document changed somewhere else, but this
+# anchor's text is untouched). Note these are not symmetric: because
+# base_docx_hash is a whole-FILE byte hash, any edit to the anchor's own
+# text necessarily also changes it -- so context_hash_mismatch is checked
+# and reported FIRST (the more specific, actionable cause), and
+# base_docx_hash_mismatch is only reported when context_hash still matches
+# but the wider document moved anyway.
+# ---------------------------------------------------------------------------
+
+PROSE_PACKET_KIND = "prose_edit"
+
+PROSE_PACKET_STATUS_BUILT = "built"
+PROSE_PACKET_STATUS_REFUSED = "refused"
+PROSE_PACKET_STATUSES: tuple[str, ...] = (PROSE_PACKET_STATUS_BUILT, PROSE_PACKET_STATUS_REFUSED)
+
+# Deliberately narrower than _BATCH_MUTABLE_ELEMENT_TYPES -- see module
+# comment above. Equations are never in this set.
+_PROSE_MUTABLE_ELEMENT_TYPES: frozenset[str] = frozenset({"paragraph", "heading"})
+
+PROSE_APPLY_REASON_INVALID_PACKET = "invalid_packet"
+PROSE_APPLY_REASON_ANCHOR_UNRESOLVED = "anchor_unresolved"
+PROSE_APPLY_REASON_UNSUPPORTED_ELEMENT_TYPE = "unsupported_element_type"
+PROSE_APPLY_REASON_CONTEXT_HASH_MISMATCH = "context_hash_mismatch"
+PROSE_APPLY_REASON_BASE_DOCX_HASH_MISMATCH = "base_docx_hash_mismatch"
+PROSE_APPLY_REASON_DUPLICATE_TARGET = "duplicate_target_in_batch"
+
+
+def _prose_context_hash(text: "str | None") -> str:
+    """Deterministic sha256 hex digest of an anchor's exact quoted_text.
+
+    Hashing (rather than storing the raw string the way the older
+    ``expected_quoted_text`` batch precondition does) keeps a prose-edit
+    packet's reviewable manifest a fixed size regardless of paragraph
+    length, and gives per-anchor content the same tamper-evidence property
+    ``_source_fingerprint`` already gives the whole document.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _prose_provenance_hash(source_provenance: "dict[str, Any] | str | None") -> "str | None":
+    """Deterministic sha256 over caller-supplied replacement-text provenance.
+
+    ``source_provenance`` is free-form caller metadata describing WHERE the
+    replacement text came from (e.g. ``{"origin": "human_edit", "author":
+    "..."}`` or ``{"origin": "llm_generated", "model": "..."}`` or a plain
+    descriptive string) -- this module does not prescribe its schema, only
+    that it hashes deterministically so two packets built from identically-
+    sourced text produce an identical hash, and the hash can be compared or
+    audited without re-transmitting the (possibly large) source text
+    itself. A dict is canonicalized via sort_keys JSON before hashing so
+    key order never affects the digest. Returns ``None`` (no provenance
+    claimed) when ``source_provenance`` is ``None`` -- provenance is
+    optional review metadata, not a required precondition for applying a
+    packet.
+    """
+    if source_provenance is None:
+        return None
+    if isinstance(source_provenance, dict):
+        payload = json.dumps(source_provenance, sort_keys=True, default=str).encode("utf-8")
+    else:
+        payload = str(source_provenance).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _prose_effective_element_type(
+    element_type: "str | None",
+    target_para_id: "str | None",
+    equations: "list[dict[str, Any]]",
+) -> "str | None":
+    """The element type to actually GATE prose-edit packets on -- ``"equation"``
+    whenever ``target_para_id`` carries an OMML equation, regardless of what
+    ``_resolve_anchor_query``'s own generic record classification reported
+    for it.
+
+    This closes a real, PRE-EXISTING gap shared with the generic
+    batch-transform layer above (982f8564): a paragraph containing ONLY
+    ``<m:oMath>`` (no ``<w:t>`` runs) is classified as an ordinary,
+    empty-text ``"paragraph"`` by ``_iter_anchor_records``'s own walk --
+    it is ``parse_docx_equations_local``'s SEPARATE walk that actually
+    knows this paragraph is math. ``_resolve_anchor_query``'s direct
+    ``para_id`` lookup checks ``records`` (paragraphs/headings/captions/
+    tables) BEFORE ever falling back to the equations list, so querying
+    ``{"para_id": "<the equation paragraph's id>"}`` resolves with
+    ``element_type="paragraph"`` and empty ``quoted_text"`` -- gating on
+    ``element_type`` alone would silently miss this case. Confirmed live
+    against the existing, unmodified ``apply_batch_transform``: targeting
+    such a paragraph by ``para_id`` currently DOES flatten its OMML to a
+    plain-text run (a latent defect in the pre-existing batch layer,
+    flagged separately for its own fix -- out of this item's scope, which
+    is this NEW prose-edit contract only). This contract must not inherit
+    that hole, so it is closed here independently by cross-referencing
+    ``target_para_id`` against the equations list directly, never trusting
+    ``element_type`` alone.
+    """
+    if target_para_id is not None and any(
+        eq.get("para_id") == target_para_id for eq in equations
+    ):
+        return "equation"
+    return element_type
+
+
+def build_prose_edit_packet(
+    document_path: str,
+    anchor_query: "dict[str, Any]",
+    replacement_text: str,
+    *,
+    section_role: "str | None" = None,
+    source_provenance: "dict[str, Any] | str | None" = None,
+    expected_source_fingerprint: "str | None" = None,
+) -> dict[str, Any]:
+    """Build ONE reviewable, typed prose-edit packet for a single anchor.
+
+    READ-ONLY: resolves ``anchor_query`` via the exact same
+    :func:`_resolve_anchor_query` that :func:`locate_anchor` and the
+    declarative batch-transform layer already use, against a fresh parse of
+    ``document_path``. Never opens the document for writing, never mutates
+    it.
+
+    Args:
+      document_path:                Document to build the packet against.
+                                    Never opened for writing.
+      anchor_query:                  A ``locate_anchor``-style query dict
+                                    (``para_id`` / ``section_path`` /
+                                    ``section_text`` / ``caption_label`` /
+                                    ``text``, optionally ``element_types``).
+      replacement_text:              The new visible text for this anchor.
+                                    Must be a ``str``.
+      section_role:                  Optional caller-supplied classification
+                                    of this anchor's role in the document
+                                    (e.g. ``"abstract"``, ``"main"``,
+                                    ``"appendix"``) -- carried through to the
+                                    packet and back out of
+                                    ``apply_prose_edit_packets``'s
+                                    ``applied_packets`` unchanged; this
+                                    function does not itself validate or
+                                    classify it.
+      source_provenance:             Optional free-form metadata describing
+                                    where ``replacement_text`` came from
+                                    (see :func:`_prose_provenance_hash`).
+                                    Hashed, never stored verbatim on the
+                                    packet.
+      expected_source_fingerprint:   Optional whole-document staleness guard
+                                    (a prior ``locate_anchor``/
+                                    ``read_document_snapshot`` result's
+                                    ``source_fingerprint``) -- checked
+                                    before any anchor resolution is even
+                                    attempted, so a caller building a
+                                    packet against an already-known-stale
+                                    document gets an explicit refusal
+                                    instead of a packet built against
+                                    unexpected content.
+
+    Refuses (returns ``{"packet_kind": "prose_edit", "status": "refused",
+    "reason": ...}``, no packet built -- and no expensive hashing performed)
+    when:
+      * ``replacement_text`` is not a ``str``, or ``anchor_query`` is not a
+        non-empty dict;
+      * the anchor does not resolve cleanly (``not_found``/``ambiguous``/
+        ``stale`` -- the anchor's own result is echoed back under
+        ``"anchor"`` so the caller sees exactly why);
+      * the resolved ``element_type`` is not in
+        :data:`_PROSE_MUTABLE_ELEMENT_TYPES` -- most importantly this means
+        an ``"equation"`` anchor is refused immediately, before any hash is
+        computed, so a caller can never build a packet whose apply step
+        would find a route to overwrite OMML with plain text.
+
+    On success returns:
+    ``{"packet_kind": "prose_edit", "status": "built", "document_path",
+    "target_para_id", "anchor_query", "element_type", "section_path",
+    "section_role", "expected_context_hash", "replacement_text",
+    "source_provenance_hash", "base_docx_hash",
+    "built_at_source_fingerprint"}``. ``base_docx_hash`` and
+    ``built_at_source_fingerprint`` are the same value (both are the
+    document's ``source_fingerprint`` at build time) -- the first name
+    matches this item's own vocabulary, the second matches the rest of this
+    module's ``locate_anchor``/batch-transform naming; both are kept so a
+    caller can match on either.
+    """
+    if not isinstance(replacement_text, str):
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": "replacement_text must be a string",
+        }
+    if not isinstance(anchor_query, dict) or not anchor_query:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": "anchor_query must be a non-empty locate_anchor-style query dict",
+        }
+
+    # Own fresh parse (rather than delegating to locate_anchor) so this
+    # function has direct access to the equations list -- required for the
+    # equation-bearing cross-check in _prose_effective_element_type above,
+    # which locate_anchor's own return value does not expose.
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": str(exc),
+        }
+
+    source_fingerprint = _source_fingerprint(raw)
+    if expected_source_fingerprint and expected_source_fingerprint != source_fingerprint:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": "source_fingerprint_mismatch",
+            "anchor": {
+                "status": "stale",
+                "document_path": document_path,
+                "reason": "source_fingerprint_mismatch",
+                "expected_source_fingerprint": expected_source_fingerprint,
+                "source_fingerprint": source_fingerprint,
+                "candidates": [],
+            },
+        }
+
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": str(exc),
+        }
+
+    anchor = _resolve_anchor_query(
+        records, equations, anchor_query,
+        document_path=document_path, source_fingerprint=source_fingerprint,
+    )
+    if anchor.get("status") != "resolved":
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": (
+                anchor.get("reason")
+                or f"anchor did not resolve (status={anchor.get('status')!r})"
+            ),
+            "anchor": anchor,
+        }
+
+    target_para_id = anchor["target_para_id"]
+    effective_element_type = _prose_effective_element_type(
+        anchor.get("element_type"), target_para_id, equations,
+    )
+    if effective_element_type not in _PROSE_MUTABLE_ELEMENT_TYPES:
+        return {
+            "packet_kind": PROSE_PACKET_KIND,
+            "status": PROSE_PACKET_STATUS_REFUSED,
+            "reason": (
+                f"unsupported_element_type: {effective_element_type!r} is not "
+                f"prose -- prose-edit packets are scoped to "
+                f"{sorted(_PROSE_MUTABLE_ELEMENT_TYPES)} only; an equation, "
+                "caption, or table must never be routed through the "
+                "plain-text prose writer"
+            ),
+            "effective_element_type": effective_element_type,
+            "anchor": anchor,
+        }
+
+    return {
+        "packet_kind": PROSE_PACKET_KIND,
+        "status": PROSE_PACKET_STATUS_BUILT,
+        "document_path": document_path,
+        "target_para_id": target_para_id,
+        "anchor_query": dict(anchor_query),
+        "element_type": effective_element_type,
+        "section_path": anchor.get("section_path"),
+        "section_role": section_role,
+        "expected_context_hash": _prose_context_hash(anchor.get("quoted_text")),
+        "replacement_text": replacement_text,
+        "source_provenance_hash": _prose_provenance_hash(source_provenance),
+        "base_docx_hash": anchor["source_fingerprint"],
+        "built_at_source_fingerprint": anchor["source_fingerprint"],
+    }
+
+
+def _prose_packet_structural_error(packet: "dict[str, Any]") -> "str | None":
+    """Structural validation only -- no document access. Returns an error
+    string when ``packet`` is not a well-formed, successfully-built prose
+    packet; ``None`` when it is well-formed enough to attempt resolution."""
+    if not isinstance(packet, dict):
+        return "packet must be a dict"
+    if packet.get("packet_kind") != PROSE_PACKET_KIND:
+        return f"packet_kind must be {PROSE_PACKET_KIND!r}"
+    if packet.get("status") != PROSE_PACKET_STATUS_BUILT:
+        return (
+            f"packet.status must be {PROSE_PACKET_STATUS_BUILT!r} "
+            "(this packet was refused at build time and was never "
+            "buildable in the first place)"
+        )
+    if not isinstance(packet.get("anchor_query"), dict) or not packet["anchor_query"]:
+        return "packet.anchor_query must be a non-empty dict"
+    if not isinstance(packet.get("replacement_text"), str):
+        return "packet.replacement_text must be a string"
+    if not isinstance(packet.get("expected_context_hash"), str) or not packet["expected_context_hash"]:
+        return "packet.expected_context_hash must be a non-empty string"
+    if not isinstance(packet.get("base_docx_hash"), str) or not packet["base_docx_hash"]:
+        return "packet.base_docx_hash must be a non-empty string"
+    return None
+
+
+def apply_prose_edit_packets(
+    document_path: str,
+    packets: "list[dict[str, Any]]",
+    draft_output_path: str,
+    *,
+    expected_source_fingerprint: "str | None" = None,
+) -> dict[str, Any]:
+    """Re-resolve and apply a batch of :func:`build_prose_edit_packet`
+    packets to an ISOLATED draft.
+
+    ``document_path`` is opened READ-ONLY throughout this call and is NEVER
+    the write target -- ``draft_output_path`` is. ALL-OR-NOTHING, exactly
+    like :func:`apply_batch_transform`: if even ONE packet fails
+    re-resolution or drift-checking, NOTHING is written --
+    ``draft_output_path`` is never created or partially written -- and this
+    returns a rejection manifest naming every failing packet.
+
+    Every packet's anchor is RE-RESOLVED fresh against the CURRENT on-disk
+    content of ``document_path`` (the packet's own stored anchor/hashes are
+    never trusted blindly) via the same :func:`_resolve_anchor_query`
+    ``locate_anchor``/``plan_batch_transform`` already use. The prose-only
+    element-type gate (:data:`_PROSE_MUTABLE_ELEMENT_TYPES`) is re-checked
+    here too, against the FRESHLY resolved ``element_type`` -- defense in
+    depth against a caller who hand-edited a packet dict after
+    :func:`build_prose_edit_packet` returned it, or against the document
+    having changed an element's kind out from under a stale packet.
+
+    Drift is rejected with one of two DISTINGUISHABLE reasons (see the
+    module comment above this section for why they are not symmetric):
+      * ``"context_hash_mismatch"`` -- this specific anchor's own text
+        changed since the packet was built (checked first: the more
+        specific, actionable cause);
+      * ``"base_docx_hash_mismatch"`` -- this anchor's text is unchanged,
+        but the wider document changed since the packet was built.
+    A packet whose anchor no longer resolves at all (deleted paragraph) or
+    resolves ambiguously gets ``"anchor_unresolved"``; two packets in the
+    same call targeting the same live anchor get
+    ``"duplicate_target_in_batch"`` on the second one.
+
+    Args:
+      document_path:                The document to transform. Read-only.
+      packets:                       Non-empty list of
+                                    :func:`build_prose_edit_packet` results
+                                    (each must have
+                                    ``status == "built"``).
+      draft_output_path:             Where to stage the transformed draft.
+                                    MUST differ from ``document_path``.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard checked BEFORE any packet is even
+                                    inspected -- a mismatch here short-
+                                    circuits with
+                                    ``"document_changed_before_apply"``
+                                    rather than a per-packet conflict list.
+
+    Returns on success: ``{"applied": True, "draft_output_path",
+    "source_fingerprint" (pre-apply), "applied_packets": [...one entry per
+    paragraph actually rewritten, {"index", "target_para_id",
+    "section_role"}...], "write_transaction" (the ``_save_docx_xml_stdlib``
+    transaction dict for the DRAFT write itself)}``.
+
+    Returns on failure: ``{"applied": False, "reason": "batch_has_conflicts",
+    "conflicts": [{"index", "reason", "detail", "anchor"}, ...],
+    "packet_count", "ready_count"}`` -- ``draft_output_path`` untouched. A
+    malformed ``draft_output_path``, an unreadable ``document_path``, or a
+    whole-document staleness mismatch returns ``{"applied": False,
+    "error"/"reason": ...}`` before any packet is inspected.
+    """
+    if not isinstance(packets, list) or not packets:
+        return {"applied": False, "error": "packets must be a non-empty list"}
+    if not draft_output_path or not str(draft_output_path).strip():
+        return {"applied": False, "error": "draft_output_path is required"}
+    if os.path.normcase(os.path.abspath(draft_output_path)) == os.path.normcase(os.path.abspath(document_path)):
+        return {
+            "applied": False,
+            "error": (
+                "draft_output_path must differ from document_path -- a "
+                "prose-edit packet's output must be an isolated draft "
+                "artifact, never the source document itself"
+            ),
+        }
+
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"applied": False, "error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    if expected_source_fingerprint and expected_source_fingerprint != source_fingerprint:
+        return {
+            "applied": False,
+            "reason": "document_changed_before_apply",
+            "error": (
+                "document_path has changed since expected_source_fingerprint "
+                "was captured -- refusing to even attempt re-resolution "
+                "against content this call was not invoked against"
+            ),
+            "expected_source_fingerprint": expected_source_fingerprint,
+            "source_fingerprint": source_fingerprint,
+        }
+
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {"applied": False, "error": str(exc)}
+
+    conflicts: "list[dict[str, Any]]" = []
+    ready: "list[dict[str, Any]]" = []
+    seen_targets: "dict[str, int]" = {}
+
+    for index, packet in enumerate(packets):
+        structural_error = _prose_packet_structural_error(packet)
+        if structural_error:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_INVALID_PACKET,
+                "detail": structural_error,
+                "anchor": None,
+            })
+            continue
+
+        anchor = _resolve_anchor_query(
+            records, equations, packet["anchor_query"],
+            document_path=document_path, source_fingerprint=source_fingerprint,
+        )
+        if anchor.get("status") != "resolved":
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_ANCHOR_UNRESOLVED,
+                "detail": anchor.get("reason") or f"status={anchor.get('status')!r}",
+                "anchor": anchor,
+            })
+            continue
+
+        target_para_id = anchor["target_para_id"]
+        effective_element_type = _prose_effective_element_type(
+            anchor.get("element_type"), target_para_id, equations,
+        )
+        if effective_element_type not in _PROSE_MUTABLE_ELEMENT_TYPES:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_UNSUPPORTED_ELEMENT_TYPE,
+                "detail": (
+                    f"{effective_element_type!r} is not prose-mutable "
+                    f"({sorted(_PROSE_MUTABLE_ELEMENT_TYPES)}) -- refusing "
+                    "to route this packet through the plain-text prose "
+                    "writer"
+                ),
+                "effective_element_type": effective_element_type,
+                "anchor": anchor,
+            })
+            continue
+
+        if target_para_id in seen_targets:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_DUPLICATE_TARGET,
+                "detail": (
+                    f"target_para_id {target_para_id!r} is also targeted by "
+                    f"the packet at index {seen_targets[target_para_id]} "
+                    "earlier in this same apply call -- two packets may "
+                    "never target the same live anchor in one apply"
+                ),
+                "anchor": anchor,
+            })
+            continue
+
+        # Content-level drift, checked BEFORE whole-document drift -- see
+        # the module comment above for why these two are not symmetric.
+        live_context_hash = _prose_context_hash(anchor.get("quoted_text"))
+        if live_context_hash != packet["expected_context_hash"]:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_CONTEXT_HASH_MISMATCH,
+                "detail": (
+                    "this anchor's live text no longer matches the context "
+                    "this packet was built against -- the paragraph itself "
+                    "was edited since build_prose_edit_packet ran"
+                ),
+                "anchor": anchor,
+            })
+            continue
+
+        # Whole-document drift: this anchor's own content is untouched, but
+        # something ELSE in the document changed since this packet was
+        # built -- reject conservatively rather than assume an unrelated
+        # change is safe to ignore.
+        if anchor["source_fingerprint"] != packet["base_docx_hash"]:
+            conflicts.append({
+                "index": index,
+                "reason": PROSE_APPLY_REASON_BASE_DOCX_HASH_MISMATCH,
+                "detail": (
+                    "document_path's whole-file content has changed since "
+                    "this packet was built, even though this specific "
+                    "anchor's own text is unchanged -- refusing to apply "
+                    "against a document state this packet was not built "
+                    "against"
+                ),
+                "anchor": anchor,
+            })
+            continue
+
+        seen_targets[target_para_id] = index
+        ready.append({
+            "index": index, "packet": packet, "anchor": anchor,
+            "target_para_id": target_para_id,
+        })
+
+    if conflicts:
+        return {
+            "applied": False,
+            "reason": "batch_has_conflicts",
+            "conflicts": conflicts,
+            "packet_count": len(packets),
+            "ready_count": len(ready),
+        }
+
+    try:
+        raw_for_write, root = _load_docx_xml_stdlib(document_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"applied": False, "error": str(exc)}
+
+    if _source_fingerprint(raw_for_write) != source_fingerprint:
+        return {
+            "applied": False,
+            "reason": "document_changed_during_apply",
+            "error": (
+                "document_path changed on disk between resolution and "
+                "write -- refusing to apply against content that was not "
+                "just re-resolved; re-run apply_prose_edit_packets"
+            ),
+        }
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"applied": False, "error": f"{document_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+
+    def _find_paragraph(target_id: str) -> "ET.Element | None":
+        for p in body:
+            if p.tag == w_p and p.get(w14_para_id) == target_id:
+                return p
+        return None
+
+    applied: "list[dict[str, Any]]" = []
+    for entry in ready:
+        target_para_id = entry["target_para_id"]
+        el = _find_paragraph(target_para_id)
+        if el is None:
+            return {
+                "applied": False,
+                "reason": "element_vanished_during_apply",
+                "error": (
+                    f"packet at index {entry['index']}'s target "
+                    f"{target_para_id!r} could not be re-located in the "
+                    "live XML tree during apply -- aborting the whole "
+                    "batch, draft_output_path is untouched"
+                ),
+            }
+        _set_paragraph_text(el, entry["packet"]["replacement_text"])
+        applied.append({
+            "index": entry["index"],
+            "target_para_id": target_para_id,
+            "section_role": entry["packet"].get("section_role"),
+        })
+
+    try:
+        write_transaction = _save_docx_xml_stdlib(raw_for_write, root, draft_output_path)
+    except DocxWriteVerificationError as exc:
+        return {
+            "applied": False,
+            "reason": "draft_write_verification_failed",
+            "error": str(exc),
+        }
+    except OSError as exc:
+        return {"applied": False, "error": f"could not write {draft_output_path}: {exc}"}
+
+    return {
+        "applied": True,
+        "draft_output_path": draft_output_path,
+        "source_fingerprint": source_fingerprint,
+        "applied_packets": applied,
+        "write_transaction": write_transaction,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 0d62f067 (BE4ED581-W2) -- batch reviewable section moves / prose edits into
+# ONE fail-closed, all-or-nothing writer transaction.
+#
+# Every primitive this section composes already supports isolated drafting
+# on its own (fe989980's draft_output_path/wave_run_id on move_section /
+# copy_section / relocate_table / relocate_figure; 4c992e91's
+# apply_prose_edit_packets) -- but nothing chains several of them into ONE
+# reviewable unit with genuine all-or-nothing rollback. The closest existing
+# precedent, apply_and_merge_batch_transform (982f8564, directly above), is
+# a single apply step + a single merge; test_merge_draft_into_canonical_
+# sequential_non_overlapping_drafts_combine (test_fe989980_merge_draft.py)
+# chains two OPERATIONS but merges into canonical after EACH ONE -- that is
+# multi-session wave coordination, not a single all-or-nothing batch. This
+# section is the genuinely different composition: chain
+# docx_path=draft_(n-1) -> draft_output_path=draft_n across every step
+# WITHOUT ever touching canonical_path mid-batch, then call
+# merge_draft_into_canonical exactly ONCE, only after every step has
+# already succeeded.
+#
+# canonical_path is the docx_path for step 0 ONLY, and is opened read-only
+# there (like every other draft-mode call in this module) -- every
+# subsequent step's docx_path is the previous step's own isolated draft.
+# canonical_path is therefore never a write target anywhere in this
+# function except inside the final merge_draft_into_canonical call, which
+# already carries its own atomic stage/verify/backup/restore discipline.
+#
+# Deliberate scope reduction for this pass (see the sprint item's own
+# priority list): this composes prose-edit packets + the four EXISTING
+# structural mutators only. Two adjacent asks from the same item are
+# explicitly DEFERRED, not silently dropped:
+#
+#   * Caption normalization -- edit_caption (9d749639, elsewhere in this
+#     module) has NO draft_output_path/wave_run_id support at all: it
+#     writes docx_path in place, with no promotion lock and no post-write
+#     verification, unlike every mutator this transaction chains. Routing
+#     a caption-label edit through apply_prose_edit_packets/
+#     apply_batch_transform's plain-text writer would destroy the
+#     paragraph's SEQ field (_set_paragraph_text discards every child but
+#     w:pPr). Folding caption edits into this transaction needs
+#     edit_caption extended with the SAME opt-in draft pattern FIRST -- a
+#     separate, sequenced follow-up.
+#   * Single-writer locking -- meridian/db/locks.py's
+#     acquire_docx_document_lease/release_docx_document_lease (from item
+#     ab940e79) is exactly the primitive the item's notes ask for, but it
+#     is an ASYNC, aiosqlite-backed function in the Meridian CORE package.
+#     This extension (extensions/meridian-docs) is deliberately stdlib-only
+#     and DB-free -- see merge_draft_into_canonical's own module comment
+#     above, and pyproject.toml's dependencies = ["mcp", "latex2mathml",
+#     "lxml"], no aiosqlite/meridian-core -- so calling it here would cross
+#     a boundary this package intentionally does not cross, from a
+#     synchronous call site, for a dependency this package does not
+#     declare. Wiring it is a separate, cross-package change: the CALLER
+#     (a Meridian MCP session, which does have DB access) is responsible
+#     for acquiring/releasing that lease around a call to this function
+#     until that follow-up lands -- see the docstring below.
+# ---------------------------------------------------------------------------
+
+TRANSACTION_STEP_KIND_PROSE_EDITS = "prose_edit_packets"
+TRANSACTION_STEP_KIND_MOVE_SECTION = "move_section"
+TRANSACTION_STEP_KIND_COPY_SECTION = "copy_section"
+TRANSACTION_STEP_KIND_RELOCATE_TABLE = "relocate_table"
+TRANSACTION_STEP_KIND_RELOCATE_FIGURE = "relocate_figure"
+
+#: Every step "kind" apply_reviewable_edit_transaction accepts. Caption
+#: normalization is NOT included -- see the module comment above.
+TRANSACTION_SUPPORTED_STEP_KINDS: tuple[str, ...] = (
+    TRANSACTION_STEP_KIND_PROSE_EDITS,
+    TRANSACTION_STEP_KIND_MOVE_SECTION,
+    TRANSACTION_STEP_KIND_COPY_SECTION,
+    TRANSACTION_STEP_KIND_RELOCATE_TABLE,
+    TRANSACTION_STEP_KIND_RELOCATE_FIGURE,
+)
+
+# Required params.* keys per step kind, beyond the fields this function
+# injects itself (docx_path/draft_output_path/wave_run_id/index_db_path).
+# prose_edit_packets is validated separately (params.packets must be a
+# non-empty list) since it has no single-string required key.
+_TRANSACTION_STEP_REQUIRED_PARAMS: "dict[str, tuple[str, ...]]" = {
+    TRANSACTION_STEP_KIND_MOVE_SECTION: ("section_id", "destination_anchor_para_id"),
+    TRANSACTION_STEP_KIND_COPY_SECTION: ("section_id", "destination_anchor_para_id"),
+    TRANSACTION_STEP_KIND_RELOCATE_TABLE: ("table_index", "destination_anchor_para_id"),
+    TRANSACTION_STEP_KIND_RELOCATE_FIGURE: ("figure_index", "destination_anchor_para_id"),
+}
+
+_TRANSACTION_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _transaction_draft_filename(wave_run_id: str, index: int, kind: str) -> str:
+    """Deterministic, filesystem-safe intermediate draft filename for step
+    ``index`` of a transaction. Not used for the caller-supplied
+    ``draft_dir`` itself -- only for the basename inside it."""
+    safe_wave = _TRANSACTION_UNSAFE_FILENAME_CHARS.sub("_", str(wave_run_id)).strip("_") or "wave"
+    safe_kind = _TRANSACTION_UNSAFE_FILENAME_CHARS.sub("_", str(kind))
+    return f"{safe_wave}.step{index:02d}.{safe_kind}.docx"
+
+
+def _validate_transaction_step(index: int, step: Any) -> "str | None":
+    """Structural validation ONLY (kind recognised, params well-shaped,
+    required keys present) -- semantic resolution (does section_id actually
+    exist, etc.) is deliberately left to the underlying primitive when the
+    step actually runs, exactly like every other anchor-resolving call in
+    this module. Returns an error string, or ``None`` when well-formed."""
+    if not isinstance(step, dict):
+        return f"step {index} must be a dict, got {type(step).__name__}"
+    kind = step.get("kind")
+    if kind not in TRANSACTION_SUPPORTED_STEP_KINDS:
+        return (
+            f"step {index} has unsupported kind {kind!r} -- must be one of "
+            f"{TRANSACTION_SUPPORTED_STEP_KINDS}"
+        )
+    params = step.get("params")
+    if not isinstance(params, dict):
+        return f"step {index} ({kind}) params must be a dict"
+    if kind == TRANSACTION_STEP_KIND_PROSE_EDITS:
+        packets = params.get("packets")
+        if not isinstance(packets, list) or not packets:
+            return f"step {index} (prose_edit_packets) params.packets must be a non-empty list"
+        return None
+    required = _TRANSACTION_STEP_REQUIRED_PARAMS[kind]
+    missing = [name for name in required if params.get(name, None) is None]
+    if missing:
+        return f"step {index} ({kind}) params missing required key(s): {missing}"
+    return None
+
+
+def _transaction_step_failed(kind: str, result: Any) -> bool:
+    """Uniform success/failure read across the two distinct result shapes
+    this transaction composes: prose_edit_packets uses ``{"applied": bool}``
+    (982f8564/4c992e91's convention); the four structural mutators use a
+    plain success dict with NO "error" key, or ``{"error": ...}`` on
+    failure (fe989980's pre-existing convention, unchanged here)."""
+    if not isinstance(result, dict):
+        return True
+    if kind == TRANSACTION_STEP_KIND_PROSE_EDITS:
+        return not result.get("applied")
+    return "error" in result
+
+
+def _run_transaction_step(
+    kind: str,
+    params: "dict[str, Any]",
+    src: str,
+    dest: str,
+    wave_run_id: str,
+) -> "dict[str, Any]":
+    """Dispatch one already-validated transaction step. ``src`` is read-only
+    (the previous step's draft, or canonical_path for step 0); ``dest`` is
+    THIS step's own isolated draft -- never src, never canonical_path."""
+    if kind == TRANSACTION_STEP_KIND_PROSE_EDITS:
+        return apply_prose_edit_packets(
+            src,
+            params["packets"],
+            dest,
+            expected_source_fingerprint=params.get("expected_source_fingerprint"),
+        )
+    if kind == TRANSACTION_STEP_KIND_MOVE_SECTION:
+        return move_section(
+            docx_path=src,
+            section_id=params["section_id"],
+            destination_anchor_para_id=params["destination_anchor_para_id"],
+            destination_position=params.get("destination_position", "after"),
+            allow_bookmark_split=bool(params.get("allow_bookmark_split", False)),
+            draft_output_path=dest,
+            wave_run_id=wave_run_id,
+        )
+    if kind == TRANSACTION_STEP_KIND_COPY_SECTION:
+        return copy_section(
+            docx_path=src,
+            section_id=params["section_id"],
+            destination_anchor_para_id=params["destination_anchor_para_id"],
+            destination_position=params.get("destination_position", "after"),
+            trim_original_to=params.get("trim_original_to"),
+            allow_relationship_reuse=bool(params.get("allow_relationship_reuse", False)),
+            draft_output_path=dest,
+            wave_run_id=wave_run_id,
+        )
+    if kind == TRANSACTION_STEP_KIND_RELOCATE_TABLE:
+        return relocate_table(
+            docx_path=src,
+            table_index=params["table_index"],
+            destination_anchor_para_id=params["destination_anchor_para_id"],
+            destination_position=params.get("destination_position", "after"),
+            allow_bookmark_split=bool(params.get("allow_bookmark_split", False)),
+            draft_output_path=dest,
+            wave_run_id=wave_run_id,
+        )
+    if kind == TRANSACTION_STEP_KIND_RELOCATE_FIGURE:
+        return relocate_figure(
+            docx_path=src,
+            figure_index=params["figure_index"],
+            destination_anchor_para_id=params["destination_anchor_para_id"],
+            destination_position=params.get("destination_position", "after"),
+            allow_bookmark_split=bool(params.get("allow_bookmark_split", False)),
+            draft_output_path=dest,
+            wave_run_id=wave_run_id,
+            artifact_provenance=params.get("artifact_provenance"),
+        )
+    raise AssertionError(f"unreachable -- unsupported step kind {kind!r}")  # pragma: no cover
+
+
+def _cleanup_transaction_drafts(paths: "list[str]") -> "dict[str, list[str]]":
+    """Best-effort delete every path in ``paths`` (deduplicated, order
+    preserved). Never raises -- a draft that is already gone, or that could
+    not be removed (e.g. permissions), is reported back rather than
+    crashing the transaction result the caller still needs to see."""
+    deleted: "list[str]" = []
+    failed: "list[str]" = []
+    seen: "set[str]" = set()
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            deleted.append(path)
+        except OSError:
+            failed.append(path)
+    return {"deleted": deleted, "failed": failed}
+
+
+def apply_reviewable_edit_transaction(
+    canonical_path: str,
+    steps: "list[dict[str, Any]]",
+    draft_dir: str,
+    wave_run_id: str,
+    *,
+    expected_source_fingerprint: "str | None" = None,
+    index_db_path: "str | None" = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: "str | None" = None,
+    cleanup_drafts: bool = True,
+) -> dict[str, Any]:
+    """0d62f067 (BE4ED581-W2) -- apply a reviewable BATCH of staged prose
+    replacements and/or section/table/figure relocations as ONE
+    all-or-nothing writer transaction, then promote exactly once.
+
+    ``canonical_path`` is opened READ-ONLY for step 0 and is NEVER a write
+    target anywhere in this function except inside the final
+    :func:`merge_draft_into_canonical` call (which has its own atomic
+    stage -> verify -> backup/restore-on-failure discipline). Every step
+    after the first reads the PREVIOUS step's own isolated draft, chaining
+    ``docx_path=draft_(n-1) -> draft_output_path=draft_n`` through
+    ``draft_dir`` so no step ever mutates canonical_path or an earlier
+    step's input mid-batch.
+
+    ALL-OR-NOTHING: the first step that fails aborts the WHOLE batch --
+    every draft this call itself created so far (all preceding successful
+    steps' outputs) is deleted, canonical_path is guaranteed untouched (it
+    was only ever read), and the result names exactly which step failed and
+    why. Nothing is promoted unless every single step succeeds.
+
+    Args:
+      canonical_path:                The real document. Read-only throughout
+                                     every step; only ever written by the
+                                     final promotion, and only via the same
+                                     verified, backup-guarded
+                                     merge_draft_into_canonical every other
+                                     promotion path in this module uses.
+      steps:                         Non-empty list of ``{"kind": ..., "params":
+                                     {...}}``. ``kind`` must be one of
+                                     :data:`TRANSACTION_SUPPORTED_STEP_KINDS`
+                                     ("prose_edit_packets", "move_section",
+                                     "copy_section", "relocate_table",
+                                     "relocate_figure" -- NOT caption edits,
+                                     see the module comment above this
+                                     function). ``params`` mirrors that
+                                     primitive's own keyword arguments MINUS
+                                     ``docx_path``/``draft_output_path``/
+                                     ``wave_run_id``/``index_db_path``, which
+                                     this function injects itself for every
+                                     step. ``prose_edit_packets``' params is
+                                     ``{"packets": [...], "expected_source_
+                                     fingerprint": <optional>}`` (packets from
+                                     :func:`build_prose_edit_packet`).
+      draft_dir:                     Directory to stage every intermediate
+                                     draft in (created if missing). Must
+                                     differ from canonical_path's own
+                                     directory reasoning is unnecessary here
+                                     -- what matters is that each step's own
+                                     dest differs from its own src, which
+                                     this function guarantees by construction
+                                     (a fresh, uniquely-named file per step).
+      wave_run_id:                  Required, non-empty. Threaded into every
+                                     chained step's own wave_run_id (opaque
+                                     to this stdlib-only, DB-free extension)
+                                     and used to name intermediate drafts.
+      expected_source_fingerprint:  Optional whole-document staleness guard
+                                     on canonical_path, checked BEFORE step 0
+                                     even runs (a mismatch short-circuits
+                                     with reason="document_changed_before_
+                                     apply" -- no step runs, nothing is
+                                     staged).
+      index_db_path:                Forwarded ONLY to the final
+                                     merge_draft_into_canonical call (each
+                                     intermediate step already skips sidecar
+                                     invalidation while draft_output_path is
+                                     set -- see move_section's own docstring
+                                     -- so passing it earlier would be a
+                                     no-op).
+      allow_degraded_render /
+      degraded_render_reason:       Forwarded verbatim to the final
+                                     merge_draft_into_canonical call -- see
+                                     its own docstring for the shared,
+                                     audited-opt-in contract.
+      cleanup_drafts:               Default True. On a full success (every
+                                     step AND the final merge succeeded),
+                                     every intermediate AND final draft this
+                                     call created is deleted (their job is
+                                     done -- the content is now canonical).
+                                     On a step failure, every draft created
+                                     so far is ALWAYS deleted regardless of
+                                     this flag (a rejected batch must never
+                                     leave orphaned staged files). On a
+                                     MERGE failure specifically (every step
+                                     succeeded, but the final promotion did
+                                     not), intermediate drafts are deleted
+                                     but the FINAL pre-merge draft is kept
+                                     on disk (its path is returned) so a
+                                     caller can inspect it or retry the
+                                     promotion via merge_docx_draft once
+                                     whatever blocked it (e.g. a render
+                                     backend) is fixed -- unless
+                                     cleanup_drafts=False is passed, kept
+                                     drafts are never silently deleted by a
+                                     later call.
+
+    Returns on full success: ``merge_draft_into_canonical``'s own result
+    dict PLUS ``{"transaction": True, "wave_run_id", "steps_applied": [...
+    one entry per step, {"index", "kind", "draft_path"}...], "cleanup":
+    {"deleted": [...], "failed": [...]}}``.
+
+    Returns on a step failure: ``{"transaction": False, "reason":
+    "step_failed", "failed_step_index", "failed_step_kind", "step_result",
+    "steps_applied": [...steps BEFORE the failing one...], "cleanup": {...}}``
+    -- canonical_path untouched, every draft this call created removed.
+
+    Returns on a merge failure (every step succeeded): ``merge_draft_into_
+    canonical``'s own error dict PLUS ``{"transaction": False, "reason":
+    "merge_failed", "steps_applied": [...], "final_draft_path", "cleanup":
+    {...}}``.
+
+    Returns ``{"transaction": False, "reason": "invalid_request", "error":
+    ...}`` for a malformed request (empty/missing steps, an unsupported step
+    kind, missing wave_run_id, an unwritable draft_dir, ...) or
+    ``{"transaction": False, "reason": "document_changed_before_apply",
+    ...}`` for a canonical_path staleness mismatch -- in both cases NOTHING
+    is touched, not even a directory is created for the latter.
+
+    NOT provided by this function (deliberately deferred -- see the module
+    comment above): caption normalization as a step kind, and cross-process
+    single-writer locking. A caller that needs the latter today should
+    acquire meridian.db.locks.acquire_docx_document_lease(session_id,
+    canonical_path) over its own separate Meridian MCP/DB connection BEFORE
+    calling this function, and release it after -- this stdlib-only, DB-free
+    extension has no access to that state itself.
+    """
+    if not canonical_path or not str(canonical_path).strip():
+        return {"transaction": False, "reason": "invalid_request", "error": "canonical_path is required"}
+    if not wave_run_id or not str(wave_run_id).strip():
+        return {"transaction": False, "reason": "invalid_request", "error": "wave_run_id is required"}
+    if not isinstance(steps, list) or not steps:
+        return {"transaction": False, "reason": "invalid_request", "error": "steps must be a non-empty list"}
+    if not draft_dir or not str(draft_dir).strip():
+        return {"transaction": False, "reason": "invalid_request", "error": "draft_dir is required"}
+
+    for index, step in enumerate(steps):
+        step_error = _validate_transaction_step(index, step)
+        if step_error:
+            return {"transaction": False, "reason": "invalid_request", "error": step_error}
+
+    if expected_source_fingerprint:
+        try:
+            actual_fingerprint = _source_fingerprint(canonical_path)
+        except OSError as exc:
+            return {"transaction": False, "reason": "invalid_request", "error": str(exc)}
+        if actual_fingerprint != expected_source_fingerprint:
+            return {
+                "transaction": False,
+                "reason": "document_changed_before_apply",
+                "error": (
+                    "canonical_path has changed since expected_source_fingerprint "
+                    "was captured -- refusing to stage a transaction against "
+                    "content this call was not invoked against"
+                ),
+                "expected_source_fingerprint": expected_source_fingerprint,
+                "source_fingerprint": actual_fingerprint,
+            }
+
+    try:
+        os.makedirs(draft_dir, exist_ok=True)
+    except OSError as exc:
+        return {
+            "transaction": False,
+            "reason": "invalid_request",
+            "error": f"could not create draft_dir {draft_dir!r}: {exc}",
+        }
+
+    created_drafts: "list[str]" = []
+    steps_applied: "list[dict[str, Any]]" = []
+    src = canonical_path
+
+    for index, step in enumerate(steps):
+        kind = step["kind"]
+        params = step["params"]
+        dest = os.path.join(draft_dir, _transaction_draft_filename(wave_run_id, index, kind))
+        if os.path.normcase(os.path.abspath(dest)) == os.path.normcase(os.path.abspath(canonical_path)):
+            # Astronomically unlikely given the wave_run_id/index/kind-scoped
+            # name, but never silently write over canonical_path.
+            cleanup = _cleanup_transaction_drafts(created_drafts)
+            return {
+                "transaction": False,
+                "reason": "step_failed",
+                "failed_step_index": index,
+                "failed_step_kind": kind,
+                "step_result": {"error": f"computed draft path {dest!r} collides with canonical_path"},
+                "steps_applied": steps_applied,
+                "cleanup": cleanup,
+            }
+
+        result = _run_transaction_step(kind, params, src, dest, wave_run_id)
+        if _transaction_step_failed(kind, result):
+            # 0d62f067 -- roll back EVERY draft this call created so far,
+            # including a partially-written `dest` from THIS failing step
+            # (e.g. a post-write verification failure inside move_section
+            # itself can leave a malformed file at dest even though the
+            # step is being reported as failed) -- never leave an orphaned
+            # staged file behind after a rejected batch.
+            cleanup = _cleanup_transaction_drafts(created_drafts + [dest])
+            return {
+                "transaction": False,
+                "reason": "step_failed",
+                "failed_step_index": index,
+                "failed_step_kind": kind,
+                "step_result": result,
+                "steps_applied": steps_applied,
+                "cleanup": cleanup,
+            }
+
+        created_drafts.append(dest)
+        steps_applied.append({"index": index, "kind": kind, "draft_path": dest})
+        src = dest
+
+    final_draft_path = src
+    merge_result = merge_draft_into_canonical(
+        canonical_path,
+        final_draft_path,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+    if not merge_result.get("merged"):
+        # Every step succeeded, but the single promotion did not. Drop the
+        # now-superseded INTERMEDIATE drafts (steps 0..n-2 are unreachable
+        # once chained forward into the final draft) but keep the final
+        # pre-merge draft on disk -- it is a real, structurally valid
+        # document a caller can still promote via merge_docx_draft once
+        # whatever blocked this merge (a transient render backend issue,
+        # for instance) is resolved, rather than forcing the whole chain
+        # to be redone from canonical_path.
+        intermediate_drafts = created_drafts[:-1]
+        cleanup = _cleanup_transaction_drafts(intermediate_drafts)
+        return {
+            **merge_result,
+            "transaction": False,
+            "reason": "merge_failed",
+            "steps_applied": steps_applied,
+            "final_draft_path": final_draft_path,
+            "cleanup": cleanup,
+        }
+
+    cleanup = {"deleted": [], "failed": []}
+    if cleanup_drafts:
+        cleanup = _cleanup_transaction_drafts(created_drafts)
+
+    return {
+        **merge_result,
+        "transaction": True,
+        "wave_run_id": wave_run_id,
+        "steps_applied": steps_applied,
+        "cleanup": cleanup,
+    }
+
+
+# ---------------------------------------------------------------------------
+# e03b41ef (BE4ED581-W2) -- a hard, fail-closed boundary between PROSE-EDIT
+# packets (4c992e91, directly above) and any packet-shaped operation that
+# touches OMML/equation content.
+#
+# This is INTEGRATION, not reimplementation: every check below composes an
+# already-shipped primitive rather than re-deriving its logic --
+#   * the prose side re-runs the EXACT SAME _prose_packet_structural_error
+#     gate apply_prose_edit_packets itself uses (never a second, possibly-
+#     drifting notion of "is this prose packet well-formed");
+#   * the OMML side validates a candidate raw-OMML payload with the SAME
+#     _validate_omml_structure every equation writer in this module already
+#     calls before touching a document, and cross-checks the operation's
+#     target anchor against audit_equation_integrity's own findings for the
+#     CURRENT on-disk document (never a second structural-integrity walk).
+#
+# Deliberate scope decision (flagged during discovery, confirmed here): this
+# function CLASSIFIES a packet-shaped dict -- it never builds, applies, or
+# persists anything, and it does not introduce a typed, symmetric
+# "OMML edit packet" contract (a build_omml_edit_packet/apply_omml_edit_packets
+# pair mirroring the prose contract). That remains real, unclaimed follow-up
+# work in its own right (see the sprint item's own notes) -- inventing half
+# of that contract here, under a different item's scope, would be exactly
+# the kind of ad hoc reimplementation this module's own conventions warn
+# against. What this function DOES guarantee: given ANY packet-shaped dict,
+# it either (a) confidently recognizes it as belonging to the existing prose
+# contract and re-validates it against that contract's own gate, (b)
+# confidently recognizes it as an OMML-touching operation and validates its
+# payload/target against the existing OMML hardening primitives, or (c)
+# refuses to guess and rejects it. There is no fourth outcome where an
+# ambiguous or mixed-signal packet is silently treated as safe.
+#
+# Recognition rule (deliberately narrow, so nothing is ever misclassified by
+# accident): a packet declaring packet_kind == PROSE_PACKET_KIND is prose;
+# a packet carrying a non-empty string under one of _OMML_PAYLOAD_KEYS is an
+# OMML-touching operation; a packet that is BOTH (mixed signals) or NEITHER
+# (unrecognized) is rejected outright -- this function never falls back to
+# "probably prose" or "probably OMML" on a packet it cannot place with
+# confidence.
+#
+# audit_equation_style's punctuation/alignment findings are intentionally
+# surfaced as INFORMATIONAL "style_findings" on an accepted "omml"
+# classification rather than folded into the reject/accept decision: unlike
+# a structural-integrity finding (evidence the anchor's CURRENT state is
+# already corrupt -- a reason to refuse touching it blind), a pre-existing
+# style finding (misaligned, missing trailing punctuation) on the anchor
+# being edited may be exactly what the caller's operation is trying to fix.
+# Rejecting on style findings would make it impossible to ever classify a
+# legitimate style-correction operation as "omml" -- so they are reported,
+# never used to reject.
+#
+# Round 2 (e03b41ef, BE4ED581-W2 verifier fix): an audit ERRORING OUT
+# (audit_equation_integrity/audit_equation_style returning {"error": ...} --
+# a bad/missing/unreadable document_path, or any other I/O/parse failure) is
+# NOT the same thing as "the audit ran and found nothing." The former means
+# verification never actually happened; treating it as equivalent to a clean
+# audit would silently accept an OMML operation this function could never
+# actually check -- exactly the "can't verify, so must refuse" case this
+# module's fail-closed design is supposed to cover. Both audits erroring
+# reject with CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE, a REASON
+# DISTINCT from CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING on
+# purpose: a caller needs to be able to tell "verification never ran" (retry
+# with a valid document_path, or escalate an infra problem) apart from
+# "verification ran and the anchor is genuinely suspect" (a real content
+# problem, not an availability one).
+# ---------------------------------------------------------------------------
+
+CLASSIFIER_BOUNDARY_PROSE = "prose"
+CLASSIFIER_BOUNDARY_OMML = "omml"
+CLASSIFIER_BOUNDARY_REJECTED = "rejected"
+CLASSIFIER_BOUNDARIES: tuple[str, ...] = (
+    CLASSIFIER_BOUNDARY_PROSE,
+    CLASSIFIER_BOUNDARY_OMML,
+    CLASSIFIER_BOUNDARY_REJECTED,
+)
+
+CLASSIFIER_REASON_NOT_A_DICT = "packet_not_a_dict"
+CLASSIFIER_REASON_PROSE_INVALID = "prose_packet_invalid"
+CLASSIFIER_REASON_MIXED_SIGNALS = "mixed_prose_and_omml_signals"
+CLASSIFIER_REASON_OMML_PAYLOAD_MISSING = "omml_payload_missing"
+CLASSIFIER_REASON_OMML_STRUCTURE_INVALID = "omml_structure_invalid"
+CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING = "omml_target_has_integrity_finding"
+CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE = "omml_integrity_audit_unavailable"
+CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND = "ambiguous_or_unrecognized_packet_kind"
+
+# Recognized field names for a candidate OMML-touching operation's raw
+# "<m:oMath>...</m:oMath>" payload. Kept short and explicit rather than
+# pattern-matched -- a caller must name one of these fields exactly, never
+# guessed at from arbitrary dict shapes.
+_OMML_PAYLOAD_KEYS: tuple[str, ...] = ("omml_payload", "raw_omml")
+
+
+def _classifier_omml_payload_key(packet: "dict[str, Any]") -> "str | None":
+    """The first recognized OMML-payload field NAME present in ``packet``,
+    or ``None`` if the packet carries none of them.
+
+    Checks key PRESENCE (``key in packet``), not the value's truthiness --
+    a packet that explicitly sets ``omml_payload`` to ``""``/``None``/a
+    non-string is still declaring itself an OMML-directed operation, just
+    an invalid one; it must be rejected with
+    :data:`CLASSIFIER_REASON_OMML_PAYLOAD_MISSING` downstream, never fall
+    through to being treated as an unrecognized/ambiguous packet.
+    """
+    for key in _OMML_PAYLOAD_KEYS:
+        if key in packet:
+            return key
+    return None
+
+
+def _classifier_target_para_id(packet: "dict[str, Any]") -> "str | None":
+    """Best-effort target anchor id for an OMML-touching packet, using the
+    SAME field names prose packets already use (``target_para_id`` directly,
+    or ``anchor_query["para_id"]``) -- no new anchor vocabulary is
+    introduced for the OMML side."""
+    target_para_id = packet.get("target_para_id")
+    if isinstance(target_para_id, str) and target_para_id:
+        return target_para_id
+    anchor_query = packet.get("anchor_query")
+    if isinstance(anchor_query, dict):
+        candidate = anchor_query.get("para_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def classify_edit_packet(
+    packet: "dict[str, Any]",
+    *,
+    document_path: "str | None" = None,
+) -> "dict[str, Any]":
+    """Classify one packet-shaped dict onto exactly one side of the
+    prose/OMML boundary, or reject it. Never mutates anything; never builds
+    or applies a packet of either kind.
+
+    Returns ``{"boundary": ..., "reason": ..., ...}`` where ``boundary`` is
+    one of :data:`CLASSIFIER_BOUNDARIES`:
+
+      * ``"prose"`` -- ``packet`` declares ``packet_kind == PROSE_PACKET_KIND``,
+        carries none of :data:`_OMML_PAYLOAD_KEYS`, and passes the SAME
+        :func:`_prose_packet_structural_error` gate
+        :func:`apply_prose_edit_packets` itself re-checks at apply time.
+        ``reason`` is ``None``.
+
+      * ``"omml"`` -- ``packet`` carries a non-empty string under one of
+        :data:`_OMML_PAYLOAD_KEYS`, does NOT also declare
+        ``packet_kind == PROSE_PACKET_KIND``, the payload parses as a
+        structurally valid ``<m:oMath>`` per :func:`_validate_omml_structure`,
+        and -- when both ``document_path`` and a resolvable target anchor
+        (``target_para_id`` or ``anchor_query["para_id"]``) are given --
+        a fresh :func:`audit_equation_integrity` run against
+        ``document_path`` both SUCCEEDS (no ``"error"`` key) and finds no
+        existing finding for that anchor, AND a fresh
+        :func:`audit_equation_style` run against ``document_path`` also
+        succeeds. ``reason`` is ``None``. When ``document_path`` and a
+        target anchor are both available, an additional informational
+        ``style_findings`` list is attached (see module note above: never
+        used to reject). If either audit itself errors, this function
+        rejects with :data:`CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE`
+        instead of falling through to acceptance.
+        This classification is scoped to VALIDATION ONLY -- no typed,
+        build/apply OMML packet contract exists yet; a caller must still
+        route an ``"omml"``-classified operation through
+        :func:`insert_equation_local` / :func:`edit_equation_local` (or a
+        future typed contract), never through the prose writer.
+
+      * ``"rejected"`` -- everything else. ``reason`` is one of:
+
+        - :data:`CLASSIFIER_REASON_NOT_A_DICT` -- ``packet`` is not a dict.
+        - :data:`CLASSIFIER_REASON_MIXED_SIGNALS` -- ``packet`` declares
+          ``packet_kind == PROSE_PACKET_KIND`` AND also carries an OMML
+          payload field -- a single packet may never claim both sides of
+          the boundary at once.
+        - :data:`CLASSIFIER_REASON_PROSE_INVALID` -- declares
+          ``packet_kind == PROSE_PACKET_KIND`` but fails
+          :func:`_prose_packet_structural_error` (includes a prose packet
+          that was itself REFUSED at build time -- e.g. an equation-anchor
+          refusal from :func:`build_prose_edit_packet` -- since a refused
+          packet's own ``status`` is never ``"built"``).
+        - :data:`CLASSIFIER_REASON_OMML_PAYLOAD_MISSING` -- carries a
+          recognized OMML-payload key whose value is not a non-empty
+          string.
+        - :data:`CLASSIFIER_REASON_OMML_STRUCTURE_INVALID` -- the OMML
+          payload fails :func:`_validate_omml_structure` (malformed
+          fraction, ``m:oMathPara`` wrapper, flattened-fallback text with
+          no structural element, ...); ``detail`` carries that validator's
+          own message.
+        - :data:`CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING` --
+          the operation's target anchor already carries one or more
+          unresolved :func:`audit_equation_integrity` findings; refusing to
+          route a new OMML operation at an anchor whose current state is
+          already known to be structurally suspect (``findings`` carries
+          the matched finding dicts).
+        - :data:`CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE` --
+          :func:`audit_equation_integrity` or :func:`audit_equation_style`
+          itself returned ``{"error": ...}`` for ``document_path`` (bad,
+          missing, or unreadable path; any I/O/parse failure) while
+          checking the target anchor -- verification could not run at all,
+          so this is refused rather than silently treated as "audit found
+          nothing." Distinct from
+          ``CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING`` above: this
+          reason means the check never ran; that one means it ran and found
+          a real problem. ``detail`` carries the underlying audit's own
+          error message; ``audit_error`` carries it unwrapped.
+        - :data:`CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND` -- ``packet`` is
+          neither a recognizable prose packet nor carries an OMML payload
+          field; this function never guesses, so an unrecognized shape is
+          always rejected rather than defaulted to either side.
+    """
+    if not isinstance(packet, dict):
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_NOT_A_DICT,
+            "detail": f"packet must be a dict, got {type(packet).__name__}",
+        }
+
+    omml_payload_key = _classifier_omml_payload_key(packet)
+    is_prose_kind = packet.get("packet_kind") == PROSE_PACKET_KIND
+
+    if is_prose_kind and omml_payload_key is not None:
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_MIXED_SIGNALS,
+            "detail": (
+                f"packet declares packet_kind={PROSE_PACKET_KIND!r} but also "
+                f"carries a raw OMML payload under {omml_payload_key!r} -- a "
+                "single packet may never claim to be both prose and OMML; "
+                "refusing rather than guessing which side is authoritative"
+            ),
+        }
+
+    if is_prose_kind:
+        structural_error = _prose_packet_structural_error(packet)
+        if structural_error:
+            return {
+                "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                "reason": CLASSIFIER_REASON_PROSE_INVALID,
+                "detail": structural_error,
+            }
+        return {"boundary": CLASSIFIER_BOUNDARY_PROSE, "reason": None}
+
+    if omml_payload_key is None:
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND,
+            "detail": (
+                f"packet_kind={packet.get('packet_kind')!r} is not "
+                f"{PROSE_PACKET_KIND!r} and the packet carries none of "
+                f"{_OMML_PAYLOAD_KEYS!r} -- cannot confidently place this "
+                "packet on either side of the prose/OMML boundary, so it "
+                "is rejected rather than guessed at"
+            ),
+        }
+
+    omml_payload = packet.get(omml_payload_key)
+    if not isinstance(omml_payload, str) or not omml_payload.strip():
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_OMML_PAYLOAD_MISSING,
+            "detail": f"packet[{omml_payload_key!r}] must be a non-empty OMML XML string",
+        }
+
+    try:
+        _validate_omml_structure(omml_payload)
+    except ValueError as exc:
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_OMML_STRUCTURE_INVALID,
+            "detail": str(exc),
+        }
+
+    target_para_id = _classifier_target_para_id(packet)
+    style_findings: "list[dict[str, Any]]" = []
+
+    if document_path and target_para_id:
+        integrity = audit_equation_integrity(document_path)
+        if "error" in integrity:
+            return {
+                "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                "reason": CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE,
+                "detail": (
+                    f"audit_equation_integrity(document_path) could not run "
+                    f"against {document_path!r} to check target anchor "
+                    f"{target_para_id!r} before allowing this OMML operation "
+                    f"({integrity['error']!r}) -- refusing rather than "
+                    "treating an unauditable document as clean"
+                ),
+                "audit_error": integrity["error"],
+            }
+
+        matching = [
+            finding
+            for finding in integrity.get("findings", [])
+            if finding.get("anchor") == target_para_id
+            or target_para_id in (finding.get("anchors") or [])
+        ]
+        if matching:
+            return {
+                "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                "reason": CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING,
+                "detail": (
+                    f"target anchor {target_para_id!r} already carries "
+                    f"{len(matching)} unresolved equation-integrity "
+                    "finding(s) -- refusing to route a new OMML "
+                    "operation at an anchor whose current state is "
+                    "already known to be structurally suspect"
+                ),
+                "findings": matching,
+            }
+
+        style_audit = audit_equation_style(document_path)
+        if "error" in style_audit:
+            return {
+                "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                "reason": CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE,
+                "detail": (
+                    f"audit_equation_style(document_path) could not run "
+                    f"against {document_path!r} to check target anchor "
+                    f"{target_para_id!r} before allowing this OMML operation "
+                    f"({style_audit['error']!r}) -- refusing rather than "
+                    "treating an unauditable document as clean"
+                ),
+                "audit_error": style_audit["error"],
+            }
+        style_findings = [
+            finding
+            for finding in style_audit.get("findings", [])
+            if finding.get("para_id") == target_para_id
+        ]
+
+    result: "dict[str, Any]" = {"boundary": CLASSIFIER_BOUNDARY_OMML, "reason": None}
+    if document_path and target_para_id:
+        result["style_findings"] = style_findings
+    return result
+
+
+def classify_edit_packet_batch(
+    packets: "list[dict[str, Any]]",
+    *,
+    document_path: "str | None" = None,
+) -> "list[dict[str, Any]]":
+    """Classify every packet in ``packets`` independently via
+    :func:`classify_edit_packet`, returning one result per packet (index
+    preserved via an added ``"index"`` key on each result).
+
+    Deliberately a thin per-item map, not a batch-transaction primitive: a
+    caller must not read "some packets classified as prose" as license to
+    silently drop or auto-degrade an OMML-classified or rejected packet
+    elsewhere in the same batch -- each entry's own ``boundary``/``reason``
+    is the complete, independent verdict for that one packet. In
+    particular, a batch mixing a valid prose packet with an OMML-touching
+    operation always reports BOTH verdicts; the prose packet's success
+    never suppresses or masks the OMML packet's own result.
+    """
+    return [
+        {"index": index, **classify_edit_packet(packet, document_path=document_path)}
+        for index, packet in enumerate(packets)
+    ]
 
 
 # ---------------------------------------------------------------------------

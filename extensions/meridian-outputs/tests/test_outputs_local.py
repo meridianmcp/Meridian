@@ -16,6 +16,7 @@ Covers:
 """
 from __future__ import annotations
 
+import builtins
 import contextlib
 import hashlib
 import io
@@ -1074,6 +1075,45 @@ class TestFileFingerprint:
         assert fp.kind == "text_content"
         assert fp.csv_columns is None
 
+    def test_extract_json_skips_parse_when_truncated(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): text at/above _MAX_CONTENT_CHARS is a
+        very likely truncated fragment (missing its closing brackets) --
+        json.loads() must not even be attempted, since it would guarantee a
+        full-buffer parse failure for a large JSON file the content cap cut
+        off mid-structure."""
+        truncated_text = "x" * OL._MAX_CONTENT_CHARS
+
+        def _boom(*_a: object, **_kw: object) -> None:
+            raise AssertionError("json.loads should not be called for truncated text")
+
+        monkeypatch.setattr(OL.json, "loads", _boom)
+        keys, _script = OL._extract_json(truncated_text)
+        assert keys is None
+
+    def test_extract_json_still_parses_when_not_truncated(self) -> None:
+        keys, _script = OL._extract_json('{"alpha": 1}')
+        assert keys == ["alpha"]
+
+    def test_non_json_text_suffix_skips_json_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): only a literal .json suffix should
+        ever reach _extract_json -- the other _TEXT_CONTENT_SUFFIXES
+        entries (.txt/.md/.log/.r/.qmd/.rmd/.sty/.yml/.yaml) are not JSON,
+        and attempting json.loads() on them is a guaranteed-useless parse."""
+        f = tmp_path / "notes.txt"
+        f.write_text("plain text notes, not json", encoding="utf-8")
+
+        def _boom(*_a: object, **_kw: object) -> None:
+            raise AssertionError("json.loads should not be attempted for a .txt file")
+
+        monkeypatch.setattr(OL.json, "loads", _boom)
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "text_content"
+        assert fp.json_keys is None
+
 
 # ---------------------------------------------------------------------------
 # PDF body-content indexing (sprint item aa423c7e)
@@ -1539,6 +1579,98 @@ class TestOutputsFtsIndex:
             idx.close()
 
     @duckdb_required
+    def test_ingest_meridian_notes_respects_deadline(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up: _ingest_meridian_notes is now called with
+        `newly_seen` (this call's own walk discoveries) instead of the whole
+        corpus's `all_paths`, so -- like every other per-file Phase 1/2 loop
+        in rebuild() -- it must be deadline-aware: a huge cold `newly_seen`
+        batch must not be able to consume the entire rebuild() budget before
+        Phase 2 (_apply_precomputed) gets a chance to run at all."""
+        notes_path = str(tmp_path / OL.MERIDIAN_NOTES_FILENAME)
+        (tmp_path / OL.MERIDIAN_NOTES_FILENAME).write_text("hello", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            already_expired = time.monotonic() - 1.0
+            assert idx._ingest_meridian_notes([notes_path], already_expired) == 0
+            assert idx._ingest_meridian_notes([notes_path], time.monotonic() + 60) == 1
+            # No deadline (the default) behaves exactly as before this fix.
+            (tmp_path / "sub").mkdir()
+            other_notes = tmp_path / "sub" / OL.MERIDIAN_NOTES_FILENAME
+            other_notes.write_text("world", encoding="utf-8")
+            assert idx._ingest_meridian_notes([str(other_notes)]) == 1
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_rebuild_records_notes_ingest_seconds_metric(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up: notes ingestion now has its own timed metric
+        (mirroring legacy_migration_seconds/apply_precomputed_seconds right
+        next to it), so previously-unaccounted time in Phase 2's write block
+        is directly attributable rather than silently folded into whatever
+        metric happened to be timed next."""
+        (tmp_path / OL.MERIDIAN_NOTES_FILENAME).write_text("hello", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert "notes_ingest_seconds" in idx.last_rebuild_metrics
+            assert idx.last_rebuild_metrics["notes_ingest_seconds"] >= 0
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_rebuild_ingests_notes_once_not_every_call_mid_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up: the old call rescanned the cumulative
+        `all_paths` (every file discovered so far THIS walk pass,
+        re-derived fresh on every call) to find MERIDIAN_NOTES.md, so an
+        already-ingested, unchanged notes file got re-read and
+        re-annotated on EVERY subsequent call of the same still-in-progress
+        pass -- confirmed to cost real unaccounted time on a 385K-file
+        tree. Scoping to `newly_seen` means a given file is only
+        (re-)ingested on the call that actually (re-)discovers it."""
+        (tmp_path / OL.MERIDIAN_NOTES_FILENAME).write_text("note", encoding="utf-8")
+        for i in range(20):
+            (tmp_path / f"zzz_filler_{i:03d}.csv").write_text("a\n1", encoding="utf-8")
+
+        TestRebuildWalkDeadlineAwareness._install_slow_walk(monkeypatch, 0.05)
+
+        captured: list[list[str]] = []
+        real_ingest = OL.OutputsFtsIndex._ingest_meridian_notes
+
+        def spy(self: Any, paths: list[str], deadline: Any = None) -> int:
+            captured.append(list(paths))
+            return real_ingest(self, paths, deadline)
+
+        monkeypatch.setattr(OL.OutputsFtsIndex, "_ingest_meridian_notes", spy)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            for _ in range(15):
+                idx.rebuild(max_seconds=0.15)
+                if idx.last_rebuild_metrics.get("walk_complete"):
+                    break
+            assert len(captured) >= 2, (
+                "expected the slow walk to force this pass across multiple "
+                f"rebuild() calls, only got {len(captured)}"
+            )
+            calls_seeing_notes = sum(
+                1 for paths in captured
+                if any(
+                    os.path.basename(p) == OL.MERIDIAN_NOTES_FILENAME for p in paths
+                )
+            )
+            assert calls_seeing_notes == 1, (
+                "expected the notes file to land in exactly one call's "
+                f"newly_seen batch, got {calls_seeing_notes} of {len(captured)} calls"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
     def test_incremental_rebuild(self, tmp_path: Path) -> None:
         f = tmp_path / "data.json"
         f.write_text('{"key": "value1"}', encoding="utf-8")
@@ -1553,6 +1685,26 @@ class TestOutputsFtsIndex:
         count3 = idx.rebuild()
         assert count3 == 1
         idx.close()
+
+    @duckdb_required
+    def test_apply_precomputed_returns_int_count_not_row_list(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up (perf): _apply_precomputed used to build a
+        full list[OutputRow] (every all_paths entry present in
+        _row_cache) purely to hand the caller a len() -- confirmed unused
+        for anything else, while an unused `path_set` parameter sat right
+        there instead. Returns a plain int count now."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            count = idx.rebuild()
+            assert count == 2
+            assert idx.last_rebuild_metrics["rows_returned"] == 2
+            assert isinstance(idx.last_rebuild_metrics["rows_returned"], int)
+        finally:
+            idx.close()
 
     @duckdb_required
     def test_empty_query_returns_empty(self, tmp_path: Path) -> None:
@@ -1757,6 +1909,76 @@ class TestRowCacheContentEviction:
             assert "x" * 100 in content
         finally:
             idx2.close()
+
+    @duckdb_required
+    def test_rehydrate_from_disk_is_chunked_across_multiple_batches(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up: _rehydrate_cache_from_disk() must fetch via
+        cursor.fetchmany() in bounded chunks (mirroring
+        _migrate_legacy_storage_paths_locked's own established pattern),
+        not one unchunked fetchall() -- a real live reconnect to a
+        ~98,304-row/2.85GB index spent multiple I/O-bound minutes and one
+        large ~2.3GB one-step memory jump on this before the fix. Forces a
+        tiny adaptive-batch size so a small, fast-to-build dataset still
+        spans several fetchmany() chunks, and asserts every row survives
+        the chunk boundaries with no loss or duplication."""
+        n = 47  # deliberately not a clean multiple of the forced batch size
+        for i in range(n):
+            (tmp_path / f"r{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        # An external db_path (outside outputs_dir) avoids the indexer's own
+        # ensure_gitignored() writing a .gitignore INTO outputs_dir, which
+        # would otherwise get walked and counted as an unexpected extra file.
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-chunked.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild(max_seconds=None)
+        assert len(idx1._row_cache) == n
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx2._adaptive_batch = 5  # forces >1 fetchmany() chunk for n=47
+            idx2._connect()  # first connect already calls _rehydrate_cache_from_disk once
+            idx2._row_cache.clear()
+            idx2._manifest.clear()
+            # Re-run directly (connection already open) so the chunk size
+            # override above is what governs this call -- verifies the
+            # OUTCOME (no loss/duplication across fetchmany() boundaries),
+            # which is the property that would actually regress if
+            # chunking were implemented incorrectly.
+            idx2._rehydrate_cache_from_disk()
+            assert len(idx2._row_cache) == n, (
+                "chunked rehydration lost or duplicated rows across "
+                "fetchmany() batch boundaries"
+            )
+            assert len(idx2._manifest) == n
+            for i in range(n):
+                key = next(
+                    p for p in idx2._row_cache if p.endswith(f"r{i:03d}.csv")
+                )
+                assert idx2._row_cache[key].content is None
+                assert idx2._row_cache[key].sha256 is not None
+        finally:
+            idx2.close()
+
+    def test_light_row_returns_independent_copy(self) -> None:
+        """fa600e42 follow-up (perf): _light_row switched from
+        dataclasses.replace() to copy.copy()+attribute-set (replace() calls
+        dataclasses.fields()/getattr() on all 11 fields to rebuild a kwargs
+        dict for a full __init__ call, once per stale/new row every
+        rebuild()) -- must still return a genuinely independent object, not
+        the same instance or a shallow alias that leaks mutations back."""
+        original = OL.OutputRow(
+            path="/a/b.csv", content="body text", mtime=1.0, sha256="abc",
+            size=10, generating_script=None,
+        )
+        light = OL._light_row(original)
+        assert light is not original
+        assert light.content is None
+        assert original.content == "body text"
+        light.is_archival = True
+        assert original.is_archival is False
 
 
 # ---------------------------------------------------------------------------
@@ -2718,6 +2940,98 @@ class TestAnalyseFile:
             assert a.fingerprint.csv_columns is not None
             assert expected_col in a.fingerprint.csv_columns
 
+    def test_large_file_streams_instead_of_single_unbounded_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf/memory): the fast path used to read a
+        whole file into one in-memory buffer (`fh.read()`, no size arg)
+        regardless of size, reproducing the same per-item memory-spike
+        class that caused a real MemoryError crash in this project's own
+        B1 baseline (large clustered files, unbounded per-item reads).
+        Above `_LARGE_FILE_STREAM_THRESHOLD_BYTES`, _analyse_file must take
+        the streaming fallback path instead (`_sha256_file`/`_xxh3_file`
+        already chunk-read in bounded pieces) -- verified here by asserting
+        every `.read()` call against the large file passed an explicit
+        chunk size, never an unbounded `fh.read()`."""
+        monkeypatch.setattr(OL, "_LARGE_FILE_STREAM_THRESHOLD_BYTES", 100)
+        f = tmp_path / "big.bin"
+        content = b"x" * 1000
+        f.write_bytes(content)
+
+        real_open = builtins.open
+        read_calls: list[tuple[Any, ...]] = []
+
+        def spy_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+            fh = real_open(path, *args, **kwargs)
+            if os.fspath(path) == str(f):
+                real_read = fh.read
+
+                def spy_read(*a: Any, **kw: Any) -> Any:
+                    read_calls.append(a)
+                    return real_read(*a, **kw)
+
+                fh.read = spy_read
+            return fh
+
+        monkeypatch.setattr(OL, "open", spy_open, raising=False)
+        analysis = OL._analyse_file(str(f), OL._sha256_file)
+        assert analysis.sha256 == hashlib.sha256(content).hexdigest()
+        assert read_calls, "expected at least one read() call against the large file"
+        assert all(a for a in read_calls), (
+            f"expected only bounded, explicit-size read() calls, got: {read_calls!r}"
+        )
+
+    def test_small_file_still_uses_fast_single_read_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Companion to the large-file streaming test: a file at or below
+        the threshold must still take the single-read fast path (an
+        unbounded `fh.read()`), so the streaming fix doesn't regress the
+        documented common-case performance win (e1fd4182)."""
+        monkeypatch.setattr(OL, "_LARGE_FILE_STREAM_THRESHOLD_BYTES", 100)
+        f = tmp_path / "small.bin"
+        content = b"y" * 50
+        f.write_bytes(content)
+
+        real_open = builtins.open
+        read_calls: list[tuple[Any, ...]] = []
+
+        def spy_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+            fh = real_open(path, *args, **kwargs)
+            if os.fspath(path) == str(f):
+                real_read = fh.read
+
+                def spy_read(*a: Any, **kw: Any) -> Any:
+                    read_calls.append(a)
+                    return real_read(*a, **kw)
+
+                fh.read = spy_read
+            return fh
+
+        monkeypatch.setattr(OL, "open", spy_open, raising=False)
+        analysis = OL._analyse_file(str(f), OL._sha256_file)
+        assert analysis.sha256 == hashlib.sha256(content).hexdigest()
+        assert any(not a for a in read_calls), (
+            f"expected an unbounded fh.read() call on the fast path, got: {read_calls!r}"
+        )
+
+    def test_fast_path_non_json_text_suffix_skips_json_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): mirrors file_fingerprint's matching
+        fix -- the fast path must also route only a literal .json suffix
+        through _extract_json, not every non-CSV text_content suffix."""
+        f = tmp_path / "readme.md"
+        f.write_text("# Notes\nplain markdown, not json", encoding="utf-8")
+
+        def _boom(*_a: object, **_kw: object) -> None:
+            raise AssertionError("json.loads should not be attempted for a .md file")
+
+        monkeypatch.setattr(OL.json, "loads", _boom)
+        analysis = OL._analyse_file(str(f), OL._sha256_file)
+        assert analysis.fingerprint.kind == "text_content"
+        assert analysis.fingerprint.json_keys is None
+
 
 @duckdb_required
 class TestParallelRebuildCorrectness:
@@ -2904,6 +3218,19 @@ class TestParallelRebuildCorrectness:
 
         repaired = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
         try:
+            # fa600e42 follow-up -- the legacy-migration-scan throttle state
+            # now persists across process restarts (see
+            # TestLegacyMigrationScanSurvivesRestart), so `first`'s own
+            # clean scan already persisted "scanned, found nothing" before
+            # this out-of-band duplicate was inserted directly via duckdb
+            # above. A real fresh-DB-or-past-its-recheck-interval instance
+            # would still scan; force that same condition explicitly here
+            # rather than relying on `repaired` merely being a new object.
+            # connect() FIRST (so rehydration -- which would otherwise
+            # immediately reload and overwrite this override -- has already
+            # happened), THEN override.
+            repaired._connect()
+            repaired._legacy_migration_ever_scanned = False
             assert repaired.rebuild() == 1
             rows = repaired._con.execute(
                 "SELECT path FROM outputs_index"
@@ -3318,6 +3645,416 @@ class TestLegacyMigrationThrottle:
             idx.close()
 
 
+class TestLegacyMigrationScanSurvivesRestart:
+    """fa600e42 follow-up: the legacy-migration-scan throttle state must
+    persist across process restarts, the same shape of fix already applied
+    to the resumable file walk.
+
+    Confirmed live (2026-09-03): _legacy_migration_ever_scanned was a plain
+    in-memory flag with constructor default False and no persistence, so
+    EVERY freshly-constructed OutputsFtsIndex -- including one from a
+    periodic-restart harness reconnecting to an index a prior process had
+    already fully migration-scanned seconds earlier -- unconditionally ran
+    a full O(total indexed rows) table scan on its first rebuild() call.
+    This forced that scan onto literally every restart, growing more
+    expensive as the index grows, never reaching the intended
+    once-per-25-calls steady state.
+    """
+
+    @duckdb_required
+    def test_second_instance_does_not_rescan_after_clean_first_scan(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-persist.duckdb")
+
+        first = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            first.rebuild()
+            assert first._legacy_migration_ever_scanned is True
+            assert first._legacy_migration_found_last_time is False
+        finally:
+            first.close()
+
+        second = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            # The core regression: without the fix, a brand-new instance's
+            # _legacy_migration_ever_scanned starts at the constructor
+            # default (False), forcing run_legacy_migration True on this
+            # call regardless of what `first` already confirmed. With the
+            # fix, rehydration restores the persisted "already scanned,
+            # found nothing" state before the throttle decision runs, so
+            # this call does NOT re-trigger the full-table scan.
+            scan_called = False
+            real_migrate = second._migrate_legacy_storage_paths_locked
+
+            def _tracking_migrate(con):
+                nonlocal scan_called
+                scan_called = True
+                return real_migrate(con)
+
+            second._migrate_legacy_storage_paths_locked = _tracking_migrate
+            second.rebuild()
+            assert scan_called is False, (
+                "second instance re-ran the legacy-migration scan despite "
+                "the first instance already persisting a clean scan"
+            )
+            assert second._legacy_migration_ever_scanned is True
+        finally:
+            second.close()
+
+    @duckdb_required
+    def test_persisted_calls_since_scan_continues_counting_across_restart(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-counter.duckdb")
+        interval = OL.OutputsFtsIndex._LEGACY_MIGRATION_RECHECK_INTERVAL
+
+        first = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            first.rebuild()
+            # Advance most, but not all, of the way through the recheck
+            # interval in the FIRST process.
+            for _ in range(interval - 2):
+                first.rebuild()
+            assert first._legacy_migration_calls_since_scan == interval - 2
+        finally:
+            first.close()
+
+        second = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            # Restart resumes the counter from where it left off (interval
+            # - 2), not from zero -- confirmed via _connect() (which
+            # triggers rehydration) before rebuild() would otherwise
+            # advance it.
+            second._connect()
+            assert second._legacy_migration_calls_since_scan == interval - 2
+            # One call short of the threshold: no scan yet.
+            second.rebuild()
+            assert second._legacy_migration_calls_since_scan == interval - 1
+            # Force the pre-check value to the threshold directly (matching
+            # TestLegacyMigrationThrottle's own precise-count style) and
+            # confirm crossing it still re-triggers a scan and resets the
+            # counter -- i.e. persistence didn't just freeze the old
+            # in-memory throttle behavior, it correctly continues it.
+            second._legacy_migration_calls_since_scan = interval
+            second.rebuild()
+            assert second._legacy_migration_calls_since_scan == 0
+        finally:
+            second.close()
+
+    @duckdb_required
+    def test_brand_new_db_still_scans_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        """No persisted state yet (a genuinely fresh DB) must behave
+        exactly as before this fix -- degrade gracefully, not silently skip
+        the one-time first-scan concern this whole mechanism exists for."""
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-fresh.duckdb")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            scan_called = False
+            real_migrate = idx._migrate_legacy_storage_paths_locked
+
+            def _tracking_migrate(con):
+                nonlocal scan_called
+                scan_called = True
+                return real_migrate(con)
+
+            idx._migrate_legacy_storage_paths_locked = _tracking_migrate
+            idx.rebuild()
+            assert scan_called is True
+        finally:
+            idx.close()
+
+
+class TestWriteSecondsSubMetrics:
+    """fa600e42 follow-up (write_seconds diagnostics): write_seconds is a
+    wall-clock umbrella over legacy-migration-scan, apply_precomputed, the
+    DB insert itself, and walk-state persist -- previously indistinguishable
+    from each other, which made a real live discrepancy (write_seconds
+    running 13-50x slower per row than an isolated pyarrow bulk-insert
+    benchmark) impossible to attribute without guessing. These sub-metrics
+    make each piece separately visible."""
+
+    @duckdb_required
+    def test_sub_metrics_present_and_sum_close_to_write_seconds(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            for key in (
+                "legacy_migration_seconds", "apply_precomputed_seconds",
+                "db_insert_seconds", "walk_state_persist_seconds",
+                "write_seconds",
+            ):
+                assert key in m, f"{key} missing from last_rebuild_metrics"
+                assert m[key] >= 0
+            # These four are all sub-windows of write_seconds's own timed
+            # span (not necessarily exhaustive -- Tantivy staging/commit and
+            # other small steps fill the remainder) -- they must never sum
+            # to MORE than the umbrella itself.
+            sub_total = (
+                m["legacy_migration_seconds"] + m["apply_precomputed_seconds"]
+                + m["db_insert_seconds"] + m["walk_state_persist_seconds"]
+            )
+            assert sub_total <= m["write_seconds"] + 1e-3
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_bulk_insert_path_recorded_as_pyarrow_when_available(
+        self, tmp_path: Path,
+    ) -> None:
+        pytest.importorskip("pyarrow")
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["bulk_insert_path"] == "pyarrow"
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_bulk_insert_path_recorded_as_fallback_when_pyarrow_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert (
+                idx.last_rebuild_metrics["bulk_insert_path"]
+                == "values_fallback"
+            )
+            assert idx._pyarrow_missing_warned is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_db_insert_marshal_and_engine_sub_metrics_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up (perf): db_insert_seconds used to start its
+        timer before the Arrow table was even built, conflating pure-Python
+        marshalling (list building + json.dumps) with real DuckDB engine
+        time -- biasing any future insert-mechanism A/B. These two new
+        sub-metrics separate them; db_insert_seconds itself is unchanged."""
+        pytest.importorskip("pyarrow")
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            assert m["bulk_insert_path"] == "pyarrow"
+            assert "db_insert_marshal_seconds" in m
+            assert "db_insert_engine_seconds" in m
+            assert m["db_insert_marshal_seconds"] >= 0
+            assert m["db_insert_engine_seconds"] >= 0
+            assert (
+                m["db_insert_marshal_seconds"] + m["db_insert_engine_seconds"]
+                <= m["db_insert_seconds"] + 1e-3
+            )
+        finally:
+            idx.close()
+
+    def test_db_insert_setup_and_commit_sub_metrics_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up (perf diagnostics): a real, disclosed
+        db_insert_seconds change (2.343s -> 2.735s) between two live runs
+        left a ~1s gap unattributable to marshal+engine alone -- COMMIT
+        (where DuckDB unconditionally fsyncs the WAL) ran entirely outside
+        every existing sub-timer, and BEGIN TRANSACTION/the delete-chunk
+        loop/`import pyarrow` had no timer either. These two new metrics
+        (setup = everything before marshal starts; commit = the COMMIT
+        call itself) make the full db_insert_seconds window self-accounting."""
+        pytest.importorskip("pyarrow")
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            assert m["bulk_insert_path"] == "pyarrow"
+            assert "db_insert_setup_seconds" in m
+            assert "db_insert_commit_seconds" in m
+            assert m["db_insert_setup_seconds"] >= 0
+            assert m["db_insert_commit_seconds"] >= 0
+            # Every sub-window together must never exceed the umbrella.
+            sub_total = (
+                m["db_insert_setup_seconds"] + m["db_insert_marshal_seconds"]
+                + m["db_insert_engine_seconds"] + m["db_insert_commit_seconds"]
+            )
+            assert sub_total <= m["db_insert_seconds"] + 1e-3
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_files_hash_needed_and_skipped_metrics(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up (perf diagnostics): the size-uniqueness
+        prefilter's own validation (e1fd4182) was a 420-file tree with 95%
+        unique sizes -- whether that assumption holds on any given real
+        corpus was previously unanswerable from last_rebuild_metrics alone.
+        Two files of the SAME size must both need a real hash (to tell them
+        apart); a lone uniquely-sized file must be skippable."""
+        (tmp_path / "a.bin").write_bytes(b"x" * 100)
+        (tmp_path / "b.bin").write_bytes(b"y" * 100)  # same size as a.bin
+        (tmp_path / "unique.bin").write_bytes(b"z" * 999)  # unique size
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            assert m["files_hash_needed"] == 2
+            assert m["files_hash_skipped"] == 1
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_files_hash_needed_and_skipped_present_when_nothing_stale(
+        self, tmp_path: Path,
+    ) -> None:
+        """The counters must exist (as 0) even on a call with nothing to
+        analyse, not only when `stale` is non-empty."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            assert m["files_hash_needed"] == 0
+            assert m["files_hash_skipped"] == 0
+        finally:
+            idx.close()
+
+    @staticmethod
+    def _install_execute_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Wrap real duckdb.connect() so every SQL string executed through
+        it is captured, in order, while still running against a real
+        in-process DuckDB connection underneath."""
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _ExecuteSpyCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
+        )
+        return captured
+
+    @duckdb_required
+    def test_db_write_wrapped_in_explicit_transaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): DuckDB's own INSERT docs warn that
+        autocommitted statements in a loop each pay their own fsync --
+        the whole delete+insert sequence must run inside one explicit
+        BEGIN TRANSACTION/COMMIT, matching the pattern
+        _migrate_legacy_storage_paths_locked already uses elsewhere in
+        this same class."""
+        captured = self._install_execute_spy(monkeypatch)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+        finally:
+            idx.close()
+        assert "BEGIN TRANSACTION" in captured
+        assert "COMMIT" in captured
+        begin_idx = captured.index("BEGIN TRANSACTION")
+        commit_idx = captured.index("COMMIT")
+        insert_idx = next(
+            i for i, sql in enumerate(captured)
+            if "INSERT OR REPLACE INTO outputs_index" in sql
+        )
+        assert begin_idx < insert_idx < commit_idx
+
+    @duckdb_required
+    def test_bulk_insert_select_has_order_by_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): DuckDB issue #11275 -- INSERT OR
+        REPLACE against an already-populated PRIMARY KEY table measured
+        3.7x-7.8x slower when the incoming batch isn't sorted by the
+        conflict key. This connection runs with
+        preserve_insertion_order=false (a deliberate, unrelated
+        OOM-avoidance setting), which per DuckDB's own Order Preservation
+        docs means a no-ORDER-BY SELECT may be silently re-ordered before
+        the upsert ever sees it, discarding new_rows' own upstream sort."""
+        pytest.importorskip("pyarrow")
+        captured = self._install_execute_spy(monkeypatch)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+        finally:
+            idx.close()
+        insert_sql = next(
+            sql for sql in captured if "INSERT OR REPLACE INTO outputs_index" in sql
+        )
+        assert "ORDER BY path" in insert_sql
+
+    @duckdb_required
+    def test_db_write_failure_rolls_back_transaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): a failure partway through the
+        delete/insert sequence must roll back the new explicit transaction
+        (not leave the connection sitting mid-transaction for the next
+        rebuild() call) and still surface via the existing
+        last_db_write_error contract -- rebuild() itself must not raise."""
+        pytest.importorskip("pyarrow")
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _FailingInsertCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                if sql.startswith("INSERT OR REPLACE INTO outputs_index"):
+                    raise RuntimeError("boom")
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect",
+            lambda *a, **kw: _FailingInsertCon(real_connect(*a, **kw)),
+        )
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.last_db_write_error is not None
+            assert "boom" in idx.last_db_write_error
+            assert "ROLLBACK" in captured
+        finally:
+            idx.close()
+
+
 # ---------------------------------------------------------------------------
 # rebuild() Phase 1 deadline enforcement (sprint item d9c76caa)
 # ---------------------------------------------------------------------------
@@ -3540,6 +4277,291 @@ class TestResumableFileWalkDeadlineAwareness:
         assert walk.drain(None) == []
 
 
+class TestResumeAfterCrossProcess:
+    """fa600e42 follow-up: a fresh _ResumableFileWalk/OutputsFtsIndex must be
+    able to pick up where a PRIOR process's walk left off (via a persisted
+    scan boundary), instead of always re-walking the tree from the top.
+
+    Confirmed live (2026-09-03): a periodic-restart harness that reconstructs
+    OutputsFtsIndex against the same db_path/outputs_dir every N calls made
+    literally zero net forward progress past whatever a single process's own
+    call budget could reach -- 8+ consecutive segments each rediscovered the
+    exact same already-indexed files (rows_changed=0) and never advanced,
+    because _scan_boundary was tracked for convergence REPORTING only and
+    never fed back into a freshly-constructed walk to skip already-covered
+    ground.
+    """
+
+    def test_walk_safe_output_files_resume_after_skips_covered_ground(
+        self, tmp_path: Path,
+    ) -> None:
+        names = [f"f{i:03d}.csv" for i in range(20)]
+        for name in names:
+            (tmp_path / name).write_text("col\n1", encoding="utf-8")
+        full = sorted(OL._iter_safe_output_files(str(tmp_path)))
+        boundary = full[9]  # simulate a prior pass that got exactly halfway
+        resumed = list(
+            OL._walk_safe_output_files(str(tmp_path), resume_after=boundary)
+        )
+        assert sorted(resumed) == full[10:]
+
+    def test_walk_safe_output_files_resume_after_prunes_earlier_subdirs(
+        self, tmp_path: Path,
+    ) -> None:
+        # Subdirectories sorting entirely before the boundary must be
+        # skipped WITHOUT being scandir()'d at all -- not merely filtered
+        # out of their yielded results.
+        (tmp_path / "aaa_early").mkdir()
+        (tmp_path / "aaa_early" / "x.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "mid.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "zzz_late").mkdir()
+        (tmp_path / "zzz_late" / "y.csv").write_text("col\n1", encoding="utf-8")
+
+        scanned_dirs: list[str] = []
+        real_scandir = os.scandir
+
+        def _tracking_scandir(path):  # noqa: ANN001
+            scanned_dirs.append(os.fspath(path))
+            return real_scandir(path)
+
+        boundary = str(tmp_path / "mid.csv")
+        with patch("os.scandir", side_effect=_tracking_scandir):
+            resumed = list(
+                OL._walk_safe_output_files(str(tmp_path), resume_after=boundary)
+            )
+        assert resumed == [str(tmp_path / "zzz_late" / "y.csv")]
+        assert not any(
+            "aaa_early" in d for d in scanned_dirs
+        ), f"pruned subtree was scandir()'d anyway: {scanned_dirs!r}"
+
+    def test_resumable_file_walk_resume_after_matches_direct_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        for i in range(15):
+            (tmp_path / f"h{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        full = sorted(OL._iter_safe_output_files(str(tmp_path)))
+        boundary = full[6]
+        walk = OL._ResumableFileWalk(str(tmp_path), resume_after=boundary)
+        chunk = walk.drain(None)
+        assert sorted(chunk) == full[7:]
+
+    def test_outputsftsindex_second_instance_resumes_past_first_boundary(
+        self, tmp_path: Path,
+    ) -> None:
+        """End-to-end simulation of the actual periodic-restart bug: two
+        SEPARATE OutputsFtsIndex instances against the same db_path/
+        outputs_dir (simulating a process restart), the second seeded with
+        the first's _scan_boundary via initial_scan_boundary. The second
+        instance's walk must reach genuinely new ground, not rediscover
+        what the first already covered."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(40):
+            (outputs_dir / f"r{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        # Force a partial pass: cap the walk so it stops partway through
+        # the tree, mirroring one periodic-restart segment's own budget.
+        idx1._max_batch = 10
+        idx1.rebuild(max_seconds=30.0)
+        boundary = idx1._scan_boundary
+        assert boundary is not None, "first instance's pass should still be in progress"
+        first_total = len(idx1._row_cache)
+        assert 0 < first_total < 40, "first instance should have made partial, not full, progress"
+        idx1.close()
+
+        # Simulate the restart: a genuinely NEW instance against the same
+        # db_path, seeded with the boundary the (now-gone) prior process's
+        # walk had reached.
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path, initial_scan_boundary=boundary,
+        )
+        idx2._max_batch = 10
+        idx2.rebuild(max_seconds=30.0)
+        second_call_metrics = dict(idx2.last_rebuild_metrics)
+        # The core regression: without the fix, this call's walk restarts
+        # from the top and rediscovers exactly the same `first_total` files
+        # idx1 already found, so files_new/rows_changed come back 0 and
+        # idx2's row count never exceeds first_total. With the fix, it
+        # picks up past idx1's boundary and reaches genuinely new ground.
+        assert second_call_metrics.get("files_new", 0) > 0, (
+            "second instance rediscovered only already-indexed files -- "
+            "cross-process walk resume is not working"
+        )
+        assert second_call_metrics.get("rows_changed", 0) > 0
+        # Checked post-rebuild (not via last_rebuild_metrics, which is
+        # computed in Phase 0 before this call's own _connect() rehydrates
+        # idx1's rows into _row_cache) -- the real, ground-truth outcome:
+        # idx2 now knows about idx1's original rows PLUS genuinely new ones.
+        assert len(idx2._row_cache) > first_total
+
+    def test_boundary_resumed_pass_does_not_delete_pre_boundary_rows_on_completion(
+        self, tmp_path: Path,
+    ) -> None:
+        """Code-review-caught regression: a boundary-resumed pass that
+        reaches full exhaustion within the resuming instance must NOT treat
+        pre-boundary files as removed just because ITS OWN walk never
+        revisited them. Forces get_convergence_state() to connect (and
+        rehydrate _manifest) BEFORE the first rebuild() call, matching the
+        exact sequence that reproduced this live."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(6):
+            (outputs_dir / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path, max_batch=3)
+        idx1.rebuild(max_seconds=30.0)
+        boundary = idx1._scan_boundary
+        assert boundary is not None
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path, max_batch=3,
+            initial_scan_boundary=boundary,
+        )
+        # Connects (and rehydrates _manifest) BEFORE any rebuild() call --
+        # this is what made self._manifest non-empty while self._walk_
+        # accumulated only held post-boundary paths, the exact ordering
+        # that triggered the false "removed" detection.
+        pre_state = idx2.get_convergence_state()
+        assert pre_state.converged is False
+        idx2.rebuild(max_seconds=30.0)
+        # max_batch=3 with exactly 3 remaining files drains them all but
+        # can't yet distinguish "drained exactly max_batch" from "more
+        # remain" (see _ResumableFileWalk.drain()) -- one more call
+        # confirms exhaustion and triggers the walk_complete branch under
+        # test.
+        idx2.rebuild(max_seconds=30.0)
+        assert idx2.get_convergence_state().converged is True
+        assert len(idx2._row_cache) == 6, (
+            "boundary-resumed pass wrongly deleted pre-boundary rows on completion"
+        )
+        idx2.close()
+
+
+class TestInitialRowCacheAndManifest:
+    """fa600e42 follow-up, round 4: initial_row_cache/initial_manifest let a
+    caller seed OutputsFtsIndex's staleness-detection state BEFORE any
+    rebuild() call -- closing the gap where Phase 0/1's staleness check
+    (self._manifest.get(p) != sig or p not in self._row_cache) runs before
+    Phase 2's lazy _connect() has ever rehydrated a fresh process's cache.
+
+    Confirmed live: without this, EVERY already-indexed file looked stale
+    on every restart, forcing a full re-hash-and-rewrite of the whole
+    index each time -- which eventually caused a real MemoryError crash
+    after the repeated cycle bloated the DB file from 6GB to 8.7GB.
+    """
+
+    @duckdb_required
+    def test_seeded_cache_prevents_false_staleness_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(10):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        assert idx1.get_convergence_state().converged is True
+        row_cache = dict(idx1._row_cache)
+        manifest = dict(idx1._manifest)
+        idx1.close()
+
+        # Simulate a restart, seeded with the prior instance's cache (as a
+        # harness-level probe would source it) instead of the constructor
+        # defaults (empty dicts).
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path,
+            initial_row_cache=row_cache, initial_manifest=manifest,
+        )
+        assert len(idx2._row_cache) == 10
+        assert len(idx2._manifest) == 10
+        idx2.rebuild(max_seconds=30.0)
+        m = idx2.last_rebuild_metrics
+        # The core regression: without seeding, every one of the 10 files
+        # looks stale on this call (files_new==10, rows_changed==10) since
+        # Phase 0/1 run before _connect() has rehydrated anything. With
+        # seeding, the staleness check already knows all 10 are current.
+        assert m.get("files_new", 0) == 0, (
+            "seeded cache did not prevent false staleness on the first call"
+        )
+        assert m.get("rows_changed", 0) == 0
+        idx2.close()
+
+    @duckdb_required
+    def test_no_seed_reproduces_the_original_false_staleness_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        """Control case: confirms the regression test above is actually
+        exercising the bug, not passing vacuously. Same setup, but a
+        SECOND instance constructed WITHOUT seeding (today's default)
+        must still show the original false-staleness behavior."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(10):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx2.rebuild(max_seconds=30.0)
+        m = idx2.last_rebuild_metrics
+        assert m.get("files_new", 0) == 10, (
+            "expected the original false-staleness behavior without seeding"
+        )
+        idx2.close()
+
+    @duckdb_required
+    def test_seeded_cache_produces_correct_final_row_count(
+        self, tmp_path: Path,
+    ) -> None:
+        """A seeded restart must still correctly pick up genuinely NEW
+        files discovered alongside the seeded (already-current) ones."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(5):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        row_cache = dict(idx1._row_cache)
+        manifest = dict(idx1._manifest)
+        idx1.close()
+
+        # A genuinely new file appears between "process 1 exits" and
+        # "process 2 starts" -- exactly the ongoing-writer scenario the
+        # staleness check must still catch even when seeded.
+        (outputs_dir / "new_file.csv").write_text("col\nnew", encoding="utf-8")
+
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path,
+            initial_row_cache=row_cache, initial_manifest=manifest,
+        )
+        idx2.rebuild(max_seconds=30.0)
+        assert idx2.get_convergence_state().converged is True
+        assert len(idx2._row_cache) == 6
+        idx2.close()
+
+    @duckdb_required
+    def test_none_defaults_preserve_existing_empty_cache_behavior(
+        self, tmp_path: Path,
+    ) -> None:
+        """Omitting initial_row_cache/initial_manifest (every existing
+        caller) must behave exactly as before -- empty dicts, not None
+        leaking through into code that assumes a dict."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        assert idx._row_cache == {}
+        assert idx._manifest == {}
+
+
 class TestRebuildWalkDeadlineAwareness:
     """rebuild()-level regression coverage for 6ba77ada: a walk that alone
     exceeds max_seconds must not prevent rebuild() from returning promptly
@@ -3553,9 +4575,10 @@ class TestRebuildWalkDeadlineAwareness:
         real_walk = OL._walk_safe_output_files
 
         def slow_walk(outputs_dir: str, *, exclude_patterns: tuple = (),
-                       on_error=None):
+                       on_error=None, resume_after=None):
             for p in real_walk(
                 outputs_dir, exclude_patterns=exclude_patterns, on_error=on_error,
+                resume_after=resume_after,
             ):
                 time.sleep(delay)
                 yield p
@@ -3699,6 +4722,399 @@ class TestRebuildWalkDeadlineAwareness:
                 "walk pass completed"
             )
             assert any("keep.csv" in p for p in idx._row_cache)
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Walk-restart cooldown (architecture review follow-up, fa600e42)
+# ---------------------------------------------------------------------------
+
+class TestWalkRestartCooldown:
+    """Confirmed live on a real 385,064-file corpus: once walk_complete
+    fires, self._walk_state resets to None with no "did anything change /
+    how long since the last pass" check -- the next call whose backlog dips
+    back under analysis_limit re-walks the ENTIRE tree from scratch, 3 times
+    in a row at the tail of one run (~35-59s each, ~8% of total wall-clock).
+    The fix (an opt-in cooldown) must (a) default to disabled so it never
+    changes the existing "rebuild() again immediately notices a change"
+    contract every other caller/test relies on, (b) actually skip a
+    redundant pass when explicitly enabled, (c) still eventually discover
+    new files once the cooldown window elapses, and (d) never mark existing
+    rows as falsely removed while skipped (the near-miss this fix's own
+    first draft caught: an empty self._walk_accumulated during a
+    cooldown-skip must NOT feed the "full pass just finished, anything not
+    in this list was removed" reconciliation path)."""
+
+    @duckdb_required
+    def test_cooldown_disabled_by_default_detects_new_file_immediately(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._walk_cooldown_seconds == 0.0
+            count1 = idx.rebuild()
+            assert count1 == 1
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            count2 = idx.rebuild()
+            assert count2 == 2, (
+                "a new file must be discovered on the very next rebuild() "
+                "call by default -- the cooldown must never engage unless "
+                "explicitly opted into"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_opt_in_cooldown_skips_redundant_full_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=3600.0)
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 0, (
+                "a call within the cooldown window must not re-walk the "
+                "tree at all"
+            )
+            # walk_complete must still read True during a cooldown-skip --
+            # the tree IS still converged as of the last real pass.
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_cooldown_skip_never_falsely_marks_existing_rows_removed(
+        self, tmp_path: Path,
+    ) -> None:
+        """The critical correctness guard: a cooldown-skipped call's empty
+        self._walk_accumulated must never be treated as "the walk just
+        confirmed the whole tree is exactly this" -- that would delete
+        every previously-indexed row on the very next call after a real
+        pass completed."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=3600.0)
+        try:
+            count1 = idx.rebuild()
+            assert count1 == 2
+            count2 = idx.rebuild()
+            assert count2 == 2, (
+                "existing rows must survive a cooldown-skipped call "
+                f"unchanged, got count={count2}"
+            )
+            hits = idx.search("col")
+            assert len(hits) == 2, (
+                "a cooldown-skipped call must not have deleted any "
+                "previously-indexed row from the DB/FTS index"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_opt_in_cooldown_still_discovers_after_window_elapses(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=0.05)
+        try:
+            idx.rebuild()
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            time.sleep(0.1)
+            count2 = idx.rebuild()
+            assert count2 == 2, (
+                "a new file must still be discovered once the cooldown "
+                "window has elapsed -- the cooldown only delays, never "
+                "blocks, re-discovery"
+            )
+        finally:
+            idx.close()
+
+
+class TestWalkCooldownSafetyFactorResolver:
+    """fa600e42 follow-up (adaptive cooldown) -- pure resolver tests for the
+    safety-factor knob, same style as TestTantivyHeapSize etc."""
+
+    def test_default_is_half(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, raising=False)
+        assert OL._default_walk_cooldown_safety_factor() == 0.5
+
+    def test_env_var_overrides_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, "1.5")
+        assert OL._default_walk_cooldown_safety_factor() == 1.5
+
+    def test_invalid_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, "not-a-number")
+        assert OL._default_walk_cooldown_safety_factor() == 0.5
+
+    def test_negative_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, "-1")
+        assert OL._default_walk_cooldown_safety_factor() == 0.5
+
+    def test_zero_is_a_valid_explicit_opt_out(self) -> None:
+        assert OL._resolve_walk_cooldown_safety_factor(0.0) == 0.0
+
+    def test_explicit_constructor_arg_takes_precedence_over_env_var(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, "1.5")
+        assert OL._resolve_walk_cooldown_safety_factor(0.25) == 0.25
+
+    def test_negative_explicit_arg_falls_back_to_default(self) -> None:
+        assert OL._resolve_walk_cooldown_safety_factor(-0.5) == 0.5
+
+
+class TestWalkCooldownMaxSecondsResolver:
+    """fa600e42 follow-up (adaptive cooldown) -- pure resolver tests for the
+    ceiling knob, same style as TestTantivyHeapSize etc."""
+
+    def test_default_is_1800(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, raising=False)
+        assert OL._default_walk_cooldown_max_seconds() == 1800.0
+
+    def test_env_var_overrides_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, "600")
+        assert OL._default_walk_cooldown_max_seconds() == 600.0
+
+    def test_invalid_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, "not-a-number")
+        assert OL._default_walk_cooldown_max_seconds() == 1800.0
+
+    def test_negative_env_var_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, "-1")
+        assert OL._default_walk_cooldown_max_seconds() == 1800.0
+
+    def test_explicit_constructor_arg_takes_precedence_over_env_var(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv(OL._WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, "600")
+        assert OL._resolve_walk_cooldown_max_seconds(120.0) == 120.0
+
+    def test_negative_explicit_arg_falls_back_to_default(self) -> None:
+        assert OL._resolve_walk_cooldown_max_seconds(-5.0) == 1800.0
+
+
+class TestAdaptiveWalkCooldown:
+    """fa600e42 follow-up (adaptive cooldown) -- confirmed live on an
+    85-call, 385,064-file rerun with a flat 60s cooldown: 73/85 calls were
+    correctly suppressed, but ~7 full-pass restarts still cost ~776s (20.5%
+    of total wall-clock), because completing one full pass over that corpus
+    itself took several minutes -- the flat 60s window had always already
+    expired by the time rebuild() next checked it. These tests use direct
+    field injection to simulate a slow-corpus pass's observed duration
+    rather than a real multi-minute sleep; the walk/corpus itself stays
+    trivial in every test, only the recorded duration is faked."""
+
+    @duckdb_required
+    def test_first_pass_ever_effective_cooldown_equals_flat_floor(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=60.0)
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 60.0, (
+                "with no prior pass duration observed yet, scaling must not "
+                "apply -- byte-identical to the pre-scaling flat window"
+            )
+            assert idx.last_rebuild_metrics["walk_last_full_pass_duration_seconds"] is not None, (
+                "the just-completed first pass's own duration must now be recorded"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_disabled_cooldown_effective_seconds_always_zero(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))  # walk_cooldown_seconds defaults to 0.0
+        try:
+            idx.rebuild()
+            idx._walk_last_full_pass_duration_seconds = 10_000.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 0.0, (
+                "the disabled (default) case must never scale up from 0.0, "
+                "regardless of any recorded pass duration"
+            )
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 2, (
+                "disabled cooldown means every rebuild() starts a brand-new "
+                "full pass from the top -- it re-discovers both files, not "
+                "just the newly added one"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_scaled_cooldown_extends_protection_past_flat_floor_for_slow_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """The actual gap this fix closes: a corpus whose full pass takes
+        much longer than the flat floor gets a correspondingly longer
+        effective cooldown, not just the floor."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=60.0)
+        try:
+            idx.rebuild()
+            # Simulate a corpus whose real full pass takes 300s (default
+            # safety_factor 0.5 -> scaled component = 150s, above the flat
+            # 60s floor).
+            idx._walk_last_full_pass_duration_seconds = 300.0
+            idx._walk_last_full_pass_completed_at = time.time() - 100.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 150.0
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 0, (
+                "100s after the last pass, a flat 60s floor would already "
+                "have expired and restarted a full re-walk -- the scaled "
+                "150s window must still be suppressing it"
+            )
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_ceiling_bounds_scaling_from_an_anomalously_slow_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=60.0)
+        try:
+            idx.rebuild()
+            # Simulate an anomalously slow pass (e.g. a transient
+            # network-filesystem stall): scaled component would be
+            # 10000*0.5=5000s, far past the default 1800s ceiling.
+            idx._walk_last_full_pass_duration_seconds = 10_000.0
+            idx._walk_last_full_pass_completed_at = time.time() - 1900.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 1800.0
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 2, (
+                "1900s after the last pass exceeds the 1800s ceiling, so "
+                "the walk must resume (re-discovering the whole tree from "
+                "the top) even though the naive scaled value (5000s) would "
+                "still have blocked it"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_floor_never_shrunk_by_a_smaller_misconfigured_ceiling(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path), walk_cooldown_seconds=3600.0,
+            walk_cooldown_max_seconds=100.0,  # explicitly smaller than the floor
+        )
+        try:
+            idx.rebuild()
+            # A huge duration would push the ceiling-bounded scaled term
+            # (min(100000*0.5, 100) == 100) BELOW the floor if the outer
+            # max() were missing or wrong.
+            idx._walk_last_full_pass_duration_seconds = 100_000.0
+            idx._walk_last_full_pass_completed_at = time.time() - 500.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 3600.0, (
+                "the explicit floor must always win via the outer max(), "
+                "even when a misconfigured ceiling is smaller than it"
+            )
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 0
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_safety_factor_zero_disables_duration_scaling(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path), walk_cooldown_seconds=60.0,
+            walk_cooldown_safety_factor=0.0,
+        )
+        try:
+            idx.rebuild()
+            idx._walk_last_full_pass_duration_seconds = 10_000.0
+            idx._walk_last_full_pass_completed_at = time.time() - 100.0
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_cooldown_effective_seconds"] == 60.0
+            assert idx.last_rebuild_metrics["discovered_this_call"] == 2, (
+                "safety_factor=0.0 must fully opt out of duration-based "
+                "scaling -- the flat 60s floor alone governs, and 100s has "
+                "already elapsed past it, so the walk must resume"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_boundary_resumed_pass_does_not_update_observed_duration(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pass resumed from a scan boundary only re-walks the remainder
+        of the tree a prior (possibly now-gone) process didn't finish -- its
+        own elapsed time doesn't represent a FULL pass's cost, so it must
+        never overwrite the previously observed full-pass duration the
+        cooldown scaling above relies on."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), walk_cooldown_seconds=60.0)
+        try:
+            idx.rebuild()
+            first_duration = idx._walk_last_full_pass_duration_seconds
+            assert first_duration is not None
+            # Use the REAL canonical path key the walk itself just recorded
+            # for "a.csv" (not a synthetic bare filename) as the resume
+            # boundary -- resume_after must match the same path format the
+            # walker's own sort order compares against.
+            real_boundary = next(iter(idx._manifest))
+            # Force the next call to both bypass cooldown (long-elapsed) and
+            # simulate a boundary-resumed pass (as if a prior process's scan
+            # boundary had been rehydrated).
+            idx._walk_last_full_pass_completed_at = time.time() - 9999.0
+            idx._scan_boundary = real_boundary
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+            assert idx._walk_last_full_pass_duration_seconds == first_duration, (
+                "a boundary-resumed pass's own elapsed time must not "
+                "overwrite the last FULL pass's observed duration"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_outage_mid_pass_resets_start_marker_without_recording_duration(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(5):
+            (outputs_dir / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(
+            str(outputs_dir), walk_cooldown_seconds=60.0, max_batch=1,
+        )
+        try:
+            idx.rebuild()
+            assert idx._walk_state is not None, (
+                "walk must still be mid-pass with max_batch=1 and 5 files"
+            )
+            assert idx._walk_last_full_pass_started_at is not None
+            assert idx._walk_last_full_pass_duration_seconds is None
+            for f in outputs_dir.iterdir():
+                f.unlink()
+            outputs_dir.rmdir()
+            idx.rebuild()
+            assert idx._walk_last_full_pass_started_at is None, (
+                "an outage mid-pass must reset the in-flight start marker "
+                "so it never leaks into a future pass's measured duration"
+            )
+            assert idx._walk_last_full_pass_duration_seconds is None
         finally:
             idx.close()
 
@@ -4150,6 +5566,39 @@ class TestColdTreeFtsDeferral:
         idx.rebuild()
         assert idx.last_db_write_error is None
 
+    def test_rebuild_return_value_is_cumulative_not_a_per_call_delta(
+        self, tmp_path: Path,
+    ) -> None:
+        """Gap-register MO-IMP-04: a prior finding observed a caller
+        (run_scale.py) mistaking rebuild()'s return value for a per-call
+        delta and having to compute the real increment independently. The
+        return value (and search_outputs()'s "total_indexed" field it
+        feeds) is, and must remain, the CUMULATIVE total -- the per-call
+        delta is separately and explicitly available as
+        last_rebuild_metrics["files_new"], so no caller needing a delta has
+        to infer one from before/after totals."""
+        for i in range(5):
+            (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            total1 = idx.rebuild()
+            assert total1 == 5
+            assert idx.last_rebuild_metrics["files_new"] == 5
+
+            for i in range(5, 35):  # a known 30-file increment
+                (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+            total2 = idx.rebuild()
+            assert total2 == 35, (
+                "rebuild()'s return value must be the cumulative total "
+                "(35), not the per-call delta (30)"
+            )
+            assert idx.last_rebuild_metrics["files_new"] == 30, (
+                "the per-call delta must be available explicitly, without "
+                "the caller computing total2 - total1 itself"
+            )
+        finally:
+            idx.close()
+
     def test_search_outputs_surfaces_db_write_error_in_result_dict(
         self, tmp_path: Path,
     ) -> None:
@@ -4533,6 +5982,60 @@ class TestDuckDBMemoryLimit:
         idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=2048 * 1024 * 1024)
         assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
 
+    def test_row_count_hint_widens_reserve_and_shrinks_limit(self, monkeypatch) -> None:
+        """fa600e42 follow-up (architecture review): _DUCKDB_MEMORY_RESERVE_
+        BYTES (768MB) is a flat constant calibrated on sub-million-file
+        runs -- it doesn't account for self._row_cache/_manifest's own
+        growth, which scales with corpus size (edc84500 only evicts the
+        heavy `content` field, never the row itself). A non-zero
+        row_count_hint must widen the reserve (and therefore shrink the
+        resulting limit) proportionally."""
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        tantivy_heap = 512 * 1024 * 1024
+        without_hint = OL._default_duckdb_memory_limit_bytes(tantivy_heap)
+        with_hint = OL._default_duckdb_memory_limit_bytes(
+            tantivy_heap, row_count_hint=1_000_000,
+        )
+        assert with_hint < without_hint
+        expected_reserve = (
+            OL._DUCKDB_MEMORY_RESERVE_BYTES
+            + 1_000_000 * OL._ESTIMATED_ROW_CACHE_BYTES_PER_ENTRY
+        )
+        usable = 20 * 1024**3 - tantivy_heap - expected_reserve
+        expected = max(
+            OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES,
+            min(int(usable * OL._DUCKDB_MEMORY_LIMIT_SHARE), OL._DUCKDB_MEMORY_LIMIT_CEILING_BYTES),
+        )
+        assert with_hint == expected
+
+    def test_zero_row_count_hint_matches_pre_fix_behaviour(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        tantivy_heap = 512 * 1024 * 1024
+        assert (
+            OL._default_duckdb_memory_limit_bytes(tantivy_heap, row_count_hint=0)
+            == OL._default_duckdb_memory_limit_bytes(tantivy_heap)
+        )
+
+    def test_constructor_derives_row_count_hint_from_initial_row_cache(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Integration check: a real OutputsFtsIndex construction with a
+        large initial_row_cache (the periodic-restart harness's own
+        mechanism) must actually reach the wider-reserve/smaller-limit
+        path, not just the module function in isolation."""
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        fake = self._fake_psutil(20 * 1024**3)
+        fake.cpu_count.return_value = 4  # also consulted by _physical_core_count()
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        fake_row_cache = {f"/a/{i}.csv": object() for i in range(500_000)}
+        idx_without = OL.OutputsFtsIndex(str(tmp_path))
+        idx_with = OL.OutputsFtsIndex(
+            str(tmp_path), initial_row_cache=fake_row_cache,  # type: ignore[arg-type]
+        )
+        assert idx_with._duckdb_memory_limit_bytes < idx_without._duckdb_memory_limit_bytes
+
     @duckdb_required
     def test_connect_applies_memory_limit_pragma(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4638,6 +6141,44 @@ class TestDuckDBMemoryLimit:
         assert matches, f"expected a preserve_insertion_order PRAGMA, got: {captured!r}"
         assert "false" in matches[0].lower()
 
+    @duckdb_required
+    def test_connect_raises_checkpoint_threshold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): DuckDB's default checkpoint_threshold
+        (16MB) let Phase 2's own autocommitted bulk writes silently
+        accumulate WAL across a call -- confirmed live, whichever COMMIT
+        happened to cross the threshold paid the full stop-the-world
+        checkpoint cost, near-always the tiny walk-state-persist commit at
+        the tail of rebuild() (up to 30+s, 23% of an entire 385K-file run).
+        Must be raised on every connect, same as preserve_insertion_order."""
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _ExecuteSpyCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._connect()
+        finally:
+            idx.close()
+        matches = [sql for sql in captured if "checkpoint_threshold" in sql.lower()]
+        assert matches, f"expected a checkpoint_threshold PRAGMA, got: {captured!r}"
+
     def test_connect_tantivy_passes_resolved_heap_size_to_writer(
         self, tmp_path: Path,
     ) -> None:
@@ -4660,6 +6201,560 @@ class TestDuckDBMemoryLimit:
             with patch.object(tantivy.Index, "writer", _spy_writer):
                 idx._connect_tantivy()
             assert captured.get("heap_size") == 33 * 1024 * 1024
+        finally:
+            idx.close()
+
+
+class TestDuckDBMemoryLimitRetuning:
+    """fa600e42 follow-up (OOM crash, confirmed live during the adaptive
+    walk-cooldown validation rerun): self._duckdb_memory_limit_bytes was
+    resolved ONCE at construction from a single memory snapshot and never
+    revisited, even though a live DuckDB connection accepts `PRAGMA
+    memory_limit=...` changes at any time (confirmed empirically -- not
+    assumed) and self._row_cache's own growth over a long run is exactly
+    the signal the row_count_hint reserve-widening mechanism (see
+    TestDuckDBMemoryLimit.test_row_count_hint_widens_reserve_and_shrinks_
+    limit) was already built for. A real 385,064-file rerun crashed with a
+    Python-level MemoryError because neither of those facts was being used
+    after construction."""
+
+    @staticmethod
+    def _fake_psutil(available_bytes: int) -> MagicMock:
+        fake = MagicMock()
+        fake.virtual_memory.return_value = MagicMock(available=available_bytes)
+        fake.cpu_count.return_value = 4  # also consulted by _physical_core_count()
+        return fake
+
+    def test_no_retune_before_first_connect(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        original = idx._duckdb_memory_limit_bytes
+        assert idx._con is None
+        idx._maybe_retune_duckdb_memory_limit()  # must not raise
+        assert idx._duckdb_memory_limit_bytes == original
+
+    @duckdb_required
+    def test_retune_shrinks_limit_as_available_memory_drops(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            healthy_limit = idx._duckdb_memory_limit_bytes
+            assert healthy_limit > OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES
+            # Simulate available memory collapsing between calls -- exactly
+            # what a long-running, growing process does to its OWN
+            # environment even without any other process's interference.
+            fake.virtual_memory.return_value = MagicMock(available=100 * 1024 * 1024)
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx._duckdb_memory_limit_bytes == OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES, (
+                "the ceiling must shrink to reflect newly-low available "
+                "memory on the very next call, not stay pinned to the "
+                "construction-time snapshot"
+            )
+            assert (
+                idx.last_rebuild_metrics["duckdb_memory_limit_bytes"]
+                == OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_retune_widens_reserve_as_row_cache_grows(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """Same fixed available-memory reading throughout -- only
+        self._row_cache's length changes -- isolates the row_count_hint
+        wiring from the available-memory wiring tested above."""
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            baseline_limit = idx._duckdb_memory_limit_bytes
+            # Cheap stand-ins for a huge accumulated corpus -- only len()
+            # matters to the method under test, so real OutputRow values
+            # are unnecessary (and would make this test far slower).
+            idx._row_cache.update({f"__fake_{i}__": 0 for i in range(500_000)})
+            idx._maybe_retune_duckdb_memory_limit()
+            expected = OL._default_duckdb_memory_limit_bytes(
+                idx._tantivy_heap_bytes, row_count_hint=len(idx._row_cache),
+            )
+            assert idx._duckdb_memory_limit_bytes == expected
+            assert idx._duckdb_memory_limit_bytes < baseline_limit, (
+                "a much larger accumulated row_cache must widen the reserve "
+                "and therefore shrink the effective limit, exactly like the "
+                "construction-time initial_row_cache path already does"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_explicit_override_never_retuned(self, monkeypatch, tmp_path: Path) -> None:
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path), duckdb_memory_limit_bytes=2048 * 1024 * 1024,
+        )
+        try:
+            idx.rebuild()
+            assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
+            # Swing available memory wildly in both directions -- an
+            # explicit caller value must never move regardless.
+            fake.virtual_memory.return_value = MagicMock(available=50 * 1024 * 1024)
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
+            fake.virtual_memory.return_value = MagicMock(available=200 * 1024**3)
+            idx._row_cache.update({f"__fake_{i}__": 0 for i in range(500_000)})
+            idx._maybe_retune_duckdb_memory_limit()
+            assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_retune_skips_pragma_when_value_unchanged(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._connect()
+            # First call establishes whatever the resolved value is under
+            # these exact conditions (may or may not differ from the
+            # construction-time value -- irrelevant here).
+            idx._maybe_retune_duckdb_memory_limit()
+
+            # Nothing changes between here and the next call -- same fixed
+            # psutil reading, same (empty) self._row_cache -- so THIS call
+            # must be a true no-op.
+            captured: list[str] = []
+            real_con = idx._con
+
+            class _ExecuteSpyCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    captured.append(sql)
+                    return real_con.execute(sql, *a, **kw)
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _ExecuteSpyCon()
+            idx._maybe_retune_duckdb_memory_limit()
+            pragma_calls = [s for s in captured if "memory_limit" in s.lower()]
+            assert not pragma_calls, (
+                "identical conditions must not re-issue a no-op PRAGMA "
+                f"every call, got: {pragma_calls!r}"
+            )
+        finally:
+            idx._con = real_con
+            idx.close()
+
+    @duckdb_required
+    def test_retune_survives_pragma_failure(self, monkeypatch, tmp_path: Path) -> None:
+        """Mirrors _connect()'s own contract: a PRAGMA failure here must
+        never propagate, and must leave the previous (still-applied) limit
+        in place rather than updating the tracked value to one that was
+        never actually set on the live connection."""
+        fake = self._fake_psutil(20 * 1024**3)
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            previous_limit = idx._duckdb_memory_limit_bytes
+            real_con = idx._con
+
+            class _FailingPragmaCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    if "memory_limit" in sql.lower():
+                        raise RuntimeError("simulated PRAGMA failure")
+                    return real_con.execute(sql, *a, **kw)
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _FailingPragmaCon()
+            fake.virtual_memory.return_value = MagicMock(available=100 * 1024 * 1024)
+            idx._maybe_retune_duckdb_memory_limit()  # must not raise
+            assert idx._duckdb_memory_limit_bytes == previous_limit, (
+                "a failed PRAGMA must not update the tracked limit -- that "
+                "would desync self._duckdb_memory_limit_bytes from what "
+                "DuckDB actually has configured"
+            )
+        finally:
+            idx._con = real_con
+            idx.close()
+
+
+class TestFatalConnectionRecovery:
+    """fa600e42 follow-up (OOM crash, confirmed live at a real
+    660,150-file/466GB qualification run): a DuckDB `FatalException`
+    ("Failed to rollback transaction... Out of Memory Error... database has
+    been invalidated") means the connection object itself is permanently
+    unusable -- DuckDB's own error text literally says "the database must
+    be restarted prior to being used again". Before this fix, self._con was
+    never discarded on this condition, so every subsequent rebuild() call
+    kept reusing the same dead connection and failed identically forever --
+    live evidence: 3 consecutive identical last_db_write_error values
+    tripped the harness's own circuit breaker after only 57 of a
+    400-call budget, mid-run, with no crash and no exception ever
+    propagating out of rebuild() itself."""
+
+    @duckdb_required
+    def test_fatal_exception_discards_connection_for_clean_reconnect(
+        self, tmp_path: Path,
+    ) -> None:
+        import duckdb
+
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            real_con = idx._con
+            assert real_con is not None
+
+            class _FatalOnCommitCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    if sql.strip().upper() == "COMMIT":
+                        raise duckdb.FatalException(
+                            "simulated: database has been invalidated",
+                        )
+                    return real_con.execute(sql, *a, **kw)
+
+                def close(self_inner) -> None:
+                    pass  # a fatally-invalidated connection still "closes"
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _FatalOnCommitCon()
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()  # must not raise
+            # A later _connect() call in the SAME rebuild() (walk-state
+            # persistence, at the tail of the method) already sees
+            # self._con is None and reconnects immediately -- so the fake
+            # wrapper is gone by the time this call returns, not merely by
+            # the START of the next one. Assert the functional outcome
+            # (discarded, not silently kept and reused) rather than pinning
+            # to exactly which call site does the reconnect.
+            assert idx._con is not real_con, (
+                "a FatalException during Phase 2's write must discard the "
+                "dead connection, not keep reusing it forever"
+            )
+            assert idx.last_db_write_error is not None
+            assert "FatalException" in idx.last_db_write_error
+
+            # Self-heal: the previously-failed file must still be retried
+            # and succeed (it was never dropped from self._pending_stale).
+            count = idx.rebuild()
+            assert idx._con is not None
+            assert count == 2, (
+                "the file that failed under the dead connection must be "
+                "retried and succeed once a fresh connection is open"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_non_fatal_write_exception_keeps_the_connection(
+        self, tmp_path: Path,
+    ) -> None:
+        """Only a genuine FatalException warrants discarding a connection --
+        an ordinary transient write error must not throw away an otherwise
+        healthy connection."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            real_con = idx._con
+            assert real_con is not None
+
+            class _TransientErrorOnCommitCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    if sql.strip().upper() == "COMMIT":
+                        raise RuntimeError("simulated transient failure")
+                    return real_con.execute(sql, *a, **kw)
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _TransientErrorOnCommitCon()
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx._con is not None, (
+                "a non-fatal exception must not discard a perfectly "
+                "reusable connection"
+            )
+            assert "RuntimeError" in (idx.last_db_write_error or "")
+        finally:
+            idx._con = real_con
+            idx.close()
+
+    @duckdb_required
+    def test_fatal_exception_survives_close_failure(
+        self, tmp_path: Path,
+    ) -> None:
+        """Mirrors _connect()'s own best-effort convention: cleanup must
+        never raise, even when closing the already-dead connection itself
+        fails."""
+        import duckdb
+
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            real_con = idx._con
+
+            class _FatalAndUnclosableCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    if sql.strip().upper() == "COMMIT":
+                        raise duckdb.FatalException("simulated fatal error")
+                    return real_con.execute(sql, *a, **kw)
+
+                def close(self_inner) -> None:
+                    raise RuntimeError("simulated close failure")
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _FatalAndUnclosableCon()
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()  # must not raise, even though close() itself raises
+            assert idx._con is not real_con
+        finally:
+            idx.close()
+
+
+class TestConvergenceStateStaleErrorHonesty:
+    """fa600e42 follow-up (MO-IMP-06, honesty gap; confirmed live at the
+    660,153-file/466GiB full-corpus qualification): last_db_write_error /
+    last_lock_error only reset at the TOP of the next rebuild() call. A
+    fatal-connection self-heal (a21411b5) can leave one of these set after
+    its own call already succeeded end-to-end -- if that was the run's LAST
+    call, there is no next call to clear it, so get_convergence_state()
+    reported converged=False with a stale error on an index that was
+    otherwise genuinely, fully converged (indexed_count exactly matched
+    expected_count). The fix: gate last_db_write_error/last_lock_error's
+    effect on self._pending_stale being non-empty -- the field that
+    already, authoritatively, tracks whether an error still has a real,
+    unresolved consequence."""
+
+    @duckdb_required
+    def test_stale_write_error_with_empty_backlog_does_not_block_convergence(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert len(idx._pending_stale) == 0
+            # Simulate a write error whose failed rows were already
+            # retried and confirmed (pending_stale empty), but whose error
+            # field was never cleared because no FURTHER rebuild() call
+            # happened to reset it at its own top -- exactly what a
+            # fatal-connection self-heal on a run's last call leaves behind.
+            idx.last_db_write_error = "FatalException: simulated stale error"
+            state = idx.get_convergence_state()
+            assert state.converged is True, (
+                "a lingering write error with zero pending consequences "
+                "must not block convergence"
+            )
+            assert state.last_error is None, (
+                "a stale, already-resolved write error must not be "
+                "reported as the current last_error"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_write_error_with_real_pending_backlog_still_blocks_convergence(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            idx.last_db_write_error = "FatalException: simulated ongoing error"
+            idx._pending_stale["b.csv"] = (None, None)
+            state = idx.get_convergence_state()
+            assert state.converged is False, (
+                "a write error with a genuinely unresolved pending "
+                "consequence must still block convergence"
+            )
+            assert state.last_error == "FatalException: simulated ongoing error"
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_stale_lock_error_with_empty_backlog_does_not_block_convergence(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert len(idx._pending_stale) == 0
+            idx.last_lock_error = "IndexLockAcquireError: simulated stale lock error"
+            state = idx.get_convergence_state()
+            assert state.converged is True
+            assert state.last_error is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_walk_error_still_blocks_convergence_regardless_of_backlog(
+        self, tmp_path: Path,
+    ) -> None:
+        """_last_walk_error is deliberately NOT gated on pending_stale --
+        it reflects a directory-listing failure (already covered by its
+        own reset-on-fresh-pass-start fix, MO-IMP-02), not a row-
+        persistence one, so an empty backlog says nothing about whether
+        it's stale."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert len(idx._pending_stale) == 0
+            idx._last_walk_error = "could not list directory 'x': simulated"
+            state = idx.get_convergence_state()
+            assert state.converged is False
+            assert state.last_error == "could not list directory 'x': simulated"
+        finally:
+            idx.close()
+
+
+class TestReadConnectIsolation:
+    """fa600e42 follow-up (architecture review): search()/get_annotations_
+    for_path()/resolve_output()/get_content() used to run their SELECT on
+    the exact same connection object (self._con) Phase 2's write
+    transaction runs on, guarded only by self._read_lock (a plain
+    in-process RLock) -- NOT self._write_lock. _read_connect() gives those
+    pure-read paths a dedicated connection instead."""
+
+    @duckdb_required
+    def test_read_connect_returns_separate_connection_for_file_backed_db(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            write_con = idx._connect()
+            read_con = idx._read_connect()
+            assert read_con is not write_con
+            # Calling it again must return the SAME cached connection, not
+            # open a new one every time.
+            assert idx._read_connect() is read_con
+        finally:
+            idx.close()
+
+    def test_read_connect_falls_back_to_shared_connection_for_memory_db(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two independent duckdb.connect(':memory:') calls are two
+        entirely separate, unrelated in-memory databases (confirmed live)
+        -- there is no way to share state across a second :memory:
+        connection, so this mode must keep using the single shared
+        connection exactly like every query path did before this fix."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            write_con = idx._connect()
+            read_con = idx._read_connect()
+            assert read_con is write_con
+            assert idx._read_con is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_read_connect_isolated_from_in_flight_write_transaction(
+        self, tmp_path: Path,
+    ) -> None:
+        """The actual race this fix closes: a query on a separate
+        connection must never observe a Phase 2 write's uncommitted,
+        in-flight transaction on self._con -- confirmed live this is
+        DuckDB's real, correct MVCC behaviour for two same-process
+        connections to the same file, not just an assumption."""
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            write_con = idx._connect()
+            idx._ensure_schema(write_con)
+            write_con.execute(
+                "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                "size, generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys) VALUES "
+                "('a', 'body', 1.0, 'x', 4, NULL, 'text_content', false, "
+                "NULL, NULL, NULL)"
+            )
+            read_con = idx._read_connect()
+
+            write_con.execute("BEGIN TRANSACTION")
+            write_con.execute(
+                "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                "size, generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys) VALUES "
+                "('b', 'body2', 1.0, 'y', 5, NULL, 'text_content', false, "
+                "NULL, NULL, NULL)"
+            )
+            mid_txn_count = read_con.execute(
+                "SELECT COUNT(*) FROM outputs_index"
+            ).fetchone()[0]
+            assert mid_txn_count == 1, (
+                "the read connection must not see the writer's uncommitted "
+                f"row, saw count={mid_txn_count}"
+            )
+            write_con.execute("COMMIT")
+            after_commit_count = read_con.execute(
+                "SELECT COUNT(*) FROM outputs_index"
+            ).fetchone()[0]
+            assert after_commit_count == 2
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_close_cleans_up_read_connection(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx._connect()
+        read_con = idx._read_connect()
+        idx.close()
+        assert idx._read_con is None
+        with pytest.raises(Exception):  # noqa: B017 -- a closed connection must error, not silently no-op
+            read_con.execute("SELECT 1")
+
+    @duckdb_required
+    def test_search_and_resolve_output_and_get_content_use_read_connection(
+        self, tmp_path: Path,
+    ) -> None:
+        """Integration check: the actual public methods route through
+        _read_connect(), not just a unit test of the helper in isolation."""
+        (tmp_path / "a.csv").write_text("col\nvalue", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=str(tmp_path / "index.duckdb"))
+        try:
+            idx.rebuild()
+            calls: list[Any] = []
+            real_read_connect = idx._read_connect
+
+            def _spy_read_connect():
+                con = real_read_connect()
+                calls.append(con)
+                return con
+
+            with patch.object(idx, "_read_connect", side_effect=_spy_read_connect):
+                idx.search("value")
+                target = str(tmp_path / "a.csv")
+                idx.resolve_output(target)
+                idx.get_content(target)
+                idx.get_annotations_for_path(str(tmp_path))
+            assert len(calls) == 4
+            assert all(c is idx._read_con for c in calls)
         finally:
             idx.close()
 
@@ -5431,6 +7526,80 @@ class TestAdaptiveBatchPolicy:
         finally:
             idx.close()
 
+    def test_low_memory_forces_floor_even_with_fast_commits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (architecture review): before this fix,
+        _adaptive_batch_limit() only ever checked commit latency -- with
+        fast commits, the batch would keep DOUBLING toward
+        _ADAPTIVE_MAX_BATCH regardless of how little system memory
+        remained (self._row_cache/_manifest grow unboundedly with corpus
+        size and don't show up as slow commits at all). Low memory must
+        override fast-commit growth, exactly like _initial_adaptive_batch's
+        own "low" band does at construction time."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 32_768
+            idx.last_rebuild_metrics = {"fts_seconds": 0.5, "write_seconds": 1.0}
+            monkeypatch.setitem(
+                sys.modules, "psutil",
+                TestAdaptiveBatchMemoryProbe._fake_psutil(1 * 1024**3),
+            )
+            assert idx._adaptive_batch_limit() == OL.OutputsFtsIndex._ADAPTIVE_MIN_BATCH
+        finally:
+            idx.close()
+
+    def test_growth_requires_healthy_memory_not_just_fast_commits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Memory in the middle band (not low, not healthy) with fast
+        commits must NOT grow the batch -- growth requires BOTH signals
+        to agree, not commit latency alone."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 8_192
+            idx.last_rebuild_metrics = {"fts_seconds": 0.5, "write_seconds": 1.0}
+            monkeypatch.setitem(
+                sys.modules, "psutil",
+                TestAdaptiveBatchMemoryProbe._fake_psutil(3 * 1024**3),
+            )
+            assert idx._adaptive_batch_limit() == 8_192
+        finally:
+            idx.close()
+
+    def test_healthy_memory_and_fast_commits_still_grows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The legitimate growth path must still work when memory really
+        is healthy -- this fix must not accidentally freeze the batch size
+        forever."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 8_192
+            idx.last_rebuild_metrics = {"fts_seconds": 0.5, "write_seconds": 1.0}
+            monkeypatch.setitem(
+                sys.modules, "psutil",
+                TestAdaptiveBatchMemoryProbe._fake_psutil(8 * 1024**3),
+            )
+            assert idx._adaptive_batch_limit() == 16_384
+        finally:
+            idx.close()
+
+    def test_missing_psutil_falls_back_to_commit_latency_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Graceful degradation: without psutil, behaviour must match the
+        pre-fix commit-latency-only logic exactly (fast commits still grow
+        the batch when memory can't be checked at all)."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._adaptive_batch = 8_192
+            idx.last_rebuild_metrics = {"fts_seconds": 0.5, "write_seconds": 1.0}
+            monkeypatch.setitem(sys.modules, "psutil", None)
+            assert idx._adaptive_batch_limit() == 16_384
+        finally:
+            idx.close()
+
     @duckdb_required
     def test_replacement_writes_use_upsert_without_delete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -6064,6 +8233,44 @@ class TestConvergenceState:
         finally:
             idx.close()
 
+    @duckdb_required
+    def test_convergence_recovery_after_removal_costs_exactly_one_full_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Gap-register MO-IMP-05, explicit product decision: convergence
+        recovery after a file REMOVAL is allowed -- by design -- to require
+        a full pass, because a full pass is what makes removed-file
+        detection safe (see rebuild()'s Phase 0 "full pass just finished"
+        reconciliation). This is not an unbounded or undocumented cost: for
+        a small tree with no walk-restart cooldown in play (the default),
+        it is exactly one additional rebuild() call, not zero (an in-place
+        edit is caught the same call via staleness, but a removal needs the
+        walk to positively confirm absence) and not more than one (the
+        walk is not throttled here, so a single call completes the whole
+        pass and reconciles)."""
+        for i in range(5):
+            (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.get_convergence_state().converged is True
+            assert len(idx._row_cache) == 5
+
+            (tmp_path / "f0.csv").unlink()
+            count_after_one_call = idx.rebuild()
+            state_after_one_call = idx.get_convergence_state()
+
+            assert count_after_one_call == 4, (
+                "exactly one additional rebuild() call must detect the "
+                "removal and restore the row cache to the true count"
+            )
+            assert state_after_one_call.converged is True
+            assert state_after_one_call.indexed_count == 4
+            assert state_after_one_call.expected_count == 4
+            assert "f0.csv" not in idx._row_cache
+        finally:
+            idx.close()
+
     def test_missing_dir_returns_error(self) -> None:
         result = OL.get_convergence_state("/no/such/dir")
         assert "error" in result
@@ -6118,6 +8325,13 @@ class TestConvergenceState:
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
             idx.last_db_write_error = "simulated write failure"
+            # fa600e42 follow-up (MO-IMP-06) -- a write error only surfaces
+            # while it still has a real, unresolved consequence (a path
+            # left in self._pending_stale); see
+            # TestConvergenceStateStaleErrorHonesty for the counterpart
+            # (an empty backlog means the error is stale and must NOT
+            # block convergence).
+            idx._pending_stale["some/file.csv"] = (None, None)
             state = idx.get_convergence_state()
             assert state.last_error == "simulated write failure"
             assert state.converged is False
@@ -7425,5 +9639,123 @@ class TestScaleTelemetry:
 
             monkeypatch.setattr(builtins, "__import__", _no_psutil)
             assert idx._current_process_rss_bytes() is None
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# compact_to() -- DuckDB's own VACUUM does not reclaim space (fa600e42)
+# ---------------------------------------------------------------------------
+
+@duckdb_required
+class TestCompactTo:
+    """confirmed live before implementing: DuckDB's VACUUM is a no-op for
+    file size in this version -- the only verified-working compaction
+    mechanism is ATTACH + COPY FROM DATABASE to a fresh file."""
+
+    def test_compact_to_produces_a_readable_copy_with_same_rows(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+        new_path = str(tmp_path / "compacted.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            count = idx.rebuild()
+            assert count == 2
+            idx.compact_to(new_path)
+            assert os.path.exists(new_path)
+
+            import duckdb
+            con = duckdb.connect(new_path, read_only=True)
+            try:
+                assert con.execute(
+                    "SELECT COUNT(*) FROM outputs_index"
+                ).fetchone()[0] == 2
+            finally:
+                con.close()
+        finally:
+            idx.close()
+
+    def test_compact_to_leaves_original_db_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+        new_path = str(tmp_path / "compacted.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx.rebuild()
+            idx.compact_to(new_path)
+            # The original instance/connection must still work normally --
+            # compact_to must never repoint or invalidate it.
+            assert idx.search("col") or idx.resolve_output(
+                str(tmp_path / "a.csv")
+            ) is not None
+            assert idx._db_path == db_path
+        finally:
+            idx.close()
+
+    def test_compact_to_rejects_memory_mode(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            with pytest.raises(ValueError, match=":memory:"):
+                idx.compact_to(str(tmp_path / "compacted.duckdb"))
+        finally:
+            idx.close()
+
+    def test_compact_to_rejects_same_path_as_source(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx.rebuild()
+            with pytest.raises(ValueError):
+                idx.compact_to(db_path)
+        finally:
+            idx.close()
+
+    def test_compact_to_actually_reclaims_space_after_heavy_churn(
+        self, tmp_path: Path,
+    ) -> None:
+        """The actual point of this method: verified end to end, not just
+        that it runs without error. Large content churned via repeated
+        rebuild()s (each rewriting the same paths) must leave the ORIGINAL
+        file bloated relative to live content, while the COMPACTED copy is
+        substantially smaller."""
+        big = "x" * 200_000
+        paths = [tmp_path / f"f{i}.csv" for i in range(20)]
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            for p in paths:
+                p.write_text(f"col\n{big}", encoding="utf-8")
+            idx.rebuild()
+            idx._connect().execute("CHECKPOINT")
+            # Churn: rewrite every file's content several times, CHECKPOINTing
+            # after each rebuild() so every old version is actually durably
+            # persisted to on-disk row-group storage before Phase 2's
+            # DELETE+INSERT-OR-REPLACE write path replaces it -- otherwise
+            # (confirmed live) DuckDB can coalesce same-call overwrites
+            # within one WAL cycle with nothing left to reclaim, and a
+            # single checkpoint_threshold=1GB deferred final checkpoint
+            # (see the earlier fa600e42 fix) makes the raw file size an
+            # unrelated, misleadingly-small artifact of checkpoint timing
+            # rather than a measurement of the churn this test cares about.
+            for _ in range(5):
+                for i, p in enumerate(paths):
+                    p.write_text(f"col\n{big}{i}", encoding="utf-8")
+                idx.rebuild()
+                idx._connect().execute("CHECKPOINT")
+            original_size = os.path.getsize(db_path)
+
+            new_path = str(tmp_path / "compacted.duckdb")
+            idx.compact_to(new_path)
+            compacted_size = os.path.getsize(new_path)
+
+            assert compacted_size < original_size, (
+                f"expected compaction to shrink the file "
+                f"(original={original_size}, compacted={compacted_size})"
+            )
         finally:
             idx.close()

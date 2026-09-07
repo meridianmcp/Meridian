@@ -375,10 +375,18 @@ def _bind_one_artifact(
     kind = artifact.get("kind")
     canonical_path = artifact.get("canonical_path")
     expected_sha256 = artifact.get("expected_sha256")
+    # `generating_script` defaults to None here and is populated below the
+    # `resolve_figure_output` call, the instant meridian-outputs' own index
+    # has an opinion on it (exact OR basename tier). Every branch after that
+    # point returns via `**base`, so the generator identity this function
+    # already fetches (bd63385b / W31-A) is no longer silently discarded --
+    # it rides along with every binding, resolved or not, instead of being
+    # computed and then thrown away.
     base = {
         "artifact_id": artifact_id,
         "kind": kind,
         "canonical_path": canonical_path,
+        "generating_script": None,
     }
 
     if not canonical_path or not str(canonical_path).strip():
@@ -398,6 +406,11 @@ def _bind_one_artifact(
         outputs_dir, canonical_path, fuzzy_limit=fuzzy_limit,
     )
     if resolved is not None:
+        # W31-A: carry the generator identity resolve_figure_output already
+        # fetched through to every binding this call produces, authoritative
+        # or not -- see the `base` dict's own comment above for why this is
+        # set once here rather than repeated in each branch below.
+        base["generating_script"] = resolved.get("generating_script")
         match_type = resolved.get("match_type")
         resolved_sha256 = resolved.get("sha256")
 
@@ -591,7 +604,8 @@ def bind_artifact_provenance(
       ``{"bindings": [...], "counts": {...}, "all_clear": bool}`` where each
       binding is
       ``{"artifact_id", "kind", "canonical_path", "status", "match_type",
-      "evidence", "resolved_sha256", "reason"}`` and ``status`` is one of:
+      "evidence", "resolved_sha256", "generating_script", "reason"}`` and
+      ``status`` is one of:
 
         - ``"resolved"``      -- authoritatively confirmed: an exact
           meridian-outputs record (hash match, when ``expected_sha256`` was
@@ -627,6 +641,20 @@ def bind_artifact_provenance(
       all still gets a binding entry (``"orphaned"``/``"unresolved"``), never
       an exception -- fail-closed means an explicit reject verdict, not a
       crash.
+
+      ``generating_script`` (W31-A) -- the media-to-output-to-GENERATOR half
+      of this binding: whatever :func:`resolve_figure_output` reported for
+      ``canonical_path``, carried through unchanged on every binding it
+      touched (``"resolved"``, ``"hash_mismatch"``, and both ``"unresolved"``
+      basename-tier cases alike) rather than only on the authoritative exact
+      match. ``None`` whenever ``resolve_figure_output`` itself found nothing
+      (a directory-fallback/index-not-converged/orphaned binding, or one with
+      no ``canonical_path`` at all) -- never fabricated. Same authority tier
+      as the binding's own ``match_type``: on an exact match this is a
+      confirmed generator identity; on a basename match it is diagnostic only
+      (the same relocation-tolerant, non-authoritative caveat that already
+      applies to the rest of that tier's evidence), never proof the exact
+      DOCX media file came from that generator.
     """
     bindings = [
         _bind_one_artifact(outputs_dir, artifact, fuzzy_limit=fuzzy_limit)

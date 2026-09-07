@@ -301,6 +301,162 @@ async def handle_checkpoint(
     return _ckpt_resp
 
 
+async def handle_register_external_job(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: register_external_job (88277b63).
+
+    Thin wrapper over ``meridian.db.external_jobs.register_external_job``:
+    creates (or, for an already-known job_key, reaffirms) a durable
+    project-scoped record, then refreshes the host-local crash-surviving
+    snapshot for the whole project so a resuming session can read it even
+    without DB access. ``task_log.description`` is a bounded, secret-checked
+    summary the caller may pass straight to ``log_task`` — this handler does
+    not call it itself, matching every other MCP tool in this dispatch group
+    (logging is the caller's decision, not implicit side effect).
+    """
+    from meridian.db import external_jobs as job_db  # noqa: PLC0415
+    from meridian import external_job_register as model  # noqa: PLC0415
+
+    project_id = args["project_id"]
+    job = await job_db.register_external_job(
+        db, project_id, args["session_id"],
+        job_key=args["job_key"], provider=args["provider"], external_id=args["external_id"],
+        status=args.get("status", "running"), phase=args.get("phase"),
+        check_hint=args.get("check_hint"), resume_hint=args.get("resume_hint"),
+        resource_hint=args.get("resource_hint"), next_check_at=args.get("next_check_at"),
+        detail=args.get("detail"), metadata=args.get("metadata"),
+    )
+    jobs = await job_db.list_external_jobs(db, project_id, include_terminal=True, limit=500)
+    snapshot = model.write_local_status_snapshot(data_dir, project_id, jobs)
+    return {
+        "job": job,
+        "task_log": {"description": model.build_log_description("registered", job)},
+        "local_snapshot": snapshot,
+    }
+
+
+async def handle_update_external_job(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: update_external_job (88277b63).
+
+    Only fields present in ``args`` are changed — ``job_db._UNSET`` (not
+    ``None``) is the sentinel for "not provided", so a caller can explicitly
+    clear a hint by passing ``null`` without it being confused with omission.
+    """
+    from meridian.db import external_jobs as job_db  # noqa: PLC0415
+    from meridian import external_job_register as model  # noqa: PLC0415
+
+    project_id = args["project_id"]
+    job = await job_db.update_external_job(
+        db, project_id, args["session_id"],
+        job_id=args.get("job_id"), job_key=args.get("job_key"),
+        status=args.get("status", job_db._UNSET),
+        phase=args.get("phase", job_db._UNSET),
+        check_hint=args.get("check_hint", job_db._UNSET),
+        resume_hint=args.get("resume_hint", job_db._UNSET),
+        resource_hint=args.get("resource_hint", job_db._UNSET),
+        next_check_at=args.get("next_check_at", job_db._UNSET),
+        detail=args.get("detail", job_db._UNSET),
+        metadata=args.get("metadata", job_db._UNSET),
+    )
+    jobs = await job_db.list_external_jobs(db, project_id, include_terminal=True, limit=500)
+    snapshot = model.write_local_status_snapshot(data_dir, project_id, jobs)
+    return {
+        "job": job,
+        "task_log": {"description": model.build_log_description("updated", job)},
+        "local_snapshot": snapshot,
+    }
+
+
+async def handle_get_external_job(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_external_job (88277b63)."""
+    from meridian.db import external_jobs as job_db  # noqa: PLC0415
+
+    project_id = args["project_id"]
+    job = await job_db.get_external_job(
+        db, project_id, job_id=args.get("job_id"), job_key=args.get("job_key"),
+        include_history=args.get("include_history", True),
+    )
+    if job is None:
+        return {"error": "external job not found in this project"}
+    return {"job": job}
+
+
+async def handle_list_external_jobs(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: list_external_jobs (88277b63).
+
+    ``local_snapshot`` reports the host-local file's OWN state (last write,
+    independent of this read) — not a fresh write — so a caller can tell
+    whether the crash-surviving snapshot is actually current.
+    """
+    from meridian.db import external_jobs as job_db  # noqa: PLC0415
+    from meridian import external_job_register as model  # noqa: PLC0415
+
+    project_id = args["project_id"]
+    jobs = await job_db.list_external_jobs(
+        db, project_id,
+        include_terminal=args.get("include_terminal", False),
+        status=args.get("status"),
+        limit=args.get("limit", 100),
+    )
+    snapshot = model.read_local_status_snapshot(data_dir, project_id)
+    local_snapshot: dict[str, Any] = {"exists": snapshot is not None}
+    if snapshot is not None:
+        local_snapshot["generated_at"] = snapshot.get("generated_at")
+        local_snapshot["job_count"] = len(snapshot.get("jobs") or [])
+    return {"jobs": jobs, "count": len(jobs), "local_snapshot": local_snapshot}
+
+
+async def handle_complete_external_job(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: complete_external_job (88277b63). Never infers success —
+    the caller must supply an explicit terminal ``status``."""
+    from meridian.db import external_jobs as job_db  # noqa: PLC0415
+    from meridian import external_job_register as model  # noqa: PLC0415
+
+    project_id = args["project_id"]
+    job = await job_db.complete_external_job(
+        db, project_id, args["session_id"],
+        job_id=args.get("job_id"), job_key=args.get("job_key"),
+        status=args.get("status", "succeeded"),
+        detail=args.get("detail"), metadata=args.get("metadata"),
+    )
+    jobs = await job_db.list_external_jobs(db, project_id, include_terminal=True, limit=500)
+    snapshot = model.write_local_status_snapshot(data_dir, project_id, jobs)
+    return {
+        "job": job,
+        "task_log": {"description": model.build_log_description("completed", job)},
+        "local_snapshot": snapshot,
+    }
+
+
 async def handle_get_context_block(
     args: dict[str, Any],
     db: Any,
@@ -961,6 +1117,27 @@ async def handle_get_session_brief(
             + "\n</hitl_recent>"
         )
     blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
+    # 88277b63 — surface active (non-terminal) external jobs so a resuming
+    # session sees what still needs observation without a separate call.
+    external_jobs_xml = ""
+    try:
+        from meridian.db import external_jobs as job_db  # noqa: PLC0415
+
+        _active_jobs = await job_db.list_external_jobs(
+            db, project_id, include_terminal=False, limit=10
+        )
+        if _active_jobs:
+            external_jobs_xml = (
+                f'<external_jobs count="{len(_active_jobs)}">\n'
+                + "\n".join(
+                    f'  <job provider="{j.get("provider","")}" status="{j.get("status","")}">'
+                    f'{(j.get("job_key") or "")}: {(j.get("resume_hint") or "")[:120]}</job>'
+                    for j in _active_jobs
+                )
+                + "\n</external_jobs>\n"
+            )
+    except Exception:
+        pass
     # v2.6 — include session scratch-pad notes at top of brief
     notes_xml = ""
     new_items_xml = ""
@@ -1144,6 +1321,7 @@ async def handle_get_session_brief(
         f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
         f'{blocking_xml}\n'
         f'{hitl_xml}\n'
+        f'{external_jobs_xml}'
         f'{planner_extra_xml}'
         f'{role_extra_xml}'
         f'</session_brief>'

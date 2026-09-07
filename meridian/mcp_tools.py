@@ -34,6 +34,11 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "reopen_proposal_gate": 'reopen_proposal_gate(project_id="abc-123", gate_id="gate-uuid", actor="adam", reason="new evidence surfaced")',
     "get_proposal_gates": 'get_proposal_gates(project_id="abc-123", sprint_item_id="item-uuid")',
     "checkpoint": 'checkpoint(session_id="session-uuid", project_id="abc-123")',
+    "register_external_job": 'register_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", provider="runpod", external_id="pod-123", phase="build", check_hint="query pod status", resume_hint="rerun the next safe step")',
+    "update_external_job": 'update_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="running", phase="upload", check_hint="check transfer process")',
+    "get_external_job": 'get_external_job(project_id="abc-123", job_key="gps-slam-build")',
+    "list_external_jobs": 'list_external_jobs(project_id="abc-123")',
+    "complete_external_job": 'complete_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="succeeded", detail="verified output")',
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
@@ -71,6 +76,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
+    "move_workspace_note_to_project": 'move_workspace_note_to_project(note_id="note-uuid", project_id="abc-123")',
     "add_workspace_proposal": 'add_workspace_proposal(title="IDEA: expose auth as plugin", body="Could ship auth as a separate optional plugin so self-hosters can swap it out", tags="arch")',
     "add_proposal": 'add_proposal(project_id="proj-uuid", title="Cache the parser output", body="Re-parsing on every call is slow; memoize by content hash", tags="perf")',
     "get_workspace_proposals": 'get_workspace_proposals(status="investigating")',
@@ -97,6 +103,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "export_ai_log": 'export_ai_log(project_id="abc-123", event_type="tool.invoked", limit=500)',
     "export_ai_log_artifacts": 'export_ai_log_artifacts(project_id="abc-123", content_hashes=["sha256:..."])',
     "purge_ai_log": 'purge_ai_log(project_id="abc-123", cutoff="2025-01-01T00:00:00Z")',
+    "search_ai_log": 'search_ai_log(project_id="abc-123", correlation_id="run-42", event_type="tool.invoked", limit=50)',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -374,7 +381,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "{requested, effective, availability, manifest_hash, executable, "
         "executable_reasons, generated_at} object describing the project's declared "
         "capabilities and whether an executor can run right now — null if contract-"
-        "building failed. Every executor-facing /goal payload also includes an "
+        "building failed. It also carries per-pending-item enrichment sections "
+        "(item_tool_requirements, item_sprint_item_pointers, "
+        "item_artifact_pointer_findings, item_executor_contracts, "
+        "item_routing_summary) — each capped (537a7cef) to the first 15 items by "
+        "id, with a sibling item_<section>_truncated {truncated, total_candidates, "
+        "included} marker reporting the real count when a board exceeds that; the "
+        "requested/effective capability lists are separately capped past 50 "
+        "entries the same way. A capped section never drops data silently — the "
+        "full detail for an omitted item is still reachable via a follow-up "
+        "generate_handoff(mode='full') call. Every executor-facing /goal payload also includes an "
         "explicit <executor_item_ids> manifest containing every claimable item ID "
         "in deterministic order; receivers must use that manifest rather than "
         "parsing presentation prose or a truncated starter preview. Also returns "
@@ -473,6 +489,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "on receipt. Returns {valid: bool, reason: str}. reason is 'ok' on success; "
         "on failure: 'not_found', 'expired', 'already_consumed', 'wrong_project', or "
         "'body_mismatch'. "
+        "1b7eb437: pass session_id (your OWN claiming session's id) to attribute a "
+        "durable, server-written provenance receipt to this call on success — "
+        "purely additive bookkeeping, never required, never changes this tool's "
+        "return shape. A project that has opted into the "
+        "'handoff_provenance_verification' capability (set_capability_manifest) can "
+        "then surface, at claim_sprint_item time, whether THIS session's own "
+        "verification actually happened — informational only in this pass (never "
+        "blocks a claim); see meridian/handoff_receipt.py for the full contract "
+        "and its documented 'cannot force a non-compliant client' limit. "
         "efaa918a body-hash binding (closes the 2ee0000c gap): pass presented_body "
         "— the FULL pasted block, token and SECURITY banner included — and this tool "
         "strips those back out and checks the remaining text against the body hash "
@@ -493,7 +518,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "token": {"type": "string",
              "description": "The token value from the <goal_token>…</goal_token> line in the /goal block."},
          "presented_body": {"type": "string",
-             "description": "Optional: the full pasted /goal block (token + SECURITY banner included) to check against the token's stored body_hash, if any. Closes the 2ee0000c body-integrity gap — see description."}},
+             "description": "Optional: the full pasted /goal block (token + SECURITY banner included) to check against the token's stored body_hash, if any. Closes the 2ee0000c body-integrity gap — see description."},
+         "session_id": {"type": "string",
+             "description": "Optional (1b7eb437): your own claiming session's id, used ONLY to attribute a durable handoff-provenance receipt to this call on success (action_audit_log, event_type='handoff_provenance_receipt'). Purely additive — omitting it changes nothing about this tool's behavior or return shape."}},
          "required": ["token"]}},
     {"name": "accept_handoff", "description":
         "Read-only: (1bd5e810) Canonical receiver-side acceptance check for a handoff "
@@ -555,7 +582,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names the handoff declared as required. Paired with available_tools to detect CAPABILITY_UNAVAILABLE."},
          "available_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names actually available to you right now (e.g. from a live tools/list). Paired with required_tools."},
          "expected_repo_path": {"type": "string", "description": "Optional (22f2604d): YOUR OWN independently-known repo root (e.g. from your own meridian.toml/cwd) — never a value read out of presented_body itself. Compared against presented_body's <project_start_config repo_path=...>; a disagreement is FOREIGN_PROJECT_CONFIG."},
-         "delivery_source": {"type": "string", "description": "Optional (22f2604d): a label for how you received this content (default 'chat_paste'). Echoed back verbatim; purely informational bookkeeping alongside the always-false is_trusted_channel."}},
+         "delivery_source": {"type": "string", "description": "Optional (22f2604d): a label for how you received this content (default 'chat_paste'). Echoed back verbatim; purely informational bookkeeping alongside the always-false is_trusted_channel."},
+         "session_id": {"type": "string", "description": "Optional (1b7eb437): your own claiming session's id, used ONLY to attribute a durable handoff-provenance receipt to this call when accepted=true (action_audit_log, event_type='handoff_provenance_receipt'). Purely additive — omitting it changes nothing about this tool's behavior or return shape. See verify_handoff_token's session_id for the same contract."}},
          "required": []}},
     {"name": "record_handoff_correction", "description":
         "3af86d28 — record a corrective handoff when a blocked executor session "
@@ -645,6 +673,32 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "cutoff": {"type": "string", "description": "ISO-8601 UTC datetime, e.g. '2025-01-01T00:00:00Z'. Events/artifacts recorded strictly before this are deleted."}},
          "required": ["cutoff"]}},
+    {"name": "search_ai_log", "description":
+        "d26b9943 (R2-B) — Read-only: EXACT-MATCH scoped search over "
+        "ai_log_events, bounded and cursor-paginated. Every filter is a plain "
+        "SQL equality (session_id/tenant_id/correlation_id/parent_event_id/"
+        "actor_kind/actor_id/event_type) or an inclusive occurred_at range "
+        "(since_occurred_at/until_occurred_at) — there is no lexical (FTS) or "
+        "semantic index anywhere in this codebase yet, so the response's "
+        "index_status field always honestly reports 'exact_only', never a "
+        "fabricated 'complete'/'resolving' state. Filters are AND-ed together "
+        "(more filters only ever narrow the result). Ordered newest-recorded-"
+        "first (recorded_at DESC, id DESC — same contract as list_events), "
+        "with a stable integer OFFSET cursor (pass a prior response's "
+        "next_cursor back in — same contract as get_project_notes_page). "
+        "Returns {project_id, filters, events, total_count, has_more, "
+        "next_cursor, index_status}. limit defaults to 50, capped at 500.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"}, "tenant_id": {"type": "string"},
+         "correlation_id": {"type": "string"}, "parent_event_id": {"type": "string"},
+         "actor_kind": {"type": "string", "description": "One of: session, system, human, tool, model."},
+         "actor_id": {"type": "string"}, "event_type": {"type": "string"},
+         "since_occurred_at": {"type": "string", "description": "ISO-8601 UTC datetime, inclusive lower bound on occurred_at."},
+         "until_occurred_at": {"type": "string", "description": "ISO-8601 UTC datetime, inclusive upper bound on occurred_at."},
+         "cursor": {"type": "integer", "description": "Offset into the ordered result set. Pass a prior response's next_cursor. Default 0."},
+         "limit": {"type": "integer", "description": "Default 50, capped at 500."}},
+         "required": []}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions) "
@@ -794,6 +848,68 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string"},
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."}},
+         "required": ["session_id"]}},
+    {"name": "register_external_job", "description":
+        "Create or reaffirm a project-scoped record for long-running external work "
+        "such as RunPod, SSH, Slurm, or CI. Meridian records the opaque external "
+        "identity and resumable state, appends a task-log event, and writes an "
+        "atomic host-local JSON snapshot. Do not include credentials or machine-"
+        "local absolute paths in shared hints or metadata.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "job_key": {"type": "string", "description": "Stable project-local logical key; reuse it for later observations."},
+         "provider": {"type": "string", "description": "Provider/launcher label, e.g. runpod, ssh, slurm, ci."},
+         "external_id": {"type": "string", "description": "Opaque external job/pod/build identifier."},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "phase": {"type": "string"},
+         "check_hint": {"type": "string", "description": "Exact safe next observation to make; no credentials or absolute paths."},
+         "resume_hint": {"type": "string", "description": "Exact safe continuation instruction; no credentials or absolute paths."},
+         "resource_hint": {"type": "string"},
+         "next_check_at": {"type": "string"},
+         "detail": {"type": "string"},
+         "metadata": {"type": "object"}},
+         "required": ["session_id", "job_key", "provider", "external_id"]}},
+    {"name": "update_external_job", "description":
+        "Record a new observation for an existing external job. Use job_id or "
+        "job_key, and pass only fields that changed; every write appends durable "
+        "history and refreshes the local crash-surviving snapshot. Terminal jobs "
+        "cannot be reopened or silently replaced.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"}, "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "phase": {"type": "string"}, "check_hint": {"type": "string"},
+         "resume_hint": {"type": "string"}, "resource_hint": {"type": "string"},
+         "next_check_at": {"type": "string"}, "detail": {"type": "string"},
+         "metadata": {"type": "object"}},
+         "required": ["session_id"]}},
+    {"name": "get_external_job", "description":
+        "Read one project-scoped external job and its durable observation history. "
+        "Use this from a fresh session before taking any action on a live job.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "include_history": {"type": "boolean"}}, "required": []}},
+    {"name": "list_external_jobs", "description":
+        "Read the project's live external-job register. By default terminal jobs "
+        "are omitted so a new session sees only work that may require observation "
+        "or resumption. The response also reports the host-local snapshot state.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "include_terminal": {"type": "boolean"},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": []}},
+    {"name": "complete_external_job", "description":
+        "Finalize an external job with an explicit terminal outcome. This never "
+        "infers success from output files and never reopens a terminal record. "
+        "It appends a final task-log event and refreshes the local snapshot.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"}, "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
+         "detail": {"type": "string"}, "metadata": {"type": "object"}},
          "required": ["session_id"]}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "
@@ -1880,6 +1996,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "tag": {"type": "string"}},
          "required": []}},
+    {"name": "move_workspace_note_to_project", "description":
+        "Reclassify a workspace-level note (visible across ALL projects) into a "
+        "single project's notes: copies title/body/tags to a new project note "
+        "then removes the workspace note. Tenant-safe on the source note "
+        "(scoped like every other workspace-note tool) and atomic-in-effect on "
+        "the write (a concurrent move/delete of the same note is detected and "
+        "compensated rather than silently duplicated). Returns the new project "
+        "note, or {error} if note_id is unknown/not yours, the destination "
+        "project doesn't exist, or a race already claimed the note.",
+     "inputSchema": {"type": "object", "properties": {
+         "note_id": {"type": "string", "description": "The workspace note's id, as returned by get_workspace_notes/add_workspace_note."},
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": ["note_id"]}},
     {"name": "pin_workspace_decision", "description":
         "Pin a workspace-level decision that applies across ALL projects (shared "
         "architecture, org-wide standards). Injected at the top of every project's "
@@ -2820,6 +2950,51 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "type": {"type": "string", "enum": ["code", "repo"], "description": "Which keyless GitHub endpoint to search (default 'code')."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently indexed/updated first)."}},
          "required": ["query"]}},
+    {"name": "save_watchlist_query", "description":
+        "b924fd7c — save a recurring research query so it can be re-run and "
+        "diffed over time via run_watchlist_query. Persisted as a project note "
+        "(no separate table); the returned watchlist_id addresses it. Sources "
+        "beyond paper_search's own 'arxiv'/'openalex' are reachable here by "
+        "calling the underlying search function directly: 'semantic_scholar' "
+        "and 'pubmed' (meridian.paper_search), 'github_code'/'github_repo' "
+        "(meridian.github_search), and 'hn' (meridian.social_search).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "source_type": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "github_code", "github_repo", "hn"], "description": "Which keyless source this watchlist re-runs against."},
+         "query": {"type": "string", "description": "The search terms to re-run each time."},
+         "limit": {"type": "integer", "description": "Max results per run (default 10, max 50)."},
+         "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order for each run (default relevance)."},
+         "name": {"type": "string", "description": "Optional short label for the watchlist note's title (defaults to the query text)."}},
+         "required": ["source_type", "query"]}},
+    {"name": "list_watchlist_queries", "description":
+        "Read-only: list saved research watchlist queries for a project "
+        "(optionally filtered by source_type), each with its watchlist_id, "
+        "query, source_type, limit, and sort_by.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "source_type": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "github_code", "github_repo", "hn"], "description": "Optional filter."}},
+         "required": []}},
+    {"name": "run_watchlist_query", "description":
+        "b924fd7c — re-run a saved watchlist query and diff its results against "
+        "everything already captured for it. Every newly-seen result (matched "
+        "by a per-source stable id — arxiv_id/openalex_id/s2_id/pmid/sha/repo/"
+        "hn_id, falling back to url) is auto-captured via the same durable "
+        "path as capture_research_finding/save_finding, tagged so the NEXT run "
+        "recognizes it as already-seen. Returns {new_count, already_seen_count, "
+        "new_results, captured, total_results}. Never raises — an unresolvable "
+        "watchlist_id or a network/parse failure from the underlying search "
+        "both degrade to {error}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "watchlist_id": {"type": "string", "description": "id returned by save_watchlist_query / list_watchlist_queries."}},
+         "required": ["watchlist_id"]}},
+    {"name": "delete_watchlist_query", "description":
+        "Delete a saved research watchlist query. Scoped to project_id + the "
+        "watchlist tag, so it never deletes an unrelated note.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "watchlist_id": {"type": "string", "description": "id returned by save_watchlist_query / list_watchlist_queries."}},
+         "required": ["watchlist_id"]}},
     {"name": "get_agent_instructions", "description":
         "Read-only: Return the custom agent_instructions for a project. "
         "These are injected automatically by start_session so every session picks them up. "
@@ -3225,6 +3400,39 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "min_sessions": {"type": "integer"},
          "days": {"type": "integer"}},
          "required": []}},
+    {"name": "list_active_worktrees", "description":
+        "dffcde86 — Read-only: list active (not-removed) git worktrees "
+        "registered for a project, newest first, each row including the "
+        "owning session's name. Reads the same active_worktrees registry "
+        "the merge guard (validate_worktree_merge) and the REST worktree "
+        "endpoints (GET /projects/{id}/worktrees) use — this is the MCP-side "
+        "view of it, for a session that wants to check what's checked out "
+        "before creating a new worktree or investigating a stale one, "
+        "without going through the REST API. Works identically on hosted "
+        "and self-hosted Meridian: it only reads DB rows, never the "
+        "filesystem.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
+    {"name": "list_worktrees_pending_cleanup", "description":
+        "dffcde86 (a03c0eeb) — Read-only: list active_worktrees rows still "
+        "marked active in the DB (removed_at IS NULL) whose owning sprint "
+        "item has reached a terminal status (done/skipped/failed/pushed) or "
+        "whose owning session is closed/archived — the real disk-cleanup "
+        "candidates the periodic sweep (worktree_cleanup.sweep_stale_worktrees) "
+        "reclaims. On hosted Meridian the POST /worktrees/sweep endpoint is "
+        "an explicit filesystem no-op (hosted has no access to the caller's "
+        "disk, so there is nothing there to remove from disk) — this tool is "
+        "the DB-only, hosted-safe way to see which registry rows are stale "
+        "either way; actually clearing a row still requires the self-hosted "
+        "sweep or an explicit DELETE /projects/{id}/worktrees/{worktree_id}. "
+        "Omit project_id to scope across every project, matching the "
+        "server-wide periodic sweep's own query.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
     {"name": "claim_docx_region", "description":
         "f7ee1ba7 — Model B scoped-region claiming for .docx files. Claim a "
         "specific paragraph/element by its durable `element_id` (the w14:paraId "
@@ -3258,6 +3466,51 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "file_path": {"type": "string", "description": "Optional: scope release to one file."},
          "element_id": {"type": "string", "description": "Optional: scope release to one element (requires file_path)."}},
          "required": ["session_id"]}},
+    {"name": "acquire_docx_document_lease", "description":
+        "6507e83a — Whole-document cross-process lease for .docx files, the "
+        "counterpart claim_docx_region never provided (that tool hard-requires a "
+        "specific element_id). Use this when a session needs to rewrite an ENTIRE "
+        "document (a bulk restructure, a canonical-merge promotion) and must block "
+        "out every other writer, not just one element. Blocked by another live "
+        "session's whole-file lock (claim_file) OR ANY other live session's claim "
+        "on the file (lease or scoped element) — a whole-document lease requires the "
+        "document be free of every other session's claims first. Once held, blocks "
+        "every other session's writes (via check_docx_region_write_conflict, the "
+        "same gate update_paragraph and the meridian-docs tunnel relay already "
+        "enforce) and new claim_docx_region attempts on this file until released or "
+        "expired (same TTL as every other claim in this module). Returns "
+        "{leased: true, file_path, session_id} on success or {leased: false, "
+        "reason, message, ...} on conflict — never raises.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string", "description": "The calling session."},
+         "file_path": {"type": "string", "description": "The .docx source path."}},
+         "required": ["session_id", "file_path"]}},
+    {"name": "get_docx_document_lease", "description":
+        "6507e83a — Read-only: the live whole-document lease on a .docx file, if "
+        "any (who holds it). Use before acquire_docx_document_lease or a bulk "
+        "rewrite to see whether the document is already leased by someone else.",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string", "description": "The .docx source path."}},
+         "required": ["file_path"]}},
+    {"name": "release_docx_document_lease", "description":
+        "6507e83a — Release a session's whole-document lease on a .docx file, if "
+        "held. Returns {released: <0 or 1>, session_id, file_path}.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string", "description": "The session releasing its lease."},
+         "file_path": {"type": "string", "description": "The .docx source path."}},
+         "required": ["session_id", "file_path"]}},
+    {"name": "find_orphaned_docx_staged_files", "description":
+        "6507e83a — Maintenance diagnostic: detect staged-DOCX temp files "
+        "(.meridian-docx-stage-*.tmp) left behind by a process that crashed "
+        "between STAGE and PROMOTE inside meridian.doc_store's write transaction. "
+        "Purely a detection utility — never deletes or touches anything it finds. "
+        "Returns a list of {path, size_bytes, age_seconds, likely_orphan}, oldest "
+        "first. A file younger than max_age_seconds is reported but not flagged "
+        "likely_orphan (it may be an active, in-flight promotion).",
+     "inputSchema": {"type": "object", "properties": {
+         "directory": {"type": "string", "description": "Directory to scan (typically a .docx's own parent directory)."},
+         "max_age_seconds": {"type": "number", "description": "Age threshold in seconds for likely_orphan=true. Default 3600 (1 hour)."}},
+         "required": ["directory"]}},
     {"name": "list_plugins", "description":
         "Read-only: Lightweight index of active tunnel plugins — name, description, "
         "enabled state, and tool_count. Does NOT return full tool schemas (use "
@@ -3364,7 +3617,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
          "required": ["file", "anchor", "content"]}},
     {"name": "claim_sprint_item",
-     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, its touches_files overlap active file claims from another live session, or (18c488b6) a touches_resources file:/symbol: entry is locked by another live session — this last check ACQUIRES the resource lock (via claim_file/claim_symbol) as part of claiming, is a hard block regardless of worktree isolation, and rolls back cleanly if the claim itself doesn't land. 54c488b6/54d2c2af: every symbol:/file: resource this acquires also gets a durable lock-granularity receipt (achieved symbol vs. coarse-fallback grain, and why), auditable after the fact independent of this call's response payload.",
+     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, its touches_files overlap active file claims from another live session, or (18c488b6) a touches_resources file:/symbol: entry is locked by another live session — this last check ACQUIRES the resource lock (via claim_file/claim_symbol) as part of claiming, is a hard block regardless of worktree isolation, and rolls back cleanly if the claim itself doesn't land. 54c488b6/54d2c2af: every symbol:/file: resource this acquires also gets a durable lock-granularity receipt (achieved symbol vs. coarse-fallback grain, and why), auditable after the fact independent of this call's response payload. 1b7eb437: on a project that has opted into the 'handoff_provenance_verification' capability (set_capability_manifest), the claimed item's response also carries handoff_provenance_warning (no matching verify_handoff_token/accept_handoff receipt attributable to this session_id was found) or handoff_provenance_receipt (a matching receipt) — informational only, never blocks the claim in this pass. Reuses this tool's existing session_id argument for attribution; no new argument is needed.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -3522,13 +3775,15 @@ _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
     "paper_search", "social_search", "github_search",
+    "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
+    "get_external_job", "list_external_jobs",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
     "search_server_logs", "get_server_log_checkpoint",
     "idle_until_session_done", "generate_handoff", "load_handoff",
     "verify_handoff_token",
-    "export_ai_log", "export_ai_log_artifacts",
+    "export_ai_log", "export_ai_log_artifacts", "search_ai_log",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_blog_posts",
@@ -3537,6 +3792,7 @@ _READ_ONLY_TOOLS = {
     "list_plugins", "get_plugin_details", "refresh_tool_manifest",
     "get_tunnel_diagnostics",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
+    "list_active_worktrees", "list_worktrees_pending_cleanup",
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
     "find_similar_figure",
@@ -3561,7 +3817,7 @@ _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete
 # rather than only reading Meridian's own state.  Keep this separate from the
 # read-only set: a GitHub/paper/social search can be read-only for Meridian
 # while still operating in an external open world.
-_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search"}
+_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search", "run_watchlist_query"}
 
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
@@ -3610,7 +3866,13 @@ _TOOL_CATEGORY: dict[str, str] = {
     "export_ai_log":           "notes",
     "export_ai_log_artifacts": "notes",
     "purge_ai_log":            "notes",
+    "search_ai_log":           "notes",
     "checkpoint":              "session",
+    "register_external_job":    "session",
+    "update_external_job":      "session",
+    "get_external_job":         "session",
+    "list_external_jobs":       "session",
+    "complete_external_job":    "session",
     "get_session_brief":       "session",
     "get_context_block":       "session",
     "get_session_log":         "session",
@@ -3700,6 +3962,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     # workspace-level
     "add_workspace_note":              "workspace",
     "get_workspace_notes":             "workspace",
+    "move_workspace_note_to_project":  "workspace",
     "pin_workspace_decision":          "workspace",
     "get_workspace_decisions":         "workspace",
     "get_workspace_settings":          "workspace",
@@ -3756,6 +4019,12 @@ _TOOL_CATEGORY: dict[str, str] = {
     "claim_docx_region":        "file-locking",
     "get_docx_region_claims":   "file-locking",
     "release_docx_region_claims": "file-locking",
+    "acquire_docx_document_lease": "file-locking",
+    "get_docx_document_lease":     "file-locking",
+    "release_docx_document_lease": "file-locking",
+    "find_orphaned_docx_staged_files": "file-locking",
+    "list_active_worktrees":       "file-locking",
+    "list_worktrees_pending_cleanup": "file-locking",
     # parallel coordination
     "send_message":      "parallel-coord",
     "receive_messages":  "parallel-coord",
@@ -3792,6 +4061,10 @@ _TOOL_CATEGORY: dict[str, str] = {
     "paper_search": "research",
     "social_search": "research",
     "github_search": "research",
+    "save_watchlist_query": "research",
+    "list_watchlist_queries": "research",
+    "run_watchlist_query": "research",
+    "delete_watchlist_query": "research",
 }
 
 _TOOL_ROLE_RELEVANCE: dict[str, str] = {
@@ -3821,6 +4094,16 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "claim_docx_region":         "executor",
     "get_docx_region_claims":    "executor",
     "release_docx_region_claims": "executor",
+    "acquire_docx_document_lease": "executor",
+    "get_docx_document_lease":     "executor",
+    "release_docx_document_lease": "executor",
+    "find_orphaned_docx_staged_files": "executor",
+    # dffcde86 — "both": unlike get_file_claims/get_symbol_claims (executor-only
+    # above), a planner session legitimately wants to see what worktrees are
+    # checked out / pending cleanup too (e.g. before fanning out a wave), not
+    # just an executor mid-edit.
+    "list_active_worktrees":     "both",
+    "list_worktrees_pending_cleanup": "both",
     "insert_equation":           "executor",
     "update_paragraph":          "executor",
     "index_equation":            "executor",
@@ -3835,6 +4118,11 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "generate_handoff":          "executor",
     "record_handoff_correction": "executor",
     "checkpoint":                "executor",
+    "register_external_job":      "executor",
+    "update_external_job":        "executor",
+    "complete_external_job":      "executor",
+    "get_external_job":           "both",
+    "list_external_jobs":         "both",
     "add_sprint_note":           "executor",
     "heartbeat":                 "executor",
     "run_verification":          "executor",
@@ -3866,6 +4154,10 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "paper_search":              "planner",
     "social_search":             "planner",
     "github_search":             "planner",
+    "save_watchlist_query":      "planner",
+    "list_watchlist_queries":    "planner",
+    "run_watchlist_query":       "planner",
+    "delete_watchlist_query":    "planner",
     "capture_research_finding":  "planner",
     "add_insight":               "planner",
     "get_insights":              "planner",
@@ -3887,6 +4179,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "export_ai_log":             "both",
     "export_ai_log_artifacts":   "both",
     "purge_ai_log":              "executor",
+    "search_ai_log":             "both",
     "refresh_context":           "both",
     "get_context_block":         "both",
     "get_session_brief":         "both",
@@ -3943,6 +4236,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_workspace_decisions":   "both",
     "get_workspace_notes":       "both",
     "add_workspace_note":        "both",
+    "move_workspace_note_to_project": "both",
     "get_workspace_settings":    "both",
     "get_blog_posts":            "both",
     "request_hitl":              "both",
@@ -4042,6 +4336,11 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # ---- COMMON SUPPORT: frequent hygiene ----
     # explicitly listed by Adam as common-support
     "checkpoint":                 "common-support",
+    "register_external_job":       "common-support",
+    "update_external_job":         "common-support",
+    "get_external_job":            "common-support",
+    "list_external_jobs":          "common-support",
+    "complete_external_job":       "common-support",
     "add_insight":                "common-support",
     "get_insights":               "common-support",
     "validate_assumption":        "common-support",
@@ -4108,6 +4407,10 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "paper_search":               "common-support",
     "social_search":              "common-support",
     "github_search":              "common-support",
+    "save_watchlist_query":       "common-support",
+    "list_watchlist_queries":     "common-support",
+    "run_watchlist_query":        "common-support",
+    "delete_watchlist_query":     "common-support",
     "capture_research_finding":   "common-support",
     "save_finding":               "common-support",
     # workspace proposals workflow arc
@@ -4168,6 +4471,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "export_ai_log":              "maintenance-only",
     "export_ai_log_artifacts":    "maintenance-only",
     "purge_ai_log":               "maintenance-only",
+    "search_ai_log":              "maintenance-only",
     # sprint item pointer cleanup
     "delete_sprint_item_pointer": "maintenance-only",
     # note cleanup
@@ -4190,6 +4494,10 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "claim_docx_region":          "maintenance-only",
     "get_docx_region_claims":     "maintenance-only",
     "release_docx_region_claims": "maintenance-only",
+    "acquire_docx_document_lease": "maintenance-only",
+    "get_docx_document_lease":     "maintenance-only",
+    "release_docx_document_lease": "maintenance-only",
+    "find_orphaned_docx_staged_files": "maintenance-only",
     "get_citation_edges":         "maintenance-only",
     "resolve_citations":          "maintenance-only",
     "link_flag_to_section":       "maintenance-only",
@@ -4197,6 +4505,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # workspace management (cross-project admin)
     "add_workspace_note":              "maintenance-only",
     "get_workspace_notes":             "maintenance-only",
+    "move_workspace_note_to_project":  "maintenance-only",
     "pin_workspace_decision":          "maintenance-only",
     "get_workspace_decisions":         "maintenance-only",
     "get_workspace_settings":          "maintenance-only",
@@ -4253,6 +4562,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "pin_workspace_decision": "Pin Workspace Decision",
     "get_workspace_notes": "Get Workspace Notes",
     "add_workspace_note": "Add Workspace Note",
+    "move_workspace_note_to_project": "Move Workspace Note to Project",
     "get_workspace_proposals": "Get Workspace Proposals",
     "add_workspace_proposal": "Add Workspace Proposal",
     "add_proposal": "Add Proposal",
@@ -4279,6 +4589,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "export_ai_log": "Export AI Log",
     "export_ai_log_artifacts": "Export AI Log Artifacts",
     "purge_ai_log": "Purge AI Log",
+    "search_ai_log": "Search AI Log",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

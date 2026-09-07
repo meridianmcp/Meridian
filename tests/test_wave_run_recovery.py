@@ -35,6 +35,7 @@ Coverage:
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -374,6 +375,143 @@ async def test_record_outcome_rejects_non_int_exit_code(db):
         await record_wave_run_child_outcome(
             db, run["id"], item["id"], status="succeeded", exit_code="0",
         )
+
+
+# ---------------------------------------------------------------------------
+# 14b-14c. dcf78192 round 2 — record_wave_run_child_outcome must not split its
+# status write from its exit_code write under a mid-flight cancellation
+# (regression for the verifier's exact 2-commit-gap corruption scenario).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_record_outcome_update_path_cancellation_loses_both_fields_not_one(db):
+    """Pre-fix, record_wave_run_child_outcome wrote status/failure_mode via
+    record_wave_run_child's own UPDATE+commit, then issued a SEPARATE
+    exit_code/agent_id UPDATE with its own second commit. A cancellation
+    landing in the gap between those two commits left the row durably
+    showing the new status with exit_code un-set -- exactly the corruption
+    the round-1 verifier reproduced (this is that same scenario, re-targeted
+    at the fixed code).
+
+    Post-fix there is exactly ONE UPDATE and ONE commit for an existing
+    child row, so there is no gap left for a cancellation to land in:
+    a CancelledError raised at that single commit must find status AND
+    exit_code ALREADY applied together (proving the write itself is one
+    atomic unit, not two), and rolling back afterward must revert BOTH
+    fields together back to the pre-call state (proving nothing durable was
+    split either) -- never "status changed, exit_code still stale/None".
+    """
+    pid = await _project(db, "wrc-cancel-update")
+    item = await db_module.add_sprint_item(db, pid, "v1", "FEAT: a")
+    run = await _run(db, pid, item_ids=[item["id"]])
+    await claim_wave_run_child(db, run["id"], item["id"], agent_id="agent-A")
+
+    baseline = (await db_module.get_wave_run_children(db, run["id"]))[0]
+    assert baseline["status"] == "running"
+    assert baseline["exit_code"] is None
+
+    from meridian.db import wave_runs as wave_runs_module
+
+    real_commit = db.commit
+    commit_calls = {"n": 0}
+
+    async def _cancel_first_commit():
+        commit_calls["n"] += 1
+        if commit_calls["n"] == 1:
+            raise asyncio.CancelledError(
+                "simulated outer wait_for timeout landing on the single "
+                "record_wave_run_child_outcome commit"
+            )
+        return await real_commit()
+
+    # A plain instance-attribute assignment (not a class-level patch) shadows
+    # the bound `commit` method without going through the descriptor
+    # protocol, so `_cancel_first_commit` is called with no `self` -- it
+    # already closes over `real_commit`, the genuine bound method captured
+    # above.
+    db.commit = _cancel_first_commit
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await wave_runs_module.record_wave_run_child_outcome(
+                db, run["id"], item["id"],
+                status="succeeded", exit_code=137, actor="agent-A",
+                agent_id="agent-A",
+            )
+
+        # The single UPDATE's execute() already ran (only the commit() that
+        # followed it was poisoned) -- reading it back over the SAME
+        # connection must show status and exit_code TOGETHER, never split,
+        # because they were written by one statement, not two.
+        in_flight = (await db_module.get_wave_run_children(db, run["id"]))[0]
+        assert in_flight["status"] == "succeeded"
+        assert in_flight["exit_code"] == 137, (
+            "status advanced without its paired exit_code -- the exact "
+            "corruption this fix closes"
+        )
+    finally:
+        db.commit = real_commit
+
+    # Now roll back the still-pending transaction (what a caller that
+    # actually reacts to the cancellation -- or a dropped/reset connection
+    # -- would do). Nothing was ever committed, so BOTH fields must revert
+    # together to the pre-call baseline; a split rollback (e.g. status
+    # reverting but exit_code staying at 137, or vice versa) would be just
+    # as much a violation of the "atomic pair" contract as the original bug.
+    await db.rollback()
+    reverted = (await db_module.get_wave_run_children(db, run["id"]))[0]
+    assert reverted["status"] == "running"
+    assert reverted["exit_code"] is None
+
+    # And the function is genuinely retriable afterward -- a real second
+    # attempt (as complete_sprint_item's caller would issue) succeeds
+    # cleanly and lands both fields together for good this time.
+    retried = await wave_runs_module.record_wave_run_child_outcome(
+        db, run["id"], item["id"],
+        status="succeeded", exit_code=137, actor="agent-A", agent_id="agent-A",
+    )
+    assert retried["status"] == "succeeded"
+    assert retried["exit_code"] == 137
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_insert_path_cancellation_leaves_no_row(db):
+    """Same atomicity guarantee for the (rarer) path where no
+    wave_run_children row exists yet when the terminal outcome is recorded
+    (record_wave_run_child_outcome falls back to a single INSERT carrying
+    status, failure_mode, exit_code AND agent_id together). A cancellation
+    at that INSERT's single commit must leave NO row at all after rollback
+    -- never a half-inserted row with a status but no exit_code."""
+    pid = await _project(db, "wrc-cancel-insert")
+    item = await db_module.add_sprint_item(db, pid, "v1", "FEAT: a")
+    run = await _run(db, pid, item_ids=[])  # no pre-registered child row
+
+    assert await db_module.get_wave_run_children(db, run["id"]) == []
+
+    from meridian.db import wave_runs as wave_runs_module
+
+    real_commit = db.commit
+    commit_calls = {"n": 0}
+
+    async def _cancel_first_commit():
+        commit_calls["n"] += 1
+        if commit_calls["n"] == 1:
+            raise asyncio.CancelledError("simulated cancellation on the insert commit")
+        return await real_commit()
+
+    db.commit = _cancel_first_commit
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await wave_runs_module.record_wave_run_child_outcome(
+                db, run["id"], item["id"],
+                status="succeeded", exit_code=0, actor="agent-A", agent_id="agent-A",
+            )
+    finally:
+        db.commit = real_commit
+
+    await db.rollback()
+    assert await db_module.get_wave_run_children(db, run["id"]) == []
 
 
 # ---------------------------------------------------------------------------

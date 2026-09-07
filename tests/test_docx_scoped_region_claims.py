@@ -366,3 +366,85 @@ async def test_claim_docx_region_rejects_empty_element_id(db):
     result = await db_module.claim_docx_region(db, sess, "doc.docx", "")
     assert result["claimed"] is False
     assert result["reason"] == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# Staleness (40937a21) — a stale/crashed holder must not wedge the write gate
+# shut past its own nominal TTL. check_docx_region_write_conflict's Rule 2
+# must agree with claim_docx_region's own acquire-path conflict check
+# (_live_docx_region_claims_for_file / _CLAIM_LIVE_HOURS) about what counts
+# as "still held" — both read the SAME liveness-filtered view, not the raw
+# (intentionally unfiltered) get_docx_region_claims().
+# ---------------------------------------------------------------------------
+
+def _hours_ago(n: float) -> str:
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc) - timedelta(hours=n)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def test_check_conflict_stale_holder_not_blocked(db):
+    """A crashed holder's element claim (released_at still NULL, heartbeat
+    long past _CLAIM_LIVE_HOURS) must not block a DIFFERENT, live session's
+    write to that same element.
+
+    Regression test: check_docx_region_write_conflict used to enforce Rule 2
+    off the unfiltered get_docx_region_claims() read, so a crashed session's
+    never-released claim kept blocking writes indefinitely — past the exact
+    TTL that claim_docx_region's own acquire-path conflict check already
+    treats as expired.
+    """
+    crashed = await _mk_session(db, "crashed-holder")
+    rescuer = await _mk_session(db, "rescuer")
+    doc = "stale-holder.docx"
+    elem = "STALE_ELEM"
+
+    claimed = await db_module.claim_docx_region(db, crashed, doc, elem)
+    assert claimed["claimed"] is True
+
+    # Simulate a crash: the holder's heartbeat goes stale well past
+    # _CLAIM_LIVE_HOURS (2h). Its claim row is never explicitly released
+    # (released_at stays NULL) — exactly the "session gone, row still there"
+    # shape a crash (as opposed to a clean release) produces.
+    await db.execute(
+        "UPDATE sessions SET last_seen = ? WHERE id = ?",
+        (_hours_ago(3), crashed),
+    )
+    await db.commit()
+
+    conflict = await db_module.check_docx_region_write_conflict(
+        db, rescuer, doc, elem
+    )
+    assert conflict is None, (
+        f"A stale/crashed holder's claim should not block a live session: {conflict}"
+    )
+
+
+async def test_claim_docx_region_stale_holder_reclaimable(db):
+    """Companion to the write-gate test above, in one place: claim_docx_region
+    already lets a new session reclaim a stale holder's element (via
+    _live_docx_region_claims_for_file), and after the 40937a21 fix
+    check_docx_region_write_conflict agrees — closing the exact acquire-path
+    vs. write-gate inconsistency the item title names."""
+    crashed = await _mk_session(db, "crashed-holder-2")
+    rescuer = await _mk_session(db, "rescuer-2")
+    doc = "stale-reclaim.docx"
+    elem = "STALE_ELEM_2"
+
+    claimed = await db_module.claim_docx_region(db, crashed, doc, elem)
+    assert claimed["claimed"] is True
+
+    await db.execute(
+        "UPDATE sessions SET last_seen = ? WHERE id = ?",
+        (_hours_ago(3), crashed),
+    )
+    await db.commit()
+
+    # The acquire path already treats the stale claim as gone.
+    reclaim = await db_module.claim_docx_region(db, rescuer, doc, elem)
+    assert reclaim["claimed"] is True
+
+    # ...and the write-conflict gate now agrees: the new owner is not blocked.
+    conflict = await db_module.check_docx_region_write_conflict(
+        db, rescuer, doc, elem
+    )
+    assert conflict is None

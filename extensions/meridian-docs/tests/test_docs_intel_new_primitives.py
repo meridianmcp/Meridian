@@ -552,6 +552,92 @@ def test_write_section_rejects_bad_reference_target(tmp_path):
     assert "error" in result
 
 
+# ---------------------------------------------------------------------------
+# 6b. write_section -- 4544bbe5 style_policy["heading_terminal_punctuation"]
+# ---------------------------------------------------------------------------
+
+def test_write_section_no_style_policy_leaves_heading_text_unchanged(tmp_path):
+    """Default (no style_policy) reproduces pre-4544bbe5 behavior exactly."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    content_spec = [{"type": "paragraph", "text": "Body."}]
+    result = docs_intel.write_section(path, "Discussion.", 1, content_spec, "P0000001")
+    assert result["status"] == "inserted"
+    assert result["heading_text"] == "Discussion."
+
+    paras = docs_intel.parse_docx(path)
+    by_id = {p["para_id"]: p for p in paras}
+    assert by_id[result["heading_para_id"]]["text"] == "Discussion."
+
+
+def test_write_section_empty_heading_terminal_punctuation_strips_trailing_period(tmp_path):
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    content_spec = [{"type": "paragraph", "text": "Body."}]
+    result = docs_intel.write_section(
+        path,
+        "Discussion.",
+        1,
+        content_spec,
+        "P0000001",
+        style_policy={"heading_terminal_punctuation": ""},
+    )
+    assert result["status"] == "inserted"
+    assert result["heading_text"] == "Discussion"
+
+    paras = docs_intel.parse_docx(path)
+    by_id = {p["para_id"]: p for p in paras}
+    assert by_id[result["heading_para_id"]]["text"] == "Discussion"
+
+
+def test_write_section_heading_terminal_punctuation_replaces_existing_punctuation(tmp_path):
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    content_spec = [{"type": "paragraph", "text": "Body."}]
+    result = docs_intel.write_section(
+        path,
+        "Discussion!",
+        1,
+        content_spec,
+        "P0000001",
+        style_policy={"heading_terminal_punctuation": ":"},
+    )
+    assert result["heading_text"] == "Discussion:"
+
+
+def test_write_section_heading_terminal_punctuation_appends_when_absent(tmp_path):
+    """A heading with no existing terminal punctuation still gets the
+    configured string appended (rstrip of an unmatched char set is a no-op,
+    so this exercises the "append" half separately from the "strip" half)."""
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    content_spec = [{"type": "paragraph", "text": "Body."}]
+    result = docs_intel.write_section(
+        path,
+        "Discussion",
+        1,
+        content_spec,
+        "P0000001",
+        style_policy={"heading_terminal_punctuation": ":"},
+    )
+    assert result["heading_text"] == "Discussion:"
+
+
+def test_write_section_rejects_bad_style_policy_without_mutating_file(tmp_path):
+    path = _write_docx(tmp_path, _TWO_SECTION_XML)
+    with open(path, "rb") as fh:
+        original_bytes = fh.read()
+
+    content_spec = [{"type": "paragraph", "text": "Body."}]
+    result = docs_intel.write_section(
+        path,
+        "Discussion",
+        1,
+        content_spec,
+        "P0000001",
+        style_policy={"heading_terminal_punctuation": 123},
+    )
+    assert "error" in result
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes
+
+
 def test_write_section_after_heading_anchor_does_not_swallow_section_body(tmp_path):
     """6822b142 regression: anchoring "after" a HEADING paragraph (instead of
     that section's own last body paragraph) must land the new section after

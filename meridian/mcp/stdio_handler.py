@@ -367,6 +367,12 @@ def build_mcp_server():
                     "required": ["session_id", "file_path"],
                 },
             ),
+            # dffcde86 — _shared_tool() pulls the exact same schema HTTP/MCP
+            # advertises from _MCP_TOOLS_LIST, so this transport can't drift
+            # out of sync with it (same pattern as load_handoff/start_session
+            # above).
+            _shared_tool("list_active_worktrees"),
+            _shared_tool("list_worktrees_pending_cleanup"),
             Tool(
                 name="idle_until_session_done",
                 description=(
@@ -1570,6 +1576,10 @@ def build_mcp_server():
                     "required": [],
                 },
             ),
+            # 84f77597 — _shared_tool() pulls the exact same schema HTTP/MCP
+            # advertises, so stdio can't drift out of sync with it (same
+            # pattern as get_workspace_proposals below).
+            _shared_tool("move_workspace_note_to_project"),
             _shared_tool("get_workspace_proposals"),
             Tool(
                 name="pin_workspace_decision",
@@ -2292,6 +2302,20 @@ def build_mcp_server():
                     arguments["session_id"],
                 )
                 result = {"released": released, "file_path": arguments["file_path"]}
+            elif name == "find_orphaned_docx_staged_files":
+                # 6507e83a — maintenance diagnostic: staged-DOCX temp files
+                # left behind by a crash between STAGE and PROMOTE inside
+                # meridian.doc_store's own write transaction.
+                from ..doc_store import (  # noqa: PLC0415
+                    find_orphaned_docx_staged_files as _find_orphans,
+                )
+                result = {
+                    "directory": arguments["directory"],
+                    "staged_files": _find_orphans(
+                        arguments["directory"],
+                        max_age_seconds=float(arguments.get("max_age_seconds", 3600.0)),
+                    ),
+                }
             elif name == "claim_docx_region":
                 # f7ee1ba7 — Model B scoped docx-region claim.
                 result = await db_module.claim_docx_region(
@@ -2320,6 +2344,29 @@ def build_mcp_server():
                     "session_id": arguments["session_id"],
                     "file_path": arguments.get("file_path"),
                     "element_id": arguments.get("element_id"),
+                }
+            elif name == "acquire_docx_document_lease":
+                # 6507e83a — whole-document cross-process lease.
+                result = await db_module.acquire_docx_document_lease(
+                    db, arguments["session_id"], arguments["file_path"],
+                )
+            elif name == "get_docx_document_lease":
+                # 6507e83a — read-only: the live whole-document lease, if any.
+                result = {
+                    "file_path": arguments["file_path"],
+                    "lease": await db_module.get_docx_document_lease(
+                        db, arguments["file_path"]
+                    ),
+                }
+            elif name == "release_docx_document_lease":
+                # 6507e83a — release a session's whole-document lease.
+                released = await db_module.release_docx_document_lease(
+                    db, arguments["session_id"], arguments["file_path"],
+                )
+                result = {
+                    "released": released,
+                    "session_id": arguments["session_id"],
+                    "file_path": arguments["file_path"],
                 }
             elif name == "idle_until_session_done":
                 _idle_kwargs = {}
@@ -2599,11 +2646,22 @@ def build_mcp_server():
                 "add_sprint_item",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
+                # 88277b63 — durable external-job register; share dispatch
+                # with HTTP MCP so all three transports stay in sync.
+                "register_external_job", "update_external_job",
+                "get_external_job", "list_external_jobs",
+                "complete_external_job",
                 "execute_batch",
                 "batch_read", "batch_mutate",
                 "add_workspace_note", "get_workspace_notes",
+                "move_workspace_note_to_project",
                 "get_workspace_proposals",
                 "pin_workspace_decision", "get_workspace_decisions",
+                # dffcde86 — dispatches to the _handle_file_claims group's
+                # list_active_worktrees / list_worktrees_pending_cleanup
+                # branches in meridian/mcp/handler.py (mirrors that group's
+                # existing get_file_claims branch).
+                "list_active_worktrees", "list_worktrees_pending_cleanup",
             ):
                 # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
                 result = await _dispatch_mcp_tool(

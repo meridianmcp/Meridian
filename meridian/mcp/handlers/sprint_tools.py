@@ -42,6 +42,24 @@ from meridian._deps import validate_input_size, _hosted_mode
 # deferred; the response records that fact below.
 _COMPLETION_ADVISORY_TIMEOUT_S = 5.0
 
+# dcf78192 — pre-commit worktree merge-validation gate (up to three
+# sequential 20s-timeout git subprocess calls inside validate_worktree_merge,
+# f291bb24/eb2e44f8) had no outer bound at all: worst case it alone could
+# consume more wall time than the entire 45s complete_sprint_item dispatch
+# budget (_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S in handler.py). Unlike
+# _COMPLETION_ADVISORY_TIMEOUT_S above, this gate runs BEFORE the commit and
+# is a genuine gate, not advisory work — pinned decision f983b41f explicitly
+# distinguishes "active-worktree validation and strict merge approval remain
+# genuine gates" from the advisory work that gets a fail-open/deferred
+# treatment. So a timeout here fails CLOSED (see WORKTREE_MERGE_VALIDATION_
+# TIMEOUT below), the same direction validate_worktree_merge itself already
+# takes for every other "couldn't verify" case it can hit (HEAD_UNRESOLVABLE,
+# DIRTY_CHECK_FAILED, ANCESTRY_UNRESOLVABLE all block rather than skip) —
+# this extends that existing philosophy to "couldn't verify in time" instead
+# of inventing a new one. 10s leaves ample headroom under the 45s budget
+# while still comfortably covering a real (non-degenerate) git call.
+_MERGE_VALIDATION_TIMEOUT_S = 10.0
+
 
 async def _run_bounded_completion_advisory(
     name: str,
@@ -1294,6 +1312,34 @@ async def handle_claim_sprint_item(
         item = dict(item)
         item["touches_resources_code_notes"] = _resource_code_notes
 
+    # 1b7eb437 (follow-up to 833649f1) — HANDOFF-PROVENANCE receipt gate.
+    # Opt-in via the PROJECT's capability manifest (mirrors a8c0f3b7's
+    # code-intel-prospecting gate contract exactly): a no-op — zero behavior
+    # change, zero extra I/O beyond one cheap manifest read (see
+    # meridian.handoff_receipt's module docstring, point 3) — unless the
+    # project has declared "handoff_provenance_verification" via
+    # set_capability_manifest. When declared, this surfaces whether a
+    # verify_handoff_token/accept_handoff call attributable to THIS claiming
+    # session (its session_id) actually happened, rather than trusting a
+    # pasted /goal's self-report — WARN-ONLY in this pass, never blocks the
+    # claim regardless of the declared availability_policy; a fail-closed
+    # required path + an override_handoff_provenance_receipt escape hatch
+    # are explicitly deferred (see meridian.handoff_receipt module docstring
+    # "Deliberate scope reduction" for the full rationale).
+    try:
+        from meridian.handoff_receipt import verify_handoff_provenance  # noqa: PLC0415
+        _hp_check = await verify_handoff_provenance(
+            db, tenant, args["project_id"], session_id=args.get("session_id"),
+        )
+    except Exception:  # noqa: BLE001 — this advisory check must never block a claim
+        _hp_check = None
+    if _hp_check and _hp_check.get("applicable"):
+        item = dict(item)
+        if _hp_check.get("degraded"):
+            item["handoff_provenance_warning"] = _hp_check.get("warning")
+        elif _hp_check.get("receipt"):
+            item["handoff_provenance_receipt"] = _hp_check.get("receipt")
+
     return item
 
 
@@ -1496,9 +1542,34 @@ async def handle_complete_sprint_item(
                         from meridian.worktree_merge_guard import (  # noqa: PLC0415
                             validate_worktree_merge,
                         )
-                        _validation = await validate_worktree_merge(
-                            db, _server._REPO_ROOT, _wt["id"]
-                        )
+                        try:
+                            _validation = await asyncio.wait_for(
+                                validate_worktree_merge(db, _server._REPO_ROOT, _wt["id"]),
+                                timeout=_MERGE_VALIDATION_TIMEOUT_S,
+                            )
+                        except asyncio.TimeoutError:
+                            # dcf78192 — see _MERGE_VALIDATION_TIMEOUT_S above
+                            # for why this fails closed instead of silently
+                            # proceeding: this is a genuine gate (f983b41f),
+                            # not advisory work, and the underlying gate
+                            # already fails closed on every other
+                            # "couldn't verify" outcome it can produce.
+                            return {
+                                "error": "WORKTREE_MERGE_VALIDATION_TIMEOUT",
+                                "item_id": args["item_id"],
+                                "worktree_id": _wt["id"],
+                                "message": (
+                                    "Refusing to complete: pre-merge worktree "
+                                    "validation (git HEAD/dirty/ancestry checks) did "
+                                    f"not finish within {_MERGE_VALIDATION_TIMEOUT_S:.0f}s. "
+                                    "This is a genuine gate, not advisory work, so it "
+                                    "fails closed rather than skipping the check under "
+                                    "load. Call get_sprint_items to confirm this item "
+                                    "is still not 'done' first, then retry — if git "
+                                    "itself is slow or contended on this host, a brief "
+                                    "wait before retrying may help."
+                                ),
+                            }
                         if not _validation.get("ok"):
                             return {
                                 "error": "WORKTREE_MERGE_BLOCKED",
@@ -2158,9 +2229,27 @@ async def handle_get_sprint_item_pointers(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: get_sprint_item_pointers."""
+    """MCP tool: get_sprint_item_pointers.
+
+    efea329f — cross-project isolation: ``db.get_sprint_item_pointers``
+    itself filters only by ``sprint_item_id`` (no ``project_id`` parameter
+    exists on it at all), so this handler previously returned ANY sprint
+    item's pointers — file paths, symbols, node/citation ids — to a caller
+    that merely knew (or guessed, e.g. from a note or commit message) a
+    foreign project's sprint_item_id, with no project_id check whatsoever.
+    Fixed by requiring project_id and verifying the item's real project_id
+    matches before proceeding, mirroring ``batch_read._op_get_sprint_item_pointers``
+    (which already enforced exactly this for the same underlying DB read)
+    and ``db.proposal_links.link_proposal_evidence``'s verify-then-act
+    pattern used elsewhere in this codebase.
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
     if not args.get("sprint_item_id"):
         return {"error": "sprint_item_id is required"}
+    item = await db_module.get_sprint_item(db, args["sprint_item_id"])
+    if item is None or item.get("project_id") != args["project_id"]:
+        return {"error": f"sprint item not found in project: {args['sprint_item_id']}"}
     pointers = await db_module.get_sprint_item_pointers(
         db, args["sprint_item_id"]
     )
@@ -2193,6 +2282,18 @@ async def handle_resolve_sprint_item_pointers(
     exact same tenant's ``prospect_symbol`` / direct ``codebase__search_graph``
     calls resolved instantly — see build_symbol_resolver's docstring for the
     full root-cause writeup.
+
+    efea329f — cross-project isolation: ``project_id`` was already a
+    required argument here, but it was ONLY ever used to scope the
+    code-graph symbol search — this handler never checked that
+    ``sprint_item_id`` actually belongs to ``project_id`` before resolving
+    and returning its pointer targets (file paths, symbols, node/citation
+    ids). A caller scoped to one project who knew (or was handed, e.g. via a
+    note or commit message) another project's sprint_item_id could resolve
+    and read that foreign item's pointers. Fixed by verifying the item's
+    real project_id before proceeding, mirroring
+    ``batch_read._op_get_sprint_item_pointers`` and
+    ``db.proposal_links.link_proposal_evidence``'s verify-then-act pattern.
     """
     from ..handler import _resolve_ingest_doc_store  # noqa: PLC0415
     from ...pointers import resolve_pointer  # noqa: PLC0415
@@ -2202,6 +2303,10 @@ async def handle_resolve_sprint_item_pointers(
         return {"error": "project_id is required (or pass project_name)"}
     if not args.get("sprint_item_id"):
         return {"error": "sprint_item_id is required"}
+
+    _sprint_item = await db_module.get_sprint_item(db, args["sprint_item_id"])
+    if _sprint_item is None or _sprint_item.get("project_id") != args["project_id"]:
+        return {"error": f"sprint item not found in project: {args['sprint_item_id']}"}
 
     # Resolve the doc-structure store once for node_id lookups (best-effort;
     # None → node_id targets degrade to {resolved:false}).

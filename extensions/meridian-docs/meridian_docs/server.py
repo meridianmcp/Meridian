@@ -1697,6 +1697,34 @@ def audit_equation_style(
 
 
 @mcp.tool()
+def get_journal_style_preset(journal: str) -> dict[str, Any]:
+    """4544bbe5 — Look up a named publishing-convention style-policy preset
+    (a "document profile" shorthand) instead of hand-writing a full
+    style_policy override dict.
+
+    The returned dict is the FULLY RESOLVED policy (every
+    resolve_style_policy key populated), ready to pass straight through as
+    style_policy= to insert_figure_block, insert_caption,
+    audit_equation_style, insert_equation, insert_highlighted_note,
+    write_section, or insert_table.
+
+    Args:
+      journal: Preset name — currently "default" (built-in defaults, named
+        for explicit selection) or "jcshm" (a representative academic-
+        journal convention: centered captions/equations, no terminal
+        punctuation on headings, label-left/data-center table columns).
+
+    Returns:
+      The resolved style policy dict for journal, or {error: <message>} if
+      journal names no known preset.
+    """
+    try:
+        return docs_intel.get_journal_style_preset(journal)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
 def scan_citation_keys(docx_path: str) -> list[str]:
     """1258794a — Return all citation keys present in a .docx (in appearance order).
 
@@ -1994,6 +2022,41 @@ def scan_stale_notes(docx_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def find_orphaned_docx_staged_files(
+    directory: str, max_age_seconds: float = 3600.0,
+) -> list[dict[str, Any]]:
+    """6507e83a (C84-W3, category 8 follow-up) — Detect staged-DOCX temp files
+    left behind by a process that crashed between STAGE and PROMOTE inside a
+    write transaction (see docs_intel._atomic_write_docx_bytes).
+
+    A crash mid-write leaves an orphaned ``.meridian-docx-stage-*.tmp`` file
+    in the destination document's own directory forever — nothing scanned for
+    or cleaned these up before this tool existed (the detection function
+    itself, ``docs_intel.find_orphaned_docx_staged_files``, predates this
+    wiring but had zero real callers — this is the first one). Run this
+    against a document's directory after a suspected crash, or periodically
+    as a maintenance check, to surface what a crashed process left behind.
+
+    Args:
+      directory: Directory to scan (typically the .docx's own parent — the
+        same directory _atomic_write_docx_bytes always stages into).
+      max_age_seconds: A staged file younger than this is far more likely an
+        ACTIVE, in-flight promotion (a legitimate concurrent write) than a
+        crash artifact — it is still reported but with likely_orphan=False.
+        Default 3600 (1 hour).
+
+    Returns a list of {path, size_bytes, age_seconds, likely_orphan} dicts,
+    oldest (most suspicious) first. Never raises — an unreadable/missing
+    directory returns an empty list. Purely a DETECTION utility: it never
+    deletes or otherwise touches anything it finds; removal is a deliberate,
+    separate, caller-driven decision.
+    """
+    return docs_intel.find_orphaned_docx_staged_files(
+        directory, max_age_seconds=max_age_seconds
+    )
+
+
+@mcp.tool()
 def renumber_sequences(
     docx_path: str,
     index_db_path: str | None = None,
@@ -2124,6 +2187,7 @@ def write_section(
     anchor_para_id: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """82d22824 — Create a whole new section (heading + body + figure/table
@@ -2156,6 +2220,12 @@ def write_section(
       anchor_para_id:  w14:paraId (or p{N}) of the paragraph/table to anchor on.
       position:        "before" or "after" (default) the anchor.
       index_db_path:   If supplied, sidecar is invalidated after the write.
+      style_policy:    4544bbe5 — optional document-profile override dict
+                       (see resolve_style_policy / get_journal_style_preset).
+                       Only heading_terminal_punctuation is consulted here:
+                       when not None, strips any trailing .,:;!? from
+                       heading_text and appends this value instead. Omitted
+                       (default None), heading_text is used exactly as given.
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -2175,6 +2245,7 @@ def write_section(
         anchor_para_id=anchor_para_id,
         position=position,
         index_db_path=index_db_path,
+        style_policy=style_policy,
     )
 
 
@@ -2518,6 +2589,7 @@ def insert_table(
     index_db_path: str | None = None,
     allow_degraded_render: bool = False,
     degraded_render_reason: str | None = None,
+    style_policy: dict[str, Any] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """0a1e9c22 — Insert a brand-new bare <w:tbl> at a position relative to an
@@ -2556,6 +2628,12 @@ def insert_table(
                        degraded_render_reason.
       degraded_render_reason: Required, non-empty when
                        allow_degraded_render is True.
+      style_policy:    4544bbe5 — optional document-profile override dict
+                       (see resolve_style_policy / get_journal_style_preset).
+                       table_label_column_alignment sets w:jc on column 0 of
+                       every new cell; table_data_column_alignment sets it on
+                       every column after that. Both default to None (no
+                       w:jc added — same output as before this change).
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -2578,6 +2656,7 @@ def insert_table(
         index_db_path=index_db_path,
         allow_degraded_render=allow_degraded_render,
         degraded_render_reason=degraded_render_reason,
+        style_policy=style_policy,
     )
 
 
@@ -3021,6 +3100,274 @@ def apply_and_merge_batch_transform(
         index_db_path=index_db_path,
         allow_degraded_render=allow_degraded_render,
         degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def build_prose_edit_packet(
+    document_path: str,
+    anchor_query: dict[str, Any],
+    replacement_text: str,
+    section_role: str | None = None,
+    source_provenance: dict[str, Any] | str | None = None,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """4c992e91 -- build ONE reviewable, typed prose-edit packet for a
+    single anchor. READ-ONLY: resolves anchor_query the same way
+    locate_anchor does, against a fresh parse of document_path; never
+    mutates it.
+
+    Refuses (status="refused", no packet built) when replacement_text/
+    anchor_query are malformed, the anchor does not resolve cleanly, or the
+    resolved element is not prose (paragraph/heading only -- an equation,
+    caption, or table is refused so it can never be routed through the
+    plain-text prose writer).
+
+    Args:
+      document_path:                Document to build the packet against.
+                                    Never opened for writing.
+      anchor_query:                  A locate_anchor-style query dict.
+      replacement_text:              The new visible text for this anchor.
+      section_role:                  Optional caller classification of this
+                                    anchor's role (e.g. "abstract", "main")
+                                    -- carried through unchanged, not
+                                    validated here.
+      source_provenance:             Optional free-form metadata describing
+                                    where replacement_text came from --
+                                    hashed into source_provenance_hash,
+                                    never stored verbatim on the packet.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard (a prior locate_anchor/
+                                    read_document_snapshot result's
+                                    source_fingerprint).
+
+    Returns ``{packet_kind: "prose_edit", status: "built", document_path,
+    target_para_id, anchor_query, element_type, section_path, section_role,
+    expected_context_hash, replacement_text, source_provenance_hash,
+    base_docx_hash, built_at_source_fingerprint}`` on success, or
+    ``{packet_kind: "prose_edit", status: "refused", reason, anchor?}`` on
+    refusal. Pass the returned packet to apply_prose_edit_packets to
+    actually write it -- this call never touches disk beyond reading
+    document_path.
+    """
+    return docs_intel.build_prose_edit_packet(
+        document_path, anchor_query, replacement_text,
+        section_role=section_role,
+        source_provenance=source_provenance,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
+def apply_prose_edit_packets(
+    document_path: str,
+    packets: list[dict[str, Any]],
+    draft_output_path: str,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """4c992e91 -- re-resolve and apply a batch of build_prose_edit_packet
+    packets to an ISOLATED draft. document_path is opened read-only
+    throughout and is never the write target -- draft_output_path is.
+
+    ALL-OR-NOTHING: every packet's anchor is re-resolved fresh against
+    document_path's CURRENT content (the packet's own stored anchor/hashes
+    are never trusted blindly); if even one packet fails re-resolution or
+    drift-checking, NOTHING is written -- draft_output_path is never
+    created or partially written.
+
+    Drift is rejected with one of two distinguishable reasons:
+    "context_hash_mismatch" (this anchor's own text changed since the
+    packet was built -- checked first) vs. "base_docx_hash_mismatch" (this
+    anchor's text is unchanged, but the wider document changed). An anchor
+    that no longer resolves gets "anchor_unresolved"; two packets targeting
+    the same live anchor in one call get "duplicate_target_in_batch" on the
+    second. The prose-only element-type gate (paragraph/heading) is
+    re-checked here too, against the freshly resolved element_type --
+    defense in depth against a hand-edited packet or a document whose
+    element kind changed since the packet was built.
+
+    Args:
+      document_path:                The document to transform. Read-only.
+      packets:                       Non-empty list of build_prose_edit_
+                                    packet results (each must have
+                                    status="built").
+      draft_output_path:             Where to stage the transformed draft.
+                                    Must differ from document_path.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard checked before any packet is even
+                                    inspected.
+
+    Returns ``{applied: True, draft_output_path, source_fingerprint,
+    applied_packets, write_transaction}`` on success, or ``{applied: False,
+    reason: "batch_has_conflicts", conflicts, packet_count, ready_count}``
+    on failure (conflicts lists every failing packet, not just the first).
+    See docs_intel.apply_prose_edit_packets for the full contract. This is
+    a LOCAL staging step only -- pair with merge_docx_draft for the actual
+    promotion to a canonical document.
+    """
+    return docs_intel.apply_prose_edit_packets(
+        document_path, packets, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
+def apply_reviewable_edit_transaction(
+    canonical_path: str,
+    steps: list[dict[str, Any]],
+    draft_dir: str,
+    wave_run_id: str,
+    expected_source_fingerprint: str | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    cleanup_drafts: bool = True,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """0d62f067 (BE4ED581-W2) -- batch staged prose replacements and/or
+    section/table/figure relocations into ONE all-or-nothing writer
+    transaction, then promote to canonical_path exactly once.
+
+    canonical_path is opened READ-ONLY for the first step and is NEVER a
+    write target anywhere in this call except inside the final promotion
+    (merge_draft_into_canonical's own atomic stage/verify/backup-restore).
+    Each subsequent step chains onto the PREVIOUS step's own isolated draft
+    inside draft_dir -- docx_path=draft_(n-1) -> draft_output_path=draft_n
+    -- so canonical_path and every earlier draft stay untouched mid-batch.
+
+    ALL-OR-NOTHING: the first step that fails aborts the whole batch. Every
+    draft this call created so far is deleted, canonical_path is guaranteed
+    untouched, and the result names exactly which step failed and why.
+    Promotion only ever runs after every step has already succeeded.
+
+    Args:
+      canonical_path:                The real document (read-only until the
+                                     final promotion).
+      steps:                         Non-empty list of ``{"kind": ..., "params":
+                                     {...}}``. ``kind`` is one of
+                                     "prose_edit_packets" (params:
+                                     ``{"packets": [...], "expected_source_
+                                     fingerprint": <optional>}``, packets
+                                     from build_prose_edit_packet),
+                                     "move_section", "copy_section",
+                                     "relocate_table", or "relocate_figure"
+                                     (params: that primitive's own keyword
+                                     arguments minus docx_path/
+                                     draft_output_path/wave_run_id/
+                                     index_db_path, which this tool injects
+                                     itself). Caption normalization is NOT
+                                     yet a supported step kind -- edit_caption
+                                     has no draft-mode support yet; this is a
+                                     documented, deferred follow-up, not an
+                                     oversight.
+      draft_dir:                     Directory to stage every intermediate
+                                     draft in (created if missing).
+      wave_run_id:                  Required, non-empty; threaded into every
+                                     chained step's own wave_run_id and used
+                                     to name intermediate drafts.
+      expected_source_fingerprint:  Optional whole-document staleness guard
+                                     on canonical_path, checked before the
+                                     first step even runs.
+      index_db_path:                Forwarded only to the final promotion
+                                     (each intermediate step already skips
+                                     sidecar invalidation while
+                                     draft_output_path is set).
+      allow_degraded_render /
+      degraded_render_reason:       Forwarded verbatim to the final
+                                     promotion -- see merge_docx_draft's own
+                                     docstring for the shared, audited
+                                     opt-in contract.
+      cleanup_drafts:               Default True. On full success, every
+                                     draft this call created (intermediate
+                                     and final) is deleted. On a step
+                                     failure, every draft created so far is
+                                     ALWAYS deleted regardless of this flag.
+                                     On a merge failure specifically
+                                     (every step succeeded, promotion did
+                                     not), intermediate drafts are deleted
+                                     but the final pre-merge draft is kept
+                                     on disk so it can be inspected or
+                                     retried via merge_docx_draft.
+      session_id:                   273df573, wired for this tool by the
+                                     0d62f067 round-2 fix -- identifies the
+                                     calling Meridian session to the
+                                     tunnel-layer DOCX region-claim guard
+                                     (check_docs_write_conflict in
+                                     meridian/routes/tunnel.py, backed by
+                                     that module's _DOCS_WRITE_TOOLS map;
+                                     the guarded path is canonical_path,
+                                     with no narrower anchor -- this tool is
+                                     registered the same "whole-document
+                                     fallback" way merge_docx_draft is,
+                                     since a single transaction can touch an
+                                     arbitrary mix of elements across its
+                                     steps list). Not forwarded to
+                                     docs_intel; has no effect when this
+                                     tool is invoked outside Meridian's
+                                     tunnel (e.g. standalone
+                                     `uvx meridian-docs`).
+
+                                     Known limits of that guard, honestly
+                                     stated rather than overclaimed: (1) it
+                                     is FAIL-OPEN, same as every other
+                                     _DOCS_WRITE_TOOLS entry -- a missing db,
+                                     an unidentifiable target, or a claim-
+                                     lookup error lets the call through
+                                     unblocked rather than refusing it; (2)
+                                     this tool is NOT one of the four
+                                     _PRIMARY_DOCX_RELEASE_TOOLS
+                                     (move_section/copy_section/
+                                     relocate_table/merge_docx_draft), so it
+                                     gets neither those tools' FAIL-CLOSED
+                                     required-claim-lookup gate
+                                     (_required_claim_lookup_gate) nor their
+                                     docx_merge PREPARED->RELEASED release-
+                                     transaction audit trail -- a deliberate,
+                                     separately-scoped follow-up (see the
+                                     comment above _PRIMARY_DOCX_RELEASE_TOOLS
+                                     in tunnel.py), not something this fix
+                                     silently grants.
+
+                                     NOT provided by this tool call itself
+                                     AT ALL, guard or no guard: cross-process
+                                     single-writer LOCKING (mutual exclusion,
+                                     as opposed to the claim-conflict check
+                                     above). meridian.db.locks.
+                                     acquire_docx_document_lease/
+                                     release_docx_document_lease is an
+                                     async, aiosqlite-backed primitive in
+                                     the Meridian CORE package -- this
+                                     stdlib-only, DB-free extension cannot
+                                     call it. A caller that needs exclusive
+                                     access across this whole transaction
+                                     should acquire that lease over its own
+                                     separate Meridian MCP/DB connection
+                                     BEFORE calling this tool, and release
+                                     it after.
+
+    Returns on full success: merge_docx_draft's own result dict plus
+    ``{transaction: True, wave_run_id, steps_applied, cleanup}``. Returns on
+    a step failure: ``{transaction: False, reason: "step_failed",
+    failed_step_index, failed_step_kind, step_result, steps_applied,
+    cleanup}`` (canonical_path untouched). Returns on a merge failure:
+    merge_docx_draft's own error dict plus ``{transaction: False, reason:
+    "merge_failed", steps_applied, final_draft_path, cleanup}``. Returns
+    ``{transaction: False, reason: "invalid_request"|
+    "document_changed_before_apply", error: ...}`` for a malformed request
+    or a canonical_path staleness mismatch -- nothing is touched in either
+    case. See docs_intel.apply_reviewable_edit_transaction for the full
+    contract.
+    """
+    return docs_intel.apply_reviewable_edit_transaction(
+        canonical_path,
+        steps,
+        draft_dir,
+        wave_run_id,
+        expected_source_fingerprint=expected_source_fingerprint,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+        cleanup_drafts=cleanup_drafts,
     )
 
 

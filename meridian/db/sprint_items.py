@@ -258,7 +258,29 @@ async def get_open_task_for_sprint_item(
 async def get_blocking_dependency_for_sprint_item(
     db: aiosqlite.Connection, sprint_item_id: str
 ) -> dict[str, Any] | None:
-    """Return the unmet parent sprint item that blocks a claim, if any."""
+    """Return the unmet parent sprint item that blocks a claim, if any.
+
+    efea329f — cross-project isolation fix: a ``depends_on`` id that
+    resolves to a REAL item belonging to a DIFFERENT project than
+    ``sprint_item_id``'s own project is treated exactly like a nonexistent
+    dependency target (the same ``"(missing sprint item)"``/``status:
+    "missing"`` shape already used below for a truly-missing id) rather
+    than returning the foreign item's full row — title included — to the
+    caller. This mirrors ``get_dependency_frontier``'s documented
+    multi-project isolation contract a few hundred lines below in this same
+    module ("a foreign-project id is indistinguishable from — and correctly
+    treated the same as — a nonexistent one").
+
+    Before this fix, this function had NO project check at all: both of its
+    call sites — ``routes.tasks._claim_task_result`` (wired to the plain
+    authenticated ``POST /projects/{project_id}/tasks/claim`` route) and
+    ``executor_contract._resolve_dependency_state`` (embedded in every
+    ``generate_handoff`` call's ``capability_contract.item_executor_contracts``)
+    — surfaced the returned dict's ``title``/``id`` straight through, so a
+    cross-project ``depends_on`` value let one project's sprint-item title
+    leak into another project's task-claim response / rendered handoff. See
+    ``tests/test_efea329f_cross_project_isolation.py``.
+    """
     item = await get_sprint_item(db, sprint_item_id)
     if item is None:
         return None
@@ -267,6 +289,10 @@ async def get_blocking_dependency_for_sprint_item(
         return None
     parent = await get_sprint_item(db, parent_id)
     if parent is None:
+        return {"id": parent_id, "title": "(missing sprint item)", "status": "missing"}
+    _own_project_id = item.get("project_id")
+    if _own_project_id and parent.get("project_id") != _own_project_id:
+        # Foreign-project dependency target — isolate, treat as missing.
         return {"id": parent_id, "title": "(missing sprint item)", "status": "missing"}
     if parent.get("status") != "done":
         return parent
@@ -469,6 +495,43 @@ def _title_word_overlap(a: set[str], b: set[str]) -> float:
 _SPRINT_ITEMS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _SPRINT_ITEMS_CACHE_TTL = 2.0  # seconds — see a1d75ff3 note above for why 2s, not 10s
 
+# 2cf57fde — hit/miss counters for this cache, the one genuinely active,
+# already-measurable Neon-avoidance mechanism today (see
+# meridian/redis_bridge.py's get_redis_runtime_diagnostics, which reports
+# these under cache.local_process_cache). Per-process, like the cache
+# itself; reset alongside it via reset_sprint_items_cache_diagnostics.
+_SPRINT_ITEMS_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+def reset_sprint_items_cache_diagnostics() -> None:
+    """Test helper — zero the hit/miss counters without touching the cache
+    entries themselves (mirrors redis_bridge.reset_redis_client_cache's
+    "clean diagnostics slate" role for this module's own cache)."""
+    _SPRINT_ITEMS_CACHE_STATS["hits"] = 0
+    _SPRINT_ITEMS_CACHE_STATS["misses"] = 0
+
+
+def get_sprint_items_cache_diagnostics() -> dict[str, Any]:
+    """Safe, non-secret snapshot of this process-local board-read cache:
+    hits, misses, hit rate, live entry count, and TTL. ``reads_avoided`` is
+    exactly ``hits`` — every hit is one get_sprint_items() DB/Neon query that
+    did not happen. Used by meridian/redis_bridge.py's
+    get_redis_runtime_diagnostics to report genuine, measured Neon-avoidance
+    (as opposed to the not-yet-implemented Redis-backed cache, which reports
+    honestly as inactive rather than reusing these numbers)."""
+    hits = _SPRINT_ITEMS_CACHE_STATS["hits"]
+    misses = _SPRINT_ITEMS_CACHE_STATS["misses"]
+    total = hits + misses
+    return {
+        "available": True,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": (hits / total) if total else None,
+        "entries": len(_SPRINT_ITEMS_CACHE),
+        "ttl_seconds": _SPRINT_ITEMS_CACHE_TTL,
+        "reads_avoided": hits,
+    }
+
 
 def _invalidate_sprint_items_cache(project_id: str) -> None:
     """Drop the cached sprint-item list for a project after a mutation.
@@ -506,7 +569,9 @@ async def get_sprint_items_cached(
     now = time.monotonic()
     hit = _SPRINT_ITEMS_CACHE.get(project_id)
     if hit is not None and (now - hit[0]) < _SPRINT_ITEMS_CACHE_TTL:
+        _SPRINT_ITEMS_CACHE_STATS["hits"] += 1
         return hit[1]
+    _SPRINT_ITEMS_CACHE_STATS["misses"] += 1
     items = await get_sprint_items(db, project_id)
     _SPRINT_ITEMS_CACHE[project_id] = (now, items)
     return items
@@ -2160,6 +2225,17 @@ async def complete_sprint_item(
     wave-run bookkeeping hook in this module: never lets wave-run
     bookkeeping block or fail a completion that has already committed. A
     project that never calls ``start_wave_run`` sees zero behavior change.
+
+    07229675 — WARN-ONLY ``blocker_kind`` completion re-check: if the item
+    still carries ``blocker_kind in ('superseded', 'systemic_invalidated_run')``
+    at completion time (:func:`_is_hard_blocked_sprint_item`), the returned
+    row gains a ``blocker_kind_completion_warning`` key explaining that this
+    item's premise may have been invalidated after it was claimed.
+    Deliberately advisory only — completion is never blocked by this check
+    in this pass (see the inline comment at the check site for the full
+    rationale and the deferred fail-closed follow-up). Runs in the same
+    branch as the ownership/verification/evidence gates above, so it is
+    correctly skipped for the idempotent ``already_committed`` replay path.
     """
     _t_start = time.monotonic()
     _phase_ms: dict[str, float] = {}
@@ -2192,7 +2268,43 @@ async def complete_sprint_item(
 
     _evidence_quality_warning: str | None = None
     _stored_evidence_warning: str | None = None
+    _blocker_kind_completion_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
+        # 07229675 — WARN-ONLY blocker_kind re-check at completion time.
+        # claim_sprint_item hard-gates blocker_kind in ('superseded',
+        # 'systemic_invalidated_run') at CLAIM time (f89d440f/cc3864bd), but
+        # nothing previously re-read blocker_kind here at COMPLETE time. An
+        # item can transition INTO one of those two states after a session
+        # has already claimed it — block_sprint_items_for_systemic_invalidation
+        # explicitly documents that an already in_progress item stays
+        # in_progress (never forced to a new status) when marked invalidated
+        # — so a session holding a live claim could complete the item anyway,
+        # unconditionally bypassing the hard gate's entire purpose. Reuses
+        # the existing :func:`_is_hard_blocked_sprint_item` predicate (same
+        # one ``get_parallelizable_groups``/handoff goal-building already use)
+        # so this can never disagree with claim_sprint_item's own gate about
+        # which blocker_kind values are hard-blocking ('manual' is a soft,
+        # listing-only exclusion — see f89d440f — and is deliberately NOT
+        # included here).
+        #
+        # Deliberately WARN-ONLY, not a hard block, in this pass — mirrors
+        # meridian/handoff_receipt.py's own precedent (1b7eb437): ship
+        # warn-only first on the single hottest completion path in the
+        # codebase, defer a fail-closed gate + override flag to a follow-up
+        # once the warning's real-world false-positive rate is known. Fails
+        # open (no warning) for a missing/unset blocker_kind, matching every
+        # other structural gate in this module.
+        if _is_hard_blocked_sprint_item(item):
+            _blocker_kind_completion_warning = (
+                f"item {item_id} is being completed while still marked "
+                f"blocker_kind={item.get('blocker_kind')!r} — its premise may "
+                "have been superseded or the wave run that owned it "
+                "systemically invalidated AFTER this claim was taken. This "
+                "is a WARN-ONLY signal: completion is NOT blocked. Verify "
+                "this item's work is still valid before relying on it; if "
+                "so, clear blocker_kind via update_sprint_item so future "
+                "claims/completions stop seeing this warning."
+            )
         # 8693b6a8 — claim-ownership gate. See the docstring above for the
         # full contract; short version: only block when we can actually
         # compare two non-empty identities and they disagree, and even then
@@ -2347,6 +2459,7 @@ async def complete_sprint_item(
         # so it runs under a bounded budget and can never turn an
         # already-successful commit into a hung or misleading response.
         _completion_outcome = "committed"
+        _advisory_deferred = False
         # 7d71d6bc — RESCUE-R2: best-effort wave-run child terminal-outcome
         # bookkeeping, INCLUDING the real subprocess exit code (see the
         # docstring's exit_code paragraph). Only on a genuine fresh commit —
@@ -2354,20 +2467,22 @@ async def complete_sprint_item(
         # this function's own "no duplicate side effects on retry"
         # discipline. Lazy import + fully swallowed: must never turn an
         # already-successful completion into a failure.
+        #
+        # dcf78192 — this step used to be the one post-commit block in this
+        # function with no wall-clock bound at all (every sibling advisory
+        # step below already ran under _ADVISORY_PHASE_TIMEOUT_S). A slow
+        # wave_runs DB round-trip could eat unbounded time here before the
+        # response was ever built. Now bounded the same way as its siblings:
+        # a timeout sets advisory_work_deferred=True instead of stalling.
         try:
-            from meridian.db import wave_runs as _wave_runs_module  # noqa: PLC0415
-            _wr_child = await _wave_runs_module.find_active_wave_run_child_for_item(
-                db, project_id, item_id,
+            await asyncio.wait_for(
+                _record_wave_run_completion(db, project_id, item_id, exit_code, actor),
+                timeout=_ADVISORY_PHASE_TIMEOUT_S,
             )
-            if _wr_child is not None:
-                await _wave_runs_module.record_wave_run_child_outcome(
-                    db, _wr_child["wave_run_id"], item_id,
-                    status="succeeded", exit_code=exit_code,
-                    actor=actor, agent_id=actor,
-                )
+        except asyncio.TimeoutError:
+            _advisory_deferred = True
         except Exception:  # noqa: BLE001 — wave-run bookkeeping must never wedge completion
             pass
-        _advisory_deferred = False
         try:
             await asyncio.wait_for(
                 _run_post_commit_side_effects(db, project_id, item_id),
@@ -2378,12 +2493,14 @@ async def complete_sprint_item(
         except Exception:  # noqa: BLE001 — advisory only, never block completion
             pass
         _mark_phase("post_commit_advisory")
-        if _evidence_quality_warning or _stored_evidence_warning:
+        if _evidence_quality_warning or _stored_evidence_warning or _blocker_kind_completion_warning:
             result = dict(result)
             if _evidence_quality_warning:
                 result["evidence_quality_warning"] = _evidence_quality_warning
             if _stored_evidence_warning:
                 result["stored_evidence_warning"] = _stored_evidence_warning
+            if _blocker_kind_completion_warning:
+                result["blocker_kind_completion_warning"] = _blocker_kind_completion_warning
         # ecc8b280 — machine-readable continuation_required/terminal_ready
         # state, scoped to this item's own version bucket, so a caller that
         # only calls complete_sprint_item (never get_sprint_progress) still
@@ -2436,6 +2553,39 @@ async def complete_sprint_item(
         result["correlation_id"] = _correlation_id
         result["phase_timings_ms"] = dict(_phase_ms)
     return result
+
+
+async def _record_wave_run_completion(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    exit_code: int | None,
+    actor: str | None,
+) -> None:
+    """7d71d6bc / dcf78192 — best-effort wave-run child terminal-outcome
+    bookkeeping (INCLUDING the real subprocess exit code), split out so the
+    caller can await it under its own bounded ``asyncio.wait_for`` budget,
+    mirroring :func:`_run_post_commit_side_effects`. A project that never
+    calls ``start_wave_run`` sees zero behavior change (``find_active_wave_
+    run_child_for_item`` returns ``None`` and this is a no-op).
+
+    Deliberately has NO internal try/except: the caller (``complete_sprint_
+    item``) already treats any exception raised here — and, as of dcf78192,
+    any timeout — as fail-open, so double-swallowing here would only hide
+    the classification. Module-level lookup (not a top-of-file import) to
+    avoid an import cycle, matching the pre-existing call site this was
+    extracted from.
+    """
+    from meridian.db import wave_runs as _wave_runs_module  # noqa: PLC0415
+    _wr_child = await _wave_runs_module.find_active_wave_run_child_for_item(
+        db, project_id, item_id,
+    )
+    if _wr_child is not None:
+        await _wave_runs_module.record_wave_run_child_outcome(
+            db, _wr_child["wave_run_id"], item_id,
+            status="succeeded", exit_code=exit_code,
+            actor=actor, agent_id=actor,
+        )
 
 
 async def _run_post_commit_side_effects(
@@ -2599,12 +2749,16 @@ async def get_dependency_frontier(
     site that needs REAL fan-in barrier enforcement — currently
     ``claim_sprint_item``'s DEPENDENCY_NOT_SATISFIED gate below and
     ``get_parallelizable_groups``'s eligibility check.
-    ``get_blocking_dependency_for_sprint_item`` itself is left completely
-    unchanged: it has callers outside this item's declared scope (e.g.
-    ``executor_contract._resolve_dependency_state``) that still expect its
-    original single-parent contract, and a JSON-array ``depends_on`` value
-    simply fails closed there (never matches a real item id, so it reads as
-    an unresolved/missing dependency rather than a falsely-satisfied one).
+    ``get_blocking_dependency_for_sprint_item``'s single-parent CONTRACT is
+    left completely unchanged (it has callers outside this item's declared
+    scope, e.g. ``executor_contract._resolve_dependency_state``, that still
+    expect its original single-parent shape, and a JSON-array ``depends_on``
+    value simply fails closed there — never matches a real item id, so it
+    reads as an unresolved/missing dependency rather than a falsely-satisfied
+    one) — but efea329f DID give it the same cross-project isolation guard
+    this function documents immediately below: see that function's own
+    docstring. The two now share the identical "foreign-project id reads as
+    missing" contract; only the single- vs. multi-parent shape differs.
 
     Zero-predecessor items (the overwhelming majority) short-circuit with no
     DB access at all: ``{"predecessor_ids": [], "ready": True, "blocking":

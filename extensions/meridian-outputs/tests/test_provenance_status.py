@@ -41,6 +41,15 @@ from meridian_outputs import outputs_local as OL
 from meridian_outputs import provenance_status as PS
 from meridian_outputs import research_evidence as RE
 
+# db63385b (W31-B): tools/meridian_fallbacks/figure_invariant_gate.py lives
+# under the repo root, not this extension -- add the repo root explicitly
+# (this file's own established pattern above, just one level further up)
+# rather than depending solely on pytest.ini's `pythonpath = .`.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tools.meridian_fallbacks import figure_invariant_gate as FIG
+
 try:
     import duckdb as _duckdb_probe  # noqa: F401
     _DUCKDB_AVAILABLE = True
@@ -1094,3 +1103,122 @@ class TestBuildProvenanceEnvelope:
         payload = RE.serialize_provenance_envelope(env, format="xml")
         restored = RE.parse_provenance_envelope(payload, format="xml")
         assert restored == env
+
+
+# ---------------------------------------------------------------------------
+# db63385b (W31-B): a REAL get_provenance_status RELOCATED/AMBIGUOUS result
+# must thread into tools/meridian_fallbacks/figure_invariant_gate.py's own
+# fail-closed classification correctly -- SOURCE_MISMATCH/AMBIGUOUS, never a
+# false INVARIANT_HOLDS just because bound_source/content happen to line up.
+# ---------------------------------------------------------------------------
+
+class TestFigureInvariantGateProvenanceIntegration:
+    @duckdb_required
+    def test_relocated_provenance_maps_to_source_mismatch_not_false_holds(
+        self, tmp_path: Path,
+    ) -> None:
+        old = tmp_path / "run_1" / "figure_data.csv"
+        old.parent.mkdir()
+        old.write_text("x,y\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script="plot.py")
+
+        new = tmp_path / "run_1_moved" / "figure_data.csv"
+        new.parent.mkdir()
+        new.write_text("x,y\n1,2\n", encoding="utf-8")  # identical content, moved
+        old.unlink()
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+
+        # Deliberately give canonical and candidate the SAME bound_source
+        # value (the recorded OLD path) and identical numeric/text content
+        # -- without figure_invariant_gate's dedicated RELOCATED rule, this
+        # would otherwise be a false INVARIANT_HOLDS.
+        canonical = FIG.FigureSlotPayload(
+            bound_source={"kind": "resolved_path", "value": str(old)},
+            numeric_values=(1, 2),
+            text_content=("x", "y"),
+            provenance_type=FIG.PROVENANCE_EXACT,
+        )
+        candidate = FIG.FigureSlotPayload(
+            bound_source={"kind": "resolved_path", "value": status["record"]["path"]},
+            numeric_values=(1, 2),
+            text_content=("x", "y"),
+            provenance_type=status["provenance_type"],
+            provenance_candidates=status.get("candidates") or (),
+        )
+        assert canonical.bound_source == candidate.bound_source  # precondition
+
+        result = FIG.compare_figure_invariants(canonical, candidate)
+        assert result["verdict"] == FIG.SOURCE_MISMATCH
+        assert result["verdict"] != FIG.INVARIANT_HOLDS
+
+    @duckdb_required
+    def test_ambiguous_provenance_maps_to_ambiguous_not_false_holds(
+        self, tmp_path: Path,
+    ) -> None:
+        content = "epoch,accuracy\n1,0.9\n"
+        first = tmp_path / "run_a" / "metrics.csv"
+        first.parent.mkdir()
+        first.write_text(content, encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(first))
+        second = tmp_path / "run_b" / "metrics.csv"
+        second.parent.mkdir()
+        second.write_text(content, encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(second))
+        candidate_file = tmp_path / "run_c" / "metrics.csv"
+        candidate_file.parent.mkdir()
+        candidate_file.write_text(content, encoding="utf-8")  # matches BOTH
+
+        status = PS.get_provenance_status(str(tmp_path), str(candidate_file))
+        assert status["provenance_type"] == PS.AMBIGUOUS
+        assert len(status["candidates"]) == 2
+
+        canonical = FIG.FigureSlotPayload(
+            bound_source={"kind": "resolved_path", "value": str(first)},
+            numeric_values=(0.9,),
+            text_content=("epoch", "accuracy"),
+            provenance_type=FIG.PROVENANCE_EXACT,
+        )
+        candidate = FIG.FigureSlotPayload(
+            bound_source={"kind": None, "value": None},
+            numeric_values=(0.9,),
+            text_content=("epoch", "accuracy"),
+            provenance_type=status["provenance_type"],
+            provenance_candidates=status["candidates"],
+        )
+        result = FIG.compare_figure_invariants(canonical, candidate)
+        assert result["verdict"] == FIG.AMBIGUOUS
+        assert result["verdict"] != FIG.INVARIANT_HOLDS
+        assert result["verdict"] != FIG.NO_GENERATOR  # ambiguous, not "no signal at all"
+
+    @duckdb_required
+    def test_exact_provenance_with_matching_source_and_content_holds(
+        self, tmp_path: Path,
+    ) -> None:
+        """Control case: a REAL exact (non-relocated, non-ambiguous)
+        provenance result, threaded through unchanged, must still be able
+        to reach INVARIANT_HOLDS -- proving the RELOCATED/AMBIGUOUS rules
+        above are targeted overrides, not a blanket refusal to ever hold."""
+        f = tmp_path / "figure_data.csv"
+        f.write_text("x,y\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f))
+
+        status = PS.get_provenance_status(str(tmp_path), str(f))
+        assert status["provenance_type"] == PS.EXACT
+
+        canonical = FIG.FigureSlotPayload(
+            bound_source={"kind": "resolved_path", "value": status["record"]["path"]},
+            numeric_values=(1, 2),
+            text_content=("x", "y"),
+            provenance_type=status["provenance_type"],
+        )
+        candidate = FIG.FigureSlotPayload(
+            bound_source={"kind": "resolved_path", "value": status["record"]["path"]},
+            numeric_values=(1, 2),
+            text_content=("x", "y"),
+            typography={"font": "Arial"},
+            provenance_type=status["provenance_type"],
+        )
+        result = FIG.compare_figure_invariants(canonical, candidate)
+        assert result["verdict"] == FIG.INVARIANT_HOLDS

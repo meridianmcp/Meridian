@@ -1890,6 +1890,57 @@ async def handle_audit_figure_table_provenance(
         counts[f"{entry['status']}_count"] += 1
         tables_out.append(entry)
 
+    # W31-A -- durable resolver receipts. Every figure/table resolution this
+    # call just computed is translated onto bind_artifact_provenance's own
+    # four-way status vocabulary (AUDIT_STATUS_TO_BINDING_STATUS) and
+    # persisted as one artifact_provenance_receipt row each, so a later
+    # reader (find_recent_artifact_provenance_receipt /
+    # find_recent_artifact_provenance_receipts_for_document) can see, after
+    # the fact, that this document's provenance was actually resolved and
+    # what was found -- not just a transient report dict that's gone the
+    # moment this call returns. Best-effort and fully guarded: a receipt-
+    # write failure must never break this tool's primary, already-computed
+    # audit report.
+    receipts_recorded = 0
+    try:
+        from meridian import artifact_provenance_receipt as _apr  # noqa: PLC0415
+
+        bindings: list[dict[str, Any]] = []
+        for fig in figures_out:
+            bindings.append({
+                "artifact_id": f"figure:{fig.get('id')}",
+                "kind": "figure",
+                "canonical_path": fig.get("file_path"),
+                "status": _apr.AUDIT_STATUS_TO_BINDING_STATUS.get(
+                    fig.get("status"), _apr.UNRESOLVED,
+                ),
+                "match_type": fig.get("match_type"),
+                "generating_script": fig.get("generating_script"),
+                "resolved_sha256": fig.get("sha256"),
+                "reason": fig.get("reason"),
+            })
+        for tbl in tables_out:
+            bindings.append({
+                "artifact_id": f"table:{tbl.get('id')}",
+                "kind": "table",
+                "canonical_path": None,
+                "status": _apr.AUDIT_STATUS_TO_BINDING_STATUS.get(
+                    tbl.get("status"), _apr.UNRESOLVED,
+                ),
+                "match_type": None,
+                "generating_script": tbl.get("generating_script"),
+                "resolved_sha256": tbl.get("sha256"),
+                "reason": tbl.get("reason"),
+            })
+        written = await _apr.record_artifact_provenance_receipts_batch(
+            db, project_id=args["project_id"], bindings=bindings,
+            document_id=doc_row["id"],
+            tenant_id=(tenant or {}).get("id") if tenant else None,
+        )
+        receipts_recorded = len(written)
+    except Exception:  # noqa: BLE001 -- receipts are additive, never load-bearing here
+        receipts_recorded = 0
+
     return {
         "project_id": args["project_id"],
         "doc": doc_source,
@@ -1901,6 +1952,7 @@ async def handle_audit_figure_table_provenance(
             "table_count": len(tables_out),
             **counts,
         },
+        "receipts_recorded": receipts_recorded,
     }
 
 
@@ -2206,6 +2258,78 @@ async def handle_get_workspace_notes(
     return await db_module.get_workspace_notes(
         db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
     )
+
+
+async def handle_move_workspace_note_to_project(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: move_workspace_note_to_project (84f77597).
+
+    Reclassifies a workspace-level note (visible across all projects) into a
+    single project's notes. The destination is deliberately named
+    ``project_id`` (with a ``project_name`` alternative, resolved to
+    ``project_id`` upstream in ``_dispatch_mcp_tool`` before this handler
+    runs) so it flows through the generic project-scope gate in
+    ``mcp/handler.py`` like every other project-scoped write tool — source
+    ownership is enforced by ``tenant_id`` inside
+    ``db_module.move_workspace_note_to_project`` itself; see that function's
+    docstring for the full tenant-safety and atomicity-in-effect rationale.
+
+    Round-2 security fix (verifier-reported bypass, 84f77597): the generic
+    gate in ``_handle_mcp_request`` checks ``args["project_id"]`` BEFORE
+    ``_dispatch_mcp_tool``'s project_name -> project_id resolver runs, and
+    that resolver unconditionally overwrites ``args["project_id"]`` with
+    whatever ``project_name`` resolves to, with no re-check. A caller could
+    pass an in-scope ``project_id`` (satisfies the early gate) together with
+    an out-of-scope ``project_name`` (silently wins the resolver, never
+    re-validated) and land the note in a project outside their scope. By the
+    time THIS handler runs, ``args["project_id"]`` is whatever the
+    dispatcher finally settled on regardless of which of the two args
+    "won" — so re-checking that final, resolved value here, right before the
+    destination write, closes the gap independent of arrival order.
+    ``_scoped_project_ids`` is threaded straight through from
+    ``mcp/handler.py``'s ``_handle_mcp_request`` (the exact list object the
+    generic gate already computed for this request — see the call site
+    immediately before ``_dispatch_mcp_tool``) and reused as-is here, never
+    recomputed, so this check can never disagree with the gate about what
+    the caller's scope actually is. Absent/None means scoping doesn't apply
+    (self-hosted, unauthenticated, or an unscoped/owner caller) — same
+    semantics as the generic gate's own ``scoped_project_ids is not None``
+    condition.
+    """
+    note_id = (args.get("note_id") or "").strip()
+    if not note_id:
+        return {"error": "note_id is required"}
+    project_id = (args.get("project_id") or "").strip()
+    if not project_id:
+        return {"error": "project_id (or project_name) is required"}
+    _scoped_project_ids = args.get("_scoped_project_ids")
+    if _scoped_project_ids is not None and project_id not in _scoped_project_ids:
+        # Refuse before touching the db layer at all — the workspace note
+        # must be left completely untouched (no partial mutation).
+        return {
+            "error": (
+                "project is outside your access scope: destination project "
+                f"'{project_id}' is not one of the projects this caller is "
+                "scoped to"
+            )
+        }
+    result = await db_module.move_workspace_note_to_project(
+        db, note_id, project_id, tenant_id=_mcp_tenant_id,
+    )
+    if result is None:
+        return {
+            "error": (
+                "could not move workspace note: note_id not found "
+                "(or not owned by this tenant), destination project not "
+                "found, or a concurrent move/delete already claimed it"
+            )
+        }
+    return result
 
 
 async def handle_pin_workspace_decision(

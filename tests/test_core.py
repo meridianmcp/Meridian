@@ -3405,19 +3405,39 @@ async def test_dispatch_project_scoped_tool_with_only_project_name(db):
 
 @pytest.mark.asyncio
 async def test_dispatch_project_id_wins_over_project_name(db):
-    """When both are given, project_id takes precedence (the resolver only
-    overrides when project_name is set OR project_id is a non-UUID name)."""
+    """a9c041d7 — CORRECTED: this test's original name/docstring claimed
+    project_id takes precedence over project_name when both are supplied.
+    That was never true of the resolver (``_lookup = _pname_raw or
+    _pid_raw`` picks project_name whenever it is present) and the original
+    assertion (``isinstance(items, list)``) was too weak to notice: it passed
+    regardless of which project's data actually came back. Verified here by
+    seeding each project with a distinguishing sprint item and asserting on
+    identity — project_name's project id (the decoy) is what actually gets
+    dispatched against, not the supplied project_id. This resolver precedence
+    is a separate, pre-existing behavior from the scoped_project_ids bypass
+    fixed by a9c041d7 (see the dedicated scoped_project_ids tests below) —
+    changing WHICH of project_id/project_name wins during resolution is out
+    of that fix's scope, so this test now documents the real behavior instead
+    of asserting a false one."""
     from meridian import server as srv
 
     real = await db_module.create_project(db, "wins-real")
-    await db_module.create_project(db, "wins-decoy")
+    decoy = await db_module.create_project(db, "wins-decoy")
+    await db_module.add_sprint_item(db, real["id"], "v1", "real-project-item")
+    await db_module.add_sprint_item(db, decoy["id"], "v1", "decoy-project-item")
+
     items = await srv._dispatch_mcp_tool(
         "get_sprint_items",
         {"project_id": real["id"], "project_name": "wins-decoy"},
         db, "/tmp",
     )
-    # Resolves against the UUID project_id, not the decoy name → no crash, list.
     assert isinstance(items, list)
+    titles = {it["title"] for it in items}
+    # The resolver overrides the supplied project_id with project_name's
+    # project — dispatch actually runs against the DECOY project.
+    assert titles == {"decoy-project-item"}
+    assert "real-project-item" not in titles
+    assert all(it["project_id"] == decoy["id"] for it in items)
 
 
 @pytest.mark.asyncio
@@ -3446,6 +3466,107 @@ async def test_dispatch_project_scoped_tool_with_neither_fails_cleanly(db):
     )
     assert isinstance(result, dict) and result.get("error")
     assert "project_id" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# a9c041d7 — SECURITY: scoped_project_ids gate must re-check AFTER the
+# project_name resolver runs, not just against the caller's raw project_id.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_scoped_project_ids_blocks_project_name_override_of_in_scope_id(db):
+    """The exact exploit: a scoped caller supplies an IN-scope project_id
+    alongside an OUT-of-scope project_name. The pre-dispatch gate in
+    _handle_mcp_request only inspects the raw project_id and lets this
+    through; without the a9c041d7 post-resolution re-check, the resolver in
+    _dispatch_mcp_tool would then silently swap in the out-of-scope project
+    (project_name wins — see test_dispatch_project_id_wins_over_project_name)
+    and dispatch would proceed against data the caller has no access to. Must
+    be denied with the same -32603 "access scope" shape as the pre-check gate."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    in_scope = await db_module.create_project(db, "scope-in-a9c041d7")
+    out_of_scope = await db_module.create_project(db, "scope-out-a9c041d7")
+    await db_module.add_sprint_item(db, out_of_scope["id"], "v1", "secret-item")
+
+    resp = await _handle_mcp_request(
+        {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "get_sprint_items",
+                "arguments": {
+                    "project_id": in_scope["id"],
+                    "project_name": "scope-out-a9c041d7",
+                },
+            },
+        },
+        db=db, data_dir="/tmp",
+        scoped_project_ids=[in_scope["id"]],
+    )
+    assert "error" in resp, (
+        "combined in-scope project_id + out-of-scope project_name must be "
+        f"denied, not dispatched — got: {resp}"
+    )
+    assert resp["error"]["code"] == -32603
+    assert "access scope" in resp["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_scoped_project_ids_none_unaffected_by_new_check(db):
+    """No scoping in effect (self-host / owner / workspace-wide member) —
+    the a9c041d7 post-resolution check must not fire at all. Combined
+    in-scope-shaped id + a different project_name still resolves and
+    dispatches against whatever project_name resolves to, matching the
+    documented pre-existing resolver precedence."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    id_only_project = await db_module.create_project(db, "noscope-id-a9c041d7")
+    name_project = await db_module.create_project(db, "noscope-name-a9c041d7")
+    await db_module.add_sprint_item(db, name_project["id"], "v1", "name-project-item")
+
+    resp = await _handle_mcp_request(
+        {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "get_sprint_items",
+                "arguments": {
+                    "project_id": id_only_project["id"],
+                    "project_name": "noscope-name-a9c041d7",
+                },
+            },
+        },
+        db=db, data_dir="/tmp",
+        scoped_project_ids=None,
+    )
+    assert "error" not in resp, resp
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert isinstance(payload, list)
+    assert any(it["title"] == "name-project-item" for it in payload)
+
+
+@pytest.mark.asyncio
+async def test_scoped_project_ids_allows_project_name_only_when_in_scope(db):
+    """project_name-only (no project_id) resolving to an IN-scope project must
+    still succeed — the a9c041d7 check must not produce a false-positive
+    denial on the ordinary, legitimate project_name-only path."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    p = await db_module.create_project(db, "scope-name-only-a9c041d7")
+
+    resp = await _handle_mcp_request(
+        {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "get_sprint_items",
+                "arguments": {"project_name": "scope-name-only-a9c041d7"},
+            },
+        },
+        db=db, data_dir="/tmp",
+        scoped_project_ids=[p["id"]],
+    )
+    assert "error" not in resp, resp
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert payload == []
 
 
 # ---------------------------------------------------------------------------
@@ -5658,6 +5779,89 @@ async def test_workspace_note_move_to_project(db):
     note2 = await db_module.add_workspace_note(db, "keep me", "body")
     assert await db_module.move_workspace_note_to_project(db, note2["id"], "no-such-project") is None
     assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"keep me"}
+
+
+@pytest.mark.asyncio
+async def test_move_workspace_note_to_project_destination_tenant_note_untouched(db):
+    """84f77597 — destination side: a caller passing a DIFFERENT tenant_id
+    than the source note's owner must fail closed (source ownership is real
+    tenant enforcement here; see the function's own docstring for why the
+    destination *project* check is existence-only and enforcement for it
+    lives at the MCP layer instead — this proves the source-ownership half,
+    which mirrors test_delete_workspace_note_respects_tenant's shape)."""
+    p = await db_module.create_project(db, "move-target-tenant")
+    note = await db_module.add_workspace_note(
+        db, "tenant-a-note", "body", tenant_id="tenant-a"
+    )
+    # Wrong tenant: fails closed, nothing created, nothing removed.
+    assert await db_module.move_workspace_note_to_project(
+        db, note["id"], p["id"], tenant_id="tenant-b"
+    ) is None
+    assert await db_module.get_project_notes(db, p["id"]) == []
+    a_titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-a")}
+    assert a_titles == {"tenant-a-note"}
+    # Right tenant: succeeds.
+    moved = await db_module.move_workspace_note_to_project(
+        db, note["id"], p["id"], tenant_id="tenant-a"
+    )
+    assert moved is not None
+    assert moved["project_id"] == p["id"]
+
+
+@pytest.mark.asyncio
+async def test_move_workspace_note_to_project_race_compensates_duplicate(db, monkeypatch):
+    """84f77597 — if the workspace note is deleted (or moved) by a concurrent
+    caller between the initial read and the guarded delete, the just-created
+    project note must be compensated away (deleted) rather than left as a
+    silent duplicate, and the call must return None."""
+    from meridian.db import workspace as workspace_module
+
+    p = await db_module.create_project(db, "move-race-target")
+    note = await db_module.add_workspace_note(db, "race note", "body", "t1")
+
+    real_add_project_note = db_module.add_project_note
+
+    async def _add_project_note_then_concurrent_delete(*args, **kwargs):
+        # Simulate a sibling session deleting the same workspace note right
+        # after this function created the project note but before it could
+        # guard-delete the workspace note itself.
+        created = await real_add_project_note(*args, **kwargs)
+        await db_module.delete_workspace_note(db, note["id"])
+        return created
+
+    monkeypatch.setattr(
+        workspace_module, "add_project_note", _add_project_note_then_concurrent_delete
+    )
+
+    result = await db_module.move_workspace_note_to_project(db, note["id"], p["id"])
+
+    assert result is None
+    # The compensating delete must have removed the just-created project note
+    # — no duplicate left behind.
+    assert await db_module.get_project_notes(db, p["id"]) == []
+    # The workspace note is gone too (the simulated concurrent delete), but
+    # never duplicated back.
+    assert await db_module.get_workspace_notes(db) == []
+
+
+@pytest.mark.asyncio
+async def test_move_workspace_note_to_project_secret_body_leaves_source_intact(db):
+    """84f77597 — failure-path atomicity: if add_project_note's
+    check_for_secrets rejects the body (secret-shaped content), the raise
+    must propagate and the workspace note must remain exactly as it was —
+    nothing partially applied. add_project_note's check runs before its own
+    INSERT, so this is true by construction; this test proves it end to end
+    through move_workspace_note_to_project specifically."""
+    p = await db_module.create_project(db, "move-secret-target")
+    secret_body = "AKIAABCDEFGHIJKLMNOP"  # matches the aws-access-key-id pattern
+    note = await db_module.add_workspace_note(db, "secret note", secret_body)
+
+    with pytest.raises(ValueError, match="secret"):
+        await db_module.move_workspace_note_to_project(db, note["id"], p["id"])
+
+    # Nothing partially applied: workspace note intact, no project note created.
+    assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"secret note"}
+    assert await db_module.get_project_notes(db, p["id"]) == []
 
 
 @pytest.mark.asyncio
@@ -8339,10 +8543,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_research_graph",
         "_migrate_pg_object_sync_state",
         "_migrate_pg_proposal_project_scope",
+        "_migrate_pg_experiment_model",
+        "_migrate_pg_external_job_register",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 156
+    assert len(allnames) == len(set(allnames)) == 158
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -9866,6 +10072,187 @@ async def test_get_session_brief_surfaces_pending_hitl_questions(db):
 async def test_get_hitl_request_returns_none_for_unknown(db):
     result = await db_module.get_hitl_request(db, "00000000-0000-0000-0000-000000000000")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# e6f58c25 — HITL evidence-staleness detection/flagging
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("question,context", [
+    ("Re-verify: head e6d45334 still failing?", None),
+    ("Is the CI run still green?", None),
+    ("Build is green since 2026-09-03 23:13Z, ok to proceed?", None),
+    ("Any red streak on dev since the last deploy?", None),
+    (None, "Deployed to prod at 2026-08-30, committed 62a3a6c"),
+    ("Should we trust the workflow run from yesterday?", None),
+])
+def test_detect_checkable_hitl_evidence_positive_cases(question, context):
+    """Mirrors the real 04be5832 phrasing ('head <sha>') plus other CI/
+    timestamp-shaped claims that make a HITL's premise time-sensitive."""
+    result = db_module._detect_checkable_hitl_evidence(question, context)
+    assert result is not None, f"expected evidence detected for {question!r}/{context!r}"
+
+
+@pytest.mark.parametrize("question,context", [
+    ("Should we rename this field?", None),
+    ("Do we prefer snake_case or camelCase for the new API?", None),
+    ("", None),
+    (None, None),
+    ("What color should the button be?", "no strong opinion either way"),
+])
+def test_detect_checkable_hitl_evidence_negative_cases(question, context):
+    """Purely subjective HITLs must not be flagged as carrying checkable evidence."""
+    assert db_module._detect_checkable_hitl_evidence(question, context) is None
+
+
+def test_parse_hitl_created_at_handles_both_backend_formats():
+    """SQLite's created_at omits microseconds; Postgres's clock_timestamp()-based
+    default includes them — age computation must not silently degrade to
+    'unknown age' on either backend's format."""
+    sqlite_style = db_module._parse_hitl_created_at("2026-09-01 12:00:00")
+    pg_style = db_module._parse_hitl_created_at("2026-09-01 12:00:00.123456")
+    assert sqlite_style is not None and sqlite_style.hour == 12
+    assert pg_style is not None and pg_style.microsecond == 123456
+    assert db_module._parse_hitl_created_at(None) is None
+    assert db_module._parse_hitl_created_at("not-a-timestamp") is None
+
+
+async def _backdate_hitl(db, hitl_id, hours):
+    from datetime import datetime, timedelta
+
+    old_ts = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE hitl_requests SET created_at = ? WHERE id = ?", (old_ts, hitl_id)
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_requests_flags_stale_evidence(db):
+    """A pending HITL citing checkable evidence, backdated past the staleness
+    threshold, is flagged with evidence_may_be_stale + an explanatory note."""
+    p = await db_module.create_project(db, "hitl-stale-evidence")
+    h = await db_module.request_hitl(
+        db, p["id"], "Re-verified: head e6d45334 still failing on CI?"
+    )
+    await _backdate_hitl(db, h["id"], 48)
+
+    rows = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert len(rows) == 1
+    assert rows[0]["evidence_may_be_stale"] is True
+    assert "evidence_staleness_note" in rows[0]
+    # Existing fields/values are untouched by the new annotation.
+    assert rows[0]["status"] == "pending"
+    assert rows[0]["answer"] is None
+    assert rows[0]["question"] == "Re-verified: head e6d45334 still failing on CI?"
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_requests_fresh_evidence_not_flagged_stale(db):
+    """A freshly-filed pending HITL with the same evidence text is not stale."""
+    p = await db_module.create_project(db, "hitl-fresh-evidence")
+    await db_module.request_hitl(
+        db, p["id"], "Re-verified: head e6d45334 still failing on CI?"
+    )
+    rows = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert len(rows) == 1
+    # Contract allows either an explicit False or the key being absent.
+    assert rows[0].get("evidence_may_be_stale", False) is False
+    assert "evidence_staleness_note" not in rows[0]
+
+
+@pytest.mark.asyncio
+async def test_hitl_evidence_staleness_scoped_to_pending_only(db):
+    """An answered HITL with the same stale evidence text is never annotated —
+    staleness detection is pending-only by design (a human already acted)."""
+    p = await db_module.create_project(db, "hitl-answered-evidence")
+    h = await db_module.request_hitl(
+        db, p["id"], "Re-verified: head e6d45334 still failing on CI?"
+    )
+    await _backdate_hitl(db, h["id"], 48)
+    await db_module.answer_hitl_request(
+        db, h["id"], "Re-verified, CI is green now.", answered_by="adam"
+    )
+
+    answered = await db_module.list_hitl_requests(db, p["id"], status="answered")
+    assert len(answered) == 1
+    assert "evidence_may_be_stale" not in answered[0]
+    assert "evidence_staleness_note" not in answered[0]
+
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["status"] == "answered"
+    assert "evidence_may_be_stale" not in fetched
+    assert "evidence_staleness_note" not in fetched
+
+
+@pytest.mark.asyncio
+async def test_get_hitl_request_flags_stale_evidence(db):
+    """get_hitl_request (single-row path) applies the same annotation."""
+    p = await db_module.create_project(db, "hitl-single-stale")
+    h = await db_module.request_hitl(
+        db, p["id"], "CI run green since 2026-09-03 23:13Z, still true?"
+    )
+    await _backdate_hitl(db, h["id"], 30)
+
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["evidence_may_be_stale"] is True
+    assert "evidence_staleness_note" in fetched
+
+
+@pytest.mark.asyncio
+async def test_get_planning_brief_carries_evidence_staleness_flag(db):
+    """e6f58c25 — get_planning_brief's pending_hitls re-projection must not
+    silently drop the evidence-staleness flag/note computed by
+    list_hitl_requests (the one behavior a DB-only fix would miss)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "hitl-brief-stale")
+    h = await db_module.request_hitl(
+        db, p["id"], "Deploy to Fly.io green since 2026-09-04 00:48Z, still holds?"
+    )
+    await _backdate_hitl(db, h["id"], 72)
+
+    res = await srv._dispatch_mcp_tool(
+        "get_planning_brief", {"project_id": p["id"]}, db, "/tmp"
+    )
+    matches = [row for row in res["pending_hitls"] if row["id"] == h["id"]]
+    assert len(matches) == 1
+    assert matches[0]["evidence_may_be_stale"] is True
+    assert "evidence_staleness_note" in matches[0]
+    # Existing shape (id/question truncation/urgency) is unchanged.
+    assert matches[0]["question"] == h["question"][:120]
+    assert "urgency" in matches[0]
+
+
+@pytest.mark.asyncio
+async def test_hitl_evidence_staleness_never_makes_network_calls(db, monkeypatch):
+    """Guard: evidence detection is a pure text heuristic — list_hitl_requests,
+    get_hitl_request, and get_planning_brief must never touch the network even
+    when stale checkable evidence is present, per the item's bounded/
+    best-effort requirement."""
+    import meridian.server as srv
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("httpx.AsyncClient must not be constructed from a HITL read path")
+
+    monkeypatch.setattr("httpx.AsyncClient", _boom)
+
+    p = await db_module.create_project(db, "hitl-no-network")
+    h = await db_module.request_hitl(
+        db, p["id"], "head e6d45334 CI run still red, re-check?"
+    )
+    await _backdate_hitl(db, h["id"], 48)
+
+    rows = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert rows[0]["evidence_may_be_stale"] is True
+
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["evidence_may_be_stale"] is True
+
+    res = await srv._dispatch_mcp_tool(
+        "get_planning_brief", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert res["pending_hitls"][0]["evidence_may_be_stale"] is True
 
 
 def test_hitl_rest_lifecycle(client):
@@ -20502,3 +20889,230 @@ async def test_supersede_pinned_decision_inherits_slug_generation(db):
     )
     assert new.get("slug"), "superseding decision should have slug"
     assert new.get("nickname"), "superseding decision should have nickname"
+
+
+# ---------------------------------------------------------------------------
+# paper_search — semantic_scholar_search, author_search, pubmed_search
+# (2e51a41a)
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock, MagicMock, patch as _patch  # noqa: E402
+
+
+def _make_async_cm(mock_http):
+    """Return an async context-manager mock that yields *mock_http* on __aenter__."""
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=mock_http)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+def _mock_response(json_data=None, text_data="", status_code=200):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=json_data or {})
+    resp.text = text_data
+    resp.status_code = status_code
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_semantic_scholar_search_returns_results():
+    from meridian.paper_search import semantic_scholar_search
+
+    payload = {
+        "data": [
+            {
+                "paperId": "s2id1",
+                "title": "Witches Broom Disease of Cacao",
+                "authors": [{"name": "J. Doe"}, {"name": "M. Smith"}],
+                "abstract": "Moniliophthora perniciosa causes significant yield loss.",
+                "year": 2021,
+                "citationCount": 42,
+                "tldr": {"text": "Fungal pathogen review."},
+                "openAccessPdf": {"url": "https://example.com/paper.pdf"},
+                "externalIds": {"DOI": "10.1234/cacao"},
+            }
+        ]
+    }
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await semantic_scholar_search("cacao disease", limit=5)
+
+    assert result["query"] == "cacao disease"
+    assert result["count"] == 1
+    r = result["results"][0]
+    assert r["s2_id"] == "s2id1"
+    assert r["title"] == "Witches Broom Disease of Cacao"
+    assert r["authors"] == ["J. Doe", "M. Smith"]
+    assert r["citation_count"] == 42
+    assert r["doi"] == "10.1234/cacao"
+    assert r["pdf_url"] == "https://example.com/paper.pdf"
+    assert r["tldr"] == "Fungal pathogen review."
+
+
+@pytest.mark.asyncio
+async def test_semantic_scholar_search_degrades_on_error():
+    from meridian.paper_search import semantic_scholar_search
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=Exception("connection refused"))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await semantic_scholar_search("cacao")
+
+    assert "error" in result
+    assert result.get("query") == "cacao"
+    assert "results" not in result
+
+
+@pytest.mark.asyncio
+async def test_semantic_scholar_search_empty_query_returns_error():
+    from meridian.paper_search import semantic_scholar_search
+
+    result = await semantic_scholar_search("")
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_author_search_returns_results():
+    from meridian.paper_search import author_search
+
+    payload = {
+        "data": [
+            {
+                "authorId": "auth42",
+                "name": "Karina Gramacho",
+                "affiliations": ["CEPEC"],
+                "paperCount": 30,
+                "citationCount": 200,
+                "papers": [
+                    {"title": "Cacao Resistance", "year": 2009, "externalIds": {"DOI": "10.5/cr"}},
+                    {"title": "Biocontrol Review", "year": 2015, "externalIds": None},
+                ],
+            }
+        ]
+    }
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await author_search("Karina Gramacho", limit=3)
+
+    assert result["query"] == "Karina Gramacho"
+    assert result["count"] == 1
+    a = result["results"][0]
+    assert a["author_id"] == "auth42"
+    assert a["name"] == "Karina Gramacho"
+    assert a["affiliations"] == ["CEPEC"]
+    assert a["paper_count"] == 30
+    assert a["citation_count"] == 200
+    assert len(a["papers"]) == 2
+    assert a["papers"][0]["doi"] == "10.5/cr"
+    assert a["papers"][1]["doi"] == ""  # externalIds None degrades to ""
+
+
+@pytest.mark.asyncio
+async def test_author_search_empty_name_returns_error():
+    from meridian.paper_search import author_search
+
+    result = await author_search("")
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_author_search_degrades_on_http_error():
+    from meridian.paper_search import author_search
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=Exception("timeout"))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await author_search("Pirovani")
+
+    assert "error" in result
+    assert result.get("query") == "Pirovani"
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_returns_results():
+    from meridian.paper_search import pubmed_search
+
+    esearch_payload = {"esearchresult": {"idlist": ["38123456"]}}
+    efetch_xml = """\
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>38123456</PMID>
+      <Article>
+        <ArticleTitle>AOX and Nitric Oxide in Cacao Defense</ArticleTitle>
+        <Abstract>
+          <AbstractText>Alternative oxidase mediates reactive oxygen species.</AbstractText>
+        </Abstract>
+        <AuthorList>
+          <Author><LastName>Pirovani</LastName><ForeName>C P</ForeName></Author>
+        </AuthorList>
+        <Journal><JournalIssue><PubDate><Year>2019</Year></PubDate></JournalIssue></Journal>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="doi">10.1016/j.plantsci.2019.01.001</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>"""
+
+    esearch_resp = _mock_response(json_data=esearch_payload)
+    efetch_resp = _mock_response(text_data=efetch_xml)
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=[esearch_resp, efetch_resp])
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await pubmed_search("cacao alternative oxidase")
+
+    assert result["query"] == "cacao alternative oxidase"
+    assert result["count"] == 1
+    r = result["results"][0]
+    assert r["pmid"] == "38123456"
+    assert r["title"] == "AOX and Nitric Oxide in Cacao Defense"
+    assert "Alternative oxidase" in r["summary"]
+    assert r["authors"] == ["C P Pirovani"]
+    assert r["published"] == "2019"
+    assert r["url"] == "https://pubmed.ncbi.nlm.nih.gov/38123456/"
+    assert r["pdf_url"] == ""
+    assert r["doi"] == "10.1016/j.plantsci.2019.01.001"
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_empty_idlist_returns_zero():
+    from meridian.paper_search import pubmed_search
+
+    esearch_payload = {"esearchresult": {"idlist": []}}
+    esearch_resp = _mock_response(json_data=esearch_payload)
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=esearch_resp)
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await pubmed_search("xyzzy_nonexistent_topic")
+
+    assert result["count"] == 0
+    assert result["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_degrades_on_error():
+    from meridian.paper_search import pubmed_search
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=Exception("network error"))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await pubmed_search("disease")
+
+    assert "error" in result
+    assert result.get("query") == "disease"

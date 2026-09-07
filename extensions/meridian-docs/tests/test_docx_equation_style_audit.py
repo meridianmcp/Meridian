@@ -31,7 +31,7 @@ _EXT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _EXT_PATH not in sys.path:
     sys.path.insert(0, _EXT_PATH)
 
-from meridian_docs import docs_intel  # noqa: E402
+from meridian_docs import docs_intel, server  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -143,6 +143,39 @@ _INLINE_MIXED_DOC = _doc(f'''    <w:p w14:paraId="0000I001">
       <w:r><w:t xml:space="preserve"> was a physicist</w:t></w:r>
     </w:p>''')
 
+# Bookmark wrapping the equation (Word's own "Insert Cross-reference"/
+# "Insert Bookmark" commands produce exactly this shape) -> the bookmarkStart
+# before <m:oMath> must NOT be mistaken for prose disqualifying the equation
+# from being a "display equation". Deliberately unstyled + bad trailing text
+# so both findings would previously have been silently skipped entirely.
+_DISPLAY_WITH_BOOKMARK_DOC = _doc(f'''    <w:p w14:paraId="0000L001">
+      <w:bookmarkStart w:id="1" w:name="_Hlk1"/>
+      {_SIMPLE_OMATH}
+      <w:bookmarkEnd w:id="1"/>
+      <w:r><w:t xml:space="preserve"> (see note)</w:t></w:r>
+    </w:p>''')
+
+# Comment anchor + spell-check marker before the equation -> same "zero-width
+# markup, not prose" exclusion as bookmarks. Centered + clean trailing text
+# so a correct audit reports nothing.
+_DISPLAY_WITH_COMMENT_AND_PROOFERR_DOC = _doc(f'''    <w:p w14:paraId="0000M001">
+      <w:pPr><w:jc w:val="center"/></w:pPr>
+      <w:commentRangeStart w:id="5"/>
+      <w:proofErr w:type="spellStart"/>
+      {_SIMPLE_OMATH}
+      <w:commentRangeEnd w:id="5"/>
+      <w:r><w:t>.</w:t></w:r>
+    </w:p>''')
+
+# A REAL prose run before the bookmark must still disqualify the equation --
+# the fix must not make the "preceding content" check vacuous.
+_INLINE_MIXED_WITH_BOOKMARK_DOC = _doc(f'''    <w:p w14:paraId="0000N001">
+      <w:bookmarkStart w:id="2" w:name="_Hlk2"/>
+      <w:r><w:t xml:space="preserve">Einstein: </w:t></w:r>
+      {_SIMPLE_OMATH}
+      <w:bookmarkEnd w:id="2"/>
+    </w:p>''')
+
 # Two oMath as the ONLY content of one paragraph -> ambiguous, both skipped.
 _AMBIGUOUS_MULTI_EQ_DOC = _doc(f'''    <w:p w14:paraId="0000J001">
       {_SIMPLE_OMATH}
@@ -201,6 +234,9 @@ def test_resolve_style_policy_defaults():
         "equation_punctuation_chars": ".,;:",
         "note_style": "MeridianInternalNote",
         "note_highlight_color": "yellow",
+        "heading_terminal_punctuation": None,
+        "table_label_column_alignment": None,
+        "table_data_column_alignment": None,
     }
 
 
@@ -276,6 +312,107 @@ def test_resolve_style_policy_accepts_valid_note_highlight_color():
 
 
 # ---------------------------------------------------------------------------
+# resolve_style_policy -- 4544bbe5 document-profile keys (heading terminal
+# punctuation, table column alignment)
+# ---------------------------------------------------------------------------
+
+def test_resolve_style_policy_heading_terminal_punctuation_defaults_none():
+    assert docs_intel.resolve_style_policy()["heading_terminal_punctuation"] is None
+
+
+def test_resolve_style_policy_accepts_empty_heading_terminal_punctuation():
+    policy = docs_intel.resolve_style_policy({"heading_terminal_punctuation": ""})
+    assert policy["heading_terminal_punctuation"] == ""
+
+
+def test_resolve_style_policy_accepts_string_heading_terminal_punctuation():
+    policy = docs_intel.resolve_style_policy({"heading_terminal_punctuation": ":"})
+    assert policy["heading_terminal_punctuation"] == ":"
+
+
+@pytest.mark.parametrize("bad_value", [1, True, [], {}])
+def test_resolve_style_policy_rejects_non_string_heading_terminal_punctuation(bad_value):
+    with pytest.raises(ValueError, match="heading_terminal_punctuation"):
+        docs_intel.resolve_style_policy({"heading_terminal_punctuation": bad_value})
+
+
+@pytest.mark.parametrize(
+    "key", ["table_label_column_alignment", "table_data_column_alignment"]
+)
+def test_resolve_style_policy_table_column_alignment_defaults_none(key):
+    assert docs_intel.resolve_style_policy()[key] is None
+
+
+@pytest.mark.parametrize(
+    "key", ["table_label_column_alignment", "table_data_column_alignment"]
+)
+@pytest.mark.parametrize("valid_alignment", ["left", "center", "right", "both"])
+def test_resolve_style_policy_accepts_valid_table_column_alignments(key, valid_alignment):
+    policy = docs_intel.resolve_style_policy({key: valid_alignment})
+    assert policy[key] == valid_alignment
+
+
+@pytest.mark.parametrize(
+    "key", ["table_label_column_alignment", "table_data_column_alignment"]
+)
+def test_resolve_style_policy_rejects_bad_table_column_alignment(key):
+    with pytest.raises(ValueError, match=key):
+        docs_intel.resolve_style_policy({key: "diagonal"})
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset -- 4544bbe5 publishing-convention shorthand
+# ---------------------------------------------------------------------------
+
+def test_get_journal_style_preset_default_matches_resolve_style_policy_defaults():
+    assert docs_intel.get_journal_style_preset("default") == docs_intel.resolve_style_policy()
+
+
+def test_get_journal_style_preset_jcshm_is_fully_resolved():
+    preset = docs_intel.get_journal_style_preset("jcshm")
+    # Every resolve_style_policy key is present (fully resolved, not raw overrides).
+    assert set(preset) == set(docs_intel.resolve_style_policy())
+    assert preset["caption_centered"] is True
+    assert preset["heading_terminal_punctuation"] == ""
+    assert preset["table_label_column_alignment"] == "left"
+    assert preset["table_data_column_alignment"] == "center"
+
+
+def test_get_journal_style_preset_jcshm_round_trips_through_resolve_style_policy():
+    preset = docs_intel.get_journal_style_preset("jcshm")
+    # A fully-resolved policy must be idempotent under re-resolution.
+    assert docs_intel.resolve_style_policy(preset) == preset
+
+
+def test_get_journal_style_preset_rejects_unknown_name():
+    with pytest.raises(ValueError, match="unknown journal style preset"):
+        docs_intel.get_journal_style_preset("not-a-real-journal")
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset -- MCP tool boundary (server.py wrapper)
+# ---------------------------------------------------------------------------
+
+def test_server_get_journal_style_preset_delegates_to_docs_intel():
+    assert server.get_journal_style_preset("jcshm") == docs_intel.get_journal_style_preset("jcshm")
+
+
+def test_server_get_journal_style_preset_unknown_name_returns_error_dict():
+    """The MCP boundary never raises -- an unknown preset name comes back as
+    a structured {"error": ...} dict, same convention as every other tool."""
+    result = server.get_journal_style_preset("not-a-real-journal")
+    assert "error" in result
+    assert "not-a-real-journal" in result["error"]
+
+
+def test_server_get_journal_style_preset_result_usable_as_style_policy(tmp_path):
+    """The preset returned at the MCP boundary round-trips straight into
+    another tool's style_policy= parameter with no further transformation."""
+    preset = server.get_journal_style_preset("jcshm")
+    assert docs_intel.resolve_style_policy(preset) == preset
+
+
+# ---------------------------------------------------------------------------
 # audit_equation_style -- basic shape / no equations
 # ---------------------------------------------------------------------------
 
@@ -324,6 +461,41 @@ def test_audit_alignment_policy_left_matches_unset_jc(tmp_path):
 
 def test_audit_inline_equation_excluded_from_alignment_and_punctuation(tmp_path):
     path = _write_docx(tmp_path, _INLINE_MIXED_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["equation_count"] == 1
+    assert result["findings"] == []
+
+
+def test_audit_bookmark_before_equation_does_not_suppress_findings(tmp_path):
+    """Regression (found 2026-09-06 via a real organic corpus document): a
+    <w:bookmarkStart> directly before <m:oMath> was being counted as
+    "preceding content" mixing the equation into prose, silently skipping
+    BOTH the alignment and trailing-punctuation checks for an otherwise
+    ordinary display equation. A bookmark renders nothing and must not
+    disqualify the equation."""
+    path = _write_docx(tmp_path, _DISPLAY_WITH_BOOKMARK_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["equation_count"] == 1
+    assert result["findings_by_type"] == {
+        "misaligned_equation": 1,
+        "incorrect_trailing_punctuation": 1,
+    }
+    misaligned = next(f for f in result["findings"] if f["type"] == "misaligned_equation")
+    assert misaligned["para_id"] == "0000L001"
+
+
+def test_audit_comment_anchor_and_prooferr_before_equation_do_not_disqualify(tmp_path):
+    path = _write_docx(tmp_path, _DISPLAY_WITH_COMMENT_AND_PROOFERR_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["equation_count"] == 1
+    assert result["findings"] == []
+
+
+def test_audit_real_prose_before_bookmarked_equation_still_excludes_it(tmp_path):
+    """The bookmark fix must not make the preceding-content check vacuous --
+    genuine prose mixed with the equation is still excluded even when a
+    bookmark also wraps it."""
+    path = _write_docx(tmp_path, _INLINE_MIXED_WITH_BOOKMARK_DOC)
     result = docs_intel.audit_equation_style(path)
     assert result["equation_count"] == 1
     assert result["findings"] == []

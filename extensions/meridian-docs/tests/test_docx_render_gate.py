@@ -612,6 +612,13 @@ def test_check_render_capability_default_max_retries_is_one(tmp_path):
 
 
 def test_check_render_capability_timeout_failure_detail_is_never_retried(tmp_path):
+    """Generic contract test: retryable=False (however a backend arrives at
+    it) must never be retried, regardless of error_class. TIMEOUT_ERROR is
+    just this test's example class -- it is NOT asserting that every real
+    timeout is non-retryable. _soffice_render's OWN timeouts are retryable
+    as of 2026-09-07 (see test_soffice_render_timeout_is_classified_and_
+    carries_stderr); this test's fake backend constructs retryable=False
+    directly, independent of that real classification."""
     docx_path = _write_dummy_docx(tmp_path)
     calls: list[int] = []
 
@@ -700,7 +707,107 @@ def test_classify_soffice_failure_empty_stderr_is_transport():
     assert retryable is True
 
 
+def test_soffice_render_passes_an_isolated_user_installation(tmp_path, monkeypatch):
+    """d4a1f2c8 -- soffice defaults to ONE shared profile directory (and its
+    lock file) across every invocation on the machine unless told otherwise;
+    two soffice processes contending for that lock reliably manifests as a
+    silent hang, which this function's timeout then reports as a real
+    render failure even though nothing is actually wrong with the document.
+    Confirmed live (2026-09-07): a document that had just failed inside a
+    long confirmatory benchmark run rendered successfully in isolation
+    seconds later. Each call must get its OWN private profile directory via
+    -env:UserInstallation= so it can never contend with any other soffice
+    invocation -- from this process or a completely unrelated one -- for
+    the shared lock."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    captured_cmds = []
+
+    def _fake_run(cmd, **kwargs):
+        captured_cmds.append(cmd)
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    render_gate._soffice_render(docx_path)
+    render_gate._soffice_render(docx_path)
+
+    assert len(captured_cmds) == 2
+    profile_args = []
+    for cmd in captured_cmds:
+        matches = [arg for arg in cmd if arg.startswith("-env:UserInstallation=")]
+        assert len(matches) == 1, f"expected exactly one -env:UserInstallation= arg, got {matches}"
+        assert matches[0].startswith("-env:UserInstallation=file:")
+        profile_args.append(matches[0])
+
+    # Two separate calls must never share a profile directory -- that would
+    # recreate the exact lock contention this fix exists to eliminate.
+    assert profile_args[0] != profile_args[1]
+
+
+def test_soffice_render_profile_dir_ignores_a_long_redirected_temp(tmp_path, monkeypatch):
+    """d4a1f2c8 -- confirmed live, 2026-09-07, with a clean isolated repro:
+    nesting the isolated profile directory inside whatever TEMP/TMP the
+    CALLING process has redirected (this project's own benchmark harness
+    deliberately redirects TEMP to a trial-specific scratch directory,
+    nested several levels deep, specifically so concurrent trials can't
+    collide on a shared path) can push the total path past ~210 characters
+    once LibreOffice bootstraps its own nested internal profile structure
+    on top -- and soffice reliably crashes with 0xC0000409
+    (STATUS_STACK_BUFFER_OVERRUN) when that happens. The identical
+    conversion, with the profile rooted somewhere short instead, never
+    crashed once. The profile directory must be rooted at a short, stable
+    location regardless of how deep the caller's own TEMP/TMP is."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    long_redirected_temp = tmp_path / ("deeply" + os.sep + "nested" + os.sep + "trial" + os.sep + "scratch" + os.sep + ("x" * 150))
+    long_redirected_temp.mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", str(long_redirected_temp))
+    monkeypatch.setenv("TEMP", str(long_redirected_temp))
+    monkeypatch.setenv("TMP", str(long_redirected_temp))
+
+    short_root = tmp_path / "short"
+    short_root.mkdir()
+    monkeypatch.setattr(render_gate, "_short_temp_root", lambda: str(short_root))
+
+    captured_cmds = []
+
+    def _fake_run(cmd, **kwargs):
+        captured_cmds.append(cmd)
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    render_gate._soffice_render(docx_path)
+
+    profile_arg = next(arg for arg in captured_cmds[0] if arg.startswith("-env:UserInstallation="))
+    profile_path = profile_arg[len("-env:UserInstallation="):]
+    assert str(short_root).replace("\\", "/") in profile_path.replace("\\", "/")
+    assert str(long_redirected_temp).replace("\\", "/") not in profile_path.replace("\\", "/")
+
+
 def test_soffice_render_timeout_is_classified_and_carries_stderr(tmp_path, monkeypatch):
+    """d4a1f2c8 -- retryable is False, same day it was briefly flipped to
+    True and reverted. True was well-reasoned in isolation (each call now
+    gets its own profile, so a timeout no longer means "the identical stuck
+    lock" the way it did under the old shared-profile design) but wrong in
+    practice: it roughly doubles a single attempt's worst-case latency (60s
+    -> 60s + backoff + 60s), and the CALLING agent already retries the
+    whole tool call itself (observed consistently, 2-3x per trial) --
+    confirmed live that this combination pushed real confirmatory-benchmark
+    trials past the harness's OUTER 300s subprocess timeout with zero JSON
+    output at all (killed mid-flight, no transcript), strictly worse than
+    the clean, informative render-gate failure every one of these trials
+    produced before. Reverted rather than layering another mitigation on
+    top of a change that measurably made things worse under real load."""
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
 
@@ -759,6 +866,7 @@ def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp
     REAL _soffice_render backend (not a fake stand-in)."""
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+    monkeypatch.setattr(render_gate, "_RENDER_RETRY_BACKOFF_SECONDS", 0)
 
     calls: list[int] = []
 
@@ -766,7 +874,7 @@ def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp
         calls.append(1)
         if len(calls) == 1:
             raise OSError("transient spawn failure")
-        out_dir = cmd[5]
+        out_dir = cmd[cmd.index("--outdir") + 1]
         with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
             fh.write(b"%PDF-1.4 fake")
         return _FakeCompletedProcess(0)
@@ -778,6 +886,114 @@ def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp
     assert result["status"] == render_gate.RENDERED
     assert result["detail"]["converted_via"] == "soffice"
     assert len(calls) == 2
+
+
+def test_soffice_timeout_is_not_retried_through_check_render_capability(tmp_path, monkeypatch):
+    """d4a1f2c8 -- end-to-end, exercising the REAL _soffice_render backend:
+    a soffice timeout must fail straight through check_render_capability
+    with exactly one attempt, not retry. (This was briefly made retryable
+    the same day and reverted -- see test_soffice_render_timeout_is_
+    classified_and_carries_stderr for why: it measurably made real
+    confirmatory-benchmark trials worse by pushing them past the harness's
+    outer 300s subprocess timeout.)"""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+    monkeypatch.setattr(render_gate, "_RENDER_RETRY_BACKOFF_SECONDS", 0)
+
+    calls: list[int] = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(1)
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"), output=b"", stderr=b"stuck")
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    result = render_gate.check_render_capability(
+        docx_path, backends=[render_gate._SOFFICE_BACKEND], max_retries=5,
+    )
+
+    assert result["status"] == render_gate.FAILED
+    assert result["detail"]["error_class"] == render_gate.TIMEOUT_ERROR
+    assert len(calls) == 1
+
+
+def test_check_render_capability_sleeps_before_a_retry_not_before_the_first_attempt(tmp_path, monkeypatch):
+    """d4a1f2c8 -- a retryable failure means a transient resource race (e.g.
+    soffice contending with another concurrent instance for a shared
+    resource), not a property of this document. Confirmed live, 2026-09-07:
+    a real confirmatory benchmark run showed the OLD zero-delay retry
+    failing on effectively every attempt for the same transient-crash
+    signature -- immediate retry gives whatever's contending no time to
+    clear. A backoff must run before the retry, but never before the first
+    attempt (that would slow down the overwhelmingly common success case
+    for no reason)."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(render_gate.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    calls: list[int] = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("transient spawn failure")
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+
+    assert result["status"] == render_gate.RENDERED
+    assert sleep_calls == [render_gate._RENDER_RETRY_BACKOFF_SECONDS]
+
+
+def test_check_render_capability_does_not_sleep_when_the_first_attempt_succeeds(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(render_gate.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def _fake_run(cmd, **kwargs):
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+
+    assert result["status"] == render_gate.RENDERED
+    assert sleep_calls == []
+
+
+def test_check_render_capability_does_not_sleep_after_the_final_non_retryable_failure(tmp_path, monkeypatch):
+    """A genuine document-corruption failure is never retryable (retrying
+    can't fix a broken source document), so it must fail straight through
+    with no backoff delay -- there is no retry coming, so sleeping first
+    would only slow down a result that was already decided."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(render_gate.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    monkeypatch.setattr(
+        render_gate.subprocess, "run",
+        lambda cmd, **kwargs: _FakeCompletedProcess(1, stderr=b"source file could not be loaded"),
+    )
+
+    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+
+    assert result["status"] == render_gate.FAILED
+    assert result["detail"]["error_class"] == render_gate.CORRUPTION_ERROR
+    assert sleep_calls == []
 
 
 # --- _word_com_render: bounded timeout, owned-process cleanup, COM error ---

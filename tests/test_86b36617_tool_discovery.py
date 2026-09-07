@@ -482,6 +482,113 @@ async def test_discovery_state_deterministic_for_identical_state(db):
 
 
 # ---------------------------------------------------------------------------
+# b71e0960 -- "tool discovery" stress/contract additions: independent
+# concurrent build_tool_discovery_state calls stay deterministic and
+# truthful (no shared-mutable-state bleed between concurrently-in-flight
+# items), and executable=False is reported honestly even when several other
+# concurrent calls are resolving as executable=True at the same time.
+# ---------------------------------------------------------------------------
+
+async def test_concurrent_discovery_state_calls_stay_isolated_and_deterministic(db):
+    """N different items, each with its OWN tool_requirements, built
+    CONCURRENTLY via asyncio.gather: every item's resulting state must
+    reflect only ITS OWN requirements -- no cross-item bleed through shared
+    module-level state -- and repeating the same concurrent batch produces
+    byte-identical output per item (determinism holds under concurrency,
+    not just sequentially, per test_discovery_state_deterministic_for_identical_state
+    above)."""
+    project = await db_module.create_project(db, "td-state-concurrent")
+    # b0d42ef6 -- add_sprint_item's 60%-word-overlap duplicate guard rejects
+    # near-duplicate titles (returning {"error": "duplicate", ...} instead of
+    # a normal item dict), so these titles are deliberately UNRELATED to each
+    # other, not just numbered variants of the same phrase.
+    distinct_titles = [
+        "Trace the payments retry loop",
+        "Audit the OAuth redirect handler",
+        "Rewrite the CSV export streamer",
+        "Profile the dashboard websocket relay",
+        "Harden the webhook signature check",
+    ]
+    items = []
+    for i, title in enumerate(distinct_titles):
+        item = await db_module.add_sprint_item(
+            db, project["id"], "v1", title,
+            tool_requirements=[_req(name=f"tool_{i}", server_or_namespace=f"server_{i}")],
+        )
+        assert "id" in item, f"unexpected add_sprint_item result: {item}"
+        items.append(item)
+
+    async def _build(item):
+        return await td.build_tool_discovery_state(db, project["id"], item)
+
+    states_a = await asyncio.gather(*[_build(i) for i in items])
+    states_b = await asyncio.gather(*[_build(i) for i in items])
+
+    for i, (state_a, state_b) in enumerate(zip(states_a, states_b)):
+        assert state_a["item_id"] == items[i]["id"]
+        assert state_a["requested"][0]["name"] == f"tool_{i}"
+        assert state_a["requested"][0]["server_or_namespace"] == f"server_{i}"
+        # No cross-item leakage: exactly one requested entry, matching this
+        # item's own single tool_requirements entry, never another item's.
+        assert len(state_a["requested"]) == 1
+        assert _json.dumps(state_a, sort_keys=True) == _json.dumps(state_b, sort_keys=True)
+
+
+async def test_concurrent_discovery_state_truthful_executable_mix(db):
+    """A "truthful tools/list" contract check: concurrently building state
+    for one item with a genuinely missing REQUIRED tool (must report
+    executable=False, fail_closed) alongside several items with fully
+    available tools (must report executable=True) must never cross-
+    contaminate -- the fail-closed item's rejection doesn't leak into the
+    others' results, and the available items don't mask the fail-closed
+    one's honest rejection."""
+    project = await db_module.create_project(db, "td-state-truthful-mix")
+    bad_item = await db_module.add_sprint_item(
+        db, project["id"], "v1", "Missing required tool for the export job",
+        tool_requirements=[_req(name="totally_missing_tool_x")],
+    )
+    # b0d42ef6 -- distinct titles again, same reason as the test above.
+    good_titles = [
+        "Deploy the canary release gate",
+        "Compact the session heartbeat table",
+        "Validate the invoice PDF renderer",
+    ]
+    good_items = []
+    for i, title in enumerate(good_titles):
+        item = await db_module.add_sprint_item(
+            db, project["id"], "v1", title,
+            tool_requirements=[_req(name=f"available_tool_{i}")],
+        )
+        assert "id" in item, f"unexpected add_sprint_item result: {item}"
+        good_items.append(item)
+    bad_avail = {("Serena", "totally_missing_tool_x"): {"status": "missing", "fallback_used": None}}
+
+    async def _build_bad():
+        return await td.build_tool_discovery_state(
+            db, project["id"], bad_item, availability_by_key=bad_avail,
+        )
+
+    async def _build_good(item, i):
+        avail = {("Serena", f"available_tool_{i}"): {"status": "available", "fallback_used": None}}
+        return await td.build_tool_discovery_state(
+            db, project["id"], item, availability_by_key=avail,
+        )
+
+    results = await asyncio.gather(
+        _build_bad(),
+        *[_build_good(item, i) for i, item in enumerate(good_items)],
+    )
+    bad_state, good_states = results[0], results[1:]
+
+    assert bad_state["executable"] is False
+    assert any("fail_closed_tools" in r for r in bad_state["executable_reasons"])
+
+    for state in good_states:
+        assert state["executable"] is True
+        assert state["executable_reasons"] == []
+
+
+# ---------------------------------------------------------------------------
 # 5. Integration: executor_contract.build_executor_contract.
 # ---------------------------------------------------------------------------
 

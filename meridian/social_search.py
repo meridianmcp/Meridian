@@ -17,11 +17,18 @@ were explicitly out of scope for this item.
 Only ``story`` items are searched (not raw comments) so results read like
 discussion/link submissions rather than isolated comment fragments — closer in
 spirit to a "paper" result than a mid-thread reply would be.
+
+2e51a41a — adds an in-memory result cache (TTL 5 min, keyed by query+limit) and
+exponential backoff on HTTP 429/503 (max 3 attempts, delays 0.5s and 1.5s between
+attempts). Only successful responses are cached; errors always re-try the network
+path on the next call.
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import re
+import time
 from typing import Any
 
 # Algolia's HN Search API. ``/search`` ranks by relevance; ``/search_by_date`` is
@@ -30,6 +37,55 @@ _HN_API = "https://hn.algolia.com/api/v1/search"
 _HN_API_BY_DATE = "https://hn.algolia.com/api/v1/search_by_date"
 
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# 2e51a41a — in-memory result cache. Key: (query, limit); value: (result_dict, ts).
+_CACHE: dict[tuple, tuple] = {}
+_CACHE_TTL = 300.0  # 5 minutes in seconds
+_RETRY_DELAYS = (0.5, 1.5)  # waits [s] before attempt 2 and attempt 3; no wait before 1
+
+
+def _cache_get(key: tuple) -> Any | None:
+    """Return cached result if still within TTL, evicting stale entries. Returns None on miss."""
+    entry = _CACHE.get(key)
+    if entry is None:
+        return None
+    result, ts = entry
+    if time.monotonic() - ts > _CACHE_TTL:
+        del _CACHE[key]
+        return None
+    return result
+
+
+def _cache_set(key: tuple, result: Any) -> None:
+    """Store result in cache with current monotonic timestamp."""
+    _CACHE[key] = (result, time.monotonic())
+
+
+async def _fetch_with_backoff(
+    http: Any, url: str, params: dict[str, str], headers: dict[str, str]
+) -> Any:
+    """HTTP GET with exponential backoff on 429/503; max 3 attempts.
+
+    No delay before the first attempt. Waits ``_RETRY_DELAYS[0]`` s before the
+    second attempt and ``_RETRY_DELAYS[1]`` s before the third. Any non-429/503
+    exception propagates immediately so the caller's outer ``except Exception``
+    can degrade the response without retrying.
+    """
+    import httpx as _httpx  # noqa: PLC0415 — match paper_search's inline-httpx pattern
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
+        try:
+            resp = await http.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            return resp
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (429, 503):
+                last_exc = exc
+                continue
+            raise  # non-429/503 HTTP error — don't retry, propagate immediately
+    raise last_exc  # type: ignore[misc]
 
 
 def _strip_html(text: str) -> str:
@@ -112,13 +168,19 @@ async def hn_search(
     recently submitted first, via the API's ``search_by_date`` endpoint).
     Never raises — an empty query returns ``{error}`` and any network/parse failure
     degrades to ``{error, query}`` so a research call can't crash the MCP handler.
+    Results are cached in memory for ``_CACHE_TTL`` seconds; 429/503 responses
+    trigger exponential backoff (max 3 attempts).
     """
     q = (query or "").strip()
     if not q:
         return {"error": "query is required"}
     n = max(1, min(int(limit or 10), 50))
+    cache_key = (q, n)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     endpoint = _HN_API_BY_DATE if str(sort_by).lower() in ("date", "recent", "newest") else _HN_API
-    params = {
+    params: dict[str, str] = {
         "query": q,
         "hitsPerPage": str(n),
         "tags": "story",
@@ -126,12 +188,13 @@ async def hn_search(
     import httpx as _httpx  # noqa: PLC0415 — match paper_search's inline-httpx pattern
     try:
         async with _httpx.AsyncClient(timeout=15.0) as http:
-            resp = await http.get(
-                endpoint, params=params,
+            resp = await _fetch_with_backoff(
+                http, endpoint, params=params,
                 headers={"User-Agent": "Meridian/social_search (research routing)"},
             )
-            resp.raise_for_status()
             results = parse_hn_hits(resp.json(), n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
         return {"error": f"hn search failed: {exc}", "query": q}
-    return {"query": q, "count": len(results), "results": results}
+    out = {"query": q, "count": len(results), "results": results}
+    _cache_set(cache_key, out)
+    return out

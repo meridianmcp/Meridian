@@ -1493,7 +1493,27 @@ async def _handle_mcp_request(
             if _is_github:
                 result = await _dispatch_github_tool(name, args, tenant, db)
             else:
-                result = await _dispatch_mcp_tool(name, args, db, data_dir, tenant=tenant)
+                # a9c041d7 (systemic fix) — _dispatch_mcp_tool itself re-checks
+                # scoped_project_ids against the FINAL resolved project_id right
+                # after its project_name resolver runs, for every tool. See that
+                # function's docstring for the full rationale.
+                #
+                # 84f77597 round-2 predates a9c041d7 and closed the same class of
+                # bug narrowly for move_workspace_note_to_project by threading the
+                # scope list through as a private args key the handler re-checks
+                # itself. Left in place as harmless, already-tested defense in
+                # depth — a9c041d7's check below now runs first and would already
+                # raise before this handler is ever reached, so this path is
+                # effectively redundant, not a second real gate — but removing
+                # already-shipped, tested code for a purely cosmetic cleanup isn't
+                # worth the extra churn/risk.
+                _dispatch_args = args
+                if name == "move_workspace_note_to_project" and scoped_project_ids is not None:
+                    _dispatch_args = {**args, "_scoped_project_ids": scoped_project_ids}
+                result = await _dispatch_mcp_tool(
+                    name, _dispatch_args, db, data_dir, tenant=tenant,
+                    scoped_project_ids=scoped_project_ids,
+                )
                 # 4b698ea5 — implicit last_seen bump on the HOSTED path, mirroring
                 # the stdio handler. Previously ONLY stdio tool calls refreshed a
                 # session's last_seen; a hosted/tunnel executor's session went
@@ -3075,7 +3095,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log, search_ai_log."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -3427,16 +3447,61 @@ async def _handle_task_tools(
         # incomplete, so a contract built alongside it must not silently
         # report executable=true. Fully guarded — a failure degrades to no
         # field rather than breaking the mandatory handoff.
+        #
+        # 537a7cef — max_executor_contracts/max_contract_list_items were
+        # previously omitted here, so every mode (full/delta/goal/starter)
+        # got capability_contract.build_capability_contract's own generous
+        # 25/200 defaults, unbounded per-item routing-summary field, and
+        # unbounded requested/effective capability lists — on a large board
+        # this alone produced a ~440KB capability_contract, defeating the
+        # documented "compact summary object" contract for full/delta/goal
+        # alike (the item's own repro). Bound to the SAME
+        # _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS=15 the /goal text's own
+        # <tool_requirements>/<sprint_item_pointers>/
+        # <artifact_pointer_findings> clauses already use for starter/goal
+        # (see that constant's docstring: this JSON field is the documented
+        # escape hatch for whatever the text trims, so it should never be
+        # LARGER than what a compact render already omits) — never a silent
+        # drop: every item_*_truncated marker still reports the full
+        # candidate count when a board exceeds this.
+        #
+        # fd5871a5 — when this call was scoped via selected_item_ids,
+        # _selected_scope_outcome (populated by generate_handoff above) now
+        # carries the resolved dependency-closure ids. Resolve those to full
+        # item dicts and pass them as `items=` so item_tool_requirements/
+        # item_sprint_item_pointers/item_artifact_pointer_findings/
+        # item_executor_contracts/item_routing_summary all narrow to the
+        # SAME closure `content` was already scoped to, instead of each
+        # silently self-fetching the full project-wide pending-item list
+        # regardless of the caller's requested scope (the item's own repro:
+        # a 1-item-scoped handoff still emitting a ~400KB capability_contract
+        # built from the OTHER ~150 unrelated pending items on the board).
+        # None (unscoped) for every pre-existing call that never passes
+        # selected_item_ids — zero behavior change for that case.
+        _selected_closure_items = await handoff_module_local.resolve_closure_items_for_scope(
+            db, _selected_scope_outcome,
+        )
         _capability_contract = await handoff_module_local.build_effective_capability_contract(
             db, args["project_id"], board_stale=_handoff_degraded,
             version=_effective_version,
+            items=_selected_closure_items,
+            max_executor_contracts=handoff_module_local._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+            max_contract_list_items=handoff_module_local._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
         )
         # 6cdc5df3 — machine-readable proposal-to-evidence linkage, emitted on
         # every generate_handoff mode alongside the capability contract above.
         # Fully guarded — a failure degrades to no field rather than breaking
         # the mandatory handoff.
+        #
+        # fd5871a5 — same selected-item-scope narrowing as capability_contract
+        # just above: pass the closure ids so only proposals actually linked
+        # to an item in THIS scope are considered, instead of always falling
+        # back to the project's top-10 most-recently-linked proposals
+        # regardless of scope. None (unscoped) when this call was never
+        # selected_item_ids-scoped — zero behavior change for that case.
         _proposal_evidence = await handoff_module_local.build_proposal_evidence_for_handoff(
             db, args["project_id"],
+            item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
         )
         # d09c29fe — machine-readable DOCX-integrity gate, emitted on every
         # generate_handoff mode alongside the two fields above. Tied to the
@@ -3772,9 +3837,31 @@ async def _handle_task_tools(
             if isinstance(_presented_body, str)
             else None
         )
-        return await handoff_module_local.verify_handoff_token(
+        _vht_result = await handoff_module_local.verify_handoff_token(
             db, _token, _pid, body=_body_for_check
         )
+        if _vht_result.get("valid"):
+            # 1b7eb437 (follow-up to 833649f1) — best-effort, purely-additive
+            # handoff-provenance receipt: a durable, server-written record
+            # that a genuine verify_handoff_token call succeeded for this
+            # project, attributable to the CALLING session when it supplies
+            # session_id (a new, optional, attribution-only field — see this
+            # tool's schema in mcp_tools.py). Written ONLY on valid=True —
+            # never for a failed verification, which is already visible via
+            # the returned reason. Never raises and never changes the
+            # returned dict (see handoff_receipt.record_handoff_provenance_
+            # receipt's own best-effort contract, mirroring
+            # code_intel_receipt.record_prospect_receipt exactly) — the
+            # dict returned below is byte-identical to before this change,
+            # pinned by tests/test_dd07ece0_handoff_token.py.
+            from .. import handoff_receipt as _handoff_receipt_local  # noqa: PLC0415
+            await _handoff_receipt_local.record_handoff_provenance_receipt(
+                db,
+                tenant_id=(tenant or {}).get("id") if tenant else None,
+                project_id=_pid, session_id=args.get("session_id"),
+                tool_name="verify_handoff_token", outcome="valid",
+            )
+        return _vht_result
     if name == "accept_handoff":
         # 1bd5e810 — canonical receiver-side acceptance check, shared by
         # MCP/stdio/HTTP (see meridian.handoff.accept_handoff_envelope's own
@@ -3788,7 +3875,7 @@ async def _handle_task_tools(
             else None
         )
         _ah_live_items = args.get("live_items")
-        return await handoff_module_local.accept_handoff_envelope(
+        _ah_result = await handoff_module_local.accept_handoff_envelope(
             db,
             args.get("project_id") or "",
             goal_token=args.get("goal_token"),
@@ -3811,6 +3898,19 @@ async def _handle_task_tools(
             # untrusted-by-default posture requirement 4 asks for.
             delivery_source=args.get("delivery_source") or "chat_paste",
         )
+        if _ah_result.get("accepted"):
+            # 1b7eb437 — same best-effort, purely-additive receipt as the
+            # verify_handoff_token branch above; see its comment for the
+            # full contract. Written only on a genuine accepted=True.
+            from .. import handoff_receipt as _handoff_receipt_local  # noqa: PLC0415
+            await _handoff_receipt_local.record_handoff_provenance_receipt(
+                db,
+                tenant_id=(tenant or {}).get("id") if tenant else None,
+                project_id=args.get("project_id") or "",
+                session_id=args.get("session_id"),
+                tool_name="accept_handoff", outcome="accepted",
+            )
+        return _ah_result
     if name == "export_ai_log":
         # c0168425 — implementation follow-up to ea972129's design: read-only,
         # receipted export of ai_log_events. See db.ai_log.export_events for
@@ -3823,6 +3923,28 @@ async def _handle_task_tools(
             correlation_id=args.get("correlation_id"),
             parent_event_id=args.get("parent_event_id"),
             limit=int(_limit_raw) if _limit_raw is not None else 5000,
+        )
+    if name == "search_ai_log":
+        # d26b9943 (R2-B) — read-only, exact-first scoped search over
+        # ai_log_events. See db.ai_log.search_events for the full filter/
+        # pagination/index_status contract. All filter kwargs forwarded
+        # 1:1, no extra business logic here (matches this dispatch group's
+        # established export_ai_log/purge_ai_log pattern above).
+        _sal_limit_raw = args.get("limit")
+        _sal_cursor_raw = args.get("cursor")
+        return await db_module.search_events(
+            db, args["project_id"],
+            session_id=args.get("session_id"),
+            tenant_id=args.get("tenant_id"),
+            correlation_id=args.get("correlation_id"),
+            parent_event_id=args.get("parent_event_id"),
+            actor_kind=args.get("actor_kind"),
+            actor_id=args.get("actor_id"),
+            event_type=args.get("event_type"),
+            since_occurred_at=args.get("since_occurred_at"),
+            until_occurred_at=args.get("until_occurred_at"),
+            cursor=int(_sal_cursor_raw) if _sal_cursor_raw is not None else 0,
+            limit=int(_sal_limit_raw) if _sal_limit_raw is not None else 50,
         )
     if name == "export_ai_log_artifacts":
         # c0168425 — read-only, receipted export of stored ai_log artifacts
@@ -4097,7 +4219,8 @@ async def _handle_notes_decisions(
     link_flag_to_section, get_flag_drift,
     ingest_document_structure, add_insight, get_insights, save_finding,
     capture_research_finding, get_notes, read_note, delete_note,
-    add_workspace_note, get_workspace_notes, pin_workspace_decision,
+    add_workspace_note, get_workspace_notes, move_workspace_note_to_project,
+    pin_workspace_decision,
     get_workspace_decisions, get_workspace_settings, update_workspace_settings,
     save_blog_post, get_blog_posts, add_workspace_sprint_item,
     get_workspace_sprint_items, update_workspace_sprint_item,
@@ -4153,6 +4276,7 @@ async def _handle_notes_decisions(
         handle_capture_research_finding,
         handle_add_workspace_note,
         handle_get_workspace_notes,
+        handle_move_workspace_note_to_project,
         handle_pin_workspace_decision,
         handle_get_workspace_decisions,
         handle_get_workspace_settings,
@@ -4216,6 +4340,7 @@ async def _handle_notes_decisions(
         "capture_research_finding": handle_capture_research_finding,
         "add_workspace_note": handle_add_workspace_note,
         "get_workspace_notes": handle_get_workspace_notes,
+        "move_workspace_note_to_project": handle_move_workspace_note_to_project,
         "pin_workspace_decision": handle_pin_workspace_decision,
         "get_workspace_decisions": handle_get_workspace_decisions,
         "get_workspace_settings": handle_get_workspace_settings,
@@ -4455,7 +4580,9 @@ async def _handle_session_tools(
     """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log,
     get_session_activity, get_agent_instructions, set_agent_instructions,
     set_executor_config, idle_until_session_done, search_all, search_synthesis,
-    paper_search, social_search, github_search, get_session_brief.
+    paper_search, social_search, github_search, get_session_brief,
+    save_watchlist_query, list_watchlist_queries, run_watchlist_query,
+    delete_watchlist_query.
 
     81abd31f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4466,6 +4593,11 @@ async def _handle_session_tools(
     """
     from .handlers.session_tools import (  # noqa: PLC0415
         handle_checkpoint,
+        handle_register_external_job,
+        handle_update_external_job,
+        handle_get_external_job,
+        handle_list_external_jobs,
+        handle_complete_external_job,
         handle_get_context_block,
         handle_list_sessions,
         handle_get_session_log,
@@ -4485,9 +4617,21 @@ async def _handle_session_tools(
         handle_get_session_brief,
     )
     from .handlers.research_tools import handle_github_search  # noqa: PLC0415
+    # b924fd7c — recurring research watchlist, a new sibling module in the same
+    # Research Module family as research_tools.py (see that module's own
+    # docstring for why the family gets its own handlers modules rather than
+    # growing session_tools.py further).
+    from .handlers.research_watchlist import (  # noqa: PLC0415
+        handle_save_watchlist_query,
+        handle_list_watchlist_queries,
+        handle_run_watchlist_query,
+        handle_delete_watchlist_query,
+    )
 
     # Tools that need no extra context beyond the standard five parameters.
     _standard_dispatch: dict[str, Any] = {
+        "get_external_job": handle_get_external_job,
+        "list_external_jobs": handle_list_external_jobs,
         "get_context_block": handle_get_context_block,
         "list_sessions": handle_list_sessions,
         "get_session_log": handle_get_session_log,
@@ -4506,10 +4650,27 @@ async def _handle_session_tools(
         "social_search": handle_social_search,
         "github_search": handle_github_search,
         "get_session_brief": handle_get_session_brief,
+        "save_watchlist_query": handle_save_watchlist_query,
+        "list_watchlist_queries": handle_list_watchlist_queries,
+        "run_watchlist_query": handle_run_watchlist_query,
+        "delete_watchlist_query": handle_delete_watchlist_query,
     }
 
     if name in _standard_dispatch:
         return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+
+    if name == "register_external_job":
+        return await handle_register_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
+    if name == "update_external_job":
+        return await handle_update_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
+    if name == "complete_external_job":
+        return await handle_complete_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
 
     # checkpoint needs handler-level _fetch_recent_commits and
     # _resolve_caller_identity passed explicitly to keep the import graph acyclic.
@@ -4664,7 +4825,7 @@ async def _handle_file_claims(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics, claim_docx_region, get_docx_region_claims, release_docx_region_claims."""
+    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics, claim_docx_region, get_docx_region_claims, release_docx_region_claims, acquire_docx_document_lease, get_docx_document_lease, release_docx_document_lease, find_orphaned_docx_staged_files, list_active_worktrees, list_worktrees_pending_cleanup."""
     if name == "claim_file":
         # 4bac57ff — symbol-level claim when both `symbol` and `content` are
         # supplied; otherwise the coarse whole-file lock. Falls back to a
@@ -4698,6 +4859,23 @@ async def _handle_file_claims(
     if name == "get_file_claims":
         return await db_module.get_file_claims(
             db, args["file_path"], args.get("project_id"), args.get("symbol")
+        )
+    if name == "list_active_worktrees":
+        # dffcde86 — project_id is required at the DB layer; the b6ab6e83
+        # project_name resolver above (in _dispatch_mcp_tool) has already
+        # folded a resolved project_name into args["project_id"] by the time
+        # this runs, so only a genuinely absent project_id/project_name
+        # reaches this guard.
+        _wt_pid = (args.get("project_id") or "").strip()
+        if not _wt_pid:
+            return {"error": "project_id is required (or pass project_name)"}
+        return await db_module.list_active_worktrees(db, _wt_pid)
+    if name == "list_worktrees_pending_cleanup":
+        # dffcde86 (a03c0eeb) — project_id is optional here: omitting it
+        # scopes across every project, matching the server-wide periodic
+        # sweep's own query (db_module.list_worktrees_pending_cleanup).
+        return await db_module.list_worktrees_pending_cleanup(
+            db, args.get("project_id") or None
         )
     if name == "store_finding":
         validate_input_size(args.get("content"), "finding content", 1_000_000)
@@ -4800,9 +4978,44 @@ async def _handle_file_claims(
             "file_path": args.get("file_path"),
             "element_id": args.get("element_id"),
         }
+    if name == "acquire_docx_document_lease":
+        # 6507e83a — whole-document cross-process lease.
+        return await db_module.acquire_docx_document_lease(
+            db, args["session_id"], args["file_path"],
+        )
+    if name == "get_docx_document_lease":
+        # 6507e83a — read-only: the live whole-document lease, if any.
+        return {
+            "file_path": args["file_path"],
+            "lease": await db_module.get_docx_document_lease(db, args["file_path"]),
+        }
+    if name == "release_docx_document_lease":
+        # 6507e83a — release a session's whole-document lease.
+        released = await db_module.release_docx_document_lease(
+            db, args["session_id"], args["file_path"],
+        )
+        return {
+            "released": released,
+            "session_id": args["session_id"],
+            "file_path": args["file_path"],
+        }
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
         return {"released": released, "file_path": args["file_path"]}
+    if name == "find_orphaned_docx_staged_files":
+        # 6507e83a — maintenance diagnostic: staged-DOCX temp files left
+        # behind by a process that crashed between STAGE and PROMOTE inside
+        # meridian.doc_store's own write transaction. Pure filesystem scan,
+        # no DB/tenant dependency — lazy-imported like every other doc_store
+        # access point in this module (see _resolve_ingest_doc_store above).
+        from ..doc_store import find_orphaned_docx_staged_files as _find_orphans  # noqa: PLC0415
+        return {
+            "directory": args["directory"],
+            "staged_files": _find_orphans(
+                args["directory"],
+                max_age_seconds=float(args.get("max_age_seconds", 3600.0)),
+            ),
+        }
     return _MISS
 
 
@@ -5231,6 +5444,22 @@ async def _handle_planning_tools(
                 row["version"] = it.get("version")
             return row
 
+        # e6f58c25 — carry the evidence-staleness flag (set by
+        # db_module.list_hitl_requests) through this brief's own re-projection.
+        # Without this, the flag/note computed above is silently dropped here —
+        # the one place a DB-only fix would not actually reach this tool's output.
+        def _brief_hitl_row(h: dict[str, Any]) -> dict[str, Any]:
+            row = {
+                "id": h.get("id"),
+                "question": (h.get("question") or "")[:120],
+                "urgency": h.get("urgency"),
+            }
+            if "evidence_may_be_stale" in h:
+                row["evidence_may_be_stale"] = h.get("evidence_may_be_stale")
+            if h.get("evidence_staleness_note"):
+                row["evidence_staleness_note"] = h.get("evidence_staleness_note")
+            return row
+
         return {
             "project_id": project_id,
             "project_name": project.get("name"),
@@ -5264,12 +5493,7 @@ async def _handle_planning_tools(
             "new_handoff_available": new_handoff_available,
             "handoff_signal": handoff_signal,
             "pending_hitls": [
-                {
-                    "id": h.get("id"),
-                    "question": (h.get("question") or "")[:120],
-                    "urgency": h.get("urgency"),
-                }
-                for h in (hitls if isinstance(hitls, list) else [])[:5]
+                _brief_hitl_row(h) for h in (hitls if isinstance(hitls, list) else [])[:5]
             ],
         }
     if name == "refresh_context":
@@ -6599,8 +6823,26 @@ async def _dispatch_mcp_tool(
     db: Any,
     data_dir: str,
     tenant: dict[str, Any] | None = None,
+    scoped_project_ids: "list[str] | None" = None,
 ) -> Any:
-    """Route a tools/call to the appropriate db_module function."""
+    """Route a tools/call to the appropriate db_module function.
+
+    ``scoped_project_ids`` (a9c041d7) — defense-in-depth re-check of the
+    project-scope gate, run AFTER the project_name/non-UUID resolver below has
+    settled on a final ``project_id``. The pre-dispatch gate in
+    ``_handle_mcp_request`` only inspects the caller-supplied ``project_id``
+    (falling back to resolving ``project_name`` itself when ``project_id`` is
+    absent); it never re-runs once this resolver's own name lookup overrides
+    ``args["project_id"]``. That left a bypass: a scoped caller supplying an
+    in-scope ``project_id`` alongside an out-of-scope ``project_name`` sailed
+    through the pre-check gate (which saw the in-scope id and stopped there),
+    then had this resolver silently swap in the out-of-scope project — since
+    ``project_name`` wins over a UUID ``project_id`` whenever both are present
+    (see ``_lookup`` below). Re-checking here, against the actually-resolved
+    id, closes that gap regardless of which of the three resolution paths
+    (plain UUID passthrough, non-UUID project_id-as-name, or project_name
+    override) produced it.
+    """
     # Tenant scope for the workspace layer (notes/decisions/settings). None for
     # self-host / unauthenticated; the db functions then skip isolation.
     _mcp_tenant_id = tenant.get("id") if tenant else None
@@ -6627,6 +6869,18 @@ async def _dispatch_mcp_tool(
             args = {**args, "project_id": _resolved_proj["id"]}
         elif _pname_raw and not _pid_raw:
             raise ValueError(f"no project found matching name '{_lookup}'")
+    # a9c041d7 — re-check tenant scope against the FINAL resolved project_id,
+    # after the resolver above may have overridden it via project_name (or a
+    # non-UUID project_id-as-name lookup). The pre-dispatch gate in
+    # _handle_mcp_request only ever sees the caller's raw args, so a combined
+    # {project_id: <in-scope>, project_name: <out-of-scope>} payload could pass
+    # that gate and then have this resolver silently swap in the out-of-scope
+    # project. Same error shape/message as the pre-check gate so callers can't
+    # distinguish which layer caught it.
+    if scoped_project_ids is not None:
+        _final_pid = (args.get("project_id") or "").strip()
+        if _final_pid and _final_pid not in scoped_project_ids:
+            raise ValueError("project is outside your access scope")
     _groups = (
         _handle_project_tools,
         _handle_task_tools,

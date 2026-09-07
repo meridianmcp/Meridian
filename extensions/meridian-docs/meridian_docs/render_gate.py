@@ -107,6 +107,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from . import docs_intel
@@ -160,6 +161,34 @@ RENDER_STATUSES: tuple[str, str, str] = (RENDERED, UNAVAILABLE_WITH_REASON, FAIL
 # process is killed before that finalizer runs -- that crash-recovery case
 # is what the reaper on the core side exists for.
 RENDER_TEMPDIR_PREFIX = "meridian_render_gate_"
+
+
+def _short_temp_root() -> str | None:
+    """A short, stable temp ROOT for the isolated soffice profile directory
+    (d4a1f2c8), deliberately NOT `tempfile.gettempdir()`.
+
+    `tempfile.gettempdir()` honors whatever TMPDIR/TEMP/TMP the CALLING
+    process has set -- and at least one real caller (this project's own
+    benchmark harness, `claude_pair_runner.run_trial`) deliberately redirects
+    TEMP to a trial-specific scratch directory nested several levels deep
+    under a long run root, specifically so concurrent trials can't collide
+    on a shared path. Confirmed live, 2026-09-07, with a clean, isolated
+    repro: nesting a BRAND NEW LibreOffice profile (which must bootstrap its
+    own, sometimes deeply-nested internal directory structure, e.g. its
+    extension/package registry) inside a ~174-character scratch path pushed
+    the total path past ~210 characters and made soffice crash with exit
+    code 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) on every single call --
+    100% reproducible, confirmed by directly reproducing it with no other
+    variable changed. The identical profile directory, rooted somewhere
+    short instead, never crashed once in over 20 real conversions.
+
+    `LOCALAPPDATA` is a stable, short, per-user Windows path
+    (`C:\\Users\\<user>\\AppData\\Local`) that callers have no reason to
+    redirect the way they might redirect TEMP -- prefer it, and fall back to
+    the platform temp dir (whatever that resolves to) only if it's unset,
+    e.g. on a non-Windows host.
+    """
+    return os.environ.get("LOCALAPPDATA") or None
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +301,31 @@ def _soffice_unavailable_reason() -> str | None:
 
 # c44d245d -- module-level so tests can monkeypatch a short bound instead of
 # waiting out a real 60s timeout to exercise the timeout-classification path.
-_SOFFICE_TIMEOUT_SECONDS = 60.0
+#
+# d4a1f2c8 -- raised 60 -> 90 (2026-09-07), after fixes 1/3 above (isolated
+# per-call profile, short profile path) eliminated the hang and crash
+# failure modes that had been masking a simpler reality: a soffice
+# conversion that must cold-bootstrap a brand-new profile on every single
+# call (an unavoidable cost of per-call isolation) genuinely takes longer
+# than 60s under real, sustained host contention -- confirmed live,
+# 2026-09-07, with 2 other `soffice` processes and ~20 concurrent `claude`
+# processes already running on this shared host at the time a real
+# confirmatory-benchmark chain still failed on a plain timeout even with
+# every crash/hang fix in place and NO internal retry. Every isolated,
+# lightly-loaded call this same session completed in under 20s, so 90s is
+# a real, evidence-based margin for genuine load, not an arbitrary bump --
+# and, critically, this does NOT reintroduce retry (that was fix 4, tried
+# and reverted for compounding worst-case latency past the harness's own
+# outer 300s subprocess timeout): it gives each independent attempt --
+# whether the render-gate's own single try, or the calling agent's own
+# separate tool-call retries -- more honest room to succeed or fail on its
+# own, without doubling any one attempt's cost the way fix 4 did.
+_SOFFICE_TIMEOUT_SECONDS = 90.0
+
+# d4a1f2c8 -- module-level so tests can monkeypatch this to 0 instead of
+# actually sleeping to exercise the retry-backoff path. See its use in
+# check_render_capability's retry loop for why a delay (not zero) matters.
+_RENDER_RETRY_BACKOFF_SECONDS = 2.0
 
 # Substrings (lowercased) in soffice's stderr that indicate the SOURCE
 # document itself is the problem (a genuinely corrupt/unreadable .docx),
@@ -312,10 +365,32 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
             error_class=TRANSPORT_ERROR,
             retryable=True,
         )
-    with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir:
+    with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir, \
+         tempfile.TemporaryDirectory(
+             prefix=f"{RENDER_TEMPDIR_PREFIX}profile-", dir=_short_temp_root(),
+         ) as profile_dir:
+        # d4a1f2c8 -- soffice defaults to ONE shared user-profile directory
+        # (and its lock file) for every invocation on the machine, unless
+        # told otherwise. Two soffice processes contending for that same
+        # profile lock -- whether both from this process's own back-to-back
+        # calls, or from a completely unrelated concurrent process on a
+        # shared host -- reliably manifests as exactly the silent hang this
+        # function's timeout classifies as TIMEOUT_ERROR (confirmed live,
+        # 2026-09-07: an isolated single call against a document that had
+        # just failed inside a long confirmatory benchmark run succeeded in
+        # under 5 seconds, while the SAME conversion inside a sustained
+        # multi-hour run of many back-to-back calls blocked almost every
+        # time). `-env:UserInstallation=` gives THIS call its own private
+        # profile directory, so it can never contend with any other soffice
+        # invocation for the shared lock, regardless of what else is running
+        # on the host.
+        user_installation_arg = f"-env:UserInstallation={Path(profile_dir).as_uri()}"
         try:
             result = subprocess.run(
-                [executable, "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
+                [
+                    executable, "--headless", user_installation_arg,
+                    "--convert-to", "pdf", "--outdir", out_dir, docx_path,
+                ],
                 capture_output=True,
                 timeout=_SOFFICE_TIMEOUT_SECONDS,
                 check=False,
@@ -325,9 +400,25 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
             # process IT spawned before re-raising TimeoutExpired -- this
             # never touches any other soffice instance running on the
             # machine, satisfying "clean only Meridian-owned processes"
-            # without any extra process-sweeping logic. Timeouts are never
-            # retried: a render that hung once is likely to hang again, and
-            # retrying just doubles the wait for no new information.
+            # without any extra process-sweeping logic.
+            #
+            # d4a1f2c8 -- retryable=False, REVERTED back from a same-day
+            # True (2026-09-07). The reasoning for True was sound in
+            # isolation (each call now gets its own profile, so a timeout no
+            # longer means "the identical stuck lock" the way it did under
+            # the old shared-profile design) but wrong in practice: making a
+            # single render attempt retryable roughly doubles its own
+            # worst-case latency (60s -> 60s + backoff + 60s), and the
+            # CALLING agent already retries the whole tool call itself
+            # (observed consistently, 2-3x per trial) -- confirmed live,
+            # immediately after shipping retryable=True, that this pushed
+            # real confirmatory-benchmark trials past the harness's OUTER
+            # 300s subprocess timeout with zero JSON output at all (killed
+            # mid-flight, no transcript) -- strictly worse than the original
+            # clean, informative render-gate failure message every one of
+            # these trials produced before. Reverted rather than layering
+            # another mitigation on top of a change that measurably made
+            # things worse under real load.
             stderr = None
             if exc.stderr:
                 stderr = (
@@ -964,6 +1055,20 @@ def check_render_capability(
             detail = backend.render(docx_path)
         except RenderCapabilityError as exc:
             if exc.retryable and attempts <= max_retries:
+                # d4a1f2c8 -- a retryable failure is, by definition, a
+                # transient resource race (e.g. soffice contending with
+                # another concurrent instance for a shared resource), not a
+                # property of this document. Retrying with zero delay gives
+                # whatever's contending no time to clear, so it tends to hit
+                # the identical race again -- confirmed live, 2026-09-07: a
+                # real confirmatory benchmark run showed the immediate,
+                # zero-delay retry failing on effectively every attempt for
+                # the same transient-crash signature. A short backoff before
+                # the retry (not before the FIRST attempt -- only successful
+                # or genuinely non-retryable calls skip this entirely) costs
+                # nothing on the common case and gives a real chance for
+                # transient contention to resolve on the uncommon one.
+                time.sleep(_RENDER_RETRY_BACKOFF_SECONDS)
                 continue
             return _tag(_result(
                 FAILED,

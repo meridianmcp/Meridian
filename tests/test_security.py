@@ -358,6 +358,17 @@ def test_project_scope_enforcement_http_and_mcp(monkeypatch, tmp_path):
         # Workspace-wide member: MCP allowed on the sibling project too.
         assert "outside your access scope" not in _mcp(tok_wide, {"project_id": pid_b}).text
 
+        # a9c041d7 — the real exploit path, end-to-end over real HTTP: a scoped
+        # member supplies their OWN in-scope project_id (pid_a, which passes the
+        # pre-dispatch gate) alongside project_name naming the sibling
+        # out-of-scope project (pid_b). Without the a9c041d7 post-resolution
+        # re-check in _dispatch_mcp_tool, the project_name resolver silently
+        # swaps in pid_b and the scoped member would read the sibling
+        # project's tasks despite never being granted access to it.
+        assert "outside your access scope" in _mcp(
+            tok_scoped, {"project_id": pid_a, "project_name": "ps-proj-b"},
+        ).text
+
 
 # ---------------------------------------------------------------------------
 # fdf1120f — magic-link verify renders HTML on failure, never a blank JSON page

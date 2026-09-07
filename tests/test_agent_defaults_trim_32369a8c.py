@@ -35,7 +35,14 @@ _BEFORE_TRIM_CHAR_COUNT = 16309
 # c95d0c12 above (both merged onto dev the same day); ceiling recomputed
 # directly from the merged file (17262 chars) + 100, rather than stacked
 # from two stale estimates.
-_MAX_ALLOWED_CHARS = 17362
+# b924fd7c (commit c8c5d1ac, "add recurring watchlist queries over
+# paper/github/social search") documented the new save_watchlist_query /
+# run_watchlist_query / list_watchlist_queries / delete_watchlist_query
+# mechanism in the RESEARCH ROUTING PROTOCOL section and named
+# github_search/social_search explicitly alongside paper_search -- again
+# genuine new-feature documentation, not re-inflation of previously-trimmed
+# prose. Ceiling recomputed directly from the merged file (19043 chars) + 100.
+_MAX_ALLOWED_CHARS = 19143
 
 
 def test_length_decreased_after_trim():

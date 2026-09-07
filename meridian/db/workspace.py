@@ -200,9 +200,40 @@ async def move_workspace_note_to_project(
     """Convert a workspace note into a project note on ``project_id``.
 
     Copies title/body/tags to a new project_notes row, then deletes the
-    workspace note. Returns the new project note, or None if the workspace
-    note was not found (or belongs to another tenant). Atomic: the delete
-    only runs after the project note is created.
+    workspace note. Returns the new project note, or ``None`` if the
+    workspace note was not found (unknown id, or belongs to another tenant
+    when ``tenant_id`` is given), or if ``project_id`` does not exist.
+
+    Tenant safety (84f77597): the *source* note lookup is scoped by
+    ``tenant_id`` via ``_ws_tenant_clause`` exactly like every other
+    workspace-note function (``delete_workspace_note``, ``get_workspace_notes``)
+    — a caller can never move a note it does not own. The *destination*
+    project check below is existence-only, not ownership-scoped: ``projects``
+    has no ``tenant_id`` column on this connection, and the only other
+    tenant-resolution helper (``get_tenant_id_for_project``) is documented to
+    degrade to ``None`` on hosted Neon deployments (the tenants table lives in
+    a separate control-plane DB this per-project connection can't reach) —
+    exactly the deployment where this check matters most, so it cannot serve
+    as a hard gate here. Real destination-ownership enforcement for hosted
+    multi-tenant callers lives at the MCP layer instead: the handler exposes
+    this parameter as ``project_id`` specifically so it flows through the
+    existing generic project-scope gate in ``mcp/handler.py``
+    (``scoped_project_ids`` / ``_scoped_project_ids_for_request``), the same
+    defense-in-depth every other project-scoped write tool in this codebase
+    relies on rather than re-implementing a scope check per function.
+
+    Atomicity-in-effect (84f77597): Postgres runs with ``autocommit=True``
+    (see ``pg_adapter.py``'s ``PostgresConnection.commit()``/``rollback()``
+    docstrings), so there is no real multi-statement transaction to lean on
+    here — each statement below already commits the instant it executes.
+    This uses the same guarded-write + compensating-action idiom as
+    ``advance_proposal_status`` in this module: the project note is created
+    first, then the workspace note delete is *guarded* (its return value is
+    checked, unlike the prior version of this function). If the delete
+    affects zero rows — a concurrent caller already moved or deleted the same
+    workspace note between our initial read and this point — the just-created
+    project note is compensated away (deleted) and this call returns
+    ``None``, rather than silently leaving a duplicate note in both places.
     """
     scope, scope_params = _ws_tenant_clause(tenant_id)
     sql = "SELECT * FROM workspace_notes WHERE id = ?" + (f" AND {scope}" if scope else "")
@@ -211,9 +242,16 @@ async def move_workspace_note_to_project(
     note = _row_to_dict(row) if row is not None else None
     if not note:
         return None
-    # Guard against moving to a non-existent project.
+    # Guard against moving to a non-existent project. Existence-only check —
+    # see the docstring above for why real destination tenant-ownership
+    # enforcement lives at the MCP layer, not here.
     if await get_project(db, project_id) is None:
         return None
+    # add_project_note() runs check_for_secrets() before its own INSERT and
+    # raises on a secret-shaped body — that happens before anything below,
+    # so a raise here leaves the workspace note untouched (nothing partially
+    # applied). Deliberately not caught: the caller sees the same error
+    # add_project_note() would raise on a direct call.
     created = await add_project_note(
         db,
         project_id,
@@ -221,7 +259,19 @@ async def move_workspace_note_to_project(
         note.get("body") or "",
         note.get("tags"),
     )
-    await delete_workspace_note(db, note_id, tenant_id=tenant_id)
+    # 84f77597 — guarded delete + compensating action (see docstring). Do NOT
+    # ignore delete_workspace_note's return value: it is False when a
+    # concurrent caller already removed/moved this exact note since the read
+    # above, and silently treating that as success duplicates the note.
+    deleted = await delete_workspace_note(db, note_id, tenant_id=tenant_id)
+    if not deleted:
+        # Compensate: undo the just-created project note so this call has no
+        # net effect other than reporting the race via a None return. There
+        # is no rollback() to lean on for this on Postgres (autocommit=True
+        # — see pg_adapter.py), so undo explicitly.
+        await db.execute("DELETE FROM project_notes WHERE id = ?", (created["id"],))
+        await db.commit()
+        return None
     return created
 
 
