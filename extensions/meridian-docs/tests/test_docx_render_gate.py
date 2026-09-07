@@ -742,6 +742,51 @@ def test_soffice_render_passes_an_isolated_user_installation(tmp_path, monkeypat
     assert profile_args[0] != profile_args[1]
 
 
+def test_soffice_render_profile_dir_ignores_a_long_redirected_temp(tmp_path, monkeypatch):
+    """d4a1f2c8 -- confirmed live, 2026-09-07, with a clean isolated repro:
+    nesting the isolated profile directory inside whatever TEMP/TMP the
+    CALLING process has redirected (this project's own benchmark harness
+    deliberately redirects TEMP to a trial-specific scratch directory,
+    nested several levels deep, specifically so concurrent trials can't
+    collide on a shared path) can push the total path past ~210 characters
+    once LibreOffice bootstraps its own nested internal profile structure
+    on top -- and soffice reliably crashes with 0xC0000409
+    (STATUS_STACK_BUFFER_OVERRUN) when that happens. The identical
+    conversion, with the profile rooted somewhere short instead, never
+    crashed once. The profile directory must be rooted at a short, stable
+    location regardless of how deep the caller's own TEMP/TMP is."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    long_redirected_temp = tmp_path / ("deeply" + os.sep + "nested" + os.sep + "trial" + os.sep + "scratch" + os.sep + ("x" * 150))
+    long_redirected_temp.mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", str(long_redirected_temp))
+    monkeypatch.setenv("TEMP", str(long_redirected_temp))
+    monkeypatch.setenv("TMP", str(long_redirected_temp))
+
+    short_root = tmp_path / "short"
+    short_root.mkdir()
+    monkeypatch.setattr(render_gate, "_short_temp_root", lambda: str(short_root))
+
+    captured_cmds = []
+
+    def _fake_run(cmd, **kwargs):
+        captured_cmds.append(cmd)
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    render_gate._soffice_render(docx_path)
+
+    profile_arg = next(arg for arg in captured_cmds[0] if arg.startswith("-env:UserInstallation="))
+    profile_path = profile_arg[len("-env:UserInstallation="):]
+    assert str(short_root).replace("\\", "/") in profile_path.replace("\\", "/")
+    assert str(long_redirected_temp).replace("\\", "/") not in profile_path.replace("\\", "/")
+
+
 def test_soffice_render_timeout_is_classified_and_carries_stderr(tmp_path, monkeypatch):
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")

@@ -163,6 +163,34 @@ RENDER_STATUSES: tuple[str, str, str] = (RENDERED, UNAVAILABLE_WITH_REASON, FAIL
 RENDER_TEMPDIR_PREFIX = "meridian_render_gate_"
 
 
+def _short_temp_root() -> str | None:
+    """A short, stable temp ROOT for the isolated soffice profile directory
+    (d4a1f2c8), deliberately NOT `tempfile.gettempdir()`.
+
+    `tempfile.gettempdir()` honors whatever TMPDIR/TEMP/TMP the CALLING
+    process has set -- and at least one real caller (this project's own
+    benchmark harness, `claude_pair_runner.run_trial`) deliberately redirects
+    TEMP to a trial-specific scratch directory nested several levels deep
+    under a long run root, specifically so concurrent trials can't collide
+    on a shared path. Confirmed live, 2026-09-07, with a clean, isolated
+    repro: nesting a BRAND NEW LibreOffice profile (which must bootstrap its
+    own, sometimes deeply-nested internal directory structure, e.g. its
+    extension/package registry) inside a ~174-character scratch path pushed
+    the total path past ~210 characters and made soffice crash with exit
+    code 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) on every single call --
+    100% reproducible, confirmed by directly reproducing it with no other
+    variable changed. The identical profile directory, rooted somewhere
+    short instead, never crashed once in over 20 real conversions.
+
+    `LOCALAPPDATA` is a stable, short, per-user Windows path
+    (`C:\\Users\\<user>\\AppData\\Local`) that callers have no reason to
+    redirect the way they might redirect TEMP -- prefer it, and fall back to
+    the platform temp dir (whatever that resolves to) only if it's unset,
+    e.g. on a non-Windows host.
+    """
+    return os.environ.get("LOCALAPPDATA") or None
+
+
 # ---------------------------------------------------------------------------
 # c44d245d -- bounded, diagnostic failure classification for the ``"failed"``
 # status. The three-state contract above (rendered / unavailable-with-reason /
@@ -319,7 +347,9 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
             retryable=True,
         )
     with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir, \
-         tempfile.TemporaryDirectory(prefix=f"{RENDER_TEMPDIR_PREFIX}profile-") as profile_dir:
+         tempfile.TemporaryDirectory(
+             prefix=f"{RENDER_TEMPDIR_PREFIX}profile-", dir=_short_temp_root(),
+         ) as profile_dir:
         # d4a1f2c8 -- soffice defaults to ONE shared user-profile directory
         # (and its lock file) for every invocation on the machine, unless
         # told otherwise. Two soffice processes contending for that same
