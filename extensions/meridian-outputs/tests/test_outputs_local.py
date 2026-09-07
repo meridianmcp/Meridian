@@ -5566,6 +5566,39 @@ class TestColdTreeFtsDeferral:
         idx.rebuild()
         assert idx.last_db_write_error is None
 
+    def test_rebuild_return_value_is_cumulative_not_a_per_call_delta(
+        self, tmp_path: Path,
+    ) -> None:
+        """Gap-register MO-IMP-04: a prior finding observed a caller
+        (run_scale.py) mistaking rebuild()'s return value for a per-call
+        delta and having to compute the real increment independently. The
+        return value (and search_outputs()'s "total_indexed" field it
+        feeds) is, and must remain, the CUMULATIVE total -- the per-call
+        delta is separately and explicitly available as
+        last_rebuild_metrics["files_new"], so no caller needing a delta has
+        to infer one from before/after totals."""
+        for i in range(5):
+            (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            total1 = idx.rebuild()
+            assert total1 == 5
+            assert idx.last_rebuild_metrics["files_new"] == 5
+
+            for i in range(5, 35):  # a known 30-file increment
+                (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+            total2 = idx.rebuild()
+            assert total2 == 35, (
+                "rebuild()'s return value must be the cumulative total "
+                "(35), not the per-call delta (30)"
+            )
+            assert idx.last_rebuild_metrics["files_new"] == 30, (
+                "the per-call delta must be available explicitly, without "
+                "the caller computing total2 - total1 itself"
+            )
+        finally:
+            idx.close()
+
     def test_search_outputs_surfaces_db_write_error_in_result_dict(
         self, tmp_path: Path,
     ) -> None:
