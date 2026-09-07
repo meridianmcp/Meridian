@@ -95,6 +95,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "fan_out_sprint_items": 'fan_out_sprint_items(project_id="abc-123", items=[{"title": "Design DB schema", "group": "backend"}, {"title": "Build API endpoints", "group": "backend"}, {"title": "Wire up frontend", "group": "frontend"}])',
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
+    "reconcile_stale_claims": 'reconcile_stale_claims(project_id="abc-123", dry_run=true)',
     "assign_sprint_waves": 'assign_sprint_waves(project_id="abc-123")',
     "start_wave_run": 'start_wave_run(project_id="abc-123", version="v0.2.5", wave_label="wave-2", item_ids=["item-uuid-a", "item-uuid-b"], failure_modes={"item-uuid-a": "stop"})',
     "finalize_wave_run": 'finalize_wave_run(wave_run_id="run-uuid", evidence={"status": "ok", "exit_code": 0, "passed": 1780, "failed": 0}, expected_revision_hash="sha256:...")',
@@ -2581,6 +2582,40 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
          "required": []}},
+    {"name": "reconcile_stale_claims", "description":
+        "56e9b3c7 — project/version-scoped, auditable stale-claim reconciliation sweep. The "
+        "bulk counterpart to claim_sprint_item's own inline autonomous reconciliation (which "
+        "only ever fires reactively, on a claim attempt against one already-claimed item) — "
+        "use this for a scheduler path, or an explicit human/planner/executor-triggered audit "
+        "across a whole board. Scans in_progress items in project_id (optionally narrowed to "
+        "one version and/or an explicit item_ids allow-list — never cross-project), classifies "
+        "each claim as active/stale/ambiguous via the same multi-signal check claim_sprint_item "
+        "uses (session heartbeat liveness, claimed_at age vs. a 2h threshold, worktree/pid "
+        "evidence — never age alone), and — ONLY when dry_run=False — resets every 'stale' "
+        "verdict: atomically returns the item to pending, clears claimed_at/actor, releases the "
+        "file/symbol resource locks the abandoned claim held, and writes an audit record. "
+        "'active' and 'ambiguous' verdicts are NEVER touched, dry-run or not — this never "
+        "force-releases a genuinely live owner or treats an inconclusive signal as proof of "
+        "abandonment. dry_run=True (the default) performs the full scan/classification and "
+        "reports exactly what WOULD happen without writing anything — safe to run against any "
+        "project, including live production boards, at any time. max_batch bounds how many "
+        "in_progress candidates are scanned in one call (capped server-side); truncated=true on "
+        "the result means more candidates exist than were scanned — page through with a "
+        "follow-up call. Returns {project_id, version, dry_run, max_batch, candidates_total, "
+        "scanned, truncated, active: [...], ambiguous: [...], stale: [...], reset: [...], "
+        "errors: [...]} — active/ambiguous/stale hold classification verdicts, reset holds what "
+        "was actually written back (only populated when dry_run=False), errors holds "
+        "{item_id, error} for any one candidate whose classification or reset failed (never "
+        "aborts the rest of the sweep).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "version": {"type": "string", "description": "Optional: narrow the scan to one sprint-version bucket. Omit to scan every version in the project."},
+         "item_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional: only classify/reset these specific in_progress item ids (still hard-scoped to project_id). Omit to scan every in_progress candidate."},
+         "dry_run": {"type": "boolean", "description": "Default true: classify and report only, write nothing. Set false to actually reset every 'stale' verdict (release locks, return to pending, write an audit record)."},
+         "max_batch": {"type": "integer", "description": "Cap on how many in_progress candidates are classified (and, if not dry-run, potentially reset) in this one call. Server-side hard ceiling applies regardless of what's requested. Omit for the default."},
+         "actor": {"type": "string", "description": "Recorded as who ran the sweep, for the audit trail. Omit to leave unattributed."},
+         "repo_root": {"type": "string", "description": "Self-hosted only: enables the worktree-pid and strict-completion-evidence liveness signals. Defaults to the server's own repo root when omitted."}},
+         "required": []}},
     {"name": "get_planning_brief", "description":
         "PLANNING SESSIONS: CALL THIS FIRST before anything else. "
         "Read-only: Return a compact planning context — sprint, north star, pending items, "
@@ -3895,6 +3930,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_sprint_items":              "sprint-management",
     "get_sprint_progress":           "sprint-management",
     "reconcile_sprint_drift":        "sprint-management",
+    "reconcile_stale_claims":        "sprint-management",
     "get_planning_brief":            "sprint-management",
     "get_parallelizable_groups":     "sprint-management",
     "assign_sprint_waves":           "sprint-management",
@@ -4134,6 +4170,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_parallelizable_groups": "planner",
     "analyze_sprint":            "planner",
     "reconcile_sprint_drift":    "planner",
+    "reconcile_stale_claims":    "executor",
     "analyze_model_efficiency":  "planner",
     "set_sprint":                "planner",
     "set_goal":                  "planner",
@@ -4425,6 +4462,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_parallelizable_groups":  "maintenance-only",
     "assign_sprint_waves":        "maintenance-only",
     "reconcile_sprint_drift":     "maintenance-only",
+    "reconcile_stale_claims":     "maintenance-only",
     "get_symbol_hotspots":        "maintenance-only",
     "get_symbol_claims":          "maintenance-only",
     # parallel coordination primitives (orchestrator-only)
@@ -4579,6 +4617,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "get_agent_instructions": "Get Agent Instructions",
     "set_agent_instructions": "Set Agent Instructions",
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
+    "reconcile_stale_claims": "Reconcile Stale Claims",
     "assign_sprint_waves": "Assign Sprint Waves",
     "complete_wave_gate": "Complete Wave Gate",
     "configure_wave_gate": "Configure Wave Gate",
