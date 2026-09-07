@@ -457,3 +457,131 @@ def test_diagnostics_local_process_cache_reports_sprint_items_cache_stats():
     assert local["hits"] == 0
     assert local["misses"] == 0
     assert "ttl_seconds" in local
+
+
+# ---------------------------------------------------------------------------
+# 2cf57fde round-2 -- construction_failed dead-code regression + tie-break
+#
+# Verify-phase finding: get_redis_client()'s except-block set BOTH
+# _redis_unavailable AND last_error_at/last_error_class in the same block, so
+# get_redis_runtime_diagnostics's branch order (publish-attempt evidence
+# checked before _redis_unavailable) made "construction_failed" permanently
+# unreachable -- a real construction failure always read as "unreachable",
+# identical to a genuine network outage. Fixed by giving construction
+# failures their own dedicated last_construction_error_class/_at fields,
+# never touching last_error_class/last_error_at (which stay reserved for
+# genuine publish-ATTEMPT evidence, matching every test above this section).
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostics_real_construction_failure_reports_construction_failed(monkeypatch):
+    """Exercises the REAL get_redis_client() construction path -- monkeypatches
+    redis.asyncio.from_url to raise, exactly like an actual malformed
+    MERIDIAN_REDIS_URL or an incompatible redis-py version would, rather than
+    mocking get_redis_client itself (which would not exercise the buggy
+    except-block at all)."""
+    monkeypatch.setenv("MERIDIAN_REDIS_URL", "redis://example.invalid:6379/0")
+
+    import sys
+    import types
+
+    def _boom_from_url(*_a, **_kw):
+        raise ValueError("malformed redis URL")
+
+    fake_asyncio_submodule = types.ModuleType("redis.asyncio")
+    fake_asyncio_submodule.from_url = _boom_from_url
+    fake_redis_pkg = types.ModuleType("redis")
+    fake_redis_pkg.asyncio = fake_asyncio_submodule
+    monkeypatch.setitem(sys.modules, "redis", fake_redis_pkg)
+    monkeypatch.setitem(sys.modules, "redis.asyncio", fake_asyncio_submodule)
+
+    async def _run():
+        client = await redis_bridge.get_redis_client()
+        assert client is None
+
+        diag = redis_bridge.get_redis_runtime_diagnostics()
+        # The bug: this used to be "unreachable", identical to a real outage.
+        assert diag["availability"] == "construction_failed"
+        assert diag["last_construction_error_class"] == "ValueError"
+        assert diag["last_construction_error_age_seconds"] is not None
+        assert diag["last_construction_error_age_seconds"] >= 0
+        # Must NOT leak into the publish-attempt error fields -- those stay
+        # reserved for genuine publish evidence (see the tests above).
+        assert diag["last_error_class"] is None
+        assert diag["last_error_age_seconds"] is None
+
+        # Cached failure -- a second call must not retry construction, and
+        # diagnostics must remain construction_failed.
+        client2 = await redis_bridge.get_redis_client()
+        assert client2 is None
+        assert redis_bridge.get_redis_runtime_diagnostics()["availability"] == "construction_failed"
+    asyncio.run(_run())
+
+
+def test_diagnostics_publish_evidence_still_overrides_stale_construction_failure(monkeypatch):
+    """Precedence check (must survive the fix): once genuine publish-attempt
+    evidence exists it still outranks a stale construction-failure history,
+    exactly as the precedence comment in get_redis_runtime_diagnostics
+    documents -- and this codebase's established mocking convention (tests
+    replace get_redis_client() wholesale, never touching _redis_unavailable)
+    keeps working unchanged."""
+    import sys
+    import types
+
+    monkeypatch.setenv("MERIDIAN_REDIS_URL", "redis://example.invalid:6379/0")
+
+    def _boom_from_url(*_a, **_kw):
+        raise RuntimeError("boom")
+
+    fake_asyncio_submodule = types.ModuleType("redis.asyncio")
+    fake_asyncio_submodule.from_url = _boom_from_url
+    fake_redis_pkg = types.ModuleType("redis")
+    fake_redis_pkg.asyncio = fake_asyncio_submodule
+    monkeypatch.setitem(sys.modules, "redis", fake_redis_pkg)
+    monkeypatch.setitem(sys.modules, "redis.asyncio", fake_asyncio_submodule)
+
+    async def _run():
+        assert await redis_bridge.get_redis_client() is None
+        assert redis_bridge.get_redis_runtime_diagnostics()["availability"] == "construction_failed"
+
+        fake = _FakeRedisClient()
+
+        async def _fake_get_client():
+            return fake
+
+        monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_get_client)
+        ok = await redis_bridge.publish_session_message("s1", {"id": "m1"})
+        assert ok is True
+
+        diag = redis_bridge.get_redis_runtime_diagnostics()
+        assert diag["availability"] == "reachable"
+    asyncio.run(_run())
+
+
+def test_diagnostics_tie_break_treats_equal_timestamps_as_reachable(monkeypatch):
+    """Secondary finding: an exact tie between last_error_at and
+    last_success_at (a failure immediately followed by a success within
+    float-clock precision) must read as reachable, not degraded."""
+    monkeypatch.setenv("MERIDIAN_REDIS_URL", "redis://example.invalid:6379/0")
+    fixed_time = 1_700_000_000.0
+    monkeypatch.setattr(redis_bridge.time, "time", lambda: fixed_time)
+
+    async def _run():
+        async def _fake_failing_client():
+            return _FailingRedisClient()
+
+        monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_failing_client)
+        assert await redis_bridge.publish_session_message("s1", {"id": "m1"}) is False
+
+        fake = _FakeRedisClient()
+
+        async def _fake_ok_client():
+            return fake
+
+        monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_ok_client)
+        assert await redis_bridge.publish_session_message("s1", {"id": "m2"}) is True
+
+        diag = redis_bridge.get_redis_runtime_diagnostics()
+        assert diag["last_error_class"] == "ConnectionError"
+        assert diag["availability"] == "reachable"
+    asyncio.run(_run())

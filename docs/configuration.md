@@ -117,6 +117,14 @@ Neon-avoidance numbers only ever come from a cache that is actually live.
 This snapshot never performs a live Redis round-trip; it reads in-process
 counters only.
 
+Two error pairs are reported, kept deliberately separate: `last_error_class`
+/ `last_error_age_seconds` reflect the most recent publish-*attempt* failure,
+while `last_construction_error_class` / `last_construction_error_age_seconds`
+reflect the most recent client-*construction* failure (a bad
+`MERIDIAN_REDIS_URL`, a missing/incompatible `redis-py`, etc.). Keeping these
+distinct is what makes `construction_failed` a diagnosable state rather than
+indistinguishable from a genuine network outage.
+
 ---
 
 ## Example `.env`

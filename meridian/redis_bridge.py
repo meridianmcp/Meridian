@@ -78,6 +78,18 @@ _redis_diag_state: dict[str, Any] = {
     "last_error_class": None,
     "last_error_at": None,
     "last_success_at": None,
+    # 2cf57fde round-2 fix — a pure client-CONSTRUCTION failure (bad URL,
+    # missing/incompatible redis-py, etc.) is tracked HERE, deliberately
+    # separate from last_error_class/last_error_at above. Those two fields
+    # are reserved for genuine publish-ATTEMPT evidence (see the precedence
+    # comment in get_redis_runtime_diagnostics and
+    # test_diagnostics_publish_failure_records_last_error_class /
+    # test_diagnostics_reset_clears_all_counters, which assert last_error_class
+    # reflects a publish failure). Keeping construction failures out of those
+    # fields is what makes the "construction_failed" availability state
+    # reachable at all -- see get_redis_client()'s except block.
+    "last_construction_error_class": None,
+    "last_construction_error_at": None,
     "latency_ms_samples": deque(maxlen=_LATENCY_SAMPLE_MAX),
     # Counters for a future Redis-backed read-through cache (NOT implemented
     # by this item) — see record_cache_hit/miss/set/invalidation below.
@@ -134,6 +146,8 @@ def reset_redis_client_cache() -> None:
         "last_error_class": None,
         "last_error_at": None,
         "last_success_at": None,
+        "last_construction_error_class": None,
+        "last_construction_error_at": None,
         "cache_hits": 0,
         "cache_misses": 0,
         "cache_sets": 0,
@@ -171,8 +185,16 @@ async def get_redis_client() -> Any | None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("redis_bridge: could not construct Redis client, disabling push augmentation", exc_info=True)
         _redis_unavailable = True
-        _redis_diag_state["last_error_class"] = type(exc).__name__
-        _redis_diag_state["last_error_at"] = time.time()
+        # 2cf57fde round-2 fix — record this under the dedicated
+        # construction-error fields, NOT last_error_class/last_error_at.
+        # Those are reserved for genuine publish-ATTEMPT evidence (see the
+        # precedence comment in get_redis_runtime_diagnostics); conflating
+        # the two here was the root cause of "construction_failed" being
+        # unreachable dead code, since a construction failure would always
+        # populate last_error_at and get shadowed by the publish-evidence
+        # branch below.
+        _redis_diag_state["last_construction_error_class"] = type(exc).__name__
+        _redis_diag_state["last_construction_error_at"] = time.time()
         return None
 
 
@@ -498,11 +520,18 @@ def get_redis_runtime_diagnostics(tenant: "dict | None" = None) -> dict[str, Any
             availability = "reachable"
         elif last_success is None:
             availability = "unreachable"
-        elif last_success > last_error:
+        elif last_success >= last_error:
+            # >= (not strictly >): an exact tie -- a failure immediately
+            # followed by a success within float-clock precision -- means
+            # the most recent evidence IS a success, so it must not read as
+            # "degraded". Secondary finding, 2cf57fde round-2 fix.
             availability = "reachable"
         else:
             availability = "degraded"
     elif _redis_unavailable:
+        # 2cf57fde round-2 fix — reachable now that construction failures no
+        # longer touch last_error_at/last_success_at (see get_redis_client()
+        # and the dedicated last_construction_error_* fields above/below).
         availability = "construction_failed"
     elif _redis_client is None:
         availability = "idle"  # configured, but no publish attempted yet
@@ -566,6 +595,18 @@ def get_redis_runtime_diagnostics(tenant: "dict | None" = None) -> dict[str, Any
         "last_error_class": diag["last_error_class"],
         "last_error_age_seconds": (
             (time.time() - last_error) if last_error is not None else None
+        ),
+        # 2cf57fde round-2 fix — separate from last_error_class/last_error_age
+        # above (which stay reserved for publish-ATTEMPT evidence): this is
+        # the actual exception class/age from a get_redis_client()
+        # CONSTRUCTION failure (bad MERIDIAN_REDIS_URL, missing/incompatible
+        # redis-py, etc.), so an operator seeing availability ==
+        # "construction_failed" gets the real config-vs-network distinction
+        # this diagnostics surface exists to provide, not just the label.
+        "last_construction_error_class": diag["last_construction_error_class"],
+        "last_construction_error_age_seconds": (
+            (time.time() - diag["last_construction_error_at"])
+            if diag["last_construction_error_at"] is not None else None
         ),
         "budget": budget,
     }
