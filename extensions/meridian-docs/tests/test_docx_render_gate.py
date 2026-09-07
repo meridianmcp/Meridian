@@ -612,6 +612,13 @@ def test_check_render_capability_default_max_retries_is_one(tmp_path):
 
 
 def test_check_render_capability_timeout_failure_detail_is_never_retried(tmp_path):
+    """Generic contract test: retryable=False (however a backend arrives at
+    it) must never be retried, regardless of error_class. TIMEOUT_ERROR is
+    just this test's example class -- it is NOT asserting that every real
+    timeout is non-retryable. _soffice_render's OWN timeouts are retryable
+    as of 2026-09-07 (see test_soffice_render_timeout_is_classified_and_
+    carries_stderr); this test's fake backend constructs retryable=False
+    directly, independent of that real classification."""
     docx_path = _write_dummy_docx(tmp_path)
     calls: list[int] = []
 
@@ -788,6 +795,14 @@ def test_soffice_render_profile_dir_ignores_a_long_redirected_temp(tmp_path, mon
 
 
 def test_soffice_render_timeout_is_classified_and_carries_stderr(tmp_path, monkeypatch):
+    """d4a1f2c8 -- retryable is True as of 2026-09-07 (was False). The
+    original "a render that hung once is likely to hang again" reasoning
+    held for the OLD shared-profile-lock design, where a retry fought over
+    the identical stuck lock. Now that each call gets its own isolated
+    profile, a timeout most plausibly means real, transient host-wide
+    contention (confirmed live against a real confirmatory benchmark run)
+    that a fresh attempt a couple of seconds later has a real chance of
+    avoiding."""
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
 
@@ -802,7 +817,7 @@ def test_soffice_render_timeout_is_classified_and_carries_stderr(tmp_path, monke
     exc = excinfo.value
     assert exc.error_class == render_gate.TIMEOUT_ERROR
     assert exc.timed_out is True
-    assert exc.retryable is False
+    assert exc.retryable is True
     assert exc.stderr == "stuck"
 
 
@@ -868,6 +883,35 @@ def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp
     assert len(calls) == 2
 
 
+def test_soffice_timeout_recovers_on_retry_through_check_render_capability(tmp_path, monkeypatch):
+    """d4a1f2c8 -- end-to-end: a soffice timeout on the first attempt,
+    followed by a successful conversion on the retry, now recovers via
+    check_render_capability's retry -- confirming timeouts are genuinely
+    retryable (not just classified as such in isolation), exercising the
+    REAL _soffice_render backend."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+    monkeypatch.setattr(render_gate, "_RENDER_RETRY_BACKOFF_SECONDS", 0)
+
+    calls: list[int] = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"), output=b"", stderr=b"stuck")
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+
+    assert result["status"] == render_gate.RENDERED
+    assert len(calls) == 2
+
+
 def test_check_render_capability_sleeps_before_a_retry_not_before_the_first_attempt(tmp_path, monkeypatch):
     """d4a1f2c8 -- a retryable failure means a transient resource race (e.g.
     soffice contending with another concurrent instance for a shared
@@ -925,25 +969,25 @@ def test_check_render_capability_does_not_sleep_when_the_first_attempt_succeeds(
 
 
 def test_check_render_capability_does_not_sleep_after_the_final_non_retryable_failure(tmp_path, monkeypatch):
-    """A timeout is never retryable (see _soffice_render's own reasoning), so
-    it must fail straight through with no backoff delay -- there is no
-    retry coming, so sleeping first would only slow down a result that was
-    already decided."""
+    """A genuine document-corruption failure is never retryable (retrying
+    can't fix a broken source document), so it must fail straight through
+    with no backoff delay -- there is no retry coming, so sleeping first
+    would only slow down a result that was already decided."""
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
-    monkeypatch.setattr(render_gate, "_SOFFICE_TIMEOUT_SECONDS", 0.01)
 
     sleep_calls: list[float] = []
     monkeypatch.setattr(render_gate.time, "sleep", lambda seconds: sleep_calls.append(seconds))
 
-    def _fake_run(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"), output=b"", stderr=b"stuck")
-
-    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        render_gate.subprocess, "run",
+        lambda cmd, **kwargs: _FakeCompletedProcess(1, stderr=b"source file could not be loaded"),
+    )
 
     result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
 
     assert result["status"] == render_gate.FAILED
+    assert result["detail"]["error_class"] == render_gate.CORRUPTION_ERROR
     assert sleep_calls == []
 
 

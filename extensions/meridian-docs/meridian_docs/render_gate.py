@@ -381,9 +381,23 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
             # process IT spawned before re-raising TimeoutExpired -- this
             # never touches any other soffice instance running on the
             # machine, satisfying "clean only Meridian-owned processes"
-            # without any extra process-sweeping logic. Timeouts are never
-            # retried: a render that hung once is likely to hang again, and
-            # retrying just doubles the wait for no new information.
+            # without any extra process-sweeping logic.
+            #
+            # d4a1f2c8 -- retryable=True as of 2026-09-07 (was False). The
+            # original reasoning here ("a render that hung once is likely to
+            # hang again") was sound for the OLD shared-profile-lock design:
+            # every call fought over the SAME lock, so an immediate retry
+            # hit the identical stuck resource and was guaranteed to fail
+            # the same way. That's no longer true now that each call gets
+            # its own isolated profile (this function, above) -- a timeout
+            # now most plausibly means real, transient host-wide contention
+            # (confirmed live: 25 concurrent `claude` processes and 40
+            # `python` processes running at the time a real confirmatory
+            # benchmark chain took 5 separate ~60s-timeout attempts, ~65s
+            # apart, before giving up), which a fresh isolated attempt a
+            # couple of seconds later has a real chance of avoiding. Bounded
+            # by the same max_retries as every other retryable class, and
+            # by the same backoff before the retry.
             stderr = None
             if exc.stderr:
                 stderr = (
@@ -397,7 +411,7 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
                 error_class=TIMEOUT_ERROR,
                 timed_out=True,
                 stderr=stderr,
-                retryable=False,
+                retryable=True,
             ) from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise RenderCapabilityError(
