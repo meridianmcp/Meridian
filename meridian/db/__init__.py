@@ -1146,6 +1146,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_wave_gate_configs_version_unique(db)
     await _migrate_research_graph(db)
     await _migrate_proposal_project_scope(db)
+    await _migrate_experiment_model(db)
+    await _migrate_external_job_register(db)
     return db
 
 
@@ -12962,4 +12964,24 @@ from .research_graph import (  # noqa: F401
     get_claim_evidence,
     get_lineage_subgraph,
     get_artifact_document_lineage,
+)
+
+# 4376e655 — the provider-neutral Experiment/Run/RunAttempt state model.
+# Imported LAST (after research_graph) — depends on nothing above at import
+# time. See meridian.experiment_model for the closed ATTEMPT_STATUSES/
+# FAILURE_CLASSES vocabularies and transition rules, and
+# meridian.db.experiment_model's own module docstring for the full schema/
+# derived-status contract.
+from .experiment_model import (  # noqa: F401
+    _migrate_experiment_model,
+    create_experiment,
+    get_experiment,
+    create_run,
+    get_run,
+    create_attempt,
+    get_attempt,
+    list_run_attempts,
+    transition_attempt,
+    heartbeat_attempt,
+    reconcile_stale_attempts,
 )

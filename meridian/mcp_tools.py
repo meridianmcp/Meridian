@@ -34,6 +34,11 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "reopen_proposal_gate": 'reopen_proposal_gate(project_id="abc-123", gate_id="gate-uuid", actor="adam", reason="new evidence surfaced")',
     "get_proposal_gates": 'get_proposal_gates(project_id="abc-123", sprint_item_id="item-uuid")',
     "checkpoint": 'checkpoint(session_id="session-uuid", project_id="abc-123")',
+    "register_external_job": 'register_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", provider="runpod", external_id="pod-123", phase="build", check_hint="query pod status", resume_hint="rerun the next safe step")',
+    "update_external_job": 'update_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="running", phase="upload", check_hint="check transfer process")',
+    "get_external_job": 'get_external_job(project_id="abc-123", job_key="gps-slam-build")',
+    "list_external_jobs": 'list_external_jobs(project_id="abc-123")',
+    "complete_external_job": 'complete_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="succeeded", detail="verified output")',
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
@@ -843,6 +848,68 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string"},
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."}},
+         "required": ["session_id"]}},
+    {"name": "register_external_job", "description":
+        "Create or reaffirm a project-scoped record for long-running external work "
+        "such as RunPod, SSH, Slurm, or CI. Meridian records the opaque external "
+        "identity and resumable state, appends a task-log event, and writes an "
+        "atomic host-local JSON snapshot. Do not include credentials or machine-"
+        "local absolute paths in shared hints or metadata.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string"},
+         "session_id": {"type": "string"},
+         "job_key": {"type": "string", "description": "Stable project-local logical key; reuse it for later observations."},
+         "provider": {"type": "string", "description": "Provider/launcher label, e.g. runpod, ssh, slurm, ci."},
+         "external_id": {"type": "string", "description": "Opaque external job/pod/build identifier."},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "phase": {"type": "string"},
+         "check_hint": {"type": "string", "description": "Exact safe next observation to make; no credentials or absolute paths."},
+         "resume_hint": {"type": "string", "description": "Exact safe continuation instruction; no credentials or absolute paths."},
+         "resource_hint": {"type": "string"},
+         "next_check_at": {"type": "string"},
+         "detail": {"type": "string"},
+         "metadata": {"type": "object"}},
+         "required": ["session_id", "job_key", "provider", "external_id"]}},
+    {"name": "update_external_job", "description":
+        "Record a new observation for an existing external job. Use job_id or "
+        "job_key, and pass only fields that changed; every write appends durable "
+        "history and refreshes the local crash-surviving snapshot. Terminal jobs "
+        "cannot be reopened or silently replaced.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "session_id": {"type": "string"}, "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "phase": {"type": "string"}, "check_hint": {"type": "string"},
+         "resume_hint": {"type": "string"}, "resource_hint": {"type": "string"},
+         "next_check_at": {"type": "string"}, "detail": {"type": "string"},
+         "metadata": {"type": "object"}},
+         "required": ["session_id"]}},
+    {"name": "get_external_job", "description":
+        "Read one project-scoped external job and its durable observation history. "
+        "Use this from a fresh session before taking any action on a live job.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "include_history": {"type": "boolean"}}, "required": []}},
+    {"name": "list_external_jobs", "description":
+        "Read the project's live external-job register. By default terminal jobs "
+        "are omitted so a new session sees only work that may require observation "
+        "or resumption. The response also reports the host-local snapshot state.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "include_terminal": {"type": "boolean"},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": []}},
+    {"name": "complete_external_job", "description":
+        "Finalize an external job with an explicit terminal outcome. This never "
+        "infers success from output files and never reopens a terminal record. "
+        "It appends a final task-log event and refreshes the local snapshot.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "session_id": {"type": "string"}, "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
+         "detail": {"type": "string"}, "metadata": {"type": "object"}},
          "required": ["session_id"]}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "
@@ -3710,6 +3777,7 @@ _READ_ONLY_TOOLS = {
     "paper_search", "social_search", "github_search",
     "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
+    "get_external_job", "list_external_jobs",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
     "search_server_logs", "get_server_log_checkpoint",
@@ -3800,6 +3868,11 @@ _TOOL_CATEGORY: dict[str, str] = {
     "purge_ai_log":            "notes",
     "search_ai_log":           "notes",
     "checkpoint":              "session",
+    "register_external_job":    "session",
+    "update_external_job":      "session",
+    "get_external_job":         "session",
+    "list_external_jobs":       "session",
+    "complete_external_job":    "session",
     "get_session_brief":       "session",
     "get_context_block":       "session",
     "get_session_log":         "session",
@@ -4045,6 +4118,11 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "generate_handoff":          "executor",
     "record_handoff_correction": "executor",
     "checkpoint":                "executor",
+    "register_external_job":      "executor",
+    "update_external_job":        "executor",
+    "complete_external_job":      "executor",
+    "get_external_job":           "both",
+    "list_external_jobs":         "both",
     "add_sprint_note":           "executor",
     "heartbeat":                 "executor",
     "run_verification":          "executor",
@@ -4258,6 +4336,11 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # ---- COMMON SUPPORT: frequent hygiene ----
     # explicitly listed by Adam as common-support
     "checkpoint":                 "common-support",
+    "register_external_job":       "common-support",
+    "update_external_job":         "common-support",
+    "get_external_job":            "common-support",
+    "list_external_jobs":          "common-support",
+    "complete_external_job":       "common-support",
     "add_insight":                "common-support",
     "get_insights":               "common-support",
     "validate_assumption":        "common-support",

@@ -2646,6 +2646,11 @@ def build_mcp_server():
                 "add_sprint_item",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
+                # 88277b63 — durable external-job register; share dispatch
+                # with HTTP MCP so all three transports stay in sync.
+                "register_external_job", "update_external_job",
+                "get_external_job", "list_external_jobs",
+                "complete_external_job",
                 "execute_batch",
                 "batch_read", "batch_mutate",
                 "add_workspace_note", "get_workspace_notes",

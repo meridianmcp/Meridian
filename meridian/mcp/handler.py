@@ -4593,6 +4593,11 @@ async def _handle_session_tools(
     """
     from .handlers.session_tools import (  # noqa: PLC0415
         handle_checkpoint,
+        handle_register_external_job,
+        handle_update_external_job,
+        handle_get_external_job,
+        handle_list_external_jobs,
+        handle_complete_external_job,
         handle_get_context_block,
         handle_list_sessions,
         handle_get_session_log,
@@ -4625,6 +4630,8 @@ async def _handle_session_tools(
 
     # Tools that need no extra context beyond the standard five parameters.
     _standard_dispatch: dict[str, Any] = {
+        "get_external_job": handle_get_external_job,
+        "list_external_jobs": handle_list_external_jobs,
         "get_context_block": handle_get_context_block,
         "list_sessions": handle_list_sessions,
         "get_session_log": handle_get_session_log,
@@ -4651,6 +4658,19 @@ async def _handle_session_tools(
 
     if name in _standard_dispatch:
         return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+
+    if name == "register_external_job":
+        return await handle_register_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
+    if name == "update_external_job":
+        return await handle_update_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
+    if name == "complete_external_job":
+        return await handle_complete_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
 
     # checkpoint needs handler-level _fetch_recent_commits and
     # _resolve_caller_identity passed explicitly to keep the import graph acyclic.
