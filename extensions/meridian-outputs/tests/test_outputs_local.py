@@ -8233,6 +8233,44 @@ class TestConvergenceState:
         finally:
             idx.close()
 
+    @duckdb_required
+    def test_convergence_recovery_after_removal_costs_exactly_one_full_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Gap-register MO-IMP-05, explicit product decision: convergence
+        recovery after a file REMOVAL is allowed -- by design -- to require
+        a full pass, because a full pass is what makes removed-file
+        detection safe (see rebuild()'s Phase 0 "full pass just finished"
+        reconciliation). This is not an unbounded or undocumented cost: for
+        a small tree with no walk-restart cooldown in play (the default),
+        it is exactly one additional rebuild() call, not zero (an in-place
+        edit is caught the same call via staleness, but a removal needs the
+        walk to positively confirm absence) and not more than one (the
+        walk is not throttled here, so a single call completes the whole
+        pass and reconciles)."""
+        for i in range(5):
+            (tmp_path / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.get_convergence_state().converged is True
+            assert len(idx._row_cache) == 5
+
+            (tmp_path / "f0.csv").unlink()
+            count_after_one_call = idx.rebuild()
+            state_after_one_call = idx.get_convergence_state()
+
+            assert count_after_one_call == 4, (
+                "exactly one additional rebuild() call must detect the "
+                "removal and restore the row cache to the true count"
+            )
+            assert state_after_one_call.converged is True
+            assert state_after_one_call.indexed_count == 4
+            assert state_after_one_call.expected_count == 4
+            assert "f0.csv" not in idx._row_cache
+        finally:
+            idx.close()
+
     def test_missing_dir_returns_error(self) -> None:
         result = OL.get_convergence_state("/no/such/dir")
         assert "error" in result
