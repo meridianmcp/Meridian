@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from meridian_outputs import annotate as AN
 from meridian_outputs import fingerprint as FP
 from meridian_outputs import outputs_local as OL
+from meridian_outputs import provenance as PV
 from meridian_outputs import provenance_status as PS
 from meridian_outputs import research_evidence as RE
 
@@ -412,6 +413,168 @@ class TestRelocated:
         assert rec.partial is False
         assert rec.is_authoritative is True
         assert rec.attributes["provenance_type"] == PS.RELOCATED
+
+    @duckdb_required
+    def test_content_hash_relocation_reports_content_hash_evidence(
+        self, tmp_path: Path,
+    ) -> None:
+        """00c3c3f0: the pre-existing content-hash relocation tier must
+        keep reporting relocation_evidence="content_hash" (additive field,
+        introduced alongside the new basename tier below) so a caller can
+        always tell the two tiers apart."""
+        old = tmp_path / "run_2" / "metrics.csv"
+        old.parent.mkdir()
+        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old))
+        new = tmp_path / "run_2_moved" / "metrics.csv"
+        new.parent.mkdir()
+        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        old.unlink()
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["relocation_evidence"] == "content_hash"
+
+
+# ---------------------------------------------------------------------------
+# Basename-fallback relocation routing (sprint item 00c3c3f0)
+#
+# get_provenance_status previously never routed an exact-path miss through
+# resolve_figure_output's basename-fallback tier -- a file registered
+# (indexed) at one path, then relocated with no annotate provenance record
+# (so the content-hash tier above has nothing to match against), reported
+# unregistered/unknown even though calling resolve_figure_output directly
+# on the same path recovers it via basename fallback.
+# ---------------------------------------------------------------------------
+
+class TestBasenameRelocationFallback:
+    @duckdb_required
+    def test_registered_then_relocated_file_reports_relocated_not_unregistered(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        original = outputs_dir / "run_1" / "meridian_reloc_gap_9f2c1a.csv"
+        original.parent.mkdir()
+        original.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        # "Register" the file: indexed by outputs_local, but -- unlike
+        # AN.record_provenance -- with NO annotate provenance record, so
+        # the existing content-hash relocation tier has nothing to match.
+        OL.register_priority_path(str(outputs_dir), str(original))
+        assert AN.get_provenance(str(outputs_dir), str(original)) is None  # sanity
+
+        # "Move" it: the file now lives entirely OUTSIDE outputs_dir (e.g.
+        # copied into a docx's own media folder), same unique basename.
+        relocated_dir = tmp_path / "docx_media"
+        relocated_dir.mkdir()
+        relocated = relocated_dir / "meridian_reloc_gap_9f2c1a.csv"
+        relocated.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+
+        # Sanity, matching the bug report: resolve_figure_output DOES
+        # recover it directly, via its own basename-fallback tier.
+        direct = PV.resolve_figure_output(str(outputs_dir), str(relocated))
+        assert direct is not None
+        assert direct["match_type"] == "basename"
+        assert direct["path"] == str(original)
+
+        status = PS.get_provenance_status(str(outputs_dir), str(relocated))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["provenance_type"] != PS.UNREGISTERED
+        assert status["provenance_type"] != PS.UNKNOWN
+        assert status["relocation_evidence"] == "basename"
+        assert status["record"]["path"] == str(original)
+        assert status["directory_note"] is None
+        assert status["inconclusive"] is False
+
+    @duckdb_required
+    def test_resolver_state_maps_basename_relocation_to_verified(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        original = outputs_dir / "meridian_reloc_gap_ev01.csv"
+        original.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(original))
+
+        relocated = tmp_path / "elsewhere" / "meridian_reloc_gap_ev01.csv"
+        relocated.parent.mkdir()
+        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(outputs_dir), str(relocated))
+        assert status["provenance_type"] == PS.RELOCATED  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.VERIFIED
+        assert rec.attributes["relocation_evidence"] == "basename"
+
+    @duckdb_required
+    def test_multiple_basename_candidates_is_ambiguous(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        first = outputs_dir / "run_a" / "meridian_reloc_gap_dup7b.csv"
+        first.parent.mkdir()
+        first.write_text("x,y\n1,1\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(first))
+        second = outputs_dir / "run_b" / "meridian_reloc_gap_dup7b.csv"
+        second.parent.mkdir()
+        second.write_text("x,y\n2,2\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(second))
+
+        relocated = tmp_path / "elsewhere" / "meridian_reloc_gap_dup7b.csv"
+        relocated.parent.mkdir()
+        relocated.write_text("x,y\n3,3\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(outputs_dir), str(relocated))
+        assert status["provenance_type"] == PS.AMBIGUOUS
+        assert status["relocation_evidence"] == "basename"
+        assert len(status["candidates"]) == 1  # best-scoring row only
+        assert status["candidates"][0]["candidate_count"] == 2
+
+    @duckdb_required
+    def test_own_indexed_row_short_circuits_basename_lookup(
+        self, tmp_path: Path,
+    ) -> None:
+        """A path that is ALREADY its own indexed row is UNREGISTERED, not
+        routed through the basename tier at all -- that gap is only for an
+        exact-path MISS."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        f = outputs_dir / "meridian_reloc_gap_self1.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(f))
+
+        status = PS.get_provenance_status(str(outputs_dir), str(f))
+        assert status["provenance_type"] == PS.UNREGISTERED
+
+    def test_no_side_effect_discovery_of_unrelated_sibling_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression guard: routing an exact-path miss through the
+        basename-fallback tier must NEVER trigger a filesystem walk that
+        discovers and indexes a completely unrelated sibling path in the
+        same outputs_dir -- that would silently flip the sibling's own
+        later classification from UNKNOWN to UNREGISTERED as a side effect
+        of checking a different path entirely. resolve_figure_output
+        itself forces such a walk (its own, unmodified contract); this
+        module's own basename lookup must not."""
+        indexed = tmp_path / "indexed.csv"
+        indexed.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(tmp_path), str(indexed))
+        sibling = tmp_path / "totally_unrelated_sibling.csv"
+        sibling.write_text("c,d\n3,4\n", encoding="utf-8")
+
+        relocated = tmp_path / "elsewhere" / "indexed.csv"
+        relocated.parent.mkdir()
+        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
+        # Trigger the basename-fallback path (miss on `relocated`'s own
+        # exact path) several times over -- none of these lookups may
+        # discover `sibling`.
+        PS.get_provenance_status(str(tmp_path), str(relocated))
+        PS.get_provenance_status(str(tmp_path), str(relocated))
+
+        status_sibling = PS.get_provenance_status(str(tmp_path), str(sibling))
+        assert status_sibling["provenance_type"] == PS.UNKNOWN
 
 
 # ---------------------------------------------------------------------------

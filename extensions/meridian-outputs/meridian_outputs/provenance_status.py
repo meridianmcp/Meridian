@@ -201,14 +201,78 @@ requirement, a record built from either of those two provenance_type values
 is, by construction, known-incomplete (no exact record/directory note was
 ever captured for it), regardless of how confident the resolver mapping
 above is about its VERIFIED/STALE/etc status.
+
+Basename-fallback relocation routing (sprint item 00c3c3f0)
+--------------------------------------------------------------
+:func:`_relocation_candidates` (fa600e42, above) only ever finds a
+relocation when some OTHER path's ``content_hash`` -- recorded in
+``annotate``'s own provenance ledger -- matches this file's current
+on-disk content. ``provenance.resolve_figure_output`` (a sibling module)
+already answers a related but DIFFERENT question via its own, separate
+second tier: is this path's BASENAME uniquely identifiable somewhere else
+in the live outputs FTS INDEX (populated by the outputs walker, not by
+``annotate.record_provenance``)? Before this item, :func:`get_provenance_status`
+never consulted that tier at all -- a file discovered by the walker,
+relocated, and never given an ``annotate`` provenance record with a
+matching content hash (e.g. moved to a location outside ``outputs_dir``
+entirely, as when a figure is copied into a docx's media folder) fell
+straight through this module's exact/content-hash tiers to
+:data:`UNREGISTERED`/:data:`UNKNOWN`, even though calling
+``provenance.resolve_figure_output`` directly on the same path recovers it
+via basename fallback.
+
+:func:`_basename_relocation_lookup` closes that gap: on an exact-path
+miss (this exact path has neither an ``annotate`` record nor a row of its
+own in the outputs index), after the existing content-hash relocation/
+ambiguity tiers and before falling to
+:data:`DIRECTORY_FALLBACK`/:data:`UNREGISTERED`/:data:`UNKNOWN`, it
+reproduces ``resolve_figure_output``'s BASENAME tier -- same
+``provenance._basename_key`` normalisation, same "exact basename match
+among search hits, best score wins" rule, reused via that private helper
+rather than duplicated by value -- and re-classifies a hit as
+:data:`RELOCATED`, reusing the existing "found via relocation" status
+rather than minting a new one, so every existing consumer of that string
+(the research-evidence bridge below, and the standalone
+``tools/meridian_fallbacks/figure_invariant_gate.py``, which hardcodes the
+SAME literal ``"relocated"`` value and treats it conservatively as a
+possible source mismatch) keeps working unchanged. A new, purely additive
+``relocation_evidence`` field (``"content_hash"`` or ``"basename"``)
+distinguishes which tier actually produced the verdict for a caller that
+cares. A basename hit with more than one candidate (``candidate_count >
+1``) is classified :data:`AMBIGUOUS` instead, mirroring how the
+content-hash tier already treats multiple matches.
+
+This is deliberately NOT implemented as a direct call to
+``resolve_figure_output`` itself (this item does not touch that
+function's own matching/scoring logic -- only reuses it). That function
+(via ``outputs_local.search_outputs``) forces a full
+``OutputsFtsIndex.rebuild()`` -- a real filesystem walk -- on every call,
+which would silently break two of this module's existing, deliberately
+tested invariants: a genuinely never-walked index answering
+UNKNOWN/inconclusive on its very first query without ITSELF triggering
+the walk that resolves that uncertainty (item 3f758063's fix), and
+checking one path's status never having the side effect of discovering
+and indexing an unrelated SIBLING path in the same ``outputs_dir``,
+silently flipping that sibling's own later classification from UNKNOWN to
+UNREGISTERED. :func:`_basename_relocation_lookup` instead queries the SAME
+cached :class:`~outputs_local.OutputsFtsIndex` instance's ``search()``
+method directly -- the identical primitive those functions use, minus the
+``rebuild()`` in front of it -- so it only ever searches what has ALREADY
+been discovered (by a prior walk, or by an explicit
+``register_priority_path``/``register_output_paths``/``record_provenance``
+call), matching this module's "never triggers a rebuild" contract for
+every one of its other read-only helpers.
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
 
 from . import annotate, fingerprint, outputs_local, research_evidence
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "EXACT",
@@ -396,6 +460,111 @@ def _relocation_candidates(outputs_dir: str, path: str) -> list[dict[str, Any]]:
     return matches
 
 
+def _basename_relocation_lookup(
+    outputs_dir: str, path: str, *, fuzzy_limit: int = 25,
+) -> dict[str, Any] | None:
+    """Routes an exact-path miss through ``provenance.resolve_figure_output``'s
+    BASENAME-fallback tier (sprint item 00c3c3f0), so a file whose
+    recorded/indexed path no longer matches -- but which is still uniquely
+    identifiable by basename elsewhere in the outputs corpus -- is
+    classified as a relocation instead of falling straight to
+    :data:`DIRECTORY_FALLBACK`/:data:`UNREGISTERED`/:data:`UNKNOWN`, even
+    though ``resolve_figure_output`` (an EXACT-path tier, then a BASENAME
+    tier over the same live outputs FTS index) already recovers it when
+    called directly on the same path.
+
+    ``get_provenance_status`` already checks its own exact-path tiers
+    (``annotate.get_provenance`` for an exact provenance record; this
+    module's content-hash-based :func:`_relocation_candidates` for a
+    RELOCATED/AMBIGUOUS verdict; and :func:`_indexed_lookup`'s own
+    no-rebuild exact row check, which the caller has already used to
+    decide whether to call this at all -- see below) before this is ever
+    reached, so only the BASENAME tier is meaningful here: this function
+    reproduces that tier's exact filtering/scoring contract (same
+    ``provenance._basename_key`` normalisation, same "exact basename match
+    among search hits, best BM25 score wins" rule -- reused, not
+    reimplemented, via a lazy import of that private helper so this
+    module's own semantics can never silently drift from
+    ``resolve_figure_output``'s) rather than delegating to
+    ``resolve_figure_output`` itself.
+
+    That delegation is deliberately NOT done directly, for one load-bearing
+    reason: ``resolve_figure_output`` (via ``outputs_local.search_outputs``)
+    forces a full ``OutputsFtsIndex.rebuild()`` -- a real filesystem walk --
+    on every call. Calling it from inside ``get_provenance_status`` would
+    silently break TWO of this module's existing, deliberately-tested
+    invariants: (1) a genuinely never-walked index must answer
+    UNKNOWN/inconclusive on its very first query without ITSELF triggering
+    the walk that resolves that uncertainty (item 3f758063's "a caller
+    trusting get_provenance_status as authoritative on its very first
+    call" fix), and (2) checking one path's provenance status must never
+    have the side effect of discovering and indexing a completely
+    UNRELATED sibling path in the same ``outputs_dir``, silently flipping
+    that sibling's own later classification from UNKNOWN to UNREGISTERED.
+    Querying the SAME cached :class:`OutputsFtsIndex` instance's
+    ``search()`` method directly -- the exact same primitive
+    ``outputs_local.search_outputs``/``resolve_figure_output`` use, just
+    without the ``rebuild()`` call in front of it -- searches only
+    whatever has ALREADY been discovered (by a prior walk, or by an
+    explicit ``register_priority_path``/``register_output_paths``/
+    ``record_provenance`` call), exactly matching this module's own
+    "never triggers a rebuild" contract for every one of its other
+    read-only helpers (:func:`_indexed_lookup`, :func:`_directory_fallback`).
+
+    Returns a dict with the SAME shape ``resolve_figure_output`` returns
+    for a basename-tier hit (``path``, ``generating_script``,
+    ``is_archival``, ``canonical_path``, ``kind``, ``size``, ``mtime``,
+    ``csv_columns``, ``json_keys``, plus ``match_type="basename"``,
+    ``queried_path``, ``candidate_count``), or ``None`` on no match or any
+    lookup failure -- never raises.
+    """
+    if not path or not str(path).strip():
+        return None
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return None
+    try:
+        # Lazy import: `provenance` imports this module too (`from . import
+        # outputs_local, provenance_status`), so importing it at module
+        # scope here would create an import cycle. `_basename_key` is a
+        # pure string-normalisation helper with no module-level side
+        # effects of its own, so reusing it this way is safe regardless of
+        # which of the two modules happens to import first.
+        from . import provenance as _provenance
+    except Exception:  # noqa: BLE001
+        return None
+    target_base = _provenance._basename_key(path)
+    if not target_base:
+        return None
+    query = os.path.basename(str(path).replace("\\", "/").rstrip("/"))
+    if not query:
+        return None
+    try:
+        index = outputs_local._get_cached_index_for_lookup(outputs_dir)
+        hits = index.search(
+            query, limit=max(int(fuzzy_limit), 1), include_archival=True,
+        )
+    except Exception:  # noqa: BLE001
+        _log.debug(
+            "get_provenance_status: basename-relocation search failed for "
+            "%r under %r", path, outputs_dir, exc_info=True,
+        )
+        return None
+    candidates = [
+        h for h in hits if _provenance._basename_key(h.get("path")) == target_base
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda h: (h.get("score") or 0.0), reverse=True)
+    best = dict(candidates[0])
+    best.pop("score", None)
+    best.pop("bm25", None)
+    best.pop("annotations", None)
+    best["match_type"] = "basename"
+    best["queried_path"] = path
+    best["candidate_count"] = len(candidates)
+    return best
+
+
 def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     """The richer, authoritative answer to "what do we know about this
     file's provenance", composed from both underlying systems and ranked by
@@ -424,15 +593,23 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
           record; ``staleness`` is populated (see :func:`_staleness`).
           ``script_staleness`` is ``None`` (never fingerprint-tagged) or
           not stale.
-        - :data:`RELOCATED` -- no exact record for THIS path, but exactly
-          one OTHER recorded path's ``content_hash`` matches this file's
-          current content (fa600e42). ``record`` is that matching record;
-          ``staleness`` reports the hash match (not a same-path existence
-          check -- see :func:`_relocation_candidates`).
+        - :data:`RELOCATED` -- no exact record for THIS path, but either (a)
+          exactly one OTHER recorded path's ``content_hash`` matches this
+          file's current content (fa600e42; ``record`` is that matching
+          record, ``staleness`` reports the hash match -- not a same-path
+          existence check, see :func:`_relocation_candidates`), or (b) no
+          content-hash match exists but ``resolve_figure_output``'s
+          basename-fallback tier uniquely resolves this path to a
+          different one already known to the outputs index (00c3c3f0;
+          ``record`` is that resolved row, ``staleness`` notes the weaker,
+          basename-only evidence). ``relocation_evidence`` (additive) is
+          ``"content_hash"`` or ``"basename"`` so a caller can tell which.
         - :data:`AMBIGUOUS` -- same as :data:`RELOCATED`, but MORE THAN ONE
-          other recorded path matches by content hash (fa600e42). ``record``
-          is ``None``; the matches are listed verbatim under a new
-          ``candidates`` key.
+          candidate matches -- either by content hash (fa600e42; ``record``
+          is ``None``, the matches are listed verbatim under a new
+          ``candidates`` key) or by basename (00c3c3f0; ``candidates`` holds
+          the single best-scoring row ``resolve_figure_output`` itself
+          returned, since that tier does not expose the full candidate set).
         - :data:`DIRECTORY_FALLBACK` -- ``directory_note`` is the covering
           ``MERIDIAN_NOTES.md`` annotation; ``staleness`` is ``None`` (a
           directory-level note has no single file to check staleness
@@ -506,6 +683,7 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
             "script_staleness": _stale_by_script_result(outputs_dir, path),
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
+            "relocation_evidence": "content_hash",
             "inconclusive": False,
         }
     if len(relocation_matches) > 1:
@@ -519,6 +697,64 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
             "candidates": relocation_matches,
+            "relocation_evidence": "content_hash",
+            "inconclusive": False,
+        }
+
+    # 00c3c3f0 -- no content-hash relocation match either, and this exact
+    # path is not itself already an indexed row (that case is already
+    # correctly handled by the UNREGISTERED branch at the bottom): route
+    # the miss through resolve_figure_output's basename-fallback tier
+    # before concluding DIRECTORY_FALLBACK/UNREGISTERED/UNKNOWN (see
+    # _basename_relocation_lookup's own docstring, and the module
+    # docstring's "Basename-fallback relocation routing" section, for the
+    # full rationale).
+    basename_hit = (
+        _basename_relocation_lookup(outputs_dir, path)
+        if indexed["row"] is None else None
+    )
+    if basename_hit is not None:
+        candidate_count = basename_hit.get("candidate_count") or 1
+        if candidate_count > 1:
+            return {
+                "path": path,
+                "provenance_type": AMBIGUOUS,
+                "record": None,
+                "directory_note": None,
+                "staleness": None,
+                "script_staleness": None,
+                "archival": indexed["archival"],
+                "convergence": indexed["convergence"],
+                "candidates": [basename_hit],
+                "relocation_evidence": "basename",
+                "inconclusive": False,
+            }
+        return {
+            "path": path,
+            "provenance_type": RELOCATED,
+            "record": basename_hit,
+            "directory_note": None,
+            "staleness": {
+                "exists_on_disk": None,
+                "recorded_content_hash": None,
+                "current_content_hash": None,
+                "stale": False,
+                "reason": (
+                    "no exact provenance record and no content-hash "
+                    "relocation match for this path, but "
+                    "resolve_figure_output's basename-fallback tier found "
+                    "a uniquely matching indexed output at a different "
+                    f"path ({basename_hit.get('path')!r}); file appears to "
+                    "have been relocated/renamed. Identity is confirmed by "
+                    "basename only here, which is weaker evidence than a "
+                    "content-hash match -- exists_on_disk/content hashes "
+                    "are left unknown rather than guessed"
+                ),
+            },
+            "script_staleness": _stale_by_script_result(outputs_dir, path),
+            "archival": indexed["archival"],
+            "convergence": indexed["convergence"],
+            "relocation_evidence": "basename",
             "inconclusive": False,
         }
 
@@ -770,14 +1006,23 @@ def _resolver_state_for_provenance_status(
         )
     if ptype == AMBIGUOUS:
         candidates = status.get("candidates") or []
-        return research_evidence.ResolverState(
-            status=research_evidence.ResolverStatus.AMBIGUOUS,
-            confidence=0.2,
-            reason=(
+        if status.get("relocation_evidence") == "basename":
+            reason = (
+                f"resolve_figure_output's basename-fallback tier matched "
+                f"{len(candidates)} candidate(s) sharing this path's "
+                "basename -- cannot confirm which one this file "
+                "originated from"
+            )
+        else:
+            reason = (
                 f"content hash matches {len(candidates)} distinct prior "
                 "provenance records -- cannot confirm which one this file "
                 "originated from"
-            ),
+            )
+        return research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.2,
+            reason=reason,
         )
     if ptype == DIRECTORY_FALLBACK:
         return research_evidence.ResolverState(
@@ -915,11 +1160,19 @@ def evidence_record_from_provenance_status(
             )
     elif ptype == AMBIGUOUS:
         candidate_count = len(status.get("candidates") or [])
-        partial_reason = (
-            f"content hash matches {candidate_count} distinct prior "
-            "provenance records -- cannot confirm which one this file "
-            "originated from"
-        )
+        if status.get("relocation_evidence") == "basename":
+            partial_reason = (
+                f"resolve_figure_output's basename-fallback tier matched "
+                f"{candidate_count} candidate(s) sharing this path's "
+                "basename -- cannot confirm which one this file "
+                "originated from"
+            )
+        else:
+            partial_reason = (
+                f"content hash matches {candidate_count} distinct prior "
+                "provenance records -- cannot confirm which one this file "
+                "originated from"
+            )
 
     external_ids: "dict[str, str]" = {}
     canonical_path = (archival or {}).get("canonical_path")
@@ -959,6 +1212,11 @@ def evidence_record_from_provenance_status(
             # dropped on the floor"). None for every other provenance_type,
             # matching how the other optional keys above already behave.
             "candidates": status.get("candidates"),
+            # 00c3c3f0 -- which relocation tier (content-hash vs. basename-
+            # fallback) actually produced a RELOCATED/AMBIGUOUS verdict.
+            # None for every other provenance_type, same convention as
+            # every other optional key above.
+            "relocation_evidence": status.get("relocation_evidence"),
         },
     )
 
