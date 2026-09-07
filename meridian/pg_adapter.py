@@ -5060,6 +5060,42 @@ async def _migrate_pg_paper_strategy_graph(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_structural_patch(conn: PostgresConnection) -> None:
+    """6d109127 -- Postgres mirror of SCHEMA: structural_patch (a proposed
+    manuscript structural edit behind a human approval gate). See
+    db.structural_patch._migrate_structural_patch's docstring for the full
+    schema/approval-gate contract this reproduces exactly -- same columns,
+    same deliberate absence of a CHECK constraint on operation/status (see
+    that module's docstring for why), same soft (non-FK) document_id/
+    target_element_id references into doc_store's separately-owned schema.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS structural_patches ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    document_id TEXT NOT NULL,"
+        "    target_element_id TEXT,"
+        "    operation TEXT NOT NULL,"
+        "    payload TEXT NOT NULL DEFAULT '{}',"
+        "    rationale TEXT,"
+        "    base_content_hash TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'proposed',"
+        "    proposed_by_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    decided_by_human_id TEXT,"
+        "    decision_note TEXT,"
+        "    decided_at TEXT,"
+        "    applied_at TEXT,"
+        "    supersedes_patch_id TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_structural_patches_project_status "
+        "ON structural_patches(project_id, status, created_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_structural_patches_document "
+        "ON structural_patches(document_id, status);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -5187,4 +5223,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_paper_contract,
     _migrate_pg_paper_strategy_graph,
     _migrate_pg_lint_finding,
+    _migrate_pg_structural_patch,
 )

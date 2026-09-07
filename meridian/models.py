@@ -1050,6 +1050,91 @@ class PaperContract(BaseModel):
     updated_at: str
 
 
+# ---------------------------------------------------------------------------
+# 6d109127 -- SCHEMA: structural_patch, a proposed manuscript structural
+# edit behind a human approval gate. See meridian.structural_patch (closed
+# PATCH_OPERATIONS/PATCH_STATUSES vocabularies, transition rules) and
+# meridian.db.structural_patch (persistence, the human-approval-gate
+# enforcement) for the full contract these wire-format shapes describe.
+#
+# SCHEMA-ONLY, deliberately UNWIRED: no route or MCP tool constructs or
+# returns these yet -- this sprint item is scoped to the data model alone
+# (Pydantic model + migration + minimal CRUD), matching the "Project
+# family / template revisions" block above's identical
+# additive-and-unwired convention.
+# ---------------------------------------------------------------------------
+
+
+class StructuralPatchCreate(BaseModel):
+    """Request shape for proposing a new structural_patch. Always creates
+    the patch in status ``'proposed'`` -- see
+    ``meridian.db.structural_patch.create_structural_patch``.
+    """
+
+    project_id: str = Field(..., min_length=1)
+    session_id: str = Field(
+        ..., min_length=1,
+        description="Proposing session -- becomes proposed_by_session_id. Must belong to project_id.",
+    )
+    document_id: str = Field(
+        ..., min_length=1,
+        description="meridian.doc_store doc_documents.id this patch targets.",
+    )
+    target_element_id: str | None = Field(
+        default=None,
+        description="meridian.doc_store doc_elements.id anchor. None for a patch with no single "
+        "existing anchor (e.g. inserting a brand-new top-level section).",
+    )
+    operation: Literal["insert", "delete", "move", "replace", "reorder"] = Field(
+        ..., description="The shape of the proposed edit -- see meridian.structural_patch.PATCH_OPERATIONS."
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Operation-specific structured content (e.g. new element text/kind for "
+        "insert, destination parent/ordinal for move). Validated JSON-safe, bounded, "
+        "and secret-free by meridian.structural_patch.validate_payload.",
+    )
+    rationale: str | None = Field(
+        default=None, description="Human-readable justification shown to the approving human."
+    )
+    base_content_hash: str | None = Field(
+        default=None,
+        description="doc_documents.content_hash at proposal time -- the version pin used to "
+        "detect drift before approval/application (same value "
+        "meridian.doc_store.compute_content_hash produces).",
+    )
+    supersedes_patch_id: str | None = Field(
+        default=None,
+        description="An earlier structural_patch (same project) this one revises and replaces. "
+        "Does not itself mark that patch superseded -- a separate decision call does.",
+    )
+
+
+class StructuralPatch(BaseModel):
+    """A structural_patch row -- see meridian.db.structural_patch's module
+    docstring for the full schema/approval-gate contract."""
+
+    id: str
+    project_id: str
+    document_id: str
+    target_element_id: str | None = None
+    operation: Literal["insert", "delete", "move", "replace", "reorder"]
+    payload: dict[str, Any] = Field(default_factory=dict)
+    rationale: str | None = None
+    base_content_hash: str | None = None
+    status: Literal[
+        "proposed", "approved", "rejected", "withdrawn", "superseded", "applied"
+    ] = "proposed"
+    proposed_by_session_id: str
+    decided_by_human_id: str | None = None
+    decision_note: str | None = None
+    decided_at: str | None = None
+    applied_at: str | None = None
+    supersedes_patch_id: str | None = None
+    created_at: str
+    updated_at: str
+
+
 class PaperContractRevisionCreate(BaseModel):
     """Args for proposing a new revision. Always creates a PENDING revision
     — see PaperContractRevisionApproval for the human-approval gate that
@@ -1272,3 +1357,19 @@ class LintFindingStatusUpdate(BaseModel):
     status: Literal["open", "acknowledged", "resolved", "dismissed"]
     resolved_by: str | None = None
     resolution_note: str | None = None
+
+
+class StructuralPatchDecision(BaseModel):
+    """Request shape for the human approval gate itself: approve or reject
+    a proposed structural_patch. See
+    ``meridian.db.structural_patch.transition_structural_patch`` --
+    ``decided_by_human_id`` is required there (and here) precisely because
+    an unattributed decision defeats the point of an approval gate."""
+
+    project_id: str = Field(..., min_length=1)
+    decision: Literal["approved", "rejected"]
+    decided_by_human_id: str = Field(
+        ..., min_length=1,
+        description="Required -- the human approval gate must record who decided.",
+    )
+    decision_note: str | None = None

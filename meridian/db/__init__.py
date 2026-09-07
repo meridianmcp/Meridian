@@ -1151,6 +1151,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_paper_contract(db)
     await _migrate_paper_strategy_graph(db)
     await _migrate_lint_finding(db)
+    await _migrate_structural_patch(db)
     return db
 
 
@@ -13044,4 +13045,20 @@ from .lint_finding import (  # noqa: F401
     list_lint_findings,
     set_lint_finding_status,
     check_finding_freshness,
+)
+
+# 6d109127 -- SCHEMA: structural_patch, a proposed manuscript structural edit
+# behind a human approval gate. Imported LAST (after experiment_model) --
+# depends on nothing above at import time. See meridian.structural_patch for
+# the closed PATCH_OPERATIONS/PATCH_STATUSES vocabularies and transition
+# rules, and meridian.db.structural_patch's own module docstring for the
+# full schema/approval-gate contract. Schema + minimal CRUD only -- no MCP
+# tool or route is wired to this yet (intentionally out of scope for this
+# sprint item).
+from .structural_patch import (  # noqa: F401
+    _migrate_structural_patch,
+    create_structural_patch,
+    get_structural_patch,
+    list_structural_patches,
+    transition_structural_patch,
 )
