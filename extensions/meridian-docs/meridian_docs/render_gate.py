@@ -301,7 +301,26 @@ def _soffice_unavailable_reason() -> str | None:
 
 # c44d245d -- module-level so tests can monkeypatch a short bound instead of
 # waiting out a real 60s timeout to exercise the timeout-classification path.
-_SOFFICE_TIMEOUT_SECONDS = 60.0
+#
+# d4a1f2c8 -- raised 60 -> 90 (2026-09-07), after fixes 1/3 above (isolated
+# per-call profile, short profile path) eliminated the hang and crash
+# failure modes that had been masking a simpler reality: a soffice
+# conversion that must cold-bootstrap a brand-new profile on every single
+# call (an unavoidable cost of per-call isolation) genuinely takes longer
+# than 60s under real, sustained host contention -- confirmed live,
+# 2026-09-07, with 2 other `soffice` processes and ~20 concurrent `claude`
+# processes already running on this shared host at the time a real
+# confirmatory-benchmark chain still failed on a plain timeout even with
+# every crash/hang fix in place and NO internal retry. Every isolated,
+# lightly-loaded call this same session completed in under 20s, so 90s is
+# a real, evidence-based margin for genuine load, not an arbitrary bump --
+# and, critically, this does NOT reintroduce retry (that was fix 4, tried
+# and reverted for compounding worst-case latency past the harness's own
+# outer 300s subprocess timeout): it gives each independent attempt --
+# whether the render-gate's own single try, or the calling agent's own
+# separate tool-call retries -- more honest room to succeed or fail on its
+# own, without doubling any one attempt's cost the way fix 4 did.
+_SOFFICE_TIMEOUT_SECONDS = 90.0
 
 # d4a1f2c8 -- module-level so tests can monkeypatch this to 0 instead of
 # actually sleeping to exercise the retry-backoff path. See its use in
