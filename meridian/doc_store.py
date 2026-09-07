@@ -1469,6 +1469,39 @@ class DocxConcurrentWriteConflictError(OSError):
         self.manifest = manifest or {}
 
 
+class DocxPromotionEvidenceError(OSError):
+    """ba0af0a4 (DOCS-R2-B) -- fail-closed rejection when
+    :func:`meridian.fallbacks.check_docx_promotion_evidence` reports
+    :data:`meridian.fallbacks.PROMOTION_CONTRADICTORY` for a promoted write.
+
+    Distinct from :class:`DocxRenderVerificationError`: that error fires
+    when render status alone is not ``"rendered"`` (an OPT-IN,
+    ``allow_degraded_render``-overridable degradation -- unchanged by this
+    item). This error fires when the promotion-evidence gate finds an
+    actual CONTRADICTION -- most commonly, the promoted file's current
+    on-disk hash no longer matches ``_write_docx_transaction``'s own
+    ``promoted_sha256`` fingerprint of what THIS writer just wrote, even
+    though the caller-specific text/structural verification already passed.
+    A contradiction is never downgradable via ``allow_degraded_render``
+    (there is no override for it) -- per this item's fail-closed mandate, an
+    actively contradictory piece of evidence must never be reported as a
+    successful promotion. A best-effort restore from ``dest + ".bak"`` is
+    attempted first, subject to the same compare-and-swap safety check as
+    :func:`_safe_restore_after_verification_failure` -- check
+    ``.manifest.get("restored")`` for whether it succeeded, and
+    ``.manifest.get("promotion_evidence")`` for the full evidence dict that
+    triggered this. When it was NOT safe to restore (a genuine concurrent
+    write landed), :class:`DocxConcurrentWriteConflictError` is raised
+    instead of this class, exactly like the render/text verification paths.
+    Subclasses ``OSError`` for the same broad-except compatibility as its
+    siblings.
+    """
+
+    def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.manifest = manifest or {}
+
+
 _DOCX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 # dccc2311 -- single serialized canonical-merge point per destination path,
@@ -4635,6 +4668,22 @@ class DocStructureStore:
           (``write_dest`` != canonical ``source_path``) are render-gated the
           same way, against the draft file, when requested.
 
+          ba0af0a4 (DOCS-R2-B) -- when ``check_render=True``, the render
+          evidence just gathered is ALSO run through
+          :func:`meridian.fallbacks.check_docx_promotion_evidence` together
+          with the write transaction's stage hash (``manifest_hash``),
+          canonical post-promotion hash (``promoted_sha256``), and a fresh
+          re-read of ``write_dest``'s current on-disk hash. This is
+          genuinely new coverage (not merely a restatement of the render
+          check): it catches a promoted file whose current bytes no longer
+          match what THIS writer's own promotion just produced -- e.g. a
+          different writer's promotion landing in the window between our
+          promotion+text-verify and this check -- even when render status
+          itself reports ``"rendered"``. A contradictory verdict raises
+          :class:`DocxPromotionEvidenceError` (or
+          :class:`DocxConcurrentWriteConflictError` when a restore would not
+          be safe) and is NEVER downgradable via ``allow_degraded_render``.
+
         Mandatory post-write verification (5988a5bb, part A) now runs after
         every promoted write, draft or direct: the written file is re-read
         FRESH FROM DISK (never the in-memory ``root`` just serialized) and
@@ -4658,13 +4707,19 @@ class DocStructureStore:
         success.
 
         Returns ``{document_id, para_id, new_text, elements_resynced,
-        source_path, manifest_hash, pre_counts, post_counts}`` (draft mode
-        additionally carries ``draft_path``, ``wave_run_id``, ``is_draft:
-        True`` and omits ``elements_resynced``). ``check_render=True``
+        source_path, manifest_hash, pre_counts, post_counts,
+        promoted_sha256}`` (draft mode additionally carries ``draft_path``,
+        ``wave_run_id``, ``is_draft: True`` and omits ``elements_resynced``;
+        ``promoted_sha256`` -- ba0af0a4 -- was already computed by
+        ``_write_docx_transaction`` since 5988a5bb but previously discarded
+        here, unconditionally surfaced now). ``check_render=True``
         additionally adds ``render_status``, ``render_verified``,
         ``render_backend`` (and, for a degraded-accepted render,
-        ``render_degraded: True`` plus ``degraded_render_reason``) — omitted
-        entirely when ``check_render`` is left at its default ``False``.
+        ``render_degraded: True`` plus ``degraded_render_reason``), plus
+        ``promotion_evidence`` (ba0af0a4 -- the full
+        :func:`meridian.fallbacks.check_docx_promotion_evidence` verdict dict)
+        — all omitted entirely when ``check_render`` is left at its default
+        ``False``.
         Raises ``ValueError`` for an unknown document, an unresolvable/missing
         source path, a stale ``expected_content_hash``, an
         ``allow_degraded_render=True`` with no ``degraded_render_reason``, a
@@ -4677,9 +4732,12 @@ class DocStructureStore:
         cannot be confirmed on disk and it was safe to restore, or
         :class:`DocxRenderVerificationError` when the promoted write's
         render-gate check fails/is unavailable and it was safe to restore, or
-        :class:`DocxConcurrentWriteConflictError` when either could not be
-        safely auto-corrected because a different writer's promotion landed
-        after this one's — never fabricates a silent no-op success.
+        :class:`DocxPromotionEvidenceError` (ba0af0a4) when the promotion
+        evidence gate finds an actual contradiction (never downgradable) and
+        it was safe to restore, or
+        :class:`DocxConcurrentWriteConflictError` when any of the above could
+        not be safely auto-corrected because a different writer's promotion
+        landed after this one's — never fabricates a silent no-op success.
         """
         src = source.strip() if isinstance(source, str) else ""
         if not src:
@@ -4809,6 +4867,7 @@ class DocStructureStore:
         # compare-and-swap check just below is for.
         render_check: dict[str, Any] | None = None
         render_degraded = False
+        promotion_evidence: dict[str, Any] | None = None
         with _docx_promotion_lock(write_dest):
             # Canonical _save_docx_xml serializes ``root`` and rewrites only
             # the document part into a copy of the original ZIP (``raw``) at
@@ -4866,6 +4925,64 @@ class DocStructureStore:
             # has already passed (the branch above always raises otherwise).
             if check_render:
                 render_check = fallbacks.check_render_capability(write_dest)
+
+                # ba0af0a4 (DOCS-R2-B) — unify stage/canonical/observed hash
+                # evidence with the render evidence just gathered, BEFORE
+                # deciding what to do with a non-"rendered" render status.
+                # This is genuinely NEW coverage, not a refactor of the
+                # render branch below: it fires even on a "rendered" status,
+                # catching a promoted file whose CURRENT on-disk bytes no
+                # longer match what THIS writer's own promotion produced
+                # (transaction["promoted_sha256"]) — e.g. a different
+                # (cross-process) writer's promotion landing in the window
+                # between our own promotion+text-verify and this render
+                # check — a case nothing checked before this item, since the
+                # render check only ever inspected render OUTPUT, never
+                # re-confirmed the promoted bytes themselves. A contradiction
+                # here is never downgradable via allow_degraded_render.
+                promotion_evidence = fallbacks.check_docx_promotion_evidence(
+                    write_dest,
+                    transaction.get("manifest_hash"),
+                    transaction.get("promoted_sha256"),
+                    _docx_file_sha256(write_dest),
+                    render=render_check,
+                )
+                if promotion_evidence["verdict"] == fallbacks.PROMOTION_CONTRADICTORY:
+                    safe_to_restore, restored = _safe_restore_after_verification_failure(
+                        write_dest, transaction.get("promoted_sha256"),
+                    )
+                    if not safe_to_restore:
+                        raise DocxConcurrentWriteConflictError(
+                            f"promotion evidence check found a contradiction for "
+                            f"para_id={para_id!r} in {write_dest}: "
+                            f"{'; '.join(promotion_evidence['reasons'])} — AND a "
+                            "different writer's promotion has landed on this file "
+                            "since ours, so this could not be safely auto-corrected: "
+                            "restoring from our own backup would destroy that "
+                            f"writer's already-promoted work. {write_dest} was left "
+                            "untouched, exactly as that other writer left it — "
+                            "investigate manually.",
+                            manifest={
+                                **transaction,
+                                "restored": False,
+                                "concurrent_write_detected": True,
+                                "promotion_evidence": promotion_evidence,
+                            },
+                        )
+                    raise DocxPromotionEvidenceError(
+                        f"promotion evidence check found a contradiction for "
+                        f"para_id={para_id!r} in {write_dest}: "
+                        f"{'; '.join(promotion_evidence['reasons'])}"
+                        + (
+                            " — restored from backup, the file reflects its PRE-write state"
+                            if restored
+                            else " — WARNING: could not restore from backup (no .bak "
+                            "found or restore failed); the file may be left in an "
+                            "unverified state"
+                        ),
+                        manifest={**transaction, "restored": restored, "promotion_evidence": promotion_evidence},
+                    )
+
                 if render_check["status"] != fallbacks.RENDERED:
                     if allow_degraded_render:
                         render_degraded = True
@@ -4916,6 +5033,14 @@ class DocStructureStore:
             # computed by _write_docx_transaction but discarded here).
             "pre_counts": transaction.get("pre_counts"),
             "post_counts": transaction.get("post_counts"),
+            # ba0af0a4 (DOCS-R2-B) — surface the canonical post-promotion
+            # hash (_write_docx_transaction has always computed this as
+            # "promoted_sha256" since 5988a5bb; it was silently discarded
+            # here rather than being a new computation). Unconditional
+            # (unlike the check_render=True-only fields below) since it
+            # costs nothing extra and every existing caller ignoring an
+            # unknown dict key is unaffected.
+            "promoted_sha256": transaction.get("promoted_sha256"),
         }
         if render_check is not None:
             # 8d2ef784 (DOCS-R2-A) — tri-state render-gate evidence for this
@@ -4926,6 +5051,14 @@ class DocStructureStore:
             if render_degraded:
                 result["render_degraded"] = True
                 result["degraded_render_reason"] = degraded_render_reason
+        if promotion_evidence is not None:
+            # ba0af0a4 (DOCS-R2-B) — the unified evidence-gate verdict,
+            # present only when check_render=True (the only path that
+            # currently computes it). Reaching this point guarantees the
+            # verdict was NOT contradictory (a contradictory verdict always
+            # raises above), so this is PROMOTION_VERIFIED or
+            # PROMOTION_DEGRADED.
+            result["promotion_evidence"] = promotion_evidence
         if draft_dest is not None:
             # Draft mode: source_path (canonical) was never touched, so the
             # doc_elements index — which reflects the CANONICAL file — must
@@ -4950,6 +5083,9 @@ class DocStructureStore:
         session_id: str,
         *,
         expected_base_revision: str | None = None,
+        check_render: bool = False,
+        allow_degraded_render: bool = False,
+        degraded_render_reason: str | None = None,
     ) -> dict[str, Any]:
         """Promote ONE anchor from an isolated wave-scoped draft into the
         canonical .docx (5988a5bb) — the counterpart of ``update_paragraph``'s
@@ -4999,11 +5135,63 @@ class DocStructureStore:
         index — unlike ``update_paragraph``'s draft-write path, the canonical
         file DID just change.
 
+        ba0af0a4 (DOCS-R2-B) -- three new, entirely OPT-IN keyword
+        parameters, mirroring ``update_paragraph``'s own
+        ``check_render``/``allow_degraded_render``/``degraded_render_reason``
+        contract exactly: every existing caller that omits all three (this
+        method's own wave-merge callers today) gets BYTE-IDENTICAL behavior
+        to before this change -- ``check_render`` defaults to ``False`` and
+        neither a render check nor the promotion-evidence gate below ever
+        runs. Before this item, this method ran NO evidence check at all
+        (not even DOCS-R2-A's render gate, which only ever reached
+        ``update_paragraph``) -- this is the method the item's own "must not
+        be reported as success" language is most squarely about, since it is
+        the ONLY path that mutates the canonical ``source_path`` for a
+        wave-scoped edit. Deliberately kept opt-in rather than made
+        mandatory: forcing every existing wave-merge caller through a new
+        required render/evidence check in the same change that introduces it
+        would be an unreviewed behavior change to production's wave-merge
+        flow, not something to ship silently in a single pass (mirrors the
+        WARN-only-first, deferred-fail-closed-follow-up precedent
+        ``meridian/handoff_receipt.py`` documents for the same kind of
+        judgment call). When ``check_render=True`` IS passed, the gate is
+        the SAME fail-closed contract as ``update_paragraph``'s: after
+        post-write text verification passes,
+        :func:`meridian.fallbacks.check_render_capability` runs against
+        ``source_path`` and its result -- together with this transaction's
+        stage hash, canonical post-promotion hash, and a fresh re-read of
+        ``source_path``'s current on-disk hash -- is run through
+        :func:`meridian.fallbacks.check_docx_promotion_evidence`. A
+        :data:`meridian.fallbacks.PROMOTION_CONTRADICTORY` verdict raises
+        :class:`DocxPromotionEvidenceError` (never downgradable); a
+        :data:`meridian.fallbacks.PROMOTION_DEGRADED` verdict (render not
+        ``"rendered"``) raises :class:`DocxRenderVerificationError` UNLESS
+        ``allow_degraded_render=True`` is passed together with a non-empty
+        ``degraded_render_reason`` -- both subject to the same compare-and-
+        swap safe-restore-or-conflict handling as the text-verification path
+        above (:class:`DocxConcurrentWriteConflictError` when a restore
+        would not be safe).
+
         Returns ``{document_id, para_id, new_text, elements_resynced,
         source_path, draft_path, manifest_hash, pre_counts, post_counts,
-        merge_result}``. Raises :class:`AmbiguousParagraphIdError` (827b6bdc,
+        promoted_sha256, merge_result}`` (``promoted_sha256`` -- ba0af0a4 --
+        was already computed by ``_write_docx_transaction`` since 5988a5bb
+        but previously discarded here, unconditionally surfaced now).
+        ``check_render=True`` additionally adds ``render_status``,
+        ``render_verified``, ``render_backend`` (and, for a degraded-
+        accepted render, ``render_degraded: True`` plus
+        ``degraded_render_reason``) plus ``promotion_evidence`` (the full
+        evidence-gate verdict dict) -- all omitted entirely when
+        ``check_render`` is left at its default ``False``.
+        Raises :class:`AmbiguousParagraphIdError` (827b6bdc,
         a ``ValueError`` subclass) when ``para_id`` matches more than one
-        paragraph in the draft — see :func:`_find_paragraph_by_id`.
+        paragraph in the draft — see :func:`_find_paragraph_by_id`; raises
+        :class:`DocxRenderVerificationError` or
+        :class:`DocxPromotionEvidenceError` when ``check_render=True`` and
+        the corresponding check fails and it was safe to restore, or
+        :class:`DocxConcurrentWriteConflictError` when any of the above
+        could not be safely auto-corrected because a different writer's
+        promotion landed after this one's.
         """
         src = source.strip() if isinstance(source, str) else ""
         if not src:
@@ -5020,6 +5208,17 @@ class DocStructureStore:
         merge_session_id = (session_id or "").strip()
         if not merge_session_id:
             raise ValueError("session_id is required")
+        # ba0af0a4 (DOCS-R2-B) -- validated BEFORE any read/mutation, same
+        # discipline as update_paragraph's identical check: an audited
+        # opt-in with no reason is a caller error, not something to
+        # silently ignore or default away.
+        if allow_degraded_render and not (
+            isinstance(degraded_render_reason, str) and degraded_render_reason.strip()
+        ):
+            raise ValueError(
+                "degraded_render_reason must be a non-empty string when "
+                "allow_degraded_render=True"
+            )
 
         doc_row = await self.get_document(project_id, src)
         if doc_row is None:
@@ -5077,6 +5276,9 @@ class DocStructureStore:
         # stage+promote THROUGH verify and any conditional restore, and use
         # the compare-and-swap check before ever restoring — see
         # update_paragraph's identical comment for the full rationale.
+        render_check: dict[str, Any] | None = None
+        render_degraded = False
+        promotion_evidence: dict[str, Any] | None = None
         with _docx_promotion_lock(source_path):
             transaction = _save_docx_xml(dest_raw, draft_root, source_path)
 
@@ -5109,12 +5311,106 @@ class DocStructureStore:
                     manifest={**transaction, "restored": restored},
                 )
 
+            # ba0af0a4 (DOCS-R2-B) — OPT-IN promotion-evidence gate (only
+            # reached when check_render=True; every existing wave-merge
+            # caller that omits it never reaches this block at all, so
+            # behavior is byte-identical to before this change). Mirrors
+            # update_paragraph's own check_render block exactly, gated
+            # against source_path (the canonical file THIS method just
+            # promoted into — the only doc_store.py write path that had NO
+            # evidence check at all before this item). Reached only once
+            # text verification has already passed above.
+            if check_render:
+                render_check = fallbacks.check_render_capability(source_path)
+                promotion_evidence = fallbacks.check_docx_promotion_evidence(
+                    source_path,
+                    transaction.get("manifest_hash"),
+                    transaction.get("promoted_sha256"),
+                    _docx_file_sha256(source_path),
+                    render=render_check,
+                )
+                if promotion_evidence["verdict"] == fallbacks.PROMOTION_CONTRADICTORY:
+                    safe_to_restore, restored = _safe_restore_after_verification_failure(
+                        source_path, transaction.get("promoted_sha256"),
+                    )
+                    if not safe_to_restore:
+                        raise DocxConcurrentWriteConflictError(
+                            f"promotion evidence check found a contradiction merging "
+                            f"para_id={para_id!r} from draft {draft_path!r} into "
+                            f"{source_path}: {'; '.join(promotion_evidence['reasons'])} "
+                            "— AND a different writer's promotion has landed on this "
+                            "file since ours, so this could not be safely "
+                            "auto-corrected: restoring from our own backup would "
+                            f"destroy that writer's already-promoted work. "
+                            f"{source_path} was left untouched, exactly as that other "
+                            "writer left it — investigate manually.",
+                            manifest={
+                                **transaction,
+                                "restored": False,
+                                "concurrent_write_detected": True,
+                                "promotion_evidence": promotion_evidence,
+                            },
+                        )
+                    raise DocxPromotionEvidenceError(
+                        f"promotion evidence check found a contradiction merging "
+                        f"para_id={para_id!r} from draft {draft_path!r} into "
+                        f"{source_path}: {'; '.join(promotion_evidence['reasons'])}"
+                        + (
+                            " — restored from backup, the file reflects its PRE-merge state"
+                            if restored
+                            else " — WARNING: could not restore from backup (no .bak "
+                            "found or restore failed); the file may be left in an "
+                            "unverified state"
+                        ),
+                        manifest={**transaction, "restored": restored, "promotion_evidence": promotion_evidence},
+                    )
+
+                if render_check["status"] != fallbacks.RENDERED:
+                    if allow_degraded_render:
+                        render_degraded = True
+                    else:
+                        safe_to_restore, restored = _safe_restore_after_verification_failure(
+                            source_path, transaction.get("promoted_sha256"),
+                        )
+                        if not safe_to_restore:
+                            raise DocxConcurrentWriteConflictError(
+                                f"render verification merging para_id={para_id!r} from "
+                                f"draft {draft_path!r} into {source_path} did not pass "
+                                f"(status={render_check['status']!r}) — AND a different "
+                                "writer's promotion has landed on this file since "
+                                "ours, so this could not be safely auto-corrected: "
+                                "restoring from our own backup would destroy that "
+                                f"writer's already-promoted work. {source_path} was "
+                                "left untouched, exactly as that other writer left it "
+                                "— investigate manually.",
+                                manifest={
+                                    **transaction,
+                                    "restored": False,
+                                    "concurrent_write_detected": True,
+                                    "render_check": render_check,
+                                },
+                            )
+                        raise DocxRenderVerificationError(
+                            f"render verification merging para_id={para_id!r} from "
+                            f"draft {draft_path!r} into {source_path} did not pass "
+                            f"(status={render_check['status']!r}): "
+                            f"{render_check.get('reason', '(no reason given)')}"
+                            + (
+                                " — restored from backup, the file reflects its PRE-merge state"
+                                if restored
+                                else " — WARNING: could not restore from backup (no .bak "
+                                "found or restore failed); the file may be left in an "
+                                "unverified state"
+                            ),
+                            manifest={**transaction, "restored": restored, "render_check": render_check},
+                        )
+
         merge_result = await db_module.record_merge_result(
             self._db, wave_id, source_path, merge_session_id, para_id,
             canonical_revision_after=transaction.get("manifest_hash"),
         )
         resynced = await self._resync_element_text(doc_row["id"], para_id, draft_text)
-        return {
+        result = {
             "document_id": doc_row["id"],
             "para_id": para_id,
             "new_text": draft_text,
@@ -5124,8 +5420,21 @@ class DocStructureStore:
             "manifest_hash": transaction.get("manifest_hash"),
             "pre_counts": transaction.get("pre_counts"),
             "post_counts": transaction.get("post_counts"),
+            # ba0af0a4 (DOCS-R2-B) — see update_paragraph's identical field
+            # for why this is unconditional rather than check_render-gated.
+            "promoted_sha256": transaction.get("promoted_sha256"),
             "merge_result": merge_result,
         }
+        if render_check is not None:
+            result["render_status"] = render_check["status"]
+            result["render_verified"] = render_check["status"] == fallbacks.RENDERED
+            result["render_backend"] = render_check.get("backend")
+            if render_degraded:
+                result["render_degraded"] = True
+                result["degraded_render_reason"] = degraded_render_reason
+        if promotion_evidence is not None:
+            result["promotion_evidence"] = promotion_evidence
+        return result
 
     async def close(self) -> None:
         """Close the underlying connection (best-effort)."""

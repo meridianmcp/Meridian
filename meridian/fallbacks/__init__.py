@@ -81,7 +81,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
     "RENDERED",
@@ -100,6 +100,12 @@ __all__ = [
     "detect_backend",
     "check_render_capability",
     "check_word_com_render_receipt",
+    "PROMOTION_SCHEMA_VERSION",
+    "PROMOTION_VERIFIED",
+    "PROMOTION_DEGRADED",
+    "PROMOTION_CONTRADICTORY",
+    "PROMOTION_VERDICTS",
+    "check_docx_promotion_evidence",
 ]
 
 # ---------------------------------------------------------------------------
@@ -607,3 +613,273 @@ def check_render_capability(
             ))
         else:
             return _tag(_result(RENDERED, backend=backend.name, detail={**detail, "attempts": attempts}))
+
+
+# ---------------------------------------------------------------------------
+# DOCX promotion evidence gate (ba0af0a4, DOCS-R2-B).
+#
+# Unifies the independent evidence signals a DOCX write-transaction
+# promotion can gather -- the STAGE hash (``_docx_manifest_hash``, over the
+# transaction's changed parts), the CANONICAL post-promotion hash
+# (``_write_docx_transaction``'s ``promoted_sha256``, the exact bytes this
+# writer put on disk), a fresh re-read of the promoted file's OWN current
+# on-disk hash, render-capability evidence
+# (:func:`check_render_capability`'s tri-state result), and -- when a
+# caller happens to have them -- output-provenance status
+# (``tools.meridian_fallbacks.output_provenance_gate.check_output_provenance``'s
+# shape) and outputs-index convergence state
+# (``meridian.outputs_indexer.OutputsFtsIndex.get_convergence_state()``'s
+# shape) -- into ONE explicit, tri-state verdict a promotion call can gate
+# on. Mirrors ``tools/meridian_fallbacks/figure_slot_manifest.py``'s
+# ``MANIFEST_COMPLETE``/``MANIFEST_INCOMPLETE``/``MANIFEST_CONTRADICTORY``
+# pattern -- the closest existing precedent for "a synchronous, tri-state,
+# fail-closed verdict gating a promotion, built from caller-supplied
+# evidence" -- applied here to DOCX write promotion instead of figure-slot
+# asset promotion.
+#
+# WHY THIS LIVES HERE, NOT UNDER tools/meridian_fallbacks/: every sibling
+# gate under that package (figure_slot_manifest.py, output_provenance_gate.py,
+# docx_completion_gate.py) is a standalone module an EXTERNAL executor with
+# no live MCP connection shells out to directly -- none of them is imported
+# by any core ``meridian`` module today, in either direction (by design --
+# see each of their own module docstrings). ``meridian/doc_store.py``'s own
+# promotion paths (``update_paragraph``, ``merge_paragraph_draft``) already
+# import THIS module (``from . import fallbacks``) for
+# :func:`check_render_capability`, so a new in-process gate those paths call
+# belongs here: adding a fresh ``tools.meridian_fallbacks`` import to
+# doc_store.py would be a new production dependency on a repo-root
+# convenience directory that is not necessarily part of a packaged
+# ``meridian`` distribution (``tools/`` ships no ``pyproject.toml`` package
+# data entry of its own), which the "no cross-import" convention documented
+# throughout this codebase deliberately avoids.
+#
+# Deliberately a PURE function of already-decided evidence -- never reads a
+# .docx, never scans an outputs directory, never touches the filesystem at
+# all -- exactly mirroring ``figure_slot_manifest.reconcile_slot_manifest``'s
+# own "pure function of already-decided classification data" discipline.
+# The CALLER is responsible for actually gathering each piece of evidence
+# (re-hashing the promoted file, calling :func:`check_render_capability`,
+# calling ``check_output_provenance``, calling
+# ``OutputsFtsIndex.get_convergence_state()``) and handing the results in
+# here. ``render``/``provenance``/``convergence`` are each independently
+# OPT-IN: passing ``None`` (the default) for any of them means "the caller
+# did not check this signal", contributing nothing to the verdict --
+# exactly like ``update_paragraph``'s own pre-existing ``check_render=False``
+# default. Only ``stage_hash``/``canonical_hash``/``observed_hash`` are
+# mandatory, because a promotion call that reaches this gate at all has, by
+# definition, already run ``_write_docx_transaction`` and can always supply
+# real values for all three; a caller that genuinely cannot (e.g. the
+# promoted file vanished before it could be re-hashed) passes ``None``,
+# which this gate treats as a hard, non-downgradable contradiction -- see
+# below.
+# ---------------------------------------------------------------------------
+
+PROMOTION_SCHEMA_VERSION = 1
+
+#: Every signal checked out clean (or was never checked at all) -- nothing
+#: here should stop a caller from reporting this promotion a success.
+PROMOTION_VERIFIED = "promotion_verified"
+#: At least one OPT-IN signal the caller supplied came back inconclusive or
+#: unavailable (e.g. no render backend in this environment, an unconverged
+#: outputs-index scan) -- never proof of a real problem, but not
+#: confirmation either. A caller decides whether to accept this (mirroring
+#: ``update_paragraph``'s own ``allow_degraded_render`` opt-in) or to fail
+#: closed on it.
+PROMOTION_DEGRADED = "promotion_degraded"
+#: Two or more independent signals actively disagree, or a piece of
+#: evidence this gate cannot function without is itself missing/blank/
+#: unreadable. Never downgradable by a caller-side "accept degraded" opt-in
+#: -- a genuine contradiction must never be reported as success.
+PROMOTION_CONTRADICTORY = "promotion_contradictory"
+PROMOTION_VERDICTS: tuple[str, str, str] = (
+    PROMOTION_VERIFIED, PROMOTION_DEGRADED, PROMOTION_CONTRADICTORY,
+)
+
+# Provenance-type vocabulary this gate understands when a caller supplies a
+# ``provenance`` mapping, string-identical to
+# ``tools/meridian_fallbacks/output_provenance_gate.py``'s own constants
+# (deliberately NOT imported -- see this section's module-boundary note
+# above; the same deliberate duplication already established between
+# doc_store.py and docs_intel.py for ``_docx_promotion_lock``).
+_PROVENANCE_UNREGISTERED = "unregistered"
+_PROVENANCE_UNKNOWN = "unknown"
+_PROVENANCE_STALE_BY_SCRIPT = "stale_by_script"
+_PROVENANCE_DEGRADED_TYPES = (
+    _PROVENANCE_UNREGISTERED, _PROVENANCE_UNKNOWN, _PROVENANCE_STALE_BY_SCRIPT,
+)
+
+
+def _blank(value: Any) -> bool:
+    return not isinstance(value, str) or not value.strip()
+
+
+def check_docx_promotion_evidence(
+    docx_path: str,
+    stage_hash: Any,
+    canonical_hash: Any,
+    observed_hash: Any,
+    *,
+    render: "Mapping[str, Any] | None" = None,
+    provenance: "Mapping[str, Any] | None" = None,
+    convergence: "Mapping[str, Any] | None" = None,
+) -> dict[str, Any]:
+    """Compose already-gathered DOCX promotion evidence into one tri-state
+    verdict (ba0af0a4, DOCS-R2-B): :data:`PROMOTION_VERIFIED`,
+    :data:`PROMOTION_DEGRADED`, or :data:`PROMOTION_CONTRADICTORY`.
+
+    Args:
+      docx_path: The promoted file this evidence is about. Never read --
+        used only to label the returned dict and any reason strings.
+      stage_hash: The write transaction's staged-delta fingerprint (e.g.
+        ``_write_docx_transaction``'s ``manifest_hash``, a hash over the
+        parts the transaction actually changed).
+      canonical_hash: The exact-bytes fingerprint of what THIS writer
+        promoted (e.g. ``_write_docx_transaction``'s ``promoted_sha256``).
+      observed_hash: A FRESH hash of ``docx_path``'s CURRENT on-disk bytes,
+        computed by the caller after promotion (e.g. doc_store.py's own
+        ``_docx_file_sha256(write_dest)``). Compared against
+        ``canonical_hash`` -- this is the literal "post-promotion hash"
+        check this item is named for: it catches a promoted file that no
+        longer matches what was just promoted (a different writer's
+        promotion landing in between, or a corrupted intermediate state)
+        even when every OTHER signal (render, provenance, convergence)
+        reports clean, a case nothing in ``doc_store.py`` checked before
+        this item.
+      render: :func:`check_render_capability`'s result dict, or ``None``
+        if the caller did not check render status for this promotion.
+      provenance: ``check_output_provenance``'s result dict, or ``None`` if
+        the caller did not check output provenance for this promotion (the
+        common case for a document write with no natural ``outputs_dir``
+        handle -- see doc_store.py's own callers).
+      convergence: ``OutputsFtsIndex.get_convergence_state()``'s result
+        dict, or ``None`` if the caller did not check index convergence.
+
+    Returns a dict with ``verdict`` plus every input echoed back
+    (``docx_path``, ``stage_hash``, ``canonical_hash``, ``observed_hash``,
+    ``render``, ``provenance``, ``convergence``), ``contradictions`` and
+    ``degraded_reasons`` (each a list of human-readable strings -- empty
+    when nothing of that severity was found), and ``reasons`` (the two
+    concatenated, contradictions first).
+
+    Never raises for well-formed argument TYPES -- a missing/blank/
+    mismatched hash or an unrecognized render status becomes a
+    ``PROMOTION_CONTRADICTORY`` verdict with an itemized reason, never a
+    crash, mirroring ``figure_slot_manifest.reconcile_slot_manifest``'s own
+    "malformed data becomes a reported failure" discipline. Raises
+    :class:`TypeError` only when ``docx_path`` is not a non-empty string, or
+    ``render``/``provenance``/``convergence`` is neither ``None`` nor a
+    mapping -- a caller programming error, not an evidence-content problem.
+    """
+    if not isinstance(docx_path, str) or not docx_path.strip():
+        raise TypeError("docx_path must be a non-empty string")
+    for _name, _value in (
+        ("render", render), ("provenance", provenance), ("convergence", convergence),
+    ):
+        if _value is not None and not isinstance(_value, Mapping):
+            raise TypeError(f"{_name} must be a mapping or None, got {type(_value).__name__}")
+
+    contradictions: list[str] = []
+    degraded: list[str] = []
+
+    if _blank(stage_hash):
+        contradictions.append(
+            "stage_hash is missing or blank -- cannot confirm what this "
+            "write transaction's staged delta actually was"
+        )
+    if _blank(canonical_hash):
+        contradictions.append(
+            "canonical_hash is missing or blank -- cannot confirm what "
+            "bytes this writer actually promoted"
+        )
+    if _blank(observed_hash):
+        contradictions.append(
+            f"observed_hash for {docx_path} is missing or blank -- the "
+            "promoted file could not be confirmed to still hold what was "
+            "promoted"
+        )
+    elif not _blank(canonical_hash) and observed_hash != canonical_hash:
+        contradictions.append(
+            f"the current on-disk hash of {docx_path} ({observed_hash!r}) "
+            f"does not match canonical_hash ({canonical_hash!r}) -- either "
+            "a different writer has promoted to this destination since, or "
+            "the recorded canonical hash is wrong; this promotion cannot be "
+            "confirmed as the file's current state"
+        )
+
+    if render is not None:
+        render_status = render.get("status")
+        if render_status == RENDERED:
+            pass
+        elif render_status in (FAILED, UNAVAILABLE_WITH_REASON):
+            degraded.append(
+                f"render status is {render_status!r} "
+                f"({render.get('reason') or 'no reason given'})"
+            )
+        else:
+            contradictions.append(
+                f"render evidence has an unrecognized status {render_status!r} "
+                "-- refusing to interpret an evidence shape this gate does "
+                "not recognize as a pass"
+            )
+
+    if provenance is not None:
+        prov_hash = provenance.get("output_sha256")
+        if (
+            not _blank(canonical_hash)
+            and isinstance(prov_hash, str)
+            and prov_hash
+            and prov_hash != canonical_hash
+        ):
+            contradictions.append(
+                f"provenance's independently-computed output_sha256 "
+                f"({prov_hash!r}) does not match canonical_hash "
+                f"({canonical_hash!r}) for the same path -- two independent "
+                "hash computations of the same promoted artifact disagree"
+            )
+        if provenance.get("inconclusive"):
+            degraded.append(
+                "provenance is inconclusive (the local outputs scan did "
+                "not fully converge) -- per output_provenance_gate's own "
+                "contract this is never proof of a problem, but it is not "
+                "confirmation either"
+            )
+        else:
+            prov_type = provenance.get("provenance_type")
+            if prov_type in _PROVENANCE_DEGRADED_TYPES:
+                degraded.append(f"provenance_type is {prov_type!r}")
+
+    if convergence is not None:
+        if convergence.get("inconclusive"):
+            degraded.append(
+                "the outputs index's most recent scan was inconclusive (a "
+                "walk or DB-write error) -- an absence of prior findings "
+                "here is not proof nothing changed"
+            )
+        elif convergence.get("degraded"):
+            degraded.append(
+                "the outputs index reports a degraded state "
+                f"(partial_index={convergence.get('partial_index')!r}, "
+                f"pending_count={convergence.get('pending_count')!r})"
+            )
+
+    if contradictions:
+        verdict = PROMOTION_CONTRADICTORY
+    elif degraded:
+        verdict = PROMOTION_DEGRADED
+    else:
+        verdict = PROMOTION_VERIFIED
+
+    return {
+        "schema_version": PROMOTION_SCHEMA_VERSION,
+        "verdict": verdict,
+        "docx_path": docx_path,
+        "stage_hash": stage_hash,
+        "canonical_hash": canonical_hash,
+        "observed_hash": observed_hash,
+        "render": dict(render) if render is not None else None,
+        "provenance": dict(provenance) if provenance is not None else None,
+        "convergence": dict(convergence) if convergence is not None else None,
+        "contradictions": contradictions,
+        "degraded_reasons": degraded,
+        "reasons": [*contradictions, *degraded],
+    }
