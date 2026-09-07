@@ -217,8 +217,8 @@
     },
     "figure_slot_manifest": {
       "file": "figure_slot_manifest.py",
-      "sha256": "fe69ff5aed5f6db0495bc1ab1986743e76e0177d8243d739e9e88c9d9fad96d4",
-      "byte_size": 18516,
+      "sha256": "7ad25f22ebbd8f44096d159c32d325acc95d6a6d220cb96e43f537461b1e9d23",
+      "byte_size": 19281,
       "supported_operations": [
         "reconcile_slot_manifest(expected_slot_ids, promoted=(), held=(), skipped=(), ambiguous=()) -> dict -- fail-closed manifest-level verdict reconciling an expected set of figure-slot ids against four caller-supplied disposition buckets",
         "SlotClassification -- dataclass (slot_id, bucket, reason, owner); to_dict()/from_dict() for lossless JSON round-tripping. A blank/missing reason or owner is reported as a structural_errors entry, never silently accepted as a valid classification.",
@@ -230,6 +230,21 @@
         "Never raises for a malformed dict-shaped bucket entry -- becomes a structural_errors string instead (folded into MANIFEST_CONTRADICTORY). Raises TypeError only when an entry is neither a SlotClassification nor a mapping at all -- a caller programming error, not a manifest-content problem.",
         "Duplicate-assignment and unknown-slot detection is keyed on exact slot_id string equality only -- it has no notion of slot aliases or renames across a promotion batch; a renamed slot id must be reconciled by the caller before this module ever sees it.",
         "The defensive raw-entry-count-mismatch fallback check (MANIFEST_CONTRADICTORY) is mathematically unreachable given an otherwise-clean manifest -- it exists purely as a fail-closed backstop against a future logic gap this module's own checks did not anticipate, not a documented real-world trigger."
+      ]
+    },
+    "generate_capability_manifest": {
+      "file": "generate_capability_manifest.py",
+      "sha256": "9a0612383f17ffc49ae6d4cf223b247d223162459e7b2a5665b230d162a9f907",
+      "byte_size": 8529,
+      "supported_operations": [
+        "compute_module_drift(manifest, pkg_dir=...) -> list[dict] -- pure comparison of every modules[*].sha256/byte_size against the real file on disk right now; empty list means fully converged",
+        "regenerate_manifest_text(manifest_text, manifest, pkg_dir=...) -> (new_text, drift) -- surgically rewrites ONLY the drifted sha256/byte_size value spans in the manifest's raw source text, leaving every other byte (key order, formatting, prose) untouched",
+        "main(argv) -- CLI: `python -m tools.meridian_fallbacks.generate_capability_manifest --check` (report drift, exit 0/1/2, never writes) or `--write` (surgically fix drift in place, exit 0/2); `--manifest-path` overrides which manifest file to target"
+      ],
+      "limitations": [
+        "Only recomputes sha256/byte_size -- never infers or updates supported_operations/limitations prose for a changed module; a real behavior change still needs a human-written description update alongside a --write run.",
+        "regenerate_manifest_text's surgical regex assumes this manifest's own established per-module layout (\"file\" immediately followed by \"sha256\" then \"byte_size\", one JSON key per line) -- a manifest reformatted to a different layout would need _surgical_field_pattern updated to match; it fails loudly (ValueError, not a silent wrong edit) if a module's block does not match exactly once.",
+        "Raises FileNotFoundError (exit 2) rather than silently dropping a manifest module whose file has been deleted or renamed -- that is a structural defect for a human to resolve (rename the module entry or remove it), not something this generator guesses at."
       ]
     }
   },
