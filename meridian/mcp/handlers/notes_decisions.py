@@ -1890,6 +1890,57 @@ async def handle_audit_figure_table_provenance(
         counts[f"{entry['status']}_count"] += 1
         tables_out.append(entry)
 
+    # W31-A -- durable resolver receipts. Every figure/table resolution this
+    # call just computed is translated onto bind_artifact_provenance's own
+    # four-way status vocabulary (AUDIT_STATUS_TO_BINDING_STATUS) and
+    # persisted as one artifact_provenance_receipt row each, so a later
+    # reader (find_recent_artifact_provenance_receipt /
+    # find_recent_artifact_provenance_receipts_for_document) can see, after
+    # the fact, that this document's provenance was actually resolved and
+    # what was found -- not just a transient report dict that's gone the
+    # moment this call returns. Best-effort and fully guarded: a receipt-
+    # write failure must never break this tool's primary, already-computed
+    # audit report.
+    receipts_recorded = 0
+    try:
+        from meridian import artifact_provenance_receipt as _apr  # noqa: PLC0415
+
+        bindings: list[dict[str, Any]] = []
+        for fig in figures_out:
+            bindings.append({
+                "artifact_id": f"figure:{fig.get('id')}",
+                "kind": "figure",
+                "canonical_path": fig.get("file_path"),
+                "status": _apr.AUDIT_STATUS_TO_BINDING_STATUS.get(
+                    fig.get("status"), _apr.UNRESOLVED,
+                ),
+                "match_type": fig.get("match_type"),
+                "generating_script": fig.get("generating_script"),
+                "resolved_sha256": fig.get("sha256"),
+                "reason": fig.get("reason"),
+            })
+        for tbl in tables_out:
+            bindings.append({
+                "artifact_id": f"table:{tbl.get('id')}",
+                "kind": "table",
+                "canonical_path": None,
+                "status": _apr.AUDIT_STATUS_TO_BINDING_STATUS.get(
+                    tbl.get("status"), _apr.UNRESOLVED,
+                ),
+                "match_type": None,
+                "generating_script": tbl.get("generating_script"),
+                "resolved_sha256": tbl.get("sha256"),
+                "reason": tbl.get("reason"),
+            })
+        written = await _apr.record_artifact_provenance_receipts_batch(
+            db, project_id=args["project_id"], bindings=bindings,
+            document_id=doc_row["id"],
+            tenant_id=(tenant or {}).get("id") if tenant else None,
+        )
+        receipts_recorded = len(written)
+    except Exception:  # noqa: BLE001 -- receipts are additive, never load-bearing here
+        receipts_recorded = 0
+
     return {
         "project_id": args["project_id"],
         "doc": doc_source,
@@ -1901,6 +1952,7 @@ async def handle_audit_figure_table_provenance(
             "table_count": len(tables_out),
             **counts,
         },
+        "receipts_recorded": receipts_recorded,
     }
 
 
