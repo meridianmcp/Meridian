@@ -293,3 +293,167 @@ def test_subscribe_session_messages_yields_nothing_when_unconfigured():
             results.append(msg)
         assert results == []
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# 2cf57fde -- runtime health / cache-effectiveness / Neon-avoidance diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostics_report_unconfigured_when_no_url():
+    diag = redis_bridge.get_redis_runtime_diagnostics()
+    assert diag["configured"] is False
+    assert diag["availability"] == "unconfigured"
+    assert diag["connection_generation"] == 0
+    assert diag["budget"] is None
+    # MERIDIAN_REDIS_URL's value must never appear, only a boolean flag.
+    assert "MERIDIAN_REDIS_URL" not in str(diag)
+
+
+def test_diagnostics_never_perform_live_network_io(monkeypatch):
+    """get_redis_runtime_diagnostics must be pure/sync -- it must not call
+    get_redis_client or otherwise touch the network, even when configured."""
+    monkeypatch.setenv("MERIDIAN_REDIS_URL", "redis://example.invalid:6379/0")
+
+    async def _boom():
+        raise AssertionError("get_redis_runtime_diagnostics must not call get_redis_client")
+
+    monkeypatch.setattr(redis_bridge, "get_redis_client", _boom)
+    diag = redis_bridge.get_redis_runtime_diagnostics()
+    assert diag["configured"] is True
+    # configured but never used in this test -> idle, not reachable/degraded.
+    assert diag["availability"] == "idle"
+
+
+def test_diagnostics_connection_generation_increments_on_client_construction(monkeypatch):
+    """Exercises the REAL get_redis_client() import/construction path (not a
+    monkeypatch of get_redis_client itself) so the connection_generation
+    increment inside it is actually under test."""
+    monkeypatch.setenv("MERIDIAN_REDIS_URL", "redis://example.invalid:6379/0")
+
+    import sys
+    import types
+
+    fake_asyncio_submodule = types.ModuleType("redis.asyncio")
+    fake_asyncio_submodule.from_url = lambda *a, **kw: object()
+    fake_redis_pkg = types.ModuleType("redis")
+    fake_redis_pkg.asyncio = fake_asyncio_submodule
+    monkeypatch.setitem(sys.modules, "redis", fake_redis_pkg)
+    monkeypatch.setitem(sys.modules, "redis.asyncio", fake_asyncio_submodule)
+
+    async def _run():
+        assert redis_bridge.get_redis_runtime_diagnostics()["connection_generation"] == 0
+        await redis_bridge.get_redis_client()
+        assert redis_bridge.get_redis_runtime_diagnostics()["connection_generation"] == 1
+        # Cached client -- a second call must NOT bump the generation again.
+        await redis_bridge.get_redis_client()
+        assert redis_bridge.get_redis_runtime_diagnostics()["connection_generation"] == 1
+    asyncio.run(_run())
+
+
+def test_diagnostics_publish_success_updates_pubsub_counters_and_latency(monkeypatch):
+    fake = _FakeRedisClient()
+
+    async def _fake_get_client():
+        return fake
+
+    monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_get_client)
+
+    async def _run():
+        ok = await redis_bridge.publish_session_message("s1", {"id": "m1"})
+        assert ok is True
+        diag = redis_bridge.get_redis_runtime_diagnostics()
+        assert diag["pubsub"]["publish_attempts"] == 1
+        assert diag["pubsub"]["publish_successes"] == 1
+        assert diag["pubsub"]["publish_failures"] == 0
+        assert diag["pubsub"]["latency_ms"]["sample_count"] == 1
+        assert diag["pubsub"]["latency_ms"]["avg_ms"] >= 0
+        # A successful publish is not itself a fallback of either kind.
+        assert diag["pubsub"]["fallback_unconfigured_count"] == 0
+        assert diag["pubsub"]["fallback_budget_count"] == 0
+    asyncio.run(_run())
+
+
+def test_diagnostics_publish_failure_records_last_error_class(monkeypatch):
+    async def _fake_get_client():
+        return _FailingRedisClient()
+
+    monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_get_client)
+
+    async def _run():
+        ok = await redis_bridge.publish_session_message("s1", {"id": "m1"})
+        assert ok is False
+        diag = redis_bridge.get_redis_runtime_diagnostics()
+        assert diag["pubsub"]["publish_failures"] == 1
+        assert diag["last_error_class"] == "ConnectionError"
+        assert diag["last_error_age_seconds"] is not None
+        assert diag["last_error_age_seconds"] >= 0
+    asyncio.run(_run())
+
+
+def test_diagnostics_fallback_unconfigured_counter_increments():
+    async def _run():
+        await redis_bridge.publish_session_message("s1", {"id": "m1"})
+        await redis_bridge.publish_session_message("s1", {"id": "m2"})
+        diag = redis_bridge.get_redis_runtime_diagnostics()
+        assert diag["pubsub"]["fallback_unconfigured_count"] == 2
+        assert diag["pubsub"]["publish_attempts"] == 0  # never got past the fallback
+    asyncio.run(_run())
+
+
+def test_diagnostics_reset_clears_all_counters(monkeypatch):
+    fake = _FakeRedisClient()
+
+    async def _fake_get_client():
+        return fake
+
+    monkeypatch.setattr(redis_bridge, "get_redis_client", _fake_get_client)
+
+    async def _run():
+        await redis_bridge.publish_session_message("s1", {"id": "m1"})
+    asyncio.run(_run())
+
+    diag_before = redis_bridge.get_redis_runtime_diagnostics()
+    assert diag_before["pubsub"]["publish_successes"] == 1
+
+    redis_bridge.reset_redis_client_cache()
+    diag_after = redis_bridge.get_redis_runtime_diagnostics()
+    assert diag_after["pubsub"]["publish_successes"] == 0
+    assert diag_after["connection_generation"] == 0
+    assert diag_after["last_error_class"] is None
+
+
+def test_diagnostics_cache_section_reports_inactive_redis_cache_by_default():
+    """The Redis-backed read-through cache is NOT implemented by this item --
+    diagnostics must say so honestly rather than fabricate savings."""
+    diag = redis_bridge.get_redis_runtime_diagnostics()
+    assert diag["cache"]["redis_cache"]["active"] is False
+    assert diag["cache"]["redis_cache"]["hits"] == 0
+    assert diag["cache"]["redis_cache"]["misses"] == 0
+
+
+def test_diagnostics_cache_recorder_functions_increment_counters():
+    redis_bridge.record_cache_hit()
+    redis_bridge.record_cache_hit()
+    redis_bridge.record_cache_miss()
+    redis_bridge.record_cache_set()
+    redis_bridge.record_cache_invalidation()
+    diag = redis_bridge.get_redis_runtime_diagnostics()
+    assert diag["cache"]["redis_cache"]["hits"] == 2
+    assert diag["cache"]["redis_cache"]["misses"] == 1
+    assert diag["cache"]["redis_cache"]["sets"] == 1
+    assert diag["cache"]["redis_cache"]["invalidations"] == 1
+
+
+def test_diagnostics_local_process_cache_reports_sprint_items_cache_stats():
+    """cache.local_process_cache should reflect the genuinely active
+    process-local board-read cache in meridian/db/sprint_items.py."""
+    from meridian.db import sprint_items as sprint_items_module
+
+    sprint_items_module.reset_sprint_items_cache_diagnostics()
+    diag = redis_bridge.get_redis_runtime_diagnostics()
+    local = diag["cache"]["local_process_cache"]
+    assert local["available"] is True
+    assert local["hits"] == 0
+    assert local["misses"] == 0
+    assert "ttl_seconds" in local

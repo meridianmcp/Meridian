@@ -101,6 +101,22 @@ $0.20 / 100,000 commands ($1.00 = 500,000 commands).
 The thresholds above apply to paid tenants. Free-tier tenants receive no Redis
 push augmentation by default (they rely on Postgres polling only).
 
+### Runtime diagnostics
+
+`GET /tunnel/diagnostics/{tenant_id}` (and the equivalent `get_tunnel_diagnostics`
+MCP tool) include a `redis` section reporting: whether Redis is configured
+(`MERIDIAN_REDIS_URL` presence only — never the value itself), an
+`availability` state (`unconfigured` / `construction_failed` / `idle` /
+`connected_unverified` / `reachable` / `unreachable` / `degraded`), a
+`connection_generation` counter, pub/sub publish attempt/success/failure and
+fallback counts with bounded latency samples, per-tenant budget-tier status,
+and a `cache` block distinguishing an (as of this writing, not yet
+implemented) Redis-backed read-through cache from the genuinely active
+process-local board-read cache in `meridian/db/sprint_items.py` — reported
+Neon-avoidance numbers only ever come from a cache that is actually live.
+This snapshot never performs a live Redis round-trip; it reads in-process
+counters only.
+
 ---
 
 ## Example `.env`

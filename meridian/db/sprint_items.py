@@ -469,6 +469,43 @@ def _title_word_overlap(a: set[str], b: set[str]) -> float:
 _SPRINT_ITEMS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _SPRINT_ITEMS_CACHE_TTL = 2.0  # seconds — see a1d75ff3 note above for why 2s, not 10s
 
+# 2cf57fde — hit/miss counters for this cache, the one genuinely active,
+# already-measurable Neon-avoidance mechanism today (see
+# meridian/redis_bridge.py's get_redis_runtime_diagnostics, which reports
+# these under cache.local_process_cache). Per-process, like the cache
+# itself; reset alongside it via reset_sprint_items_cache_diagnostics.
+_SPRINT_ITEMS_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+def reset_sprint_items_cache_diagnostics() -> None:
+    """Test helper — zero the hit/miss counters without touching the cache
+    entries themselves (mirrors redis_bridge.reset_redis_client_cache's
+    "clean diagnostics slate" role for this module's own cache)."""
+    _SPRINT_ITEMS_CACHE_STATS["hits"] = 0
+    _SPRINT_ITEMS_CACHE_STATS["misses"] = 0
+
+
+def get_sprint_items_cache_diagnostics() -> dict[str, Any]:
+    """Safe, non-secret snapshot of this process-local board-read cache:
+    hits, misses, hit rate, live entry count, and TTL. ``reads_avoided`` is
+    exactly ``hits`` — every hit is one get_sprint_items() DB/Neon query that
+    did not happen. Used by meridian/redis_bridge.py's
+    get_redis_runtime_diagnostics to report genuine, measured Neon-avoidance
+    (as opposed to the not-yet-implemented Redis-backed cache, which reports
+    honestly as inactive rather than reusing these numbers)."""
+    hits = _SPRINT_ITEMS_CACHE_STATS["hits"]
+    misses = _SPRINT_ITEMS_CACHE_STATS["misses"]
+    total = hits + misses
+    return {
+        "available": True,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": (hits / total) if total else None,
+        "entries": len(_SPRINT_ITEMS_CACHE),
+        "ttl_seconds": _SPRINT_ITEMS_CACHE_TTL,
+        "reads_avoided": hits,
+    }
+
 
 def _invalidate_sprint_items_cache(project_id: str) -> None:
     """Drop the cached sprint-item list for a project after a mutation.
@@ -506,7 +543,9 @@ async def get_sprint_items_cached(
     now = time.monotonic()
     hit = _SPRINT_ITEMS_CACHE.get(project_id)
     if hit is not None and (now - hit[0]) < _SPRINT_ITEMS_CACHE_TTL:
+        _SPRINT_ITEMS_CACHE_STATS["hits"] += 1
         return hit[1]
+    _SPRINT_ITEMS_CACHE_STATS["misses"] += 1
     items = await get_sprint_items(db, project_id)
     _SPRINT_ITEMS_CACHE[project_id] = (now, items)
     return items

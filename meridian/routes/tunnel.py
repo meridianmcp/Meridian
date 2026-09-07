@@ -40,6 +40,7 @@ from fastapi.responses import Response
 from .. import db as db_module
 from .. import process_registry as process_registry_module
 from .. import profile_contract as profile_contract_module
+from .. import redis_bridge as _redis_bridge  # 2cf57fde — runtime diagnostics
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
@@ -2447,7 +2448,15 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
     :func:`_local_process_lease_summary`). Included even in the
     unauthenticated/no-tenant branch because that is exactly the shape
     self-hosted callers get — the case where this field is actually most
-    useful."""
+    useful.
+
+    2cf57fde — both branches also include ``redis``: Redis runtime health,
+    pub/sub-vs-cache effectiveness, and Neon-avoidance diagnostics (see
+    :func:`meridian.redis_bridge.get_redis_runtime_diagnostics`). Present
+    even unauthenticated/self-hosted, since MERIDIAN_REDIS_URL usually is
+    NOT set there and that "configured: false" truth is itself the useful
+    signal for that caller. Purely synchronous/in-process — never performs a
+    live Redis round-trip, so it cannot add latency or block this call."""
     run_id = uuid.uuid4().hex
     generated_at = time.time()
     if tenant is None:
@@ -2466,6 +2475,7 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
                 "tools_list_stale": False,
             },
             "process_leases": _local_process_lease_summary(),
+            "redis": _redis_bridge.get_redis_runtime_diagnostics(None),
         }
 
     tid = tenant.get("id")
@@ -2537,6 +2547,7 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
             "tools_list_stale": tid in _tools_list_changed_pending,
         },
         "process_leases": _local_process_lease_summary(),
+        "redis": _redis_bridge.get_redis_runtime_diagnostics(tenant),
     }
 
 
