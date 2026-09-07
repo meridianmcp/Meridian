@@ -700,6 +700,48 @@ def test_classify_soffice_failure_empty_stderr_is_transport():
     assert retryable is True
 
 
+def test_soffice_render_passes_an_isolated_user_installation(tmp_path, monkeypatch):
+    """d4a1f2c8 -- soffice defaults to ONE shared profile directory (and its
+    lock file) across every invocation on the machine unless told otherwise;
+    two soffice processes contending for that lock reliably manifests as a
+    silent hang, which this function's timeout then reports as a real
+    render failure even though nothing is actually wrong with the document.
+    Confirmed live (2026-09-07): a document that had just failed inside a
+    long confirmatory benchmark run rendered successfully in isolation
+    seconds later. Each call must get its OWN private profile directory via
+    -env:UserInstallation= so it can never contend with any other soffice
+    invocation -- from this process or a completely unrelated one -- for
+    the shared lock."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    captured_cmds = []
+
+    def _fake_run(cmd, **kwargs):
+        captured_cmds.append(cmd)
+        out_dir = cmd[cmd.index("--outdir") + 1]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    render_gate._soffice_render(docx_path)
+    render_gate._soffice_render(docx_path)
+
+    assert len(captured_cmds) == 2
+    profile_args = []
+    for cmd in captured_cmds:
+        matches = [arg for arg in cmd if arg.startswith("-env:UserInstallation=")]
+        assert len(matches) == 1, f"expected exactly one -env:UserInstallation= arg, got {matches}"
+        assert matches[0].startswith("-env:UserInstallation=file:")
+        profile_args.append(matches[0])
+
+    # Two separate calls must never share a profile directory -- that would
+    # recreate the exact lock contention this fix exists to eliminate.
+    assert profile_args[0] != profile_args[1]
+
+
 def test_soffice_render_timeout_is_classified_and_carries_stderr(tmp_path, monkeypatch):
     docx_path = _write_dummy_docx(tmp_path)
     monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
@@ -766,7 +808,7 @@ def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp
         calls.append(1)
         if len(calls) == 1:
             raise OSError("transient spawn failure")
-        out_dir = cmd[5]
+        out_dir = cmd[cmd.index("--outdir") + 1]
         with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
             fh.write(b"%PDF-1.4 fake")
         return _FakeCompletedProcess(0)

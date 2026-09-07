@@ -107,6 +107,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from . import docs_intel
@@ -312,10 +313,30 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
             error_class=TRANSPORT_ERROR,
             retryable=True,
         )
-    with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir:
+    with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir, \
+         tempfile.TemporaryDirectory(prefix=f"{RENDER_TEMPDIR_PREFIX}profile-") as profile_dir:
+        # d4a1f2c8 -- soffice defaults to ONE shared user-profile directory
+        # (and its lock file) for every invocation on the machine, unless
+        # told otherwise. Two soffice processes contending for that same
+        # profile lock -- whether both from this process's own back-to-back
+        # calls, or from a completely unrelated concurrent process on a
+        # shared host -- reliably manifests as exactly the silent hang this
+        # function's timeout classifies as TIMEOUT_ERROR (confirmed live,
+        # 2026-09-07: an isolated single call against a document that had
+        # just failed inside a long confirmatory benchmark run succeeded in
+        # under 5 seconds, while the SAME conversion inside a sustained
+        # multi-hour run of many back-to-back calls blocked almost every
+        # time). `-env:UserInstallation=` gives THIS call its own private
+        # profile directory, so it can never contend with any other soffice
+        # invocation for the shared lock, regardless of what else is running
+        # on the host.
+        user_installation_arg = f"-env:UserInstallation={Path(profile_dir).as_uri()}"
         try:
             result = subprocess.run(
-                [executable, "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
+                [
+                    executable, "--headless", user_installation_arg,
+                    "--convert-to", "pdf", "--outdir", out_dir, docx_path,
+                ],
                 capture_output=True,
                 timeout=_SOFFICE_TIMEOUT_SECONDS,
                 check=False,
