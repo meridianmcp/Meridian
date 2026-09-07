@@ -9486,6 +9486,362 @@ def edit_equation_local(
         "docx_path": docx_path,
     }
 
+
+def _build_numbered_equation_table(
+    omml_raw: str, number: str, eq_para_id: str, num_para_id: str,
+) -> ET.Element:
+    """DOCS-R2-D — build a borderless, 2-column, 1-row <w:tbl> matching the
+    EXACT structure :func:`parse_docx_equations_local` recognizes as
+    ``pattern="table-numbered"``: cell 1 holds the equation (OMML), cell 2
+    holds the parenthesized number (matching ``_EQ_NUMBER_RE``).
+
+    Column widths are a fixed 8500/1000 dxa split (roughly matching a
+    6.5in text-width page with a narrow right-hand number column) — no
+    caller override is exposed since the item's own contract keeps this a
+    single, predictable layout; widths are recorded on the conversion
+    manifest so a caller can inspect what landed.
+    """
+    tbl = ET.Element(_q(_W, "tbl"))
+    tblPr = ET.SubElement(tbl, _q(_W, "tblPr"))
+    ET.SubElement(tblPr, _q(_W, "tblStyle"), {_q(_W, "val"): "TableNormal"})
+    ET.SubElement(tblPr, _q(_W, "tblW"), {_q(_W, "w"): "0", _q(_W, "type"): "auto"})
+    borders = ET.SubElement(tblPr, _q(_W, "tblBorders"))
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        ET.SubElement(
+            borders, _q(_W, edge),
+            {_q(_W, "val"): "none", _q(_W, "sz"): "0", _q(_W, "space"): "0"},
+        )
+    ET.SubElement(tblPr, _q(_W, "tblLook"), {
+        _q(_W, "val"): "0000", _q(_W, "firstRow"): "0", _q(_W, "lastRow"): "0",
+        _q(_W, "firstColumn"): "0", _q(_W, "lastColumn"): "0",
+        _q(_W, "noHBand"): "0", _q(_W, "noVBand"): "0",
+    })
+
+    grid = ET.SubElement(tbl, _q(_W, "tblGrid"))
+    ET.SubElement(grid, _q(_W, "gridCol"), {_q(_W, "w"): "8500"})
+    ET.SubElement(grid, _q(_W, "gridCol"), {_q(_W, "w"): "1000"})
+
+    tr = ET.SubElement(tbl, _q(_W, "tr"))
+
+    tc1 = ET.SubElement(tr, _q(_W, "tc"))
+    tc1Pr = ET.SubElement(tc1, _q(_W, "tcPr"))
+    ET.SubElement(tc1Pr, _q(_W, "tcW"), {_q(_W, "w"): "8500", _q(_W, "type"): "dxa"})
+    p1 = ET.SubElement(tc1, _q(_W, "p"))
+    p1.set(_q(_W14, "paraId"), eq_para_id)
+    pPr1 = ET.SubElement(p1, _q(_W, "pPr"))
+    ET.SubElement(pPr1, _q(_W, "jc"), {_q(_W, "val"): "center"})
+    p1.append(ET.fromstring(omml_raw))
+
+    tc2 = ET.SubElement(tr, _q(_W, "tc"))
+    tc2Pr = ET.SubElement(tc2, _q(_W, "tcPr"))
+    ET.SubElement(tc2Pr, _q(_W, "tcW"), {_q(_W, "w"): "1000", _q(_W, "type"): "dxa"})
+    p2 = ET.SubElement(tc2, _q(_W, "p"))
+    p2.set(_q(_W14, "paraId"), num_para_id)
+    pPr2 = ET.SubElement(p2, _q(_W, "pPr"))
+    ET.SubElement(pPr2, _q(_W, "jc"), {_q(_W, "val"): "right"})
+    r2 = ET.SubElement(p2, _q(_W, "r"))
+    t2 = ET.SubElement(r2, _q(_W, "t"))
+    t2.text = number
+    t2.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+    return tbl
+
+
+def _verify_numbered_equation_conversion(
+    docx_path: str, expected_number: str, expected_flat_text: str,
+) -> dict[str, Any] | None:
+    """Post-write structural verification for
+    :func:`convert_equation_to_numbered_row` — re-reads ``docx_path`` FRESH
+    FROM DISK (never the in-memory tree just serialized) and confirms:
+
+    1. exactly one ``pattern="table-numbered"`` equation now carries
+       ``expected_number``, and
+    2. its OMML content (via the same flatten-to-text dedup key
+       :func:`parse_docx_equations_local` already computes) is BYTE-
+       IDENTICAL to what was converted — the conversion must never silently
+       alter the equation's actual mathematical content.
+
+    Returns ``None`` on success, or ``{"error": ...}`` describing exactly
+    what failed to verify.
+    """
+    try:
+        equations = parse_docx_equations_local(docx_path)
+    except (OSError, ET.ParseError, zipfile.BadZipFile) as exc:
+        return {"error": f"post-write verification could not re-parse {docx_path}: {exc}"}
+
+    matches = [
+        eq for eq in equations
+        if eq["pattern"] == "table-numbered" and eq["number"] == expected_number
+    ]
+    if not matches:
+        return {
+            "error": (
+                f"post-write verification found no table-numbered equation with "
+                f"number={expected_number!r} in {docx_path} after conversion"
+            )
+        }
+    if len(matches) > 1:
+        return {
+            "error": (
+                f"post-write verification found {len(matches)} table-numbered "
+                f"equations with number={expected_number!r} in {docx_path} — "
+                "expected exactly one; refusing to guess which one is ours"
+            )
+        }
+    if matches[0]["flat_text"] != expected_flat_text:
+        return {
+            "error": (
+                "post-write verification found the converted equation's content "
+                "does not match the original — the conversion must never alter "
+                "equation content"
+            )
+        }
+    return None
+
+
+def convert_equation_to_numbered_row(
+    docx_path: str,
+    equation_para_id: str,
+    number: str,
+    index_db_path: str | None = None,
+    dry_run: bool = False,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """DOCS-R2-D — convert a standalone display equation into a numbered,
+    borderless two-column table row: cell 1 holds the OMML equation, cell 2
+    holds the parenthesized number — the EXACT ``pattern="table-numbered"``
+    structure :func:`parse_docx_equations_local` and :func:`audit_equation_style`
+    already recognize and validate elsewhere in this module.
+
+    This is a SAFE, DISPOSABLE-COPY operation: it never edits the paragraph
+    in place text-by-text and never guesses at surrounding prose. It only
+    accepts a paragraph whose sole meaningful content is the display
+    equation itself (no mixed prose text) — a paragraph with any other text
+    is refused with a clear error rather than silently split or rewrapped.
+    Call this against a disposable working copy of a document, never
+    directly against a canonical/production file the caller cares about
+    preserving untouched on any failure path other than the documented
+    backup-restore below.
+
+    ``dry_run=True`` returns the planned conversion manifest (new paraIds,
+    equation content hash, target body position) WITHOUT writing anything —
+    inspect this before committing to the real write.
+
+    ddd79188-style contract (mirrors :func:`insert_equation_local` /
+    :func:`insert_figure_block` exactly): after the write is staged and
+    promoted, TWO independent checks gate success —
+
+      1. Structural re-parse (:func:`_verify_numbered_equation_conversion`):
+         the new table-numbered equation exists with the expected number and
+         byte-identical OMML content.
+      2. Real render-capability verification
+         (:func:`_enforce_render_verification`): ``"rendered"`` succeeds with
+         evidence attached; ``"failed"`` or ``"unavailable-with-reason"``
+         fails closed (restore from backup + error) unless the caller passes
+         ``allow_degraded_render=True`` with a non-empty
+         ``degraded_render_reason`` — the only audited opt-in.
+
+    Both checks run under the SAME promotion lock as the write itself, and
+    any failure attempts a compare-and-swap-safe restore from the pre-write
+    ``.bak`` backup (never blind — a concurrent writer's already-promoted
+    work is never clobbered).
+
+    Args:
+        docx_path:         Absolute path to the .docx file (mutated in
+                            place — pass a disposable copy, see above).
+        equation_para_id:  w14:paraId / synth id / p{N} of the paragraph
+                            holding the standalone equation to convert.
+        number:            The equation number text, e.g. ``"(1)"`` or
+                            ``"(2a)"`` — must match the same format
+                            :func:`parse_docx_equations_local` already
+                            requires for a table-numbered equation.
+        index_db_path:      If supplied, sidecar is invalidated after write.
+        dry_run:            Return the planned manifest without writing.
+        allow_degraded_render: Explicit, audited opt-in to accept this write
+                            when no render backend is available in this
+                            environment. Requires degraded_render_reason.
+        degraded_render_reason: Required, non-empty when
+                            allow_degraded_render is True; carried onto the
+                            result as an audit trail.
+
+    Returns:
+        ``{status: "dry_run", ...manifest}`` for a dry run;
+        ``{status: "converted", equation_para_id, number, omml_sha256,
+        new_equation_cell_para_id, new_number_cell_para_id, docx_path,
+        render_status, render_verified, render_backend, render_detail}``
+        on success; ``{"error": <message>}`` on failure (file restored from
+        backup on a structural- or render-verification failure; left
+        completely untouched on any earlier validation failure).
+    """
+    if not number or not str(number).strip():
+        return {"error": "number must be a non-empty string"}
+    number = number.strip()
+    if not _EQ_NUMBER_RE.match(number):
+        return {
+            "error": (
+                f"number {number!r} does not match the expected equation-number "
+                "format, e.g. '(1)' or '(2a)'"
+            )
+        }
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, equation_para_id)
+    if result is None:
+        return {"error": f"para_id {equation_para_id!r} not found in {docx_path}"}
+    body, para_elem, child_idx = result
+
+    m_omath_tag = _qm("oMath")
+    omath_els = para_elem.findall(f".//{m_omath_tag}")
+    if not omath_els:
+        return {"error": f"paragraph {equation_para_id!r} contains no <m:oMath> equation"}
+    if len(omath_els) > 1:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} contains {len(omath_els)} equations "
+                "-- convert_equation_to_numbered_row only supports a single-equation "
+                "paragraph; disambiguate manually"
+            )
+        }
+
+    # Fail closed on mixed prose (never guess how to split/rewrap it): any
+    # <w:t> found under the paragraph is Word running text OUTSIDE the OMML
+    # subtree (equations carry their own text as <m:t>, a different tag in a
+    # different namespace, so this can never false-positive on the
+    # equation's own content).
+    prose_runs = para_elem.findall(f".//{_q(_W, 't')}")
+    if any((t.text or "").strip() for t in prose_runs):
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} contains surrounding prose text "
+                "in addition to the equation -- convert_equation_to_numbered_row "
+                "only supports a standalone display-equation paragraph (no mixed "
+                "text); split the prose out into its own paragraph first"
+            )
+        }
+
+    omath_el = omath_els[0]
+    omml_raw = ET.tostring(omath_el, encoding="unicode")
+    expected_flat_text = _omml_flatten_text_local(omml_raw)
+    omml_sha256 = hashlib.sha256(omml_raw.encode("utf-8")).hexdigest()
+
+    taken_ids = {
+        el.get(_q(_W14, "paraId"))
+        for el in root.iter(_q(_W, "p"))
+        if el.get(_q(_W14, "paraId"))
+    }
+    eq_cell_para_id = _new_para_id(taken_ids)
+    num_cell_para_id = _new_para_id(taken_ids)
+
+    manifest = {
+        "docx_path": docx_path,
+        "equation_para_id": equation_para_id,
+        "number": number,
+        "omml_sha256": omml_sha256,
+        "new_equation_cell_para_id": eq_cell_para_id,
+        "new_number_cell_para_id": num_cell_para_id,
+        "body_child_index": child_idx,
+        "column_widths_dxa": [8500, 1000],
+    }
+    if dry_run:
+        return {"status": "dry_run", **manifest}
+
+    table_el = _build_numbered_equation_table(
+        omml_raw, number, eq_cell_para_id, num_cell_para_id,
+    )
+
+    # Replace the standalone-equation paragraph with the new table at the
+    # SAME body position -- position 100% preserved, surrounding prose
+    # elsewhere in the document is never touched.
+    body.remove(para_elem)
+    body.insert(child_idx, table_el)
+
+    # Mirrors insert_equation_local exactly: hold docx_path's promotion lock
+    # across stage+promote THROUGH structural verify, any conditional
+    # restore, and the render-capability gate -- closing the same-process
+    # promotion/verify window entirely.
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_numbered_equation_conversion(
+            docx_path, expected_number=number, expected_flat_text=expected_flat_text,
+        )
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["equation_para_id"] = equation_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["equation_para_id"] = equation_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "converted",
+        "equation_para_id": equation_para_id,
+        "number": number,
+        "omml_sha256": omml_sha256,
+        "new_equation_cell_para_id": eq_cell_para_id,
+        "new_number_cell_para_id": num_cell_para_id,
+        "docx_path": docx_path,
+        **render_info,
+    }
+
+
 def append_text_run_after_math(
     docx_path: str,
     equation_para_id: str,
