@@ -1150,6 +1150,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_external_job_register(db)
     await _migrate_paper_contract(db)
     await _migrate_paper_strategy_graph(db)
+    await _migrate_lint_finding(db)
     return db
 
 
@@ -13025,4 +13026,22 @@ from .paper_strategy_graph import (  # noqa: F401
     supersede_strategy_node,
     create_strategy_edge,
     get_strategy_edges_for_node,
+)
+
+# d2539453 — lint_finding: structured, version-pinned paper/manuscript audit
+# output. Imported LAST (after experiment_model) — depends on nothing above
+# at import time. See meridian.db.lint_finding's module docstring for the
+# full schema and the two-axis (document content + linter rule-set) version-
+# pinning contract this schema exists to serve.
+from .lint_finding import (  # noqa: F401
+    _migrate_lint_finding,
+    LINT_FINDING_SEVERITIES,
+    LINT_FINDING_STATUSES,
+    validate_lint_finding_severity,
+    validate_lint_finding_status,
+    create_lint_finding,
+    get_lint_finding,
+    list_lint_findings,
+    set_lint_finding_status,
+    check_finding_freshness,
 )

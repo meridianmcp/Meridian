@@ -3402,6 +3402,48 @@ async def _migrate_pg_experiment_model(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_lint_finding(conn: PostgresConnection) -> None:
+    """d2539453 — lint_findings: structured, version-pinned paper/manuscript
+    audit output. Mirrors db.lint_finding._migrate_lint_finding exactly —
+    see that module's docstring for the full schema and the two-axis
+    (document content via source_fingerprint, rule-set via linter_version)
+    version-pinning contract. Not present in the base CREATE_TABLES_CORE
+    literal — this guarded migration is the only creation path on Postgres,
+    matching _migrate_pg_experiment_model immediately above.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS lint_findings ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    document_id TEXT,"
+        "    audit_run_id TEXT,"
+        "    linter_name TEXT NOT NULL,"
+        "    linter_version TEXT NOT NULL,"
+        "    source_fingerprint TEXT NOT NULL,"
+        "    category TEXT NOT NULL,"
+        "    finding_type TEXT NOT NULL,"
+        "    severity TEXT NOT NULL DEFAULT 'warning'"
+        "        CHECK (severity IN ('error', 'warning', 'info')),"
+        "    message TEXT NOT NULL,"
+        "    location TEXT,"
+        "    detail TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'open'"
+        "        CHECK (status IN ('open', 'acknowledged', 'resolved', 'dismissed')),"
+        "    resolved_by TEXT,"
+        "    resolution_note TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    resolved_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_lint_findings_project "
+        "ON lint_findings(project_id, status);"
+        "CREATE INDEX IF NOT EXISTS idx_lint_findings_document "
+        "ON lint_findings(document_id);"
+        "CREATE INDEX IF NOT EXISTS idx_lint_findings_audit_run "
+        "ON lint_findings(audit_run_id);"
+    )
+
+
 async def _migrate_pg_ai_log_events(conn: PostgresConnection) -> None:
     """9e83be4a (Round 1 proposal e143949d) — ai_log_events: canonical,
     versioned, append-only ExecutionEvent storage (mirrors
@@ -5144,4 +5186,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_external_job_register,
     _migrate_pg_paper_contract,
     _migrate_pg_paper_strategy_graph,
+    _migrate_pg_lint_finding,
 )

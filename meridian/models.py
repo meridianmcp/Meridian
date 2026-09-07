@@ -1178,3 +1178,97 @@ class PaperContractRevisionApproval(BaseModel):
 
     revision_id: str = Field(..., min_length=1)
     approved_by_human_id: str = Field(..., min_length=1)
+
+
+# d2539453 — lint_finding: structured, version-pinned paper/manuscript audit
+# output. See meridian.db.lint_finding for the persistence layer (migration +
+# CRUD) and its module docstring for the full two-axis version-pinning
+# contract: ``source_fingerprint`` pins the audited document's exact content
+# (matches extensions/meridian-docs' docs_intel._source_fingerprint /
+# doc_store.compute_content_hash convention); ``linter_version`` separately
+# pins the rule logic that produced the finding. Mirrors the finding shape
+# already emitted ad hoc by docs_intel.audit_document / audit_equation_style
+# (type/category/severity/detail) — this is the durable, persisted form of
+# those currently-ephemeral results.
+# ---------------------------------------------------------------------------
+
+
+class LintFindingCreate(BaseModel):
+    """Body for recording one structured paper-audit finding."""
+
+    project_id: str = Field(..., min_length=1)
+    linter_name: str = Field(
+        ..., min_length=1, description="Which audit routine produced this, e.g. 'meridian_docs.audit_document'."
+    )
+    linter_version: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Version pin for the RULE LOGIC that produced this finding (semver or a "
+            "rule-set content hash) — independent of source_fingerprint, which pins "
+            "the document content instead."
+        ),
+    )
+    source_fingerprint: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Version pin for the audited document's exact content at generation time "
+            "(sha256 hex, matching docs_intel._source_fingerprint / doc_store's "
+            "content_hash convention)."
+        ),
+    )
+    category: str = Field(..., min_length=1, description="Coarse grouping, e.g. 'equation' | 'caption' | 'citation'.")
+    finding_type: str = Field(..., min_length=1, description="Fine-grained rule/type slug, e.g. 'orphan_image'.")
+    message: str = Field(..., min_length=1, description="Human-readable summary of the finding.")
+    severity: Literal["error", "warning", "info"] = "warning"
+    document_id: str | None = Field(
+        default=None,
+        description="Optional cross-store reference to a doc_store document id. No DB-level FK.",
+    )
+    audit_run_id: str | None = Field(
+        default=None,
+        description="Optional grouping id shared by every finding from one audit invocation.",
+    )
+    location: dict[str, Any] | None = Field(
+        default=None, description="Opaque structural anchor (para_id/node_id/table_id/section_path/etc.)."
+    )
+    detail: dict[str, Any] | None = Field(
+        default=None, description="Opaque raw finding payload from the linter, for full fidelity."
+    )
+
+
+class LintFinding(BaseModel):
+    """A persisted ``lint_findings`` row."""
+
+    id: str
+    project_id: str
+    document_id: str | None = None
+    audit_run_id: str | None = None
+    linter_name: str
+    linter_version: str
+    source_fingerprint: str
+    category: str
+    finding_type: str
+    severity: Literal["error", "warning", "info"] = "warning"
+    message: str
+    location: dict[str, Any] | None = None
+    detail: dict[str, Any] | None = None
+    status: Literal["open", "acknowledged", "resolved", "dismissed"] = "open"
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+    created_at: str
+    updated_at: str | None = None
+    resolved_at: str | None = None
+
+
+class LintFindingStatusUpdate(BaseModel):
+    """Body for transitioning a lint_finding's human-triage status. See
+    ``meridian.db.lint_finding.set_lint_finding_status`` — status moves
+    freely between any of the four values (no illegal-transition concept,
+    unlike ``AttemptTransitionRequest``'s attempt-status state machine)."""
+
+    project_id: str = Field(..., min_length=1)
+    status: Literal["open", "acknowledged", "resolved", "dismissed"]
+    resolved_by: str | None = None
+    resolution_note: str | None = None
