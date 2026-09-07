@@ -534,10 +534,13 @@ async def verify_handoff_token(
     guidance would wrongly conclude the handoff was spoofed.  The token proves
     block provenance; it does not prove body integrity.
 
-    Future improvement: bind a SHA-256 digest of the quick_start_goal body into
-    the token store at mint time and verify it here — that would upgrade the
-    guarantee from token-provenance to full body-integrity.  Not yet implemented
-    (see 2ee0000c investigation).
+    Update (efaa918a, closing the gap the paragraph above describes): a
+    SHA-256 digest of the quick_start_goal body IS now bound into the token
+    store at mint time (``mint_handoff_token``'s ``body`` param) and verified
+    here via the ``body_hash``/``body_mismatch`` check below when a caller
+    supplies ``body`` — see 2ee0000c's investigation notes for why this was
+    scoped as an opt-in ``body`` parameter rather than a mandatory one (not
+    every caller has the full body text on hand at verification time).
 
     Returns ``{valid: bool, reason: str}`` on success, or ``{valid: False,
     reason: str, recovery: dict}`` on failure (f46372e8):

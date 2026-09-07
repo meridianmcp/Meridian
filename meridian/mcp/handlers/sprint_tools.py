@@ -2229,9 +2229,27 @@ async def handle_get_sprint_item_pointers(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: get_sprint_item_pointers."""
+    """MCP tool: get_sprint_item_pointers.
+
+    efea329f — cross-project isolation: ``db.get_sprint_item_pointers``
+    itself filters only by ``sprint_item_id`` (no ``project_id`` parameter
+    exists on it at all), so this handler previously returned ANY sprint
+    item's pointers — file paths, symbols, node/citation ids — to a caller
+    that merely knew (or guessed, e.g. from a note or commit message) a
+    foreign project's sprint_item_id, with no project_id check whatsoever.
+    Fixed by requiring project_id and verifying the item's real project_id
+    matches before proceeding, mirroring ``batch_read._op_get_sprint_item_pointers``
+    (which already enforced exactly this for the same underlying DB read)
+    and ``db.proposal_links.link_proposal_evidence``'s verify-then-act
+    pattern used elsewhere in this codebase.
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
     if not args.get("sprint_item_id"):
         return {"error": "sprint_item_id is required"}
+    item = await db_module.get_sprint_item(db, args["sprint_item_id"])
+    if item is None or item.get("project_id") != args["project_id"]:
+        return {"error": f"sprint item not found in project: {args['sprint_item_id']}"}
     pointers = await db_module.get_sprint_item_pointers(
         db, args["sprint_item_id"]
     )
@@ -2264,6 +2282,18 @@ async def handle_resolve_sprint_item_pointers(
     exact same tenant's ``prospect_symbol`` / direct ``codebase__search_graph``
     calls resolved instantly — see build_symbol_resolver's docstring for the
     full root-cause writeup.
+
+    efea329f — cross-project isolation: ``project_id`` was already a
+    required argument here, but it was ONLY ever used to scope the
+    code-graph symbol search — this handler never checked that
+    ``sprint_item_id`` actually belongs to ``project_id`` before resolving
+    and returning its pointer targets (file paths, symbols, node/citation
+    ids). A caller scoped to one project who knew (or was handed, e.g. via a
+    note or commit message) another project's sprint_item_id could resolve
+    and read that foreign item's pointers. Fixed by verifying the item's
+    real project_id before proceeding, mirroring
+    ``batch_read._op_get_sprint_item_pointers`` and
+    ``db.proposal_links.link_proposal_evidence``'s verify-then-act pattern.
     """
     from ..handler import _resolve_ingest_doc_store  # noqa: PLC0415
     from ...pointers import resolve_pointer  # noqa: PLC0415
@@ -2273,6 +2303,10 @@ async def handle_resolve_sprint_item_pointers(
         return {"error": "project_id is required (or pass project_name)"}
     if not args.get("sprint_item_id"):
         return {"error": "sprint_item_id is required"}
+
+    _sprint_item = await db_module.get_sprint_item(db, args["sprint_item_id"])
+    if _sprint_item is None or _sprint_item.get("project_id") != args["project_id"]:
+        return {"error": f"sprint item not found in project: {args['sprint_item_id']}"}
 
     # Resolve the doc-structure store once for node_id lookups (best-effort;
     # None → node_id targets degrade to {resolved:false}).

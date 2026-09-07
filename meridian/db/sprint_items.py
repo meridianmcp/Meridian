@@ -258,7 +258,29 @@ async def get_open_task_for_sprint_item(
 async def get_blocking_dependency_for_sprint_item(
     db: aiosqlite.Connection, sprint_item_id: str
 ) -> dict[str, Any] | None:
-    """Return the unmet parent sprint item that blocks a claim, if any."""
+    """Return the unmet parent sprint item that blocks a claim, if any.
+
+    efea329f — cross-project isolation fix: a ``depends_on`` id that
+    resolves to a REAL item belonging to a DIFFERENT project than
+    ``sprint_item_id``'s own project is treated exactly like a nonexistent
+    dependency target (the same ``"(missing sprint item)"``/``status:
+    "missing"`` shape already used below for a truly-missing id) rather
+    than returning the foreign item's full row — title included — to the
+    caller. This mirrors ``get_dependency_frontier``'s documented
+    multi-project isolation contract a few hundred lines below in this same
+    module ("a foreign-project id is indistinguishable from — and correctly
+    treated the same as — a nonexistent one").
+
+    Before this fix, this function had NO project check at all: both of its
+    call sites — ``routes.tasks._claim_task_result`` (wired to the plain
+    authenticated ``POST /projects/{project_id}/tasks/claim`` route) and
+    ``executor_contract._resolve_dependency_state`` (embedded in every
+    ``generate_handoff`` call's ``capability_contract.item_executor_contracts``)
+    — surfaced the returned dict's ``title``/``id`` straight through, so a
+    cross-project ``depends_on`` value let one project's sprint-item title
+    leak into another project's task-claim response / rendered handoff. See
+    ``tests/test_efea329f_cross_project_isolation.py``.
+    """
     item = await get_sprint_item(db, sprint_item_id)
     if item is None:
         return None
@@ -267,6 +289,10 @@ async def get_blocking_dependency_for_sprint_item(
         return None
     parent = await get_sprint_item(db, parent_id)
     if parent is None:
+        return {"id": parent_id, "title": "(missing sprint item)", "status": "missing"}
+    _own_project_id = item.get("project_id")
+    if _own_project_id and parent.get("project_id") != _own_project_id:
+        # Foreign-project dependency target — isolate, treat as missing.
         return {"id": parent_id, "title": "(missing sprint item)", "status": "missing"}
     if parent.get("status") != "done":
         return parent
@@ -2723,12 +2749,16 @@ async def get_dependency_frontier(
     site that needs REAL fan-in barrier enforcement — currently
     ``claim_sprint_item``'s DEPENDENCY_NOT_SATISFIED gate below and
     ``get_parallelizable_groups``'s eligibility check.
-    ``get_blocking_dependency_for_sprint_item`` itself is left completely
-    unchanged: it has callers outside this item's declared scope (e.g.
-    ``executor_contract._resolve_dependency_state``) that still expect its
-    original single-parent contract, and a JSON-array ``depends_on`` value
-    simply fails closed there (never matches a real item id, so it reads as
-    an unresolved/missing dependency rather than a falsely-satisfied one).
+    ``get_blocking_dependency_for_sprint_item``'s single-parent CONTRACT is
+    left completely unchanged (it has callers outside this item's declared
+    scope, e.g. ``executor_contract._resolve_dependency_state``, that still
+    expect its original single-parent shape, and a JSON-array ``depends_on``
+    value simply fails closed there — never matches a real item id, so it
+    reads as an unresolved/missing dependency rather than a falsely-satisfied
+    one) — but efea329f DID give it the same cross-project isolation guard
+    this function documents immediately below: see that function's own
+    docstring. The two now share the identical "foreign-project id reads as
+    missing" contract; only the single- vs. multi-parent shape differs.
 
     Zero-predecessor items (the overwhelming majority) short-circuit with no
     DB access at all: ``{"predecessor_ids": [], "ready": True, "blocking":
