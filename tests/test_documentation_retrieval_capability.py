@@ -187,10 +187,16 @@ def test_version_constant_and_embedded_marker_agree():
     stale against its own governing constant."""
     embedded = agent_defaults.parse_standard_version(agent_defaults.DEFAULT_AGENT_INSTRUCTIONS)
     assert embedded == agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION
-    # 18, not 17 -- c95d0c12 landed its own v17 entry on dev while this
-    # worktree was stale; this item's entry was renumbered to v18 during the
-    # cherry-pick merge (see the changelog comment in agent_defaults.py).
-    assert agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION == 18
+    # 19, not 18 -- two more real changelog entries landed on dev after the
+    # 17->18 bump above: v18 (d5de2d23, sprint items 94f48e4d/92ac025c) fixed
+    # the stale Context7 `get-library-docs` tool name and added the
+    # documentation_retrieval capability contract; v19 (c8c5d1ac, b924fd7c)
+    # documented the save_watchlist_query/run_watchlist_query research
+    # watchlist mechanism and named github_search/social_search explicitly in
+    # the RESEARCH ROUTING PROTOCOL. Verified via `git log -- meridian/agent_defaults.py`
+    # and the changelog comment above AGENT_INSTRUCTIONS_STANDARD_VERSION in
+    # agent_defaults.py, which already documents both bumps in full.
+    assert agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION == 19
 
 
 def test_fresh_default_instructions_are_not_stale():

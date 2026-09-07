@@ -392,9 +392,12 @@ async def test_add_sprint_item_pointer_roundtrip(db):
     )
     assert "error" not in result
     # Pointer can be retrieved.
+    # efea329f — get_sprint_item_pointers now requires project_id (closes a
+    # cross-project pointer-disclosure leak); pass it here so this roundtrip
+    # still exercises the happy path under the corrected, secure contract.
     got = await mh._dispatch_mcp_tool(
         "get_sprint_item_pointers",
-        {"sprint_item_id": item["id"]},
+        {"project_id": proj["id"], "sprint_item_id": item["id"]},
         db, "/tmp",
     )
     assert got["sprint_item_id"] == item["id"]
@@ -402,15 +405,32 @@ async def test_add_sprint_item_pointer_roundtrip(db):
 
 
 # ---------------------------------------------------------------------------
-# 8. get_sprint_item_pointers — missing required arg
+# 8. get_sprint_item_pointers — missing required args
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_get_sprint_item_pointers_missing_sprint_item_id(db):
-    """get_sprint_item_pointers returns error when sprint_item_id is absent."""
+async def test_get_sprint_item_pointers_missing_project_id(db):
+    """efea329f — get_sprint_item_pointers returns error when project_id is
+    absent, and checks it BEFORE sprint_item_id (cross-project isolation fix:
+    the handler previously had no project scoping check at all)."""
     out = await mh._dispatch_mcp_tool(
         "get_sprint_item_pointers",
         {},
+        db, "/tmp",
+    )
+    assert "error" in out
+    assert "project_id is required" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_item_pointers_missing_sprint_item_id(db):
+    """get_sprint_item_pointers returns error when sprint_item_id is absent
+    but project_id is present, exercising the second validation branch
+    (efea329f made project_id the first-checked, mandatory argument)."""
+    proj = await db_module.create_project(db, "ptr-missing-item-id")
+    out = await mh._dispatch_mcp_tool(
+        "get_sprint_item_pointers",
+        {"project_id": proj["id"]},
         db, "/tmp",
     )
     assert "error" in out

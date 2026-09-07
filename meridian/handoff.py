@@ -8399,6 +8399,146 @@ _CONTINUATION_MANIFEST_SCHEMA_VERSION = 1
 # is to not bloat), so it carries bounded id lists, not full item payloads.
 _CONTINUATION_MANIFEST_ID_CAP = 20
 
+# bc834237 (regression re-fix, 2026-09) — bound on the free-text
+# ``continuation_rationale`` string _cap_blocker_summary keeps inside a
+# capped ``blocker_summary``. blocker_policy.evaluate_board_blockers builds
+# this string by joining an "id:kind" pair for EVERY blocked item (no cap of
+# its own — it is a general-purpose primitive other, non-delta callers may
+# reasonably want in full), so on a large blocked backlog it grows exactly
+# like the per-item id/dict fields below it. A plain length truncation (vs.
+# trying to regenerate a shorter version of blocker_policy's own sentence)
+# keeps this file from re-deriving blocker_policy's phrasing/ordering rules.
+_CONTINUATION_MANIFEST_RATIONALE_CAP_CHARS = 400
+
+# bc834237 (regression re-fix) — a SMALLER cap than _CONTINUATION_MANIFEST_ID_CAP
+# for the two heaviest per-item dicts inside blocker_summary:
+# ``evidence_status`` (a nested evidence dict per blocked item — by far the
+# largest single field measured on the reproduction backlog, ~138 chars/item)
+# and ``skipped_dependents`` (id -> dependent-id list, present-but-usually-
+# empty per key). Neither is named in the "still surfaces genuine blocker
+# information" list this fix is scoped to (counts, policy, run_stop, a
+# bounded sample of blocked ids/classifications) — unlike blocked_item_ids/
+# classifications, a resuming session's primary need (which ids, why) is
+# already served by the full _CONTINUATION_MANIFEST_ID_CAP-sized sample of
+# those two fields, so the bulkier diagnostic detail can afford a tighter
+# cap without losing the information this manifest exists to convey.
+# Measured on the 60-item/needs_scope reproduction: capping every field to
+# _CONTINUATION_MANIFEST_ID_CAP alone left only ~400 bytes of headroom under
+# the 30000-char budget (29600/30000) — too tight to trust as a general
+# bound given real boards can have richer per-item evidence payloads than
+# this test's synthetic items. This second, smaller cap buys back a safer
+# margin (~26900/30000) without touching the fields the fix is scoped to.
+_CONTINUATION_MANIFEST_BLOCKER_DETAIL_CAP = 5
+
+
+def _cap_blocker_summary(blocker_summary: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Bound the per-item detail inside a ``blocker_summary`` dict (see
+    :func:`meridian.blocker_policy.evaluate_board_blockers` for the shape)
+    so embedding it in :func:`build_continuation_manifest`'s output can never
+    reproduce the bc834237-style unbounded-payload regression.
+
+    07229675 added ``blocker_summary`` to the continuation manifest by
+    passing ``snapshot["blocker_summary"]`` through VERBATIM. Unlike every
+    other per-item field in this manifest (``pending_item_ids``,
+    ``hard_blocked_pending_ids``), nothing capped it — on a board where most
+    of the non-done items classify as blocked (e.g. the real, working
+    ``needs_scope`` quality-gate policy flagging items with no
+    touches_resources/pointers), ``blocked_item_ids``, ``classifications``,
+    ``evidence_status``, ``skipped_dependents`` and ``quarantined_item_ids``
+    each carry one entry per blocked item and ``continuation_rationale``
+    inlines an "id:kind" pair per item too — together they reproduced the
+    exact kind of unbounded, board-size-scaling growth bc834237 already fixed
+    once for ``pending_item_ids`` (confirmed: a 60-item backlog pushed a
+    delta handoff to 44744 chars against the < 30000 budget bc834237
+    established).
+
+    Mirrors this function's caller's own ``capped_pending_ids =
+    claimable_pending_ids[:_CONTINUATION_MANIFEST_ID_CAP]`` pattern: every
+    id-keyed/id-valued field is filtered down to the SAME capped subset of
+    ``blocked_item_ids`` (not independently truncated per field), so a
+    resuming session never sees ``classifications``/``evidence_status``
+    entries for an id that ``blocked_item_ids`` itself no longer lists —
+    the capped view stays internally consistent. Counts implied by the
+    pre-cap lists (how many were actually blocked/eligible/fail-closed) are
+    NOT separately surfaced here — matches this manifest's existing
+    ``pending_item_ids``/``pending_count`` split instead, i.e. a caller that
+    wants the true blocked count already has that from ``len(blocked_ids)``
+    upstream in ``evaluate_board_blockers``, not from this rendered copy.
+
+    ``None`` in, ``None`` out (the "best-effort upstream, may be None" case
+    :func:`build_continuation_manifest` already documents is untouched).
+    A dict that is already within the cap on every field is returned as an
+    equal, freshly-copied dict — no observable change for the common
+    (small/unblocked board) case, matching the "purely additive, no existing
+    field's shape changed" contract the surrounding 07229675 fields already
+    committed to.
+    """
+    if not isinstance(blocker_summary, dict):
+        return blocker_summary
+
+    capped = dict(blocker_summary)
+
+    blocked_ids = blocker_summary.get("blocked_item_ids")
+    if isinstance(blocked_ids, list) and len(blocked_ids) > _CONTINUATION_MANIFEST_ID_CAP:
+        capped_ids = blocked_ids[:_CONTINUATION_MANIFEST_ID_CAP]
+        capped_id_set = set(capped_ids)
+        capped["blocked_item_ids"] = capped_ids
+
+        classifications = blocker_summary.get("classifications")
+        if isinstance(classifications, dict):
+            capped["classifications"] = {
+                iid: v for iid, v in classifications.items() if iid in capped_id_set
+            }
+
+        detail_id_set = set(capped_ids[:_CONTINUATION_MANIFEST_BLOCKER_DETAIL_CAP])
+
+        evidence_status = blocker_summary.get("evidence_status")
+        if isinstance(evidence_status, dict):
+            capped["evidence_status"] = {
+                iid: v for iid, v in evidence_status.items() if iid in detail_id_set
+            }
+
+        skipped_dependents = blocker_summary.get("skipped_dependents")
+        if isinstance(skipped_dependents, dict):
+            capped["skipped_dependents"] = {
+                iid: v for iid, v in skipped_dependents.items() if iid in detail_id_set
+            }
+
+        # quarantined_item_ids is documented (evaluate_board_blockers) as
+        # "same as blocked_item_ids" — cap it to the identical subset rather
+        # than independently slicing, so the two fields can never disagree
+        # about which ids survived capping.
+        quarantined_ids = blocker_summary.get("quarantined_item_ids")
+        if isinstance(quarantined_ids, list):
+            capped["quarantined_item_ids"] = [
+                iid for iid in quarantined_ids if iid in capped_id_set
+            ]
+
+    # fail_closed_item_ids and eligible_item_ids are independent id sets
+    # (not derived from blocked_item_ids — a run_stop=True board reports
+    # eligible_item_ids == [], but a large policy != "run_stop" board with
+    # few blocks and many eligible items could otherwise let this field grow
+    # unbounded in the opposite direction). Capped independently for the
+    # same reason, with the same cap size.
+    fail_closed_ids = blocker_summary.get("fail_closed_item_ids")
+    if isinstance(fail_closed_ids, list) and len(fail_closed_ids) > _CONTINUATION_MANIFEST_ID_CAP:
+        capped["fail_closed_item_ids"] = fail_closed_ids[:_CONTINUATION_MANIFEST_ID_CAP]
+
+    eligible_ids = blocker_summary.get("eligible_item_ids")
+    if isinstance(eligible_ids, list) and len(eligible_ids) > _CONTINUATION_MANIFEST_ID_CAP:
+        capped["eligible_item_ids"] = eligible_ids[:_CONTINUATION_MANIFEST_ID_CAP]
+
+    rationale = blocker_summary.get("continuation_rationale")
+    if (
+        isinstance(rationale, str)
+        and len(rationale) > _CONTINUATION_MANIFEST_RATIONALE_CAP_CHARS
+    ):
+        capped["continuation_rationale"] = (
+            rationale[:_CONTINUATION_MANIFEST_RATIONALE_CAP_CHARS] + "...(truncated)"
+        )
+
+    return capped
+
 
 async def build_continuation_manifest(
     db: Any,
@@ -8489,12 +8629,14 @@ async def build_continuation_manifest(
         listed here instead, same "excluded but surfaced" pattern
         ``_build_manual_todo_note``/``_build_backburner_todo_note`` already
         use for their own exclusions.
-      - ``blocker_summary`` (07229675) — passed through verbatim from
+      - ``blocker_summary`` (07229675; bounded by :func:`_cap_blocker_summary`
+        as of the bc834237 regression re-fix below) — derived from
         ``snapshot["blocker_summary"]`` (already computed by
         ``build_board_snapshot`` via ``blocker_policy.classify_and_evaluate``,
         previously discarded here): the typed blocker-triage decision for the
         same non-done item set (``policy``, ``blocked_item_ids``,
-        ``classifications``, ``skipped_dependents``, ``eligible_item_ids``,
+        ``classifications``, ``evidence_status``, ``fail_closed_item_ids``,
+        ``skipped_dependents``, ``quarantined_item_ids``, ``eligible_item_ids``,
         ``run_stop``/``run_stop_reason``, ``continuation_rationale``). ``None``
         when the underlying triage itself failed (best-effort upstream — see
         ``build_board_snapshot``'s own docstring). Deliberately NOT folded
@@ -8502,6 +8644,35 @@ async def build_continuation_manifest(
         documented rationale (a notes-only quarantine-clearing edit should
         recompute this fresh, not wait for a hash the edit itself wouldn't
         move).
+
+        07229675 originally passed this dict through VERBATIM — unlike
+        every other per-item field in this manifest, nothing capped it, so
+        on a board where most non-done items classify as blocked (e.g. the
+        ``needs_scope`` quality-gate policy on a backlog with no
+        touches_resources/pointers) ``blocked_item_ids``, ``classifications``,
+        ``evidence_status``, ``skipped_dependents`` and
+        ``quarantined_item_ids`` each grew one entry per blocked item, and
+        ``continuation_rationale`` inlined an "id:kind" pair per item too —
+        reproducing the exact unbounded-payload shape bc834237 already fixed
+        once for ``pending_item_ids`` (confirmed: a 60-item backlog pushed a
+        delta handoff to 44744 chars against the < 30000 budget bc834237
+        established). ``_cap_blocker_summary`` now bounds every id-keyed/
+        id-valued field to the same :data:`_CONTINUATION_MANIFEST_ID_CAP`
+        subset of ``blocked_item_ids`` (so a resuming session never sees a
+        ``classifications``/``evidence_status`` entry for an id
+        ``blocked_item_ids`` itself no longer lists) and truncates
+        ``continuation_rationale`` by length — purely a size bound, the field
+        set/keys are unchanged and a dict already within cap on every field
+        passes through with the same content. This capping happens INSIDE
+        this function (not in ``blocker_policy.evaluate_board_blockers`` or
+        ``build_board_snapshot``), since ``build_continuation_manifest`` is,
+        as of this fix, still the ONLY caller that embeds ``blocker_summary``
+        into a size-budgeted payload — confirmed by grep, nothing else in
+        this codebase reads the ``blocker_summary`` key today. A future
+        full/goal-mode consumer that legitimately needs the uncapped
+        per-item detail should read ``blocker_policy.classify_and_evaluate``
+        / ``build_board_snapshot`` directly rather than this manifest's
+        capped copy.
       - ``hitl_gated_item_ids`` (07229675) — subset of the (already-capped)
         ``pending_item_ids`` that currently have at least one blocking/
         quarantining proposal gate (``meridian.proposal_gates`` — typed
@@ -8628,7 +8799,7 @@ async def build_continuation_manifest(
         "pending_count": len(claimable_pending_ids),
         "pending_item_ids": capped_pending_ids,
         "hard_blocked_pending_ids": hard_blocked_pending[:_CONTINUATION_MANIFEST_ID_CAP],
-        "blocker_summary": snapshot.get("blocker_summary"),
+        "blocker_summary": _cap_blocker_summary(snapshot.get("blocker_summary")),
         "hitl_gated_item_ids": hitl_gated_item_ids,
     }
 
