@@ -6361,6 +6361,145 @@ class TestDuckDBMemoryLimitRetuning:
             idx.close()
 
 
+class TestFatalConnectionRecovery:
+    """fa600e42 follow-up (OOM crash, confirmed live at a real
+    660,150-file/466GB qualification run): a DuckDB `FatalException`
+    ("Failed to rollback transaction... Out of Memory Error... database has
+    been invalidated") means the connection object itself is permanently
+    unusable -- DuckDB's own error text literally says "the database must
+    be restarted prior to being used again". Before this fix, self._con was
+    never discarded on this condition, so every subsequent rebuild() call
+    kept reusing the same dead connection and failed identically forever --
+    live evidence: 3 consecutive identical last_db_write_error values
+    tripped the harness's own circuit breaker after only 57 of a
+    400-call budget, mid-run, with no crash and no exception ever
+    propagating out of rebuild() itself."""
+
+    @duckdb_required
+    def test_fatal_exception_discards_connection_for_clean_reconnect(
+        self, tmp_path: Path,
+    ) -> None:
+        import duckdb
+
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            real_con = idx._con
+            assert real_con is not None
+
+            class _FatalOnCommitCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    if sql.strip().upper() == "COMMIT":
+                        raise duckdb.FatalException(
+                            "simulated: database has been invalidated",
+                        )
+                    return real_con.execute(sql, *a, **kw)
+
+                def close(self_inner) -> None:
+                    pass  # a fatally-invalidated connection still "closes"
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _FatalOnCommitCon()
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()  # must not raise
+            # A later _connect() call in the SAME rebuild() (walk-state
+            # persistence, at the tail of the method) already sees
+            # self._con is None and reconnects immediately -- so the fake
+            # wrapper is gone by the time this call returns, not merely by
+            # the START of the next one. Assert the functional outcome
+            # (discarded, not silently kept and reused) rather than pinning
+            # to exactly which call site does the reconnect.
+            assert idx._con is not real_con, (
+                "a FatalException during Phase 2's write must discard the "
+                "dead connection, not keep reusing it forever"
+            )
+            assert idx.last_db_write_error is not None
+            assert "FatalException" in idx.last_db_write_error
+
+            # Self-heal: the previously-failed file must still be retried
+            # and succeed (it was never dropped from self._pending_stale).
+            count = idx.rebuild()
+            assert idx._con is not None
+            assert count == 2, (
+                "the file that failed under the dead connection must be "
+                "retried and succeed once a fresh connection is open"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_non_fatal_write_exception_keeps_the_connection(
+        self, tmp_path: Path,
+    ) -> None:
+        """Only a genuine FatalException warrants discarding a connection --
+        an ordinary transient write error must not throw away an otherwise
+        healthy connection."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            real_con = idx._con
+            assert real_con is not None
+
+            class _TransientErrorOnCommitCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    if sql.strip().upper() == "COMMIT":
+                        raise RuntimeError("simulated transient failure")
+                    return real_con.execute(sql, *a, **kw)
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _TransientErrorOnCommitCon()
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()
+            assert idx._con is not None, (
+                "a non-fatal exception must not discard a perfectly "
+                "reusable connection"
+            )
+            assert "RuntimeError" in (idx.last_db_write_error or "")
+        finally:
+            idx._con = real_con
+            idx.close()
+
+    @duckdb_required
+    def test_fatal_exception_survives_close_failure(
+        self, tmp_path: Path,
+    ) -> None:
+        """Mirrors _connect()'s own best-effort convention: cleanup must
+        never raise, even when closing the already-dead connection itself
+        fails."""
+        import duckdb
+
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            real_con = idx._con
+
+            class _FatalAndUnclosableCon:
+                def execute(self_inner, sql: str, *a: Any, **kw: Any) -> Any:
+                    if sql.strip().upper() == "COMMIT":
+                        raise duckdb.FatalException("simulated fatal error")
+                    return real_con.execute(sql, *a, **kw)
+
+                def close(self_inner) -> None:
+                    raise RuntimeError("simulated close failure")
+
+                def __getattr__(self_inner, name: str) -> Any:
+                    return getattr(real_con, name)
+
+            idx._con = _FatalAndUnclosableCon()
+            (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+            idx.rebuild()  # must not raise, even though close() itself raises
+            assert idx._con is not real_con
+        finally:
+            idx.close()
+
+
 class TestReadConnectIsolation:
     """fa600e42 follow-up (architecture review): search()/get_annotations_
     for_path()/resolve_output()/get_content() used to run their SELECT on
