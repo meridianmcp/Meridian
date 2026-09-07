@@ -6491,9 +6491,33 @@ class OutputsFtsIndex:
                 self._walk_state is not None
                 or not self._walk_pass_confirmed_complete
             )
+            # fa600e42 follow-up (MO-IMP-06, honesty gap; confirmed live at
+            # the 660,153-file/466GiB full-corpus qualification) -- a write
+            # or lock error recorded mid-call, self-healed LATER in that
+            # SAME call (see the Phase 2 write-exception handler's
+            # duckdb.FatalException discard-and-reconnect), stays in
+            # self.last_db_write_error / self.last_lock_error until the TOP
+            # of the NEXT rebuild() call resets it. If that was the run's
+            # LAST call, there is no next call -- a caller checking
+            # get_convergence_state() then sees a permanently-stale error on
+            # an index that is otherwise genuinely, fully converged
+            # (indexed_count exactly matched expected_count; confirmed
+            # live). The authoritative signal for "does this error still
+            # have a real, live consequence" is self._pending_stale: a path
+            # that failed to persist stays there until confirmed written
+            # (see the write_confirmed check in rebuild()'s Phase 2), and a
+            # lock-acquire failure returns before touching it at all -- so
+            # once it's empty, a lingering write/lock error is historical,
+            # not current. self._last_walk_error is deliberately NOT gated
+            # here: it already resets on a fresh walk-pass start (MO-IMP-02)
+            # and reflects a directory-listing failure, not a row-
+            # persistence one, so an empty pending-stale backlog says
+            # nothing about whether it's stale.
+            no_pending_write_consequence = not self._pending_stale
             last_error = (
-                self.last_db_write_error or self._last_walk_error
-                or self.last_lock_error
+                self._last_walk_error
+                or (None if no_pending_write_consequence else self.last_db_write_error)
+                or (None if no_pending_write_consequence else self.last_lock_error)
             )
             # 3f758063 -- see docstring above: zero evidence a walk has
             # EVER touched this outputs_dir, in-process or in a prior
