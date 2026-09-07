@@ -5879,6 +5879,47 @@ class OutputsFtsIndex:
                         f"{type(_db_write_exc).__name__}: {_db_write_exc}"
                     )
                     write_confirmed = False
+                    # fa600e42 follow-up (OOM crash, confirmed live at a real
+                    # 660,150-file/466GB qualification run) -- a DuckDB
+                    # FatalException means the CONNECTION ITSELF is
+                    # permanently unusable ("the database must be restarted
+                    # prior to being used again" -- DuckDB's own error text,
+                    # observed live: "Failed to rollback transaction... Out
+                    # of Memory Error... database has been invalidated").
+                    # Before this fix, self._con was never discarded, so
+                    # EVERY subsequent rebuild() call kept reusing the same
+                    # dead connection and failed identically forever --
+                    # observed live: 3 consecutive identical
+                    # last_db_write_error values tripped the harness's own
+                    # circuit breaker after the connection was invalidated
+                    # mid-run, well before this call's --max-calls budget
+                    # was anywhere near exhausted. Discarding the connection
+                    # here lets the NEXT call's self._connect() open a
+                    # genuinely fresh one (re-resolving memory_limit against
+                    # then-current conditions -- see
+                    # _maybe_retune_duckdb_memory_limit) and rehydrate from
+                    # the last successfully COMMITTED on-disk state. The
+                    # failed transaction's own rows are safely retried
+                    # anyway (they stay in self._pending_stale -- see the
+                    # write_confirmed check just below), so this is a real
+                    # self-heal, not just a cleaner crash.
+                    try:
+                        import duckdb  # noqa: PLC0415
+                        is_fatal_connection_error = isinstance(
+                            _db_write_exc, duckdb.FatalException,
+                        )
+                    except ImportError:
+                        is_fatal_connection_error = False
+                    if is_fatal_connection_error:
+                        try:
+                            con.close()
+                        except Exception:  # noqa: BLE001
+                            _log.debug(
+                                "OutputsFtsIndex.rebuild: closing a "
+                                "fatally-invalidated connection failed",
+                                exc_info=True,
+                            )
+                        self._con = None
             # <false-convergence ROOT-CAUSE FIX> -- a path is only dropped from
             # the pending-stale backlog once its row is CONFIRMED persisted
             # (write_confirmed True). Before this fix, the pop ran
