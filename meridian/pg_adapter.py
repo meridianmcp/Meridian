@@ -4901,6 +4901,57 @@ async def _migrate_pg_external_job_register(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
+    """7c96d41b — Postgres mirror of the paper_contract schema: the
+    first-class versioned editorial-intent document for Meridian's
+    manuscript/paper editorial tooling line. Mirrors
+    db.paper_contract._migrate_paper_contract exactly — see that module's
+    docstring (and meridian.paper_contract's) for the full schema,
+    revision-numbering, and human-approval-gate contract.
+
+    ``paper_contracts.current_revision_id`` deliberately carries no
+    ``REFERENCES`` — same forward/mutable-pointer reasoning as
+    ``workspace_proposals.promoted_to_sprint_item_id`` above; it is
+    validated at the application layer (db.paper_contract), not by the
+    schema.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS paper_contracts ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    paper_key TEXT NOT NULL,"
+        "    title TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'draft'"
+        "        CHECK (status IN ('draft', 'active', 'archived')),"
+        "    current_revision_id TEXT,"
+        "    latest_revision_number INTEGER NOT NULL DEFAULT 0,"
+        "    created_by_human_id TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (project_id, paper_key)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_paper_contracts_project ON paper_contracts(project_id);"
+        "CREATE TABLE IF NOT EXISTS paper_contract_revisions ("
+        "    id TEXT PRIMARY KEY,"
+        "    contract_id TEXT NOT NULL REFERENCES paper_contracts(id),"
+        "    revision_number INTEGER NOT NULL,"
+        "    content_json TEXT NOT NULL,"
+        "    content_hash TEXT NOT NULL,"
+        "    change_summary TEXT,"
+        "    approval_status TEXT NOT NULL DEFAULT 'pending'"
+        "        CHECK (approval_status IN ('pending', 'approved', 'rejected')),"
+        "    approved_by_human_id TEXT,"
+        "    approved_at TEXT,"
+        "    superseded_by_revision_id TEXT REFERENCES paper_contract_revisions(id),"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (contract_id, revision_number)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_paper_contract_revisions_contract "
+        "ON paper_contract_revisions(contract_id, revision_number DESC);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -5025,4 +5076,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_project_scope,
     _migrate_pg_experiment_model,
     _migrate_pg_external_job_register,
+    _migrate_pg_paper_contract,
 )

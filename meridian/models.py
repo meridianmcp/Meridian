@@ -968,3 +968,127 @@ class AttemptTransitionRequest(BaseModel):
     provenance_ref: dict[str, Any] | None = None
 
 
+# ---------------------------------------------------------------------------
+# 7c96d41b — SCHEMA: paper_contract, the first-class versioned editorial
+# intent document for Meridian's manuscript/paper editorial tooling line.
+# See meridian.paper_contract (closed vocabularies, content fingerprint) and
+# meridian.db.paper_contract (persistence, revision numbering, the
+# human-approval gate) for the full contract these wire-format shapes
+# describe. SCHEMA-ONLY, same ahead-of-wiring precedent as the
+# Experiment/ResearchRun/RunAttempt classes above: no route or MCP tool
+# constructs or returns any of these yet.
+# ---------------------------------------------------------------------------
+
+
+class PaperContractContent(BaseModel):
+    """The editorial-intent payload carried by one revision — what an
+    editorial session (human or AI) is and is not allowed to assume about a
+    manuscript. Typed rather than a free-form dict because these are
+    exactly the fields a session most needs to check before writing a single
+    word; ``constraints`` remains the free-form escape hatch for anything
+    this shape doesn't anticipate (embargo dates, co-author sign-off rules,
+    forbidden phrasing, tone)."""
+
+    working_title: str = Field(
+        ..., min_length=1, description="May differ from the contract's own display title while a rename is pending."
+    )
+    target_venue: str | None = Field(default=None, description="Journal/conference/venue this draft targets.")
+    audience: str | None = None
+    thesis: str | None = Field(
+        default=None, description="The paper's core claim/argument in one or two sentences."
+    )
+    scope_in: list[str] = Field(default_factory=list, description="Claims/topics explicitly in scope.")
+    scope_out: list[str] = Field(
+        default_factory=list,
+        description="Claims/topics explicitly OUT of scope — the guardrail an editorial session must not cross.",
+    )
+    required_sections: list[str] = Field(default_factory=list)
+    style_guide: str | None = None
+    citation_style: str | None = None
+    word_limit: int | None = Field(default=None, ge=1)
+    constraints: list[str] = Field(
+        default_factory=list,
+        description="Other editorial constraints not covered above (tone, forbidden phrasing, embargo, "
+        "co-author sign-off requirements, etc).",
+    )
+
+
+class PaperContractCreate(BaseModel):
+    """Args for creating a new paper_contract container. Contains no
+    editorial content — content only ever exists on a revision (see
+    PaperContractRevisionCreate); this just establishes the stable
+    ``(project_id, paper_key)`` identity a revision ledger hangs off of."""
+
+    project_id: str = Field(..., min_length=1)
+    paper_key: str = Field(
+        ..., min_length=1,
+        description="Stable identifier for this manuscript within the project, e.g. 'main-paper' or a short slug.",
+    )
+    title: str = Field(..., min_length=1)
+    created_by_human_id: str | None = None
+
+
+class PaperContract(BaseModel):
+    """A paper_contract row — the versioned container.
+    ``current_revision_id`` is the ONLY mutable pointer (mirrors
+    ``ProjectTemplate.latest_revision_id`` / the profile_layers revision
+    pointer): it is ``None`` until a revision is approved, then always names
+    the most recently APPROVED revision — never the newest draft — so an
+    in-flight edit can never silently become binding without passing the
+    human-approval gate (see PaperContractRevisionApproval)."""
+
+    id: str
+    project_id: str
+    paper_key: str
+    title: str
+    status: Literal["draft", "active", "archived"] = "draft"
+    current_revision_id: str | None = None
+    latest_revision_number: int = Field(default=0, ge=0)
+    created_by_human_id: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class PaperContractRevisionCreate(BaseModel):
+    """Args for proposing a new revision. Always creates a PENDING revision
+    — see PaperContractRevisionApproval for the human-approval gate that
+    pins it as ``current_revision_id``."""
+
+    contract_id: str = Field(..., min_length=1)
+    content: PaperContractContent
+    change_summary: str | None = None
+    created_by: str | None = None
+
+
+class PaperContractRevision(BaseModel):
+    """One immutable revision in a contract's ledger. Never mutated after
+    creation except ``superseded_by_revision_id``, which is set exactly
+    once, when a later revision is approved in its place — same immutable-
+    ledger contract as ``TemplateRevisionSnapshot``/``RunAttempt`` above."""
+
+    id: str
+    contract_id: str
+    revision_number: int = Field(..., ge=1)
+    content: PaperContractContent
+    content_hash: str = Field(..., description="'sha256:...' canonical fingerprint of `content`.")
+    change_summary: str | None = None
+    approval_status: Literal["pending", "approved", "rejected"] = "pending"
+    approved_by_human_id: str | None = None
+    approved_at: str | None = None
+    superseded_by_revision_id: str | None = Field(
+        default=None, description="None means this IS (or still could become) the current approved revision."
+    )
+    created_by: str | None = None
+    created_at: str
+
+
+class PaperContractRevisionApproval(BaseModel):
+    """Args for the human-approval gate: approving a pending revision pins
+    it as the contract's ``current_revision_id`` and supersedes the
+    previously-approved one, if any. Requires a human identity — an
+    unattributed approval defeats the point of the gate."""
+
+    revision_id: str = Field(..., min_length=1)
+    approved_by_human_id: str = Field(..., min_length=1)
+
+

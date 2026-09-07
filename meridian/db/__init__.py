@@ -1148,6 +1148,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_proposal_project_scope(db)
     await _migrate_experiment_model(db)
     await _migrate_external_job_register(db)
+    await _migrate_paper_contract(db)
     return db
 
 
@@ -12984,4 +12985,23 @@ from .experiment_model import (  # noqa: F401
     transition_attempt,
     heartbeat_attempt,
     reconcile_stale_attempts,
+)
+
+# 7c96d41b — SCHEMA: paper_contract, the first-class versioned editorial
+# intent document for Meridian's manuscript/paper editorial tooling line.
+# Imported LAST (after experiment_model) — depends on nothing above at
+# import time. See meridian.paper_contract for the closed CONTRACT_STATUSES/
+# REVISION_APPROVAL_STATUSES vocabularies and content-fingerprint helper,
+# and meridian.db.paper_contract's own module docstring for the full
+# schema/human-approval-gate contract. Schema-only: no MCP tool or HTTP
+# route is wired to this yet.
+from .paper_contract import (  # noqa: F401
+    _migrate_paper_contract,
+    create_paper_contract,
+    get_paper_contract,
+    get_paper_contract_by_key,
+    create_paper_contract_revision,
+    get_paper_contract_revision,
+    list_paper_contract_revisions,
+    approve_paper_contract_revision,
 )
