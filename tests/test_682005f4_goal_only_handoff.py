@@ -972,7 +972,7 @@ async def test_handoff_modes_agree_on_project_start_config(db, tmp_path):
 
 @pytest.mark.asyncio
 async def test_project_start_config_coexists_with_required_tool_and_exclusions(
-    db, tmp_path,
+    db, tmp_path, monkeypatch,
 ):
     """Realistic multi-item board: a required_tool pin, a dependency chain
     (wave order), a MANUAL item, and a backburnered item all together --
@@ -984,7 +984,23 @@ async def test_project_start_config_coexists_with_required_tool_and_exclusions(
     (required_tool/tool_requirements/exclusions/wave-order are unaffected by
     the f471c4b8 fix) -- but starter deliberately does not render
     <project_start_config> (see test_handoff_modes_agree_on_project_start_config
-    for why), so its assertion is skipped for that one mode only."""
+    for why), so its assertion is skipped for that one mode only.
+
+    Isolated from real git state: _annotate_touches_files inspects the
+    actual repo's last 3 commits and auto-infers touches_resources from a
+    title-keyword/changed-filename match. This test's own fixture titles
+    (e.g. "base symbol rename") can coincidentally collide with a real
+    filename stem elsewhere in the repo depending on git history position --
+    confirmed happening in practice -- which would spuriously exclude the
+    item as unprospected. This test's intent is the project_start_config/
+    required_tool/dependency-order contract, not this heuristic, so make it
+    hermetic by neutralizing the git-history lookup."""
+    async def _no_op_annotate_touches_files(db, project_id, pending_items):
+        return pending_items
+
+    monkeypatch.setattr(
+        handoff_module, "_annotate_touches_files", _no_op_annotate_touches_files,
+    )
     p = await db_module.create_project(db, "start-config-multi-item")
     await db_module.set_executor_config(
         db, p["id"], {"repo_path": "/srv/repos/multi-item", "test_cmd": "pixi run test"},

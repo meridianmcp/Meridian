@@ -857,7 +857,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "local absolute paths in shared hints or metadata.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
-         "project_name": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "session_id": {"type": "string"},
          "job_key": {"type": "string", "description": "Stable project-local logical key; reuse it for later observations."},
          "provider": {"type": "string", "description": "Provider/launcher label, e.g. runpod, ssh, slurm, ci."},
@@ -877,7 +877,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "history and refreshes the local crash-surviving snapshot. Terminal jobs "
         "cannot be reopened or silently replaced.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "session_id": {"type": "string"}, "job_id": {"type": "string"}, "job_key": {"type": "string"},
          "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
          "phase": {"type": "string"}, "check_hint": {"type": "string"},
@@ -889,7 +889,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read one project-scoped external job and its durable observation history. "
         "Use this from a fresh session before taking any action on a live job.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "job_id": {"type": "string"}, "job_key": {"type": "string"},
          "include_history": {"type": "boolean"}}, "required": []}},
     {"name": "list_external_jobs", "description":
@@ -897,7 +897,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "are omitted so a new session sees only work that may require observation "
         "or resumption. The response also reports the host-local snapshot state.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "include_terminal": {"type": "boolean"},
          "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
          "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": []}},
@@ -906,7 +906,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "infers success from output files and never reopens a terminal record. "
         "It appends a final task-log event and refreshes the local snapshot.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "session_id": {"type": "string"}, "job_id": {"type": "string"}, "job_key": {"type": "string"},
          "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
          "detail": {"type": "string"}, "metadata": {"type": "object"}},
