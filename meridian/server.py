@@ -5068,6 +5068,7 @@ async def _build_continue_payload(
     session: dict[str, Any],
     *,
     source: str | None = None,
+    version_rescoped: bool = False,
 ) -> dict[str, Any]:
     """c793377d — compact 'just continue' resume block.
 
@@ -5077,6 +5078,35 @@ async def _build_continue_payload(
     L0/L1/L2 orientation (goal_xml / cache_blocks / instructions / workspace).
     Used both by the auto-detected heartbeat-window continuation and an explicit
     mode='continue'. Every enrichment is best-effort so a resume never fails.
+
+    862f6522 — this is the OTHER "just continue" entry point
+    ``handoff_module.build_continuation_manifest``'s own docstring names as a
+    documented-but-unfinished follow-up ("Wiring meridian/server.py's
+    _build_continue_payload to call this function... deferred because
+    server.py is a high-contention file"). Two fixes land together here:
+
+    1. ``continuation_manifest`` (below) is now populated from the SAME
+       canonical, byte-stable board-snapshot/revision-ledger serializer
+       ``generate_handoff(mode='delta')`` already embeds — see
+       :func:`meridian.handoff.build_continuation_manifest`. This resume
+       payload no longer independently re-derives its own ad hoc notion of
+       "what's pending" with no revision/identity signal a caller could use
+       to detect a stale resume; it carries the same project_id/session_id/
+       sprint_version/revision_hash/revision_counter tuple every other
+       continuation surface (delta handoff, checkpoint) already reports.
+       Best-effort: a manifest-build failure degrades to ``None`` rather than
+       breaking the resume.
+    2. ``version_rescoped`` (set by the caller, :func:`_start_session_composite`)
+       flags a resume whose session row was JUST re-scoped to a caller-
+       requested ``version`` that differed from what this session name was
+       previously resolved to — see that function's own docstring for why
+       this matters: without it, a reused session name silently kept serving
+       whatever version bucket it happened to be scoped to when it last
+       pinged, even when the new caller explicitly asked to work a different
+       version. Surfaced here so a receiving executor can tell "this is a
+       genuine continuation of the same scope" apart from "this is a fresh
+       version-scoped goal, presented through the continuation shape because
+       the session identity itself was reused."
     """
     scoped_version = session.get("sprint_version") or None
     try:
@@ -5104,13 +5134,34 @@ async def _build_continue_payload(
     _hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
     # d5849a67 — same durable pointer-evidence resolution as generate_handoff,
     # so this resume payload's excluded_unprospected list also agrees with
-    # what claim_sprint_item will actually enforce. Guarded, fail-open.
+    # what claim_sprint_item will actually enforce.
+    #
+    # 862f6522 — FAIL CLOSED here, not fail-open. d5849a67's own docstring on
+    # `pointer_evidence_ids` documents `None` (query failed / not supplied) as
+    # a DELIBERATE fail-open default for _build_quick_start_goal's shared
+    # helper — "treated as fail-open... rather than 'confirmed no evidence'
+    # (which would risk mass-excluding every resource-declaring item on a
+    # transient DB hiccup)" — and that general default is left unchanged for
+    # every other caller. This ONE call site is different: it is the resume/
+    # re-entry path, reached precisely when a session identity is being
+    # reused across a boundary (heartbeat window, explicit mode='continue',
+    # a tunnel restart) — exactly where silently treating "the evidence query
+    # itself failed" as "assume every pending item is prospected" is most
+    # dangerous, since it is the one path with no accompanying full L0/L1/L2
+    # re-orientation to catch a stale/incorrect assumption. Passing an empty
+    # set (not None) makes this fail CLOSED instead: is_item_claim_prospected
+    # already treats an item with no declared touches_resources as prospected
+    # regardless of this set's contents, so failing closed here only ever
+    # tightens the claimable batch for items that actually declared resources
+    # and lack a bypass — it can never mass-exclude an item that never needed
+    # evidence in the first place, and a genuinely prospected item keeps its
+    # evidence on the very next successful query.
     try:
         _continue_pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
             db, [it.get("id") for it in pending]
         )
     except Exception:  # noqa: BLE001
-        _continue_pointer_evidence_ids = None
+        _continue_pointer_evidence_ids = frozenset()
     # `goal_string` (not `goal`) deliberately — consumers like hooks_session_start
     # treat a result `goal` key as the goal *dict* (north_star/sprint); this is the
     # ready-to-paste /goal *command* string, a distinct shape.
@@ -5199,6 +5250,23 @@ async def _build_continue_payload(
         )
     except Exception:  # noqa: BLE001
         latest_executor_report = None
+    # 862f6522 — the canonical continuation manifest, built by the SAME
+    # shared serializer generate_handoff(mode='delta') already embeds (see
+    # handoff_module.build_continuation_manifest's own docstring, which named
+    # wiring this call site as its long-documented, previously-unfinished
+    # follow-up). Scoped to this session's own resolved version so a
+    # foreign/stale board never leaks in. Best-effort by that function's own
+    # documented convention — a build failure degrades to no manifest rather
+    # than breaking the resume.
+    try:
+        _continuation_manifest = await handoff_module.build_continuation_manifest(
+            db, project_id,
+            session_id=session.get("id"),
+            version=scoped_version,
+            source="continue:start_session",
+        )
+    except Exception:  # noqa: BLE001 — manifest is best-effort, never fatal
+        _continuation_manifest = None
     return {
         "continuation": True,
         "mode": "continue",
@@ -5206,6 +5274,8 @@ async def _build_continue_payload(
         "session": session,
         "source": source,
         "sprint_version": scoped_version,
+        "version_rescoped": version_rescoped,
+        "continuation_manifest": _continuation_manifest,
         "pending_items": pending_slim,
         "pending_count": len(pending_slim),
         "goal_string": goal_string,
@@ -5631,6 +5701,26 @@ async def _start_session_composite(
     (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
     regenerates that header per tool call.
 
+    862f6522 — REJECT STALE CROSS-VERSION CONTINUATION: the check above is
+    keyed on (project_id, session_name) alone — it says nothing about
+    ``version``. Before this fix, an explicit ``version`` argument was
+    silently DROPPED the instant the continuation branch matched: the
+    returned payload always reflected whatever ``sprint_version`` the
+    matched session row happened to already carry from a PRIOR call, never
+    the version this call actually asked for. Confirmed gap: a reused
+    session name (deliberate — e.g. an orchestrator resuming the same
+    logical executor slot for a new version bucket — or accidental, e.g. a
+    generic name like "executor" reused across unrelated runs) could hand
+    the caller a goal built from a stale, unrelated version's board with no
+    signal anything was wrong. When ``version`` is given AND differs from
+    the matched session's own stored scope, the session row is re-scoped to
+    the requested version FIRST (so ``_build_continue_payload`` builds its
+    manifest/goal from the NEW version's live board, not the old one) and
+    the returned payload carries ``version_rescoped=True`` so a receiving
+    executor can tell this apart from a genuine same-scope resume. A
+    same-version re-call (or no explicit ``version`` at all) is completely
+    unaffected — this only engages on an actual version mismatch.
+
     ``expand_stale`` (2b4e69aa; extended by 14847f20) only affects the full
     (``compact=False``) payload: it defaults to ``False`` so any goal field
     the coherence check flagged stale (a week-old north_star / version_goal /
@@ -5649,7 +5739,32 @@ async def _start_session_composite(
         db, project_id, session_name, max_idle_minutes=_continue_window
     )
     if existing is not None:
-        return await _build_continue_payload(db, project_id, existing, source=source)
+        # 862f6522 — an explicit, DIFFERENT version means this call is asking
+        # to work a new scope under a reused session identity, not to resume
+        # the old one. Re-scope the session row to the requested version
+        # BEFORE building the continue payload so it is built from the new
+        # version's live board — never a blind reuse of the stale scope.
+        # Best-effort: if the re-scope write itself fails, fall through and
+        # resume the session's existing (stale) scope rather than raising —
+        # a resume must never hard-fail over a diagnostic-only re-label.
+        _version_rescoped = False
+        if version is not None and version != (existing.get("sprint_version") or None):
+            try:
+                await db.execute(
+                    "UPDATE sessions SET sprint_version = ? WHERE id = ?",
+                    (version, existing["id"]),
+                )
+                await db.commit()
+            except Exception:  # noqa: BLE001 — best-effort re-scope
+                pass
+            else:
+                existing = dict(existing)
+                existing["sprint_version"] = version
+                _version_rescoped = True
+        return await _build_continue_payload(
+            db, project_id, existing, source=source,
+            version_rescoped=_version_rescoped,
+        )
     # v1.8.x — archive sessions silent for 7+ days so they don't crowd
     # the active list seen by new sessions.
     await db_module.archive_empty_sessions(db)

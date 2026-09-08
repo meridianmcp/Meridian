@@ -915,3 +915,194 @@ class TestCanonicalGoalBlockStructure:
         # effect of this test's ordering.
         genuine = await handoff_module.verify_handoff_token(db, token, project["id"], body=body)
         assert genuine["valid"] is True
+
+
+# ===========================================================================
+# 862f6522 — unify _build_continue_payload with the canonical continuation
+# manifest, and reject a stale cross-version goal on session-name reuse.
+#
+# build_continuation_manifest's own docstring long documented "wiring
+# meridian/server.py's _build_continue_payload to call this function" as a
+# deliberately deferred follow-up ("server.py is a high-contention file
+# outside this change's file scope"). These tests cover that follow-up now
+# landing, plus the concrete fail-open pointer-evidence seam its notes
+# named as the exact gap that let a reused session name serve a stale,
+# cross-version goal.
+# ===========================================================================
+
+
+async def test_build_continue_payload_includes_canonical_continuation_manifest(db):
+    """The continue-mode resume payload now carries the SAME canonical
+    manifest shape generate_handoff(mode='delta') already embeds — see
+    handoff_module.build_continuation_manifest — instead of no revision/
+    identity signal at all."""
+    from meridian.server import _start_session_composite
+
+    p = await db_module.create_project(db, "862f6522-manifest-unify")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v9", "solo item", prospect_bypass=True,
+    )
+    await _start_session_composite(
+        db, p["id"], "manifest-resume", "/tmp", version="v9",
+    )
+    second = await _start_session_composite(
+        db, p["id"], "manifest-resume", "/tmp", source="resume",
+    )
+    assert second.get("continuation") is True
+    manifest = second.get("continuation_manifest")
+    assert manifest is not None
+    assert manifest["project_id"] == p["id"]
+    assert manifest["session_id"] == second["session_id"]
+    assert manifest["sprint_version"] == "v9"
+    assert manifest["source"] == "continue:start_session"
+    assert item["id"] in manifest["pending_item_ids"]
+    assert manifest["revision_hash"]
+
+
+async def test_build_continue_payload_manifest_none_on_build_failure(db, monkeypatch):
+    """Best-effort by convention: a manifest-build failure degrades to None
+    rather than breaking the resume itself."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "862f6522-manifest-boom")
+    await db_module.add_sprint_item(db, p["id"], "v9", "item", prospect_bypass=True)
+    await srv._start_session_composite(db, p["id"], "manifest-boom-resume", "/tmp", version="v9")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(srv.handoff_module, "build_continuation_manifest", _boom)
+    second = await srv._start_session_composite(
+        db, p["id"], "manifest-boom-resume", "/tmp", source="resume",
+    )
+    assert second.get("continuation") is True
+    assert second["continuation_manifest"] is None
+    assert second["goal_string"]  # the resume itself still succeeded
+
+
+async def test_continue_resume_same_version_not_rescoped(db):
+    """No explicit version (or a matching one) on the re-call: zero
+    behaviour change — version_rescoped stays False."""
+    from meridian.server import _start_session_composite
+
+    p = await db_module.create_project(db, "862f6522-same-version")
+    await db_module.add_sprint_item(db, p["id"], "v9", "item", prospect_bypass=True)
+    await _start_session_composite(db, p["id"], "same-version-resume", "/tmp", version="v9")
+
+    second = await _start_session_composite(
+        db, p["id"], "same-version-resume", "/tmp", source="resume",
+    )
+    assert second.get("continuation") is True
+    assert second.get("version_rescoped") is False
+    assert second["sprint_version"] == "v9"
+
+    third = await _start_session_composite(
+        db, p["id"], "same-version-resume", "/tmp", version="v9", source="resume",
+    )
+    assert third.get("version_rescoped") is False
+    assert third["sprint_version"] == "v9"
+
+
+async def test_continue_resume_rejects_stale_cross_version_goal(db):
+    """ACCEPTANCE: a reused session name with an explicit, DIFFERENT version
+    must re-scope to the new version rather than silently serving the old
+    version's goal — no foreign item id from the stale version may leak into
+    the resumed payload.
+
+    This is the exact scenario 862f6522's notes describe: "a reused session
+    name to receive a pending_goal from another project/version."
+    """
+    from meridian.server import _start_session_composite
+
+    p = await db_module.create_project(db, "862f6522-cross-version")
+    pid = p["id"]
+    old_item = await db_module.add_sprint_item(
+        db, pid, "v1", "stale bucket alpha widget", prospect_bypass=True,
+    )
+    new_item = await db_module.add_sprint_item(
+        db, pid, "v2", "fresh bucket beta gadget", prospect_bypass=True, force=True,
+    )
+
+    first = await _start_session_composite(db, pid, "reused-name", "/tmp", version="v1")
+    assert first["sprint_version"] == "v1"
+
+    # Reused session name, but this call explicitly asks for a DIFFERENT
+    # version — must not be served v1's stale goal.
+    second = await _start_session_composite(
+        db, pid, "reused-name", "/tmp", version="v2", source="resume",
+    )
+    assert second.get("continuation") is True
+    assert second.get("version_rescoped") is True
+    assert second["sprint_version"] == "v2"
+    assert second["session_id"] == first["session_id"]  # same identity, re-scoped
+
+    # No foreign (v1) item id leaks into the resumed goal or pending list.
+    assert old_item["id"] not in second["goal_string"]
+    assert new_item["id"] in second["goal_string"]
+    pending_ids = {it["id"] for it in second["pending_items"]}
+    assert old_item["id"] not in pending_ids
+    assert new_item["id"] in pending_ids
+
+    manifest = second.get("continuation_manifest")
+    assert manifest is not None
+    assert manifest["sprint_version"] == "v2"
+    assert old_item["id"] not in manifest["pending_item_ids"]
+    assert new_item["id"] in manifest["pending_item_ids"]
+
+    # The re-scope is durably persisted on the session row, not just
+    # reflected in this one response.
+    async with db.execute(
+        "SELECT sprint_version FROM sessions WHERE id = ?", (second["session_id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert (row["sprint_version"] if isinstance(row, dict) else row[0]) == "v2"
+
+
+async def test_continue_resume_pointer_evidence_failure_fails_closed(db, monkeypatch):
+    """862f6522 — the fail-open pointer-evidence seam: when the durable
+    evidence fetch itself fails during a continue-mode resume, an item that
+    DECLARED touches_resources but has no confirmed prospecting evidence
+    (and no prospect_bypass) must be EXCLUDED from the claimable goal, not
+    silently waved through. Before this fix, the exception handler set
+    pointer_evidence_ids=None, which _build_quick_start_goal's fail-open
+    default treats as "assume every item has evidence" — this item would
+    have appeared as claimable despite zero real prospecting evidence."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "862f6522-pointer-fail-closed")
+    pid = p["id"]
+    unprospected = await db_module.add_sprint_item(
+        db, pid, "v1", "touches real resources, never prospected",
+        touches_resources=["file:risky.py"],
+    )
+    bypassed = await db_module.add_sprint_item(
+        db, pid, "v1", "human already reviewed and cleared this one",
+        touches_resources=["file:ok.py"], prospect_bypass=True, force=True,
+    )
+
+    await srv._start_session_composite(db, pid, "pointer-fail-resume", "/tmp", version="v1")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("evidence query boom")
+
+    monkeypatch.setattr(db_module, "get_pointer_evidence_item_ids", _boom)
+
+    second = await srv._start_session_composite(
+        db, pid, "pointer-fail-resume", "/tmp", source="resume",
+    )
+    assert second.get("continuation") is True
+    goal_string = second["goal_string"]
+    claimable_body = _sprint_items_tag_body(goal_string)
+    # The unprospected, non-bypassed item must NOT be in the claimable batch
+    # -- fail-closed excludes it, even though the evidence fetch itself blew
+    # up rather than cleanly reporting "no evidence".
+    assert unprospected["id"] not in claimable_body
+    assert "<excluded_unprospected" in goal_string
+    excluded_body = goal_string.split("<excluded_unprospected", 1)[1].split(
+        "</excluded_unprospected>", 1
+    )[0]
+    assert unprospected["id"] in excluded_body
+    # A human-bypassed item is unaffected by the evidence-fetch failure --
+    # prospect_bypass short-circuits is_item_claim_prospected regardless of
+    # has_pointer_evidence.
+    assert bypassed["id"] in claimable_body
