@@ -968,3 +968,408 @@ class AttemptTransitionRequest(BaseModel):
     provenance_ref: dict[str, Any] | None = None
 
 
+# ---------------------------------------------------------------------------
+# 7c96d41b — SCHEMA: paper_contract, the first-class versioned editorial
+# intent document for Meridian's manuscript/paper editorial tooling line.
+# See meridian.paper_contract (closed vocabularies, content fingerprint) and
+# meridian.db.paper_contract (persistence, revision numbering, the
+# human-approval gate) for the full contract these wire-format shapes
+# describe. SCHEMA-ONLY, same ahead-of-wiring precedent as the
+# Experiment/ResearchRun/RunAttempt classes above: no route or MCP tool
+# constructs or returns any of these yet.
+# ---------------------------------------------------------------------------
+
+
+
+class PaperContractContent(BaseModel):
+    """The editorial-intent payload carried by one revision — what an
+    editorial session (human or AI) is and is not allowed to assume about a
+    manuscript. Typed rather than a free-form dict because these are
+    exactly the fields a session most needs to check before writing a single
+    word; ``constraints`` remains the free-form escape hatch for anything
+    this shape doesn't anticipate (embargo dates, co-author sign-off rules,
+    forbidden phrasing, tone)."""
+
+    working_title: str = Field(
+        ..., min_length=1, description="May differ from the contract's own display title while a rename is pending."
+    )
+    target_venue: str | None = Field(default=None, description="Journal/conference/venue this draft targets.")
+    audience: str | None = None
+    thesis: str | None = Field(
+        default=None, description="The paper's core claim/argument in one or two sentences."
+    )
+    scope_in: list[str] = Field(default_factory=list, description="Claims/topics explicitly in scope.")
+    scope_out: list[str] = Field(
+        default_factory=list,
+        description="Claims/topics explicitly OUT of scope — the guardrail an editorial session must not cross.",
+    )
+    required_sections: list[str] = Field(default_factory=list)
+    style_guide: str | None = None
+    citation_style: str | None = None
+    word_limit: int | None = Field(default=None, ge=1)
+    constraints: list[str] = Field(
+        default_factory=list,
+        description="Other editorial constraints not covered above (tone, forbidden phrasing, embargo, "
+        "co-author sign-off requirements, etc).",
+    )
+
+
+class PaperContractCreate(BaseModel):
+    """Args for creating a new paper_contract container. Contains no
+    editorial content — content only ever exists on a revision (see
+    PaperContractRevisionCreate); this just establishes the stable
+    ``(project_id, paper_key)`` identity a revision ledger hangs off of."""
+
+    project_id: str = Field(..., min_length=1)
+    paper_key: str = Field(
+        ..., min_length=1,
+        description="Stable identifier for this manuscript within the project, e.g. 'main-paper' or a short slug.",
+    )
+    title: str = Field(..., min_length=1)
+    created_by_human_id: str | None = None
+
+
+class PaperContract(BaseModel):
+    """A paper_contract row — the versioned container.
+    ``current_revision_id`` is the ONLY mutable pointer (mirrors
+    ``ProjectTemplate.latest_revision_id`` / the profile_layers revision
+    pointer): it is ``None`` until a revision is approved, then always names
+    the most recently APPROVED revision — never the newest draft — so an
+    in-flight edit can never silently become binding without passing the
+    human-approval gate (see PaperContractRevisionApproval)."""
+
+    id: str
+    project_id: str
+    paper_key: str
+    title: str
+    status: Literal["draft", "active", "archived"] = "draft"
+    current_revision_id: str | None = None
+    latest_revision_number: int = Field(default=0, ge=0)
+    created_by_human_id: str | None = None
+    created_at: str
+    updated_at: str
+
+
+# ---------------------------------------------------------------------------
+# 6d109127 -- SCHEMA: structural_patch, a proposed manuscript structural
+# edit behind a human approval gate. See meridian.structural_patch (closed
+# PATCH_OPERATIONS/PATCH_STATUSES vocabularies, transition rules) and
+# meridian.db.structural_patch (persistence, the human-approval-gate
+# enforcement) for the full contract these wire-format shapes describe.
+#
+# SCHEMA-ONLY, deliberately UNWIRED: no route or MCP tool constructs or
+# returns these yet -- this sprint item is scoped to the data model alone
+# (Pydantic model + migration + minimal CRUD), matching the "Project
+# family / template revisions" block above's identical
+# additive-and-unwired convention.
+# ---------------------------------------------------------------------------
+
+
+class StructuralPatchCreate(BaseModel):
+    """Request shape for proposing a new structural_patch. Always creates
+    the patch in status ``'proposed'`` -- see
+    ``meridian.db.structural_patch.create_structural_patch``.
+    """
+
+    project_id: str = Field(..., min_length=1)
+    session_id: str = Field(
+        ..., min_length=1,
+        description="Proposing session -- becomes proposed_by_session_id. Must belong to project_id.",
+    )
+    document_id: str = Field(
+        ..., min_length=1,
+        description="meridian.doc_store doc_documents.id this patch targets.",
+    )
+    target_element_id: str | None = Field(
+        default=None,
+        description="meridian.doc_store doc_elements.id anchor. None for a patch with no single "
+        "existing anchor (e.g. inserting a brand-new top-level section).",
+    )
+    operation: Literal["insert", "delete", "move", "replace", "reorder"] = Field(
+        ..., description="The shape of the proposed edit -- see meridian.structural_patch.PATCH_OPERATIONS."
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Operation-specific structured content (e.g. new element text/kind for "
+        "insert, destination parent/ordinal for move). Validated JSON-safe, bounded, "
+        "and secret-free by meridian.structural_patch.validate_payload.",
+    )
+    rationale: str | None = Field(
+        default=None, description="Human-readable justification shown to the approving human."
+    )
+    base_content_hash: str | None = Field(
+        default=None,
+        description="doc_documents.content_hash at proposal time -- the version pin used to "
+        "detect drift before approval/application (same value "
+        "meridian.doc_store.compute_content_hash produces).",
+    )
+    supersedes_patch_id: str | None = Field(
+        default=None,
+        description="An earlier structural_patch (same project) this one revises and replaces. "
+        "Does not itself mark that patch superseded -- a separate decision call does.",
+    )
+
+
+class StructuralPatch(BaseModel):
+    """A structural_patch row -- see meridian.db.structural_patch's module
+    docstring for the full schema/approval-gate contract."""
+
+    id: str
+    project_id: str
+    document_id: str
+    target_element_id: str | None = None
+    operation: Literal["insert", "delete", "move", "replace", "reorder"]
+    payload: dict[str, Any] = Field(default_factory=dict)
+    rationale: str | None = None
+    base_content_hash: str | None = None
+    status: Literal[
+        "proposed", "approved", "rejected", "withdrawn", "superseded", "applied"
+    ] = "proposed"
+    proposed_by_session_id: str
+    decided_by_human_id: str | None = None
+    decision_note: str | None = None
+    decided_at: str | None = None
+    applied_at: str | None = None
+    supersedes_patch_id: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class PaperContractRevisionCreate(BaseModel):
+    """Args for proposing a new revision. Always creates a PENDING revision
+    — see PaperContractRevisionApproval for the human-approval gate that
+    pins it as ``current_revision_id``."""
+
+    contract_id: str = Field(..., min_length=1)
+    content: PaperContractContent
+    change_summary: str | None = None
+    created_by: str | None = None
+
+
+class PaperContractRevision(BaseModel):
+    """One immutable revision in a contract's ledger. Never mutated after
+    creation except ``superseded_by_revision_id``, which is set exactly
+    once, when a later revision is approved in its place — same immutable-
+    ledger contract as ``TemplateRevisionSnapshot``/``RunAttempt`` above."""
+
+    id: str
+    contract_id: str
+    revision_number: int = Field(..., ge=1)
+    content: PaperContractContent
+    content_hash: str = Field(..., description="'sha256:...' canonical fingerprint of `content`.")
+    change_summary: str | None = None
+    approval_status: Literal["pending", "approved", "rejected"] = "pending"
+    approved_by_human_id: str | None = None
+    approved_at: str | None = None
+    superseded_by_revision_id: str | None = Field(
+        default=None, description="None means this IS (or still could become) the current approved revision."
+    )
+    created_by: str | None = None
+    created_at: str
+
+
+# ---------------------------------------------------------------------------
+# 81b5491b — SCHEMA: paper_strategy_graph — argument-layer nodes and
+# rhetorical edges for the manuscript/paper editorial tooling line. See
+# meridian.paper_strategy (closed vocabularies) and
+# meridian.db.paper_strategy_graph (persistence, versioning, human-approval
+# gate) for the full contract these wire-format shapes describe.
+# ---------------------------------------------------------------------------
+
+_PAPER_STRATEGY_NODE_TYPE = Literal[
+    "thesis", "claim", "counter_claim", "evidence", "warrant",
+    "rebuttal", "concession", "motivation", "framing_note",
+]
+
+_PAPER_STRATEGY_EDGE_KIND = Literal[
+    "supports", "rebuts", "concedes", "qualifies", "motivates",
+    "contrasts", "elaborates", "restates",
+]
+
+
+class PaperStrategyNodeCreate(BaseModel):
+    """Body for creating a brand-new argument-layer node (always starts a
+    new node family at version 1, status 'draft' — see
+    ``meridian.db.paper_strategy_graph.create_strategy_node``)."""
+
+    project_id: str = Field(..., min_length=1)
+    node_type: _PAPER_STRATEGY_NODE_TYPE
+    statement: str = Field(..., min_length=1)
+    document_ref: str | None = None
+    rationale: str | None = None
+    created_by: str | None = None
+
+
+class PaperStrategyNode(BaseModel):
+    """One versioned argument-layer node row. ``family_id``/``version``
+    together identify this node's place in its append-only revision history
+    (mirrors ``meridian.db.research_graph``'s identity/seq convention);
+    ``status`` carries the human-approval gate (``draft`` ->
+    ``approved``/``rejected``; ``superseded`` when a later version replaced
+    this row) — see ``meridian.db.paper_strategy_graph`` for the full
+    contract."""
+
+    id: str
+    project_id: str
+    family_id: str
+    version: int
+    node_type: _PAPER_STRATEGY_NODE_TYPE
+    document_ref: str | None = None
+    statement: str
+    rationale: str | None = None
+    status: Literal["draft", "approved", "rejected", "superseded"] = "draft"
+    approved_by: str | None = None
+    approved_at: str | None = None
+    rejection_reason: str | None = None
+    supersedes_id: str | None = None
+    superseded_by: str | None = None
+    created_by: str | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
+class PaperStrategyEdgeCreate(BaseModel):
+    """Body for creating one rhetorical edge between two EXACT, already-
+    existing argument-layer node ids (see
+    ``meridian.db.paper_strategy_graph.create_strategy_edge`` for the
+    self-loop / missing-endpoint rejection rules)."""
+
+    project_id: str = Field(..., min_length=1)
+    edge_kind: _PAPER_STRATEGY_EDGE_KIND
+    from_node_id: str = Field(..., min_length=1)
+    to_node_id: str = Field(..., min_length=1)
+    label: str | None = None
+    created_by: str | None = None
+
+
+class PaperStrategyEdge(BaseModel):
+    """One rhetorical edge row linking two argument-layer nodes by exact id."""
+
+    id: str
+    project_id: str
+    edge_kind: _PAPER_STRATEGY_EDGE_KIND
+    from_node_id: str
+    to_node_id: str
+    label: str | None = None
+    created_by: str | None = None
+    created_at: str
+
+
+class PaperContractRevisionApproval(BaseModel):
+    """Args for the human-approval gate: approving a pending revision pins
+    it as the contract's ``current_revision_id`` and supersedes the
+    previously-approved one, if any. Requires a human identity — an
+    unattributed approval defeats the point of the gate."""
+
+    revision_id: str = Field(..., min_length=1)
+    approved_by_human_id: str = Field(..., min_length=1)
+
+
+# d2539453 — lint_finding: structured, version-pinned paper/manuscript audit
+# output. See meridian.db.lint_finding for the persistence layer (migration +
+# CRUD) and its module docstring for the full two-axis version-pinning
+# contract: ``source_fingerprint`` pins the audited document's exact content
+# (matches extensions/meridian-docs' docs_intel._source_fingerprint /
+# doc_store.compute_content_hash convention); ``linter_version`` separately
+# pins the rule logic that produced the finding. Mirrors the finding shape
+# already emitted ad hoc by docs_intel.audit_document / audit_equation_style
+# (type/category/severity/detail) — this is the durable, persisted form of
+# those currently-ephemeral results.
+# ---------------------------------------------------------------------------
+
+
+class LintFindingCreate(BaseModel):
+    """Body for recording one structured paper-audit finding."""
+
+    project_id: str = Field(..., min_length=1)
+    linter_name: str = Field(
+        ..., min_length=1, description="Which audit routine produced this, e.g. 'meridian_docs.audit_document'."
+    )
+    linter_version: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Version pin for the RULE LOGIC that produced this finding (semver or a "
+            "rule-set content hash) — independent of source_fingerprint, which pins "
+            "the document content instead."
+        ),
+    )
+    source_fingerprint: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Version pin for the audited document's exact content at generation time "
+            "(sha256 hex, matching docs_intel._source_fingerprint / doc_store's "
+            "content_hash convention)."
+        ),
+    )
+    category: str = Field(..., min_length=1, description="Coarse grouping, e.g. 'equation' | 'caption' | 'citation'.")
+    finding_type: str = Field(..., min_length=1, description="Fine-grained rule/type slug, e.g. 'orphan_image'.")
+    message: str = Field(..., min_length=1, description="Human-readable summary of the finding.")
+    severity: Literal["error", "warning", "info"] = "warning"
+    document_id: str | None = Field(
+        default=None,
+        description="Optional cross-store reference to a doc_store document id. No DB-level FK.",
+    )
+    audit_run_id: str | None = Field(
+        default=None,
+        description="Optional grouping id shared by every finding from one audit invocation.",
+    )
+    location: dict[str, Any] | None = Field(
+        default=None, description="Opaque structural anchor (para_id/node_id/table_id/section_path/etc.)."
+    )
+    detail: dict[str, Any] | None = Field(
+        default=None, description="Opaque raw finding payload from the linter, for full fidelity."
+    )
+
+
+class LintFinding(BaseModel):
+    """A persisted ``lint_findings`` row."""
+
+    id: str
+    project_id: str
+    document_id: str | None = None
+    audit_run_id: str | None = None
+    linter_name: str
+    linter_version: str
+    source_fingerprint: str
+    category: str
+    finding_type: str
+    severity: Literal["error", "warning", "info"] = "warning"
+    message: str
+    location: dict[str, Any] | None = None
+    detail: dict[str, Any] | None = None
+    status: Literal["open", "acknowledged", "resolved", "dismissed"] = "open"
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+    created_at: str
+    updated_at: str | None = None
+    resolved_at: str | None = None
+
+
+class LintFindingStatusUpdate(BaseModel):
+    """Body for transitioning a lint_finding's human-triage status. See
+    ``meridian.db.lint_finding.set_lint_finding_status`` — status moves
+    freely between any of the four values (no illegal-transition concept,
+    unlike ``AttemptTransitionRequest``'s attempt-status state machine)."""
+
+    project_id: str = Field(..., min_length=1)
+    status: Literal["open", "acknowledged", "resolved", "dismissed"]
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+
+
+class StructuralPatchDecision(BaseModel):
+    """Request shape for the human approval gate itself: approve or reject
+    a proposed structural_patch. See
+    ``meridian.db.structural_patch.transition_structural_patch`` --
+    ``decided_by_human_id`` is required there (and here) precisely because
+    an unattributed decision defeats the point of an approval gate."""
+
+    project_id: str = Field(..., min_length=1)
+    decision: Literal["approved", "rejected"]
+    decided_by_human_id: str = Field(
+        ..., min_length=1,
+        description="Required -- the human approval gate must record who decided.",
+    )
+    decision_note: str | None = None

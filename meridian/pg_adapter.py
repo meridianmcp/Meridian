@@ -3402,6 +3402,48 @@ async def _migrate_pg_experiment_model(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_lint_finding(conn: PostgresConnection) -> None:
+    """d2539453 — lint_findings: structured, version-pinned paper/manuscript
+    audit output. Mirrors db.lint_finding._migrate_lint_finding exactly —
+    see that module's docstring for the full schema and the two-axis
+    (document content via source_fingerprint, rule-set via linter_version)
+    version-pinning contract. Not present in the base CREATE_TABLES_CORE
+    literal — this guarded migration is the only creation path on Postgres,
+    matching _migrate_pg_experiment_model immediately above.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS lint_findings ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    document_id TEXT,"
+        "    audit_run_id TEXT,"
+        "    linter_name TEXT NOT NULL,"
+        "    linter_version TEXT NOT NULL,"
+        "    source_fingerprint TEXT NOT NULL,"
+        "    category TEXT NOT NULL,"
+        "    finding_type TEXT NOT NULL,"
+        "    severity TEXT NOT NULL DEFAULT 'warning'"
+        "        CHECK (severity IN ('error', 'warning', 'info')),"
+        "    message TEXT NOT NULL,"
+        "    location TEXT,"
+        "    detail TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'open'"
+        "        CHECK (status IN ('open', 'acknowledged', 'resolved', 'dismissed')),"
+        "    resolved_by TEXT,"
+        "    resolution_note TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    resolved_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_lint_findings_project "
+        "ON lint_findings(project_id, status);"
+        "CREATE INDEX IF NOT EXISTS idx_lint_findings_document "
+        "ON lint_findings(document_id);"
+        "CREATE INDEX IF NOT EXISTS idx_lint_findings_audit_run "
+        "ON lint_findings(audit_run_id);"
+    )
+
+
 async def _migrate_pg_ai_log_events(conn: PostgresConnection) -> None:
     """9e83be4a (Round 1 proposal e143949d) — ai_log_events: canonical,
     versioned, append-only ExecutionEvent storage (mirrors
@@ -4901,6 +4943,159 @@ async def _migrate_pg_external_job_register(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
+    """7c96d41b — Postgres mirror of the paper_contract schema: the
+    first-class versioned editorial-intent document for Meridian's
+    manuscript/paper editorial tooling line. Mirrors
+    db.paper_contract._migrate_paper_contract exactly — see that module's
+    docstring (and meridian.paper_contract's) for the full schema,
+    revision-numbering, and human-approval-gate contract.
+
+    ``paper_contracts.current_revision_id`` deliberately carries no
+    ``REFERENCES`` — same forward/mutable-pointer reasoning as
+    ``workspace_proposals.promoted_to_sprint_item_id`` above; it is
+    validated at the application layer (db.paper_contract), not by the
+    schema.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS paper_contracts ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    paper_key TEXT NOT NULL,"
+        "    title TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'draft'"
+        "        CHECK (status IN ('draft', 'active', 'archived')),"
+        "    current_revision_id TEXT,"
+        "    latest_revision_number INTEGER NOT NULL DEFAULT 0,"
+        "    created_by_human_id TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (project_id, paper_key)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_paper_contracts_project ON paper_contracts(project_id);"
+        "CREATE TABLE IF NOT EXISTS paper_contract_revisions ("
+        "    id TEXT PRIMARY KEY,"
+        "    contract_id TEXT NOT NULL REFERENCES paper_contracts(id),"
+        "    revision_number INTEGER NOT NULL,"
+        "    content_json TEXT NOT NULL,"
+        "    content_hash TEXT NOT NULL,"
+        "    change_summary TEXT,"
+        "    approval_status TEXT NOT NULL DEFAULT 'pending'"
+        "        CHECK (approval_status IN ('pending', 'approved', 'rejected')),"
+        "    approved_by_human_id TEXT,"
+        "    approved_at TEXT,"
+        "    superseded_by_revision_id TEXT REFERENCES paper_contract_revisions(id),"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (contract_id, revision_number)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_paper_contract_revisions_contract "
+        "ON paper_contract_revisions(contract_id, revision_number DESC);"
+    )
+
+
+async def _migrate_pg_paper_strategy_graph(conn: PostgresConnection) -> None:
+    """81b5491b — paper_strategy_nodes / paper_strategy_edges: SCHEMA:
+    paper_strategy_graph — argument-layer nodes and rhetorical edges for the
+    manuscript/paper editorial tooling line. Mirrors
+    db.paper_strategy_graph._migrate_paper_strategy_graph exactly — see that
+    module's docstring (and meridian.paper_strategy's) for the full schema,
+    versioning (family_id/version), and human-approval-gate (status) contract.
+    Not present in the base CREATE_TABLES_CORE literal — this guarded
+    migration is the only creation path on Postgres, matching
+    _migrate_pg_research_graph's identical shape.
+
+    The unique index on (project_id, family_id, version) is what makes the
+    version-numbering in create_strategy_node/supersede_strategy_node safe
+    against a duplicate version being inserted for the same family. The
+    unique index on paper_strategy_edges makes create_strategy_edge
+    idempotent on its natural (project, edge_kind, from, to) key, mirroring
+    research_edges' identical technique.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS paper_strategy_nodes ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    family_id TEXT NOT NULL,"
+        "    version INTEGER NOT NULL DEFAULT 1,"
+        "    node_type TEXT NOT NULL CHECK (node_type IN ("
+        "        'thesis', 'claim', 'counter_claim', 'evidence', 'warrant',"
+        "        'rebuttal', 'concession', 'motivation', 'framing_note')),"
+        "    document_ref TEXT,"
+        "    statement TEXT NOT NULL,"
+        "    rationale TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ("
+        "        'draft', 'approved', 'rejected', 'superseded')),"
+        "    approved_by TEXT,"
+        "    approved_at TEXT,"
+        "    rejection_reason TEXT,"
+        "    supersedes_id TEXT,"
+        "    superseded_by TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    updated_at TEXT"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_strategy_nodes_family_version "
+        "ON paper_strategy_nodes(project_id, family_id, version);"
+        "CREATE INDEX IF NOT EXISTS idx_paper_strategy_nodes_project "
+        "ON paper_strategy_nodes(project_id, status);"
+        "CREATE TABLE IF NOT EXISTS paper_strategy_edges ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    edge_kind TEXT NOT NULL CHECK (edge_kind IN ("
+        "        'supports', 'rebuts', 'concedes', 'qualifies', 'motivates',"
+        "        'contrasts', 'elaborates', 'restates')),"
+        "    from_node_id TEXT NOT NULL,"
+        "    to_node_id TEXT NOT NULL,"
+        "    label TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_strategy_edges_unique "
+        "ON paper_strategy_edges(project_id, edge_kind, from_node_id, to_node_id);"
+        "CREATE INDEX IF NOT EXISTS idx_paper_strategy_edges_from "
+        "ON paper_strategy_edges(project_id, from_node_id);"
+        "CREATE INDEX IF NOT EXISTS idx_paper_strategy_edges_to "
+        "ON paper_strategy_edges(project_id, to_node_id);"
+    )
+
+
+async def _migrate_pg_structural_patch(conn: PostgresConnection) -> None:
+    """6d109127 -- Postgres mirror of SCHEMA: structural_patch (a proposed
+    manuscript structural edit behind a human approval gate). See
+    db.structural_patch._migrate_structural_patch's docstring for the full
+    schema/approval-gate contract this reproduces exactly -- same columns,
+    same deliberate absence of a CHECK constraint on operation/status (see
+    that module's docstring for why), same soft (non-FK) document_id/
+    target_element_id references into doc_store's separately-owned schema.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS structural_patches ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    document_id TEXT NOT NULL,"
+        "    target_element_id TEXT,"
+        "    operation TEXT NOT NULL,"
+        "    payload TEXT NOT NULL DEFAULT '{}',"
+        "    rationale TEXT,"
+        "    base_content_hash TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'proposed',"
+        "    proposed_by_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    decided_by_human_id TEXT,"
+        "    decision_note TEXT,"
+        "    decided_at TEXT,"
+        "    applied_at TEXT,"
+        "    supersedes_patch_id TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_structural_patches_project_status "
+        "ON structural_patches(project_id, status, created_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_structural_patches_document "
+        "ON structural_patches(document_id, status);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -5025,4 +5220,8 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_project_scope,
     _migrate_pg_experiment_model,
     _migrate_pg_external_job_register,
+    _migrate_pg_paper_contract,
+    _migrate_pg_paper_strategy_graph,
+    _migrate_pg_lint_finding,
+    _migrate_pg_structural_patch,
 )

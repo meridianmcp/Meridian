@@ -736,7 +736,8 @@ class TestModeAwareMaxContentBytesDefaults:
         in tests/test_cov_handoff.py, and the "Wire-level truncation is
         never allowed to cut an executable body" section of
         docs/meridian-handoff-contract.md). Starter mode wraps its own
-        internal ``/goal`` block in a "Done:"/"# Pending" preview, so its
+        internal ``/goal`` block in a "Done in this handoff scope:"/"#
+        pending in this handoff scope" preview (943786c9), so its
         top-level content does not match the atomic-goal prefix check and
         the pre-existing bounded-truncation behavior this test pins remains
         observable, while the protected banner region is still present to

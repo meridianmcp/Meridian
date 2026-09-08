@@ -1148,6 +1148,10 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_proposal_project_scope(db)
     await _migrate_experiment_model(db)
     await _migrate_external_job_register(db)
+    await _migrate_paper_contract(db)
+    await _migrate_paper_strategy_graph(db)
+    await _migrate_lint_finding(db)
+    await _migrate_structural_patch(db)
     return db
 
 
@@ -12984,4 +12988,77 @@ from .experiment_model import (  # noqa: F401
     transition_attempt,
     heartbeat_attempt,
     reconcile_stale_attempts,
+)
+
+# 7c96d41b — SCHEMA: paper_contract, the first-class versioned editorial
+# intent document for Meridian's manuscript/paper editorial tooling line.
+# Imported LAST (after experiment_model) — depends on nothing above at
+# import time. See meridian.paper_contract for the closed CONTRACT_STATUSES/
+# REVISION_APPROVAL_STATUSES vocabularies and content-fingerprint helper,
+# and meridian.db.paper_contract's own module docstring for the full
+# schema/human-approval-gate contract. Schema-only: no MCP tool or HTTP
+# route is wired to this yet.
+from .paper_contract import (  # noqa: F401
+    _migrate_paper_contract,
+    create_paper_contract,
+    get_paper_contract,
+    get_paper_contract_by_key,
+    create_paper_contract_revision,
+    get_paper_contract_revision,
+    list_paper_contract_revisions,
+    approve_paper_contract_revision,
+)
+
+# 81b5491b — SCHEMA: paper_strategy_graph — argument-layer nodes and
+# rhetorical edges for the manuscript/paper editorial tooling line. Imported
+# LAST (after everything above, including research_graph/experiment_model) —
+# a two-table, versioned-with-approval-gate shape with no dependency on any
+# other db/*.py submodule at import time. See meridian.paper_strategy for the
+# closed NODE_TYPES/EDGE_TYPES vocabularies and meridian.db.paper_strategy_graph's
+# own module docstring for the full schema/versioning/approval-gate contract.
+from .paper_strategy_graph import (  # noqa: F401
+    _migrate_paper_strategy_graph,
+    create_strategy_node,
+    get_strategy_node,
+    list_strategy_node_versions,
+    get_current_strategy_node,
+    approve_strategy_node,
+    reject_strategy_node,
+    supersede_strategy_node,
+    create_strategy_edge,
+    get_strategy_edges_for_node,
+)
+
+# d2539453 — lint_finding: structured, version-pinned paper/manuscript audit
+# output. Imported LAST (after experiment_model) — depends on nothing above
+# at import time. See meridian.db.lint_finding's module docstring for the
+# full schema and the two-axis (document content + linter rule-set) version-
+# pinning contract this schema exists to serve.
+from .lint_finding import (  # noqa: F401
+    _migrate_lint_finding,
+    LINT_FINDING_SEVERITIES,
+    LINT_FINDING_STATUSES,
+    validate_lint_finding_severity,
+    validate_lint_finding_status,
+    create_lint_finding,
+    get_lint_finding,
+    list_lint_findings,
+    set_lint_finding_status,
+    check_finding_freshness,
+)
+
+# 6d109127 -- SCHEMA: structural_patch, a proposed manuscript structural edit
+# behind a human approval gate. Imported LAST (after experiment_model) --
+# depends on nothing above at import time. See meridian.structural_patch for
+# the closed PATCH_OPERATIONS/PATCH_STATUSES vocabularies and transition
+# rules, and meridian.db.structural_patch's own module docstring for the
+# full schema/approval-gate contract. Schema + minimal CRUD only -- no MCP
+# tool or route is wired to this yet (intentionally out of scope for this
+# sprint item).
+from .structural_patch import (  # noqa: F401
+    _migrate_structural_patch,
+    create_structural_patch,
+    get_structural_patch,
+    list_structural_patches,
+    transition_structural_patch,
 )

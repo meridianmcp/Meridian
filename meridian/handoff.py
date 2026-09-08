@@ -6512,6 +6512,19 @@ def _render_starter_handoff(
     re-typing a generic placeholder.
     ``diagnostic_tasks`` (77a29c8b), when non-empty, surfaces recent blocked/found
     entries so a post-/compact session is not blind to known gate failures.
+
+    943786c9 — follow-up to 682005f4(c)/524e73e6: the preview below states its
+    own scope explicitly (actual pending/previewed counts, "in this handoff
+    scope" qualifying both the Done and Pending headers, and an
+    active/claimable-vs-blocked-downstream split over whatever slice of the
+    pending list is actually previewed) so a reader can never mistake
+    "previewing 3" for "there are only 3", or an unqualified "Done: (none)"
+    for "nothing has ever shipped." The complete ordered executable item list
+    always lives in ``quick_start_goal`` below (see _build_quick_start_goal's
+    own ``<executor_item_ids>``/``<sprint_items>`` tags and, when a real
+    dependency graph exists, its ``<dependency_waves>`` tag) — this function
+    never re-derives or narrows that; it only makes the PROSE preview above it
+    honest about what it does and does not show.
     """
     pid = project["id"]
     name = project["name"]
@@ -6523,27 +6536,76 @@ def _render_starter_handoff(
         "",
         f"# Meridian — {name}",
     ]
-    # Last 5 completed (titles only — one line)
+    # Last 5 completed (titles only — one line). 943786c9 — "in this handoff
+    # scope" makes explicit that this is the completed set for THIS render's
+    # scope (version-scoped when the caller passed one), not the project's
+    # entire lifetime history — an unqualified "Done: (none)" previously read
+    # as "nothing has ever been completed," which is not what it meant.
     if completed_items:
         titles = [it["title"].split(".")[0].strip()[:60] for it in completed_items[:5]]
         extra = f" (+{len(completed_items) - 5} more)" if len(completed_items) > 5 else ""
-        lines += [f"Done: {', '.join(titles)}{extra}", ""]
+        lines += [f"Done in this handoff scope: {', '.join(titles)}{extra}", ""]
     else:
-        lines += ["Done: (none)", ""]
-    # Top 3 pending items with IDs — 682005f4(c): the header must not imply
-    # only 3 items exist when there are more; the actual claimable batch in
-    # quick_start_goal below always receives the FULL pending list regardless
-    # of how many are previewed here.
+        lines += ["Done in this handoff scope: (none)", ""]
+    # Top-3 pending PREVIEW — 943786c9 (follow-up to 682005f4(c)/524e73e6):
+    # state the actual counts plainly ("N pending in this handoff scope;
+    # previewing M") instead of the old asymmetric "# Pending" (N<=3, no
+    # count at all) / "# Pending (top 3 of N — ...)" (N>3) phrasing — the
+    # N<=3 case read as authoritative ("this IS the whole list") precisely
+    # because it carried no count, and the N>3 case buried its own count in
+    # a parenthetical footnote rather than stating it as the headline. The
+    # actual claimable batch in quick_start_goal below always receives the
+    # FULL pending list regardless of how many are previewed here — this
+    # header never narrows that, only the prose preview beneath it.
     _pending_total = len(pending_items)
-    if _pending_total > 3:
-        lines.append(f"# Pending (top 3 of {_pending_total} — full batch in /goal below)")
-    else:
-        lines.append("# Pending")
-    for i, it in enumerate(pending_items[:3], 1):
-        short_title = it["title"].strip()[:80]
-        lines.append(f"{i}. [{it['id'][:8]}] {short_title}")
+    _preview_items = pending_items[:3]
+    lines.append(
+        f"# {_pending_total} pending in this handoff scope; "
+        f"previewing {len(_preview_items)}"
+    )
     if not pending_items:
         lines.append("(none)")
+    else:
+        # 943786c9 — split the PREVIEWED slice (not the whole pending list —
+        # this stays a bounded preview) into the active/claimable dependency
+        # wave vs items still blocked on a not-yet-satisfied predecessor, so
+        # a reader never mistakes "previewed together" for "equally
+        # actionable right now." ``frontier_ready``/``frontier_blocking_
+        # predecessors`` (83a7586d) are annotated in place, on these SAME
+        # dicts, by ``_build_quick_start_goal`` — which every caller of this
+        # function (``_generate_starter_handoff``) always invokes first, on
+        # the identical ``pending_items`` list, precisely so this annotation
+        # is already present here. ``.get(..., True)`` fails open to
+        # "claimable" if this function is ever called before that (e.g. a
+        # future caller that skips quick_start_goal entirely) rather than
+        # mislabeling every item as blocked.
+        _claimable = [it for it in _preview_items if it.get("frontier_ready", True)]
+        _blocked = [it for it in _preview_items if not it.get("frontier_ready", True)]
+        if _blocked:
+            if _claimable:
+                lines.append("## Claimable now")
+                for i, it in enumerate(_claimable, 1):
+                    short_title = it["title"].strip()[:80]
+                    lines.append(f"{i}. [{it['id'][:8]}] {short_title}")
+            lines.append("## Blocked (downstream — waiting on a predecessor)")
+            for it in _blocked:
+                _pred_ids = [
+                    p.get("id")
+                    for p in (it.get("frontier_blocking_predecessors") or [])
+                    if p.get("id")
+                ]
+                _pred_txt = (
+                    ", ".join(_pred[:8] for _pred in _pred_ids)
+                    if _pred_ids else "an earlier item"
+                )
+                short_title = it["title"].strip()[:80]
+                lines.append(
+                    f"- [{it['id'][:8]}] {short_title} (blocked on {_pred_txt})"
+                )
+        else:
+            for i, it in enumerate(_preview_items, 1):
+                short_title = it["title"].strip()[:80]
+                lines.append(f"{i}. [{it['id'][:8]}] {short_title}")
     # 77a29c8b — surface recent diagnostic entries (blocked/found) so a post-/compact
     # session sees known gate failures without having to fetch the full task log.
     if diagnostic_tasks:
@@ -13439,10 +13501,12 @@ async def _generate_starter_handoff(
 
     Contains only the essentials: project_id, start_session command,
     last 5 completed sprint items (titles), a top-3 pending-items PREVIEW with
-    IDs (682005f4(c): honestly labeled "top 3 of N" when N > 3 — the actual
-    claimable batch in quick_start_goal below always carries the full list),
-    and a ready-to-paste /goal string.  No decisions, no north star, no
-    file paths — just enough to orient and execute.
+    IDs (682005f4(c)/943786c9: honestly labeled "N pending in this handoff
+    scope; previewing M", split into an active/claimable wave vs a downstream
+    blocked wave when the previewed slice mixes both — the actual claimable
+    batch in quick_start_goal below always carries the full list), and a
+    ready-to-paste /goal string.  No decisions, no north star, no file paths
+    — just enough to orient and execute.
 
     ``version`` (efaa918a) — optional sprint-version bucket to scope BOTH the
     "recently completed" and pending/claimable lists to. ``None`` preserves
@@ -13776,7 +13840,8 @@ async def _generate_goal_only_handoff(
 
     No readiness header, no workspace decisions/notes, no L0/L1/L2 context —
     unlike every other mode (including ``starter``/``compact``, which still
-    carries a "Done:"/"# Pending" preview frame around the /goal string).
+    carries a "Done in this handoff scope:"/"# pending in this handoff
+    scope" preview frame (943786c9) around the /goal string).
     This is for a caller that wants nothing but the executor-facing directive
     itself, e.g. to hand straight to a fresh sub-agent with zero framing.
 
