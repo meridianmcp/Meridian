@@ -1305,6 +1305,176 @@ async def promote_workspace_proposal(
     }
 
 
+async def promote_workspace_proposal_with_children(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    project_id: str,
+    children: "list[dict[str, Any]]",
+    *,
+    sprint_item_title: str | None = None,
+    sprint_item_version: str | None = None,
+    tenant_id: str | None = None,
+    touches_resources: list[str] | None = None,
+    infer_touches_resources: bool = False,
+    allow_project_transfer: bool = False,
+    transfer_reason: str | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """a2bd8c35 — one-to-many promotion lineage: promote ``proposal_id`` into
+    ONE root investigation sprint item plus N implementation CHILD sprint
+    items, each with its own durable ``proposal_evidence_links`` row back to
+    the SAME proposal.
+
+    The root investigation is created by delegating 100% to
+    :func:`promote_workspace_proposal` — every existing guard there (not
+    found / wrong tenant / wrong status, the a8afd8f9 project-scope-mismatch
+    check, the 867317f6 lost-promotion-race guard, atomic compensation on a
+    mid-write failure) applies completely unchanged; this function adds
+    nothing to that step besides the children created afterward.
+
+    Each entry in ``children`` becomes a real ``sprint_items`` row with
+    ``parent_id`` set to the root investigation's id — the SAME tree
+    primitive :func:`meridian.db.sprint_items.add_subtask` inserts, but
+    unchained (``add_subtask``'s owner-chaining is a distinct feature this
+    function does not use: every child here is independently claimable) —
+    and a durable :func:`meridian.db.proposal_links.link_proposal_evidence`
+    row (``entity_type='sprint_item'``) back to ``proposal_id``. Before this,
+    ``promote_workspace_proposal`` could only ever produce ONE sprint item
+    per proposal and ONE evidence link for it; a proposal whose investigation
+    fans out into several implementation tasks had no durable way to record
+    that they all trace back to the same proposal except the informal
+    ``item_group``-prefix convention ``proposal_evidence_links`` itself was
+    built to replace (see ``meridian.db.proposal_links``'s module docstring).
+
+    ``children`` — a non-empty list of ``{"title": str, optional
+    "touches_resources": list[str], optional "owner": "human"|"ai"|None}``.
+    Validated BEFORE any write: raises ``ValueError`` if ``children`` is
+    empty/falsy, or any entry is missing a non-blank ``title`` or carries an
+    invalid ``owner`` — fail closed on malformed input rather than leaving a
+    partially-created batch of children behind. A caller that wants a single
+    flat sprint item with no children should keep calling
+    :func:`promote_workspace_proposal` directly — unchanged by this addition.
+
+    Each child inherits the root investigation's ``version`` (mirrors
+    ``add_subtask``'s "inherits version from parent" contract) and starts
+    ``status='pending'``.
+
+    Failure semantics: the root promotion commits durably before any child is
+    attempted (via ``promote_workspace_proposal``'s own ``db.commit()``) and
+    is NEVER rolled back by a later child-creation failure — a promoted
+    proposal is never silently un-promoted, matching every other proposal-
+    promotion helper in this module. If a child INSERT fails partway through
+    the batch, the children already inserted by THIS call are compensated
+    (deleted) before the error is re-raised, so a partial batch never leaves
+    a straggling, evidence-unlinked child behind. Evidence-linking failures
+    for individual children are non-fatal (mirrors the root's own
+    ``evidence_link`` best-effort behavior above) — a failed link surfaces as
+    ``None`` in that child's ``evidence_link`` rather than blocking the rest
+    of the batch or un-creating the child's sprint item.
+    """
+    if not children:
+        raise ValueError(
+            "promote_workspace_proposal_with_children requires at least one "
+            "entry in `children` — call promote_workspace_proposal directly "
+            "for a single flat sprint item with no children."
+        )
+    cleaned_children: list[dict[str, Any]] = []
+    for idx, spec in enumerate(children):
+        if not isinstance(spec, dict):
+            raise ValueError(f"children[{idx}] must be an object, got {type(spec).__name__}")
+        title = (spec.get("title") or "").strip()
+        if not title:
+            raise ValueError(
+                f"children[{idx}] is missing a non-blank 'title' — every "
+                "implementation child must be named before any write."
+            )
+        owner = spec.get("owner")
+        if owner not in (None, "human", "ai"):
+            raise ValueError(f"children[{idx}].owner must be 'human', 'ai', or None")
+        cleaned_children.append({
+            "title": title,
+            "owner": owner,
+            "touches_resources": spec.get("touches_resources"),
+        })
+
+    root_result = await promote_workspace_proposal(
+        db, proposal_id, project_id,
+        sprint_item_title=sprint_item_title,
+        sprint_item_version=sprint_item_version,
+        tenant_id=tenant_id,
+        touches_resources=touches_resources,
+        infer_touches_resources=infer_touches_resources,
+        allow_project_transfer=allow_project_transfer,
+        transfer_reason=transfer_reason,
+    )
+    root_id = root_result["sprint_item_id"]
+
+    # Lazy import: get_sprint_item / link_proposal_evidence live in sibling
+    # submodules imported onto meridian.db AFTER this module — same pattern
+    # as the link_proposal_evidence / request_hitl lazy imports above.
+    from meridian.db import get_sprint_item, link_proposal_evidence  # noqa: PLC0415
+
+    root_item = await get_sprint_item(db, root_id)
+    version = (root_item or {}).get("version") or (sprint_item_version or "current")
+
+    created_children: list[dict[str, Any]] = []
+    try:
+        for spec in cleaned_children:
+            resources_json: str | None = None
+            if spec["touches_resources"]:
+                try:
+                    resources_json = serialize_touches_resources(spec["touches_resources"])
+                except Exception:  # noqa: BLE001 — never block child creation
+                    resources_json = None
+            cid = _new_id()
+            await db.execute(
+                "INSERT INTO sprint_items "
+                "(id, project_id, version, title, status, touches_resources, "
+                "parent_id, owner) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (cid, project_id, version, spec["title"], resources_json, root_id, spec["owner"]),
+            )
+            created_children.append({"id": cid, "title": spec["title"]})
+    except Exception as exc:  # noqa: BLE001 — classified below
+        # Roll back only the children THIS call inserted — the already-
+        # committed root promotion is never touched (see docstring). Mirrors
+        # promote_workspace_proposal's own _undo_proposal_writes usage: a
+        # best-effort compensation, never a db.commit()/rollback() call (see
+        # that helper's own docstring for why on a shared SQLite connection).
+        await _undo_proposal_writes(
+            db,
+            [("DELETE FROM sprint_items WHERE id = ?", (c["id"],)) for c in created_children],
+        )
+        if _is_proposal_schema_drift_error(exc):
+            raise ProposalSchemaError(
+                "promote_workspace_proposal_with_children aborted while "
+                f"inserting a child sprint item: schema looks mid-migration "
+                f"on this backend ({exc}). The root investigation "
+                f"'{root_id}' was already promoted and is NOT rolled back; "
+                "no child sprint items were left behind. Run pending "
+                "migrations and retry with the same children."
+            ) from exc
+        raise
+    await db.commit()
+
+    for child in created_children:
+        try:
+            link = await link_proposal_evidence(
+                db, project_id, proposal_id, "sprint_item", child["id"],
+                label=f"implementation child: {child['title']}", actor=actor,
+            )
+        except Exception:  # noqa: BLE001 — evidence-linking must never
+            link = None            # retroactively fail a promotion whose
+                                    # sprint items already committed.
+        child["evidence_link"] = link
+
+    return {
+        **root_result,
+        "root_sprint_item_id": root_id,
+        "root_sprint_item_title": root_result.get("sprint_item_title"),
+        "children": created_children,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 3f892ea6 — deterministic proposal intake blocks: provenance-preserving
 # block parsing, idempotent ingest, and explicit sprint promotion.
