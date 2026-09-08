@@ -272,6 +272,55 @@ def test_posix_backend_close_process_lookup_error_is_success(monkeypatch):
     assert handle.closed is True
 
 
+@pytest.mark.skipif(
+    sys.platform not in ("linux", "linux2"),
+    reason="zombie-reap semantics require a real POSIX process table (/proc)",
+)
+def test_posix_backend_close_without_popen_reaps_real_child_no_zombie_left():
+    """Deliberate exception to this file's own 'all OS calls mocked' rule
+    (module docstring, section 3): zombie-reaping cannot be verified with a
+    mock, only with a real process. Regression test for a real bug found on
+    Linux CI 2026-09-08: close() on a handle with no ``popen`` attached (the
+    exact shape LocalRunner.stop() builds when it is a DIFFERENT Python
+    object than the one that originally spawned the child -- e.g. a fresh
+    LocalRunner reconstructed from an on-disk record in a later CLI
+    invocation) went through the signal-then-poll path in
+    ``_signal_and_wait`` without ever calling ``Popen.wait()``/``os.waitpid``.
+    A signalled child nobody waits on becomes a zombie -- still fully
+    present for ``kill(pid, 0)`` / ``psutil.pid_exists()`` (POSIX keeps a
+    zombie's PID entry until reaped) -- so ``close()`` kept reporting the
+    process as alive (or, worse, silently leaked a zombie once the poll
+    window elapsed) instead of confirming a clean stop.
+    """
+    import os
+    import subprocess
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    pid = proc.pid
+    try:
+        handle = pl.OwnedProcessHandle(
+            run_id="r", pid=pid, executable=sys.executable, cwd=None,
+            cmdline=[sys.executable], group_id=pid, popen=None,
+        )
+        backend = pl.PosixProcessGroupBackend()
+        ok = backend.close(handle, grace_seconds=3.0)
+        assert ok is True
+        # Fully reaped, not merely signalled-but-zombied: /proc/<pid> must
+        # be gone entirely (a zombie's /proc/<pid> entry persists, with
+        # State: Z, until its parent reaps it).
+        assert not os.path.exists(f"/proc/{pid}")
+    finally:
+        # Best-effort cleanup in case the assertion above ever fails again --
+        # never leak a zombie into the rest of the test session.
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # ---------------------------------------------------------------------------
 # 4. enable_child_subreaper -- injectable libc, never touches real prctl
 # ---------------------------------------------------------------------------

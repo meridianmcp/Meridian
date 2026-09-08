@@ -287,9 +287,39 @@ class PosixProcessGroupBackend:
         return ok
 
     @staticmethod
+    def _reap_leader(pgid: int) -> None:
+        """Best-effort non-blocking reap of the group leader (``pgid`` is
+        always the leader's own pid -- see :meth:`adopt`'s ``group_id=pid``).
+
+        Only the process's REAL OS parent can reap it, and only this class's
+        signal-then-poll path (the ``handle.popen is None`` branch of
+        :meth:`_signal_and_wait`, reached when *this* backend object is a
+        DIFFERENT Python object than the one that originally spawned the
+        child -- e.g. a fresh ``LocalRunner`` built from an on-disk record
+        for a ``stop`` invocation) never calls ``Popen.wait()`` at all. A
+        signalled child that nobody waits on becomes a zombie: still very
+        much present in ``kill(pid, 0)`` / ``psutil.pid_exists()`` terms
+        (POSIX keeps a zombie's PID entry until reaped), so without this,
+        ``_group_alive`` -- and therefore ``LocalRunner._is_pid_alive``,
+        which reads the same live-or-gone signal right after ``stop()`` --
+        would keep reporting a cleanly-terminated process as still running.
+        ``os.waitpid(pid, os.WNOHANG)`` is safe to call speculatively: it
+        returns immediately (never blocks) whether or not the child has
+        exited yet, and raising ``ChildProcessError`` just means we are not
+        (or are no longer) its waitable parent -- never a real error here.
+        """
+        try:
+            os.waitpid(pgid, os.WNOHANG)
+        except ChildProcessError:
+            pass  # not our child (already reaped, or never was) -- fine
+        except Exception:  # noqa: BLE001 — best-effort, must never break close()
+            pass
+
+    @staticmethod
     def _group_alive(pgid: int) -> bool:
         if _killpg is None:
             return False  # no way to signal/check on this platform -- treat as gone
+        PosixProcessGroupBackend._reap_leader(pgid)
         try:
             _killpg(pgid, 0)
             return True
