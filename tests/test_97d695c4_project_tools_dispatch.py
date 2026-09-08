@@ -51,6 +51,7 @@ EXPECTED_HANDLER_NAMES = [
     "handle_create_project",
     "handle_set_parent_project",
     "handle_rename_project",
+    "handle_set_project_execution_mode",
     "handle_register_session",
     "handle_start_session",
     "handle_list_projects",
@@ -321,6 +322,110 @@ async def test_rename_project_handler_direct(db, project):
         db, _DATA_DIR, None, None
     )
     assert result["name"] == "direct-renamed"
+
+
+# ---------------------------------------------------------------------------
+# set_project_execution_mode (c39a1bd3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_set_project_execution_mode_dispatch(db, project):
+    pid = project["id"]
+    result = await mh._handle_project_tools(
+        "set_project_execution_mode",
+        {"project_id": pid, "execution_mode": "interactive"},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" not in result
+    assert result["execution_mode"] == "interactive"
+
+
+@pytest.mark.asyncio
+async def test_set_project_execution_mode_repairs_existing_project(db, project):
+    """The concrete acceptance scenario: a project created with one posture
+    can later be repaired to the other WITHOUT recreating it — the gap this
+    tool closes (workspace execution_mode_default only cascades at creation
+    time, and create_project only accepts execution_mode at creation)."""
+    pid = project["id"]
+    assert project["execution_mode"] == "autonomous"  # db default
+    result = await mh._handle_project_tools(
+        "set_project_execution_mode",
+        {"project_id": pid, "execution_mode": "interactive"},
+        db, _DATA_DIR, None, None
+    )
+    assert result["execution_mode"] == "interactive"
+    back = await mh._handle_project_tools(
+        "set_project_execution_mode",
+        {"project_id": pid, "execution_mode": "autonomous"},
+        db, _DATA_DIR, None, None
+    )
+    assert back["execution_mode"] == "autonomous"
+
+
+@pytest.mark.asyncio
+async def test_set_project_execution_mode_by_name(db, project):
+    result = await mh._handle_project_tools(
+        "set_project_execution_mode",
+        {"project_name": project["name"], "execution_mode": "interactive"},
+        db, _DATA_DIR, None, None
+    )
+    assert result["execution_mode"] == "interactive"
+    assert result["id"] == project["id"]
+
+
+@pytest.mark.asyncio
+async def test_set_project_execution_mode_missing_id(db):
+    result = await mh._handle_project_tools(
+        "set_project_execution_mode",
+        {"project_id": "", "execution_mode": "autonomous"},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+    assert "project_id" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_set_project_execution_mode_missing_mode(db, project):
+    result = await mh._handle_project_tools(
+        "set_project_execution_mode",
+        {"project_id": project["id"], "execution_mode": ""},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+    assert "execution_mode" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_set_project_execution_mode_unknown_project(db):
+    result = await mh._handle_project_tools(
+        "set_project_execution_mode",
+        {"project_id": "does-not-exist", "execution_mode": "autonomous"},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_set_project_execution_mode_invalid_value_normalizes(db, project):
+    """db.set_project_execution_mode normalizes an invalid mode to
+    'autonomous' rather than raising -- confirm that passes through
+    unchanged via the MCP dispatch path."""
+    result = await mh._handle_project_tools(
+        "set_project_execution_mode",
+        {"project_id": project["id"], "execution_mode": "bogus"},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" not in result
+    assert result["execution_mode"] == "autonomous"
+
+
+@pytest.mark.asyncio
+async def test_set_project_execution_mode_handler_direct(db, project):
+    result = await pt_mod.handle_set_project_execution_mode(
+        {"project_id": project["id"], "execution_mode": "interactive"},
+        db, _DATA_DIR, None, None
+    )
+    assert result["execution_mode"] == "interactive"
 
 
 # ---------------------------------------------------------------------------
