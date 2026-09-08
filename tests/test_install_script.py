@@ -123,9 +123,24 @@ _GOOD_POLICY = "set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())"
 _BAD_POLICY = "set_event_loop_policy(asyncio.DefaultEventLoopPolicy())"
 
 
-def test_tunnel_main_uses_selector_event_loop_policy():
+def test_tunnel_main_does_not_force_selector_event_loop_policy():
+    """7b457c55 — REVERSED from this test's own prior assertion (was: MUST
+    force WindowsSelectorEventLoopPolicy). tunnel_main.py is the slim,
+    tunnel-ONLY PyInstaller entry point (no --mcp/--server dispatch exists in
+    it at all); forcing SelectorEventLoopPolicy here — originally needed for
+    a psycopg_pool issue that predates this module's later split into a
+    pure, psycopg-free tunnel-only entry point — broke every
+    run_cmd/run_verification call (asyncio.create_subprocess_exec/_shell
+    raises a bare NotImplementedError on Windows' SelectorEventLoop; see
+    docs/meridian-local-runner-tunnel-investigation-2026-08-31.md). This
+    entry point now matches meridian/__main__.py's own --tunnel carve-out
+    (see test_main_entry_uses_selector_event_loop_policy's docstring below —
+    that assertion is unchanged: __main__.py's non-tunnel/--mcp dispatch
+    still needs SelectorEventLoop for psycopg3, and its --tunnel branch
+    already skipped forcing it, which is exactly the behavior mirrored here).
+    """
     src = (_REPO_ROOT / "meridian" / "tunnel_main.py").read_text(encoding="utf-8")
-    assert _GOOD_POLICY in src
+    assert _GOOD_POLICY not in src
     assert _BAD_POLICY not in src
 
 

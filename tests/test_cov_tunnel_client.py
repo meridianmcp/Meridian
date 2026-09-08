@@ -2381,13 +2381,16 @@ def test_run_tunnel_code_slot_wired_with_dedicated_cache_and_reuse(monkeypatch, 
     real_slot_proxy = tc.SlotProxy
 
     class _RecordingSlotProxy(real_slot_proxy):
-        def __init__(self, cmd, port, label, env=None, client_id="", reuse_existing=False):
+        def __init__(
+            self, cmd, port, label, env=None, client_id="", reuse_existing=False,
+            use_owned_lifecycle=False,
+        ):
             if label == "code":
                 captured["env"] = env
                 captured["reuse_existing"] = reuse_existing
             super().__init__(
                 cmd, port, label, env=env, client_id=client_id,
-                reuse_existing=reuse_existing,
+                reuse_existing=reuse_existing, use_owned_lifecycle=use_owned_lifecycle,
             )
 
     monkeypatch.setattr(tc, "SlotProxy", _RecordingSlotProxy)
