@@ -28,26 +28,34 @@ import asyncio
 import os
 import sys
 
-# psycopg3 requires SelectorEventLoop on Windows (ProactorEventLoop is not
-# supported). The tunnel client itself does not use psycopg, but websockets /
-# subprocess pipe transports are also happier on the SelectorEventLoop, and we
-# mirror __main__.py's handling so behaviour is identical across entry points.
-# Must run before any asyncio.run()/loop call.
+# 7b457c55 — REVERSED (was: force WindowsSelectorEventLoopPolicy here). This
+# module is the slim, tunnel-ONLY PyInstaller entry point (no --mcp/--server
+# dispatch exists in this binary at all — see the module docstring), and the
+# tunnel's own `run_cmd` control-message handling
+# (tunnel_client._handle_run_cmd, used by run_verification) spawns child
+# processes via asyncio.create_subprocess_exec/_shell. Those asyncio-native
+# subprocess APIs raise a bare, message-less NotImplementedError on Windows'
+# SelectorEventLoop — they require a Proactor-compatible loop. Forcing
+# WindowsSelectorEventLoopPolicy here (originally added for a psycopg_pool
+# issue that predates this module's later split into a pure, psycopg-free
+# tunnel-only entry point — see the historical f73810d5/3ac13517 note this
+# comment replaces) broke every run_cmd/run_verification call made through
+# the compiled `meridian.exe` tunnel binary on Windows — confirmed live via
+# docs/meridian-local-runner-tunnel-investigation-2026-08-31.md ("the slim
+# tunnel entrypoint can force a selector loop while tunnel command handling
+# uses asyncio subprocess APIs that require a Proactor-compatible loop on
+# Windows").
 #
-# f73810d5/3ac13517 — this MUST be WindowsSelectorEventLoopPolicy, not
-# DefaultEventLoopPolicy(). On Windows DefaultEventLoopPolicy() *is* the
-# ProactorEventLoopPolicy: setting it and then hand-installing one SelectorEventLoop
-# fixes only the current loop, while any loop later derived through the policy
-# (e.g. psycopg_pool's async connection machinery) is still a ProactorEventLoop —
-# which surfaced as psycopg_pool.PoolTimeout / total tunnel-startup failure in the
-# compiled binary even though the source's __main__.py was correct. The fix in
-# __main__.py was never mirrored here, so the frozen .exe shipped the bug.
-if sys.platform == "win32":
-    import selectors
-
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    _loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
-    asyncio.set_event_loop(_loop)
+# meridian/__main__.py's own `--tunnel` dispatch already carries the
+# identical fix (see its module-scope comment: "Skipped for --tunnel mode...
+# Leaving tunnel mode on the Windows-default ProactorEventLoop... fixes
+# that") — this was the one tunnel entry point that never got it mirrored.
+# Unlike __main__.py, this module has NO competing --mcp/server mode that
+# would need SelectorEventLoop for psycopg3, so the fix here is simply: do
+# not force anything, and let Windows' own default policy (Proactor) apply.
+# This never touches meridian/__main__.py's real MCP stdio dispatch (--mcp),
+# which keeps forcing SelectorEventLoop exactly as before — that protocol
+# path is untouched by this module entirely.
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -108,9 +116,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def _resolve_loop() -> asyncio.AbstractEventLoop:
     """Return a usable event loop without relying on get_event_loop() state.
 
-    On Windows the module-scope SelectorEventLoop (set at import) is preferred so
-    psycopg/websocket transports behave. If it is missing or closed, fall back to
-    a brand-new SelectorEventLoop (win32) or a plain new loop (other platforms).
+    7b457c55 — no longer forces a SelectorEventLoop on Windows (see the
+    module-scope comment above for the confirmed bug this reverses: this
+    entry point is tunnel-only, and the tunnel's run_cmd/run_verification
+    handling needs asyncio.create_subprocess_exec/_shell, which requires a
+    Proactor-compatible loop on Windows). Falls back to Windows' own default
+    policy (Proactor) when there is no usable ambient loop, instead of a
+    hand-built SelectorEventLoop.
     """
     try:
         loop = asyncio.get_event_loop_policy().get_event_loop()
@@ -119,12 +131,7 @@ def _resolve_loop() -> asyncio.AbstractEventLoop:
     except RuntimeError:
         pass
 
-    if sys.platform == "win32":
-        import selectors
-
-        loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
-    else:
-        loop = asyncio.new_event_loop()
+    loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     return loop
 

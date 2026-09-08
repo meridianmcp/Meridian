@@ -16,6 +16,8 @@ import asyncio
 import subprocess
 import sys
 
+import pytest
+
 from meridian import tunnel_main
 
 
@@ -156,6 +158,66 @@ def test_main_handles_keyboard_interrupt(monkeypatch):
 
     monkeypatch.setattr(tunnel_client, "run_tunnel", boom)
     assert tunnel_main.main([]) == 0
+
+
+# ---------------------------------------------------------------------------
+# 7b457c55 — Windows event-loop/subprocess compatibility regression test.
+#
+# Confirmed live bug (docs/meridian-local-runner-tunnel-investigation-
+# 2026-08-31.md): this module used to force WindowsSelectorEventLoopPolicy
+# at import time. tunnel_client._handle_run_cmd (used by run_verification's
+# run_cmd control message) spawns children via
+# asyncio.create_subprocess_exec/_shell, which raise a bare, message-less
+# NotImplementedError on a Windows SelectorEventLoop — they require a
+# Proactor-compatible loop. meridian/__main__.py's own --tunnel dispatch
+# already carries the equivalent fix; this was the one entry point (the
+# frozen meridian.exe binary) that never got it mirrored.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_loop_does_not_force_selector_event_loop_on_windows():
+    """_resolve_loop() must not hand back a SelectorEventLoop on Windows —
+    that is exactly the loop type that breaks asyncio subprocess spawning
+    (see module comment above). Only meaningful on Windows; elsewhere
+    Selector/Proactor is not a real distinction."""
+    if sys.platform != "win32":
+        pytest.skip("SelectorEventLoop/ProactorEventLoop distinction is Windows-only")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        resolved = tunnel_main._resolve_loop()
+        assert not isinstance(resolved, asyncio.SelectorEventLoop)
+    finally:
+        loop.close()
+
+
+def test_resolved_loop_supports_asyncio_subprocess_on_windows():
+    """End-to-end regression test for the confirmed bug: a loop resolved by
+    this module's own _resolve_loop() must actually be able to run
+    asyncio.create_subprocess_exec (what tunnel_client._handle_run_cmd uses
+    for run_verification) without raising NotImplementedError.
+
+    Runs in a clean subprocess: importing meridian.tunnel_main has real,
+    process-wide asyncio event-loop-policy side effects (module-scope code),
+    so a prior test/import in the SAME process could otherwise mask or
+    leak state across this check. Only meaningful on Windows — Selector vs
+    Proactor loops behave identically for subprocess support elsewhere.
+    """
+    if sys.platform != "win32":
+        pytest.skip("SelectorEventLoop/ProactorEventLoop subprocess support only differs on Windows")
+    code = (
+        "import asyncio, sys\n"
+        "import meridian.tunnel_main as tm\n"
+        "loop = tm._resolve_loop()\n"
+        "async def _probe():\n"
+        "    proc = await asyncio.create_subprocess_exec(sys.executable, '-c', 'pass')\n"
+        "    return await proc.wait()\n"
+        "rc = loop.run_until_complete(_probe())\n"
+        "print('OK', rc)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "OK 0" in result.stdout
 
 
 # ---------------------------------------------------------------------------

@@ -3520,6 +3520,38 @@ def _close_owned_process(
 
 _SERENA_OWNED_LIFECYCLE_DISABLE_ENV = "MERIDIAN_DISABLE_OWNED_SERENA_LIFECYCLE"
 
+# 7b457c55 — TUNNEL-P0-HARDENING: the same opt-out pattern as
+# _SERENA_OWNED_LIFECYCLE_DISABLE_ENV above, for every OTHER runner-owned
+# slot (fs/code/extract/office). Per the local-runner/tunnel investigation
+# (docs/meridian-local-runner-tunnel-investigation-2026-08-31.md — "The
+# normal run_tunnel() slot construction does not consistently opt every
+# child into the existing owned-process lifecycle and budget watchdog. The
+# budget machinery exists, but existence is not enforcement"), every
+# SlotProxy run_tunnel() constructs now passes use_owned_lifecycle=True by
+# default (see each SlotProxy(...) call site in run_tunnel), so every
+# runner-owned slot gets Windows Job-Object / POSIX process-group tree
+# ownership AND is eligible for the host-local memory/CPU budget watchdog
+# (_budget_watchdog, scheduled alongside each slot's _idle_killer task —
+# see run_tunnel's task-scheduling section). This flag is the emergency
+# escape hatch back to the pre-hardening behaviour (bare Popen,
+# single-pid teardown, no budget enforcement) for a host where Job Object
+# creation is blocked by policy, or while ruling out a suspected regression
+# in the new path — checked fresh on every SlotProxy construction, never
+# cached, so it can be flipped between tunnel restarts without a code
+# change.
+_SLOT_OWNED_LIFECYCLE_DISABLE_ENV = "MERIDIAN_DISABLE_OWNED_SLOT_LIFECYCLE"
+
+
+def _slot_owned_lifecycle_enabled() -> bool:
+    """True unless explicitly opted out via
+    MERIDIAN_DISABLE_OWNED_SLOT_LIFECYCLE=1 (see the flag's own docstring
+    above). This is what makes every runner-owned SlotProxy use the owned
+    process lifecycle (job-object/process-group tree ownership + budget
+    watchdog eligibility) BY DEFAULT, closing the "existence is not
+    enforcement" gap the investigation doc identified — while keeping a
+    documented, tested way back to the old behaviour if it's ever needed."""
+    return os.environ.get(_SLOT_OWNED_LIFECYCLE_DISABLE_ENV, "").strip() != "1"
+
 
 def _owned_serena_lifecycle_disabled() -> bool:
     """Opt-out escape hatch (42a320dd): set to ``"1"`` to restore the exact
@@ -4074,8 +4106,49 @@ def _is_slot_claimed_by_live_client(port: int, current_client_id: str) -> bool:
         return False
 
 
+def _report_unknown_port_occupant(port: int, label: str, pid: int) -> None:
+    """Report (never kill) a process occupying *port* with NO Meridian
+    slot-claim identity evidence on record (7b457c55).
+
+    Replaces the prior broad behaviour of killing whatever was listening on
+    a slot's expected port with zero evidence it was ever a Meridian
+    process — the "broad port-only startup cleanup" the local-runner/tunnel
+    investigation flagged as unsafe (it "can terminate an unrelated process
+    or a concurrent tunnel instance"). A genuinely stale MERIDIAN instance
+    always has a claim file for its port (written by
+    :func:`_write_slot_claim` the moment it started serving) even after its
+    owning tunnel process has died — see :func:`_kill_stale_port_occupant`,
+    which still cleans those up exactly as before. An occupant with NO claim
+    file at all carries no such evidence and could be any unrelated process
+    (another application that happens to be bound to the same port, or a
+    port collision from something entirely outside Meridian) — this reports
+    it clearly instead, so an operator can investigate rather than having it
+    silently killed.
+
+    Best-effort process-name lookup for a more actionable message; degrades
+    to a bare PID when psutil details are unavailable. Never raises.
+    """
+    proc_name = ""
+    try:
+        import psutil  # type: ignore
+        proc_name = psutil.Process(pid).name()
+    except Exception:  # noqa: BLE001 — best-effort detail only
+        proc_name = ""
+    detail = f" ({proc_name})" if proc_name else ""
+    print(
+        f"tunnel:{label}: port {port} is already occupied by pid {pid}{detail} "
+        "with no Meridian slot-claim identity on record — NOT killing it "
+        "(unknown occupant). If this is a stale Meridian process, stop it "
+        "manually, or clear ~/.meridian/slot_claims and retry; this slot may "
+        "fail to bind until the port is free.",
+        file=sys.stderr, flush=True,
+    )
+
+
 def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = "") -> None:
-    """Kill whatever process is already listening on ``port``, if any (44892730).
+    """Kill whatever process is already listening on ``port``, IF it carries
+    Meridian slot-claim identity evidence; otherwise report it (44892730,
+    revised 7b457c55).
 
     aaddb273 — extended with per-client liveness tracking: if *current_client_id*
     is provided and a slot-claim file for *port* records a DIFFERENT client whose
@@ -4085,10 +4158,21 @@ def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = ""
     tunnel" (safe to kill) from "still owned by another currently-active client"
     (must NOT kill).
 
+    7b457c55 — identity/lease-aware stale-instance handling (TUNNEL-P0-HARDENING):
+    beyond the live-client guard above, an occupant is only ever KILLED when a
+    slot-claim file exists for *port* at all — i.e. some Meridian tunnel process
+    claimed this exact port at some point (see :func:`_write_slot_claim`), even if
+    its owning tunnel has since died (a genuine stale instance, the case this
+    function exists to clean up). An occupant with NO claim file on record carries
+    zero evidence it was ever ours; it is reported via
+    :func:`_report_unknown_port_occupant` instead of being killed — replacing the
+    prior broad "kill whatever is listening on this port" behaviour the
+    local-runner/tunnel investigation flagged as unsafe for an application startup
+    primitive (it could terminate an unrelated process with no evidence at all).
+
     When *current_client_id* is empty (or psutil is unavailable, or any error
-    occurs in the live-client check) the function falls through to the original
-    963d0bd kill-unconditionally behaviour, so the fix degrades gracefully on
-    machines without psutil or in environments where the claim file is missing.
+    occurs in the live-client check) the function still applies the claim-file
+    identity check below before killing anything.
 
     Root cause: each ``SlotProxy`` starts life with ``_proc = None``, and its
     ``is_running`` check deliberately skips the port probe in that state
@@ -4104,9 +4188,10 @@ def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = ""
 
     Calling this once per slot at tunnel startup, before the first
     ``ensure_running``, closes that gap directly: if anything is already
-    listening on the slot's port, kill it first so the fresh spawn gets a
-    clean port. Best-effort and silent on any failure (missing psutil,
-    permission error, etc.) — this must never block tunnel startup.
+    listening on the slot's port AND it is identifiable as a stale Meridian
+    instance, kill it first so the fresh spawn gets a clean port. Best-effort
+    and silent on any failure (missing psutil, permission error, etc.) — this
+    must never block tunnel startup.
     """
     # aaddb273 — live-client guard: if the port is claimed by a DIFFERENT client
     # whose tunnel process is still running, it is NOT a stale orphan — skip.
@@ -4121,6 +4206,11 @@ def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = ""
         import psutil  # type: ignore
     except Exception:  # noqa: BLE001 - psutil unavailable; nothing we can do
         return
+    # 7b457c55 — identity evidence for the kill-vs-report decision below:
+    # ANY claim file for this port (even one recording a dead tunnel) proves
+    # some Meridian process claimed it at some point — a genuine stale
+    # instance. No claim file at all means no identity evidence whatsoever.
+    has_claim = _slot_claim_path(port).exists()
     try:
         for conn in psutil.net_connections(kind="inet"):
             if (
@@ -4130,6 +4220,9 @@ def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = ""
                 and conn.pid
             ):
                 pid = conn.pid
+                if not has_claim:
+                    _report_unknown_port_occupant(port, label, pid)
+                    continue
                 print(
                     f"tunnel:{label}: killing stale prior-generation process "
                     f"(pid {pid}) still bound to port {port} before spawning fresh",
@@ -7279,7 +7372,14 @@ async def run_tunnel(
                 flush=True, file=sys.stderr,
             )
         print(f"  filesystem:        lazy-spawn on port {fs_port}", flush=True)
-        proxy_fs = SlotProxy(cmd_fs, fs_port, "fs", client_id=_client_id)
+        # 7b457c55 — use_owned_lifecycle=True: every runner-owned slot gets
+        # job-object/process-group tree ownership + budget-watchdog
+        # eligibility by default (see _slot_owned_lifecycle_enabled's
+        # docstring for the opt-out escape hatch).
+        proxy_fs = SlotProxy(
+            cmd_fs, fs_port, "fs", client_id=_client_id,
+            use_owned_lifecycle=_slot_owned_lifecycle_enabled(),
+        )
         slot_proxies.append(proxy_fs)
     else:
         print("  filesystem:        disabled (tunnel_plugins config)", flush=True)
@@ -7292,7 +7392,11 @@ async def run_tunnel(
     elif code_plugin.get("command"):
         cmd_code = _build_proxy_for_inner(npx, list(code_plugin["command"]), code_port)
         print(f"  code-intel:        lazy-spawn on port {code_port} (custom command)", flush=True)
-        proxy_code = SlotProxy(cmd_code, code_port, "code", client_id=_client_id)
+        # 7b457c55 — see the fs slot's identical comment above.
+        proxy_code = SlotProxy(
+            cmd_code, code_port, "code", client_id=_client_id,
+            use_owned_lifecycle=_slot_owned_lifecycle_enabled(),
+        )
         slot_proxies.append(proxy_code)
     else:
         code_binary = await _ensure_codebase_memory_mcp()
@@ -7322,10 +7426,16 @@ async def run_tunnel(
             # binary self-manages per-project indices keyed by repo_path, so
             # any already-live, healthy occupant of code_port is safe to
             # front instead of killing it or spawning a duplicate.
+            # 7b457c55 — use_owned_lifecycle=True is safe alongside
+            # reuse_existing=True: a reused (not-ours) occupant never sets
+            # owned_handle (see SlotProxy.ensure_running's early-return
+            # reuse path) — the owned lifecycle only takes effect when this
+            # proxy actually spawns its own process.
             proxy_code = SlotProxy(
                 cmd_code, code_port, "code",
                 env=_code_intel_spawn_env(), client_id=_client_id,
                 reuse_existing=True,
+                use_owned_lifecycle=_slot_owned_lifecycle_enabled(),
             )
             slot_proxies.append(proxy_code)
         else:
@@ -7370,7 +7480,11 @@ async def run_tunnel(
                 )
             cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
             print(f"  code-extractor:    lazy-spawn on port {extract_port} (custom command)", flush=True)
-            proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
+            # 7b457c55 — see the fs slot's identical comment above.
+            proxy_extract = SlotProxy(
+                cmd_extract, extract_port, "extract", client_id=_client_id,
+                use_owned_lifecycle=_slot_owned_lifecycle_enabled(),
+            )
             slot_proxies.append(proxy_extract)
         else:
             # ada39096/9d9a92cc — everything else (the exact-match default case
@@ -7469,7 +7583,11 @@ async def run_tunnel(
         cmd_office = _build_proxy_for_inner(npx, list(cmd), oport, stateless=not _persistent)
         mode_note = " (persistent)" if _persistent else ""
         print(f"  {human.lower():<16}lazy-spawn on port {oport}{mode_note}", flush=True)
-        op = SlotProxy(cmd_office, oport, slot, env=spawn_env, client_id=_client_id)
+        # 7b457c55 — see the fs slot's identical comment above.
+        op = SlotProxy(
+            cmd_office, oport, slot, env=spawn_env, client_id=_client_id,
+            use_owned_lifecycle=_slot_owned_lifecycle_enabled(),
+        )
         office_proxies[slot] = op
         slot_proxies.append(op)
         if _persistent:
@@ -7661,16 +7779,23 @@ async def run_tunnel(
             )
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_fs)))
+        # 7b457c55 — budget watchdog is a no-op tick whenever owned_handle is
+        # None (see _budget_watchdog's docstring), so scheduling it
+        # unconditionally is safe even when use_owned_lifecycle was disabled
+        # via the escape hatch above.
+        tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_fs)))
     if proxy_code is not None:
         tasks.append(asyncio.ensure_future(
             _reconnect_loop_lazy(ws_code, proxy_code, "code", tool_prefix=slot_prefixes.get("code"))
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_code)))
+        tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_code)))
     if proxy_extract is not None:
         tasks.append(asyncio.ensure_future(
             _reconnect_loop_lazy(ws_extract, proxy_extract, "extract", tool_prefix=slot_prefixes.get("extract"))
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_extract)))
+        tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_extract)))
     elif serena_pool is not None:
         # 64650cb4 — pooled Serena: per-repo routing + idle reaper instead of a
         # single SlotProxy + idle-killer.
@@ -7692,6 +7817,11 @@ async def run_tunnel(
         # attach the idle-killer that would reset their session after 30min.
         if slot not in persistent_slots:
             tasks.append(asyncio.ensure_future(_idle_killer(oproxy)))
+        # 7b457c55 — budget enforcement is orthogonal to idle-kill (a
+        # persistent slot like Desktop Commander can still run away with
+        # memory/CPU), so this is scheduled unconditionally, unlike the
+        # idle-killer above.
+        tasks.append(asyncio.ensure_future(_budget_watchdog(oproxy)))
     # Custom plugins (eager) still use the regular reconnect + watchdog.
     for holder in proc_holders:
         tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))

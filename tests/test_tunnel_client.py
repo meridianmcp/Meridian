@@ -2513,8 +2513,13 @@ def _install_fake_psutil(monkeypatch, connections, *, sentinel_listen="LISTEN"):
     return killed
 
 
-def test_kill_stale_port_occupant_kills_matching_listener_windows(monkeypatch):
+def test_kill_stale_port_occupant_kills_matching_listener_windows(tmp_path, monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "win32")
+    # 7b457c55 — killing now requires claim-file identity evidence for the
+    # port; write one (a genuine prior-Meridian-instance stale claim) so this
+    # test still exercises the actual kill path.
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    tc._write_slot_claim(8809, "prior-client")
     conns = [_FakeConn(port=8809, pid=999), _FakeConn(port=8810, pid=111)]
     _install_fake_psutil(monkeypatch, conns)
     calls = []
@@ -2525,14 +2530,69 @@ def test_kill_stale_port_occupant_kills_matching_listener_windows(monkeypatch):
     assert calls == [["taskkill", "/F", "/T", "/PID", "999"]]
 
 
-def test_kill_stale_port_occupant_kills_matching_listener_posix(monkeypatch):
+def test_kill_stale_port_occupant_kills_matching_listener_posix(tmp_path, monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    tc._write_slot_claim(8809, "prior-client")
     conns = [_FakeConn(port=8809, pid=999)]
     killed = _install_fake_psutil(monkeypatch, conns)
 
     tc._kill_stale_port_occupant(8809, "code")
 
     assert killed.get("terminate") == [999]
+
+
+def test_kill_stale_port_occupant_reports_unknown_occupant_without_killing(tmp_path, monkeypatch, capsys):
+    """7b457c55 — TUNNEL-P0-HARDENING: an occupant with NO slot-claim file on
+    record must be REPORTED, not killed — replacing the prior broad
+    kill-whatever-is-listening behaviour the local-runner/tunnel
+    investigation flagged as unsafe (it could terminate a genuinely
+    unrelated process with zero identity evidence)."""
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    # No claim file written for this port at all.
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    conns = [_FakeConn(port=8809, pid=999)]
+    killed = _install_fake_psutil(monkeypatch, conns)
+
+    tc._kill_stale_port_occupant(8809, "code")
+
+    assert killed == {}  # not killed
+    err = capsys.readouterr().err
+    assert "8809" in err
+    assert "999" in err
+    assert "NOT killing" in err
+
+
+def test_kill_stale_port_occupant_still_skips_live_peer_with_no_local_claim_check(tmp_path, monkeypatch):
+    """The live-client guard (aaddb273) still short-circuits before the new
+    claim-file identity check even when a claim file happens to also exist —
+    the live-peer path never needs the has_claim branch at all."""
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    tc._write_slot_claim(8809, "live-other-client")
+    real_create_time = json.loads(tc._slot_claim_path(8809).read_text()).get("create_time")
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.CONN_LISTEN = "LISTEN"
+    fake_psutil.net_connections = lambda kind="inet": [_FakeConn(port=8809, pid=888)]
+    fake_psutil.pid_exists = lambda pid: True
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            return real_create_time
+
+    fake_psutil.Process = _FakeProc
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+
+    tc._kill_stale_port_occupant(8809, "fs", current_client_id="my-new-client")
+
+    assert calls == []
 
 
 def test_kill_stale_port_occupant_noop_when_no_listener_on_port(monkeypatch):
@@ -3380,6 +3440,64 @@ def test_slot_proxy_use_owned_lifecycle_defaults_false():
     proxy = tc.SlotProxy(["cmd"], 9400, "fs")
     assert proxy.use_owned_lifecycle is False
     assert proxy.owned_handle is None
+
+
+# ---------------------------------------------------------------------------
+# 7b457c55 — TUNNEL-P0-HARDENING: every runner-owned slot in run_tunnel()
+# actually opts into the owned-process lifecycle (job-object/process-group
+# tree ownership + budget-watchdog eligibility) by default — closing the
+# "existence is not enforcement" gap the local-runner/tunnel investigation
+# flagged (the primitives above already existed and were fully tested, but
+# nothing in run_tunnel() actually wired them on for any slot).
+# ---------------------------------------------------------------------------
+
+
+def test_slot_owned_lifecycle_enabled_defaults_true(monkeypatch):
+    monkeypatch.delenv("MERIDIAN_DISABLE_OWNED_SLOT_LIFECYCLE", raising=False)
+    assert tc._slot_owned_lifecycle_enabled() is True
+
+
+def test_slot_owned_lifecycle_enabled_respects_disable_env(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_DISABLE_OWNED_SLOT_LIFECYCLE", "1")
+    assert tc._slot_owned_lifecycle_enabled() is False
+
+
+def test_slot_owned_lifecycle_enabled_ignores_other_values(monkeypatch):
+    """Only the literal '1' opts out — matches every other strict-'1'-check
+    env gate in this module (e.g. _process_leases_enabled)."""
+    monkeypatch.setenv("MERIDIAN_DISABLE_OWNED_SLOT_LIFECYCLE", "true")
+    assert tc._slot_owned_lifecycle_enabled() is True
+
+
+def test_run_tunnel_wires_use_owned_lifecycle_into_every_slot_proxy():
+    """Guards against a future regression silently reverting any SlotProxy
+    construction in run_tunnel() back to the pre-hardening bare-Popen
+    default. Every SlotProxy(...) call site (fs, code x2, extract, office)
+    must pass use_owned_lifecycle=_slot_owned_lifecycle_enabled()."""
+    import inspect
+
+    source = inspect.getsource(tc.run_tunnel)
+    occurrences = source.count("use_owned_lifecycle=_slot_owned_lifecycle_enabled()")
+    # fs, code (custom-command branch), code (default/reuse_existing branch),
+    # extract (custom branch), and the shared office-family loop = 5 sites.
+    assert occurrences == 5, (
+        f"expected 5 SlotProxy(...) call sites wired with "
+        f"use_owned_lifecycle=_slot_owned_lifecycle_enabled(), found {occurrences}"
+    )
+
+
+def test_run_tunnel_schedules_budget_watchdog_for_every_slot():
+    """Guards against a future regression that adds a SlotProxy without also
+    scheduling its _budget_watchdog task — the watchdog is what actually
+    enforces the host-local memory/CPU budget for an owned-lifecycle slot;
+    wiring use_owned_lifecycle alone does nothing without it."""
+    import inspect
+
+    source = inspect.getsource(tc.run_tunnel)
+    assert "_budget_watchdog(proxy_fs)" in source
+    assert "_budget_watchdog(proxy_code)" in source
+    assert "_budget_watchdog(proxy_extract)" in source
+    assert "_budget_watchdog(oproxy)" in source
 
 
 def test_ensure_running_owned_lifecycle_spawns_via_owned_backend(monkeypatch):
