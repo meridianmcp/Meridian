@@ -179,16 +179,37 @@ def test_resolve_loop_does_not_force_selector_event_loop_on_windows():
     """_resolve_loop() must not hand back a SelectorEventLoop on Windows —
     that is exactly the loop type that breaks asyncio subprocess spawning
     (see module comment above). Only meaningful on Windows; elsewhere
-    Selector/Proactor is not a real distinction."""
+    Selector/Proactor is not a real distinction.
+
+    _resolve_loop()'s own logic never touches the event-loop POLICY at all
+    (it only reads whatever policy is already ambient via
+    get_event_loop_policy()/new_event_loop()) -- so this test must pin that
+    ambient policy to Windows' real default (Proactor) itself before
+    asserting, exactly like the OS would have it in a real, un-contaminated
+    process. Without this, an earlier test in the SAME xdist worker process
+    that left a WindowsSelectorEventLoopPolicy installed (asyncio event-loop
+    policy is real process-global mutable state, same class of leak
+    conftest.py's own _reset_tunnel_launcher_diagnostics/
+    _reset_graph_searcher_resolver autouse fixtures guard against for other
+    modules) would make asyncio.new_event_loop() hand back a Selector loop
+    regardless of what _resolve_loop() itself does -- confirmed live: this
+    test passed in isolation but failed under the full suite for exactly
+    this reason.
+    """
     if sys.platform != "win32":
         pytest.skip("SelectorEventLoop/ProactorEventLoop distinction is Windows-only")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    original_policy = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     try:
-        resolved = tunnel_main._resolve_loop()
-        assert not isinstance(resolved, asyncio.SelectorEventLoop)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            resolved = tunnel_main._resolve_loop()
+            assert not isinstance(resolved, asyncio.SelectorEventLoop)
+        finally:
+            loop.close()
     finally:
-        loop.close()
+        asyncio.set_event_loop_policy(original_policy)
 
 
 def test_resolved_loop_supports_asyncio_subprocess_on_windows():
