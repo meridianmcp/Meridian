@@ -114,6 +114,39 @@ async def handle_rename_project(
     return updated
 
 
+async def handle_set_project_execution_mode(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: set_project_execution_mode (c39a1bd3).
+
+    MCP wrapper over the existing db.set_project_execution_mode -- previously
+    only reachable via the HTTP PATCH /projects/{project_id}/settings route
+    (execution_mode is one of update_project_settings' fields), so an
+    executor session with only MCP access had no way to repair a project's
+    persisted execution posture once workspace_execution_mode_default's
+    creation-time cascade had already run. Confirmed live 2026-08-26: a
+    child project can end up interactive/relaxed despite explicit autonomous
+    instructions in its own project prose, with no MCP path to correct it.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid and args.get("project_name"):
+        _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+        _pid = (_p or {}).get("id", "") if _p else ""
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    _mode = (args.get("execution_mode") or "").strip()
+    if not _mode:
+        return {"error": "execution_mode is required"}
+    updated = await db_module.set_project_execution_mode(db, _pid, _mode)
+    if updated is None:
+        return {"error": f"project '{_pid}' not found"}
+    return updated
+
+
 async def handle_register_session(
     args: dict[str, Any],
     db: Any,

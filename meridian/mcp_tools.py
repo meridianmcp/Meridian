@@ -10,6 +10,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "create_project": 'create_project(name="my-app")',
     "set_parent_project": 'set_parent_project(project_name="ms-thesis", parent_project_name="Camerer_MS_Graduation_2026")',
     "rename_project": 'rename_project(project_name="old-name", new_name="new-name")',
+    "set_project_execution_mode": 'set_project_execution_mode(project_name="my-project", execution_mode="autonomous")',
     "merge_project": 'merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")',
     "start_session": 'start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
@@ -293,6 +294,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "new_name": {"type": "string", "description": "The new project name."}},
          "required": ["new_name"]}},
+    {"name": "set_project_execution_mode", "description":
+        "c39a1bd3 — set, change, or repair the executor posture on an EXISTING project "
+        "(create_project only accepts execution_mode at creation time, and the "
+        "workspace's execution_mode_default only cascades onto NEW projects — neither "
+        "path can repair an already-created project's persisted mode). Confirmed live "
+        "2026-08-26: a child project can end up interactive/relaxed despite explicit "
+        "autonomous instructions in its own project prose, with no prior MCP path to "
+        "correct it (only the dashboard's PATCH /projects/{id}/settings route could). "
+        "'autonomous' (default) claims and runs sprint items immediately without "
+        "asking; 'interactive' asks for direction first. Returns the updated project, "
+        "or {error} if it does not exist.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "execution_mode": {"type": "string", "enum": ["autonomous", "interactive"], "description": "The new executor posture."}},
+         "required": ["execution_mode"]}},
     {"name": "merge_project", "description":
         "d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents EVERY "
         "child row of the source project (sprint items, tasks, decisions, insights, "
@@ -3954,6 +3971,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "create_project":      "project",
     "set_parent_project":  "project",
     "rename_project":      "project",
+    "set_project_execution_mode": "project",
     "merge_project":       "project",
     "list_projects":       "project",
     "get_project_by_name": "project",
@@ -4231,6 +4249,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "create_project":            "both",
     "set_parent_project":        "both",
     "rename_project":            "both",
+    "set_project_execution_mode": "both",
     "merge_project":             "both",
     "list_projects":             "both",
     "get_project_by_name":       "both",
@@ -4495,6 +4514,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # project CRUD
     "create_project":             "maintenance-only",
     "rename_project":             "maintenance-only",
+    "set_project_execution_mode": "maintenance-only",
     "merge_project":              "maintenance-only",
     "set_parent_project":         "maintenance-only",
     "list_projects":              "maintenance-only",
