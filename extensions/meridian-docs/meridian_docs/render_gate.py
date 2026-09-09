@@ -525,7 +525,16 @@ def _word_com_unavailable_reason() -> str | None:
 
 # c44d245d -- module-level so tests can shrink the bound instead of waiting
 # out a real 60s hang to exercise the timeout-classification/cleanup path.
-_WORD_COM_TIMEOUT_SECONDS = 60.0
+# d3f8a291 -- raised 60 -> 90 (2026-09-09), evidence-based like soffice's own
+# 60->90 raise earlier this sprint, not guessed: a real, live Documents.Open
+# call against an actual corpus document genuinely succeeded (not hung, not
+# errored) after 72.23s -- longer than the OLD 60s bound would have allowed,
+# meaning that specific real success would have been wrongly killed and
+# reported as a timeout. This does not touch the retry question (still no
+# internal retry, per the same reasoning as soffice's own fix-4 regression
+# and revert) -- it only gives a single real attempt enough real time to
+# reach a genuine outcome instead of being cut off mid-flight.
+_WORD_COM_TIMEOUT_SECONDS = 90.0
 # Give the COM worker a short grace period after its owned process is
 # terminated.  The thread is deliberately never allowed to hold up the
 # caller indefinitely: Word can block inside an overlapped COM call even after
