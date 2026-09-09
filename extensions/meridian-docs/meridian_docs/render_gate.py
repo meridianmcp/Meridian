@@ -1025,6 +1025,21 @@ def check_render_capability(
     result's ``detail`` also always carries ``attempts`` (how many render
     attempts, including retries, it took to succeed) -- previously only
     present on a ``"failed"`` result's detail.
+
+    d0e2b7a1 -- a FAILED render attempt now falls through to the NEXT
+    available backend (each still bounded by its own ``max_retries`` budget)
+    instead of giving up as soon as one is picked; ``detect_backend`` (which
+    only ever returns the single FIRST available one, used elsewhere for
+    plain capability probing) is unrelated to this and unchanged. A
+    ``"rendered"`` result whose ``detail`` carries ``fallback_from`` (a list
+    of backend names) succeeded only after one or more EARLIER backends in
+    ``backend_order`` failed first. A ``"failed"`` result now means every
+    available backend was tried and every one failed -- ``reason`` is a
+    combined string covering all of them, and ``detail`` (otherwise the last
+    attempted backend's own failure fields) additionally carries
+    ``backends_tried`` (every backend name actually attempted, distinct from
+    ``backend_order``, which also lists backends that were never available
+    at all).
     """
     backend_order = [b.name for b in backends]
 
@@ -1039,8 +1054,9 @@ def check_render_capability(
     if not os.path.isfile(docx_path):
         return _tag(_result(FAILED, reason=f"not a file: {docx_path}"))
 
-    backend, reasons = detect_backend(backends)
-    if backend is None:
+    available = [b for b in backends if b.unavailable_reason() is None]
+    if not available:
+        reasons = [f"{b.name}: {b.unavailable_reason()}" for b in backends]
         if not reasons:
             reasons = ["no render backends registered"]
         return _tag(_result(
@@ -1048,46 +1064,81 @@ def check_render_capability(
             reason="no render backend available in this environment: " + "; ".join(reasons),
         ))
 
-    attempts = 0
-    while True:
-        attempts += 1
-        try:
-            detail = backend.render(docx_path)
-        except RenderCapabilityError as exc:
-            if exc.retryable and attempts <= max_retries:
-                # d4a1f2c8 -- a retryable failure is, by definition, a
-                # transient resource race (e.g. soffice contending with
-                # another concurrent instance for a shared resource), not a
-                # property of this document. Retrying with zero delay gives
-                # whatever's contending no time to clear, so it tends to hit
-                # the identical race again -- confirmed live, 2026-09-07: a
-                # real confirmatory benchmark run showed the immediate,
-                # zero-delay retry failing on effectively every attempt for
-                # the same transient-crash signature. A short backoff before
-                # the retry (not before the FIRST attempt -- only successful
-                # or genuinely non-retryable calls skip this entirely) costs
-                # nothing on the common case and gives a real chance for
-                # transient contention to resolve on the uncommon one.
-                time.sleep(_RENDER_RETRY_BACKOFF_SECONDS)
-                continue
-            return _tag(_result(
-                FAILED,
-                reason=str(exc),
-                backend=backend.name,
-                detail=_failure_detail(exc, attempts=attempts),
-            ))
-        except Exception as exc:  # backend bug / unexpected subprocess or COM error
-            # An unclassified exception (not RenderCapabilityError) is never
-            # retried -- only a backend that explicitly classifies its own
-            # failure as retryable gets the retry budget.
-            return _tag(_result(
-                FAILED,
-                reason=f"{type(exc).__name__}: {exc}",
-                backend=backend.name,
-                detail=_failure_detail(None, attempts=attempts, exception_type=type(exc).__name__),
-            ))
-        else:
-            return _tag(_result(RENDERED, backend=backend.name, detail={**detail, "attempts": attempts}))
+    # d0e2b7a1 -- fall through to the NEXT available backend when the current
+    # one's actual render attempt fails, rather than giving up as soon as one
+    # backend is *picked*. Before this, `KNOWN_BACKENDS = (soffice, word-com)`
+    # meant word-com was registered but functionally dead on any host with
+    # soffice installed: soffice's own `unavailable_reason()` is a cheap
+    # `shutil.which` check that's satisfied regardless of whether soffice's
+    # REAL render calls are succeeding, so it was always picked first and
+    # never yielded to word-com on failure. Confirmed live, 2026-09-09, in a
+    # real confirmatory benchmark: multiple trials showed soffice's render
+    # attempt failing (timeout/transient) in the exact same window the
+    # harness's own, separate Word-COM milestone check rendered the same
+    # document cleanly -- direct evidence a second backend can genuinely
+    # succeed when the first one is failing under real host contention, not
+    # a hypothetical. Each backend still gets its own existing single-backend
+    # retry budget (`max_retries`) before fallback advances past it; a
+    # document-corruption classification does NOT skip fallback either --
+    # that classification is itself a best-effort heuristic (see
+    # `_classify_soffice_failure`'s own docstring), and a second, independent
+    # renderer actually succeeding is stronger evidence than a first
+    # renderer's stderr-parsing guess.
+    failures: list[tuple[str, str, dict[str, Any]]] = []
+    for backend in available:
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                detail = backend.render(docx_path)
+            except RenderCapabilityError as exc:
+                if exc.retryable and attempts <= max_retries:
+                    # d4a1f2c8 -- a retryable failure is, by definition, a
+                    # transient resource race (e.g. soffice contending with
+                    # another concurrent instance for a shared resource), not
+                    # a property of this document. Retrying with zero delay
+                    # gives whatever's contending no time to clear, so it
+                    # tends to hit the identical race again -- confirmed live,
+                    # 2026-09-07: a real confirmatory benchmark run showed the
+                    # immediate, zero-delay retry failing on effectively every
+                    # attempt for the same transient-crash signature. A short
+                    # backoff before the retry (not before the FIRST attempt
+                    # -- only successful or genuinely non-retryable calls
+                    # skip this entirely) costs nothing on the common case and
+                    # gives a real chance for transient contention to resolve
+                    # on the uncommon one.
+                    time.sleep(_RENDER_RETRY_BACKOFF_SECONDS)
+                    continue
+                failures.append((backend.name, str(exc), _failure_detail(exc, attempts=attempts)))
+                break
+            except Exception as exc:  # backend bug / unexpected subprocess or COM error
+                # An unclassified exception (not RenderCapabilityError) is
+                # never retried -- only a backend that explicitly classifies
+                # its own failure as retryable gets the retry budget.
+                failures.append((
+                    backend.name,
+                    f"{type(exc).__name__}: {exc}",
+                    _failure_detail(None, attempts=attempts, exception_type=type(exc).__name__),
+                ))
+                break
+            else:
+                result_detail = {**detail, "attempts": attempts}
+                if failures:
+                    result_detail["fallback_from"] = [name for name, _, _ in failures]
+                return _tag(_result(RENDERED, backend=backend.name, detail=result_detail))
+
+    # Every available backend was tried and every one failed -- report the
+    # LAST backend's own failure detail (so `error_class`/`timed_out`/
+    # `exit_code`/`stderr` stay a single well-formed dict, not a merge across
+    # incompatible backends), but the `reason` string and the new
+    # `backends_tried` field name every backend that was actually attempted,
+    # not just the last one -- a caller/human reading a "failed" result must
+    # be able to tell "we only ever had one option" apart from "we tried
+    # everything available and it all failed."
+    combined_reason = "; ".join(f"{name}: {reason}" for name, reason, _ in failures)
+    last_name, _, last_detail = failures[-1]
+    last_detail["backends_tried"] = [name for name, _, _ in failures]
+    return _tag(_result(FAILED, reason=combined_reason, backend=last_name, detail=last_detail))
 
 
 # ---------------------------------------------------------------------------

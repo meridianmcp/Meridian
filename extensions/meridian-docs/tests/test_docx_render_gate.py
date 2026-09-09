@@ -675,6 +675,165 @@ def test_check_render_capability_unclassified_exception_is_never_retried(tmp_pat
     assert result["detail"]["exception_type"] == "ValueError"
 
 
+# --- d0e2b7a1: cross-backend fallback on failure ----------------------------
+# Real, confirmed motivation (2026-09-09): KNOWN_BACKENDS = (soffice, word-com)
+# registered word-com as a second backend, but detect_backend's cheap
+# unavailable_reason() check means soffice is always picked on any host where
+# it's installed, regardless of whether its REAL render calls are succeeding
+# -- word-com was functionally dead code. A real confirmatory benchmark run
+# showed soffice's render failing (timeout) in the same window the harness's
+# separate Word-COM milestone check rendered the identical document cleanly.
+
+
+def test_check_render_capability_falls_back_to_next_backend_when_first_fails(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _first_fails(path: str) -> dict[str, Any]:
+        raise render_gate.RenderCapabilityError(
+            "first backend down", error_class=render_gate.TRANSPORT_ERROR, retryable=False
+        )
+
+    first = _fake_backend("first", available=True, render=_first_fails)
+    second = _fake_backend("second", available=True, render=lambda path: {"which": "second"})
+
+    result = render_gate.check_render_capability(docx_path, backends=[first, second])
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["backend"] == "second"
+    assert result["detail"]["which"] == "second"
+    assert result["detail"]["fallback_from"] == ["first"]
+
+
+def test_check_render_capability_falls_back_only_after_exhausting_first_backends_retries(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+    first_calls: list[int] = []
+
+    def _first_always_transient(path: str) -> dict[str, Any]:
+        first_calls.append(1)
+        raise render_gate.RenderCapabilityError(
+            "always transient", error_class=render_gate.TRANSPORT_ERROR, retryable=True
+        )
+
+    first = _fake_backend("first", available=True, render=_first_always_transient)
+    second = _fake_backend("second", available=True, render=lambda path: {"which": "second"})
+
+    result = render_gate.check_render_capability(
+        docx_path, backends=[first, second], max_retries=2
+    )
+
+    # max_retries=2 on the FIRST backend means 1 initial attempt + 2 retries
+    # = 3 calls to it before fallback advances -- fallback must not skip a
+    # backend's own retry budget.
+    assert len(first_calls) == 3
+    assert result["status"] == render_gate.RENDERED
+    assert result["backend"] == "second"
+    assert result["detail"]["fallback_from"] == ["first"]
+
+
+def test_check_render_capability_falls_back_even_on_a_corruption_classification(tmp_path):
+    """A corruption classification is itself a best-effort heuristic (see
+    _classify_soffice_failure's own docstring) -- it must not skip fallback.
+    A second, independent renderer actually succeeding is stronger evidence
+    than a first renderer's stderr-parsing guess."""
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _first_says_corrupt(path: str) -> dict[str, Any]:
+        raise render_gate.RenderCapabilityError(
+            "looks corrupt", error_class=render_gate.CORRUPTION_ERROR, retryable=False
+        )
+
+    first = _fake_backend("first", available=True, render=_first_says_corrupt)
+    second = _fake_backend("second", available=True, render=lambda path: {"which": "second"})
+
+    result = render_gate.check_render_capability(docx_path, backends=[first, second])
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["backend"] == "second"
+
+
+def test_check_render_capability_falls_back_past_an_unclassified_exception_too(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _first_explodes(path: str) -> dict[str, Any]:
+        raise ValueError("totally unexpected backend bug")
+
+    first = _fake_backend("first", available=True, render=_first_explodes)
+    second = _fake_backend("second", available=True, render=lambda path: {"which": "second"})
+
+    result = render_gate.check_render_capability(docx_path, backends=[first, second])
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["backend"] == "second"
+
+
+def test_check_render_capability_reports_failed_only_after_every_backend_tried(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _first_fails(path: str) -> dict[str, Any]:
+        raise render_gate.RenderCapabilityError(
+            "first is down", error_class=render_gate.TRANSPORT_ERROR, retryable=False
+        )
+
+    def _second_fails(path: str) -> dict[str, Any]:
+        raise render_gate.RenderCapabilityError(
+            "second is also down", error_class=render_gate.TIMEOUT_ERROR,
+            timed_out=True, retryable=False,
+        )
+
+    first = _fake_backend("first", available=True, render=_first_fails)
+    second = _fake_backend("second", available=True, render=_second_fails)
+
+    result = render_gate.check_render_capability(docx_path, backends=[first, second])
+
+    assert result["status"] == render_gate.FAILED
+    # Both backends' own failure reasons are present, not just the last one.
+    assert "first" in result["reason"] and "first is down" in result["reason"]
+    assert "second" in result["reason"] and "second is also down" in result["reason"]
+    # The reported backend/detail are the LAST one actually tried.
+    assert result["backend"] == "second"
+    assert result["detail"]["error_class"] == render_gate.TIMEOUT_ERROR
+    assert result["detail"]["timed_out"] is True
+    # backends_tried names every backend actually attempted -- distinct from
+    # backend_order, which also lists ones that were never available at all.
+    assert result["detail"]["backends_tried"] == ["first", "second"]
+
+
+def test_check_render_capability_success_on_first_backend_has_no_fallback_from_key(tmp_path):
+    """The common case (first backend just works) must not grow a spurious
+    fallback_from key -- it should only appear once fallback genuinely
+    happened."""
+    docx_path = _write_dummy_docx(tmp_path)
+    backend = _fake_backend("only", available=True, render=lambda path: {})
+
+    result = render_gate.check_render_capability(docx_path, backends=[backend])
+
+    assert result["status"] == render_gate.RENDERED
+    assert "fallback_from" not in result["detail"]
+
+
+def test_check_render_capability_skips_an_unavailable_backend_when_falling_back(tmp_path):
+    """Fallback must respect availability too -- an unavailable second
+    backend is skipped just like detect_backend already skips it for the
+    first pick, falling through to a THIRD, available one."""
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _first_fails(path: str) -> dict[str, Any]:
+        raise render_gate.RenderCapabilityError(
+            "down", error_class=render_gate.TRANSPORT_ERROR, retryable=False
+        )
+
+    first = _fake_backend("first", available=True, render=_first_fails)
+    unavailable_second = _fake_backend("second", available=False, reason="not installed")
+    third = _fake_backend("third", available=True, render=lambda path: {"which": "third"})
+
+    result = render_gate.check_render_capability(
+        docx_path, backends=[first, unavailable_second, third]
+    )
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["backend"] == "third"
+
+
 # --- _soffice_render: real classification behavior -------------------------
 
 
