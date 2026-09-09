@@ -530,7 +530,15 @@ class _FakeWordApplicationForWorker:
 
 def _install_fake_win32com_for_worker(monkeypatch, open_document, hwnd=7777):
     fake_client = types.ModuleType("win32com.client")
-    fake_client.DispatchEx = lambda prog_id: _FakeWordApplicationForWorker(hwnd, open_document)
+    _dispatch = lambda prog_id: _FakeWordApplicationForWorker(hwnd, open_document)
+    fake_client.DispatchEx = _dispatch
+    # d3f8a291 -- the real _word_com_process_worker calls gencache.EnsureDispatch,
+    # not plain DispatchEx (see render_gate.py for why) -- the fake exposes the
+    # same behavior via EnsureDispatch too, so this keeps exercising the real
+    # call site.
+    fake_gencache = types.ModuleType("win32com.client.gencache")
+    fake_gencache.EnsureDispatch = _dispatch
+    fake_client.gencache = fake_gencache
 
     fake_win32com = types.ModuleType("win32com")
     fake_win32com.client = fake_client
@@ -541,9 +549,13 @@ def _install_fake_win32com_for_worker(monkeypatch, open_document, hwnd=7777):
     fake_pythoncom = types.ModuleType("pythoncom")
     fake_pythoncom.CoInitialize = lambda: None
     fake_pythoncom.CoUninitialize = lambda: None
+    # d3f8a291 -- the real worker pumps the message queue once before
+    # SaveAs (see render_gate.py for why).
+    fake_pythoncom.PumpWaitingMessages = lambda: None
 
     monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
     monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
+    monkeypatch.setitem(sys.modules, "win32com.client.gencache", fake_gencache)
     monkeypatch.setitem(sys.modules, "win32process", fake_win32process)
     monkeypatch.setitem(sys.modules, "pythoncom", fake_pythoncom)
 

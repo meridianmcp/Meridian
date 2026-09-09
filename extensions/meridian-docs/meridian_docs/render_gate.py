@@ -525,7 +525,16 @@ def _word_com_unavailable_reason() -> str | None:
 
 # c44d245d -- module-level so tests can shrink the bound instead of waiting
 # out a real 60s hang to exercise the timeout-classification/cleanup path.
-_WORD_COM_TIMEOUT_SECONDS = 60.0
+# d3f8a291 -- raised 60 -> 90 (2026-09-09), evidence-based like soffice's own
+# 60->90 raise earlier this sprint, not guessed: a real, live Documents.Open
+# call against an actual corpus document genuinely succeeded (not hung, not
+# errored) after 72.23s -- longer than the OLD 60s bound would have allowed,
+# meaning that specific real success would have been wrongly killed and
+# reported as a timeout. This does not touch the retry question (still no
+# internal retry, per the same reasoning as soffice's own fix-4 regression
+# and revert) -- it only gives a single real attempt enough real time to
+# reach a genuine outcome instead of being cut off mid-flight.
+_WORD_COM_TIMEOUT_SECONDS = 90.0
 # Give the COM worker a short grace period after its owned process is
 # terminated.  The thread is deliberately never allowed to hold up the
 # caller indefinitely: Word can block inside an overlapped COM call even after
@@ -596,8 +605,6 @@ def _terminate_owned_process(pid: int) -> bool:
 
 
 def _word_com_render_thread(docx_path: str) -> dict[str, Any]:
-    import win32com.client  # local import: optional dependency, only touched when available
-
     with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir:
         pdf_path = os.path.join(out_dir, "render_probe.pdf")
         outcome: dict[str, Any] = {}
@@ -615,7 +622,22 @@ def _word_com_render_thread(docx_path: str) -> dict[str, Any]:
                 import pythoncom
 
                 pythoncom.CoInitialize()
-                word = win32com.client.DispatchEx("Word.Application")
+                from win32com.client import gencache
+
+                # d3f8a291 -- gencache.EnsureDispatch, NOT plain DispatchEx.
+                # Confirmed live, 2026-09-09: on a host whose pywin32 gen_py
+                # cache has never been built (its real-world state whenever
+                # `TEMP` is a fresh, trial-scoped scratch dir -- see
+                # claude_pair_runner.run_trial), plain DispatchEx returns a
+                # dynamic-dispatch object that raises AttributeError on
+                # Word.Application's own basic properties (`.Documents`,
+                # `.Hwnd`) -- not a hang, an immediate, deterministic failure
+                # that every earlier diagnosis this sprint had misread as a
+                # contention-driven timeout, since check_render_capability's
+                # own except-and-classify handling reports it uniformly.
+                # gencache.EnsureDispatch builds (or reuses) the real
+                # generated bindings and was directly verified to fix this.
+                word = gencache.EnsureDispatch("Word.Application")
                 word.Visible = False
                 # Prevent modal prompts from turning a bounded render into an
                 # unbounded worker wait.
@@ -634,6 +656,19 @@ def _word_com_render_thread(docx_path: str) -> dict[str, Any]:
                     OpenAndRepair=False,
                     NoEncodingDialog=True,
                 )
+                # d3f8a291 -- a second, independent real bug found alongside
+                # the cache one: calling SaveAs immediately after Open can
+                # raise `RPC_E_SERVERCALL_RETRYLATER` ("Call was rejected by
+                # callee") -- confirmed live, deterministic, NOT transient
+                # (5 consecutive retries with a 0.3s sleep between each all
+                # failed identically). This is COM's own message-filter
+                # mechanism rejecting a call because this client process
+                # never pumps its message queue; sleeping doesn't help
+                # because nothing about a sleep services that queue.
+                # PumpWaitingMessages() directly fixed it (succeeded on the
+                # very next attempt, no sleep needed) in the same live
+                # verification.
+                pythoncom.PumpWaitingMessages()
                 doc.SaveAs(pdf_path, FileFormat=_WD_FORMAT_PDF)
             except Exception as exc:  # COM errors surface as broad pywintypes.com_error
                 outcome["exc"] = exc
@@ -716,6 +751,28 @@ def _word_com_process_worker(docx_path: str, pdf_path: str, result_queue: Any) -
     process. Keeping the automation in a spawned child makes the timeout
     boundary real: the parent can terminate the child without taking down
     the MCP server or pytest interpreter.
+
+    d3f8a291 -- two real, deterministic bugs found and fixed here, 2026-09-09
+    (see `_word_com_render_thread`'s matching comments for the full account,
+    which applies identically -- this is the actual code path every real
+    trial uses, since `_word_com_render` only falls back to the thread-based
+    twin when a fake win32com.client is injected for tests):
+
+    1. Plain ``DispatchEx`` returns a dynamic-dispatch object missing basic
+       properties (``.Documents``, ``.Hwnd``) whenever this process's pywin32
+       gen_py cache hasn't been built -- its default, real-world state
+       whenever ``TEMP`` is a fresh, trial-scoped scratch directory. An
+       immediate, deterministic AttributeError, not a hang -- every earlier
+       diagnosis this sprint had misread this failure mode (via
+       ``check_render_capability``'s uniform except-and-classify handling)
+       as a contention-driven timeout. ``gencache.EnsureDispatch`` builds
+       (or reuses) real bindings; directly verified live to fix this.
+    2. Calling ``SaveAs`` immediately after ``Documents.Open`` can raise
+       ``RPC_E_SERVERCALL_RETRYLATER`` ("Call was rejected by callee") --
+       confirmed deterministic, not transient (5 consecutive retries with a
+       sleep between each all failed identically; sleeping does not service
+       a message queue). ``pythoncom.PumpWaitingMessages()`` directly fixed
+       it, verified live.
     """
     word = None
     doc = None
@@ -723,9 +780,9 @@ def _word_com_process_worker(docx_path: str, pdf_path: str, result_queue: Any) -
         import pythoncom
 
         pythoncom.CoInitialize()
-        import win32com.client
+        from win32com.client import gencache
 
-        word = win32com.client.DispatchEx("Word.Application")
+        word = gencache.EnsureDispatch("Word.Application")
         word.Visible = False
         word.DisplayAlerts = 0  # wdAlertsNone
         result_queue.put({"kind": "pid", "pid": _word_application_pid(word)})
@@ -739,6 +796,7 @@ def _word_com_process_worker(docx_path: str, pdf_path: str, result_queue: Any) -
             OpenAndRepair=False,
             NoEncodingDialog=True,
         )
+        pythoncom.PumpWaitingMessages()
         doc.SaveAs(pdf_path, FileFormat=_WD_FORMAT_PDF)
         result_queue.put({"kind": "result", "ok": True})
     except BaseException as exc:  # child must report all failures to parent
@@ -1025,6 +1083,21 @@ def check_render_capability(
     result's ``detail`` also always carries ``attempts`` (how many render
     attempts, including retries, it took to succeed) -- previously only
     present on a ``"failed"`` result's detail.
+
+    d0e2b7a1 -- a FAILED render attempt now falls through to the NEXT
+    available backend (each still bounded by its own ``max_retries`` budget)
+    instead of giving up as soon as one is picked; ``detect_backend`` (which
+    only ever returns the single FIRST available one, used elsewhere for
+    plain capability probing) is unrelated to this and unchanged. A
+    ``"rendered"`` result whose ``detail`` carries ``fallback_from`` (a list
+    of backend names) succeeded only after one or more EARLIER backends in
+    ``backend_order`` failed first. A ``"failed"`` result now means every
+    available backend was tried and every one failed -- ``reason`` is a
+    combined string covering all of them, and ``detail`` (otherwise the last
+    attempted backend's own failure fields) additionally carries
+    ``backends_tried`` (every backend name actually attempted, distinct from
+    ``backend_order``, which also lists backends that were never available
+    at all).
     """
     backend_order = [b.name for b in backends]
 
@@ -1039,8 +1112,9 @@ def check_render_capability(
     if not os.path.isfile(docx_path):
         return _tag(_result(FAILED, reason=f"not a file: {docx_path}"))
 
-    backend, reasons = detect_backend(backends)
-    if backend is None:
+    available = [b for b in backends if b.unavailable_reason() is None]
+    if not available:
+        reasons = [f"{b.name}: {b.unavailable_reason()}" for b in backends]
         if not reasons:
             reasons = ["no render backends registered"]
         return _tag(_result(
@@ -1048,46 +1122,81 @@ def check_render_capability(
             reason="no render backend available in this environment: " + "; ".join(reasons),
         ))
 
-    attempts = 0
-    while True:
-        attempts += 1
-        try:
-            detail = backend.render(docx_path)
-        except RenderCapabilityError as exc:
-            if exc.retryable and attempts <= max_retries:
-                # d4a1f2c8 -- a retryable failure is, by definition, a
-                # transient resource race (e.g. soffice contending with
-                # another concurrent instance for a shared resource), not a
-                # property of this document. Retrying with zero delay gives
-                # whatever's contending no time to clear, so it tends to hit
-                # the identical race again -- confirmed live, 2026-09-07: a
-                # real confirmatory benchmark run showed the immediate,
-                # zero-delay retry failing on effectively every attempt for
-                # the same transient-crash signature. A short backoff before
-                # the retry (not before the FIRST attempt -- only successful
-                # or genuinely non-retryable calls skip this entirely) costs
-                # nothing on the common case and gives a real chance for
-                # transient contention to resolve on the uncommon one.
-                time.sleep(_RENDER_RETRY_BACKOFF_SECONDS)
-                continue
-            return _tag(_result(
-                FAILED,
-                reason=str(exc),
-                backend=backend.name,
-                detail=_failure_detail(exc, attempts=attempts),
-            ))
-        except Exception as exc:  # backend bug / unexpected subprocess or COM error
-            # An unclassified exception (not RenderCapabilityError) is never
-            # retried -- only a backend that explicitly classifies its own
-            # failure as retryable gets the retry budget.
-            return _tag(_result(
-                FAILED,
-                reason=f"{type(exc).__name__}: {exc}",
-                backend=backend.name,
-                detail=_failure_detail(None, attempts=attempts, exception_type=type(exc).__name__),
-            ))
-        else:
-            return _tag(_result(RENDERED, backend=backend.name, detail={**detail, "attempts": attempts}))
+    # d0e2b7a1 -- fall through to the NEXT available backend when the current
+    # one's actual render attempt fails, rather than giving up as soon as one
+    # backend is *picked*. Before this, `KNOWN_BACKENDS = (soffice, word-com)`
+    # meant word-com was registered but functionally dead on any host with
+    # soffice installed: soffice's own `unavailable_reason()` is a cheap
+    # `shutil.which` check that's satisfied regardless of whether soffice's
+    # REAL render calls are succeeding, so it was always picked first and
+    # never yielded to word-com on failure. Confirmed live, 2026-09-09, in a
+    # real confirmatory benchmark: multiple trials showed soffice's render
+    # attempt failing (timeout/transient) in the exact same window the
+    # harness's own, separate Word-COM milestone check rendered the same
+    # document cleanly -- direct evidence a second backend can genuinely
+    # succeed when the first one is failing under real host contention, not
+    # a hypothetical. Each backend still gets its own existing single-backend
+    # retry budget (`max_retries`) before fallback advances past it; a
+    # document-corruption classification does NOT skip fallback either --
+    # that classification is itself a best-effort heuristic (see
+    # `_classify_soffice_failure`'s own docstring), and a second, independent
+    # renderer actually succeeding is stronger evidence than a first
+    # renderer's stderr-parsing guess.
+    failures: list[tuple[str, str, dict[str, Any]]] = []
+    for backend in available:
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                detail = backend.render(docx_path)
+            except RenderCapabilityError as exc:
+                if exc.retryable and attempts <= max_retries:
+                    # d4a1f2c8 -- a retryable failure is, by definition, a
+                    # transient resource race (e.g. soffice contending with
+                    # another concurrent instance for a shared resource), not
+                    # a property of this document. Retrying with zero delay
+                    # gives whatever's contending no time to clear, so it
+                    # tends to hit the identical race again -- confirmed live,
+                    # 2026-09-07: a real confirmatory benchmark run showed the
+                    # immediate, zero-delay retry failing on effectively every
+                    # attempt for the same transient-crash signature. A short
+                    # backoff before the retry (not before the FIRST attempt
+                    # -- only successful or genuinely non-retryable calls
+                    # skip this entirely) costs nothing on the common case and
+                    # gives a real chance for transient contention to resolve
+                    # on the uncommon one.
+                    time.sleep(_RENDER_RETRY_BACKOFF_SECONDS)
+                    continue
+                failures.append((backend.name, str(exc), _failure_detail(exc, attempts=attempts)))
+                break
+            except Exception as exc:  # backend bug / unexpected subprocess or COM error
+                # An unclassified exception (not RenderCapabilityError) is
+                # never retried -- only a backend that explicitly classifies
+                # its own failure as retryable gets the retry budget.
+                failures.append((
+                    backend.name,
+                    f"{type(exc).__name__}: {exc}",
+                    _failure_detail(None, attempts=attempts, exception_type=type(exc).__name__),
+                ))
+                break
+            else:
+                result_detail = {**detail, "attempts": attempts}
+                if failures:
+                    result_detail["fallback_from"] = [name for name, _, _ in failures]
+                return _tag(_result(RENDERED, backend=backend.name, detail=result_detail))
+
+    # Every available backend was tried and every one failed -- report the
+    # LAST backend's own failure detail (so `error_class`/`timed_out`/
+    # `exit_code`/`stderr` stay a single well-formed dict, not a merge across
+    # incompatible backends), but the `reason` string and the new
+    # `backends_tried` field name every backend that was actually attempted,
+    # not just the last one -- a caller/human reading a "failed" result must
+    # be able to tell "we only ever had one option" apart from "we tried
+    # everything available and it all failed."
+    combined_reason = "; ".join(f"{name}: {reason}" for name, reason, _ in failures)
+    last_name, _, last_detail = failures[-1]
+    last_detail["backends_tried"] = [name for name, _, _ in failures]
+    return _tag(_result(FAILED, reason=combined_reason, backend=last_name, detail=last_detail))
 
 
 # ---------------------------------------------------------------------------
