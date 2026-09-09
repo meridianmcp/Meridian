@@ -4943,6 +4943,35 @@ async def _migrate_pg_external_job_register(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_scratch_research_runs(conn: PostgresConnection) -> None:
+    """a5343387 -- Postgres mirror of the bounded ephemeral research-run
+    register. See meridian/db/migrations.py's _migrate_scratch_research_runs
+    for the schema rationale and the ``scratch_research_runs`` (deliberately
+    NOT ``research_runs`` -- that name is already taken by
+    _migrate_pg_experiment_model's unrelated table) naming note."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS scratch_research_runs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    creator_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    mode TEXT NOT NULL,"
+        "    allowed_paths_json TEXT NOT NULL DEFAULT '[]',"
+        "    repository_id TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'active',"
+        "    turn_budget INTEGER NOT NULL,"
+        f"    started_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    expires_at TEXT NOT NULL,"
+        "    completed_at TEXT,"
+        "    result_receipt_json TEXT,"
+        "    disposition TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_scratch_research_runs_project_status "
+        "ON scratch_research_runs(project_id, status, started_at DESC);"
+    )
+
+
 async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     """7c96d41b — Postgres mirror of the paper_contract schema: the
     first-class versioned editorial-intent document for Meridian's
@@ -5224,4 +5253,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_paper_strategy_graph,
     _migrate_pg_lint_finding,
     _migrate_pg_structural_patch,
+    _migrate_pg_scratch_research_runs,
 )

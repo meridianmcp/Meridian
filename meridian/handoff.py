@@ -8610,6 +8610,7 @@ async def build_continuation_manifest(
     version: str | None = None,
     source: str | None = None,
     record_revision: bool = True,
+    include_research_runs: bool = False,
 ) -> dict[str, Any]:
     """836ca1d5 — the shared, deterministic continuation-manifest serializer.
 
@@ -8744,15 +8745,38 @@ async def build_continuation_manifest(
         ONE ``list_gates`` call for the whole capped batch (not one call per
         item) to keep this bounded. Best-effort: a failure here degrades to
         an empty list rather than breaking the whole manifest build.
+      - ``research_run_receipts`` (a5343387) — ONLY present when
+        ``include_research_runs=True`` is passed explicitly (default
+        ``False``: omitted entirely, not an empty list, when the flag isn't
+        passed — see the byte-for-byte-identical-by-default contract below).
+        A bounded list of compact receipt summaries for this project's
+        research runs (see ``meridian.db.research_runs`` / bounded ephemeral
+        research runs, a5343387) whose ``disposition`` is ``'keep'`` or
+        ``'promote'`` — a run with ``disposition='discard'`` (or none yet,
+        i.e. still ``active``) is never embedded, matching this feature's
+        own "scratch transcripts stay OUT of ordinary handoffs unless
+        disposition=promote" rule (loosened here to also include ``'keep'``,
+        since a caller that explicitly asked to keep a run's receipt clearly
+        wants it visible on the next resume too — 'discard' is the only
+        disposition this manifest treats as truly ephemeral). Each entry is
+        ``{run_id, mode, repository_id, status, disposition,
+        result_summary}`` — no ``files_touched``/``commands_run``/
+        ``artifact_references`` detail, matching this manifest's existing
+        "ids and a short summary, not the full record" convention for every
+        other embedded list. Best-effort: a query failure degrades to ``[]``
+        rather than breaking the whole manifest build.
 
-    All four 07229675 fields above are purely additive — no existing field's
-    shape, presence, or the ``revision_hash``/``revision_counter`` byte-
-    stability contract changed. A project whose non-done board has no
-    hard-blocked items, no blocker-policy triage, and no active HITL gates
-    sees ``hard_blocked_pending_ids == []``, ``hitl_gated_item_ids == []``,
-    and whatever ``blocker_summary`` shape ``build_board_snapshot`` already
+    All four 07229675 fields above (and ``research_run_receipts``) are
+    purely additive — no existing field's shape, presence, or the
+    ``revision_hash``/``revision_counter`` byte-stability contract changed.
+    A project whose non-done board has no hard-blocked items, no
+    blocker-policy triage, and no active HITL gates sees
+    ``hard_blocked_pending_ids == []``, ``hitl_gated_item_ids == []``, and
+    whatever ``blocker_summary`` shape ``build_board_snapshot`` already
     produced for an unblocked board — i.e. no observable behavior change for
-    the common case.
+    the common case. Omitting ``include_research_runs`` (the default) is
+    likewise byte-for-byte identical to this function's behavior before
+    a5343387 — the key is not merely empty, it is absent.
 
     Best-effort by convention (matches every other enrichment step in
     ``generate_handoff``): callers should wrap this in try/except and treat a
@@ -8761,12 +8785,15 @@ async def build_continuation_manifest(
     the caller's failure mode is explicit.
 
     NOT YET DONE (documented follow-up, deliberately out of scope here):
-      - Wiring ``meridian/server.py``'s ``_build_continue_payload`` to call
-        this function instead of assembling its own ad hoc payload is a
-        purely mechanical follow-up (same fields, same semantics) — deferred
-        because server.py is a high-contention file outside this change's
-        file scope (AGENTS.md: sequential-only under this repo's parallel-
-        worktree protocol), not because of any design gap.
+      - DRIFT NOTE (a5343387): the bullet that used to live here — "wiring
+        meridian/server.py's _build_continue_payload to call this function
+        instead of assembling its own ad hoc payload" — is STALE. That
+        wiring was already done (see the 862f6522 comment inside
+        ``_build_continue_payload`` itself, which now calls this function
+        for its own ``continuation_manifest`` field). Left as a fixed
+        drift note rather than silently deleted, per this sprint item's own
+        instruction to document any drift found between a brief and the
+        actual current code.
       - Supersession metadata for corrective handoff revisions (a later
         manifest that explicitly marks an earlier one superseded) was meant
         to reuse 3af86d28's ``handoff_corrections`` data structure. That work
@@ -8849,7 +8876,7 @@ async def build_continuation_manifest(
         except Exception:  # noqa: BLE001 — best-effort enrichment, never fatal
             hitl_gated_item_ids = []
 
-    return {
+    manifest: dict[str, Any] = {
         "schema_version": _CONTINUATION_MANIFEST_SCHEMA_VERSION,
         "project_id": project_id,
         "session_id": session_id,
@@ -8864,6 +8891,39 @@ async def build_continuation_manifest(
         "blocker_summary": _cap_blocker_summary(snapshot.get("blocker_summary")),
         "hitl_gated_item_ids": hitl_gated_item_ids,
     }
+
+    # a5343387 — OPT-IN ONLY: omitting/False leaves the manifest byte-for-byte
+    # identical to before this field existed (no key added at all, not even
+    # an empty list). Scratch research-run transcripts stay OUT of ordinary
+    # handoffs unless a caller explicitly asked for them AND the run itself
+    # was explicitly kept/promoted (disposition), matching this feature's own
+    # "never inferred" convention.
+    if include_research_runs:
+        research_run_receipts: list[dict[str, Any]] = []
+        try:
+            from meridian.db import research_runs as _research_runs_module  # noqa: PLC0415
+
+            _runs = await _research_runs_module.list_research_runs(
+                db, project_id, include_terminal=True,
+                limit=_CONTINUATION_MANIFEST_ID_CAP,
+            )
+            for _run in _runs:
+                if _run.get("disposition") not in ("keep", "promote"):
+                    continue
+                _receipt = _run.get("result_receipt") or {}
+                research_run_receipts.append({
+                    "run_id": _run.get("id"),
+                    "mode": _run.get("mode"),
+                    "repository_id": _run.get("repository_id"),
+                    "status": _run.get("status"),
+                    "disposition": _run.get("disposition"),
+                    "result_summary": _receipt.get("result_summary"),
+                })
+        except Exception:  # noqa: BLE001 — best-effort enrichment, never fatal
+            research_run_receipts = []
+        manifest["research_run_receipts"] = research_run_receipts
+
+    return manifest
 
 
 # 79491e26 — schema version for the compact run-timeline projection embedded

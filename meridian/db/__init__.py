@@ -1152,6 +1152,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_paper_strategy_graph(db)
     await _migrate_lint_finding(db)
     await _migrate_structural_patch(db)
+    await _migrate_scratch_research_runs(db)
     return db
 
 

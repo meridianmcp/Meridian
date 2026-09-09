@@ -2655,6 +2655,11 @@ def build_mcp_server():
                 "register_external_job", "update_external_job",
                 "get_external_job", "list_external_jobs",
                 "complete_external_job",
+                # a5343387 — bounded ephemeral research runs; same
+                # share-dispatch-with-HTTP-MCP pattern as external_jobs above.
+                "start_research_run", "complete_research_run",
+                "get_research_run", "list_research_runs",
+                "promote_research_run",
                 "execute_batch",
                 "batch_read", "batch_mutate",
                 "add_workspace_note", "get_workspace_notes",
