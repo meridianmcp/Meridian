@@ -1215,6 +1215,13 @@ def _install_fake_win32com(monkeypatch, open_document, hwnd=4242):
         return app
 
     fake_client.DispatchEx = _dispatch_ex
+    # d3f8a291 -- the real code now calls gencache.EnsureDispatch, not plain
+    # DispatchEx (see render_gate.py for why) -- the fake exposes the SAME
+    # underlying app object/behavior via EnsureDispatch too, so these tests
+    # keep exercising the real call site instead of a stale one.
+    fake_gencache = types.ModuleType("win32com.client.gencache")
+    fake_gencache.EnsureDispatch = _dispatch_ex
+    fake_client.gencache = fake_gencache
 
     fake_win32com = types.ModuleType("win32com")
     fake_win32com.client = fake_client
@@ -1226,12 +1233,19 @@ def _install_fake_win32com(monkeypatch, open_document, hwnd=4242):
     com_calls: list[str] = []
     fake_pythoncom.CoInitialize = lambda: com_calls.append("initialize")
     fake_pythoncom.CoUninitialize = lambda: com_calls.append("uninitialize")
+    # d3f8a291 -- the real code now pumps the message queue once, right
+    # before SaveAs (see render_gate.py for why) -- tracked separately from
+    # com_calls so existing assertions on that list stay unaffected.
+    pump_calls: list[str] = []
+    fake_pythoncom.PumpWaitingMessages = lambda: pump_calls.append("pump")
 
     monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
     monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
+    monkeypatch.setitem(sys.modules, "win32com.client.gencache", fake_gencache)
     monkeypatch.setitem(sys.modules, "win32process", fake_win32process)
     monkeypatch.setitem(sys.modules, "pythoncom", fake_pythoncom)
     app_holder["com_calls"] = com_calls
+    app_holder["pump_calls"] = pump_calls
     return app_holder
 
 
@@ -1263,6 +1277,67 @@ def test_word_com_render_happy_path_produces_pdf(tmp_path, monkeypatch):
     }
     assert app_holder["com_calls"] == ["initialize"]
     assert terminate_calls == [], "a successful render must never trigger owned-process cleanup"
+
+
+def test_word_com_render_pumps_messages_before_saveas(tmp_path, monkeypatch):
+    """d3f8a291 -- a real, deterministic COM bug (RPC_E_SERVERCALL_RETRYLATER,
+    "Call was rejected by callee") was confirmed live: calling SaveAs
+    immediately after Documents.Open can be rejected because this client
+    process never services its own message queue. PumpWaitingMessages()
+    fixed it. This locks in that the call actually happens, and specifically
+    BEFORE SaveAs -- pumping after the fact wouldn't help the real bug."""
+    docx_path = _write_dummy_docx(tmp_path)
+    call_order: list[str] = []
+
+    def _open_document(path):
+        def _on_save(pdf_path):
+            call_order.append("saveas")
+            with open(pdf_path, "wb") as fh:
+                fh.write(b"%PDF-1.4 fake")
+        return _FakeWordDocument(_on_save)
+
+    _install_fake_win32com(monkeypatch, _open_document)
+    import sys as _sys
+
+    fake_pythoncom = _sys.modules["pythoncom"]
+    monkeypatch.setattr(fake_pythoncom, "PumpWaitingMessages", lambda: call_order.append("pump"))
+
+    render_gate._word_com_render(docx_path)
+
+    assert call_order == ["pump", "saveas"], "PumpWaitingMessages must run before SaveAs, not after"
+
+
+def test_word_com_render_uses_gencache_ensure_dispatch_not_plain_dispatch_ex(tmp_path, monkeypatch):
+    """d3f8a291 -- a real, deterministic bug was confirmed live: plain
+    DispatchEx returns a dynamic-dispatch object missing basic Word.Application
+    properties (.Documents, .Hwnd) whenever this process's pywin32 gen_py
+    cache hasn't been built -- its default state whenever TEMP is a fresh,
+    trial-scoped scratch directory (claude_pair_runner.run_trial's own
+    per-trial isolation). gencache.EnsureDispatch fixed it. This locks in
+    that the real code path calls EnsureDispatch, not a plain DispatchEx a
+    future edit could silently reintroduce."""
+    docx_path = _write_dummy_docx(tmp_path)
+    dispatch_ex_calls: list[str] = []
+
+    def _open_document(path):
+        def _on_save(pdf_path):
+            with open(pdf_path, "wb") as fh:
+                fh.write(b"%PDF-1.4 fake")
+        return _FakeWordDocument(_on_save)
+
+    _install_fake_win32com(monkeypatch, _open_document)
+    import sys as _sys
+
+    fake_client = _sys.modules["win32com.client"]
+    monkeypatch.setattr(
+        fake_client, "DispatchEx",
+        lambda prog_id: dispatch_ex_calls.append(prog_id),
+        raising=False,
+    )
+
+    render_gate._word_com_render(docx_path)
+
+    assert dispatch_ex_calls == [], "the real call site must use gencache.EnsureDispatch, never plain DispatchEx"
 
 
 def test_word_com_render_bounded_timeout_terminates_owned_process(tmp_path, monkeypatch):

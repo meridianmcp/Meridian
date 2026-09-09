@@ -596,8 +596,6 @@ def _terminate_owned_process(pid: int) -> bool:
 
 
 def _word_com_render_thread(docx_path: str) -> dict[str, Any]:
-    import win32com.client  # local import: optional dependency, only touched when available
-
     with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir:
         pdf_path = os.path.join(out_dir, "render_probe.pdf")
         outcome: dict[str, Any] = {}
@@ -615,7 +613,22 @@ def _word_com_render_thread(docx_path: str) -> dict[str, Any]:
                 import pythoncom
 
                 pythoncom.CoInitialize()
-                word = win32com.client.DispatchEx("Word.Application")
+                from win32com.client import gencache
+
+                # d3f8a291 -- gencache.EnsureDispatch, NOT plain DispatchEx.
+                # Confirmed live, 2026-09-09: on a host whose pywin32 gen_py
+                # cache has never been built (its real-world state whenever
+                # `TEMP` is a fresh, trial-scoped scratch dir -- see
+                # claude_pair_runner.run_trial), plain DispatchEx returns a
+                # dynamic-dispatch object that raises AttributeError on
+                # Word.Application's own basic properties (`.Documents`,
+                # `.Hwnd`) -- not a hang, an immediate, deterministic failure
+                # that every earlier diagnosis this sprint had misread as a
+                # contention-driven timeout, since check_render_capability's
+                # own except-and-classify handling reports it uniformly.
+                # gencache.EnsureDispatch builds (or reuses) the real
+                # generated bindings and was directly verified to fix this.
+                word = gencache.EnsureDispatch("Word.Application")
                 word.Visible = False
                 # Prevent modal prompts from turning a bounded render into an
                 # unbounded worker wait.
@@ -634,6 +647,19 @@ def _word_com_render_thread(docx_path: str) -> dict[str, Any]:
                     OpenAndRepair=False,
                     NoEncodingDialog=True,
                 )
+                # d3f8a291 -- a second, independent real bug found alongside
+                # the cache one: calling SaveAs immediately after Open can
+                # raise `RPC_E_SERVERCALL_RETRYLATER` ("Call was rejected by
+                # callee") -- confirmed live, deterministic, NOT transient
+                # (5 consecutive retries with a 0.3s sleep between each all
+                # failed identically). This is COM's own message-filter
+                # mechanism rejecting a call because this client process
+                # never pumps its message queue; sleeping doesn't help
+                # because nothing about a sleep services that queue.
+                # PumpWaitingMessages() directly fixed it (succeeded on the
+                # very next attempt, no sleep needed) in the same live
+                # verification.
+                pythoncom.PumpWaitingMessages()
                 doc.SaveAs(pdf_path, FileFormat=_WD_FORMAT_PDF)
             except Exception as exc:  # COM errors surface as broad pywintypes.com_error
                 outcome["exc"] = exc
@@ -716,6 +742,28 @@ def _word_com_process_worker(docx_path: str, pdf_path: str, result_queue: Any) -
     process. Keeping the automation in a spawned child makes the timeout
     boundary real: the parent can terminate the child without taking down
     the MCP server or pytest interpreter.
+
+    d3f8a291 -- two real, deterministic bugs found and fixed here, 2026-09-09
+    (see `_word_com_render_thread`'s matching comments for the full account,
+    which applies identically -- this is the actual code path every real
+    trial uses, since `_word_com_render` only falls back to the thread-based
+    twin when a fake win32com.client is injected for tests):
+
+    1. Plain ``DispatchEx`` returns a dynamic-dispatch object missing basic
+       properties (``.Documents``, ``.Hwnd``) whenever this process's pywin32
+       gen_py cache hasn't been built -- its default, real-world state
+       whenever ``TEMP`` is a fresh, trial-scoped scratch directory. An
+       immediate, deterministic AttributeError, not a hang -- every earlier
+       diagnosis this sprint had misread this failure mode (via
+       ``check_render_capability``'s uniform except-and-classify handling)
+       as a contention-driven timeout. ``gencache.EnsureDispatch`` builds
+       (or reuses) real bindings; directly verified live to fix this.
+    2. Calling ``SaveAs`` immediately after ``Documents.Open`` can raise
+       ``RPC_E_SERVERCALL_RETRYLATER`` ("Call was rejected by callee") --
+       confirmed deterministic, not transient (5 consecutive retries with a
+       sleep between each all failed identically; sleeping does not service
+       a message queue). ``pythoncom.PumpWaitingMessages()`` directly fixed
+       it, verified live.
     """
     word = None
     doc = None
@@ -723,9 +771,9 @@ def _word_com_process_worker(docx_path: str, pdf_path: str, result_queue: Any) -
         import pythoncom
 
         pythoncom.CoInitialize()
-        import win32com.client
+        from win32com.client import gencache
 
-        word = win32com.client.DispatchEx("Word.Application")
+        word = gencache.EnsureDispatch("Word.Application")
         word.Visible = False
         word.DisplayAlerts = 0  # wdAlertsNone
         result_queue.put({"kind": "pid", "pid": _word_application_pid(word)})
@@ -739,6 +787,7 @@ def _word_com_process_worker(docx_path: str, pdf_path: str, result_queue: Any) -
             OpenAndRepair=False,
             NoEncodingDialog=True,
         )
+        pythoncom.PumpWaitingMessages()
         doc.SaveAs(pdf_path, FileFormat=_WD_FORMAT_PDF)
         result_queue.put({"kind": "result", "ok": True})
     except BaseException as exc:  # child must report all failures to parent
