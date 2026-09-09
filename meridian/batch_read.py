@@ -45,6 +45,19 @@ prerequisite) using INJECTED test adapters with ``asyncio.sleep`` rather than
 relying on real DB-level parallelism, which is backend-dependent and not
 this engine's own contract to prove.
 
+**Bounded, not unbounded (d17a437a).** This engine has never had a
+per-adapter concurrency limiter of its own, and still doesn't -- it bounds
+fan-out the same two ways it always has: ``max_requests`` caps the size of
+any one batch (default :data:`DEFAULT_MAX_BATCH_REQUESTS`, hard call-level
+rejection above that), and ``timeout_ms`` bounds each individual request.
+The ``tunnel_research`` adapter (below) does not add a THIRD, adapter-local
+limiter either -- for a tunnel-routed ``call``, the real in-flight cap
+already lives one layer down, in ``meridian.routes.tunnel``'s own
+per-(slot, tenant) ``asyncio.Semaphore`` (``_slot_semaphore`` /
+``_max_slot_inflight``) that every ``call_tunnel_tool`` invocation already
+goes through -- reused automatically because this adapter calls into that
+same path, never bypassed or re-implemented here.
+
 Coalescing
 -----------
 Two requests with the SAME ``adapter``, ``operation``, normalized ``args``
@@ -95,22 +108,54 @@ Adapters implemented vs deferred
   project-ownership gate on ``get_sprint_item_pointers``.
   ``hosted_default``/``workspace``/``user`` rows are not project-scoped and
   are never filtered.
-* **code / codebase-memory / Serena-style reads** (explicitly DEFERRED, per
-  this item's own scoping note: "or document that this adapter proxies to
-  an external MCP call"). No local, in-process code-search/graph capability
-  exists anywhere in the ``meridian`` package today -- ``search_graph``,
-  ``find_symbol``, ``trace_path``, etc. are separate MCP servers
-  (``meridian-code``, ``codebase-memory-mcp``, Serena) that a calling agent
-  invokes directly over its OWN MCP connection, never proxied through
-  Meridian's own server process. Building a "code" adapter here would mean
-  embedding an MCP CLIENT inside this engine to fan out to those servers --
-  a materially larger, separate piece of work (a real client, connection
-  lifecycle, auth/tunnel plumbing) rather than a thin DB wrapper like
-  ``sprint_board``. Flagged as explicit follow-up work, not implemented.
-* **meridian-docs / meridian-outputs adapters, Model2Vec reranking** --
-  explicitly OUT of scope per this item's own acceptance criteria (listed as
-  "preferred", not "required"). Not implemented; no shallow/fake stand-in
-  added either.
+* **tunnel_research** (implemented, d17a437a) -- bounded, READ-ONLY fan-out to
+  the code-intel / meridian-docs / meridian-outputs MCP surfaces, closing (in
+  part) the gap the "code / codebase-memory / Serena-style reads" bullet
+  above used to describe as deferred. The premise of that old bullet --
+  "building a 'code' adapter here would mean embedding an MCP CLIENT inside
+  this engine ... a materially larger, separate piece of work" -- predates
+  1365e01a, which gave the ``meridian`` server process itself a generic,
+  already-live way to forward a bare tool call to whatever MCP server a
+  caller's ``meridian --tunnel`` client has wired onto ANY connected slot
+  (``meridian.mcp.handler._tunnel_proxy_outputs_tool``, originally written
+  for ``search_outputs``/``annotate_outputs`` but generic in every line of
+  its own implementation -- it keys purely off the bare tool name, never
+  anything outputs-specific). This adapter REUSES that exact function
+  (imported, never re-implemented) plus ``meridian.routes.tunnel``'s existing
+  ``has_active_tunnel``/``_label_maps``/``_tunnel_tool_routes`` readiness
+  primitives -- the same ones ``get_tunnel_diagnostics`` itself is built on
+  -- rather than inventing a parallel connectivity check or a real embedded
+  MCP client. Two operations:
+
+  * ``diagnostics`` -- read-only tunnel/slot readiness snapshot for the
+    ``code``/``docs``/``outputs`` slots: which are connected
+    (``surfaces.<name>.slot_connected``, via ``_label_maps``) and which
+    specific tool names are currently routable on them
+    (``routed_tools.<name>``, via ``_tunnel_tool_routes``). Pass
+    ``{"refresh": true}`` to force a fresh ``list_tunnel_tools`` discovery
+    pass first (bounded and timeout-guarded by that function itself, not
+    reimplemented here). Never raises for a missing tenant/session context --
+    degrades to an honest all-disconnected snapshot instead.
+  * ``call`` -- dispatches ONE tool call (``{"tool": ..., "arguments": {...}}``)
+    through whichever connected slot currently serves it. ``tool`` MUST be on
+    this module's own fixed READ-ONLY allowlist
+    (:data:`_TUNNEL_RESEARCH_TOOL_SURFACE`) -- an unrecognized OR known-
+    mutating name is rejected as ``VALIDATION_ERROR`` before any dispatch is
+    attempted, never forwarded blind. Checks ``has_active_tunnel`` itself
+    first (for an actionable message) even though the reused proxy function
+    already no-ops on a dead tunnel -- both paths resolve to ``NOT_FOUND``
+    when the target surface genuinely isn't reachable right now, never a
+    silent/successful-looking empty result.
+
+  Still explicitly DEFERRED, per this same read of the ground truth: a
+  literal embedded MCP client (its own handshake/session/auth lifecycle
+  independent of Meridian's own tunnel) remains out of scope -- this adapter
+  can only ever reach a surface the CALLER has already wired onto their own
+  ``meridian --tunnel`` connection, never an MCP server the calling agent
+  connects to directly and separately from Meridian (this session's own
+  ``meridian-outputs``/``meridian-docs``/``meridian-extract`` connections,
+  for instance, are exactly that -- invisible to this adapter on purpose).
+  Model2Vec reranking remains out of scope too, unrelated to this item.
 
 Response shape
 ---------------
@@ -137,6 +182,7 @@ contract). Each entry is::
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from dataclasses import dataclass, replace
@@ -149,7 +195,35 @@ from . import db as db_module
 #: Raise ``ValueError`` for a bad/malformed ``args`` shape (reported as
 #: ``VALIDATION_ERROR``) or ``LookupError`` for a not-found target (reported
 #: as ``NOT_FOUND``); any other exception is reported as ``INTERNAL_ERROR``.
-AdapterOperation = Callable[[Any, str, "dict[str, Any]"], Awaitable[Any]]
+#:
+#: d17a437a -- an operation MAY additionally declare a ``tenant_id`` keyword
+#: parameter (``async def op(db, project_id, args, *, tenant_id=None)``) to
+#: receive the AUTHENTICATED tenant_id ``batch_read()`` itself was called
+#: with (see :func:`_accepts_tenant_id`). This is additive and fully
+#: backward-compatible: every pre-existing 3-arg operation (``sprint_board``,
+#: ``profile``) is dispatched exactly as before, byte-for-byte -- only an
+#: operation that opts in by declaring the parameter receives it. Needed
+#: because ``tenant_id`` is a call-level, caller-authenticated value (never
+#: something a REQUEST's own ``args`` should be trusted to carry -- that
+#: would let a batch_read caller impersonate an arbitrary tenant), so it must
+#: be threaded from the engine's own dispatch loop, not smuggled through
+#: ``args``.
+AdapterOperation = Callable[..., Awaitable[Any]]
+
+
+def _accepts_tenant_id(fn: "AdapterOperation") -> bool:
+    """True when *fn* declares a ``tenant_id`` parameter (by name, or via
+    ``**kwargs``) -- see :data:`AdapterOperation`'s docstring. Never raises:
+    a signature that can't be introspected (e.g. some C-implemented
+    callables) is treated as NOT accepting it, matching every adapter
+    operation's own pre-existing 3-arg calling convention."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "tenant_id" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
 
 #: Default cap on requests per call -- same precedent as
 #: ``batch_management.DEFAULT_MAX_BATCH_ENTRIES``.
@@ -266,6 +340,194 @@ async def _op_get_profile_layer_revisions(db: Any, project_id: str, args: "dict[
     return await db_module.get_profile_layer_revisions(db, scope_id, limit=limit)
 
 
+# ---------------------------------------------------------------------------
+# tunnel_research adapter -- bounded, READ-ONLY cross-MCP fan-out (d17a437a).
+# See the module docstring's "tunnel_research" bullet for the full rationale;
+# this section only carries the allowlists and the two operations.
+#
+# Reuses, never duplicates:
+#   * meridian.mcp.handler._tunnel_proxy_outputs_tool -- the actual dispatch
+#     primitive (routing-cache scan + call_tunnel_tool + MCP content unwrap).
+#   * meridian.routes.tunnel.has_active_tunnel / _label_maps /
+#     _tunnel_tool_routes -- the exact same readiness signals
+#     get_tunnel_diagnostics itself is built on.
+# Both are imported lazily, inside the operation functions below, matching
+# this codebase's established convention for avoiding import-time cycles
+# with the (large, FastAPI-route-carrying) modules they live in -- see e.g.
+# meridian.mcp.handlers.sprint_tools.handle_batch_read's own lazy
+# `from ... import batch_read` for the identical reason in the other
+# direction.
+# ---------------------------------------------------------------------------
+
+#: Known-read-only tool names on the "code" tunnel slot (codebase-memory-mcp
+#: / Serena-style servers -- see AGENTS.md's "Code intelligence" section).
+#: Deliberately excludes every write-shaped tool on those same servers
+#: (replace_symbol_body, insert_after_symbol, insert_before_symbol,
+#: rename_symbol, safe_delete_symbol, replace_content, write_memory,
+#: edit_memory, delete_memory, rename_memory, index_repository,
+#: ingest_traces, manage_adr, delete_project) -- this adapter is READ-ONLY
+#: and will never dispatch a tool not on this list, full stop.
+_CODE_INTEL_READONLY_TOOLS: "frozenset[str]" = frozenset({
+    "search_graph", "trace_path", "get_code_snippet", "query_graph",
+    "get_architecture", "search_code", "search_code_semantic", "index_status",
+    "get_symbols_overview", "find_symbol", "find_referencing_symbols",
+    "find_declaration", "find_implementations", "get_diagnostics_for_file",
+    "list_memories", "read_memory", "list_projects",
+})
+
+#: Known-read-only tool names on the "docs" tunnel slot (extensions/meridian-docs
+#: -- see extensions/meridian-docs/meridian_docs/server.py). Excludes every
+#: insert_*/edit_*/remove_*/write_*/apply_*/index_*/ingest_*/render_*/
+#: relocate_*/move_*/copy_*/renumber_*/sync_* tool on that same server.
+_DOCS_READONLY_TOOLS: "frozenset[str]" = frozenset({
+    "document_outline", "parse_document", "get_structure", "get_structure_elements",
+    "get_paragraph", "search_paragraphs", "search_document", "read_document_snapshot",
+    "locate_anchor", "locate_anchors", "get_document_review", "audit_document",
+    "check_render_capability", "list_render_receipts", "check_release_render_gate",
+    "extract_equations", "get_equations", "audit_equation_style",
+    "get_journal_style_preset", "scan_citation_keys", "format_reference",
+    "get_section_content", "find_references_to", "scan_stale_notes",
+    "list_internal_notes", "audit_equation_integrity", "compare_equation_structures",
+    "find_orphaned_docx_staged_files",
+})
+
+#: Known-read-only tool names on the "outputs" tunnel slot (extensions/meridian-outputs
+#: -- see extensions/meridian-outputs/meridian_outputs/server.py). Excludes
+#: register_output_paths, annotate_outputs, record_provenance,
+#: bind_artifact_provenance, register_artifact, bind_artifact_source_edge,
+#: reconcile_legacy_artifact_outputs, tag_output, start_run_manifest,
+#: finalize_run_manifest on that same server.
+_OUTPUTS_READONLY_TOOLS: "frozenset[str]" = frozenset({
+    "search_outputs", "get_convergence_state", "inspect_local_file",
+    "get_provenance", "get_provenance_status", "list_provenance",
+    "get_provenance_status_envelope", "get_evidence_status_and_trusted_pointers",
+    "classify_outputs", "resolve_figure_output", "find_outputs_by_source",
+    "resolve_artifact", "verify_artifact_hash", "get_artifact_sources",
+    "get_source_artifacts", "list_registered_artifacts", "npy_metadata",
+    "file_fingerprint", "search_logs", "check_staleness", "find_stale_by_script",
+    "script_content_hash", "get_run_manifest", "list_run_manifests",
+    "get_run_manifest_envelope",
+})
+
+#: Tunnel slot label (meridian.routes.tunnel._label_maps's own vocabulary)
+#: for each of the three research surfaces this adapter fans out across.
+_TUNNEL_RESEARCH_SLOTS: "dict[str, str]" = {"code": "code", "docs": "docs", "outputs": "outputs"}
+
+#: bare tool name -> surface name, the actual allowlist `call` enforces.
+_TUNNEL_RESEARCH_TOOL_SURFACE: "dict[str, str]" = {
+    **{name: "code" for name in _CODE_INTEL_READONLY_TOOLS},
+    **{name: "docs" for name in _DOCS_READONLY_TOOLS},
+    **{name: "outputs" for name in _OUTPUTS_READONLY_TOOLS},
+}
+
+
+async def _op_tunnel_diagnostics(
+    db: Any, project_id: str, args: "dict[str, Any]", *, tenant_id: "str | None" = None,
+) -> Any:
+    """``tunnel_research.diagnostics`` -- read-only tunnel/slot readiness.
+
+    Never assumes a slot is up: reports exactly what
+    ``meridian.routes.tunnel``'s own live registries say right now, the same
+    ones ``get_tunnel_diagnostics`` reads. Never raises for a missing
+    tenant/session context -- degrades to an honest all-disconnected snapshot
+    (this is a batch_read operation; ValueError/LookupError here would
+    surface as a per-request VALIDATION_ERROR/NOT_FOUND, which would be
+    misleading for what is simply "no tunnel context available yet").
+    """
+    from ._deps import _hosted_mode  # noqa: PLC0415 -- avoid a module-load cycle
+    from .routes import tunnel as _tunnel_mod  # noqa: PLC0415 -- ditto
+
+    routed_tools: "dict[str, list[str]]" = {name: [] for name in _TUNNEL_RESEARCH_SLOTS}
+    if not tenant_id:
+        return {
+            "tenant_id": None,
+            "hosted": _hosted_mode(),
+            "tunnel_active": False,
+            "surfaces": {name: {"slot_connected": False} for name in _TUNNEL_RESEARCH_SLOTS},
+            "routed_tools": routed_tools,
+            "reason": "no tenant/session context available for this batch_read call",
+        }
+
+    if args.get("refresh"):
+        try:
+            await _tunnel_mod.list_tunnel_tools(tenant_id)
+        except Exception:  # noqa: BLE001 -- diagnostics must never fail on a refresh error
+            pass
+
+    surfaces: "dict[str, Any]" = {}
+    for name, slot_label in _TUNNEL_RESEARCH_SLOTS.items():
+        sockets, _ = _tunnel_mod._label_maps(slot_label)
+        surfaces[name] = {"slot_connected": tenant_id in sockets}
+
+    routes = _tunnel_mod._tunnel_tool_routes.get(tenant_id) or {}
+    for prefixed_name in routes:
+        bare_name = prefixed_name.rsplit("__", 1)[-1] if "__" in prefixed_name else prefixed_name
+        surface = _TUNNEL_RESEARCH_TOOL_SURFACE.get(bare_name)
+        if surface is not None:
+            routed_tools[surface].append(bare_name)
+
+    return {
+        "tenant_id": tenant_id,
+        "hosted": _hosted_mode(),
+        "tunnel_active": _tunnel_mod.has_active_tunnel(tenant_id),
+        "surfaces": surfaces,
+        "routed_tools": routed_tools,
+    }
+
+
+async def _op_tunnel_call(
+    db: Any, project_id: str, args: "dict[str, Any]", *, tenant_id: "str | None" = None,
+) -> Any:
+    """``tunnel_research.call`` -- dispatch ONE allowlisted read-only research
+    tool call through whichever connected tunnel slot currently serves it.
+
+    Reuses ``meridian.mcp.handler._tunnel_proxy_outputs_tool`` verbatim (see
+    this section's module-level comment) -- this function's own job is only
+    the allowlist gate (never forward a name that is not on
+    :data:`_TUNNEL_RESEARCH_TOOL_SURFACE`) and turning "not reachable right
+    now" into an honest ``NOT_FOUND`` instead of dispatching blind.
+    """
+    tool = args.get("tool")
+    if not isinstance(tool, str) or not tool.strip():
+        raise ValueError("tunnel_research.call requires a non-empty 'tool' name")
+    surface = _TUNNEL_RESEARCH_TOOL_SURFACE.get(tool)
+    if surface is None:
+        raise ValueError(
+            f"tool {tool!r} is not on the tunnel_research read-only allowlist -- "
+            "this adapter is READ-ONLY and will never dispatch an unrecognized "
+            "or known-mutating tool name (known surfaces: code, docs, outputs)"
+        )
+    arguments = args.get("arguments")
+    if arguments is None:
+        arguments = {}
+    elif not isinstance(arguments, dict):
+        raise ValueError("tunnel_research.call 'arguments', when given, must be an object")
+
+    if not tenant_id:
+        raise LookupError(
+            "no tenant/session context is available for this batch_read call -- "
+            "tunnel_research.call requires an authenticated tunnel session"
+        )
+
+    from .routes import tunnel as _tunnel_mod  # noqa: PLC0415 -- avoid a module-load cycle
+
+    if not _tunnel_mod.has_active_tunnel(tenant_id):
+        raise LookupError(
+            f"no active tunnel for this session -- start `meridian --tunnel` with "
+            f"the {surface} MCP server exposed on a connected slot, then retry"
+        )
+
+    from .mcp.handler import _tunnel_proxy_outputs_tool as _dispatch_tunnel_tool  # noqa: PLC0415
+
+    result = await _dispatch_tunnel_tool(tenant_id, tool, arguments)
+    if result is None:
+        raise LookupError(
+            f"tool {tool!r} ({surface}) is not exposed on any currently-connected "
+            "tunnel slot for this session"
+        )
+    return result
+
+
 #: Domain-aware adapter registry: adapter name -> {operation name -> callable}.
 #: See the module docstring's "Adapters implemented vs deferred" section.
 DEFAULT_ADAPTERS: "dict[str, dict[str, AdapterOperation]]" = {
@@ -278,6 +540,10 @@ DEFAULT_ADAPTERS: "dict[str, dict[str, AdapterOperation]]" = {
         "list_profile_layers": _op_list_profile_layers,
         "get_effective_profile": _op_get_effective_profile,
         "get_profile_layer_revisions": _op_get_profile_layer_revisions,
+    },
+    "tunnel_research": {
+        "diagnostics": _op_tunnel_diagnostics,
+        "call": _op_tunnel_call,
     },
 }
 
@@ -522,7 +788,11 @@ async def batch_read(
         fn = registry[adapter_name][operation]
         start = time.perf_counter()
         try:
-            value = await asyncio.wait_for(fn(db, project_id, args), timeout=timeout_ms / 1000.0)
+            call = (
+                fn(db, project_id, args, tenant_id=tenant_id)
+                if _accepts_tenant_id(fn) else fn(db, project_id, args)
+            )
+            value = await asyncio.wait_for(call, timeout=timeout_ms / 1000.0)
             result_records[rid] = _ReadResult(
                 request_id=rid, status="ok", adapter=adapter_name, operation=operation,
                 result=value, elapsed_ms=(time.perf_counter() - start) * 1000.0,
