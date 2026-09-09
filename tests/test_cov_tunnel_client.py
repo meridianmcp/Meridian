@@ -2269,11 +2269,23 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     async def fake_pool_reaper(pool, idle_seconds=tc._IDLE_KILL_SECONDS):
         return None
 
+    # 7b457c55 — budget watchdog is a new, separate forever-loop task
+    # (distinct from _idle_killer/_proc_watchdog above) scheduled alongside
+    # every owned/persistent slot regardless of use_owned_lifecycle (see its
+    # own "safe to schedule unconditionally" docstring/comment in
+    # tunnel_client.py). Left unmocked, run_tunnel's `await
+    # asyncio.gather(*tasks)` never returns in these tests -- it is a no-op
+    # here for the identical "so the run_tunnel task gather returns" reason
+    # _idle_killer/_pool_idle_reaper already are.
+    async def fake_budget_watchdog(proxy, budget=None):
+        return None
+
     monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
     monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
     monkeypatch.setattr(tc, "_reconnect_loop_extract_pool", fake_reconnect_extract_pool)
     monkeypatch.setattr(tc, "_pool_idle_reaper", fake_pool_reaper)
+    monkeypatch.setattr(tc, "_budget_watchdog", fake_budget_watchdog)
     return procs
 
 
@@ -2855,11 +2867,23 @@ def test_run_tunnel_fs_lazy_spawn_enoent_keeps_tunnel_up(monkeypatch, tmp_path):
     async def fake_pool_reaper(pool, idle_seconds=tc._IDLE_KILL_SECONDS):
         return None
 
+    # 7b457c55 — budget watchdog is a new, separate forever-loop task
+    # (distinct from _idle_killer/_proc_watchdog above) scheduled alongside
+    # every owned/persistent slot regardless of use_owned_lifecycle (see its
+    # own "safe to schedule unconditionally" docstring/comment in
+    # tunnel_client.py). Left unmocked, run_tunnel's `await
+    # asyncio.gather(*tasks)` never returns in these tests -- it is a no-op
+    # here for the identical "so the run_tunnel task gather returns" reason
+    # _idle_killer/_pool_idle_reaper already are.
+    async def fake_budget_watchdog(proxy, budget=None):
+        return None
+
     monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
     monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
     monkeypatch.setattr(tc, "_reconnect_loop_extract_pool", fake_reconnect_extract_pool)
     monkeypatch.setattr(tc, "_pool_idle_reaper", fake_pool_reaper)
+    monkeypatch.setattr(tc, "_budget_watchdog", fake_budget_watchdog)
 
     monkeypatch.setattr(
         tc, "_fetch_me",
@@ -3033,11 +3057,23 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
     async def fake_pool_reaper(pool, idle_seconds=tc._IDLE_KILL_SECONDS):
         return None
 
+    # 7b457c55 — budget watchdog is a new, separate forever-loop task
+    # (distinct from _idle_killer/_proc_watchdog above) scheduled alongside
+    # every owned/persistent slot regardless of use_owned_lifecycle (see its
+    # own "safe to schedule unconditionally" docstring/comment in
+    # tunnel_client.py). Left unmocked, run_tunnel's `await
+    # asyncio.gather(*tasks)` never returns in these tests -- it is a no-op
+    # here for the identical "so the run_tunnel task gather returns" reason
+    # _idle_killer/_pool_idle_reaper already are.
+    async def fake_budget_watchdog(proxy, budget=None):
+        return None
+
     monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
     monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
     monkeypatch.setattr(tc, "_reconnect_loop_extract_pool", fake_reconnect_extract_pool)
     monkeypatch.setattr(tc, "_pool_idle_reaper", fake_pool_reaper)
+    monkeypatch.setattr(tc, "_budget_watchdog", fake_budget_watchdog)
 
     class FakeProc:
         def poll(self): return None  # alive
