@@ -8005,6 +8005,22 @@ def _validate_omml_structure(omml_raw: str) -> ET.Element:
     if root.tag != _qm("oMath"):
         got = root.tag.rsplit("}", 1)[-1]
         raise ValueError(f"OMML m:oMath root required; got m:{got}")
+    if len(root) == 0:
+        # 443ba085 -- an `<m:oMath>` with zero child elements (e.g.
+        # `<m:oMath/>` or `<m:oMath></m:oMath>`) is not a malformed-but-
+        # plausible equation the way a bad fraction is; it has NO math
+        # content at all. Rejecting it here (rather than only rejecting a
+        # blank/whitespace `payload` string upstream in
+        # insert_equation_local) closes the gap where a syntactically valid
+        # but semantically vacuous OMML payload would otherwise be silently
+        # accepted and written as a blank equation box. Deliberately scoped
+        # to "no children whatsoever" -- a run with empty/whitespace text
+        # content (e.g. `<m:r><m:t></m:t></m:r>`) is a different, narrower
+        # case and is left untouched by this check.
+        raise ValueError(
+            "OMML <m:oMath> body is empty -- an equation must contain at "
+            "least one child element"
+        )
     for element in root.iter():
         name = element.tag.rsplit("}", 1)[-1] if "}" in element.tag else element.tag
         required = _OMML_REQUIRED_CHILDREN.get(name)
