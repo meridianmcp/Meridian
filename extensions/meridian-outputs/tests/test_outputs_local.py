@@ -125,6 +125,16 @@ pypdf_required = pytest.mark.skipif(
     not _PYPDF_AVAILABLE, reason="pypdf not installed"
 )
 
+try:
+    import blake3  # noqa: F401
+    _BLAKE3_AVAILABLE = True
+except ImportError:
+    _BLAKE3_AVAILABLE = False
+
+blake3_required = pytest.mark.skipif(
+    not _BLAKE3_AVAILABLE, reason="blake3 not installed"
+)
+
 
 @contextlib.contextmanager
 def inject_db_write_failure(exc: Exception | None = None):
@@ -7118,6 +7128,146 @@ class TestXxh3Hasher:
             assert idx._hasher is OL._xxh3_file
         finally:
             idx.close()
+
+
+class TestBlake3Hasher:
+    """2026-09-09 -- _blake3_file is an OPT-IN alternative to the default
+    _xxh3_file hasher (never selected unless a caller explicitly passes
+    hasher=_blake3_file), offering genuine cryptographic strength at a
+    comparable speed. Must degrade gracefully to _xxh3_file (NOT all the
+    way to SHA-256 -- xxh3 is still the module's own fast default) when the
+    optional blake3 package is unavailable, and must never be wired in as
+    any default itself."""
+
+    def test_returns_a_real_hash_for_real_content(self, tmp_path: Path) -> None:
+        f = tmp_path / "data.bin"
+        f.write_bytes(b"hello blake3 world" * 100)
+        digest = OL._blake3_file(str(f))
+        assert digest is not None
+        assert isinstance(digest, str)
+        assert len(digest) > 0
+
+    def test_deterministic_for_same_content(self, tmp_path: Path) -> None:
+        f1 = tmp_path / "a.bin"
+        f2 = tmp_path / "b.bin"
+        content = b"identical content for hashing" * 50
+        f1.write_bytes(content)
+        f2.write_bytes(content)
+        assert OL._blake3_file(str(f1)) == OL._blake3_file(str(f2))
+
+    def test_different_for_different_content(self, tmp_path: Path) -> None:
+        f1 = tmp_path / "a.bin"
+        f2 = tmp_path / "b.bin"
+        f1.write_bytes(b"content A")
+        f2.write_bytes(b"content B")
+        assert OL._blake3_file(str(f1)) != OL._blake3_file(str(f2))
+
+    def test_missing_file_returns_none(self) -> None:
+        assert OL._blake3_file("/no/such/file.bin") is None
+
+    @blake3_required
+    def test_differs_from_xxh3_for_same_content(self, tmp_path: Path) -> None:
+        """Sanity check that this is genuinely a different algorithm, not
+        accidentally aliased to the module's default hasher. Requires the
+        real blake3 package -- without it, _blake3_file's own documented
+        degrade-to-xxh3 contract makes this assertion false by construction
+        (see test_degrades_to_xxh3_when_blake3_unavailable for that case)."""
+        f = tmp_path / "data.bin"
+        f.write_bytes(b"content hashed two different ways" * 20)
+        assert OL._blake3_file(str(f)) != OL._xxh3_file(str(f))
+
+    def test_degrades_to_xxh3_when_blake3_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        f = tmp_path / "data.bin"
+        f.write_bytes(b"degrade path content")
+        monkeypatch.setitem(sys.modules, "blake3", None)
+        digest = OL._blake3_file(str(f))
+        assert digest == OL._xxh3_file(str(f))
+
+    def test_never_the_default_hasher_on_classify_canonical_archival(self) -> None:
+        import inspect
+        sig = inspect.signature(OL.classify_canonical_archival)
+        assert sig.parameters["hasher"].default is not OL._blake3_file
+        assert sig.parameters["hasher"].default is OL._xxh3_file
+
+    def test_never_the_default_hasher_on_outputs_fts_index(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._hasher is not OL._blake3_file
+        finally:
+            idx.close()
+
+    def test_opt_in_via_explicit_hasher_constructor_arg(self, tmp_path: Path) -> None:
+        """The whole point of this hasher: a caller CAN opt in explicitly."""
+        idx = OL.OutputsFtsIndex(str(tmp_path), hasher=OL._blake3_file)
+        try:
+            assert idx._hasher is OL._blake3_file
+        finally:
+            idx.close()
+
+    def test_analyse_file_uses_single_read_fast_path_with_blake3(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Companion to test_small_file_still_uses_fast_single_read_path:
+        opting into blake3 must not silently lose _analyse_file's
+        single-read optimization (e1fd4182) and fall back to the slower
+        two-read path -- that would make the opt-in a performance trap."""
+        monkeypatch.setattr(OL, "_LARGE_FILE_STREAM_THRESHOLD_BYTES", 100)
+        f = tmp_path / "small.bin"
+        content = b"z" * 50
+        f.write_bytes(content)
+
+        real_open = builtins.open
+        read_calls: list[tuple[Any, ...]] = []
+
+        def spy_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+            fh = real_open(path, *args, **kwargs)
+            if os.fspath(path) == str(f):
+                real_read = fh.read
+
+                def spy_read(*a: Any, **kw: Any) -> Any:
+                    read_calls.append(a)
+                    return real_read(*a, **kw)
+
+                fh.read = spy_read
+            return fh
+
+        monkeypatch.setattr(OL, "open", spy_open, raising=False)
+        analysis = OL._analyse_file(str(f), OL._blake3_file)
+        assert analysis.sha256 == OL._blake3_file(str(f))
+        assert any(not a for a in read_calls), (
+            f"expected an unbounded fh.read() call on the fast path, got: {read_calls!r}"
+        )
+
+    def test_analyse_file_fast_path_degrades_to_xxh3_when_blake3_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The fast path's OWN inner lazy-import (outputs_local.py's
+        _analyse_file, not _blake3_file itself) must degrade the same way:
+        blake3 missing -> xxh3, never straight to SHA-256."""
+        monkeypatch.setattr(OL, "_LARGE_FILE_STREAM_THRESHOLD_BYTES", 100)
+        monkeypatch.setitem(sys.modules, "blake3", None)
+        f = tmp_path / "small.bin"
+        content = b"w" * 50
+        f.write_bytes(content)
+        analysis = OL._analyse_file(str(f), OL._blake3_file)
+        assert analysis.sha256 == OL._xxh3_file(str(f))
+        assert analysis.sha256 != hashlib.sha256(content).hexdigest()
+
+    def test_analyse_file_fast_path_degrades_to_sha256_when_both_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Triple-fallback edge case: blake3 AND xxhash both missing must
+        still land on SHA-256, never crash or silently skip hashing."""
+        monkeypatch.setattr(OL, "_LARGE_FILE_STREAM_THRESHOLD_BYTES", 100)
+        monkeypatch.setitem(sys.modules, "blake3", None)
+        monkeypatch.setitem(sys.modules, "xxhash", None)
+        f = tmp_path / "small.bin"
+        content = b"v" * 50
+        f.write_bytes(content)
+        analysis = OL._analyse_file(str(f), OL._blake3_file)
+        assert analysis.sha256 == hashlib.sha256(content).hexdigest()
 
 
 class TestXxh3Benchmark:

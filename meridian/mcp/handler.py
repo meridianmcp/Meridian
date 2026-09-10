@@ -4584,7 +4584,8 @@ async def _handle_session_tools(
     set_executor_config, idle_until_session_done, search_all, search_synthesis,
     paper_search, social_search, github_search, get_session_brief,
     save_watchlist_query, list_watchlist_queries, run_watchlist_query,
-    delete_watchlist_query.
+    delete_watchlist_query, start_research_run, complete_research_run,
+    get_research_run, list_research_runs, promote_research_run.
 
     81abd31f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4618,7 +4619,16 @@ async def _handle_session_tools(
         handle_social_search,
         handle_get_session_brief,
     )
-    from .handlers.research_tools import handle_github_search  # noqa: PLC0415
+    from .handlers.research_tools import (  # noqa: PLC0415
+        handle_github_search,
+        # a5343387 — bounded ephemeral research runs, siblings of
+        # handle_github_search in the same research_tools.py module.
+        handle_start_research_run,
+        handle_complete_research_run,
+        handle_get_research_run,
+        handle_list_research_runs,
+        handle_promote_research_run,
+    )
     # b924fd7c — recurring research watchlist, a new sibling module in the same
     # Research Module family as research_tools.py (see that module's own
     # docstring for why the family gets its own handlers modules rather than
@@ -4651,6 +4661,12 @@ async def _handle_session_tools(
         "paper_search": handle_paper_search,
         "social_search": handle_social_search,
         "github_search": handle_github_search,
+        # a5343387 — bounded ephemeral research runs.
+        "start_research_run": handle_start_research_run,
+        "complete_research_run": handle_complete_research_run,
+        "get_research_run": handle_get_research_run,
+        "list_research_runs": handle_list_research_runs,
+        "promote_research_run": handle_promote_research_run,
         "get_session_brief": handle_get_session_brief,
         "save_watchlist_query": handle_save_watchlist_query,
         "list_watchlist_queries": handle_list_watchlist_queries,

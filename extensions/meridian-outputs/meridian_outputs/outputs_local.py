@@ -1522,6 +1522,58 @@ def _xxh3_file(path: str) -> str | None:
         return None
 
 
+def _blake3_file(path: str) -> str | None:
+    """Opt-in cryptographic-strength hasher, offered as an alternative to
+    :func:`_xxh3_file` -- NOT the default; a caller must explicitly pass
+    ``hasher=_blake3_file`` to opt in (e.g. to ``OutputsFtsIndex.__init__``
+    or :func:`classify_canonical_archival`).
+
+    2026-09-09 -- BLAKE3 is real-world benchmarked (upstream, and the SIMD-
+    parallelised C implementation the ``blake3`` PyPI package binds to) in
+    the same speed class as XXH3-128 on modern hardware, unlike SHA-256 --
+    but unlike XXH3, it is a genuine cryptographic hash. For a caller who
+    wants archival/duplicate-detection identity to also double as a
+    tamper-evident content fingerprint (e.g. before trusting a hash value
+    that crossed a less-trusted boundary), this is a strictly stronger
+    choice than XXH3 at comparable cost, at the price of the extra
+    dependency. It does not change the paper-reported wall-clock numbers
+    for this module's default configuration, since it is never selected
+    unless a caller explicitly asks for it.
+
+    Lazily imports ``blake3`` (an optional dependency -- see pyproject.toml)
+    and degrades to :func:`_xxh3_file` (not all the way to SHA-256; XXH3 is
+    still the module's own fast default) when the package is unavailable,
+    mirroring :func:`_xxh3_file`'s own graceful-degradation contract.
+
+    KNOWN, DELIBERATE SCOPE LIMIT: unlike the module's own default-algorithm
+    transition (SHA-256 -> XXH3, guarded by ``_HASH_ALGO_VERSION`` /
+    :meth:`OutputsFtsIndex._check_hash_algo_version`), this opt-in hasher is
+    NOT tracked by that version guard -- exactly like any other custom
+    ``hasher`` a caller could already inject before this function existed
+    (see the existing test-injection pattern). A caller who switches an
+    existing cache directory from the default hasher to ``_blake3_file``
+    (or vice versa) is responsible for using a fresh cache directory or
+    otherwise forcing a full re-hash; nothing here detects that switch and
+    silent hash-format mixing under the same on-disk column is possible if
+    a caller ignores this. This mirrors :func:`_xxh3_file`'s own note that
+    "the returned digest format differs depending on which path was taken"
+    and that callers must treat the value purely as an opaque equality
+    token -- extended here to a third possible format.
+    """
+    try:
+        import blake3  # noqa: PLC0415 -- optional, lazy
+    except ImportError:
+        return _xxh3_file(path)
+    try:
+        h = blake3.blake3()
+        with open(path, "rb", buffering=0) as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def _infer_generating_script_from_text(text: str) -> str | None:
     m = _SCRIPT_HINT_RE.search(text[:_SCRIPT_HINT_SEARCH_CHARS])
     return m.group(1) if m else None
@@ -2022,7 +2074,7 @@ def _analyse_file(
             size = mtime = None
 
     if (
-        (hasher is _sha256_file or hasher is _xxh3_file)
+        (hasher is _sha256_file or hasher is _xxh3_file or hasher is _blake3_file)
         and (size is None or size <= _LARGE_FILE_STREAM_THRESHOLD_BYTES)
     ):
         try:
@@ -2037,7 +2089,25 @@ def _analyse_file(
             # this fast path computes the hash directly rather than calling
             # back through hasher(path) (which would re-read) -- so it needs
             # its own lazy-import fallback, mirroring _xxh3_file's own.
-            if hasher is _xxh3_file:
+            #
+            # 2026-09-09 -- extended for the opt-in _blake3_file hasher,
+            # mirroring ITS OWN degrade chain (blake3 -> xxhash -> sha256)
+            # so choosing blake3 never silently loses this fast path's
+            # single-read optimization (which would otherwise make the
+            # opt-in quietly ~2x slower per file than the default, per
+            # e1fd4182's own live-benchmarked single-read-vs-two-read
+            # finding).
+            if hasher is _blake3_file:
+                try:
+                    import blake3 as _blake3_mod  # noqa: PLC0415
+                    h = _blake3_mod.blake3()
+                except ImportError:
+                    try:
+                        import xxhash  # noqa: PLC0415
+                        h = xxhash.xxh3_128()
+                    except ImportError:
+                        h = hashlib.sha256()
+            elif hasher is _xxh3_file:
                 try:
                     import xxhash  # noqa: PLC0415
                     h = xxhash.xxh3_128()
@@ -2217,6 +2287,28 @@ _HASH_ALGO_VERSION = 2
 # a849e3d5 -- was a flat hardcoded 8 regardless of machine size. The default
 # follows physical cores (not logical threads): filesystem-heavy analysis does
 # not benefit from one worker per hyperthread. Explicit/env overrides remain.
+#
+# 2026-09-09 correction -- the claim above ("does not benefit from one worker
+# per hyperthread") was asserted, not measured, and a live A/B against the
+# real ~633k-file/research-output corpus this module targets contradicts it:
+# disjoint 3000-file/~2.5GB batches, same machine, same corpus, per worker
+# count (workers -> effective throughput): 1->78.3 MiB/s, 2->211.7 (2.70x),
+# 4->341.9 (4.37x), 8->506.6 (6.47x, today's physical-core-count default),
+# 16->566.7 (7.24x, +12% over 8), 32->613.1 (7.83x, +8% more over 16). This
+# workload IS I/O-bound overall -- scaling clearly saturates well before
+# 32 workers, consistent with the physical-core rationale's premise -- but
+# the saturation point sits closer to LOGICAL core count than physical: the
+# 8->16 step is a real, repeatable ~12% gain, not noise, so "one worker per
+# hyperthread doesn't help" is not accurate on this hardware/workload. The
+# default below is left unchanged deliberately (changing it would silently
+# change the wall-clock -- though not the correctness -- of every existing
+# timing figure measured under the old default); a caller who wants the
+# measured ~12% gain can already get it today via the
+# MERIDIAN_OUTPUTS_MAX_WORKERS env var or the constructor's max_workers
+# param, e.g. set it to os.cpu_count() (logical) instead of leaving it at
+# this physical-core-count default. Re-benchmark before trusting this on
+# different hardware or a materially different file-size distribution --
+# this is one measurement, not a universal constant.
 _HARDCODED_MAX_WORKERS_FALLBACK = 8
 _MAX_WORKERS_ENV_VAR = "MERIDIAN_OUTPUTS_MAX_WORKERS"
 

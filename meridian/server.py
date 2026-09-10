@@ -5267,7 +5267,7 @@ async def _build_continue_payload(
         )
     except Exception:  # noqa: BLE001 — manifest is best-effort, never fatal
         _continuation_manifest = None
-    return {
+    _resume_payload: dict[str, Any] = {
         "continuation": True,
         "mode": "continue",
         "session_id": session["id"],
@@ -5287,6 +5287,23 @@ async def _build_continue_payload(
             "get_session_brief(project_id) only if you need the full orientation."
         ),
     }
+    # a5343387 — best-effort count of this project's live (status='active')
+    # bounded ephemeral research runs, surfaced on the resume block so a
+    # resuming executor can see at a glance whether it (or a sibling) left
+    # any scratch/probe work still open. ANY failure computing this — the
+    # migration not yet applied, a transient DB hiccup — degrades to
+    # OMITTING the field entirely; it must never break or change the return
+    # code of the resume itself.
+    try:
+        from meridian.db import research_runs as _research_runs_module  # noqa: PLC0415
+
+        _active_runs = await _research_runs_module.list_research_runs(
+            db, project_id, include_terminal=False, status="active", limit=500,
+        )
+        _resume_payload["active_research_runs"] = len(_active_runs)
+    except Exception:  # noqa: BLE001 — best-effort only, never fatal
+        pass
+    return _resume_payload
 
 
 # ecf69de8 — protocol-level EXECUTION MODE directive. start_session leads the

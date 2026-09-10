@@ -3011,6 +3011,81 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "type": {"type": "string", "enum": ["code", "repo"], "description": "Which keyless GitHub endpoint to search (default 'code')."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently indexed/updated first)."}},
          "required": ["query"]}},
+    {"name": "start_research_run", "description":
+        "a5343387 — start a bounded, ephemeral research/scratch run: an ADJACENT "
+        "primitive for disposable subagent probes that should not need a formal "
+        "sprint item, a formal claim_file, or a durable handoff entry unless "
+        "explicitly promoted (see promote_research_run). mode='read_only' needs no "
+        "claim_file at all. mode='isolated_write' requires is_isolated_worktree=true "
+        "(never inferred — confirm the session is actually in an isolated git "
+        "worktree, not the shared working tree) plus a non-empty allowed_paths list "
+        "of project-RELATIVE paths bounding what may be written; any write outside "
+        "that list is out of scope for the run. repository_id is a stable STRING "
+        "identity for the repo/worktree (e.g. 'meridian-repo@worktree:wf_...'), "
+        "never a machine-local absolute path. turn_budget bounds max turns/steps; "
+        "ttl_seconds bounds wall-clock life (default 3600, 60-86400) — an expired "
+        "active run is reaped by expire_stale_runs into status='expired'.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "mode": {"type": "string", "enum": ["read_only", "isolated_write"], "description": "read_only needs no claim_file; isolated_write requires is_isolated_worktree=true and a non-empty allowed_paths."},
+         "repository_id": {"type": "string", "description": "Stable STRING identity for the repository/worktree — never a machine-local absolute path."},
+         "allowed_paths": {"type": "array", "items": {"type": "string"}, "description": "Project-RELATIVE paths bounding what an isolated_write run may write. Required (non-empty) for mode='isolated_write'."},
+         "turn_budget": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Max turns/steps this run may take."},
+         "ttl_seconds": {"type": "integer", "minimum": 60, "maximum": 86400, "description": "Wall-clock time-to-live in seconds (default 3600)."},
+         "is_isolated_worktree": {"type": "boolean", "description": "Explicit caller attestation that this session is operating in an isolated git worktree — required (true) for mode='isolated_write', never inferred."}},
+         "required": ["session_id", "mode", "repository_id", "turn_budget"]}},
+    {"name": "complete_research_run", "description":
+        "a5343387 — finalize a research run with a compact, byte-bounded receipt "
+        "(16KB cap; exceeding it is REJECTED, never silently truncated). "
+        "disposition is explicit and REQUIRED (keep|discard|promote) — never "
+        "inferred from the run's outcome. Idempotent on an already-terminal run "
+        "(completed/failed/abandoned/expired): a duplicate call returns the "
+        "existing terminal state unchanged, never an error. Only disposition="
+        "'promote' runs are eligible for promote_research_run, and only "
+        "disposition in (keep, promote) runs are ever embedded into a handoff's "
+        "research_run_receipts (see generate_handoff/build_continuation_manifest) "
+        "— discard means exactly that.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "run_id": {"type": "string"},
+         "receipt": {"type": "object", "description": "Compact receipt (16KB total cap): files_touched (list of project-relative paths), commands_run (list, truncated if long), result_summary (bounded string), artifact_references (list of pointer ids), failure_reason (string or null).", "properties": {
+             "files_touched": {"type": "array", "items": {"type": "string"}},
+             "commands_run": {"type": "array", "items": {"type": "string"}},
+             "result_summary": {"type": "string"},
+             "artifact_references": {"type": "array", "items": {"type": "string"}},
+             "failure_reason": {"type": "string"}}},
+         "disposition": {"type": "string", "enum": ["keep", "discard", "promote"], "description": "Explicit, never inferred. 'promote' makes this run eligible for promote_research_run."}},
+         "required": ["session_id", "run_id", "disposition"]}},
+    {"name": "get_research_run", "description":
+        "a5343387 — read one project-scoped research run by id.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "run_id": {"type": "string"}},
+         "required": ["run_id"]}},
+    {"name": "list_research_runs", "description":
+        "a5343387 — list a project's research runs, newest-started first. By "
+        "default terminal runs (completed/failed/abandoned/expired) are omitted "
+        "so a fresh session sees only runs that may still be live.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "include_terminal": {"type": "boolean"},
+         "status": {"type": "string", "enum": ["active", "completed", "failed", "abandoned", "expired"]},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+         "required": []}},
+    {"name": "promote_research_run", "description":
+        "a5343387 — explicitly promote a completed, disposition='promote' research "
+        "run into a durable, addressable project finding (kind='finding' note, "
+        "discoverable via get_findings/get_notes) summarizing its receipt. Never "
+        "triggered automatically by completion — promotion is always a separate, "
+        "explicit call. Rejects with {error} when the run's stored disposition "
+        "is not 'promote'.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "run_id": {"type": "string"}},
+         "required": ["run_id"]}},
     {"name": "save_watchlist_query", "description":
         "b924fd7c — save a recurring research query so it can be re-run and "
         "diffed over time via run_watchlist_query. Persisted as a project note "
@@ -3839,6 +3914,7 @@ _READ_ONLY_TOOLS = {
     "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "get_external_job", "list_external_jobs",
+    "get_research_run", "list_research_runs",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
     "search_server_logs", "get_server_log_checkpoint",
@@ -3934,6 +4010,11 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_external_job":         "session",
     "list_external_jobs":       "session",
     "complete_external_job":    "session",
+    "start_research_run":       "research",
+    "complete_research_run":    "research",
+    "get_research_run":         "research",
+    "list_research_runs":       "research",
+    "promote_research_run":     "research",
     "get_session_brief":       "session",
     "get_context_block":       "session",
     "get_session_log":         "session",
@@ -4186,6 +4267,11 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "complete_external_job":      "executor",
     "get_external_job":           "both",
     "list_external_jobs":         "both",
+    "start_research_run":         "both",
+    "complete_research_run":      "both",
+    "get_research_run":           "both",
+    "list_research_runs":         "both",
+    "promote_research_run":       "both",
     "add_sprint_note":           "executor",
     "heartbeat":                 "executor",
     "run_verification":          "executor",
@@ -4406,6 +4492,11 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_external_job":            "common-support",
     "list_external_jobs":          "common-support",
     "complete_external_job":       "common-support",
+    "start_research_run":          "common-support",
+    "complete_research_run":       "common-support",
+    "get_research_run":            "common-support",
+    "list_research_runs":          "common-support",
+    "promote_research_run":        "common-support",
     "add_insight":                "common-support",
     "get_insights":               "common-support",
     "validate_assumption":        "common-support",

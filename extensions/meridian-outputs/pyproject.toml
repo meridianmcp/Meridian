@@ -81,6 +81,14 @@ dependencies = [
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.24"]
+# 2026-09-09 -- unlike xxhash/pyarrow/psutil/pypdf above, blake3 backs NO
+# default code path (_blake3_file, outputs_local.py) -- it is reachable only
+# if a caller explicitly passes hasher=_blake3_file. A normal install
+# therefore does NOT need this to get full default-path performance, so it
+# stays a genuine optional extra (pip install meridian-outputs[blake3])
+# rather than a hard dependency; outputs_local.py's own lazy import already
+# degrades gracefully to _xxh3_file when it's absent.
+blake3 = ["blake3>=0.4"]
 
 [project.scripts]
 # Entry-point is "meridian-outputs-mcp" (NOT "meridian-outputs") to avoid a uvx
