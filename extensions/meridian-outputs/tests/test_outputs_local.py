@@ -125,6 +125,16 @@ pypdf_required = pytest.mark.skipif(
     not _PYPDF_AVAILABLE, reason="pypdf not installed"
 )
 
+try:
+    import blake3  # noqa: F401
+    _BLAKE3_AVAILABLE = True
+except ImportError:
+    _BLAKE3_AVAILABLE = False
+
+blake3_required = pytest.mark.skipif(
+    not _BLAKE3_AVAILABLE, reason="blake3 not installed"
+)
+
 
 @contextlib.contextmanager
 def inject_db_write_failure(exc: Exception | None = None):
@@ -7155,9 +7165,13 @@ class TestBlake3Hasher:
     def test_missing_file_returns_none(self) -> None:
         assert OL._blake3_file("/no/such/file.bin") is None
 
+    @blake3_required
     def test_differs_from_xxh3_for_same_content(self, tmp_path: Path) -> None:
         """Sanity check that this is genuinely a different algorithm, not
-        accidentally aliased to the module's default hasher."""
+        accidentally aliased to the module's default hasher. Requires the
+        real blake3 package -- without it, _blake3_file's own documented
+        degrade-to-xxh3 contract makes this assertion false by construction
+        (see test_degrades_to_xxh3_when_blake3_unavailable for that case)."""
         f = tmp_path / "data.bin"
         f.write_bytes(b"content hashed two different ways" * 20)
         assert OL._blake3_file(str(f)) != OL._xxh3_file(str(f))
