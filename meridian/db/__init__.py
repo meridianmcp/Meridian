@@ -12748,6 +12748,10 @@ from .proposal_lineage import (  # noqa: F401
     get_proposal_lineage_links,
     get_proposal_successors,
     get_proposal_ancestors,
+    # ff1843dc — successor creation, descendant queries, version comparison.
+    get_proposal_descendants,
+    create_proposal_successor,
+    compare_proposal_versions,
 )
 
 

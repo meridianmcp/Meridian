@@ -88,6 +88,10 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "promote_proposal": 'promote_proposal(proposal_id="prop-uuid", project_id="proj-uuid", sprint_item_title="Expose auth as plugin")',
     "preview_proposal_promotion": 'preview_proposal_promotion(proposal_id="prop-uuid", project_id="proj-uuid", depth="sprint_items")',
     "commit_proposal_promotion": 'commit_proposal_promotion(proposal_id="prop-uuid", project_id="proj-uuid", depth="sprint_items", preview_hash="sha256:...")',
+    "create_proposal_successor": 'create_proposal_successor(proposal_id="prop-uuid", title="Expose auth as plugin (v2)", body="Revised after investigation", relation_type="supersedes")',
+    "link_proposal_lineage": 'link_proposal_lineage(from_proposal_id="prop-new-uuid", to_proposal_id="prop-old-uuid", relation_type="duplicates")',
+    "get_proposal_lineage": 'get_proposal_lineage(proposal_id="prop-uuid")',
+    "compare_proposal_versions": 'compare_proposal_versions(from_proposal_id="prop-new-uuid", to_proposal_id="prop-old-uuid")',
     "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
     "get_workspace_decisions": 'get_workspace_decisions()',
     "get_workspace_settings": 'get_workspace_settings()',
@@ -2347,6 +2351,79 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "actor": {"type": "string", "description": "Optional actor identity recorded on proposal events."},
          "override_reason": {"type": "string", "description": "Non-empty reason to acknowledge and proceed past a triggered HITL deviation instead of stopping (audited)."}},
          "required": ["proposal_id", "depth", "preview_hash"]}},
+    # -------------------------------------------------------------------
+    # ff1843dc — proposal lineage: successor creation, typed relations,
+    # ancestor/descendant queries, adjacent-version comparison. Layered on
+    # top of meridian.db.proposal_lineage (5a744f81's typed-relation table),
+    # which had no MCP-facing surface before this. Distinct from proposal
+    # PROMOTION (preview/commit_proposal_promotion above, a proposal ->
+    # sprint item relation) and from proposal EVIDENCE links
+    # (proposal_evidence_links, exposed only via the read-only
+    # proposal_evidence field on generate_handoff) — this is proposal ->
+    # PROPOSAL lineage: versions, forks, duplicates.
+    # -------------------------------------------------------------------
+    {"name": "create_proposal_successor", "description":
+        "Create a NEW, distinct proposal that is a version/successor of an existing one, linked to "
+        "it by an explicit typed relation (supersedes/refines/forks/continues/duplicates/responds_to) "
+        "— never by mutating the predecessor or overloading family_id/proposal_events (pinned decision "
+        "6aef812e). Inherits the predecessor's project scope (project-scoped stays project-scoped, "
+        "workspace-global stays workspace-global) and family_id automatically. Idempotent: pass the "
+        "same idempotency_key on a retry to get back the SAME successor rather than a second one — "
+        "the underlying proposal creation AND the lineage edge are both independently idempotent. "
+        "Returns {proposal, lineage, predecessor_id}.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string", "description": "The PREDECESSOR proposal's id — the new proposal's relation_type points at this one."},
+         "title": {"type": "string", "description": "Title for the new successor proposal."},
+         "body": {"type": "string", "description": "Full description for the new successor proposal."},
+         "relation_type": {"type": "string", "enum": ["supersedes", "refines", "forks", "continues", "duplicates", "responds_to"],
+                            "description": "How the new proposal relates to its predecessor."},
+         "tags": {"type": "string", "description": "Optional comma-separated tags for the new proposal."},
+         "label": {"type": "string", "description": "Optional human-readable label stored on the lineage edge itself (not on either proposal)."},
+         "idempotency_key": {"type": "string", "description": "Optional caller-supplied key; a retried call with the same key returns the original successor instead of creating a duplicate."},
+         "actor": {"type": "string", "description": "Optional actor identity recorded on the new proposal's events and on the lineage edge."},
+         "session_id": {"type": "string", "description": "Optional caller session id, recorded on the new proposal's 'created' event."}},
+         "required": ["proposal_id", "title", "body", "relation_type"]}},
+    {"name": "link_proposal_lineage", "description":
+        "Record a typed lineage relation between two EXISTING proposals: from_proposal_id "
+        "--relation_type--> to_proposal_id (to_proposal_id is the older/predecessor side). Idempotent "
+        "— linking the same (from, to, relation_type) tuple again returns the same row rather than "
+        "duplicating it. Rejected (ValueError -> {\"error\": ...}) if either proposal doesn't exist, "
+        "if the two belong to different tenants/workspaces, or if the new edge would create a cycle "
+        "in the lineage graph. Prefer create_proposal_successor when the successor doesn't exist yet — "
+        "this tool is for linking two proposals that both already exist (e.g. marking one as a "
+        "duplicate of another after the fact).",
+     "inputSchema": {"type": "object", "properties": {
+         "from_proposal_id": {"type": "string", "description": "The newer/'this' proposal."},
+         "to_proposal_id": {"type": "string", "description": "The proposal it relates to (its predecessor in the relation)."},
+         "relation_type": {"type": "string", "enum": ["supersedes", "refines", "forks", "continues", "duplicates", "responds_to"]},
+         "label": {"type": "string", "description": "Optional human-readable label for this edge."},
+         "actor": {"type": "string", "description": "Optional actor identity recorded on the edge."}},
+         "required": ["from_proposal_id", "to_proposal_id", "relation_type"]}},
+    {"name": "get_proposal_lineage", "description":
+        "Read-only: everything known about one proposal's place in its lineage graph in one call — "
+        "raw relation edges touching it (either direction), its ancestor chain (walking predecessor-"
+        "ward, nearest first), its direct successors (proposals that relate TO it, sequence-ordered), "
+        "and its full descendant set (every proposal that transitively relates to it, breadth-first, "
+        "nearest first). Descendants are capped at max_items edges with a non-silent 'descendants_truncated' "
+        "marker reporting the true total when exceeded — ancestors/successors/links are not capped "
+        "(a lineage chain/fan-out this large would itself be pathological). Returns "
+        "{proposal_id, links, ancestors, successors, descendants, descendants_truncated}.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string"},
+         "max_items": {"type": "integer", "minimum": 1, "maximum": 1000,
+                       "description": "Cap on how many descendant edges to return (default 200)."}},
+         "required": ["proposal_id"]}},
+    {"name": "compare_proposal_versions", "description":
+        "Read-only: structural diff between two proposals — most commonly two adjacent versions in a "
+        "lineage chain, but works for any two existing proposal ids. Reports per-field before/after/"
+        "changed for title/body/tags/status/scope_type/project_id/family_id, plus a difflib similarity "
+        "ratio and a unified diff for body specifically, plus whether the two are directly linked in "
+        "the lineage graph ('adjacent') and the connecting edge(s) if so. Returns "
+        "{from, to, direct_relations, adjacent, diff}.",
+     "inputSchema": {"type": "object", "properties": {
+         "from_proposal_id": {"type": "string", "description": "First proposal to compare (the 'a' side of each diff entry)."},
+         "to_proposal_id": {"type": "string", "description": "Second proposal to compare (the 'b' side of each diff entry)."}},
+         "required": ["from_proposal_id", "to_proposal_id"]}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
         "returns session, tasks, decisions, and recent commits in one call. "
@@ -3995,6 +4072,8 @@ _READ_ONLY_TOOLS = {
     "list_profile_layers", "get_profile_layer", "get_profile_layer_revisions",
     "get_effective_profile",
     "preview_proposal_promotion",
+    # ff1843dc — proposal lineage read-only queries.
+    "get_proposal_lineage", "compare_proposal_versions",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
@@ -4173,6 +4252,10 @@ _TOOL_CATEGORY: dict[str, str] = {
     "promote_proposal":                "workspace",
     "preview_proposal_promotion":      "workspace",
     "commit_proposal_promotion":       "workspace",
+    "create_proposal_successor":       "workspace",
+    "link_proposal_lineage":           "workspace",
+    "get_proposal_lineage":            "workspace",
+    "compare_proposal_versions":       "workspace",
     "save_blog_post":                  "workspace",
     "get_blog_posts":                  "workspace",
     "update_md_section":               "workspace",
@@ -4353,6 +4436,10 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "promote_proposal":          "planner",
     "preview_proposal_promotion": "planner",
     "commit_proposal_promotion": "planner",
+    "create_proposal_successor": "planner",
+    "link_proposal_lineage":     "planner",
+    "get_proposal_lineage":      "planner",
+    "compare_proposal_versions": "planner",
     "update_md_section":         "planner",
     "save_blog_post":            "planner",
     "paper_search":              "planner",

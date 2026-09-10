@@ -3505,6 +3505,16 @@ async def _handle_task_tools(
             db, args["project_id"],
             item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
         )
+        # ff1843dc — machine-readable proposal-to-PROPOSAL lineage (versions/
+        # forks/duplicates), emitted on every generate_handoff mode alongside
+        # the proposal-evidence field above — same selected-item-scope
+        # narrowing, same fully-guarded best-effort contract. Distinct field:
+        # proposal_evidence is proposal->sprint_item/note/finding/decision;
+        # this is proposal->PROPOSAL.
+        _proposal_lineage = await handoff_module_local.build_proposal_lineage_for_handoff(
+            db, args["project_id"],
+            item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
+        )
         # d09c29fe — machine-readable DOCX-integrity gate, emitted on every
         # generate_handoff mode alongside the two fields above. Tied to the
         # proposal evidence just built (6cdc5df3) so a proposal-linked .docx
@@ -3615,6 +3625,10 @@ async def _handle_task_tools(
             # 6cdc5df3 — one entry per proposal id with linked evidence in this
             # project (see meridian.db.proposal_links.get_proposal_evidence).
             "proposal_evidence": _proposal_evidence,
+            # ff1843dc — one entry per proposal id (SAME set as proposal_evidence
+            # above) with its ancestor chain, direct successors, and descendant
+            # count (see meridian.db.proposal_lineage).
+            "proposal_lineage": _proposal_lineage,
             # d09c29fe — DOCX audit status/findings/provenance for items/
             # artifacts this handoff covers, plus the executable/executable_reasons
             # readiness signal (see meridian.docx_integrity_gate).
@@ -4296,9 +4310,13 @@ async def _handle_notes_decisions(
         handle_add_proposal,
         handle_preview_proposal_promotion,
         handle_commit_proposal_promotion,
+        handle_create_proposal_successor,
+        handle_link_proposal_lineage,
+        handle_get_proposal_lineage,
+        handle_compare_proposal_versions,
     )
 
-    # All 47 tools map directly to handler functions with the standard five
+    # All 62 tools map directly to handler functions with the standard five
     # parameters — no extra context needed beyond (args, db, data_dir, tenant,
     # _mcp_tenant_id).
     _standard_dispatch: dict[str, Any] = {
@@ -4360,6 +4378,10 @@ async def _handle_notes_decisions(
         "add_proposal": handle_add_proposal,
         "preview_proposal_promotion": handle_preview_proposal_promotion,
         "commit_proposal_promotion": handle_commit_proposal_promotion,
+        "create_proposal_successor": handle_create_proposal_successor,
+        "link_proposal_lineage": handle_link_proposal_lineage,
+        "get_proposal_lineage": handle_get_proposal_lineage,
+        "compare_proposal_versions": handle_compare_proposal_versions,
     }
 
     if name in _standard_dispatch:

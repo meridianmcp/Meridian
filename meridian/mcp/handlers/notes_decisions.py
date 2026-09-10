@@ -2759,3 +2759,130 @@ async def handle_commit_proposal_promotion(
         # not-found proposal/project, and malformed pointer shapes — all
         # deterministic {"error": ...} responses instead of a raw exception.
         return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Section 16: Proposal lineage (ff1843dc) — successor creation, typed
+# relations, ancestor/descendant queries, adjacent-version comparison.
+# Layered on top of meridian.db.proposal_lineage (5a744f81's typed-relation
+# table + cycle/tenant-checked link_proposal_lineage), which had no MCP-
+# facing surface before this item.
+# ---------------------------------------------------------------------------
+
+async def handle_create_proposal_successor(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: create_proposal_successor (ff1843dc)."""
+    validate_input_size(args.get("title"), "proposal title", 500)
+    validate_input_size(args.get("body"), "proposal body", 100_000)
+    try:
+        return await db_module.create_proposal_successor(
+            db, args["proposal_id"], args["title"], args["body"],
+            args["relation_type"],
+            tenant_id=_mcp_tenant_id,
+            tags=args.get("tags"),
+            label=args.get("label"),
+            idempotency_key=args.get("idempotency_key"),
+            actor=args.get("actor"),
+            session_id=args.get("session_id"),
+        )
+    except (ValueError, ProposalSchemaError) as exc:
+        # ValueError covers an unknown predecessor, a bad relation_type, and
+        # a cross-tenant attempt; ProposalSchemaError covers a mid-migration
+        # schema on this backend (bubbled up from add_workspace_proposal).
+        return {"error": str(exc)}
+
+
+async def handle_link_proposal_lineage(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: link_proposal_lineage (ff1843dc)."""
+    try:
+        return await db_module.link_proposal_lineage(
+            db, args["from_proposal_id"], args["to_proposal_id"],
+            args["relation_type"],
+            tenant_id=_mcp_tenant_id,
+            label=args.get("label"),
+            actor=args.get("actor"),
+        )
+    except ValueError as exc:
+        # Covers a bad relation_type, an unknown/dangling proposal id, a
+        # cross-tenant attempt, and a would-be cycle — all deterministic
+        # {"error": ...} responses instead of a raw exception.
+        return {"error": str(exc)}
+
+
+async def handle_get_proposal_lineage(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_proposal_lineage (ff1843dc). Read-only.
+
+    Aggregates the raw relation edges, ancestor chain, direct successors,
+    and full descendant set for one proposal into a single response.
+    Descendants are capped at ``max_items`` (default 200) with a non-silent
+    ``descendants_truncated`` marker — see
+    :func:`meridian.db.proposal_lineage.get_proposal_descendants`'s own
+    docstring for why only descendants (not ancestors/successors/links) need
+    a cap: it is the one query shape that can fan out combinatorially.
+    """
+    proposal_id = args["proposal_id"]
+    # Clamped to the same [1, 1000] range the inputSchema declares
+    # (minimum/maximum are advisory-only at the JSON-schema level — nothing
+    # upstream of this handler enforces them against a raw/direct call), so
+    # this handler's own behavior actually matches what its schema promises,
+    # mirroring get_workspace_proposals's own internal limit clamp.
+    max_items = max(1, min(int(args.get("max_items") or 200), 1000))
+    links = await db_module.get_proposal_lineage_links(
+        db, proposal_id, tenant_id=_mcp_tenant_id,
+    )
+    ancestors = await db_module.get_proposal_ancestors(
+        db, proposal_id, tenant_id=_mcp_tenant_id,
+    )
+    successors = await db_module.get_proposal_successors(
+        db, proposal_id, tenant_id=_mcp_tenant_id,
+    )
+    # ask for one extra so a truncation can be detected without a second
+    # (potentially expensive) unbounded count query.
+    descendants = await db_module.get_proposal_descendants(
+        db, proposal_id, tenant_id=_mcp_tenant_id, max_items=max_items + 1,
+    )
+    truncated = len(descendants) > max_items
+    if truncated:
+        descendants = descendants[:max_items]
+    return {
+        "proposal_id": proposal_id,
+        "links": links,
+        "ancestors": ancestors,
+        "successors": successors,
+        "descendants": descendants,
+        "descendants_truncated": truncated,
+    }
+
+
+async def handle_compare_proposal_versions(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: compare_proposal_versions (ff1843dc). Read-only."""
+    try:
+        return await db_module.compare_proposal_versions(
+            db, args["from_proposal_id"], args["to_proposal_id"],
+            tenant_id=_mcp_tenant_id,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}

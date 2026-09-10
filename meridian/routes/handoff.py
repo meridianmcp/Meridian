@@ -108,6 +108,13 @@ async def planner_handoff_endpoint(
     proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
         db, project_id,
     )
+    # ff1843dc — machine-readable proposal-to-PROPOSAL lineage; best-effort,
+    # never breaks the planner handoff. Sibling field to proposal_evidence
+    # above (proposal->evidence vs proposal->proposal) — see
+    # build_proposal_lineage_for_handoff's own docstring.
+    proposal_lineage = await handoff_module.build_proposal_lineage_for_handoff(
+        db, project_id,
+    )
     # d09c29fe — machine-readable DOCX-integrity gate; best-effort, never
     # breaks the planner handoff. Tied to the proposal evidence above so a
     # proposal-linked .docx artifact is gated too (6cdc5df3).
@@ -141,6 +148,7 @@ async def planner_handoff_endpoint(
         "capability_contract": capability_contract,
         "profile_binding": profile_binding,
         "proposal_evidence": proposal_evidence,
+        "proposal_lineage": proposal_lineage,
         "docx_integrity": docx_integrity,
         "latest_executor_report": latest_executor_report,
         "board_context_state": board_context_state,
@@ -368,6 +376,14 @@ async def generate_handoff_endpoint(
         db, project_id,
         item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
     )
+    # ff1843dc — machine-readable proposal-to-PROPOSAL lineage; best-effort,
+    # never breaks the mandatory handoff. Same selected-item-scope narrowing
+    # as proposal_evidence just above — see
+    # build_proposal_lineage_for_handoff's own docstring.
+    proposal_lineage = await handoff_module.build_proposal_lineage_for_handoff(
+        db, project_id,
+        item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
+    )
     # d09c29fe — machine-readable DOCX-integrity gate; best-effort, never
     # breaks the mandatory handoff. Tied to the proposal evidence above so a
     # proposal-linked .docx artifact is gated too (6cdc5df3).
@@ -400,6 +416,7 @@ async def generate_handoff_endpoint(
         "capability_contract": capability_contract,
         "profile_binding": profile_binding,
         "proposal_evidence": proposal_evidence,
+        "proposal_lineage": proposal_lineage,
         "docx_integrity": docx_integrity,
         "force_include_rejected": _force_include_rejected,
         "continuation_status": _continuation_status,
