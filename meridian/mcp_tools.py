@@ -724,6 +724,74 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "cursor": {"type": "integer", "description": "Offset into the ordered result set. Pass a prior response's next_cursor. Default 0."},
          "limit": {"type": "integer", "description": "Default 50, capped at 500."}},
          "required": []}},
+    {"name": "get_ai_log_export_status", "description":
+        "R2-G — Read-only: status/diagnostics for the OPTIONAL AI-log -> OTel/"
+        "self-hosted-Langfuse export adapter (meridian.ai_log_otel_export). "
+        "Attempts NO network call — only reports whether the feature is "
+        "globally enabled (MERIDIAN_AI_LOG_OTEL_ENABLED), the effective "
+        "per-project enabled state, whether the optional opentelemetry client "
+        "library is installed, the resolved endpoint/protocol/service_name, "
+        "and the stored config/watermark row (last export status, last error, "
+        "retry_count) if one exists. Meridian's own ai_log_events table stays "
+        "authoritative regardless of this feature's state — see "
+        "meridian.ai_log_otel_export's module docstring for the binding "
+        "architectural decision (this is an export adapter, never a second "
+        "source of truth). Returns {project_id, global_feature_enabled, "
+        "effective_enabled, dependency_available, endpoint_configured, "
+        "protocol, langfuse_compat, service_name, config}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
+    {"name": "set_ai_log_export_config", "description":
+        "R2-G — Set per-project override config for the OPTIONAL AI-log -> "
+        "OTel/self-hosted-Langfuse export adapter. Every field is optional and "
+        "left-as-is when omitted (partial upsert). 'enabled=false' force-"
+        "disables export for THIS project even when the global "
+        "MERIDIAN_AI_LOG_OTEL_ENABLED flag is on; 'enabled=true' or omitted "
+        "defers to the global flag — a project can never turn export on when "
+        "the operator has globally disabled it. 'otlp_endpoint' must be an "
+        "http:// or https:// URL and is validated against this codebase's "
+        "shared secret/path checks (meridian.secret_redaction.check_for_secrets "
+        "+ meridian.capability_manifest's embedded-credential/absolute-path "
+        "patterns) — rejected with a ValueError if it looks like it carries a "
+        "bearer token, embedded basic-auth credentials, or a machine-local "
+        "path. An OTLP auth header/API key is NEVER accepted here — set the "
+        "MERIDIAN_AI_LOG_OTEL_HEADERS environment variable on the server "
+        "instead; there is no field on this tool or column in storage for it. "
+        "'langfuse_compat=true' is a purely informational hint (adds a "
+        "resource attribute, shown in get_ai_log_export_status) for pointing "
+        "otlp_endpoint at a self-hosted Langfuse OTLP-compatible ingestion "
+        "endpoint — it does not change the wire protocol.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "enabled": {"type": "boolean", "description": "Per-project override. false force-disables even if the global flag is on; true/omitted defers to the global flag."},
+         "otlp_endpoint": {"type": "string", "description": "http:// or https:// OTLP logs endpoint override for this project. Validated — never a secret-shaped or embedded-credential URL."},
+         "protocol": {"type": "string", "enum": ["otlp_http", "langfuse_otlp"], "description": "Documentation-only label; both send the same OTLP/HTTP wire format."},
+         "service_name": {"type": "string", "description": "OTel resource service.name override for this project's exported events."},
+         "langfuse_compat": {"type": "boolean", "description": "Informational hint only — set true when otlp_endpoint points at a self-hosted Langfuse OTLP-compatible ingestion endpoint."}},
+         "required": []}},
+    {"name": "export_ai_log_otel", "description":
+        "R2-G — Run ONE bounded export pass of new ai_log_events to the "
+        "configured OTel/Langfuse-compatible OTLP endpoint for a project, "
+        "resuming from the durable watermark left by the previous pass. "
+        "Always safe to call: returns {\"status\": \"disabled\"} immediately "
+        "if MERIDIAN_AI_LOG_OTEL_ENABLED (or this project's own override) is "
+        "off, {\"status\": \"unavailable\"} if the optional opentelemetry "
+        "client library isn't installed or no endpoint is configured, "
+        "{\"status\": \"idle\"} if there is nothing new to export, "
+        "{\"status\": \"sent\"} on full success, {\"status\": \"degraded\"} if "
+        "part of the batch sent before a chunk exhausted its bounded retries "
+        "(the watermark still advanced past every chunk that DID send — no "
+        "silent gaps), or {\"status\": \"sync_failed\"}/{\"status\": \"error\"} "
+        "if nothing sent this pass. NEVER raises, never blocks the caller "
+        "longer than a bounded overall deadline, and never mutates or deletes "
+        "any ai_log_events row — Meridian's own DB stays authoritative "
+        "regardless of outcome. Returns {project_id, status, sent_count, "
+        "batch_size, reason}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "batch_size": {"type": "integer", "description": "Max events to fetch this pass. Default from MERIDIAN_AI_LOG_OTEL_BATCH_SIZE (200), hard-capped at 1000."}},
+         "required": []}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions) "
@@ -4046,6 +4114,7 @@ _READ_ONLY_TOOLS = {
     "idle_until_session_done", "generate_handoff", "load_handoff",
     "verify_handoff_token",
     "export_ai_log", "export_ai_log_artifacts", "search_ai_log",
+    "get_ai_log_export_status",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_blog_posts",
@@ -4081,7 +4150,12 @@ _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete
 # rather than only reading Meridian's own state.  Keep this separate from the
 # read-only set: a GitHub/paper/social search can be read-only for Meridian
 # while still operating in an external open world.
-_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search", "run_watchlist_query"}
+_OPEN_WORLD_TOOLS = {
+    "paper_search", "social_search", "github_search", "run_watchlist_query",
+    # R2-G — the only step of this tool that isn't a local DB read/write is
+    # the actual OTLP HTTP POST to an operator-configured external endpoint.
+    "export_ai_log_otel",
+}
 
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
@@ -4131,6 +4205,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "export_ai_log_artifacts": "notes",
     "purge_ai_log":            "notes",
     "search_ai_log":           "notes",
+    "get_ai_log_export_status": "notes",
+    "set_ai_log_export_config": "notes",
+    "export_ai_log_otel":       "notes",
     "checkpoint":              "session",
     "register_external_job":    "session",
     "update_external_job":      "session",
@@ -4471,6 +4548,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "export_ai_log_artifacts":   "both",
     "purge_ai_log":              "executor",
     "search_ai_log":             "both",
+    "get_ai_log_export_status":  "both",
+    "set_ai_log_export_config":  "executor",
+    "export_ai_log_otel":        "executor",
     "refresh_context":           "both",
     "get_context_block":         "both",
     "get_session_brief":         "both",
@@ -4771,6 +4851,9 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "export_ai_log_artifacts":    "maintenance-only",
     "purge_ai_log":               "maintenance-only",
     "search_ai_log":              "maintenance-only",
+    "get_ai_log_export_status":   "maintenance-only",
+    "set_ai_log_export_config":   "maintenance-only",
+    "export_ai_log_otel":         "maintenance-only",
     # sprint item pointer cleanup
     "delete_sprint_item_pointer": "maintenance-only",
     # note cleanup
@@ -4890,6 +4973,9 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "export_ai_log_artifacts": "Export AI Log Artifacts",
     "purge_ai_log": "Purge AI Log",
     "search_ai_log": "Search AI Log",
+    "get_ai_log_export_status": "Get AI Log Export Status",
+    "set_ai_log_export_config": "Set AI Log Export Config",
+    "export_ai_log_otel": "Export AI Log to OTel",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

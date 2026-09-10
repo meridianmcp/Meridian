@@ -1154,6 +1154,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_structural_patch(db)
     await _migrate_scratch_research_runs(db)
     await _migrate_session_recovery_registry(db)
+    await _migrate_ai_log_export_config(db)
     return db
 
 
@@ -12925,6 +12926,24 @@ from .ai_log import (  # noqa: F401
     list_events,
     purge_events_before,
     search_events,
+)
+
+
+# R2-G — durable config + resumable watermark state for the OPTIONAL AI-log
+# -> OTel/Langfuse export adapter (meridian.ai_log_otel_export). Pure
+# bookkeeping over the ai_log_events stream above — see this submodule's own
+# docstring for the "export adapter, never a second source of truth" binding
+# decision (03112002) it implements. Imported right after ai_log itself
+# since it reads FROM ai_log_events (read-only) but is otherwise independent.
+from .ai_log_export_config import (  # noqa: F401
+    AI_LOG_EXPORT_STATES,
+    RETRY_ELIGIBLE_STATES as AI_LOG_EXPORT_RETRY_ELIGIBLE_STATES,
+    _migrate_ai_log_export_config,
+    fetch_new_events_for_export,
+    get_ai_log_export_config,
+    record_export_attempt as record_ai_log_export_attempt,
+    record_export_success as record_ai_log_export_success,
+    set_ai_log_export_config,
 )
 
 

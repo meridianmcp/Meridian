@@ -3097,7 +3097,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log, search_ai_log."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log, search_ai_log, get_ai_log_export_status, set_ai_log_export_config, export_ai_log_otel."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -4026,6 +4026,35 @@ async def _handle_task_tools(
                 _dt_cls.now(_tz.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
             ),
         }
+    if name == "get_ai_log_export_status":
+        # R2-G — read-only diagnostics for the optional AI-log -> OTel/
+        # Langfuse export adapter. See meridian.ai_log_otel_export's module
+        # docstring for the binding "export adapter, never a second source
+        # of truth" decision this whole dispatch group implements.
+        from .. import ai_log_otel_export as otel_export_module  # noqa: PLC0415
+        return await otel_export_module.get_export_status(db, args["project_id"])
+    if name == "set_ai_log_export_config":
+        # R2-G — mutating, but never touches ai_log_events itself; validated
+        # against this codebase's shared secret/path checks at the DB layer
+        # (see meridian.db.ai_log_export_config.set_ai_log_export_config).
+        return await db_module.set_ai_log_export_config(
+            db, args["project_id"],
+            enabled=args.get("enabled"),
+            otlp_endpoint=args.get("otlp_endpoint"),
+            protocol=args.get("protocol"),
+            service_name=args.get("service_name"),
+            langfuse_compat=args.get("langfuse_compat"),
+        )
+    if name == "export_ai_log_otel":
+        # R2-G — one bounded, on-demand export pass. Never raises (see
+        # meridian.ai_log_otel_export.run_otel_export's own contract) and
+        # never blocks longer than its own bounded overall deadline.
+        from .. import ai_log_otel_export as otel_export_module  # noqa: PLC0415
+        _otel_batch_raw = args.get("batch_size")
+        return await otel_export_module.run_otel_export(
+            db, args["project_id"],
+            batch_size=int(_otel_batch_raw) if _otel_batch_raw is not None else None,
+        )
     return _MISS
 
 

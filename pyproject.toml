@@ -70,6 +70,23 @@ semantic = [
     "model2vec>=0.3",
     "psutil>=5.9",
 ]
+# R2-G -- optional AI-log -> OTel / self-hosted-Langfuse export adapter
+# (meridian.ai_log_otel_export). OPTIONAL extra, NOT a base dep: the feature
+# is default-OFF (MERIDIAN_AI_LOG_OTEL_ENABLED unset) and lazily imported --
+# see that module's docstring. opentelemetry-exporter-otlp-proto-http pulls
+# opentelemetry-sdk transitively, but both are pinned explicitly here so a
+# `pip install 'meridian-server[otel]'` always resolves a version whose
+# Logs SDK surface (opentelemetry.sdk._logs.ReadableLogRecord,
+# opentelemetry.sdk._logs.export.LogRecordExportResult) matches what
+# ai_log_otel_export._import_otel_deps expects -- verified against 1.44.0.
+# Self-hosted Langfuse compatibility needs NO separate package: Langfuse's
+# self-hosted ingestion endpoint accepts standard OTLP, so pointing
+# MERIDIAN_AI_LOG_OTEL_ENDPOINT at it is the entire integration (see
+# docs/configuration.md).
+otel = [
+    "opentelemetry-sdk>=1.24,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.24,<2",
+]
 
 [project.scripts]
 # Console entry so `uv tool install meridian-server` / `pipx install` provide a

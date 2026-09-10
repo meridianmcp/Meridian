@@ -4943,6 +4943,38 @@ async def _migrate_pg_external_job_register(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_ai_log_export_config(conn: PostgresConnection) -> None:
+    """R2-G — Postgres mirror of ``ai_log_export_config``: per-project
+    config + resumable watermark state for the optional AI-log -> OTel/
+    Langfuse export adapter (mirrors
+    db.ai_log_export_config._migrate_ai_log_export_config exactly — see
+    that module's docstring for the full rationale, including why this
+    table intentionally has no column for a bearer token/API key)."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS ai_log_export_config ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    sink TEXT NOT NULL DEFAULT 'otel_otlp',"
+        "    enabled INTEGER,"
+        "    otlp_endpoint TEXT,"
+        "    protocol TEXT NOT NULL DEFAULT 'otlp_http',"
+        "    service_name TEXT,"
+        "    langfuse_compat INTEGER NOT NULL DEFAULT 0,"
+        "    last_exported_recorded_at TEXT,"
+        "    last_exported_event_id TEXT,"
+        "    last_exported_ids_at_watermark TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'disabled',"
+        "    last_error TEXT,"
+        "    last_attempt_at TEXT,"
+        "    last_success_at TEXT,"
+        "    retry_count INTEGER NOT NULL DEFAULT 0,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (project_id, sink)"
+        ");"
+    )
+
+
 async def _migrate_pg_scratch_research_runs(conn: PostgresConnection) -> None:
     """a5343387 -- Postgres mirror of the bounded ephemeral research-run
     register. See meridian/db/migrations.py's _migrate_scratch_research_runs
@@ -5289,4 +5321,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_structural_patch,
     _migrate_pg_scratch_research_runs,
     _migrate_pg_session_recovery_registry,
+    _migrate_pg_ai_log_export_config,
 )
