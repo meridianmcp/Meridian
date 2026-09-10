@@ -40,6 +40,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_external_job": 'get_external_job(project_id="abc-123", job_key="gps-slam-build")',
     "list_external_jobs": 'list_external_jobs(project_id="abc-123")',
     "complete_external_job": 'complete_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="succeeded", detail="verified output")',
+    "register_session_recovery": 'register_session_recovery(project_id="abc-123", session_id="session-uuid", transport="remote_control", client_type="claude-code", local_identity={"local_session_id": "conv-1", "environment_id": "env-9"})',
+    "list_resumable_sessions": 'list_resumable_sessions(project_id="abc-123")',
+    "get_session_recovery": 'get_session_recovery(project_id="abc-123", session_id="session-uuid")',
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
@@ -929,6 +932,50 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
          "detail": {"type": "string"}, "metadata": {"type": "object"}},
          "required": ["session_id"]}},
+    {"name": "register_session_recovery", "description":
+        "cdd0ef6c — Create or reaffirm (upsert + heartbeat) this session's entry in "
+        "the cross-client session recovery registry, so another client/session can "
+        "tell whether it is resumable instead of guessing from a bare RC bridge id "
+        "or transcript id. transport + optional local_identity (local_session_id, "
+        "bridge_id, environment_id, argv — HOST-LOCAL ONLY) are used to compute a "
+        "resume recipe and verified_resumable flag; local_identity itself is never "
+        "written to the hosted registry, only to a host-local snapshot file. "
+        "IMPORTANT: a remote_control transport with a bridge id but no environment_id "
+        "is NOT assumed resumable (the RESCUE-D incident this registry exists to "
+        "prevent) — verified_resumable will come back false with a reason.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string", "description": "The Meridian session id (sessions.id) this recovery record describes."},
+         "transport": {"type": "string", "enum": ["stdio", "remote_control", "cloud_environment", "tunnel", "unknown"]},
+         "client_type": {"type": "string", "description": "e.g. claude-code, claude-desktop, cursor, other."},
+         "lifecycle_status": {"type": "string", "enum": ["active", "idle", "ended", "crashed", "unknown"]},
+         "local_identity": {"type": "object", "description": "HOST-LOCAL ONLY, never persisted hosted-side: local_session_id, bridge_id, environment_id, argv, local_transcript_path. Used only to compute a resume recipe and to refresh the host-local snapshot."},
+         "local_ref_id": {"type": "string", "description": "Optional stable opaque token correlating this hosted row to the host-local snapshot entry; generated if omitted."},
+         "last_checkpoint_ref": {"type": "string", "description": "An id/label for the last checkpoint — never content."},
+         "last_handoff_ref": {"type": "string", "description": "An id/label for the last handoff — never content."},
+         "sprint_version": {"type": "string"},
+         "metadata": {"type": "object", "description": "Small hosted-safe free-form metadata; rejected if it contains a local-only identity key, a secret-shaped value, or an absolute local path."}},
+         "required": ["session_id", "transport"]}},
+    {"name": "list_resumable_sessions", "description":
+        "cdd0ef6c — Read-only: list this project's session recovery registry, newest "
+        "heartbeat first, each with a freshly computed liveness classification "
+        "(resumable/stale/dead/unknown). Dead rows are omitted by default.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "sprint_version": {"type": "string"},
+         "include_dead": {"type": "boolean"},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": []}},
+    {"name": "get_session_recovery", "description":
+        "cdd0ef6c — Read-only: fetch one session's recovery record (by session_id or "
+        "recovery_id) plus, by default, a continuation payload that RE-DERIVES the "
+        "live sprint board and this session's own still-active file claims — never a "
+        "stored /goal body. resume_recipe is resolved from THIS machine's own "
+        "host-local snapshot only and is null when this machine never registered "
+        "that session's local identity.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"}, "recovery_id": {"type": "string"},
+         "include_continuation": {"type": "boolean"}}, "required": []}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "
         "the human a question — never just ask in chat, which is invisible to the "
@@ -3914,6 +3961,7 @@ _READ_ONLY_TOOLS = {
     "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "get_external_job", "list_external_jobs",
+    "list_resumable_sessions", "get_session_recovery",
     "get_research_run", "list_research_runs",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
@@ -4010,6 +4058,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_external_job":         "session",
     "list_external_jobs":       "session",
     "complete_external_job":    "session",
+    "register_session_recovery": "session",
+    "list_resumable_sessions":   "session",
+    "get_session_recovery":      "session",
     "start_research_run":       "research",
     "complete_research_run":    "research",
     "get_research_run":         "research",
@@ -4267,6 +4318,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "complete_external_job":      "executor",
     "get_external_job":           "both",
     "list_external_jobs":         "both",
+    "register_session_recovery":  "both",
+    "list_resumable_sessions":    "both",
+    "get_session_recovery":       "both",
     "start_research_run":         "both",
     "complete_research_run":      "both",
     "get_research_run":           "both",

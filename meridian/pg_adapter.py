@@ -4972,6 +4972,40 @@ async def _migrate_pg_scratch_research_runs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_session_recovery_registry(conn: PostgresConnection) -> None:
+    """cdd0ef6c -- Postgres mirror of the cross-client session recovery
+    registry. See meridian/db/migrations.py's _migrate_session_recovery_registry
+    for the schema rationale and meridian/session_recovery.py for the full
+    host-local-vs-hosted-metadata security contract this table enforces --
+    no column here ever holds a local transcript id, RC bridge id,
+    environment id, or OS argv."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS session_recovery_registry ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    meridian_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    local_ref_id TEXT,"
+        "    client_type TEXT,"
+        "    transport TEXT NOT NULL,"
+        "    lifecycle_status TEXT NOT NULL DEFAULT 'active',"
+        "    verified_resumable INTEGER NOT NULL DEFAULT 0,"
+        f"    last_heartbeat_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    last_checkpoint_ref TEXT,"
+        "    last_handoff_ref TEXT,"
+        "    sprint_version TEXT,"
+        "    metadata_json TEXT NOT NULL DEFAULT '{}',"
+        "    registered_by_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (project_id, meridian_session_id)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_session_recovery_project_heartbeat "
+        "ON session_recovery_registry(project_id, last_heartbeat_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_session_recovery_project_version "
+        "ON session_recovery_registry(project_id, sprint_version);"
+    )
+
+
 async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     """7c96d41b — Postgres mirror of the paper_contract schema: the
     first-class versioned editorial-intent document for Meridian's
@@ -5254,4 +5288,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_lint_finding,
     _migrate_pg_structural_patch,
     _migrate_pg_scratch_research_runs,
+    _migrate_pg_session_recovery_registry,
 )
