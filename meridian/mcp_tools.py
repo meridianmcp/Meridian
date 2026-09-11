@@ -856,10 +856,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read-only: List pinned decisions, highest priority first (urgent → "
         "normal → low, then newest-first). Active only by default. Each row "
         "includes its priority and a parsed edit_log array of prior bodies "
-        "({body, ts}) recorded on every in-place body edit.",
+        "({body, ts}) recorded on every in-place body edit. Pass query to "
+        "filter to decisions whose title or body matches (every "
+        "whitespace-separated term must appear in the title or the body, "
+        "same multiword-AND convention as search_tasks/search_all) — omit "
+        "or pass a blank string for no filter (W1-A).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "include_superseded": {"type": "boolean"}},
+         "include_superseded": {"type": "boolean"},
+         "query": {"type": "string", "description": "Optional free-text filter over title + body. Every whitespace-separated term must appear in the title or the body (AND across terms, OR across columns). Blank/omitted means no filter."}},
          "required": []}},
     {"name": "archive_decision", "description":
         "Archive a pinned decision by id. Soft-deletes to preserve the audit trail. "
@@ -2865,7 +2870,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Cold sessions read this to know what's still owed. By default, items sharing a "
         "``parent_id`` (subtasks) or ``item_group`` collapse into one summary row per "
         "cluster ({collapsed, cluster_kind, item_group_or_parent, count, done, description, ids}) "
-        "instead of listing every item — pass expand=true for the full ungrouped list.",
+        "instead of listing every item — pass expand=true for the full ungrouped list. "
+        "Pagination (W1-A): pass limit and/or cursor to get a "
+        "{items, has_more, next_cursor, total_count} envelope instead of the bare list — a "
+        "project with hundreds of items (e.g. a large 'done' history) can otherwise return an "
+        "unbounded, single-shot response. Paginated mode filters by status only — expand "
+        "(clustering) is not applied to a partial page, since collapsing a cluster split across "
+        "a page boundary would be misleading. Omit both limit and cursor for the legacy full "
+        "list (unchanged, expand-aware) behavior.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "status": {"type": "string",
@@ -2875,7 +2887,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "expand": {"type": "boolean",
                     "description": "Default false: collapse parent_id/item_group clusters "
                     "(2+ items) into one summary row each. Pass true for the full "
-                    "ungrouped item list (pre-9d8e858c behavior)."}},
+                    "ungrouped item list (pre-9d8e858c behavior). Ignored in paginated mode."},
+         "limit": {"type": "integer", "description": "Page size (default 50, clamped 1..500). Passing limit or cursor switches the result to the {items, has_more, next_cursor, total_count} pagination envelope."},
+         "cursor": {"type": "integer", "description": "Offset cursor from a prior page's next_cursor. Passing it switches the result to the pagination envelope."}},
          "required": []}},
     {"name": "get_parallelizable_groups", "description":
         "Read-only: Return clusters of pending sprint items that are safe to run "
@@ -3139,13 +3153,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "search_all", "description":
         "Read-only: Universal search across all project content: tasks, notes, pinned decisions, "
         "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
-        "Returns grouped results: {tasks, notes, decisions, sprint_items, total}. "
+        "Returns grouped results: {tasks, notes, decisions, sprint_items, total, cursor, limit, "
+        "has_more, next_cursor}. limit (default 10, clamped 1..100) and cursor (default 0) bound "
+        "and page each of the four lists with one shared offset (W1-A) — pass a prior response's "
+        "next_cursor back in as cursor to fetch the next page; has_more is a per-list bool so you "
+        "can tell exactly which list(s) still have more. "
         "sprint_items default-collapse any parent_id/item_group cluster (2+ items) into one "
         "summary row — pass expand=true for the full ungrouped list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "query": {"type": "string"},
-         "limit": {"type": "integer", "description": "Max results per type (default 10)."},
+         "limit": {"type": "integer", "description": "Max results per type (default 10, clamped 1..100)."},
+         "cursor": {"type": "integer", "description": "Offset applied to all four result lists (default 0). Pass a prior response's next_cursor to fetch the next page."},
          "expand": {"type": "boolean", "description": "Default false: collapse parent_id/item_group clusters in sprint_items into one summary row each. Pass true for the full ungrouped list."}},
          "required": ["query"]}},
     {"name": "search_synthesis", "description":
@@ -3278,6 +3297,132 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string"},
          "run_id": {"type": "string"}},
          "required": ["run_id"]}},
+    {"name": "create_experiment", "description":
+        "3f6b8715 — W1-M Experiment Registry: create a named experiment (a research "
+        "question; many runs belong to one). Reuses the pre-existing experiments "
+        "table (4376e655) additively — config_template/created_by (an unrelated "
+        "ML-style tracking interface's own columns) are left untouched.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "name": {"type": "string", "description": "Bounded, non-empty experiment name."},
+         "hypothesis": {"type": "string", "description": "What this experiment is testing."}},
+         "required": ["name"]}},
+    {"name": "get_experiment", "description":
+        "3f6b8715 — read one project-scoped experiment by id.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "experiment_id": {"type": "string"}},
+         "required": ["experiment_id"]}},
+    {"name": "list_experiments", "description":
+        "3f6b8715 — list a project's experiments, newest first.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "status": {"type": "string", "enum": ["active", "archived"]},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+         "required": []}},
+    {"name": "start_experiment_run", "description":
+        "3f6b8715 — start a new active run (trial) under an experiment. Passing "
+        "pivot_parent_run_id (which must belong to the SAME experiment) "
+        "auto-writes a 'pivot' experiment_events row on the new run — "
+        "unconditional, not a separate step. ttl_seconds is optional and unlike "
+        "start_research_run has no forced default: omitting it means the run "
+        "never auto-expires via expire_stale_runs.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "experiment_id": {"type": "string"},
+         "trial_label": {"type": "string"},
+         "pivot_parent_run_id": {"type": "string", "description": "An existing run id to pivot from — must belong to the same experiment_id."},
+         "resource_profile": {"type": "object", "description": "Bounded (8KB) JSON-serializable resource/compute profile for this run."},
+         "ttl_seconds": {"type": "integer", "minimum": 60, "maximum": 2592000, "description": "Optional wall-clock time-to-live; omit for a run that never auto-expires."},
+         "repository_id": {"type": "string", "description": "Stable STRING identity for the repository — never a machine-local absolute path."},
+         "worktree_id": {"type": "string"}},
+         "required": ["session_id", "experiment_id"]}},
+    {"name": "complete_experiment_run", "description":
+        "3f6b8715 — finalize a run as status='completed' (default) or "
+        "status='abandoned'. outcome_summary and disposition (keep|discard|"
+        "promote) are explicit and REQUIRED — rejected with {error} when "
+        "missing/empty, even on a retry against an already-terminal run. "
+        "result_receipt is bounded to 32KB and REJECTED (never truncated) past "
+        "that cap. HARD INVARIANT: this call always writes an experiment_events "
+        "row when the run newly reaches a terminal state here — status='abandoned' "
+        "or an outcome_summary containing 'dead end'/'failed' (case-insensitive) "
+        "auto-writes {event_type:'dead_end'}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "run_id": {"type": "string"},
+         "outcome_summary": {"type": "string", "description": "Required, non-empty. Bounded to 4000 characters."},
+         "disposition": {"type": "string", "enum": ["keep", "discard", "promote"], "description": "Explicit, never inferred. 'promote' makes this run eligible for promote_experiment_run."},
+         "result_receipt": {"type": "object", "description": "Bounded (32KB) JSON-serializable receipt — rejected, never truncated, past the cap."},
+         "status": {"type": "string", "enum": ["completed", "abandoned"], "description": "Terminal status this call produces (default 'completed'). 'expired' is expire_stale_runs' exclusive path, not settable here."}},
+         "required": ["session_id", "run_id", "outcome_summary", "disposition"]}},
+    {"name": "promote_experiment_run", "description":
+        "3f6b8715 — explicitly promote a run whose stored disposition is already "
+        "'promote' (set at completion time via complete_experiment_run) — rejects "
+        "with {error} otherwise. Never triggered automatically by completion. "
+        "Always auto-writes a 'breakthrough' experiment_events row.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "run_id": {"type": "string"}},
+         "required": ["run_id"]}},
+    {"name": "get_experiment_run", "description":
+        "3f6b8715 — read one project-scoped experiment run by id.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "run_id": {"type": "string"}},
+         "required": ["run_id"]}},
+    {"name": "list_experiment_runs", "description":
+        "3f6b8715 — list a project's experiment runs, newest-started first. "
+        "Optionally scoped to one experiment_id and/or status.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "experiment_id": {"type": "string"},
+         "status": {"type": "string", "enum": ["active", "completed", "abandoned", "expired"]},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+         "required": []}},
+    {"name": "register_run_artifact", "description":
+        "3f6b8715 — register a project-RELATIVE artifact against a run. Rejects "
+        "an absolute path (any shape capability_manifest recognizes, a bare "
+        "leading '/', a drive letter, a UNC path, or a '..' traversal segment) "
+        "or a secret-shaped value with {error}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "run_id": {"type": "string"},
+         "logical_path": {"type": "string", "description": "Project-relative path — never a machine-local absolute path."},
+         "content_hash": {"type": "string"},
+         "artifact_role": {"type": "string", "enum": ["figure", "dataset", "model", "checkpoint", "log"]}},
+         "required": ["run_id", "logical_path"]}},
+    {"name": "record_experiment_event", "description":
+        "3f6b8715 — manually record an experiment_events row (dead_end|pivot|"
+        "breakthrough|note|milestone). Separate from, and coexists freely "
+        "alongside, the auto-skeleton events start_experiment_run/"
+        "complete_experiment_run/promote_experiment_run/expire_stale_runs write "
+        "unconditionally — this is the enrichment path for everything else worth "
+        "recording.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "experiment_id": {"type": "string"},
+         "run_id": {"type": "string", "description": "Optional — omit for an experiment-level event not tied to one run."},
+         "event_type": {"type": "string", "enum": ["dead_end", "pivot", "breakthrough", "note", "milestone"]},
+         "label": {"type": "string"},
+         "body": {"type": "string"},
+         "artifact_ids": {"type": "array", "items": {"type": "string"}}},
+         "required": ["experiment_id", "event_type"]}},
+    {"name": "get_experiment_events", "description":
+        "3f6b8715 — list an experiment's events, oldest first. Optionally scoped "
+        "to one run_id. Includes BOTH auto-skeleton writes (dead_end/pivot/"
+        "breakthrough) and manually recorded ones.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "experiment_id": {"type": "string"},
+         "run_id": {"type": "string"},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 1000}},
+         "required": ["experiment_id"]}},
     {"name": "save_watchlist_query", "description":
         "b924fd7c — save a recurring research query so it can be re-run and "
         "diffed over time via run_watchlist_query. Persisted as a project note "
@@ -4108,6 +4253,8 @@ _READ_ONLY_TOOLS = {
     "get_external_job", "list_external_jobs",
     "list_resumable_sessions", "get_session_recovery",
     "get_research_run", "list_research_runs",
+    "get_experiment", "list_experiments", "get_experiment_run", "list_experiment_runs",
+    "get_experiment_events",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
     "search_server_logs", "get_server_log_checkpoint",
@@ -4222,6 +4369,19 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_research_run":         "research",
     "list_research_runs":       "research",
     "promote_research_run":     "research",
+    # 3f6b8715 — W1-M Experiment Registry: categorized alongside the research
+    # run family above (same "adjacent research primitive" territory).
+    "create_experiment":         "research",
+    "get_experiment":            "research",
+    "list_experiments":          "research",
+    "start_experiment_run":      "research",
+    "complete_experiment_run":   "research",
+    "promote_experiment_run":    "research",
+    "get_experiment_run":        "research",
+    "list_experiment_runs":      "research",
+    "register_run_artifact":     "research",
+    "record_experiment_event":   "research",
+    "get_experiment_events":     "research",
     "get_session_brief":       "session",
     "get_context_block":       "session",
     "get_session_log":         "session",
@@ -4486,6 +4646,20 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_research_run":           "both",
     "list_research_runs":         "both",
     "promote_research_run":       "both",
+    # 3f6b8715 — W1-M Experiment Registry: "both", mirroring research_run's
+    # own role_relevance immediately above (an executor runs the experiment;
+    # a planner reviews it — neither is exclusive).
+    "create_experiment":          "both",
+    "get_experiment":             "both",
+    "list_experiments":           "both",
+    "start_experiment_run":       "both",
+    "complete_experiment_run":    "both",
+    "promote_experiment_run":     "both",
+    "get_experiment_run":         "both",
+    "list_experiment_runs":       "both",
+    "register_run_artifact":      "both",
+    "record_experiment_event":    "both",
+    "get_experiment_events":      "both",
     "add_sprint_note":           "executor",
     "heartbeat":                 "executor",
     "run_verification":          "executor",
@@ -4718,6 +4892,19 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_research_run":            "common-support",
     "list_research_runs":          "common-support",
     "promote_research_run":        "common-support",
+    # 3f6b8715 — W1-M Experiment Registry: common-support, same tier as the
+    # research_run family immediately above.
+    "create_experiment":           "common-support",
+    "get_experiment":              "common-support",
+    "list_experiments":            "common-support",
+    "start_experiment_run":        "common-support",
+    "complete_experiment_run":     "common-support",
+    "promote_experiment_run":      "common-support",
+    "get_experiment_run":          "common-support",
+    "list_experiment_runs":        "common-support",
+    "register_run_artifact":       "common-support",
+    "record_experiment_event":     "common-support",
+    "get_experiment_events":       "common-support",
     "add_insight":                "common-support",
     "get_insights":               "common-support",
     "validate_assumption":        "common-support",

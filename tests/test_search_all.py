@@ -122,6 +122,79 @@ async def test_search_all_result_shape_has_no_internal_score(anydb):
         assert "_match_score" not in row
 
 
+# ---------------------------------------------------------------------------
+# W1-A — cursor/limit pagination (search_all previously had a `limit` with
+# no way to fetch a second page at all, so a broad query on a large project
+# returned every match up to `limit` in one shot with nothing beyond it).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_search_all_cursor_pages_through_all_results(anydb):
+    """limit + cursor page through a list without dropping or duplicating
+    rows: the two pages' ids are disjoint and their union is every match."""
+    db = anydb
+    p = await db_module.create_project(db, "sa-cursor-page")
+    for i in range(5):
+        await db_module.add_project_note(
+            db, p["id"], f"pagenote-{i}", "widget content shared by every row")
+
+    page1 = await db_module.search_all(db, p["id"], "widget", limit=2, cursor=0)
+    assert len(page1["notes"]) == 2
+    assert page1["has_more"]["notes"] is True
+    assert page1["next_cursor"] == 2
+
+    page2 = await db_module.search_all(db, p["id"], "widget", limit=2, cursor=page1["next_cursor"])
+    assert len(page2["notes"]) == 2
+    assert page2["has_more"]["notes"] is True
+    assert page2["next_cursor"] == 4
+
+    page3 = await db_module.search_all(db, p["id"], "widget", limit=2, cursor=page2["next_cursor"])
+    assert len(page3["notes"]) == 1
+    assert page3["has_more"]["notes"] is False
+    assert page3["next_cursor"] is None
+
+    ids_p1 = {n["id"] for n in page1["notes"]}
+    ids_p2 = {n["id"] for n in page2["notes"]}
+    ids_p3 = {n["id"] for n in page3["notes"]}
+    assert not (ids_p1 & ids_p2)
+    assert not (ids_p2 & ids_p3)
+    assert not (ids_p1 & ids_p3)
+    assert len(ids_p1 | ids_p2 | ids_p3) == 5
+
+
+@pytest.mark.asyncio
+async def test_search_all_no_cursor_defaults_to_first_page_unchanged(anydb):
+    """Omitting cursor keeps the exact pre-existing single-page behavior —
+    a caller that never passes cursor sees no functional change."""
+    db = anydb
+    p = await db_module.create_project(db, "sa-cursor-default")
+    await db_module.add_project_note(db, p["id"], "N1", "gadget alpha")
+    result = await db_module.search_all(db, p["id"], "gadget")
+    assert result["cursor"] == 0
+    assert any(n["title"] == "N1" for n in result["notes"])
+
+
+@pytest.mark.asyncio
+async def test_search_all_limit_is_clamped(anydb):
+    """An oversized limit is clamped rather than allowed to blow up the
+    response — the exact class of bug this pagination fix exists to close."""
+    db = anydb
+    p = await db_module.create_project(db, "sa-cursor-clamp")
+    result = await db_module.search_all(db, p["id"], "anything", limit=100_000)
+    assert result["limit"] == 100
+
+
+@pytest.mark.asyncio
+async def test_search_all_has_more_false_when_query_matches_nothing(anydb):
+    db = anydb
+    p = await db_module.create_project(db, "sa-cursor-empty")
+    result = await db_module.search_all(db, p["id"], "totally-absent-term-zzz")
+    assert result["has_more"] == {
+        "tasks": False, "notes": False, "decisions": False, "sprint_items": False,
+    }
+    assert result["next_cursor"] is None
+
+
 def test_multiword_or_ranked_clause_helper():
     """25155e91/f51e38d8 — the OR/ranked builder: one OR clause per term (>=2 chars,
     capped), OR-ed across columns AND across terms; a score expression counting
@@ -385,7 +458,9 @@ async def test_search_all_unchanged_by_planning_search_addition(anydb):
 
     result = await db_module.search_all(db, p["id"], _LONG_QUERY)
     assert set(result.keys()) == {
-        "query", "tasks", "notes", "decisions", "sprint_items", "total"
+        "query", "tasks", "notes", "decisions", "sprint_items", "total",
+        # W1-A additive pagination fields (search_all cursor/limit).
+        "cursor", "limit", "has_more", "next_cursor",
     }
     assert any(
         i["title"] == "img127 coverage gap" for i in result["sprint_items"]

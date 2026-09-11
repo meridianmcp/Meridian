@@ -7630,8 +7630,8 @@ def test_dashboard_sprint_progress_has_no_thumb_buttons(client):
 
 def test_dashboard_rewind_charts_label_sprint_items(client):
     js = dashboard_source()
-    assert "Sprint items / day" in js
-    assert "Sprint items</span>" in js
+    assert "Experiments / day" in js
+    assert "Experiments</span>" in js
     assert "Tasks completed" not in js
 
 
@@ -8552,10 +8552,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_scratch_research_runs",
         "_migrate_pg_session_recovery_registry",
         "_migrate_pg_ai_log_export_config",
+        "_migrate_pg_experiment_registry_columns",
+        "_migrate_pg_experiment_registry_runs",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 165
+    assert len(allnames) == len(set(allnames)) == 167
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

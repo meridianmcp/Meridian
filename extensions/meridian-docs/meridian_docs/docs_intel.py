@@ -6101,6 +6101,64 @@ def _verify_caption_write(
     return None
 
 
+def _verify_caption_edit_write(
+    docx_path: str,
+    *,
+    caption_para_id: str,
+    expected_label_text: str,
+    body_child_index: int,
+) -> dict[str, Any] | None:
+    """Post-write verification for :func:`edit_caption` (c315bfb6).
+
+    ``edit_caption`` (unlike ``insert_caption``) never mints a fresh
+    bookmark to locate its target by. A caption paragraph without a
+    native ``w14:paraId`` is identified by the content-derived ``sp<hash>``
+    id from :func:`_find_para_by_id`'s scheme 2 -- and an edit changes
+    exactly the label text that hash is derived from, so re-resolving by
+    the PRE-edit ``caption_para_id`` post-write would look for an id that
+    no longer exists even when the edit succeeded (the id drifts out from
+    under itself the moment the content it's derived from changes).
+    Instead, re-read the SAME ``body_child_index`` ``edit_caption``
+    resolved the paragraph at BEFORE mutating it -- captions are always
+    direct body-level paragraphs (synth ids never apply inside tables, see
+    ``_find_para_by_id``), and a plain in-place text-run edit never
+    inserts or removes body children, so that index is stable across the
+    write. Confirms the new label text actually landed. Returns ``None``
+    on success, or an ``{"error": ...}`` dict on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    body_children2 = list(body2) if body2 is not None else []
+    if body2 is None or not (0 <= body_child_index < len(body_children2)):
+        return {
+            "error": (
+                f"post-write verification failed: paragraph {caption_para_id!r} "
+                f"not found in {docx_path} after the write"
+            )
+        }
+    caption_para = body_children2[body_child_index]
+
+    caption_text = "".join(t.text or "" for t in caption_para.iter(_q(_W, "t")))
+    if expected_label_text not in caption_text:
+        return {
+            "error": (
+                "post-write verification failed: caption label text "
+                f"mismatch (expected to contain {expected_label_text!r}, "
+                f"got {caption_text!r})"
+            )
+        }
+    return None
+
+
 def insert_caption(
     docx_path: str,
     anchor_para_id: str,
@@ -6437,7 +6495,7 @@ def edit_caption(
     if result is None:
         return {"error": f"para_id {caption_para_id!r} not found in {docx_path}"}
 
-    _body, caption_elem, _cidx = result
+    _body, caption_elem, body_child_index = result
 
     # Validate: must be a Caption paragraph or contain a SEQ field.
     pPr = caption_elem.find(_q(_W, "pPr"))
@@ -6478,20 +6536,70 @@ def edit_caption(
     t_el = label_run.find(_q(_W, "t"))
     if t_el is None:
         t_el = ET.SubElement(label_run, _q(_W, "t"))
-    t_el.text = f". {new_label_text.strip()}"
+    stripped_label_text = new_label_text.strip()
+    t_el.text = f". {stripped_label_text}"
     t_el.set(_q(_XML_NS, "space"), "preserve")
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # c315bfb6 -- hold docx_path's promotion lock across stage+promote
+    # through post-write structural verification, mirroring every other
+    # content-mutating write in this module (insert_caption et al. --
+    # see _docx_promotion_lock's module comment). Closes the same-process
+    # window between promotion and verify/restore, and refuses to blindly
+    # restore-from-backup if a DIFFERENT writer's promotion has already
+    # landed since ours (see _safe_restore_after_verification_failure).
+    # Previously this called _save_docx_xml_stdlib directly with NO
+    # post-write verification at all, so neither a corrupted write nor a
+    # lost concurrent update was ever caught.
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_caption_edit_write(
+            docx_path,
+            caption_para_id=caption_para_id,
+            expected_label_text=stripped_label_text,
+            body_child_index=body_child_index,
+        )
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["caption_para_id"] = caption_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
     return {
         "status": "edited",
         "caption_para_id": caption_para_id,
-        "new_label_text": new_label_text.strip(),
+        "new_label_text": stripped_label_text,
         "docx_path": docx_path,
     }
 
@@ -10319,6 +10427,212 @@ def format_apa_reference(item: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Vancouver / NLM formatter — CSL-JSON item -> formatted reference string
+#
+# Scope mirrors format_apa_reference: journal article, book, book chapter,
+# conference paper, plus a minimal fallback for anything else (W1-C).
+#
+# NOTE ON NUMBERING: Vancouver reference lists are numbered in the order
+# citations first APPEAR in the document body, not by any property of the
+# entry itself (author, title, year). This formatter has no visibility into
+# document-wide citation order -- it deliberately emits ONLY the reference
+# text, with no leading "1." number. insert_bibliography_entry's
+# style="vancouver" path reflects the same limitation: it appends the new
+# entry at the end of the references block rather than attempting an
+# alphabetical (APA-style) insert position, since alphabetical order is not
+# Vancouver order either. Actually assigning/renumbering the visible "1.",
+# "2.", ... markers against real citation-appearance order is a separate,
+# document-wide concern (see renumber_sequences) and is out of scope here.
+# ---------------------------------------------------------------------------
+
+def _vancouver_authors(authors: list[dict[str, Any]]) -> str:
+    """Format a CSL-JSON author array into a Vancouver/NLM author string.
+
+    CSL-JSON author: {"family": "Smith", "given": "John A."} or
+    {"literal": "World Health Organization"} for corporate authors.
+
+    Vancouver format: "Surname INITIALS" with no periods or spaces between
+    initials (e.g. "Smith JA"), entries comma-separated. Six or fewer
+    authors -> list all of them. Seven or more -> list the first six
+    followed by "et al." (ICMJE/NLM convention).
+    """
+    if not authors:
+        return "Unknown Author"
+
+    def _fmt_one(a: dict[str, Any]) -> str:
+        lit = a.get("literal")
+        if lit:
+            return str(lit).strip()
+        family = str(a.get("family") or "").strip()
+        given = str(a.get("given") or "").strip()
+        if not family:
+            return given or "Unknown"
+        initials = "".join(
+            p[0].upper() for p in given.replace("-", " ").split() if p
+        )
+        return f"{family} {initials}" if initials else family
+
+    if len(authors) <= 6:
+        return ", ".join(_fmt_one(a) for a in authors)
+    first_six = ", ".join(_fmt_one(a) for a in authors[:6])
+    return f"{first_six}, et al."
+
+
+def format_vancouver_reference(item: dict[str, Any]) -> str:
+    """Format a CSL-JSON item as a Vancouver (NLM/ICMJE) reference entry.
+
+    Supported item types (``type`` / ``itemType`` field):
+      - ``article-journal`` / ``journalArticle`` -> journal article format
+      - ``book``                                  -> book format
+      - ``chapter`` / ``bookSection``             -> book chapter format
+      - ``paper-conference`` / ``conferencePaper`` -> conference paper format
+      - anything else                             -> minimal fallback
+
+    The ``item`` dict is CSL-JSON-shaped, the same input contract as
+    ``format_apa_reference``. Pure / deterministic and never raises
+    (returns a best-effort string on any missing / malformed data).
+
+    NOTE: the returned string has NO leading reference number ("1.", "2.",
+    ...) -- see the module comment above this function for why a per-entry
+    formatter cannot determine that number.
+
+    OUT OF SCOPE: same as format_apa_reference -- reports, theses, datasets,
+    webpages, patents, and any type not listed above get the minimal
+    fallback: "Author. Title. Year." NLM/Index Medicus journal-title
+    abbreviation is also out of scope; whichever journal string the CSL item
+    supplies (``journalAbbreviation`` preferred, ``container-title``
+    otherwise) is used as-is.
+    """
+    if not isinstance(item, dict):
+        return ""
+
+    authors = item.get("author") or []
+    if not isinstance(authors, list):
+        authors = []
+
+    item_type = str(item.get("type") or item.get("itemType") or "").strip()
+
+    author_str = _vancouver_authors(authors)
+    year = _apa_year(item)
+    title = str(item.get("title") or "Untitled").strip()
+    doi_url = _apa_doi_or_url(item)
+
+    # --- Journal article ---
+    if item_type in ("article-journal", "journalArticle", "article"):
+        journal = str(
+            item.get("journalAbbreviation") or item.get("container-title") or ""
+        ).strip()
+        volume = str(item.get("volume") or "").strip()
+        issue = str(item.get("issue") or "").strip()
+        page = str(item.get("page") or "").strip()
+        parts = [f"{author_str}. {title}."]
+        if journal:
+            cite = journal
+            if volume and issue:
+                cite += f". {year};{volume}({issue})"
+            elif volume:
+                cite += f". {year};{volume}"
+            else:
+                cite += f". {year}"
+            if page:
+                cite += f":{page}"
+            parts.append(cite + ".")
+        else:
+            parts.append(f"{year}.")
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    # --- Book ---
+    if item_type in ("book",):
+        publisher = str(item.get("publisher") or "").strip()
+        place = str(
+            item.get("publisher-place") or item.get("place") or ""
+        ).strip()
+        edition = str(item.get("edition") or "").strip()
+        parts = [f"{author_str}. {title}."]
+        if edition:
+            parts.append(f"{edition} ed.")
+        loc_parts: list[str] = []
+        if place:
+            loc_parts.append(place)
+        if publisher:
+            loc_parts.append(publisher)
+        loc_str = ": ".join(loc_parts)
+        parts.append(f"{loc_str}; {year}." if loc_str else f"{year}.")
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    # --- Book chapter ---
+    if item_type in ("chapter", "bookSection"):
+        editor_list = item.get("editor") or []
+        if not isinstance(editor_list, list):
+            editor_list = []
+        container = str(item.get("container-title") or "").strip()
+        publisher = str(item.get("publisher") or "").strip()
+        place = str(
+            item.get("publisher-place") or item.get("place") or ""
+        ).strip()
+        page = str(item.get("page") or "").strip()
+        ed_names = _vancouver_authors(editor_list) if editor_list else ""
+        ed_role = "editor" if len(editor_list) == 1 else "editors"
+        parts = [f"{author_str}. {title}."]
+        in_parts: list[str] = []
+        if ed_names:
+            in_parts.append(f"In: {ed_names}, {ed_role}.")
+        elif container:
+            in_parts.append("In:")
+        if container:
+            in_parts.append(container + ".")
+        loc_parts: list[str] = []
+        if place:
+            loc_parts.append(place)
+        if publisher:
+            loc_parts.append(publisher)
+        loc_str = ": ".join(loc_parts)
+        in_parts.append(f"{loc_str}; {year}." if loc_str else f"{year}.")
+        if page:
+            in_parts.append(f"p. {page}.")
+        if in_parts:
+            parts.append(" ".join(in_parts))
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    # --- Conference paper ---
+    if item_type in ("paper-conference", "conferencePaper"):
+        conference = str(
+            item.get("container-title")
+            or item.get("event-title")
+            or item.get("event")
+            or ""
+        ).strip()
+        publisher = str(item.get("publisher") or "").strip()
+        page = str(item.get("page") or "").strip()
+        parts = [f"{author_str}. {title}."]
+        if conference:
+            in_parts = [f"In: {conference};"]
+            if publisher:
+                in_parts.append(f"{publisher};")
+            in_parts.append(f"{year}.")
+            if page:
+                in_parts.append(f"p. {page}.")
+            parts.append(" ".join(in_parts))
+        else:
+            parts.append(f"{year}.")
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    # --- Fallback for unrecognised types ---
+    parts = [f"{author_str}. {title}. {year}."]
+    if doi_url:
+        parts.append(doi_url)
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Document scan: discover all citation keys present in the document
 # ---------------------------------------------------------------------------
 
@@ -10563,19 +10877,16 @@ def insert_bibliography_entry(
     citation_key: str,
     csl_item: dict[str, Any],
     index_db_path: str | None = None,
+    *,
+    style: str = "apa",
 ) -> dict[str, Any]:
-    """1258794a — Write a formatted APA bibliography entry into a .docx.
+    """1258794a/W1-C — Write a formatted bibliography entry into a .docx.
 
     Locates (or creates) a ``References`` heading at the end of the document,
-    then inserts the new entry paragraph at its correct alphabetical position
-    within the existing references block (APA order, by leading author/title
-    text; appended at the end when it sorts last or the block is empty). The
-    entry is formatted as an APA 7th-edition reference from the supplied
-    CSL-JSON ``csl_item`` dict (as returned by Zotero's local API or by
-    ``zotero_client.resolve_citation_ref`` + ``fetch_zotero_csl_item``).
-
-    If an entry for ``citation_key`` already exists (detected by bookmark name)
-    this function returns an error — use ``update_bibliography_entry`` instead.
+    then inserts the new entry paragraph into the existing references block.
+    The entry is formatted from the supplied CSL-JSON ``csl_item`` dict (as
+    returned by Zotero's local API or by ``zotero_client.resolve_citation_ref``
+    + ``fetch_zotero_csl_item``).
 
     Args:
         docx_path:     Absolute path to the .docx file (mutated in place).
@@ -10584,6 +10895,27 @@ def insert_bibliography_entry(
         csl_item:      CSL-JSON-shaped item dict with at minimum ``author``,
                        ``title``, ``type``/``itemType``, and ``issued`` fields.
         index_db_path: If supplied, sidecar is invalidated after the write.
+        style:         Bibliography style — ``"apa"`` (default) or
+                       ``"vancouver"``.
+
+                       ``"apa"`` (default, and BYTE-IDENTICAL to this
+                       function's behaviour before ``style`` existed):
+                       formats via ``format_apa_reference`` and inserts the
+                       new entry at its correct alphabetical position within
+                       the references block (by leading author/title text;
+                       appended at the end when it sorts last or the block
+                       is empty).
+
+                       ``"vancouver"``: formats via
+                       ``format_vancouver_reference`` and APPENDS the new
+                       entry at the end of the references block instead.
+                       Vancouver order is citation-APPEARANCE order, which
+                       this function has no way to determine from a single
+                       entry — append-at-end is the correct default (see the
+                       module comment above ``format_vancouver_reference``).
+
+    If an entry for ``citation_key`` already exists (detected by bookmark name)
+    this function returns an error — use ``update_bibliography_entry`` instead.
 
     Returns:
         ``{status, citation_key, formatted_text, docx_path}``
@@ -10593,6 +10925,15 @@ def insert_bibliography_entry(
         return {"error": "citation_key must be a non-empty string"}
     if not isinstance(csl_item, dict):
         return {"error": "csl_item must be a CSL-JSON dict"}
+
+    style_norm = str(style or "apa").strip().lower()
+    if style_norm not in ("apa", "vancouver"):
+        return {
+            "error": (
+                f"unsupported bibliography style: {style!r} "
+                "(expected 'apa' or 'vancouver')"
+            )
+        }
 
     clean_key = str(citation_key).strip()
 
@@ -10618,7 +10959,10 @@ def insert_bibliography_entry(
 
     # Format the reference text.
     try:
-        formatted_text = format_apa_reference(csl_item)
+        if style_norm == "vancouver":
+            formatted_text = format_vancouver_reference(csl_item)
+        else:
+            formatted_text = format_apa_reference(csl_item)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"could not format CSL-JSON item: {exc}"}
 
@@ -10641,7 +10985,12 @@ def insert_bibliography_entry(
     else:
         heading_idx, _heading_elem = heading_result
         start, end = _bibliography_entries_range(body, heading_idx)
-        entry_insert_pos = _alphabetical_insert_pos(body, start, end, formatted_text)
+        if style_norm == "vancouver":
+            # Vancouver order is citation-appearance order, not derivable
+            # from a single entry -- append at the end of the block.
+            entry_insert_pos = end
+        else:
+            entry_insert_pos = _alphabetical_insert_pos(body, start, end, formatted_text)
 
     entry_p = _build_bibliography_paragraph(clean_key, formatted_text)
     body.insert(entry_insert_pos, entry_p)
@@ -10666,8 +11015,10 @@ def update_bibliography_entry(
     citation_key: str,
     csl_item: dict[str, Any],
     index_db_path: str | None = None,
+    *,
+    style: str = "apa",
 ) -> dict[str, Any]:
-    """1258794a — Refresh the formatted text of an existing bibliography entry.
+    """1258794a/W1-C — Refresh the formatted text of an existing bibliography entry.
 
     Locates the entry paragraph for ``citation_key`` by its embedded bookmark
     name, re-formats the reference from the (possibly updated) ``csl_item``,
@@ -10678,6 +11029,13 @@ def update_bibliography_entry(
         citation_key:  The same key used when the entry was inserted.
         csl_item:      Updated CSL-JSON item dict.
         index_db_path: If supplied, sidecar is invalidated after the write.
+        style:         Bibliography style — ``"apa"`` (default, and
+                       BYTE-IDENTICAL to this function's behaviour before
+                       ``style`` existed) or ``"vancouver"``. Should match
+                       the style the entry was originally inserted with —
+                       this call only re-formats the existing paragraph's
+                       text, it does not move it, so an entry's position in
+                       the block does not change regardless of ``style``.
 
     Returns:
         ``{status, citation_key, formatted_text, docx_path}``
@@ -10687,6 +11045,15 @@ def update_bibliography_entry(
         return {"error": "citation_key must be a non-empty string"}
     if not isinstance(csl_item, dict):
         return {"error": "csl_item must be a CSL-JSON dict"}
+
+    style_norm = str(style or "apa").strip().lower()
+    if style_norm not in ("apa", "vancouver"):
+        return {
+            "error": (
+                f"unsupported bibliography style: {style!r} "
+                "(expected 'apa' or 'vancouver')"
+            )
+        }
 
     clean_key = str(citation_key).strip()
 
@@ -10713,7 +11080,10 @@ def update_bibliography_entry(
     _entry_idx, entry_elem = entry_result
 
     try:
-        formatted_text = format_apa_reference(csl_item)
+        if style_norm == "vancouver":
+            formatted_text = format_vancouver_reference(csl_item)
+        else:
+            formatted_text = format_apa_reference(csl_item)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"could not format CSL-JSON item: {exc}"}
 

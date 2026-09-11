@@ -186,6 +186,13 @@ class ProvenanceRecord:
     recorded_at: float = 0.0
     recorded_at_iso: str = ""
     content_hash: str | None = None
+    # 3f6b8715 -- W1-M Experiment Registry: optional link to a
+    # meridian.db.experiments run row. Defaulted so every existing caller
+    # (and every ledger entry written before this field existed) is
+    # unaffected -- old JSON simply lacks the key, and reading code here
+    # returns the raw dict as-is rather than reconstructing this dataclass,
+    # so there is no forward-compat parsing step that could choke on it.
+    experiment_run_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -200,6 +207,7 @@ def record_provenance(
     sprint_item_id: str | None = None,
     decision_id: str | None = None,
     note: str | None = None,
+    experiment_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Attach lightweight reproducibility metadata to one output file.
 
@@ -234,11 +242,21 @@ def record_provenance(
                            notes store -- use that tool for longer
                            commentary; this field is meant to stay short
                            (e.g. "re-run after formula v3 fix").
+      experiment_run_id:   Optional (3f6b8715) — links this provenance
+                           record to a meridian.db.experiments run id (the
+                           W1-M Experiment Registry). Purely additive:
+                           omitting it (the default) is byte-for-byte
+                           identical to this function's behavior before the
+                           field existed -- no validation against a live
+                           experiment run is performed here (this module has
+                           no DB engine access at all), it is stored as an
+                           opaque string exactly like sprint_item_id/
+                           decision_id already are.
 
     Returns:
       The stored record as a dict (path, generating_script, params,
       sprint_item_id, decision_id, note, recorded_at, recorded_at_iso,
-      content_hash), or ``{"error": ...}`` on failure.
+      content_hash, experiment_run_id), or ``{"error": ...}`` on failure.
 
     bd5b8d79 -- ``content_hash`` is a best-effort SHA-256 of ``path``'s
     on-disk bytes AT THE MOMENT this record is written, via
@@ -249,6 +267,14 @@ def record_provenance(
     reader (``provenance_status.get_provenance_status``) detect that a file
     has been relocated/regenerated since this record was made, by comparing
     against a freshly-computed hash at lookup time.
+
+    W1-A -- when ``path`` is relative, it is resolved against ``outputs_dir``
+    before hashing (``os.path.join(outputs_dir, path)``); an already-absolute
+    ``path`` is used as-is. ``script_content_hash`` opens the given path
+    directly, and a relative path otherwise resolves against the calling
+    process's current working directory -- not ``outputs_dir`` -- which
+    previously made ``content_hash`` come back ``None`` for every caller that
+    (reasonably) passed a path relative to the outputs tree.
 
     6af1518d (requirement 3) -- once the record is successfully written,
     ``path`` is also registered for TARGETED, PROMPT indexing via
@@ -272,8 +298,15 @@ def record_provenance(
         except Exception:  # noqa: BLE001 -- best-effort fallback only
             generating_script = None
 
+    # W1-A: a relative `path` must be resolved against `outputs_dir` before
+    # hashing -- `script_content_hash` does a plain `open(path, "rb")`, which
+    # a relative path resolves against the CALLING PROCESS's cwd (often not
+    # outputs_dir), so a perfectly valid output recorded with a relative path
+    # silently hashed nothing and content_hash came back None. An already-
+    # absolute path is passed through unchanged.
+    _hash_path = path if os.path.isabs(path) else os.path.join(outputs_dir, path)
     try:
-        content_hash = fingerprint.script_content_hash(path)
+        content_hash = fingerprint.script_content_hash(_hash_path)
     except Exception:  # noqa: BLE001 -- best-effort snapshot only, never
         # blocks the (already-durable) provenance write on a hashing failure.
         content_hash = None
@@ -289,6 +322,7 @@ def record_provenance(
         recorded_at=now,
         recorded_at_iso=datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
         content_hash=content_hash,
+        experiment_run_id=experiment_run_id,
     )
 
     key = _normalize_path(path)

@@ -44,6 +44,35 @@ session, worker count, child pid/process-tree identity, bounded
 stdout/stderr tails, exit code/signal, timeout classification, and a
 cleanup receipt -- and fixes the Windows PID-liveness bug so a stale lock
 is reliably reclaimed on every platform.
+
+c315bfb6 -- heartbeat/lease staleness, closing a PID-reuse hole
+================================================================
+
+The fix above still left a real gap: staleness was decided SOLELY by
+``_pid_is_running(pid)``. On Windows especially, PIDs are recycled far more
+eagerly than on POSIX (a small pid space, no zombie-reaping delay) -- once
+a lock's owner process has actually exited, the OS can and does reassign
+that same PID number to a completely unrelated new process before anyone
+else looks at it. ``_pid_is_running`` has no way to tell "the original
+owner is still alive" apart from "some unrelated process now happens to
+have this PID" -- it would report the lock's PID "alive" forever, so
+``TestRunLock.acquire()`` would refuse to reclaim it, blocking every
+subsequent test run indefinitely with no self-healing path.
+
+``TestRunLock``'s lock file now carries a HEARTBEAT the owner refreshes
+periodically (``TestRunLock.heartbeat()``, called from
+``_run_pytest_observed``'s poll loop on the same cadence as the existing
+Meridian-session heartbeat) instead of a write-once creation timestamp.
+Elapsed time since that heartbeat -- not PID existence -- is now the
+AUTHORITATIVE staleness signal (``TestRunLock._lock_is_stale``): a lease
+that has gone unrenewed past ``lease_ttl_seconds`` is stale even when
+``_pid_is_running`` reports its recorded PID as alive, because a reused PID
+belongs to a process that never touches this lock file and so can never
+produce a fresh heartbeat for it. A PID confirmed genuinely dead is still
+treated as an immediate, faster-path staleness signal (no need to wait out
+the full lease TTL in the common case where the owner really did exit or
+crash) -- only the "otherwise assume alive" default changed, from
+PID-existence to elapsed-time.
 """
 
 from __future__ import annotations
@@ -66,6 +95,17 @@ from typing import Any, Callable
 
 DEFAULT_SERIAL_THRESHOLD = 40
 DEFAULT_MAX_WORKERS = 8
+# c315bfb6 -- lease TTL for TestRunLock's heartbeat-based staleness check
+# (see the module docstring section by the same id). Comfortably larger
+# than _HEARTBEAT_INTERVAL_SECONDS (60s, defined below and reused for the
+# lock's own heartbeat cadence) so a couple of missed/delayed beats from
+# ordinary scheduling jitter never falsely condemns a live run's lock, while
+# staying far short of the timescales a real PID-reuse event would need to
+# occur on -- a genuinely abandoned lock is still reclaimed in minutes, not
+# left to block every future run forever the way unconditional PID-liveness
+# trust did. Overridable for tests/tuning via
+# MERIDIAN_TEST_LOCK_LEASE_TTL_SECONDS.
+DEFAULT_LOCK_LEASE_TTL_SECONDS = 240.0
 _COLLECTED_RE = re.compile(
     r"(?:collected\s+)?(\d+)\s+(?:tests?|items?)\s+collected|"
     r"collected\s+(\d+)\s+(?:tests?|items?)",
@@ -342,10 +382,18 @@ class TestRunLock:
         # owning the lock -- set on both the success and failure paths so
         # callers can build a truthful duplicate-run report.
         self.owner_pid: "int | None" = None
-        # Set only when acquire() reclaimed a STALE lock (owner confirmed
-        # dead) -- distinguishes "fresh acquire" from "took over from a
-        # crashed/killed prior run" for the caller's own audit trail.
+        # Set only when acquire() reclaimed a STALE lock -- distinguishes
+        # "fresh acquire" from "took over from a crashed/killed/abandoned
+        # prior run" for the caller's own audit trail.
         self.reclaimed_stale_pid: "int | None" = None
+        # c315bfb6 -- WHY it was reclaimed: "dead_pid" (fast path, owner
+        # confirmed genuinely dead) or "expired_lease" (heartbeat staleness
+        # -- the PID-reuse case a raw liveness check cannot distinguish from
+        # a still-live owner). None when reclaimed_stale_pid is None too.
+        self.reclaimed_stale_reason: "str | None" = None
+        self.lease_ttl_seconds = float(
+            os.environ.get("MERIDIAN_TEST_LOCK_LEASE_TTL_SECONDS", DEFAULT_LOCK_LEASE_TTL_SECONDS)
+        )
 
     def _read_owner_pid(self) -> "int | None":
         try:
@@ -354,15 +402,53 @@ class TestRunLock:
         except (OSError, ValueError):
             return None
 
+    def _read_heartbeat_ts(self) -> "float | None":
+        """Parse the lease-heartbeat field (2nd tab-separated column) out of
+        the lock file. Returns ``None`` -- never raises -- for a missing
+        file, a pre-heartbeat/corrupt lock file, or any other unparseable
+        content; callers treat ``None`` as "can't tell", not as "stale"."""
+        try:
+            parts = self.path.read_text(encoding="utf-8").split("\t")
+            return float(parts[1]) if len(parts) > 1 else None
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def _lock_is_stale(self, pid: "int | None") -> "str | None":
+        """Return why the existing lock at ``self.path`` should be reclaimed
+        (``"dead_pid"`` or ``"expired_lease"``), or ``None`` when it must
+        still be treated as live. See the module docstring's c315bfb6
+        section for the full rationale.
+
+        Order matters: a confirmed-dead PID is stale immediately (fast
+        path, the common case). Otherwise, elapsed time since the lock's
+        last heartbeat -- not PID existence -- decides staleness; a PID
+        that merely *looks* alive (including one reused by an unrelated
+        process after the real owner exited) is never enough on its own to
+        keep a lease-expired lock from being reclaimed.
+        """
+        if pid is not None and pid > 0 and not _pid_is_running(pid):
+            return "dead_pid"
+        heartbeat_ts = self._read_heartbeat_ts()
+        if heartbeat_ts is None:
+            # Can't read/parse a lease timestamp (missing, corrupt, or a
+            # transient read race) -- fail safe: never call it stale from
+            # the lease side alone without a real elapsed time to measure.
+            return None
+        if (time.time() - heartbeat_ts) > self.lease_ttl_seconds:
+            return "expired_lease"
+        return None
+
     def acquire(self) -> bool:
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             pid = self._read_owner_pid()
             self.owner_pid = pid if pid is not None else -1
-            if _pid_is_running(self.owner_pid):
+            stale_reason = self._lock_is_stale(self.owner_pid)
+            if stale_reason is None:
                 return False
             self.reclaimed_stale_pid = self.owner_pid
+            self.reclaimed_stale_reason = stale_reason
             try:
                 self.path.unlink()
             except FileNotFoundError:
@@ -384,6 +470,23 @@ class TestRunLock:
         self.acquired = True
         self.owner_pid = os.getpid()
         return True
+
+    def heartbeat(self) -> None:
+        """Refresh this lock's lease timestamp so a live, still-working
+        owner is never mistaken for stale by lease-expiry alone. Called
+        periodically by ``_run_pytest_observed`` while this instance holds
+        the lock (see ``_HEARTBEAT_INTERVAL_SECONDS``); a no-op if this
+        instance does not currently own the lock. Best-effort and silent on
+        failure -- e.g. a transient Windows sharing violation -- a missed
+        beat or two is exactly what ``lease_ttl_seconds``'s margin over the
+        heartbeat cadence exists to tolerate; refreshing the lease must
+        never be able to crash the run it is meant to protect."""
+        if not self.acquired:
+            return
+        try:
+            self.path.write_text(f"{os.getpid()}\t{time.time()}\t{Path.cwd()}\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: could not refresh test-run lock heartbeat {self.path}: {exc}", file=sys.stderr)
 
     def owner_pid_is_confirmed_alive(self) -> bool:
         """True only when ``owner_pid`` is a real, currently-live process --
@@ -939,6 +1042,7 @@ def _run_pytest_observed(
     popen_factory: "Callable[..., Any] | None" = None,
     sleep_fn: "Callable[[float], None] | None" = None,
     clock: "Callable[[], float] | None" = None,
+    lock: "TestRunLock | None" = None,
 ) -> int:
     """Spawn pytest, stream its output while tracking phase/progress, and
     classify the outcome truthfully -- including the two failure modes a
@@ -949,6 +1053,15 @@ def _run_pytest_observed(
     counts since we DO have trustworthy results) versus a real wall-clock
     timeout (TIMED_OUT[wall_clock]) versus an honest crash (CRASHED, e.g. a
     negative/signal return code or pytest's own internal-error exit codes).
+
+    c315bfb6 -- when ``lock`` is supplied (the caller's own, already-owned
+    ``TestRunLock``), its lease heartbeat is refreshed on the same
+    ``_HEARTBEAT_INTERVAL_SECONDS`` cadence as the existing Meridian-session
+    heartbeat below, for as long as this loop keeps running -- including
+    through a long stall/hang, since the loop itself (not the possibly-stuck
+    pytest child) is what drives the heartbeat. This is what keeps a
+    genuinely still-running (or still-hung-but-alive) owner's lock from
+    ever being misjudged as an abandoned, PID-reused lease.
     """
     popen_factory = popen_factory or subprocess.Popen
     sleep_fn = sleep_fn or time.sleep
@@ -991,6 +1104,8 @@ def _run_pytest_observed(
             now = clock()
             if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                 _maybe_heartbeat_owner_session()
+                if lock is not None:
+                    lock.heartbeat()
                 last_heartbeat = now
 
             returncode = proc.poll()
@@ -1100,18 +1215,28 @@ def _run_pytest_observed(
 
 
 def _record_superseded_stale_run(lock: "TestRunLock", tracker: "TestRunTracker") -> None:
-    """After :meth:`TestRunLock.acquire` reclaims a stale lock (its owner
-    pid is confirmed dead -- the Windows WinError-87 bug this item fixes
-    made this path unreachable on Windows before), write TRUTHFUL crash
-    evidence for the abandoned run instead of leaving its last-known state
-    stuck at 'running'/'collecting' forever with no terminal outcome."""
+    """After :meth:`TestRunLock.acquire` reclaims a stale lock (either its
+    owner pid is confirmed dead -- the Windows WinError-87 bug this item
+    fixes made this path unreachable on Windows before -- or, c315bfb6, its
+    heartbeat lease simply expired, which is what actually catches a
+    PID-reuse case where the recorded pid now belongs to an unrelated,
+    genuinely-alive process), write TRUTHFUL crash evidence for the
+    abandoned run instead of leaving its last-known state stuck at
+    'running'/'collecting' forever with no terminal outcome."""
     stale = TestRunTracker.load_record(lock.state_path)
     if stale is not None and stale.state not in TERMINAL_STATES:
         stale.state = STATE_CRASHED
-        stale.error = (
-            f"owner pid {lock.reclaimed_stale_pid} was no longer running "
-            "-- stale lock reclaimed by a new run"
-        )
+        if lock.reclaimed_stale_reason == "expired_lease":
+            stale.error = (
+                f"owner pid {lock.reclaimed_stale_pid}'s lock lease expired "
+                f"(no heartbeat for over {lock.lease_ttl_seconds:.0f}s) -- "
+                "stale lock reclaimed by a new run"
+            )
+        else:
+            stale.error = (
+                f"owner pid {lock.reclaimed_stale_pid} was no longer running "
+                "-- stale lock reclaimed by a new run"
+            )
         stale.terminal_at = _now_wall()
         stale.superseded_by = tracker.record.run_id
         _write_record_atomic(lock.state_path, stale)
@@ -1321,6 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
             run_args, tracker,
             wall_timeout=wall_timeout, stall_timeout=stall_timeout,
             post_results_grace=post_results_grace, max_workers=max_workers,
+            lock=lock if lock_owned_by_us else None,
         )
     finally:
         # 9e7b01cd -- truthful exit-code propagation: a Python `finally`

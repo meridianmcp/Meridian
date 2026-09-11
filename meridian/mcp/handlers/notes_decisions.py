@@ -183,6 +183,7 @@ async def handle_get_pinned_decisions(
     return await db_module.get_pinned_decisions(
         db, args["project_id"],
         include_superseded=bool(args.get("include_superseded", False)),
+        query=args.get("query"),
     )
 
 

@@ -769,6 +769,25 @@ async def handle_get_sprint_progress(
     return _resp_progress
 
 
+def _annotate_stale_in_progress(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """10c0f6a0 — stale-session warning: flag in_progress items claimed >2h
+    ago. Shared by both the legacy full-list and paginated (W1-A) paths of
+    handle_get_sprint_items so a stale item is flagged regardless of which
+    mode surfaced it."""
+    from datetime import datetime as _dt_cls  # noqa: PLC0415
+    _now_utc = _dt_cls.utcnow()
+    for _i, _it in enumerate(items):
+        if _it.get("status") == "in_progress" and _it.get("claimed_at"):
+            try:
+                _ca = _dt_cls.fromisoformat(_it["claimed_at"].split(".")[0].replace("Z", ""))
+                _age_h = (_now_utc - _ca).total_seconds() / 3600
+                if _age_h > 2:
+                    items[_i] = {**_it, "stale_warning": True, "stale_age_hours": round(_age_h, 1)}
+            except Exception:  # noqa: BLE001
+                pass
+    return items
+
+
 async def handle_get_sprint_items(
     args: dict[str, Any],
     db: Any,
@@ -776,7 +795,37 @@ async def handle_get_sprint_items(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: get_sprint_items."""
+    """MCP tool: get_sprint_items.
+
+    W1-A — cursor pagination, opt-in (mirrors get_notes): pass ``cursor``
+    and/or ``limit`` to get a {items, has_more, next_cursor, total_count}
+    envelope via ``db_module.get_sprint_items_page``, instead of the bare
+    (potentially very large — a project's full 'done' history can run into
+    the hundreds) list. Paginated mode filters by ``status`` only —
+    ``human``/``expand`` are not applied, since include_human filtering
+    would make total_count/has_more lie about the underlying page, and
+    collapsing item_group/parent_id clusters across a page boundary is
+    unsound. Without either arg the legacy bare list is returned exactly as
+    before, expand-aware and human-filtered.
+    """
+    if "cursor" in args or "limit" in args:
+        _page_items, _total_count = await db_module.get_sprint_items_page(
+            db, args["project_id"],
+            status=args.get("status"),
+            limit=int(args.get("limit", 50)),
+            offset=int(args.get("cursor", 0)),
+        )
+        _page_items = _annotate_stale_in_progress(_page_items)
+        _limit = max(1, min(int(args.get("limit", 50)), 500))
+        _cursor = max(0, int(args.get("cursor", 0)))
+        _has_more = (_cursor + len(_page_items)) < _total_count
+        return {
+            "items": _page_items,
+            "has_more": _has_more,
+            "next_cursor": (_cursor + len(_page_items)) if _has_more else None,
+            "total_count": _total_count,
+        }
+
     include_human = args.get("human", True)
     if isinstance(include_human, bool):
         pass
@@ -787,18 +836,7 @@ async def handle_get_sprint_items(
         status=args.get("status"),
         include_human=include_human,
     )
-    # 10c0f6a0 — stale-session warning: in_progress items claimed >2h ago
-    from datetime import datetime as _dt_cls  # noqa: PLC0415
-    _now_utc = _dt_cls.utcnow()
-    for _i, _it in enumerate(_items):
-        if _it.get("status") == "in_progress" and _it.get("claimed_at"):
-            try:
-                _ca = _dt_cls.fromisoformat(_it["claimed_at"].split(".")[0].replace("Z", ""))
-                _age_h = (_now_utc - _ca).total_seconds() / 3600
-                if _age_h > 2:
-                    _items[_i] = {**_it, "stale_warning": True, "stale_age_hours": round(_age_h, 1)}
-            except Exception:  # noqa: BLE001
-                pass
+    _items = _annotate_stale_in_progress(_items)
     # 9d8e858c — default-collapse item_group/parent_id clusters into one
     # summary row each so a caller browsing the board isn't flooded by every
     # fanned-out subtask; expand=true (default false) restores the full list.

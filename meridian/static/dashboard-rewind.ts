@@ -218,11 +218,11 @@ export function renderRewindCharts(projectId: string, stats: any) {
 
   return `<div style="padding:8px 0">
 
-    <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">📊 Sprint items / day (last ${stats.period_days}d)</div>
+    <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">📊 Experiments / day (last ${stats.period_days}d)</div>
 
     <canvas id="chart-tasks-${escapeHtml(projectId)}" style="max-width:100%;max-height:160px"></canvas>
 
-    <div style="${legendStyle}"><span>${swatch('rgba(96,165,250,0.7)')}Sprint items</span></div>
+    <div style="${legendStyle}"><span>${swatch('rgba(96,165,250,0.7)')}Experiments</span></div>
 
     <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">⚡ Session task completion % by version</div>
 
@@ -290,7 +290,7 @@ export function initRewindCharts(projectId: string, stats: any) {
 
         datasets: [{
 
-          label: 'sprint items',
+          label: 'experiments',
 
           data: totals,
 

@@ -433,6 +433,7 @@ def record_provenance(
     sprint_item_id: str | None = None,
     decision_id: str | None = None,
     note: str | None = None,
+    experiment_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Attach lightweight reproducibility metadata to one output file.
 
@@ -460,10 +461,16 @@ def record_provenance(
       decision_id:         Optional linked Meridian decision id.
       note:                Optional short note (kept separate from
                           ``annotate_outputs``'s longer free-form notes).
+      experiment_run_id:   Optional (3f6b8715) — links this record to a
+                          W1-M Experiment Registry run id. Purely additive;
+                          omitting it is unchanged behavior. Stored as an
+                          opaque string, not validated against a live run
+                          (this extension has no DB engine access).
 
     Returns:
       The stored record as {path, generating_script, params, sprint_item_id,
-      decision_id, note, recorded_at, recorded_at_iso, content_hash}, or
+      decision_id, note, recorded_at, recorded_at_iso, content_hash,
+      experiment_run_id}, or
       {error: ...}. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
       ``path``'s on-disk bytes at record time (``None`` if unreadable) --
       used by ``get_provenance_status`` to later detect relocation/drift.
@@ -479,6 +486,7 @@ def record_provenance(
         sprint_item_id=sprint_item_id,
         decision_id=decision_id,
         note=note,
+        experiment_run_id=experiment_run_id,
     )
 
 

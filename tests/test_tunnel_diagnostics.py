@@ -163,12 +163,16 @@ def test_label_enabled_not_running_with_history_is_restart_required_not_stale():
     assert label == "restart_required"
 
 
-def test_label_consistently_off_is_healthy():
+def test_label_consistently_off_is_disabled_not_healthy():
+    """W1-A fix: a connector turned off in the dashboard, with nothing
+    running and no adverse signal, must report ``disabled`` — not
+    ``healthy``, which falsely implies an actively-verified-fine runtime."""
     label = tn._diag_slot_label(
         dashboard_enabled=False, process_active=False, healthy_flag=True,
         detail=None,
     )
-    assert label == "healthy"
+    assert label == "disabled"
+    assert label != "healthy"
 
 
 def test_label_consistently_on_no_issues_is_healthy():
@@ -179,10 +183,11 @@ def test_label_consistently_on_no_issues_is_healthy():
     assert label == "healthy"
 
 
-def test_all_five_states_are_distinct_strings():
-    """Sanity: the five labels the sprint item calls out are all reachable and
-    all different — a regression that collapses two of them together (e.g.
-    stale silently becoming healthy) should fail this."""
+def test_all_six_states_are_distinct_strings():
+    """Sanity: all six labels are reachable and all different — a regression
+    that collapses two of them together (e.g. stale silently becoming
+    healthy, or disabled silently becoming healthy — the W1-A bug) should
+    fail this."""
     seen = {
         tn._diag_slot_label(dashboard_enabled=True, process_active=True,
                              healthy_flag=False, detail={"state": "quarantined"}),
@@ -192,10 +197,25 @@ def test_all_five_states_are_distinct_strings():
                              healthy_flag=True, detail={"state": "idle_killed"}),
         tn._diag_slot_label(dashboard_enabled=True, process_active=False,
                              healthy_flag=True, detail=None),
+        tn._diag_slot_label(dashboard_enabled=False, process_active=False,
+                             healthy_flag=True, detail=None),
         tn._diag_slot_label(dashboard_enabled=True, process_active=True,
                              healthy_flag=True, detail=None),
     }
-    assert seen == {"quarantined", "degraded", "restart_required", "stale", "healthy"}
+    assert seen == {
+        "quarantined", "degraded", "restart_required", "stale", "disabled", "healthy",
+    }
+
+
+def test_label_disabled_never_reads_as_healthy_even_with_stale_history():
+    """W1-A: a connector that has since been disabled, and has no live
+    process, should not fall through to 'healthy' just because an old
+    (non-adverse) diagnostic detail blob is still sitting around."""
+    label = tn._diag_slot_label(
+        dashboard_enabled=False, process_active=False, healthy_flag=True,
+        detail={"reason": "previously fine"},
+    )
+    assert label == "disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +224,12 @@ def test_all_five_states_are_distinct_strings():
 
 def test_remediation_healthy_is_a_noop():
     assert tn._diag_remediation("healthy", None) == "No action needed."
+
+
+def test_remediation_disabled_is_a_noop_and_says_so():
+    text = tn._diag_remediation("disabled", None)
+    assert "no action needed" in text.lower()
+    assert "disabled" in text.lower() or "off" in text.lower()
 
 
 def test_remediation_quarantined_mentions_restart():
@@ -404,6 +430,20 @@ def test_build_diagnostics_split_brain_disabled_but_socket_still_live():
     assert code["dashboard_configured"]["enabled"] is False
     assert code["process_active"] is True
     assert code["state"] == "restart_required"
+
+
+def test_build_diagnostics_genuinely_off_connector_reports_disabled_not_healthy():
+    """W1-A: a connector with dashboard_configured.enabled=False and no live
+    process must report state='disabled', never 'healthy' — a fully-off
+    connector is not a runtime health verdict of "fine"."""
+    tenant = dict(_TENANT, tunnel_plugins=json.dumps({"filesystem": {"enabled": False}}))
+    result = tn.build_tunnel_diagnostics(tenant)
+    fs = result["slots"]["fs"]
+    assert fs["dashboard_configured"]["enabled"] is False
+    assert fs["process_active"] is False
+    assert fs["state"] == "disabled"
+    assert fs["state"] != "healthy"
+    assert fs["remediation"] == "No action needed — this connector is intentionally turned off in the dashboard."
 
 
 def test_build_diagnostics_routing_cache_reflects_last_tools_list():

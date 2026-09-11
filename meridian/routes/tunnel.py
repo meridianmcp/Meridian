@@ -2310,12 +2310,13 @@ def _diag_slot_label(
     *, dashboard_enabled: bool, process_active: bool,
     healthy_flag: bool, detail: "dict | None",
 ) -> str:
-    """Classify one connector slot into exactly ONE of five distinct states.
+    """Classify one connector slot into exactly ONE of six distinct states.
 
     Precedence (most to least specific) — matches sprint item f1e0df55's
     requirement to "show restart-required, stale, degraded, quarantined, and
     healthy states distinctly" and to never call a dashboard-only setting
-    "active":
+    "active" — plus the W1-A fix that stops a genuinely turned-off connector
+    from ever reading as a "healthy" runtime verdict:
 
     1. ``quarantined``       — the client gave up retrying after a
                                 deterministic failure (SlotState.QUARANTINED).
@@ -2344,9 +2345,19 @@ def _diag_slot_label(
                                 that has some diagnostic history showing it
                                 is down) is ``restart_required``: restart the
                                 tunnel to reconcile.
-    5. ``healthy``            — consistently and correctly off (disabled in
-                                the dashboard AND nothing running), or
-                                consistently on with no adverse signal.
+    5. ``disabled``           — consistently and correctly OFF: disabled in
+                                the dashboard AND nothing running, with no
+                                adverse quarantine/degraded/mismatch signal.
+                                Distinct from ``healthy`` on purpose — a
+                                connector that was intentionally turned off
+                                is not the same fact as one that is actively
+                                running and verified fine, and reporting the
+                                former as "healthy" reads as a false-positive
+                                runtime health verdict for something that
+                                simply is not running at all.
+    6. ``healthy``            — consistently ON with no adverse signal (the
+                                dashboard has it enabled, a process is
+                                actually active, and nothing above fired).
     """
     state = (detail or {}).get("state")
     if state == "quarantined" or (detail or {}).get("quarantine_reason"):
@@ -2359,13 +2370,20 @@ def _diag_slot_label(
         if dashboard_enabled and detail is None:
             return "stale"  # enabled, not running, and no history at all
         return "restart_required"
-    return "healthy"  # consistently off, or consistently on with no issues
+    if not dashboard_enabled:
+        # dashboard_enabled == process_active == False here: genuinely,
+        # consistently off. Never report this as "healthy" — that implies an
+        # actively-verified-fine runtime, which a disabled connector is not.
+        return "disabled"
+    return "healthy"  # consistently on with no issues
 
 
 def _diag_remediation(label: str, detail: "dict | None") -> str:
     """Exact, human-actionable remediation text for one slot's diagnostic label."""
     if label == "healthy":
         return "No action needed."
+    if label == "disabled":
+        return "No action needed — this connector is intentionally turned off in the dashboard."
     if label == "quarantined":
         reason = (detail or {}).get("quarantine_reason") or (detail or {}).get("reason") or "a deterministic failure"
         return (
@@ -2640,7 +2658,9 @@ def build_launch_matrix(
         for slot, slot_diag in iter_slots.items():
             plugin = plugins_by_slot.get(slot) or {}
             label = slot_diag.get("state")
-            failure_class = None if label in (None, "healthy") else label
+            # "disabled" is an intentional, correctly-off state, not a
+            # failure — never surface it as failure_class (W1-A).
+            failure_class = None if label in (None, "healthy", "disabled") else label
             process_active = bool(slot_diag.get("process_active"))
             rows.append({
                 "project_id": project_id,

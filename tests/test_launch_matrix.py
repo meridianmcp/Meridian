@@ -105,6 +105,19 @@ def test_degraded_slot_is_not_invocable_and_carries_failure_class(tmp_path):
     assert "degraded" in fs_row["fallback"].lower()
 
 
+def test_disabled_slot_is_not_a_failure_class(tmp_path):
+    """W1-A: a connector turned off in the dashboard reports
+    local_launcher_status='disabled', not 'healthy' — but it also is not a
+    *failure*, so failure_class must stay None (not 'disabled')."""
+    tenant = dict(_TENANT, tunnel_plugins=json.dumps({"filesystem": {"enabled": False}}))
+    repo = str(tmp_path / "myproject")
+    result = tn.build_launch_matrix(tenant, None, [_project("p1", repo_path=repo)])
+    fs_row = next(r for r in result["rows"] if r["slot"] == "fs")
+    assert fs_row["local_launcher_status"] == "disabled"
+    assert fs_row["failure_class"] is None
+    assert fs_row["active_invocable"] is False
+
+
 # ---------------------------------------------------------------------------
 # Repo-scope guard integration
 # ---------------------------------------------------------------------------

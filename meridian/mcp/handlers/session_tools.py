@@ -940,6 +940,7 @@ async def handle_search_all(
         db, args["project_id"], args["query"],
         limit=args.get("limit", 10),
         expand=bool(args.get("expand", False)),
+        cursor=int(args.get("cursor", 0)),
     )
 
 

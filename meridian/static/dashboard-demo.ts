@@ -366,9 +366,9 @@ export function showDemoOnboardingOverlay() {
 
   <ol style="color:#c4c6d4;font-size:1.02rem;line-height:1.85;padding-left:1.3em;margin:0 0 24px">
 
-    <li>This is a live demo coordinating a real multi-session build. It's read-only.</li>
+    <li>This is a live demo coordinating real AI research runs. It's read-only.</li>
 
-    <li>Click any session on the left to explore.</li>
+    <li>Click any run on the left to explore.</li>
 
     <li>Write actions are disabled — <a href="/auth/login" style="color:#6c8fff;text-decoration:underline">sign in to create your own project</a>.</li>
 

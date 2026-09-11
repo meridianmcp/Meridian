@@ -1074,7 +1074,7 @@ async function loadExecutorRulesSection(projectId: any) {
 
       <div style="margin-bottom:12px">
 
-        <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase;margin-bottom:4px">Executor Rules</div>
+        <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase;margin-bottom:4px">AI Session Rules</div>
 
         <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
           These rules are injected into every <code>start_session</code> response so AI coding
@@ -1274,9 +1274,9 @@ const _DEMO_TOUR_STEPS = [
 
     target: () => document.querySelector('.session-list, .sidebar-sessions, [data-tour="sessions"], .sidebar'),
 
-    title: 'AI coding sessions',
+    title: 'AI research runs',
 
-    body: 'Each row is one Claude Code run. Multiple sessions work in parallel on the same project — no collisions.',
+    body: 'Each row is one AI research run. Multiple runs work in parallel on the same project — no collisions.',
 
     position: 'right',
 
@@ -1286,9 +1286,9 @@ const _DEMO_TOUR_STEPS = [
 
     vtab: 'status',
 
-    title: 'Status & sessions',
+    title: 'Status & runs',
 
-    body: 'The default panel: live session status and the task log. Every meaningful action a session takes shows up here in real time.',
+    body: 'The default panel: live run status and the activity log. Every meaningful action a run takes shows up here in real time.',
 
     position: 'bottom',
 
@@ -1300,7 +1300,7 @@ const _DEMO_TOUR_STEPS = [
 
     title: 'Live view',
 
-    body: 'A right-now feed of what every active session is doing this second — tool calls, file claims, and progress as they happen.',
+    body: 'A right-now feed of what every active run is doing this second — tool calls, file claims, and progress as they happen.',
 
     position: 'bottom',
 
@@ -1314,7 +1314,7 @@ const _DEMO_TOUR_STEPS = [
 
     title: 'Shared goal state',
 
-    body: 'The north star and version goal every session reads on startup — so parallel runs stay aligned on one plan.',
+    body: 'The north star and version goal every run reads on startup — so parallel experiments stay aligned on one plan.',
 
     position: 'bottom',
 
@@ -1328,7 +1328,7 @@ const _DEMO_TOUR_STEPS = [
 
     title: 'Pinned decisions',
 
-    body: 'An append-only constitution of architectural calls. New sessions inherit them automatically instead of relitigating settled choices.',
+    body: 'An append-only record of key decisions. New runs inherit them automatically instead of relitigating settled choices.',
 
     position: 'bottom',
 
@@ -1338,9 +1338,9 @@ const _DEMO_TOUR_STEPS = [
 
     vtab: 'queue',
 
-    title: 'Work queue',
+    title: 'Experiment queue',
 
-    body: 'Pending tasks claimed atomically — parallel sessions grab work without stepping on each other.',
+    body: 'Pending experiments claimed atomically — parallel runs pick up work without stepping on each other.',
 
     position: 'bottom',
 
@@ -1352,7 +1352,7 @@ const _DEMO_TOUR_STEPS = [
 
     title: 'Activity timeline',
 
-    body: 'Every session laid out over time — when each ran, what changed, and how long each task took.',
+    body: 'Every run laid out over time — when each ran, what changed, and how long each step took.',
 
     position: 'bottom',
 
@@ -1364,7 +1364,7 @@ const _DEMO_TOUR_STEPS = [
 
     title: 'Files',
 
-    body: 'File claims and previews. Sessions lock the files they are editing so two runs never clobber the same file.',
+    body: 'File claims and previews. Runs lock the files they are editing so two runs never clobber the same file.',
 
     position: 'bottom',
 
@@ -1374,9 +1374,9 @@ const _DEMO_TOUR_STEPS = [
 
     vtab: 'hitl',
 
-    title: 'Human-in-the-loop',
+    title: 'Researcher review',
 
-    body: 'When a session needs a human decision it parks the question here and waits — you answer, it resumes. No silent guessing.',
+    body: 'When a run needs a decision from you it parks the question here and waits — you answer, it resumes. No silent guessing.',
 
     position: 'bottom',
 
@@ -1388,7 +1388,7 @@ const _DEMO_TOUR_STEPS = [
 
     title: 'Project notes',
 
-    body: 'A shared per-project wiki every session can read and append to — context that outlives any single run.',
+    body: 'A shared per-project wiki every run can read and append to — context that outlives any single run.',
 
     position: 'bottom',
 
@@ -1414,7 +1414,7 @@ const _DEMO_TOUR_STEPS = [
 
     title: 'You\'re all set',
 
-    body: 'Explore any project or session. When you\'re ready to coordinate your own AI sessions — sign in and create a project.',
+    body: 'Explore any project or run. When you\'re ready to coordinate your own AI research runs — sign in and create a project.',
 
     position: 'center',
 
@@ -3471,13 +3471,13 @@ function buildTabBody(project: any) {
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-          <button class="vtab-btn" data-vtab="queue" title="Work Queue">👷</button>
+          <button class="vtab-btn" data-vtab="queue" title="Experiments">👷</button>
 
-          <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+          <button class="vtab-btn" data-vtab="hitl" title="Researcher Review Queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
 
           <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
 
-          <button class="vtab-btn" data-vtab="sessions" title="Sessions — executor session timeline (done / failed / stopped-ambiguously)">🕒</button>
+          <button class="vtab-btn" data-vtab="sessions" title="Sessions — Run History (done / failed / stopped-ambiguously)">🕒</button>
 
         </div>
 
@@ -3653,7 +3653,7 @@ function buildTabBody(project: any) {
 
             <div class="live-queue" id="live-queue-${project.id}">
 
-              <div class="live-empty">Queue is empty. Add a task above.</div>
+              <div class="live-empty">No experiments yet. Add a task above.</div>
 
             </div>
 
@@ -3707,7 +3707,7 @@ function buildTabBody(project: any) {
 
             <span>GOAL · ${escapeHtml(project.name)}</span>
 
-            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Share your project context with AI sessions — north star, sprint, version goal</span>
+            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Share your project context with AI sessions — north star, experiment, version goal</span>
 
           </span>
 
@@ -3725,7 +3725,7 @@ function buildTabBody(project: any) {
 
           <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone — what ships this cycle (v1.2, v2.0, etc).">🎯 Version Goal</button>
 
-          <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now — updated multiple times per day. Not a multi-week scrum sprint.">⚡ Session Focus</button>
+          <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now — updated multiple times per day. Not a multi-week scrum sprint.">⚡ Current Focus</button>
 
           <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">📋 Decisions <span class="decisions-gtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:9px;font-weight:700;padding:0 5px;border-radius:8px;line-height:14px;margin-left:4px;vertical-align:1px">0</span></button>
 
@@ -6384,7 +6384,7 @@ function renderLiveQueue(projectId: any, tasks: any) {
 
   if (!live.length) {
 
-    root.innerHTML = '<div class="live-empty">Queue is empty. Add a task above.</div>';
+    root.innerHTML = '<div class="live-empty">No experiments yet. Add a task above.</div>';
 
     return;
 
@@ -7705,10 +7705,10 @@ async function loadSessionTimelineTab(projectId: any) {
     return `<span style="font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid ${m.color};color:${m.color};letter-spacing:.04em" title="${escapeHtml(String(o))}">${m.label}</span>`;
   };
 
-  let html = `<div style="font-size:9px;color:var(--muted);margin-bottom:10px">Per executor session: start/end + the sprint items it worked, grouped by item group. <b>STOPPED?</b> = the session ended while it still had an item claimed (a silent stop) — distinct from <b>FAILED</b> (the item actively errored).</div>`;
+  let html = `<div style="font-size:9px;color:var(--muted);margin-bottom:10px">Per session: start/end + the sprint items it worked, grouped by item group. <b>STOPPED?</b> = the session ended while it still had an item claimed (a silent stop) — distinct from <b>FAILED</b> (the item actively errored).</div>`;
 
   if (!sessions.length) {
-    html += `<div class="empty" id="session-timeline-empty" style="color:var(--muted);padding:8px 0">No executor sessions yet.</div>`;
+    html += `<div class="empty" id="session-timeline-empty" style="color:var(--muted);padding:8px 0">No run history yet.</div>`;
   } else {
     for (const s of sessions) {
       const when = s.ended_at
