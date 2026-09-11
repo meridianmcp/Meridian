@@ -9003,6 +9003,32 @@ class TestProvenanceTriggeredRegistration:
         assert result["content_hash"] == FP.script_content_hash(str(f))
         assert result["content_hash"] is not None
 
+    def test_record_provenance_resolves_relative_path_against_outputs_dir_for_hashing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """W1-A regression: a RELATIVE ``path`` must still get a real
+        content_hash. ``script_content_hash`` does a plain ``open(path)``,
+        which resolves a relative path against the CALLING PROCESS's cwd --
+        not ``outputs_dir`` -- so a caller that (reasonably) passed a path
+        relative to the outputs tree previously got content_hash: None even
+        though the file genuinely exists under outputs_dir."""
+        from meridian_outputs import annotate as AN
+        from meridian_outputs import fingerprint as FP
+
+        (tmp_path / "figures").mkdir()
+        f = tmp_path / "figures" / "plot.png"
+        f.write_bytes(b"fake-png-bytes")
+
+        # cwd is deliberately NOT outputs_dir/tmp_path, so a naive
+        # open("figures/plot.png") from cwd would fail.
+        other_cwd = tmp_path.parent
+        monkeypatch.chdir(other_cwd)
+
+        result = AN.record_provenance(str(tmp_path), "figures/plot.png")
+        assert "error" not in result
+        assert result["content_hash"] is not None
+        assert result["content_hash"] == FP.script_content_hash(str(f))
+
     def test_record_provenance_content_hash_none_when_path_missing(
         self, tmp_path: Path,
     ) -> None:

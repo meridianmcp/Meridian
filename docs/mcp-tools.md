@@ -375,13 +375,14 @@ Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (
 
 
 ### `get_pinned_decisions`
-[SUPPORT] Read-only: List pinned decisions, highest priority first (urgent → normal → low, then newest-first). Active only by default. Each row includes its priority and a parsed edit_log array of prior bodies ({body, ts}) recorded on every in-place body edit.
+[SUPPORT] Read-only: List pinned decisions, highest priority first (urgent → normal → low, then newest-first). Active only by default. Each row includes its priority and a parsed edit_log array of prior bodies ({body, ts}) recorded on every in-place body edit. Pass query to filter to decisions whose title or body matches (every whitespace-separated term must appear in the title or the body, same multiword-AND convention as search_tasks/search_all) — omit or pass a blank string for no filter (W1-A).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `include_superseded` | boolean | optional |  |
+| `query` | string | optional | Optional free-text filter over title + body. Every whitespace-separated term must appear in the title or the body (AND across terms, OR across columns). Blank/omitted means no filter. |
 
 **Example:**
 ```

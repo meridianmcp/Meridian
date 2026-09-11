@@ -4913,6 +4913,7 @@ async def search_all(
     query: str,
     limit: int = 10,
     expand: bool = False,
+    cursor: int = 0,
 ) -> dict[str, Any]:
     """Universal search across task_log, project_notes, sprint_items, and decisions_pinned.
 
@@ -4921,6 +4922,19 @@ async def search_all(
       - project_notes.title + project_notes.body
       - decisions_pinned.title + decisions_pinned.body
       - sprint_items.title + sprint_items.notes
+
+    W1-A — ``limit`` (clamped 1..100) and ``cursor`` (an offset, default 0,
+    applied identically to all four categories — the same "one uniform
+    offset across every list" contract ``get_project_notes_page`` uses,
+    just fanned out over four lists instead of one) bound and page each of
+    the four result lists so a broad query on a large project can no longer
+    return an unbounded, single-shot response. One extra row per category is
+    fetched to detect ``has_more`` without a COUNT query (mirrors
+    ``get_project_notes_page``): ``has_more`` is a per-category bool dict,
+    and ``next_cursor`` is ``cursor + limit`` when at least one category has
+    more, else ``None`` — pass it back as ``cursor`` for the next page. A
+    category already exhausted at a higher offset simply returns an empty
+    page for it; callers only need the single combined cursor.
 
     SQLite (25155e91): keyword match — a row matches if ANY whitespace-separated
     query term appears (as a substring) in one of its text fields, ranked by how
@@ -4934,11 +4948,11 @@ async def search_all(
     "authentication for the user" — which the SQLite substring path cannot. Zero
     schema / zero index (evaluated per query).
 
-    Returns grouped results: {tasks, notes, decisions, sprint_items}.
-    Each item includes a ``match_type`` key for the source table and a
-    ``snippet`` key — a short window of the matching body text centered on the
-    query term (empty string when no body field matched, e.g. a title-only
-    match).
+    Returns grouped results: {tasks, notes, decisions, sprint_items, total,
+    cursor, limit, has_more, next_cursor}. Each item includes a
+    ``match_type`` key for the source table and a ``snippet`` key — a short
+    window of the matching body text centered on the query term (empty
+    string when no body field matched, e.g. a title-only match).
 
     9d8e858c — ``sprint_items`` default-collapse (``expand=False``, the
     default) any cluster sharing a ``parent_id`` or ``item_group`` (2+ items)
@@ -4948,6 +4962,11 @@ async def search_all(
     """
     is_pg = hasattr(db, "_pool")
     op = "ILIKE" if is_pg else "LIKE"
+    limit = max(1, min(int(limit), 100))
+    cursor = max(0, int(cursor))
+    # Fetch one extra row per category so has_more is known without a
+    # separate COUNT query — same trick get_project_notes_page uses.
+    fetch_limit = limit + 1
 
     async def _search(sql: str, params: tuple) -> list[dict[str, Any]]:
         async with db.execute(sql, params) as cur:
@@ -4983,14 +5002,14 @@ async def search_all(
             "FROM task_log "
             f"WHERE project_id = ? AND {tv_task} @@ websearch_to_tsquery('english', ?) "
             f"ORDER BY ts_rank({tv_task}, websearch_to_tsquery('english', ?)) DESC, "
-            "created_at DESC LIMIT ?"
+            "created_at DESC LIMIT ? OFFSET ?"
         )
         notes_sql = (
             "SELECT id, title, body, tags, created_at, 'note' AS match_type "
             "FROM project_notes "
             f"WHERE project_id = ? AND {tv_note} @@ websearch_to_tsquery('english', ?) "
             f"ORDER BY ts_rank({tv_note}, websearch_to_tsquery('english', ?)) DESC, "
-            "created_at DESC LIMIT ?"
+            "created_at DESC LIMIT ? OFFSET ?"
         )
         decisions_sql = (
             "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
@@ -4998,7 +5017,7 @@ async def search_all(
             "WHERE project_id = ? AND status = 'active' "
             f"AND {tv_dec} @@ websearch_to_tsquery('english', ?) "
             f"ORDER BY ts_rank({tv_dec}, websearch_to_tsquery('english', ?)) DESC, "
-            "created_at DESC LIMIT ?"
+            "created_at DESC LIMIT ? OFFSET ?"
         )
         sprint_sql = (
             "SELECT id, title, notes, version, status, parent_id, item_group, "
@@ -5006,7 +5025,7 @@ async def search_all(
             "FROM sprint_items "
             f"WHERE project_id = ? AND {tv_sprint} @@ websearch_to_tsquery('english', ?) "
             f"ORDER BY ts_rank({tv_sprint}, websearch_to_tsquery('english', ?)) DESC, "
-            "added_at DESC LIMIT ?"
+            "added_at DESC LIMIT ? OFFSET ?"
         )
 
         # 25155e91 — OR the query terms instead of ANDing them. Plain
@@ -5019,10 +5038,22 @@ async def search_all(
         # nothing. A single-term query is passed through unchanged (still
         # stemmed). The SQL is untouched — only the bound tsquery source changes.
         tsq = _or_tsquery_source(query)
-        tasks = await _search(tasks_sql, (project_id, tsq, tsq, limit))
-        notes = await _search(notes_sql, (project_id, tsq, tsq, limit))
-        decisions = await _search(decisions_sql, (project_id, tsq, tsq, limit))
-        sprint_items = await _search(sprint_sql, (project_id, tsq, tsq, limit))
+        tasks = await _search(tasks_sql, (project_id, tsq, tsq, fetch_limit, cursor))
+        notes = await _search(notes_sql, (project_id, tsq, tsq, fetch_limit, cursor))
+        decisions = await _search(decisions_sql, (project_id, tsq, tsq, fetch_limit, cursor))
+        sprint_items = await _search(sprint_sql, (project_id, tsq, tsq, fetch_limit, cursor))
+
+        # W1-A — has_more/trim happen on the raw keyword fetch BEFORE semantic
+        # escalation: escalation's own dedupe/cap logic (len(...) >= limit)
+        # already assumes it is looking at (at most) `limit` existing keyword
+        # rows, not the fetch_limit=limit+1 probe row used to detect has_more.
+        has_more = {
+            "tasks": len(tasks) > limit, "notes": len(notes) > limit,
+            "decisions": len(decisions) > limit, "sprint_items": len(sprint_items) > limit,
+        }
+        tasks, notes, decisions, sprint_items = (
+            tasks[:limit], notes[:limit], decisions[:limit], sprint_items[:limit],
+        )
 
         # 56cd8712 — SAFE-BY-DEFAULT, OPT-IN semantic escalation. When keyword /
         # tsvector search genuinely found nothing good, and semantic search is
@@ -5059,39 +5090,50 @@ async def search_all(
             f"SELECT id, description, status, created_at, 'task' AS match_type, {sc_task} AS _match_score "
             "FROM task_log "
             f"WHERE project_id = ? AND {w_task} "
-            "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
+            "ORDER BY _match_score DESC, created_at DESC LIMIT ? OFFSET ?"
         )
         notes_sql = (
             f"SELECT id, title, body, tags, created_at, 'note' AS match_type, {sc_note} AS _match_score "
             "FROM project_notes "
             f"WHERE project_id = ? AND {w_note} "
-            "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
+            "ORDER BY _match_score DESC, created_at DESC LIMIT ? OFFSET ?"
         )
         decisions_sql = (
             f"SELECT id, title, body, category, status, created_at, 'decision' AS match_type, {sc_dec} AS _match_score "
             "FROM decisions_pinned "
             f"WHERE project_id = ? AND status = 'active' AND {w_dec} "
-            "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
+            "ORDER BY _match_score DESC, created_at DESC LIMIT ? OFFSET ?"
         )
         sprint_sql = (
             f"SELECT id, title, notes, version, status, parent_id, item_group, "
             f"added_at AS created_at, 'sprint_item' AS match_type, {sc_sprint} AS _match_score "
             "FROM sprint_items "
             f"WHERE project_id = ? AND {w_sprint} "
-            "ORDER BY _match_score DESC, added_at DESC LIMIT ?"
+            "ORDER BY _match_score DESC, added_at DESC LIMIT ? OFFSET ?"
         )
 
         # score params bind first (SELECT list), then project_id + WHERE params.
-        tasks = await _search(tasks_sql, (*sp_task, project_id, *wp_task, limit))
-        notes = await _search(notes_sql, (*sp_note, project_id, *wp_note, limit))
-        decisions = await _search(decisions_sql, (*sp_dec, project_id, *wp_dec, limit))
-        sprint_items = await _search(sprint_sql, (*sp_sprint, project_id, *wp_sprint, limit))
+        tasks = await _search(tasks_sql, (*sp_task, project_id, *wp_task, fetch_limit, cursor))
+        notes = await _search(notes_sql, (*sp_note, project_id, *wp_note, fetch_limit, cursor))
+        decisions = await _search(decisions_sql, (*sp_dec, project_id, *wp_dec, fetch_limit, cursor))
+        sprint_items = await _search(sprint_sql, (*sp_sprint, project_id, *wp_sprint, fetch_limit, cursor))
 
         # _match_score is an internal ranking column; drop it from returned rows
         # so the result shape is identical to the Postgres path.
         for _grp in (tasks, notes, decisions, sprint_items):
             for _row in _grp:
                 _row.pop("_match_score", None)
+
+        # W1-A — has_more/trim on the raw fetch_limit-sized fetch (see the
+        # matching Postgres-branch comment above for why this must happen
+        # before any semantic escalation).
+        has_more = {
+            "tasks": len(tasks) > limit, "notes": len(notes) > limit,
+            "decisions": len(decisions) > limit, "sprint_items": len(sprint_items) > limit,
+        }
+        tasks, notes, decisions, sprint_items = (
+            tasks[:limit], notes[:limit], decisions[:limit], sprint_items[:limit],
+        )
 
     # Attach a body-text snippet for each result so the dashboard search bar can
     # surface matching context. The body field name differs per content type.
@@ -5110,6 +5152,13 @@ async def search_all(
     # carries its snippet.
     sprint_items = collapse_sprint_item_clusters(sprint_items, expand=expand)
 
+    # W1-A — additive pagination fields. any_has_more/next_cursor use one
+    # combined offset across all four lists (see the function docstring);
+    # has_more is also broken out per category for a caller that wants to
+    # know exactly which list(s) still have more without guessing from
+    # len(...) == limit. Every existing field is unchanged, so a caller that
+    # ignores these new keys sees identical behavior to before.
+    any_has_more = any(has_more.values())
     return {
         "query": query,
         "tasks": tasks,
@@ -5117,6 +5166,10 @@ async def search_all(
         "decisions": decisions,
         "sprint_items": sprint_items,
         "total": len(tasks) + len(notes) + len(decisions) + len(sprint_items),
+        "cursor": cursor,
+        "limit": limit,
+        "has_more": has_more,
+        "next_cursor": (cursor + limit) if any_has_more else None,
     }
 
 
@@ -5125,9 +5178,15 @@ async def search_all(
 #
 # search_all (above) is a COMPATIBILITY universal-search surface: LIKE/ILIKE
 # on SQLite, additive tsvector on Postgres, no stable ranked-result contract,
-# no source-type/status/version filters, no explainable scores, no
-# pagination. search_synthesis calls the exact same retrieval and only adds
-# optional LLM summarization on top — it does not fix any of that either.
+# no source-type/status/version filters, no explainable scores. W1-A gave it
+# a bare cursor/limit offset (uniform across its four lists, no stable
+# cross-page ordering guarantee beyond each list's own score/created_at
+# order) purely to stop an unbounded single-shot response — planning_search
+# below is still the one with a real ranked/paginated contract (an integer
+# offset cursor with a deterministic tie-break order and no upper bound on
+# how many pages that guarantee holds for). search_synthesis calls the exact
+# same retrieval and only adds optional LLM summarization on top — it does
+# not add any of planning_search's guarantees either.
 # search_all's semantics are left completely untouched by this section; this
 # is a SEPARATE operation with its own contract:
 #
@@ -8756,6 +8815,7 @@ async def get_pinned_decisions(
     db: aiosqlite.Connection,
     project_id: str,
     include_superseded: bool = False,
+    query: "str | None" = None,
 ) -> list[dict[str, Any]]:
     """Return all pinned decisions for a project, highest priority first.
 
@@ -8766,20 +8826,31 @@ async def get_pinned_decisions(
 
     Defaults to active only — superseded entries stay in history but
     are filtered out of the live constitution view.
+
+    W1-A: ``query`` (optional) filters to decisions whose title or body
+    matches, using the same multiword AND-across-terms/OR-across-columns
+    convention as ``search_tasks``/``search_all`` (``_multiword_match_clause``)
+    — every whitespace-separated term in ``query`` must appear in the title
+    or the body. A blank/whitespace-only query is treated as "no filter",
+    matching every other list-shaped tool's convention.
     """
-    if include_superseded:
-        sql = (
-            "SELECT * FROM decisions_pinned WHERE project_id = ? "
-            "ORDER BY created_at DESC"
-        )
-        args = (project_id,)
-    else:
-        sql = (
-            "SELECT * FROM decisions_pinned WHERE project_id = ? "
-            "AND status = 'active' ORDER BY created_at DESC"
-        )
-        args = (project_id,)
-    async with db.execute(sql, args) as cur:
+    where = ["project_id = ?"]
+    args: list[Any] = [project_id]
+    if not include_superseded:
+        where.append("status = 'active'")
+    stripped_query = (query or "").strip()
+    if stripped_query:
+        is_pg = hasattr(db, "_pool")
+        op = "ILIKE" if is_pg else "LIKE"
+        match_sql, match_params = _multiword_match_clause(
+            ["title", "body"], stripped_query, op=op)
+        where.append(match_sql)
+        args.extend(match_params)
+    sql = (
+        "SELECT * FROM decisions_pinned WHERE " + " AND ".join(where) +
+        " ORDER BY created_at DESC"
+    )
+    async with db.execute(sql, tuple(args)) as cur:
         rows = await cur.fetchall()
     decisions = [_hydrate_decision_row(r) for r in rows if r is not None]
     # Stable sort by priority rank keeps the SQL newest-first order within each

@@ -268,6 +268,14 @@ def record_provenance(
     has been relocated/regenerated since this record was made, by comparing
     against a freshly-computed hash at lookup time.
 
+    W1-A -- when ``path`` is relative, it is resolved against ``outputs_dir``
+    before hashing (``os.path.join(outputs_dir, path)``); an already-absolute
+    ``path`` is used as-is. ``script_content_hash`` opens the given path
+    directly, and a relative path otherwise resolves against the calling
+    process's current working directory -- not ``outputs_dir`` -- which
+    previously made ``content_hash`` come back ``None`` for every caller that
+    (reasonably) passed a path relative to the outputs tree.
+
     6af1518d (requirement 3) -- once the record is successfully written,
     ``path`` is also registered for TARGETED, PROMPT indexing via
     ``outputs_local.register_priority_path``: rather than waiting for the
@@ -290,8 +298,15 @@ def record_provenance(
         except Exception:  # noqa: BLE001 -- best-effort fallback only
             generating_script = None
 
+    # W1-A: a relative `path` must be resolved against `outputs_dir` before
+    # hashing -- `script_content_hash` does a plain `open(path, "rb")`, which
+    # a relative path resolves against the CALLING PROCESS's cwd (often not
+    # outputs_dir), so a perfectly valid output recorded with a relative path
+    # silently hashed nothing and content_hash came back None. An already-
+    # absolute path is passed through unchanged.
+    _hash_path = path if os.path.isabs(path) else os.path.join(outputs_dir, path)
     try:
-        content_hash = fingerprint.script_content_hash(path)
+        content_hash = fingerprint.script_content_hash(_hash_path)
     except Exception:  # noqa: BLE001 -- best-effort snapshot only, never
         # blocks the (already-durable) provenance write on a hashing failure.
         content_hash = None

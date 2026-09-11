@@ -856,10 +856,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read-only: List pinned decisions, highest priority first (urgent → "
         "normal → low, then newest-first). Active only by default. Each row "
         "includes its priority and a parsed edit_log array of prior bodies "
-        "({body, ts}) recorded on every in-place body edit.",
+        "({body, ts}) recorded on every in-place body edit. Pass query to "
+        "filter to decisions whose title or body matches (every "
+        "whitespace-separated term must appear in the title or the body, "
+        "same multiword-AND convention as search_tasks/search_all) — omit "
+        "or pass a blank string for no filter (W1-A).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "include_superseded": {"type": "boolean"}},
+         "include_superseded": {"type": "boolean"},
+         "query": {"type": "string", "description": "Optional free-text filter over title + body. Every whitespace-separated term must appear in the title or the body (AND across terms, OR across columns). Blank/omitted means no filter."}},
          "required": []}},
     {"name": "archive_decision", "description":
         "Archive a pinned decision by id. Soft-deletes to preserve the audit trail. "
@@ -2865,7 +2870,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Cold sessions read this to know what's still owed. By default, items sharing a "
         "``parent_id`` (subtasks) or ``item_group`` collapse into one summary row per "
         "cluster ({collapsed, cluster_kind, item_group_or_parent, count, done, description, ids}) "
-        "instead of listing every item — pass expand=true for the full ungrouped list.",
+        "instead of listing every item — pass expand=true for the full ungrouped list. "
+        "Pagination (W1-A): pass limit and/or cursor to get a "
+        "{items, has_more, next_cursor, total_count} envelope instead of the bare list — a "
+        "project with hundreds of items (e.g. a large 'done' history) can otherwise return an "
+        "unbounded, single-shot response. Paginated mode filters by status only — expand "
+        "(clustering) is not applied to a partial page, since collapsing a cluster split across "
+        "a page boundary would be misleading. Omit both limit and cursor for the legacy full "
+        "list (unchanged, expand-aware) behavior.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "status": {"type": "string",
@@ -2875,7 +2887,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "expand": {"type": "boolean",
                     "description": "Default false: collapse parent_id/item_group clusters "
                     "(2+ items) into one summary row each. Pass true for the full "
-                    "ungrouped item list (pre-9d8e858c behavior)."}},
+                    "ungrouped item list (pre-9d8e858c behavior). Ignored in paginated mode."},
+         "limit": {"type": "integer", "description": "Page size (default 50, clamped 1..500). Passing limit or cursor switches the result to the {items, has_more, next_cursor, total_count} pagination envelope."},
+         "cursor": {"type": "integer", "description": "Offset cursor from a prior page's next_cursor. Passing it switches the result to the pagination envelope."}},
          "required": []}},
     {"name": "get_parallelizable_groups", "description":
         "Read-only: Return clusters of pending sprint items that are safe to run "
@@ -3139,13 +3153,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "search_all", "description":
         "Read-only: Universal search across all project content: tasks, notes, pinned decisions, "
         "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
-        "Returns grouped results: {tasks, notes, decisions, sprint_items, total}. "
+        "Returns grouped results: {tasks, notes, decisions, sprint_items, total, cursor, limit, "
+        "has_more, next_cursor}. limit (default 10, clamped 1..100) and cursor (default 0) bound "
+        "and page each of the four lists with one shared offset (W1-A) — pass a prior response's "
+        "next_cursor back in as cursor to fetch the next page; has_more is a per-list bool so you "
+        "can tell exactly which list(s) still have more. "
         "sprint_items default-collapse any parent_id/item_group cluster (2+ items) into one "
         "summary row — pass expand=true for the full ungrouped list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "query": {"type": "string"},
-         "limit": {"type": "integer", "description": "Max results per type (default 10)."},
+         "limit": {"type": "integer", "description": "Max results per type (default 10, clamped 1..100)."},
+         "cursor": {"type": "integer", "description": "Offset applied to all four result lists (default 0). Pass a prior response's next_cursor to fetch the next page."},
          "expand": {"type": "boolean", "description": "Default false: collapse parent_id/item_group clusters in sprint_items into one summary row each. Pass true for the full ungrouped list."}},
          "required": ["query"]}},
     {"name": "search_synthesis", "description":

@@ -258,6 +258,57 @@ async def test_get_pinned_decisions_handler_direct(db, project, monkeypatch):
     assert any(d.get("title") == "Handler decision" for d in result)
 
 
+@pytest.mark.asyncio
+async def test_get_pinned_decisions_query_filters_by_title_and_body(db, project, monkeypatch):
+    """W1-A: get_pinned_decisions(query=...) must actually filter results —
+    previously the query argument was silently dropped and every decision
+    for the project was returned regardless."""
+    monkeypatch.setattr(_server_mod(), "_append_decision_to_md", _noop_async, raising=False)
+    pid = project["id"]
+    await db_module.pin_decision(db, pid, "Use psycopg3", "asyncpg had DLL issues", "TECHNICAL")
+    await db_module.pin_decision(db, pid, "Adopt Redis", "for pub/sub fanout", "TECHNICAL")
+
+    result = await nd_mod.handle_get_pinned_decisions(
+        {"project_id": pid, "query": "psycopg3"},
+        db, _DATA_DIR, None, None,
+    )
+    titles = {d.get("title") for d in result}
+    assert titles == {"Use psycopg3"}
+
+    # A body-only match also hits (title OR body, per _multiword_match_clause).
+    result2 = await nd_mod.handle_get_pinned_decisions(
+        {"project_id": pid, "query": "fanout"},
+        db, _DATA_DIR, None, None,
+    )
+    assert {d.get("title") for d in result2} == {"Adopt Redis"}
+
+    # A query matching nothing returns an empty list, not everything.
+    result3 = await nd_mod.handle_get_pinned_decisions(
+        {"project_id": pid, "query": "totally-unrelated-term-xyz"},
+        db, _DATA_DIR, None, None,
+    )
+    assert result3 == []
+
+    # No query (or blank) keeps the old "no filter" behavior.
+    result4 = await nd_mod.handle_get_pinned_decisions(
+        {"project_id": pid},
+        db, _DATA_DIR, None, None,
+    )
+    assert {d.get("title") for d in result4} == {"Use psycopg3", "Adopt Redis"}
+
+
+@pytest.mark.asyncio
+async def test_get_pinned_decisions_db_query_multiword_and_across_terms(db, project):
+    """db.get_pinned_decisions directly: every whitespace-separated query
+    term must match (AND), same convention as search_tasks/search_all."""
+    pid = project["id"]
+    await db_module.pin_decision(db, pid, "Windows event loop", "use SelectorEventLoop on win32", "TECHNICAL")
+    await db_module.pin_decision(db, pid, "Linux install path", "totally unrelated content", "TECHNICAL")
+
+    result = await db_module.get_pinned_decisions(db, pid, query="windows event loop")
+    assert {d["title"] for d in result} == {"Windows event loop"}
+
+
 # ---------------------------------------------------------------------------
 # Decisions: update_decision
 # ---------------------------------------------------------------------------

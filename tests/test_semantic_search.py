@@ -348,7 +348,11 @@ async def test_search_all_unchanged_when_semantic_unavailable(db, monkeypatch):
     result = await db_module.search_all(db, p["id"], "rate limiting")
     assert any(n["title"] == "Rate limiting" for n in result["notes"])
     # Return shape is the documented grouped dict.
-    assert set(result) == {"query", "tasks", "notes", "decisions", "sprint_items", "total"}
+    assert set(result) == {
+        "query", "tasks", "notes", "decisions", "sprint_items", "total",
+        # W1-A additive pagination fields (search_all cursor/limit).
+        "cursor", "limit", "has_more", "next_cursor",
+    }
     # No semantic-provenance flag on any keyword row.
     assert not any(n.get("semantic") for n in result["notes"])
 
