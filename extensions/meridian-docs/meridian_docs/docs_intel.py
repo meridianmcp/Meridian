@@ -6101,6 +6101,64 @@ def _verify_caption_write(
     return None
 
 
+def _verify_caption_edit_write(
+    docx_path: str,
+    *,
+    caption_para_id: str,
+    expected_label_text: str,
+    body_child_index: int,
+) -> dict[str, Any] | None:
+    """Post-write verification for :func:`edit_caption` (c315bfb6).
+
+    ``edit_caption`` (unlike ``insert_caption``) never mints a fresh
+    bookmark to locate its target by. A caption paragraph without a
+    native ``w14:paraId`` is identified by the content-derived ``sp<hash>``
+    id from :func:`_find_para_by_id`'s scheme 2 -- and an edit changes
+    exactly the label text that hash is derived from, so re-resolving by
+    the PRE-edit ``caption_para_id`` post-write would look for an id that
+    no longer exists even when the edit succeeded (the id drifts out from
+    under itself the moment the content it's derived from changes).
+    Instead, re-read the SAME ``body_child_index`` ``edit_caption``
+    resolved the paragraph at BEFORE mutating it -- captions are always
+    direct body-level paragraphs (synth ids never apply inside tables, see
+    ``_find_para_by_id``), and a plain in-place text-run edit never
+    inserts or removes body children, so that index is stable across the
+    write. Confirms the new label text actually landed. Returns ``None``
+    on success, or an ``{"error": ...}`` dict on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    body_children2 = list(body2) if body2 is not None else []
+    if body2 is None or not (0 <= body_child_index < len(body_children2)):
+        return {
+            "error": (
+                f"post-write verification failed: paragraph {caption_para_id!r} "
+                f"not found in {docx_path} after the write"
+            )
+        }
+    caption_para = body_children2[body_child_index]
+
+    caption_text = "".join(t.text or "" for t in caption_para.iter(_q(_W, "t")))
+    if expected_label_text not in caption_text:
+        return {
+            "error": (
+                "post-write verification failed: caption label text "
+                f"mismatch (expected to contain {expected_label_text!r}, "
+                f"got {caption_text!r})"
+            )
+        }
+    return None
+
+
 def insert_caption(
     docx_path: str,
     anchor_para_id: str,
@@ -6437,7 +6495,7 @@ def edit_caption(
     if result is None:
         return {"error": f"para_id {caption_para_id!r} not found in {docx_path}"}
 
-    _body, caption_elem, _cidx = result
+    _body, caption_elem, body_child_index = result
 
     # Validate: must be a Caption paragraph or contain a SEQ field.
     pPr = caption_elem.find(_q(_W, "pPr"))
@@ -6478,20 +6536,70 @@ def edit_caption(
     t_el = label_run.find(_q(_W, "t"))
     if t_el is None:
         t_el = ET.SubElement(label_run, _q(_W, "t"))
-    t_el.text = f". {new_label_text.strip()}"
+    stripped_label_text = new_label_text.strip()
+    t_el.text = f". {stripped_label_text}"
     t_el.set(_q(_XML_NS, "space"), "preserve")
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # c315bfb6 -- hold docx_path's promotion lock across stage+promote
+    # through post-write structural verification, mirroring every other
+    # content-mutating write in this module (insert_caption et al. --
+    # see _docx_promotion_lock's module comment). Closes the same-process
+    # window between promotion and verify/restore, and refuses to blindly
+    # restore-from-backup if a DIFFERENT writer's promotion has already
+    # landed since ours (see _safe_restore_after_verification_failure).
+    # Previously this called _save_docx_xml_stdlib directly with NO
+    # post-write verification at all, so neither a corrupted write nor a
+    # lost concurrent update was ever caught.
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_caption_edit_write(
+            docx_path,
+            caption_para_id=caption_para_id,
+            expected_label_text=stripped_label_text,
+            body_child_index=body_child_index,
+        )
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["caption_para_id"] = caption_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
     return {
         "status": "edited",
         "caption_para_id": caption_para_id,
-        "new_label_text": new_label_text.strip(),
+        "new_label_text": stripped_label_text,
         "docx_path": docx_path,
     }
 
