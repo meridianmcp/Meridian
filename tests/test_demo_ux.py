@@ -1139,9 +1139,9 @@ def test_session_timeline_tab_renders(demo_client):
             btn.click()
 
             # The loader paints its explanatory header — wait for it to appear.
-            page.wait_for_selector("text=Per executor session", timeout=8000)
+            page.wait_for_selector("text=Per session", timeout=8000)
             content = page.content()
-            assert "Per executor session" in content
+            assert "Per session" in content
             # The load-bearing distinction is surfaced in the UI copy.
             assert "still had an item claimed" in content
 
