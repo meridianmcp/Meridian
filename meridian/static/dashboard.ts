@@ -3473,7 +3473,7 @@ function buildTabBody(project: any) {
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-          <button class="vtab-btn" data-vtab="queue" title="Experiments">👷</button>
+          <button class="vtab-btn" data-vtab="queue" title="Active Work">👷</button>
 
           <button class="vtab-btn" data-vtab="experiments" title="Experiments — trial registry, run drill-down &amp; event timeline">🧪</button>
 
@@ -3657,7 +3657,7 @@ function buildTabBody(project: any) {
 
             <div class="live-queue" id="live-queue-${project.id}">
 
-              <div class="live-empty">No experiments yet. Add a task above.</div>
+              <div class="live-empty">Nothing queued yet. Add a task above.</div>
 
             </div>
 
@@ -6414,7 +6414,7 @@ function renderLiveQueue(projectId: any, tasks: any) {
 
   if (!live.length) {
 
-    root.innerHTML = '<div class="live-empty">No experiments yet. Add a task above.</div>';
+    root.innerHTML = '<div class="live-empty">Nothing queued yet. Add a task above.</div>';
 
     return;
 
