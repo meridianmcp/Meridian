@@ -7630,8 +7630,8 @@ def test_dashboard_sprint_progress_has_no_thumb_buttons(client):
 
 def test_dashboard_rewind_charts_label_sprint_items(client):
     js = dashboard_source()
-    assert "Sprint items / day" in js
-    assert "Sprint items</span>" in js
+    assert "Experiments / day" in js
+    assert "Experiments</span>" in js
     assert "Tasks completed" not in js
 
 

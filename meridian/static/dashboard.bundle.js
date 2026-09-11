@@ -460,9 +460,9 @@
 
   <ol style="color:#c4c6d4;font-size:1.02rem;line-height:1.85;padding-left:1.3em;margin:0 0 24px">
 
-    <li>This is a live demo coordinating a real multi-session build. It's read-only.</li>
+    <li>This is a live demo coordinating real AI research runs. It's read-only.</li>
 
-    <li>Click any session on the left to explore.</li>
+    <li>Click any run on the left to explore.</li>
 
     <li>Write actions are disabled \u2014 <a href="/auth/login" style="color:#6c8fff;text-decoration:underline">sign in to create your own project</a>.</li>
 
@@ -7770,11 +7770,11 @@ ${n2.tags || ""}`.toLowerCase();
     const swatch = (color) => `<span style="display:inline-block;width:12px;height:12px;background:${color};border-radius:2px;margin-right:4px;vertical-align:middle"></span>`;
     return `<div style="padding:8px 0">
 
-    <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">\u{1F4CA} Sprint items / day (last ${stats.period_days}d)</div>
+    <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">\u{1F4CA} Experiments / day (last ${stats.period_days}d)</div>
 
     <canvas id="chart-tasks-${escapeHtml(projectId)}" style="max-width:100%;max-height:160px"></canvas>
 
-    <div style="${legendStyle}"><span>${swatch("rgba(96,165,250,0.7)")}Sprint items</span></div>
+    <div style="${legendStyle}"><span>${swatch("rgba(96,165,250,0.7)")}Experiments</span></div>
 
     <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">\u26A1 Session task completion % by version</div>
 
@@ -7823,7 +7823,7 @@ ${n2.tags || ""}`.toLowerCase();
         data: {
           labels,
           datasets: [{
-            label: "sprint items",
+            label: "experiments",
             data: totals,
             backgroundColor: "rgba(96, 165, 250, 0.7)",
             borderRadius: 2
@@ -8223,7 +8223,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // ../../../node_modules/preact/dist/preact.module.js
+  // node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -8482,7 +8482,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // ../../../node_modules/preact/hooks/dist/hooks.module.js
+  // node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8623,7 +8623,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -9476,7 +9476,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // ../../../node_modules/zustand/esm/vanilla.mjs
+  // node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
@@ -10227,7 +10227,7 @@ ${n2.tags || ""}`.toLowerCase();
 
       <div style="margin-bottom:12px">
 
-        <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase;margin-bottom:4px">Executor Rules</div>
+        <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase;margin-bottom:4px">AI Session Rules</div>
 
         <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
           These rules are injected into every <code>start_session</code> response so AI coding
@@ -10348,64 +10348,64 @@ ${n2.tags || ""}`.toLowerCase();
     {
       vtab: null,
       target: () => document.querySelector('.session-list, .sidebar-sessions, [data-tour="sessions"], .sidebar'),
-      title: "AI coding sessions",
-      body: "Each row is one Claude Code run. Multiple sessions work in parallel on the same project \u2014 no collisions.",
+      title: "AI research runs",
+      body: "Each row is one AI research run. Multiple runs work in parallel on the same project \u2014 no collisions.",
       position: "right"
     },
     {
       vtab: "status",
-      title: "Status & sessions",
-      body: "The default panel: live session status and the task log. Every meaningful action a session takes shows up here in real time.",
+      title: "Status & runs",
+      body: "The default panel: live run status and the activity log. Every meaningful action a run takes shows up here in real time.",
       position: "bottom"
     },
     {
       vtab: "live",
       title: "Live view",
-      body: "A right-now feed of what every active session is doing this second \u2014 tool calls, file claims, and progress as they happen.",
+      body: "A right-now feed of what every active run is doing this second \u2014 tool calls, file claims, and progress as they happen.",
       position: "bottom"
     },
     {
       vtab: "goal",
       gtab: "north-star",
       title: "Shared goal state",
-      body: "The north star and version goal every session reads on startup \u2014 so parallel runs stay aligned on one plan.",
+      body: "The north star and version goal every run reads on startup \u2014 so parallel experiments stay aligned on one plan.",
       position: "bottom"
     },
     {
       vtab: "goal",
       gtab: "decisions",
       title: "Pinned decisions",
-      body: "An append-only constitution of architectural calls. New sessions inherit them automatically instead of relitigating settled choices.",
+      body: "An append-only record of key decisions. New runs inherit them automatically instead of relitigating settled choices.",
       position: "bottom"
     },
     {
       vtab: "queue",
-      title: "Work queue",
-      body: "Pending tasks claimed atomically \u2014 parallel sessions grab work without stepping on each other.",
+      title: "Experiment queue",
+      body: "Pending experiments claimed atomically \u2014 parallel runs pick up work without stepping on each other.",
       position: "bottom"
     },
     {
       vtab: "timeline",
       title: "Activity timeline",
-      body: "Every session laid out over time \u2014 when each ran, what changed, and how long each task took.",
+      body: "Every run laid out over time \u2014 when each ran, what changed, and how long each step took.",
       position: "bottom"
     },
     {
       vtab: "files",
       title: "Files",
-      body: "File claims and previews. Sessions lock the files they are editing so two runs never clobber the same file.",
+      body: "File claims and previews. Runs lock the files they are editing so two runs never clobber the same file.",
       position: "bottom"
     },
     {
       vtab: "hitl",
-      title: "Human-in-the-loop",
-      body: "When a session needs a human decision it parks the question here and waits \u2014 you answer, it resumes. No silent guessing.",
+      title: "Researcher review",
+      body: "When a run needs a decision from you it parks the question here and waits \u2014 you answer, it resumes. No silent guessing.",
       position: "bottom"
     },
     {
       vtab: "notes",
       title: "Project notes",
-      body: "A shared per-project wiki every session can read and append to \u2014 context that outlives any single run.",
+      body: "A shared per-project wiki every run can read and append to \u2014 context that outlives any single run.",
       position: "bottom"
     },
     {
@@ -10419,7 +10419,7 @@ ${n2.tags || ""}`.toLowerCase();
       target: () => null,
       // centered finish step
       title: "You're all set",
-      body: "Explore any project or session. When you're ready to coordinate your own AI sessions \u2014 sign in and create a project.",
+      body: "Explore any project or run. When you're ready to coordinate your own AI research runs \u2014 sign in and create a project.",
       position: "center"
     }
   ];
@@ -11493,13 +11493,13 @@ Current: ${current || "(none)"}`,
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-          <button class="vtab-btn" data-vtab="queue" title="Work Queue">\u{1F477}</button>
+          <button class="vtab-btn" data-vtab="queue" title="Experiments">\u{1F477}</button>
 
-          <button class="vtab-btn" data-vtab="hitl" title="HITL \u2014 Human-in-the-Loop queue" style="position:relative">\u2753<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+          <button class="vtab-btn" data-vtab="hitl" title="Researcher Review Queue" style="position:relative">\u2753<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
 
           <button class="vtab-btn" data-vtab="team" title="Team \u2014 per-human activity">\u{1F465}</button>
 
-          <button class="vtab-btn" data-vtab="sessions" title="Sessions \u2014 executor session timeline (done / failed / stopped-ambiguously)">\u{1F552}</button>
+          <button class="vtab-btn" data-vtab="sessions" title="Sessions \u2014 Run History (done / failed / stopped-ambiguously)">\u{1F552}</button>
 
         </div>
 
@@ -11675,7 +11675,7 @@ Current: ${current || "(none)"}`,
 
             <div class="live-queue" id="live-queue-${project.id}">
 
-              <div class="live-empty">Queue is empty. Add a task above.</div>
+              <div class="live-empty">No experiments yet. Add a task above.</div>
 
             </div>
 
@@ -11729,7 +11729,7 @@ Current: ${current || "(none)"}`,
 
             <span>GOAL \xB7 ${escapeHtml(project.name)}</span>
 
-            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Share your project context with AI sessions \u2014 north star, sprint, version goal</span>
+            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Share your project context with AI sessions \u2014 north star, experiment, version goal</span>
 
           </span>
 
@@ -11747,7 +11747,7 @@ Current: ${current || "(none)"}`,
 
           <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone \u2014 what ships this cycle (v1.2, v2.0, etc).">\u{1F3AF} Version Goal</button>
 
-          <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now \u2014 updated multiple times per day. Not a multi-week scrum sprint.">\u26A1 Session Focus</button>
+          <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now \u2014 updated multiple times per day. Not a multi-week scrum sprint.">\u26A1 Current Focus</button>
 
           <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">\u{1F4CB} Decisions <span class="decisions-gtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:9px;font-weight:700;padding:0 5px;border-radius:8px;line-height:14px;margin-left:4px;vertical-align:1px">0</span></button>
 
@@ -13474,7 +13474,7 @@ Current: ${current || "(none)"}`,
     if (!root) return;
     const live = tasks.filter((t3) => t3.status === "pending" || t3.status === "in_progress");
     if (!live.length) {
-      root.innerHTML = '<div class="live-empty">Queue is empty. Add a task above.</div>';
+      root.innerHTML = '<div class="live-empty">No experiments yet. Add a task above.</div>';
       return;
     }
     live.sort((a3, b2) => {
@@ -14341,9 +14341,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const m3 = OUTCOME[String(o3)] || { label: String(o3 || "").toUpperCase(), color: "var(--muted)" };
       return `<span style="font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid ${m3.color};color:${m3.color};letter-spacing:.04em" title="${escapeHtml(String(o3))}">${m3.label}</span>`;
     };
-    let html = `<div style="font-size:9px;color:var(--muted);margin-bottom:10px">Per executor session: start/end + the sprint items it worked, grouped by item group. <b>STOPPED?</b> = the session ended while it still had an item claimed (a silent stop) \u2014 distinct from <b>FAILED</b> (the item actively errored).</div>`;
+    let html = `<div style="font-size:9px;color:var(--muted);margin-bottom:10px">Per session: start/end + the sprint items it worked, grouped by item group. <b>STOPPED?</b> = the session ended while it still had an item claimed (a silent stop) \u2014 distinct from <b>FAILED</b> (the item actively errored).</div>`;
     if (!sessions.length) {
-      html += `<div class="empty" id="session-timeline-empty" style="color:var(--muted);padding:8px 0">No executor sessions yet.</div>`;
+      html += `<div class="empty" id="session-timeline-empty" style="color:var(--muted);padding:8px 0">No run history yet.</div>`;
     } else {
       for (const s3 of sessions) {
         const when = s3.ended_at ? `${escapeHtml(String(s3.started_at || ""))} \u2192 ${escapeHtml(String(s3.ended_at))}` : `${escapeHtml(String(s3.started_at || ""))} \u2192 (${escapeHtml(String(s3.status || "active"))})`;
