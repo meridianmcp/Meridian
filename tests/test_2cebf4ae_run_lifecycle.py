@@ -209,7 +209,91 @@ def test_lock_reclaims_a_stale_lock_from_a_dead_pid(tmp_path, monkeypatch):
 
     assert lock.acquire() is True
     assert lock.reclaimed_stale_pid == dead_pid
+    assert lock.reclaimed_stale_reason == "dead_pid"
     lock.release()
+
+
+# ---------------------------------------------------------------------------
+# 1b. c315bfb6 -- heartbeat/lease staleness, closing the PID-reuse hole.
+# A raw "PID exists" check cannot distinguish "the original owner is still
+# alive" from "an unrelated new process now happens to have this recycled
+# PID" -- the exact Windows failure mode this section covers.
+# ---------------------------------------------------------------------------
+
+
+def test_lock_reclaims_an_expired_lease_even_when_pid_looks_alive(tmp_path, monkeypatch):
+    """The actual PID-reuse bug this item fixes: _pid_is_running reporting
+    the recorded pid "alive" must NOT be enough to keep a lock whose
+    heartbeat has gone stale far past the lease TTL -- that is exactly what
+    a reused pid looks like from the outside. reclaimed_stale_reason must
+    say WHY (expired_lease, not dead_pid) since the pid check never fired."""
+    lock = rt.TestRunLock(tmp_path)
+    lock.lease_ttl_seconds = 60.0
+    monkeypatch.setattr(rt, "_pid_is_running", lambda pid: True)  # looks alive -- reused pid
+    ancient = rt.time.time() - 3600.0  # 1 hour ago, way past a 60s lease
+    lock.path.write_text(f"918273\t{ancient}\t/some/old/cwd\n", encoding="utf-8")
+
+    assert lock.acquire() is True
+    assert lock.reclaimed_stale_pid == 918273
+    assert lock.reclaimed_stale_reason == "expired_lease"
+    lock.release()
+
+
+def test_lock_does_not_reclaim_a_live_pid_with_a_fresh_heartbeat(tmp_path, monkeypatch):
+    """Sanity check the widened staleness check does not regress the
+    ordinary case: pid alive AND heartbeat fresh must still mean live."""
+    lock = rt.TestRunLock(tmp_path)
+    lock.lease_ttl_seconds = 60.0
+    monkeypatch.setattr(rt, "_pid_is_running", lambda pid: True)
+    lock.path.write_text(f"918273\t{rt.time.time()}\t/some/cwd\n", encoding="utf-8")
+
+    assert lock.acquire() is False
+    assert lock.reclaimed_stale_pid is None
+    assert lock.reclaimed_stale_reason is None
+
+
+def test_lock_heartbeat_refreshes_the_lease_timestamp(tmp_path):
+    lock = rt.TestRunLock(tmp_path)
+    assert lock.acquire() is True
+    first_ts = lock._read_heartbeat_ts()
+
+    lock.heartbeat()
+    second_ts = lock._read_heartbeat_ts()
+
+    assert second_ts is not None and first_ts is not None
+    assert second_ts >= first_ts
+    # pid/cwd survive the refresh -- only the lease timestamp field changes.
+    assert lock.path.read_text(encoding="utf-8").startswith(f"{lock.owner_pid}\t")
+    lock.release()
+
+
+def test_lock_heartbeat_is_a_noop_when_not_acquired(tmp_path):
+    """heartbeat() must never create/clobber a lock file this instance does
+    not actually own (e.g. a losing acquire() attempt calling it by mistake)."""
+    lock = rt.TestRunLock(tmp_path)
+    assert not lock.path.exists()
+    lock.heartbeat()
+    assert not lock.path.exists()
+
+
+def test_lock_heartbeat_kept_fresh_prevents_lease_expiry_reclaim(tmp_path, monkeypatch):
+    """End-to-end: an owner that keeps calling heartbeat() -- as
+    _run_pytest_observed's poll loop does -- must never have its OWN lock
+    reclaimed out from under it by a competing acquire() call, even with a
+    short lease TTL and even though the owner's pid is (deliberately) mocked
+    to look alive throughout, isolating this to the lease-refresh mechanism
+    itself rather than the pid-liveness fast path."""
+    owner = rt.TestRunLock(tmp_path)
+    owner.lease_ttl_seconds = 1.0
+    monkeypatch.setattr(rt, "_pid_is_running", lambda pid: True)
+    assert owner.acquire() is True
+
+    owner.heartbeat()
+    competitor = rt.TestRunLock(tmp_path)
+    competitor.lease_ttl_seconds = 1.0
+    assert competitor.acquire() is False  # still live -- just heartbeated
+
+    owner.release()
 
 
 def test_lock_owner_pid_is_confirmed_alive_reflects_real_liveness(tmp_path, monkeypatch):
@@ -305,7 +389,13 @@ def test_main_supersede_refuses_and_preserves_receipt_when_kill_not_confirmed(tm
     closed (exit code 2) and persist a truthful (not-confirmed) cleanup
     receipt on the existing record instead."""
     lock = rt.TestRunLock(tmp_path)
-    lock.path.write_text("999\t1234.0\t/some/old/cwd\n", encoding="utf-8")
+    # c315bfb6 -- a FRESH heartbeat: this fixture simulates a genuinely
+    # still-active previous run (its pid is separately mocked alive below),
+    # and staleness is now decided by lease age, not just PID liveness -- an
+    # ancient timestamp here would make acquire() reclaim it as an expired
+    # lease regardless of the pid mock, defeating the whole point of this
+    # test (exercising the --supersede refusal path against a LIVE lock).
+    lock.path.write_text(f"999\t{rt.time.time()}\t/some/old/cwd\n", encoding="utf-8")
     existing = rt.TestRunRecord(
         run_id="prev-run", state=rt.STATE_RUNNING, started_at="t0", process_tree=[501],
     )
@@ -548,6 +638,59 @@ def test_stalled_escalates_to_timed_out_stalled(tmp_path):
     assert tracker.record.timeout_kind == "stalled"
     assert tracker.record.cleanup["attempted"] is True
     assert tracker.record.cleanup["method"] == "process_tree_kill"
+
+
+def test_run_pytest_observed_heartbeats_the_lock_on_the_interval(tmp_path):
+    """c315bfb6 -- when a lock is supplied, its lease must be refreshed on
+    the same cadence as the existing Meridian-session heartbeat, driven by
+    THIS loop (not by the pytest child) -- exactly what keeps a genuinely
+    still-running (or still-hung-but-alive) owner's lease from expiring
+    during a long stall/hang."""
+    clock = _FakeClock()
+    tracker = _make_tracker(tmp_path, clock)
+    # calls_before_exit=70 forces > _HEARTBEAT_INTERVAL_SECONDS (60) worth
+    # of 1-second poll ticks before the process "exits".
+    proc = _FakeExitingProc(pid=555, code=0, calls_before_exit=70)
+
+    heartbeat_calls = {"n": 0}
+    lock = rt.TestRunLock(tmp_path)
+    lock.acquired = True  # simulate genuine ownership for this unit test
+    lock.heartbeat = lambda: heartbeat_calls.__setitem__("n", heartbeat_calls["n"] + 1)
+
+    def _sleep(secs):
+        clock.advance(secs)
+
+    code = rt._run_pytest_observed(
+        ["tests/"], tracker,
+        wall_timeout=100_000, stall_timeout=100_000, post_results_grace=100_000,
+        max_workers=4, poll_interval=1.0,
+        popen_factory=lambda cmd, **kw: proc, sleep_fn=_sleep, clock=clock,
+        lock=lock,
+    )
+
+    assert code == 0
+    assert heartbeat_calls["n"] >= 1
+
+
+def test_run_pytest_observed_never_touches_lock_when_none_provided(tmp_path):
+    """lock=None (the default -- also what main() passes when it never
+    actually owned the lock, e.g. MERIDIAN_ALLOW_CONCURRENT_TESTS=1) must
+    not attempt to call .heartbeat() on anything, and must not raise."""
+    clock = _FakeClock()
+    tracker = _make_tracker(tmp_path, clock)
+    proc = _FakeExitingProc(pid=556, code=0, calls_before_exit=70)
+
+    def _sleep(secs):
+        clock.advance(secs)
+
+    code = rt._run_pytest_observed(
+        ["tests/"], tracker,
+        wall_timeout=100_000, stall_timeout=100_000, post_results_grace=100_000,
+        max_workers=4, poll_interval=1.0,
+        popen_factory=lambda cmd, **kw: proc, sleep_fn=_sleep, clock=clock,
+    )
+
+    assert code == 0
 
 
 def test_wall_clock_timeout_fires_even_with_fresh_progress(tmp_path):

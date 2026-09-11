@@ -107,7 +107,11 @@ def _run_main_with_fake_pytest(monkeypatch, argv, *, exit_code, collected=1):
 
 def test_main_rejects_duplicate_run_without_supersede_and_never_touches_pytest(tmp_path, monkeypatch, capsys):
     lock = rt.TestRunLock(tmp_path)
-    lock.path.write_text("424242\t1234.0\t/some/other/cwd\n", encoding="utf-8")
+    # c315bfb6 -- fresh heartbeat: staleness is lease-age-based now, not
+    # PID-liveness-based alone, so an ancient timestamp would make this
+    # "other run" look like an expired/abandoned lease and get silently
+    # reclaimed instead of rejected as a live duplicate, defeating the test.
+    lock.path.write_text(f"424242\t{rt.time.time()}\t/some/other/cwd\n", encoding="utf-8")
     existing = rt.TestRunRecord(run_id="other-run", state=rt.STATE_RUNNING, started_at="t0")
     rt._write_record_atomic(lock.state_path, existing)
 
@@ -149,7 +153,9 @@ def test_main_allow_concurrent_tests_env_var_bypasses_duplicate_lock_untouched(t
     must actually bypass the lock entirely -- including never touching the
     other run's lock file -- not merely avoid returning exit code 2."""
     lock = rt.TestRunLock(tmp_path)
-    lock.path.write_text("424242\t1234.0\t/some/other/cwd\n", encoding="utf-8")
+    # c315bfb6 -- see the sibling test above for why this must be a fresh
+    # heartbeat, not an arbitrary old timestamp.
+    lock.path.write_text(f"424242\t{rt.time.time()}\t/some/other/cwd\n", encoding="utf-8")
 
     monkeypatch.setattr(rt, "TestRunLock", lambda repo_root: lock)
     monkeypatch.setattr(rt, "_pid_is_running", lambda pid: True)  # would normally reject
@@ -161,6 +167,54 @@ def test_main_allow_concurrent_tests_env_var_bypasses_duplicate_lock_untouched(t
     # The pre-existing lock file must be untouched -- this run never
     # acquired (or released) it.
     assert lock.path.read_text(encoding="utf-8").startswith("424242")
+
+
+def test_main_passes_its_own_lock_to_run_pytest_observed_when_owned(tmp_path, monkeypatch):
+    """c315bfb6 -- main() must thread the lock it actually acquired into
+    _run_pytest_observed (so the lease gets heartbeated for the run's real
+    duration), and must NOT do so when it never owned the lock at all."""
+    monkeypatch.chdir(tmp_path)
+    seen: dict = {}
+    real_run_pytest_observed = rt._run_pytest_observed
+
+    def _spy(*args, **kwargs):
+        lock_arg = kwargs.get("lock")
+        seen["lock"] = lock_arg
+        # Captured HERE, not after main() returns -- main()'s own finally
+        # block releases the lock (acquired -> False) before this test can
+        # inspect it otherwise.
+        seen["was_acquired_at_call_time"] = lock_arg is not None and lock_arg.acquired
+        return real_run_pytest_observed(*args, **kwargs)
+
+    monkeypatch.setattr(rt, "_run_pytest_observed", _spy)
+
+    exit_code = _run_main_with_fake_pytest(monkeypatch, ["tests/"], exit_code=0)
+
+    assert exit_code == 0
+    assert isinstance(seen.get("lock"), rt.TestRunLock)
+    assert seen["was_acquired_at_call_time"] is True
+
+
+def test_main_passes_no_lock_when_concurrent_tests_allowed(tmp_path, monkeypatch):
+    """The MERIDIAN_ALLOW_CONCURRENT_TESTS=1 escape hatch never acquires a
+    lock at all -- _run_pytest_observed must receive lock=None, never an
+    unowned TestRunLock instance that heartbeat() would silently no-op on
+    anyway, but that would be misleading to a future reader/caller."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MERIDIAN_ALLOW_CONCURRENT_TESTS", "1")
+    seen: dict = {}
+    real_run_pytest_observed = rt._run_pytest_observed
+
+    def _spy(*args, **kwargs):
+        seen["lock"] = kwargs.get("lock")
+        return real_run_pytest_observed(*args, **kwargs)
+
+    monkeypatch.setattr(rt, "_run_pytest_observed", _spy)
+
+    exit_code = _run_main_with_fake_pytest(monkeypatch, ["tests/"], exit_code=0)
+
+    assert exit_code == 0
+    assert seen.get("lock") is None
 
 
 # ---------------------------------------------------------------------------
