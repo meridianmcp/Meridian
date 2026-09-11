@@ -7014,6 +7014,83 @@ async def get_queued_session_endpoint(project_id: str, request: Request) -> dict
 
 
 # ---------------------------------------------------------------------------
+# W1-P (70061103) — read-only Experiment Registry dashboard endpoints.
+#
+# Thin, read-only wrappers around meridian.db.experiments (W1-M, 3f6b8715) —
+# no new persistence logic here, only project/experiment existence checks +
+# 404 shaping to match the other GET project routes in this file (see
+# get_project_context_block / get_orphan_reaper_status above). Powers the
+# dashboard's "experiments" vtab: list -> drill into runs -> drill into the
+# event timeline (dead_end/pivot/breakthrough/note/milestone).
+# ---------------------------------------------------------------------------
+
+
+@app.get("/projects/{project_id}/experiments")
+async def list_project_experiments(
+    project_id: str, request: Request, status: str | None = None
+) -> dict[str, Any]:
+    """List a project's experiments, newest first. Optional ``?status=``
+    filter (active|archived)."""
+    from meridian.db import experiments as exp_db  # noqa: PLC0415 — avoid import cycle at module load
+
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        experiments = await exp_db.list_experiments(db, project_id, status=status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"experiments": experiments, "count": len(experiments)}
+
+
+@app.get("/projects/{project_id}/experiments/{experiment_id}/runs")
+async def list_project_experiment_runs(
+    project_id: str, experiment_id: str, request: Request, status: str | None = None
+) -> dict[str, Any]:
+    """List one experiment's runs, newest-started first. Optional
+    ``?status=`` filter (active|completed|abandoned|expired)."""
+    from meridian.db import experiments as exp_db  # noqa: PLC0415 — avoid import cycle at module load
+
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    experiment = await exp_db.get_experiment(db, project_id, experiment_id=experiment_id)
+    if experiment is None:
+        raise HTTPException(status_code=404, detail="experiment not found in this project")
+    try:
+        runs = await exp_db.list_experiment_runs(
+            db, project_id, experiment_id=experiment_id, status=status,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"runs": runs, "count": len(runs)}
+
+
+@app.get("/projects/{project_id}/experiments/{experiment_id}/events")
+async def list_project_experiment_events(
+    project_id: str, experiment_id: str, request: Request, run_id: str | None = None
+) -> dict[str, Any]:
+    """List one experiment's events (dead_end/pivot/breakthrough/note/
+    milestone), oldest first. Optional ``?run_id=`` scopes to one run —
+    the dashboard's run-drilldown event timeline."""
+    from meridian.db import experiments as exp_db  # noqa: PLC0415 — avoid import cycle at module load
+
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        events = await exp_db.get_experiment_events(
+            db, project_id, experiment_id=experiment_id, run_id=run_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"events": events, "count": len(events)}
+
+
+# ---------------------------------------------------------------------------
 # v2.0 — Bearer token management
 # ---------------------------------------------------------------------------
 

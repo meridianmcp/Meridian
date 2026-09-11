@@ -1018,6 +1018,9 @@ No auth required.
 | `POST` | `/projects/{project_id}/documents/upload` | f1c7e7d1 — tunnel-free document upload (plain .txt/.md only, v1) |
 | `GET` | `/projects/{project_id}/effective-profile` | Resolve and return the merged profile for a project across every |
 | `POST` | `/projects/{project_id}/events` | Normalize a framework event into Meridian's task_log |
+| `GET` | `/projects/{project_id}/experiments` | List a project's experiments, newest first. Optional ``?status=`` |
+| `GET` | `/projects/{project_id}/experiments/{experiment_id}/events` | List one experiment's events (dead_end/pivot/breakthrough/note/ |
+| `GET` | `/projects/{project_id}/experiments/{experiment_id}/runs` | List one experiment's runs, newest-started first. Optional |
 | `GET` | `/projects/{project_id}/export/pdf` | Generate a tamper-evident IP attribution PDF for the project |
 | `GET` | `/projects/{project_id}/files` | Return the list of editable markdown files for a project |
 | `GET` | `/projects/{project_id}/files/{filename}` | Read one editable markdown file and return its content |
