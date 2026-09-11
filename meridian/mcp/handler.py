@@ -3097,7 +3097,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log, search_ai_log."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log, search_ai_log, get_ai_log_export_status, set_ai_log_export_config, export_ai_log_otel."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -3505,6 +3505,16 @@ async def _handle_task_tools(
             db, args["project_id"],
             item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
         )
+        # ff1843dc — machine-readable proposal-to-PROPOSAL lineage (versions/
+        # forks/duplicates), emitted on every generate_handoff mode alongside
+        # the proposal-evidence field above — same selected-item-scope
+        # narrowing, same fully-guarded best-effort contract. Distinct field:
+        # proposal_evidence is proposal->sprint_item/note/finding/decision;
+        # this is proposal->PROPOSAL.
+        _proposal_lineage = await handoff_module_local.build_proposal_lineage_for_handoff(
+            db, args["project_id"],
+            item_ids=(_selected_scope_outcome or {}).get("closure_item_ids"),
+        )
         # d09c29fe — machine-readable DOCX-integrity gate, emitted on every
         # generate_handoff mode alongside the two fields above. Tied to the
         # proposal evidence just built (6cdc5df3) so a proposal-linked .docx
@@ -3615,6 +3625,10 @@ async def _handle_task_tools(
             # 6cdc5df3 — one entry per proposal id with linked evidence in this
             # project (see meridian.db.proposal_links.get_proposal_evidence).
             "proposal_evidence": _proposal_evidence,
+            # ff1843dc — one entry per proposal id (SAME set as proposal_evidence
+            # above) with its ancestor chain, direct successors, and descendant
+            # count (see meridian.db.proposal_lineage).
+            "proposal_lineage": _proposal_lineage,
             # d09c29fe — DOCX audit status/findings/provenance for items/
             # artifacts this handoff covers, plus the executable/executable_reasons
             # readiness signal (see meridian.docx_integrity_gate).
@@ -4012,6 +4026,35 @@ async def _handle_task_tools(
                 _dt_cls.now(_tz.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
             ),
         }
+    if name == "get_ai_log_export_status":
+        # R2-G — read-only diagnostics for the optional AI-log -> OTel/
+        # Langfuse export adapter. See meridian.ai_log_otel_export's module
+        # docstring for the binding "export adapter, never a second source
+        # of truth" decision this whole dispatch group implements.
+        from .. import ai_log_otel_export as otel_export_module  # noqa: PLC0415
+        return await otel_export_module.get_export_status(db, args["project_id"])
+    if name == "set_ai_log_export_config":
+        # R2-G — mutating, but never touches ai_log_events itself; validated
+        # against this codebase's shared secret/path checks at the DB layer
+        # (see meridian.db.ai_log_export_config.set_ai_log_export_config).
+        return await db_module.set_ai_log_export_config(
+            db, args["project_id"],
+            enabled=args.get("enabled"),
+            otlp_endpoint=args.get("otlp_endpoint"),
+            protocol=args.get("protocol"),
+            service_name=args.get("service_name"),
+            langfuse_compat=args.get("langfuse_compat"),
+        )
+    if name == "export_ai_log_otel":
+        # R2-G — one bounded, on-demand export pass. Never raises (see
+        # meridian.ai_log_otel_export.run_otel_export's own contract) and
+        # never blocks longer than its own bounded overall deadline.
+        from .. import ai_log_otel_export as otel_export_module  # noqa: PLC0415
+        _otel_batch_raw = args.get("batch_size")
+        return await otel_export_module.run_otel_export(
+            db, args["project_id"],
+            batch_size=int(_otel_batch_raw) if _otel_batch_raw is not None else None,
+        )
     return _MISS
 
 
@@ -4296,9 +4339,13 @@ async def _handle_notes_decisions(
         handle_add_proposal,
         handle_preview_proposal_promotion,
         handle_commit_proposal_promotion,
+        handle_create_proposal_successor,
+        handle_link_proposal_lineage,
+        handle_get_proposal_lineage,
+        handle_compare_proposal_versions,
     )
 
-    # All 47 tools map directly to handler functions with the standard five
+    # All 62 tools map directly to handler functions with the standard five
     # parameters — no extra context needed beyond (args, db, data_dir, tenant,
     # _mcp_tenant_id).
     _standard_dispatch: dict[str, Any] = {
@@ -4360,6 +4407,10 @@ async def _handle_notes_decisions(
         "add_proposal": handle_add_proposal,
         "preview_proposal_promotion": handle_preview_proposal_promotion,
         "commit_proposal_promotion": handle_commit_proposal_promotion,
+        "create_proposal_successor": handle_create_proposal_successor,
+        "link_proposal_lineage": handle_link_proposal_lineage,
+        "get_proposal_lineage": handle_get_proposal_lineage,
+        "compare_proposal_versions": handle_compare_proposal_versions,
     }
 
     if name in _standard_dispatch:
@@ -4585,7 +4636,8 @@ async def _handle_session_tools(
     paper_search, social_search, github_search, get_session_brief,
     save_watchlist_query, list_watchlist_queries, run_watchlist_query,
     delete_watchlist_query, start_research_run, complete_research_run,
-    get_research_run, list_research_runs, promote_research_run.
+    get_research_run, list_research_runs, promote_research_run,
+    register_session_recovery, list_resumable_sessions, get_session_recovery.
 
     81abd31f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4639,6 +4691,14 @@ async def _handle_session_tools(
         handle_run_watchlist_query,
         handle_delete_watchlist_query,
     )
+    # cdd0ef6c — cross-client session recovery registry, a new sibling
+    # module beside session_tools.py's external-job handlers (same shape:
+    # thin wrapper over meridian/db/session_recovery.py).
+    from .handlers.session_recovery_tools import (  # noqa: PLC0415
+        handle_register_session_recovery,
+        handle_list_resumable_sessions,
+        handle_get_session_recovery,
+    )
 
     # Tools that need no extra context beyond the standard five parameters.
     _standard_dispatch: dict[str, Any] = {
@@ -4672,11 +4732,18 @@ async def _handle_session_tools(
         "list_watchlist_queries": handle_list_watchlist_queries,
         "run_watchlist_query": handle_run_watchlist_query,
         "delete_watchlist_query": handle_delete_watchlist_query,
+        # cdd0ef6c — cross-client session recovery registry.
+        "list_resumable_sessions": handle_list_resumable_sessions,
+        "get_session_recovery": handle_get_session_recovery,
     }
 
     if name in _standard_dispatch:
         return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
 
+    if name == "register_session_recovery":
+        return await handle_register_session_recovery(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
     if name == "register_external_job":
         return await handle_register_external_job(
             args, db, data_dir, tenant, _mcp_tenant_id

@@ -360,6 +360,21 @@ class HandoffResult(BaseModel):
     # the lookup itself failed (best-effort); empty list means no linked
     # proposals yet.
     proposal_evidence: list[dict[str, Any]] | None = None
+    # ff1843dc — machine-readable proposal-to-PROPOSAL lineage (see
+    # meridian.db.proposal_lineage): one entry per proposal id — the SAME
+    # set proposal_evidence above describes for this handoff — with its
+    # ancestor chain, direct successors, and (bounded, non-silently-
+    # truncated) descendant count. Sibling field to proposal_evidence, not a
+    # replacement: that one is proposal->evidence (sprint_item/note/
+    # finding/decision), this is proposal->PROPOSAL (versions/forks/
+    # duplicates). list, not a typed submodel, for the same forward-compat
+    # reason as capability_contract above. None only if the lookup itself
+    # failed (best-effort); empty list means no relevant proposal has a
+    # lineage relation yet. Without this field, generate_handoff_endpoint's
+    # own `response_model=HandoffResult` silently stripped the key the
+    # endpoint function already computed and returned — confirmed via the
+    # `POST /projects/{id}/handoff` HTTP surface never actually carrying it.
+    proposal_lineage: list[dict[str, Any]] | None = None
     # d09c29fe -- machine-readable DOCX-integrity gate (see
     # meridian.docx_integrity_gate): per-artifact render/equation-audit/
     # provenance findings plus the executable/executable_reasons readiness

@@ -40,6 +40,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_external_job": 'get_external_job(project_id="abc-123", job_key="gps-slam-build")',
     "list_external_jobs": 'list_external_jobs(project_id="abc-123")',
     "complete_external_job": 'complete_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="succeeded", detail="verified output")',
+    "register_session_recovery": 'register_session_recovery(project_id="abc-123", session_id="session-uuid", transport="remote_control", client_type="claude-code", local_identity={"local_session_id": "conv-1", "environment_id": "env-9"})',
+    "list_resumable_sessions": 'list_resumable_sessions(project_id="abc-123")',
+    "get_session_recovery": 'get_session_recovery(project_id="abc-123", session_id="session-uuid")',
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
@@ -85,6 +88,10 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "promote_proposal": 'promote_proposal(proposal_id="prop-uuid", project_id="proj-uuid", sprint_item_title="Expose auth as plugin")',
     "preview_proposal_promotion": 'preview_proposal_promotion(proposal_id="prop-uuid", project_id="proj-uuid", depth="sprint_items")',
     "commit_proposal_promotion": 'commit_proposal_promotion(proposal_id="prop-uuid", project_id="proj-uuid", depth="sprint_items", preview_hash="sha256:...")',
+    "create_proposal_successor": 'create_proposal_successor(proposal_id="prop-uuid", title="Expose auth as plugin (v2)", body="Revised after investigation", relation_type="supersedes")',
+    "link_proposal_lineage": 'link_proposal_lineage(from_proposal_id="prop-new-uuid", to_proposal_id="prop-old-uuid", relation_type="duplicates")',
+    "get_proposal_lineage": 'get_proposal_lineage(proposal_id="prop-uuid")',
+    "compare_proposal_versions": 'compare_proposal_versions(from_proposal_id="prop-new-uuid", to_proposal_id="prop-old-uuid")',
     "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
     "get_workspace_decisions": 'get_workspace_decisions()',
     "get_workspace_settings": 'get_workspace_settings()',
@@ -717,6 +724,74 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "cursor": {"type": "integer", "description": "Offset into the ordered result set. Pass a prior response's next_cursor. Default 0."},
          "limit": {"type": "integer", "description": "Default 50, capped at 500."}},
          "required": []}},
+    {"name": "get_ai_log_export_status", "description":
+        "R2-G — Read-only: status/diagnostics for the OPTIONAL AI-log -> OTel/"
+        "self-hosted-Langfuse export adapter (meridian.ai_log_otel_export). "
+        "Attempts NO network call — only reports whether the feature is "
+        "globally enabled (MERIDIAN_AI_LOG_OTEL_ENABLED), the effective "
+        "per-project enabled state, whether the optional opentelemetry client "
+        "library is installed, the resolved endpoint/protocol/service_name, "
+        "and the stored config/watermark row (last export status, last error, "
+        "retry_count) if one exists. Meridian's own ai_log_events table stays "
+        "authoritative regardless of this feature's state — see "
+        "meridian.ai_log_otel_export's module docstring for the binding "
+        "architectural decision (this is an export adapter, never a second "
+        "source of truth). Returns {project_id, global_feature_enabled, "
+        "effective_enabled, dependency_available, endpoint_configured, "
+        "protocol, langfuse_compat, service_name, config}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
+    {"name": "set_ai_log_export_config", "description":
+        "R2-G — Set per-project override config for the OPTIONAL AI-log -> "
+        "OTel/self-hosted-Langfuse export adapter. Every field is optional and "
+        "left-as-is when omitted (partial upsert). 'enabled=false' force-"
+        "disables export for THIS project even when the global "
+        "MERIDIAN_AI_LOG_OTEL_ENABLED flag is on; 'enabled=true' or omitted "
+        "defers to the global flag — a project can never turn export on when "
+        "the operator has globally disabled it. 'otlp_endpoint' must be an "
+        "http:// or https:// URL and is validated against this codebase's "
+        "shared secret/path checks (meridian.secret_redaction.check_for_secrets "
+        "+ meridian.capability_manifest's embedded-credential/absolute-path "
+        "patterns) — rejected with a ValueError if it looks like it carries a "
+        "bearer token, embedded basic-auth credentials, or a machine-local "
+        "path. An OTLP auth header/API key is NEVER accepted here — set the "
+        "MERIDIAN_AI_LOG_OTEL_HEADERS environment variable on the server "
+        "instead; there is no field on this tool or column in storage for it. "
+        "'langfuse_compat=true' is a purely informational hint (adds a "
+        "resource attribute, shown in get_ai_log_export_status) for pointing "
+        "otlp_endpoint at a self-hosted Langfuse OTLP-compatible ingestion "
+        "endpoint — it does not change the wire protocol.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "enabled": {"type": "boolean", "description": "Per-project override. false force-disables even if the global flag is on; true/omitted defers to the global flag."},
+         "otlp_endpoint": {"type": "string", "description": "http:// or https:// OTLP logs endpoint override for this project. Validated — never a secret-shaped or embedded-credential URL."},
+         "protocol": {"type": "string", "enum": ["otlp_http", "langfuse_otlp"], "description": "Documentation-only label; both send the same OTLP/HTTP wire format."},
+         "service_name": {"type": "string", "description": "OTel resource service.name override for this project's exported events."},
+         "langfuse_compat": {"type": "boolean", "description": "Informational hint only — set true when otlp_endpoint points at a self-hosted Langfuse OTLP-compatible ingestion endpoint."}},
+         "required": []}},
+    {"name": "export_ai_log_otel", "description":
+        "R2-G — Run ONE bounded export pass of new ai_log_events to the "
+        "configured OTel/Langfuse-compatible OTLP endpoint for a project, "
+        "resuming from the durable watermark left by the previous pass. "
+        "Always safe to call: returns {\"status\": \"disabled\"} immediately "
+        "if MERIDIAN_AI_LOG_OTEL_ENABLED (or this project's own override) is "
+        "off, {\"status\": \"unavailable\"} if the optional opentelemetry "
+        "client library isn't installed or no endpoint is configured, "
+        "{\"status\": \"idle\"} if there is nothing new to export, "
+        "{\"status\": \"sent\"} on full success, {\"status\": \"degraded\"} if "
+        "part of the batch sent before a chunk exhausted its bounded retries "
+        "(the watermark still advanced past every chunk that DID send — no "
+        "silent gaps), or {\"status\": \"sync_failed\"}/{\"status\": \"error\"} "
+        "if nothing sent this pass. NEVER raises, never blocks the caller "
+        "longer than a bounded overall deadline, and never mutates or deletes "
+        "any ai_log_events row — Meridian's own DB stays authoritative "
+        "regardless of outcome. Returns {project_id, status, sent_count, "
+        "batch_size, reason}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "batch_size": {"type": "integer", "description": "Max events to fetch this pass. Default from MERIDIAN_AI_LOG_OTEL_BATCH_SIZE (200), hard-capped at 1000."}},
+         "required": []}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions) "
@@ -929,6 +1004,50 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
          "detail": {"type": "string"}, "metadata": {"type": "object"}},
          "required": ["session_id"]}},
+    {"name": "register_session_recovery", "description":
+        "cdd0ef6c — Create or reaffirm (upsert + heartbeat) this session's entry in "
+        "the cross-client session recovery registry, so another client/session can "
+        "tell whether it is resumable instead of guessing from a bare RC bridge id "
+        "or transcript id. transport + optional local_identity (local_session_id, "
+        "bridge_id, environment_id, argv — HOST-LOCAL ONLY) are used to compute a "
+        "resume recipe and verified_resumable flag; local_identity itself is never "
+        "written to the hosted registry, only to a host-local snapshot file. "
+        "IMPORTANT: a remote_control transport with a bridge id but no environment_id "
+        "is NOT assumed resumable (the RESCUE-D incident this registry exists to "
+        "prevent) — verified_resumable will come back false with a reason.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string", "description": "The Meridian session id (sessions.id) this recovery record describes."},
+         "transport": {"type": "string", "enum": ["stdio", "remote_control", "cloud_environment", "tunnel", "unknown"]},
+         "client_type": {"type": "string", "description": "e.g. claude-code, claude-desktop, cursor, other."},
+         "lifecycle_status": {"type": "string", "enum": ["active", "idle", "ended", "crashed", "unknown"]},
+         "local_identity": {"type": "object", "description": "HOST-LOCAL ONLY, never persisted hosted-side: local_session_id, bridge_id, environment_id, argv, local_transcript_path. Used only to compute a resume recipe and to refresh the host-local snapshot."},
+         "local_ref_id": {"type": "string", "description": "Optional stable opaque token correlating this hosted row to the host-local snapshot entry; generated if omitted."},
+         "last_checkpoint_ref": {"type": "string", "description": "An id/label for the last checkpoint — never content."},
+         "last_handoff_ref": {"type": "string", "description": "An id/label for the last handoff — never content."},
+         "sprint_version": {"type": "string"},
+         "metadata": {"type": "object", "description": "Small hosted-safe free-form metadata; rejected if it contains a local-only identity key, a secret-shaped value, or an absolute local path."}},
+         "required": ["session_id", "transport"]}},
+    {"name": "list_resumable_sessions", "description":
+        "cdd0ef6c — Read-only: list this project's session recovery registry, newest "
+        "heartbeat first, each with a freshly computed liveness classification "
+        "(resumable/stale/dead/unknown). Dead rows are omitted by default.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "sprint_version": {"type": "string"},
+         "include_dead": {"type": "boolean"},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": []}},
+    {"name": "get_session_recovery", "description":
+        "cdd0ef6c — Read-only: fetch one session's recovery record (by session_id or "
+        "recovery_id) plus, by default, a continuation payload that RE-DERIVES the "
+        "live sprint board and this session's own still-active file claims — never a "
+        "stored /goal body. resume_recipe is resolved from THIS machine's own "
+        "host-local snapshot only and is null when this machine never registered "
+        "that session's local identity.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"}, "recovery_id": {"type": "string"},
+         "include_continuation": {"type": "boolean"}}, "required": []}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "
         "the human a question — never just ask in chat, which is invisible to the "
@@ -2300,6 +2419,79 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "actor": {"type": "string", "description": "Optional actor identity recorded on proposal events."},
          "override_reason": {"type": "string", "description": "Non-empty reason to acknowledge and proceed past a triggered HITL deviation instead of stopping (audited)."}},
          "required": ["proposal_id", "depth", "preview_hash"]}},
+    # -------------------------------------------------------------------
+    # ff1843dc — proposal lineage: successor creation, typed relations,
+    # ancestor/descendant queries, adjacent-version comparison. Layered on
+    # top of meridian.db.proposal_lineage (5a744f81's typed-relation table),
+    # which had no MCP-facing surface before this. Distinct from proposal
+    # PROMOTION (preview/commit_proposal_promotion above, a proposal ->
+    # sprint item relation) and from proposal EVIDENCE links
+    # (proposal_evidence_links, exposed only via the read-only
+    # proposal_evidence field on generate_handoff) — this is proposal ->
+    # PROPOSAL lineage: versions, forks, duplicates.
+    # -------------------------------------------------------------------
+    {"name": "create_proposal_successor", "description":
+        "Create a NEW, distinct proposal that is a version/successor of an existing one, linked to "
+        "it by an explicit typed relation (supersedes/refines/forks/continues/duplicates/responds_to) "
+        "— never by mutating the predecessor or overloading family_id/proposal_events (pinned decision "
+        "6aef812e). Inherits the predecessor's project scope (project-scoped stays project-scoped, "
+        "workspace-global stays workspace-global) and family_id automatically. Idempotent: pass the "
+        "same idempotency_key on a retry to get back the SAME successor rather than a second one — "
+        "the underlying proposal creation AND the lineage edge are both independently idempotent. "
+        "Returns {proposal, lineage, predecessor_id}.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string", "description": "The PREDECESSOR proposal's id — the new proposal's relation_type points at this one."},
+         "title": {"type": "string", "description": "Title for the new successor proposal."},
+         "body": {"type": "string", "description": "Full description for the new successor proposal."},
+         "relation_type": {"type": "string", "enum": ["supersedes", "refines", "forks", "continues", "duplicates", "responds_to"],
+                            "description": "How the new proposal relates to its predecessor."},
+         "tags": {"type": "string", "description": "Optional comma-separated tags for the new proposal."},
+         "label": {"type": "string", "description": "Optional human-readable label stored on the lineage edge itself (not on either proposal)."},
+         "idempotency_key": {"type": "string", "description": "Optional caller-supplied key; a retried call with the same key returns the original successor instead of creating a duplicate."},
+         "actor": {"type": "string", "description": "Optional actor identity recorded on the new proposal's events and on the lineage edge."},
+         "session_id": {"type": "string", "description": "Optional caller session id, recorded on the new proposal's 'created' event."}},
+         "required": ["proposal_id", "title", "body", "relation_type"]}},
+    {"name": "link_proposal_lineage", "description":
+        "Record a typed lineage relation between two EXISTING proposals: from_proposal_id "
+        "--relation_type--> to_proposal_id (to_proposal_id is the older/predecessor side). Idempotent "
+        "— linking the same (from, to, relation_type) tuple again returns the same row rather than "
+        "duplicating it. Rejected (ValueError -> {\"error\": ...}) if either proposal doesn't exist, "
+        "if the two belong to different tenants/workspaces, or if the new edge would create a cycle "
+        "in the lineage graph. Prefer create_proposal_successor when the successor doesn't exist yet — "
+        "this tool is for linking two proposals that both already exist (e.g. marking one as a "
+        "duplicate of another after the fact).",
+     "inputSchema": {"type": "object", "properties": {
+         "from_proposal_id": {"type": "string", "description": "The newer/'this' proposal."},
+         "to_proposal_id": {"type": "string", "description": "The proposal it relates to (its predecessor in the relation)."},
+         "relation_type": {"type": "string", "enum": ["supersedes", "refines", "forks", "continues", "duplicates", "responds_to"]},
+         "label": {"type": "string", "description": "Optional human-readable label for this edge."},
+         "actor": {"type": "string", "description": "Optional actor identity recorded on the edge."}},
+         "required": ["from_proposal_id", "to_proposal_id", "relation_type"]}},
+    {"name": "get_proposal_lineage", "description":
+        "Read-only: everything known about one proposal's place in its lineage graph in one call — "
+        "raw relation edges touching it (either direction), its ancestor chain (walking predecessor-"
+        "ward, nearest first), its direct successors (proposals that relate TO it, sequence-ordered), "
+        "and its full descendant set (every proposal that transitively relates to it, breadth-first, "
+        "nearest first). Descendants are capped at max_items edges with a non-silent 'descendants_truncated' "
+        "marker reporting the true total when exceeded — ancestors/successors/links are not capped "
+        "(a lineage chain/fan-out this large would itself be pathological). Returns "
+        "{proposal_id, links, ancestors, successors, descendants, descendants_truncated}.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string"},
+         "max_items": {"type": "integer", "minimum": 1, "maximum": 1000,
+                       "description": "Cap on how many descendant edges to return (default 200)."}},
+         "required": ["proposal_id"]}},
+    {"name": "compare_proposal_versions", "description":
+        "Read-only: structural diff between two proposals — most commonly two adjacent versions in a "
+        "lineage chain, but works for any two existing proposal ids. Reports per-field before/after/"
+        "changed for title/body/tags/status/scope_type/project_id/family_id, plus a difflib similarity "
+        "ratio and a unified diff for body specifically, plus whether the two are directly linked in "
+        "the lineage graph ('adjacent') and the connecting edge(s) if so. Returns "
+        "{from, to, direct_relations, adjacent, diff}.",
+     "inputSchema": {"type": "object", "properties": {
+         "from_proposal_id": {"type": "string", "description": "First proposal to compare (the 'a' side of each diff entry)."},
+         "to_proposal_id": {"type": "string", "description": "Second proposal to compare (the 'b' side of each diff entry)."}},
+         "required": ["from_proposal_id", "to_proposal_id"]}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
         "returns session, tasks, decisions, and recent commits in one call. "
@@ -3914,6 +4106,7 @@ _READ_ONLY_TOOLS = {
     "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "get_external_job", "list_external_jobs",
+    "list_resumable_sessions", "get_session_recovery",
     "get_research_run", "list_research_runs",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
@@ -3921,6 +4114,7 @@ _READ_ONLY_TOOLS = {
     "idle_until_session_done", "generate_handoff", "load_handoff",
     "verify_handoff_token",
     "export_ai_log", "export_ai_log_artifacts", "search_ai_log",
+    "get_ai_log_export_status",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_blog_posts",
@@ -3947,6 +4141,8 @@ _READ_ONLY_TOOLS = {
     "list_profile_layers", "get_profile_layer", "get_profile_layer_revisions",
     "get_effective_profile",
     "preview_proposal_promotion",
+    # ff1843dc — proposal lineage read-only queries.
+    "get_proposal_lineage", "compare_proposal_versions",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
@@ -3954,7 +4150,12 @@ _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete
 # rather than only reading Meridian's own state.  Keep this separate from the
 # read-only set: a GitHub/paper/social search can be read-only for Meridian
 # while still operating in an external open world.
-_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search", "run_watchlist_query"}
+_OPEN_WORLD_TOOLS = {
+    "paper_search", "social_search", "github_search", "run_watchlist_query",
+    # R2-G — the only step of this tool that isn't a local DB read/write is
+    # the actual OTLP HTTP POST to an operator-configured external endpoint.
+    "export_ai_log_otel",
+}
 
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
@@ -4004,12 +4205,18 @@ _TOOL_CATEGORY: dict[str, str] = {
     "export_ai_log_artifacts": "notes",
     "purge_ai_log":            "notes",
     "search_ai_log":           "notes",
+    "get_ai_log_export_status": "notes",
+    "set_ai_log_export_config": "notes",
+    "export_ai_log_otel":       "notes",
     "checkpoint":              "session",
     "register_external_job":    "session",
     "update_external_job":      "session",
     "get_external_job":         "session",
     "list_external_jobs":       "session",
     "complete_external_job":    "session",
+    "register_session_recovery": "session",
+    "list_resumable_sessions":   "session",
+    "get_session_recovery":      "session",
     "start_research_run":       "research",
     "complete_research_run":    "research",
     "get_research_run":         "research",
@@ -4122,6 +4329,10 @@ _TOOL_CATEGORY: dict[str, str] = {
     "promote_proposal":                "workspace",
     "preview_proposal_promotion":      "workspace",
     "commit_proposal_promotion":       "workspace",
+    "create_proposal_successor":       "workspace",
+    "link_proposal_lineage":           "workspace",
+    "get_proposal_lineage":            "workspace",
+    "compare_proposal_versions":       "workspace",
     "save_blog_post":                  "workspace",
     "get_blog_posts":                  "workspace",
     "update_md_section":               "workspace",
@@ -4267,6 +4478,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "complete_external_job":      "executor",
     "get_external_job":           "both",
     "list_external_jobs":         "both",
+    "register_session_recovery":  "both",
+    "list_resumable_sessions":    "both",
+    "get_session_recovery":       "both",
     "start_research_run":         "both",
     "complete_research_run":      "both",
     "get_research_run":           "both",
@@ -4299,6 +4513,10 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "promote_proposal":          "planner",
     "preview_proposal_promotion": "planner",
     "commit_proposal_promotion": "planner",
+    "create_proposal_successor": "planner",
+    "link_proposal_lineage":     "planner",
+    "get_proposal_lineage":      "planner",
+    "compare_proposal_versions": "planner",
     "update_md_section":         "planner",
     "save_blog_post":            "planner",
     "paper_search":              "planner",
@@ -4330,6 +4548,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "export_ai_log_artifacts":   "both",
     "purge_ai_log":              "executor",
     "search_ai_log":             "both",
+    "get_ai_log_export_status":  "both",
+    "set_ai_log_export_config":  "executor",
+    "export_ai_log_otel":        "executor",
     "refresh_context":           "both",
     "get_context_block":         "both",
     "get_session_brief":         "both",
@@ -4630,6 +4851,9 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "export_ai_log_artifacts":    "maintenance-only",
     "purge_ai_log":               "maintenance-only",
     "search_ai_log":              "maintenance-only",
+    "get_ai_log_export_status":   "maintenance-only",
+    "set_ai_log_export_config":   "maintenance-only",
+    "export_ai_log_otel":         "maintenance-only",
     # sprint item pointer cleanup
     "delete_sprint_item_pointer": "maintenance-only",
     # note cleanup
@@ -4749,6 +4973,9 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "export_ai_log_artifacts": "Export AI Log Artifacts",
     "purge_ai_log": "Purge AI Log",
     "search_ai_log": "Search AI Log",
+    "get_ai_log_export_status": "Get AI Log Export Status",
+    "set_ai_log_export_config": "Set AI Log Export Config",
+    "export_ai_log_otel": "Export AI Log to OTel",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

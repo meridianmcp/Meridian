@@ -9600,6 +9600,90 @@ async def build_proposal_evidence_for_handoff(
         return None
 
 
+# ff1843dc — bound on how many descendant edges build_proposal_lineage_for_handoff
+# will COUNT per proposal before reporting a truncation marker instead of the
+# true total. Mirrors the get_proposal_lineage MCP tool's own default so the
+# JSON handoff field and a direct tool call agree on what "a lot of
+# descendants" means. Independent of `limit` (how many PROPOSALS get a
+# lineage entry at all) — this bounds the descendant COUNT within one entry.
+_DEFAULT_PROPOSAL_LINEAGE_MAX_ITEMS = 20
+
+
+async def build_proposal_lineage_for_handoff(
+    db: Any, project_id: str, *, limit: int = 10,
+    item_ids: "list[str] | None" = None,
+    max_items: int = _DEFAULT_PROPOSAL_LINEAGE_MAX_ITEMS,
+) -> "list[dict[str, Any]] | None":
+    """ff1843dc — machine-readable proposal-to-PROPOSAL lineage, emitted
+    alongside every ``generate_handoff`` mode next to
+    :func:`build_proposal_evidence_for_handoff`'s proposal-to-EVIDENCE
+    linkage (6cdc5df3) — mirrors its fully-guarded wrapper style AND its
+    exact scope-resolution rule (same ``get_proposal_ids_for_items`` /
+    ``get_proposal_ids_for_project`` choice, same ``item_ids``/``limit``
+    contract) so both fields describe the SAME set of proposals for the
+    SAME handoff — a caller does not need to reconcile two different
+    "which proposals are relevant here" answers.
+
+    This is proposal -> PROPOSAL lineage (versions/forks/duplicates — see
+    :mod:`meridian.db.proposal_lineage`), a different relationship from
+    proposal -> evidence (sprint items/notes/findings/decisions) that
+    ``proposal_evidence`` already covers — the two fields are siblings, not
+    a replacement of one by the other.
+
+    Returns one entry per proposal id considered::
+
+        {
+            "proposal_id": ..., "ancestors": [...], "successors": [...],
+            "descendant_count": <int>, "descendants_truncated": bool,
+        }
+
+    ``ancestors``/``successors`` are the raw relation rows
+    (:func:`meridian.db.get_proposal_ancestors` /
+    :func:`meridian.db.get_proposal_successors`) — already small by
+    construction (a chain / one hop respectively), so neither is separately
+    capped. ``descendant_count`` is bounded at ``max_items`` with a non-
+    silent ``descendants_truncated`` marker (248c0bb9's cap contract: never
+    a silent drop) rather than counting a potentially unbounded descendant
+    tree — mirrors the ``get_proposal_lineage`` MCP tool's own contract for
+    the identical shape.
+
+    ``None`` only when the lookup itself failed — best-effort, never breaks
+    the mandatory handoff, exactly like every sibling wrapper in this file.
+    An empty list means the project (or this call's scope) has no proposal
+    with lineage relations yet — not an error.
+    """
+    try:
+        if item_ids:
+            proposal_ids = await db_module.get_proposal_ids_for_items(
+                db, project_id, item_ids, limit=limit,
+            )
+        else:
+            proposal_ids = await db_module.get_proposal_ids_for_project(
+                db, project_id, limit=limit,
+            )
+        out: list[dict[str, Any]] = []
+        for pid in proposal_ids:
+            ancestors = await db_module.get_proposal_ancestors(db, pid)
+            successors = await db_module.get_proposal_successors(db, pid)
+            # +1: detect truncation without a second, potentially expensive
+            # unbounded count query — same trick handle_get_proposal_lineage
+            # (mcp/handlers/notes_decisions.py) uses for the live MCP tool.
+            descendants = await db_module.get_proposal_descendants(
+                db, pid, max_items=max_items + 1,
+            )
+            truncated = len(descendants) > max_items
+            out.append({
+                "proposal_id": pid,
+                "ancestors": ancestors,
+                "successors": successors,
+                "descendant_count": min(len(descendants), max_items),
+                "descendants_truncated": truncated,
+            })
+        return out
+    except Exception:  # noqa: BLE001 — proposal lineage is best-effort
+        return None
+
+
 async def build_docx_integrity_gate_for_handoff(
     db: Any, project_id: str, *,
     pending_items: "list[dict[str, Any]] | None" = None,

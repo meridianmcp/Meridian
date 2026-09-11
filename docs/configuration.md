@@ -127,6 +127,56 @@ indistinguishable from a genuine network outage.
 
 ---
 
+## Optional: AI-log OTel / self-hosted-Langfuse export
+
+Meridian's own durable AI-log event stream (``ai_log_events`` — every
+``start_session``/tool-call/handoff-correction event Meridian captures) is
+the **canonical record** of agent activity. This export is a strictly
+OPTIONAL, OFF-BY-DEFAULT adapter on top of it: an on-demand, bounded, batch
+push of that stream to a standard OTLP (OpenTelemetry Protocol) log-ingestion
+endpoint, or a self-hosted Langfuse instance's OTLP-compatible ingestion
+endpoint. Nothing outside Meridian's own database ever becomes authoritative
+— losing every byte this adapter has ever sent changes nothing about what
+Meridian itself knows.
+
+| Variable | Description | Default | Required |
+|----------|-------------|---------|----------|
+| `MERIDIAN_AI_LOG_OTEL_ENABLED` | Master opt-in switch for the whole feature. Unset/false: export is completely inert — no dependency import, no network attempt. | unset (off) | No |
+| `MERIDIAN_AI_LOG_OTEL_ENDPOINT` | OTLP logs endpoint URL, e.g. `https://collector.example.com/v1/logs` or a self-hosted Langfuse instance's OTLP ingestion URL. Falls back to the standard `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/logs`, then a project's own `otlp_endpoint` override (`set_ai_log_export_config`). | — | For export to actually send |
+| `MERIDIAN_AI_LOG_OTEL_HEADERS` | Extra HTTP headers for the endpoint (e.g. `Authorization=Bearer%20xyz`), comma-separated `key=value` pairs, percent-encoded values — same shape as the standard `OTEL_EXPORTER_OTLP_HEADERS`, which is honored as a fallback. **This is the only place a bearer token/API key belongs** — it is never accepted by `set_ai_log_export_config` and never stored in the database. | — | For an authenticated endpoint |
+| `MERIDIAN_AI_LOG_OTEL_SERVICE_NAME` | OTel resource `service.name` for exported events. Falls back to the standard `OTEL_SERVICE_NAME`, then `"meridian"`. | `meridian` | No |
+| `MERIDIAN_AI_LOG_OTEL_LANGFUSE_COMPAT` | Purely informational: adds a `meridian.otel_sink_hint` resource attribute so a receiving Langfuse instance (or a human) can tell the wire traffic is intentionally Langfuse-bound. Does not change the wire protocol — self-hosted Langfuse ingests standard OTLP. | false | No |
+| `MERIDIAN_AI_LOG_OTEL_BATCH_SIZE` | Max events fetched per export pass (clamped 1–1000). | `200` | No |
+| `MERIDIAN_AI_LOG_OTEL_CHUNK_SIZE` | Events per HTTP POST sub-batch (clamped 1–200, and never above the batch size). | `50` | No |
+| `MERIDIAN_AI_LOG_OTEL_MAX_RETRIES` | Bounded retry attempts per chunk before giving up (clamped 0–10). | `3` | No |
+| `MERIDIAN_AI_LOG_OTEL_BACKOFF_BASE_S` | Exponential backoff base (with jitter) between retries, seconds (clamped 0.05–10). | `0.5` | No |
+| `MERIDIAN_AI_LOG_OTEL_TIMEOUT_S` | Per-HTTP-attempt timeout, seconds (clamped 1–30). | `5.0` | No |
+| `MERIDIAN_AI_LOG_OTEL_TOTAL_DEADLINE_S` | Hard wall-clock ceiling for one whole export pass, seconds (clamped 1–60) — the pass returns a `"degraded"` result rather than running longer. | `20.0` | No |
+
+**No new hard dependency.** The real OTel client library
+(`opentelemetry-sdk` + `opentelemetry-exporter-otlp-proto-http`) is declared
+only under the `otel` extra: `pip install 'meridian-server[otel]'`. A normal
+install never pulls it in, and if it's ever missing (or a future release
+changes its API surface) export cleanly reports `"unavailable"` — every
+core AI-log capability (capture, storage, timeline, `export_ai_log`,
+`purge_ai_log`) continues to work identically either way.
+
+**Per-project override** — `set_ai_log_export_config` (MCP tool) lets one
+project point at a different endpoint/service name, or force itself off
+even while the feature is globally on (`enabled: false`). A project can
+never turn export ON when the operator has globally disabled it via
+`MERIDIAN_AI_LOG_OTEL_ENABLED`. `get_ai_log_export_status` reports the
+resolved, effective configuration plus the last export attempt's outcome
+without making any network call.
+
+**Triggering an export** — there is no background scheduler; call the
+`export_ai_log_otel` MCP tool (or your own cron hitting the same code path)
+whenever you want a pass. Each pass resumes from a durable watermark, so
+calling it repeatedly (e.g. every few minutes from your own scheduler) only
+ever sends events that haven't gone out yet.
+
+---
+
 ## Example `.env`
 
 ```bash

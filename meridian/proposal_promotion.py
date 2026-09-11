@@ -329,8 +329,51 @@ def _compute_wave_preview(
 def _hashable_preview(preview: dict[str, Any]) -> dict[str, Any]:
     """Stable subset used for the preview_hash — excludes the volatile
     ``computed_at`` timestamp and the hash field itself so a content-identical
-    re-preview always hashes identically."""
-    return {k: v for k, v in preview.items() if k not in ("preview_hash", "computed_at")}
+    re-preview always hashes identically.
+
+    ff1843dc — also excludes ``lineage``: purely informational
+    proposal-lineage context (see :func:`_build_lineage_preview`), not part
+    of the promotion CONTRACT this hash guards. A lineage edge created or
+    removed between a preview and its commit (e.g. a sibling session calling
+    link_proposal_lineage / create_proposal_successor concurrently) must
+    never spuriously invalidate an otherwise byte-identical promotion
+    preview — that would be a staleness false-positive unrelated to
+    anything commit_proposal_promotion actually does.
+    """
+    return {
+        k: v for k, v in preview.items()
+        if k not in ("preview_hash", "computed_at", "lineage")
+    }
+
+
+async def _build_lineage_preview(
+    db: Any, proposal_id: str, tenant_id: str | None,
+) -> "dict[str, Any] | None":
+    """ff1843dc — best-effort proposal-lineage context attached to a
+    preview/commit result: how many ancestors this proposal has, the
+    immediate predecessor (if any), and how many direct successors it
+    already has. Purely informational — deliberately EXCLUDED from the
+    preview_hash (see :func:`_hashable_preview`) so it can never affect
+    promotion freshness. Returns ``None`` on any failure — never blocks a
+    preview or commit, exactly like every other best-effort enrichment in
+    this codebase (mirrors ``handoff.build_proposal_evidence_for_handoff``'s
+    own fail-open contract)."""
+    try:
+        ancestors = await db_module.get_proposal_ancestors(
+            db, proposal_id, tenant_id=tenant_id,
+        )
+        successors = await db_module.get_proposal_successors(
+            db, proposal_id, tenant_id=tenant_id,
+        )
+        return {
+            "ancestor_count": len(ancestors),
+            "immediate_predecessor_id": (
+                ancestors[0]["to_proposal_id"] if ancestors else None
+            ),
+            "successor_count": len(successors),
+        }
+    except Exception:  # noqa: BLE001 — lineage context is best-effort
+        return None
 
 
 def _compute_preview_hash(payload: dict[str, Any]) -> str:
@@ -384,6 +427,7 @@ async def preview_proposal_promotion(
         }
         preview["preview_hash"] = _compute_preview_hash(_hashable_preview(preview))
         preview["computed_at"] = _utcnow_iso()
+        preview["lineage"] = await _build_lineage_preview(db, proposal_id, tenant_id)
         return preview
 
     events = await _load_proposal_events(db, proposal_id)
@@ -440,6 +484,15 @@ async def preview_proposal_promotion(
     }
     preview["preview_hash"] = _compute_preview_hash(_hashable_preview(preview))
     preview["computed_at"] = _utcnow_iso()
+    # ff1843dc — attach the same best-effort lineage context the
+    # already_satisfied early-return above already carries. This is the
+    # far more common path (an active raw/investigating proposal actually
+    # being previewed for promotion), so omitting it here — as the
+    # originally landed code did — left "lineage" silently absent from the
+    # result for the overwhelming majority of real preview_proposal_promotion
+    # calls, not merely None. Excluded from preview_hash by _hashable_preview
+    # for the same reason as the already_satisfied branch.
+    preview["lineage"] = await _build_lineage_preview(db, proposal_id, tenant_id)
     return preview
 
 
