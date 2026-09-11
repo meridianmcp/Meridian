@@ -6716,6 +6716,53 @@ async def _handle_code_index_tools(
     return _MISS
 
 
+async def _handle_experiment_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: the W1-M Experiment Registry (3f6b8715) --
+    create_experiment, get_experiment, list_experiments,
+    start_experiment_run, complete_experiment_run, promote_experiment_run,
+    get_experiment_run, list_experiment_runs, register_run_artifact,
+    record_experiment_event, get_experiment_events. A durable, structured
+    sibling to research_tools.py's bounded ephemeral scratch runs -- see
+    meridian/mcp/handlers/experiment_tools.py's module docstring."""
+    from .handlers.experiment_tools import (  # noqa: PLC0415
+        handle_create_experiment,
+        handle_get_experiment,
+        handle_list_experiments,
+        handle_start_experiment_run,
+        handle_complete_experiment_run,
+        handle_promote_experiment_run,
+        handle_get_experiment_run,
+        handle_list_experiment_runs,
+        handle_register_run_artifact,
+        handle_record_experiment_event,
+        handle_get_experiment_events,
+    )
+
+    _standard_dispatch: dict[str, Any] = {
+        "create_experiment": handle_create_experiment,
+        "get_experiment": handle_get_experiment,
+        "list_experiments": handle_list_experiments,
+        "start_experiment_run": handle_start_experiment_run,
+        "complete_experiment_run": handle_complete_experiment_run,
+        "promote_experiment_run": handle_promote_experiment_run,
+        "get_experiment_run": handle_get_experiment_run,
+        "list_experiment_runs": handle_list_experiment_runs,
+        "register_run_artifact": handle_register_run_artifact,
+        "record_experiment_event": handle_record_experiment_event,
+        "get_experiment_events": handle_get_experiment_events,
+    }
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+    return _MISS
+
+
 # a2a027cf — bounded dispatch-level budget for complete_sprint_item,
 # comfortably under the ~60s client-side timeouts observed in the field
 # (HTTP, stdio, and connector/mcp-remote transports all funnel through this
@@ -6982,6 +7029,7 @@ async def _dispatch_mcp_tool(
         _handle_tunnel_tools,
         _handle_outputs_tools,
         _handle_code_index_tools,
+        _handle_experiment_tools,
     )
     # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
     # Repeated live reports: an MCP client (HTTP/stdio/connector — this

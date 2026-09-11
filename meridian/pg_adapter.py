@@ -5004,6 +5004,103 @@ async def _migrate_pg_scratch_research_runs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_experiment_registry_columns(conn: PostgresConnection) -> None:
+    """3f6b8715 -- Postgres mirror: three new columns on the PRE-EXISTING
+    ``experiments`` table (hypothesis/status/creator_session_id). See
+    meridian/db/migrations.py's _migrate_experiment_registry_columns and
+    meridian.experiment's module docstring for the full coexistence
+    rationale with experiment_model.py's unrelated interface on the same
+    table. Postgres supports ADD COLUMN IF NOT EXISTS natively -- no
+    _column_exists probe needed, unlike the SQLite side."""
+    await conn.executescript(
+        "ALTER TABLE experiments ADD COLUMN IF NOT EXISTS hypothesis TEXT;"
+        "ALTER TABLE experiments "
+        "ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';"
+        "ALTER TABLE experiments ADD COLUMN IF NOT EXISTS creator_session_id TEXT"
+    )
+
+
+async def _migrate_pg_experiment_registry_runs(conn: PostgresConnection) -> None:
+    """3f6b8715 -- Postgres mirror of experiment_runs / run_artifacts /
+    run_manifest_items / experiment_events. See
+    meridian/db/migrations.py's _migrate_experiment_registry_runs for the
+    full schema rationale, the HARD INVARIANT this supports (a run can never
+    reach a terminal status without a corresponding experiment_events row),
+    and the outcome_summary/disposition NULLABLE deviation note."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS experiment_runs ("
+        "    id TEXT PRIMARY KEY,"
+        "    experiment_id TEXT NOT NULL REFERENCES experiments(id),"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    repository_id TEXT,"
+        "    worktree_id TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ("
+        "        'active', 'completed', 'abandoned', 'expired')),"
+        "    trial_label TEXT,"
+        "    outcome_summary TEXT,"
+        "    disposition TEXT CHECK (disposition IS NULL OR disposition IN ("
+        "        'keep', 'discard', 'promote')),"
+        "    pivot_parent_run_id TEXT REFERENCES experiment_runs(id),"
+        "    resource_profile_json TEXT,"
+        "    result_receipt_json TEXT,"
+        "    creator_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        f"    started_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    completed_at TEXT,"
+        "    expires_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_experiment_runs_experiment "
+        "ON experiment_runs(experiment_id, started_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_experiment_runs_project_status "
+        "ON experiment_runs(project_id, status, started_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_experiment_runs_pivot_parent "
+        "ON experiment_runs(pivot_parent_run_id);"
+        "CREATE TABLE IF NOT EXISTS run_artifacts ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    experiment_run_id TEXT NOT NULL REFERENCES experiment_runs(id),"
+        "    logical_path TEXT NOT NULL,"
+        "    content_hash TEXT,"
+        "    artifact_role TEXT CHECK (artifact_role IS NULL OR artifact_role IN ("
+        "        'figure', 'dataset', 'model', 'checkpoint', 'log')),"
+        "    host_visibility TEXT NOT NULL DEFAULT 'local' CHECK (host_visibility IN ("
+        "        'local', 'tunnel', 'public')),"
+        "    last_verified_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_run_artifacts_run "
+        "ON run_artifacts(experiment_run_id, created_at ASC);"
+        "CREATE INDEX IF NOT EXISTS idx_run_artifacts_project ON run_artifacts(project_id);"
+        "CREATE TABLE IF NOT EXISTS run_manifest_items ("
+        "    id TEXT PRIMARY KEY,"
+        "    run_id TEXT NOT NULL REFERENCES experiment_runs(id),"
+        "    artifact_id TEXT NOT NULL REFERENCES run_artifacts(id),"
+        "    role TEXT,"
+        "    position INTEGER,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_run_manifest_items_run "
+        "ON run_manifest_items(run_id, position ASC);"
+        "CREATE TABLE IF NOT EXISTS experiment_events ("
+        "    id TEXT PRIMARY KEY,"
+        "    experiment_id TEXT NOT NULL REFERENCES experiments(id),"
+        "    run_id TEXT REFERENCES experiment_runs(id),"
+        "    event_type TEXT NOT NULL CHECK (event_type IN ("
+        "        'dead_end', 'pivot', 'breakthrough', 'note', 'milestone')),"
+        "    label TEXT,"
+        "    body TEXT,"
+        "    artifact_ids_json TEXT,"
+        "    created_by_session_id TEXT REFERENCES sessions(id),"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_experiment_events_experiment "
+        "ON experiment_events(experiment_id, created_at ASC);"
+        "CREATE INDEX IF NOT EXISTS idx_experiment_events_run "
+        "ON experiment_events(run_id, created_at ASC);"
+    )
+
+
 async def _migrate_pg_session_recovery_registry(conn: PostgresConnection) -> None:
     """cdd0ef6c -- Postgres mirror of the cross-client session recovery
     registry. See meridian/db/migrations.py's _migrate_session_recovery_registry
@@ -5322,4 +5419,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_scratch_research_runs,
     _migrate_pg_session_recovery_registry,
     _migrate_pg_ai_log_export_config,
+    _migrate_pg_experiment_registry_columns,
+    _migrate_pg_experiment_registry_runs,
 )

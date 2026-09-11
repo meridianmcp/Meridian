@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname', '_migrate_sprint_item_prospect_bypass', '_migrate_handoff_tokens', '_migrate_wave_gate_results', '_migrate_wave_gate_configs', '_migrate_server_logs', '_migrate_custom_hooks', '_migrate_sprint_item_require_verification', '_migrate_sprint_item_verifications_table', '_migrate_proposal_github_issue', '_migrate_sprint_item_required_tool', '_migrate_sprint_item_github_issue_link', '_migrate_manual_issue_screening_toggle', '_migrate_action_audit_log_table', '_migrate_manual_issue_content_log_table', '_migrate_workspace_tool_priority_map', '_migrate_sprint_item_github_channel', '_migrate_workspace_claim_verification_mode', '_migrate_handoff_tokens_consumed_at', '_migrate_board_snapshot_revisions', '_migrate_wave_runs', '_migrate_handoff_tokens_body_hash', '_migrate_project_capabilities', '_migrate_capability_profiles', '_migrate_sprint_item_tool_requirements', '_migrate_sprint_item_artifact_declaration', '_migrate_sprint_item_require_strict_evidence', '_migrate_handoffs_invalidation', '_migrate_handoff_corrections_table', '_migrate_profile_layers', '_migrate_wave_gate_results_version_unique', '_migrate_wave_gate_configs_version_unique', '_migrate_proposal_project_scope', '_migrate_external_job_register', '_migrate_scratch_research_runs', '_migrate_session_recovery_registry']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname', '_migrate_sprint_item_prospect_bypass', '_migrate_handoff_tokens', '_migrate_wave_gate_results', '_migrate_wave_gate_configs', '_migrate_server_logs', '_migrate_custom_hooks', '_migrate_sprint_item_require_verification', '_migrate_sprint_item_verifications_table', '_migrate_proposal_github_issue', '_migrate_sprint_item_required_tool', '_migrate_sprint_item_github_issue_link', '_migrate_manual_issue_screening_toggle', '_migrate_action_audit_log_table', '_migrate_manual_issue_content_log_table', '_migrate_workspace_tool_priority_map', '_migrate_sprint_item_github_channel', '_migrate_workspace_claim_verification_mode', '_migrate_handoff_tokens_consumed_at', '_migrate_board_snapshot_revisions', '_migrate_wave_runs', '_migrate_handoff_tokens_body_hash', '_migrate_project_capabilities', '_migrate_capability_profiles', '_migrate_sprint_item_tool_requirements', '_migrate_sprint_item_artifact_declaration', '_migrate_sprint_item_require_strict_evidence', '_migrate_handoffs_invalidation', '_migrate_handoff_corrections_table', '_migrate_profile_layers', '_migrate_wave_gate_results_version_unique', '_migrate_wave_gate_configs_version_unique', '_migrate_proposal_project_scope', '_migrate_external_job_register', '_migrate_scratch_research_runs', '_migrate_session_recovery_registry', '_migrate_experiment_registry_columns', '_migrate_experiment_registry_runs']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -4469,6 +4469,152 @@ async def _migrate_scratch_research_runs(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_scratch_research_runs_project_status "
         "ON scratch_research_runs(project_id, status, started_at DESC)"
+    )
+    await db.commit()
+
+
+async def _migrate_experiment_registry_columns(db: aiosqlite.Connection) -> None:
+    """3f6b8715 -- W1-M Experiment Registry: three new columns on the
+    PRE-EXISTING ``experiments`` table (4376e655,
+    meridian/db/experiment_model.py) -- ``hypothesis``, ``status``,
+    ``creator_session_id``. Deliberately guarded ``ALTER TABLE ADD COLUMN``
+    via ``_migrate_add_column_if_missing``, NEVER ``CREATE TABLE IF NOT
+    EXISTS`` -- that table already exists, so a CREATE-based migration would
+    silently no-op and never add these columns at all. The pre-existing
+    ``config_template``/``created_by`` columns are untouched; see
+    meridian.experiment's module docstring for the full coexistence
+    rationale between this registry and experiment_model.py's unrelated
+    ML-style experiment-tracking interface, which keeps using those two
+    columns unchanged. Mirrored on Postgres by
+    pg_adapter._migrate_pg_experiment_registry_columns.
+    """
+    await _migrate_add_column_if_missing(db, "experiments", "hypothesis", "TEXT")
+    await _migrate_add_column_if_missing(
+        db, "experiments", "status", "TEXT NOT NULL DEFAULT 'active'"
+    )
+    await _migrate_add_column_if_missing(db, "experiments", "creator_session_id", "TEXT")
+
+
+async def _migrate_experiment_registry_runs(db: aiosqlite.Connection) -> None:
+    """3f6b8715 -- W1-M Experiment Registry: experiment_runs, run_artifacts,
+    run_manifest_items, experiment_events. All four are brand-new tables
+    (CREATE TABLE IF NOT EXISTS, no naming collision to route around, unlike
+    _migrate_scratch_research_runs' ``scratch_research_runs`` drift note).
+
+    HARD INVARIANT this schema exists to support (enforced in
+    meridian.db.experiments, tested in tests/test_experiments.py): a run can
+    never reach a terminal status (completed/abandoned/expired) without a
+    corresponding experiment_events row for that run_id -- every
+    terminal-transition code path in meridian.db.experiments unconditionally
+    auto-writes one. Silent abandonment of a run is not allowed.
+
+    outcome_summary/disposition are deliberately NULLABLE here despite the
+    sprint-item brief listing them as NOT NULL -- see
+    meridian.experiment's module docstring, "DEVIATIONS FROM THE
+    SPRINT-ITEM BRIEF" item 1, for the full rationale (a run row is created,
+    with neither field known yet, before any outcome exists).
+
+    Mirrored on Postgres by pg_adapter._migrate_pg_experiment_registry_runs.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS experiment_runs (
+            id TEXT PRIMARY KEY,
+            experiment_id TEXT NOT NULL REFERENCES experiments(id),
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            repository_id TEXT,
+            worktree_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN (
+                'active', 'completed', 'abandoned', 'expired'
+            )),
+            trial_label TEXT,
+            outcome_summary TEXT,
+            disposition TEXT CHECK (disposition IS NULL OR disposition IN (
+                'keep', 'discard', 'promote'
+            )),
+            pivot_parent_run_id TEXT REFERENCES experiment_runs(id),
+            resource_profile_json TEXT,
+            result_receipt_json TEXT,
+            creator_session_id TEXT NOT NULL REFERENCES sessions(id),
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_runs_experiment "
+        "ON experiment_runs(experiment_id, started_at DESC)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_runs_project_status "
+        "ON experiment_runs(project_id, status, started_at DESC)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_runs_pivot_parent "
+        "ON experiment_runs(pivot_parent_run_id)"
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS run_artifacts (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            experiment_run_id TEXT NOT NULL REFERENCES experiment_runs(id),
+            logical_path TEXT NOT NULL,
+            content_hash TEXT,
+            artifact_role TEXT CHECK (artifact_role IS NULL OR artifact_role IN (
+                'figure', 'dataset', 'model', 'checkpoint', 'log'
+            )),
+            host_visibility TEXT NOT NULL DEFAULT 'local' CHECK (host_visibility IN (
+                'local', 'tunnel', 'public'
+            )),
+            last_verified_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_artifacts_run "
+        "ON run_artifacts(experiment_run_id, created_at ASC)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_artifacts_project "
+        "ON run_artifacts(project_id)"
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS run_manifest_items (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES experiment_runs(id),
+            artifact_id TEXT NOT NULL REFERENCES run_artifacts(id),
+            role TEXT,
+            position INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_manifest_items_run "
+        "ON run_manifest_items(run_id, position ASC)"
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS experiment_events (
+            id TEXT PRIMARY KEY,
+            experiment_id TEXT NOT NULL REFERENCES experiments(id),
+            run_id TEXT REFERENCES experiment_runs(id),
+            event_type TEXT NOT NULL CHECK (event_type IN (
+                'dead_end', 'pivot', 'breakthrough', 'note', 'milestone'
+            )),
+            label TEXT,
+            body TEXT,
+            artifact_ids_json TEXT,
+            created_by_session_id TEXT REFERENCES sessions(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_events_experiment "
+        "ON experiment_events(experiment_id, created_at ASC)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_events_run "
+        "ON experiment_events(run_id, created_at ASC)"
     )
     await db.commit()
 

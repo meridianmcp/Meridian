@@ -1155,6 +1155,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_scratch_research_runs(db)
     await _migrate_session_recovery_registry(db)
     await _migrate_ai_log_export_config(db)
+    # 3f6b8715 -- W1-M Experiment Registry.
+    await _migrate_experiment_registry_columns(db)
+    await _migrate_experiment_registry_runs(db)
     return db
 
 
