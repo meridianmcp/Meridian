@@ -622,3 +622,295 @@ async def test_build_continue_payload_reports_active_research_runs(db):
     )
     payload = await server._build_continue_payload(db, project["id"], session)
     assert payload["active_research_runs"] == 1
+
+
+# ---------------------------------------------------------------------------
+# W2-A (d59786cf, depends on W1-F/0f0782d2) -- optional off/warn/strict
+# symbol-lock guard, reusing meridian.claim_guard.evaluate_claim_guard's pure
+# decision core (see 260ead1f for the full off/warn/strict acceptance
+# criteria this mirrors: read-only runs never evaluated as a write; disjoint
+# symbols stay concurrent; never silently widen a symbol ask to whole-file;
+# expired/malformed claim data must fail open and be visible in the verdict).
+# ---------------------------------------------------------------------------
+
+
+def test_validate_guard_mode_defaults_off_and_rejects_unknown():
+    assert model.validate_guard_mode(None) == "off"
+    assert model.validate_guard_mode("STRICT") == "strict"
+    assert model.validate_guard_mode("Warn") == "warn"
+    with pytest.raises(model.ResearchRunError, match="guard_mode must be one of"):
+        model.validate_guard_mode("block")
+
+
+def test_evaluate_research_run_guard_off_never_evaluates_even_with_a_real_conflict():
+    """off must be the ONLY branch that skips evaluate_claim_guard entirely --
+    a conflicting whole-file lock in the claims payload must not matter."""
+    claims = {"file_lock": {"session_id": "other"}, "symbol_claims": [], "read_claims": []}
+    verdict = model.evaluate_research_run_guard(
+        claims, "s1", guard_mode="off", run_mode="isolated_write",
+    )
+    assert verdict == {
+        "checked": False, "allow": True, "guard_mode": "off", "conflict": False,
+        "reason": None, "holder": None, "claim_mode": None, "symbol": None,
+    }
+
+
+def test_evaluate_research_run_guard_warn_surfaces_conflict_but_never_blocks():
+    claims = {"file_lock": {"session_id": "other"}, "symbol_claims": [], "read_claims": []}
+    verdict = model.evaluate_research_run_guard(
+        claims, "s1", guard_mode="warn", run_mode="isolated_write",
+    )
+    assert verdict["checked"] is True
+    assert verdict["allow"] is True  # warn never blocks
+    assert verdict["conflict"] is True
+    assert verdict["reason"] == "write_locked"
+    assert verdict["holder"] == "other"
+
+
+def test_evaluate_research_run_guard_strict_blocks_on_whole_file_conflict():
+    claims = {"file_lock": {"session_id": "other"}, "symbol_claims": [], "read_claims": []}
+    verdict = model.evaluate_research_run_guard(
+        claims, "s1", guard_mode="strict", run_mode="isolated_write",
+    )
+    assert verdict["allow"] is False
+    assert verdict["conflict"] is True
+    assert verdict["reason"] == "write_locked"
+
+
+def test_evaluate_research_run_guard_strict_allows_when_no_conflict():
+    verdict = model.evaluate_research_run_guard(
+        {"file_lock": None, "symbol_claims": [], "read_claims": []},
+        "s1", guard_mode="strict", run_mode="isolated_write",
+    )
+    assert verdict["allow"] is True
+    assert verdict["conflict"] is False
+
+
+def test_evaluate_research_run_guard_read_only_is_never_evaluated_as_a_write():
+    """A read_only run must be evaluated in claim_guard's 'read' mode even
+    under guard_mode='strict' -- a live SYMBOL claim by another session must
+    never block a read (evaluate_claim_guard's read mode ignores symbol/read
+    claims entirely; only another session's whole-file WRITE lock blocks)."""
+    claims_with_symbol_claim = {
+        "file_lock": None,
+        "symbol_claims": [{"session_id": "other", "symbol": "AuthRouter"}],
+        "read_claims": [],
+    }
+    verdict = model.evaluate_research_run_guard(
+        claims_with_symbol_claim, "s1", guard_mode="strict", run_mode="read_only",
+    )
+    assert verdict["claim_mode"] == "read"
+    assert verdict["allow"] is True
+    assert verdict["conflict"] is False
+
+    # But a live WHOLE-FILE write lock by another session still blocks even a
+    # read_only run's strict check (mirrors evaluate_claim_guard's own rule:
+    # a write lock blocks everything, including reads).
+    claims_with_write_lock = {
+        "file_lock": {"session_id": "other"}, "symbol_claims": [], "read_claims": [],
+    }
+    blocked = model.evaluate_research_run_guard(
+        claims_with_write_lock, "s1", guard_mode="strict", run_mode="read_only",
+    )
+    assert blocked["claim_mode"] == "read"
+    assert blocked["allow"] is False
+    assert blocked["reason"] == "write_locked"
+
+
+def test_evaluate_research_run_guard_disjoint_symbols_stay_concurrent():
+    """Two sessions on DISJOINT symbols in the same file must never conflict
+    -- this function must never silently widen a symbol-scoped ask to a
+    whole-file check."""
+    claims = {
+        "file_lock": None,
+        "symbol_claims": [{"session_id": "other", "symbol": "insert_figure_block"}],
+        "read_claims": [],
+    }
+    disjoint = model.evaluate_research_run_guard(
+        claims, "s1", guard_mode="strict", run_mode="isolated_write", symbol="edit_caption",
+    )
+    assert disjoint["allow"] is True
+    assert disjoint["conflict"] is False
+
+    same_symbol = model.evaluate_research_run_guard(
+        claims, "s1", guard_mode="strict", run_mode="isolated_write", symbol="insert_figure_block",
+    )
+    assert same_symbol["allow"] is False
+    assert same_symbol["conflict"] is True
+    assert same_symbol["reason"] == "symbol_locked"
+    assert same_symbol["holder"] == "other"
+
+
+def test_evaluate_research_run_guard_fails_open_on_malformed_claims():
+    """Malformed/unknown claim data must fail open, per claim_guard's own
+    documented contract, for every guard_mode that actually evaluates."""
+    for mode in ("warn", "strict"):
+        verdict = model.evaluate_research_run_guard(
+            "not-a-dict", "s1", guard_mode=mode, run_mode="isolated_write",
+        )
+        assert verdict["allow"] is True
+        assert verdict["conflict"] is False
+
+
+# --- db-layer integration: start_research_run + check_research_run_guard ---
+
+
+@pytest.mark.asyncio
+async def test_start_research_run_guard_off_by_default_ignores_a_real_conflict(db):
+    """Zero-behavior-change default: an isolated_write run starts normally
+    even when another live session already write-claims one of its
+    allowed_paths, as long as guard_mode is left at its default ('off')."""
+    project, holder = await _session(db, "guard-off-holder")
+    await db_module.claim_file(db, "meridian/scratch/shared.py", holder["id"])
+
+    project2, runner = await _session(db, "guard-off-runner")
+    run = await run_db.start_research_run(
+        db, project2["id"], runner["id"],
+        mode="isolated_write", repository_id="meridian-repo@worktree:wf-guard-off",
+        allowed_paths=["meridian/scratch/shared.py"], turn_budget=10,
+        is_isolated_worktree=True,
+    )
+    assert run["status"] == "active"
+    assert run["guard"]["checked"] is False
+    assert run["guard"]["guard_mode"] == "off"
+
+
+@pytest.mark.asyncio
+async def test_start_research_run_guard_warn_surfaces_conflict_but_still_starts(db):
+    project, holder = await _session(db, "guard-warn-holder")
+    await db_module.claim_file(db, "meridian/scratch/warned.py", holder["id"])
+
+    project2, runner = await _session(db, "guard-warn-runner")
+    run = await run_db.start_research_run(
+        db, project2["id"], runner["id"],
+        mode="isolated_write", repository_id="meridian-repo@worktree:wf-guard-warn",
+        allowed_paths=["meridian/scratch/warned.py"], turn_budget=10,
+        is_isolated_worktree=True, guard_mode="warn",
+    )
+    assert run["status"] == "active"
+    assert run["guard"]["checked"] is True
+    assert run["guard"]["allow"] is True
+    assert len(run["guard"]["conflicts"]) == 1
+    conflict = run["guard"]["conflicts"][0]
+    assert conflict["file_path"] == "meridian/scratch/warned.py"
+    assert conflict["reason"] == "write_locked"
+    assert conflict["holder"] == holder["id"]
+
+
+@pytest.mark.asyncio
+async def test_start_research_run_guard_strict_blocks_and_creates_no_run(db):
+    project, holder = await _session(db, "guard-strict-holder")
+    await db_module.claim_file(db, "meridian/scratch/blocked.py", holder["id"])
+
+    project2, runner = await _session(db, "guard-strict-runner")
+    before = await run_db.list_research_runs(db, project2["id"], include_terminal=True)
+    with pytest.raises(model.ResearchRunError, match="guard_mode='strict' blocked"):
+        await run_db.start_research_run(
+            db, project2["id"], runner["id"],
+            mode="isolated_write", repository_id="meridian-repo@worktree:wf-guard-strict",
+            allowed_paths=["meridian/scratch/blocked.py"], turn_budget=10,
+            is_isolated_worktree=True, guard_mode="strict",
+        )
+    after = await run_db.list_research_runs(db, project2["id"], include_terminal=True)
+    assert after == before  # no partial row was left behind
+
+
+@pytest.mark.asyncio
+async def test_start_research_run_guard_strict_allows_a_clear_path(db):
+    project, runner = await _session(db, "guard-strict-clear")
+    run = await run_db.start_research_run(
+        db, project["id"], runner["id"],
+        mode="isolated_write", repository_id="meridian-repo@worktree:wf-guard-clear",
+        allowed_paths=["meridian/scratch/clear.py"], turn_budget=10,
+        is_isolated_worktree=True, guard_mode="strict",
+    )
+    assert run["status"] == "active"
+    assert run["guard"]["checked"] is True
+    assert run["guard"]["allow"] is True
+    assert run["guard"]["conflicts"] == []
+
+
+@pytest.mark.asyncio
+async def test_check_research_run_guard_same_symbol_conflict_and_disjoint_concurrency(db):
+    """DB-level counterpart of the pure symbol tests above, using REAL
+    claim_symbol rows -- simulates two isolated Meridian Docs executor edits
+    on the same file: one session owns edit_caption, another wants
+    insert_figure_block (disjoint -- must stay concurrent) or edit_caption
+    itself (same symbol -- must conflict under strict)."""
+    docs_file = "meridian_docs/caption_ops.py"
+    content = (
+        "def edit_caption():\n    pass\n\n\n"
+        "def insert_figure_block():\n    pass\n"
+    )
+    project, holder = await _session(db, "guard-docs-holder")
+    claimed = await db_module.claim_symbol(db, holder["id"], docs_file, "edit_caption", content)
+    assert claimed["claimed"] is True
+
+    project2, runner = await _session(db, "guard-docs-runner")
+
+    disjoint = await run_db.check_research_run_guard(
+        db, project2["id"], runner["id"],
+        run_mode="isolated_write", guard_mode="strict",
+        targets=[{"file_path": docs_file, "symbol": "insert_figure_block"}],
+    )
+    assert disjoint["allow"] is True
+    assert disjoint["conflicts"] == []
+
+    same = await run_db.check_research_run_guard(
+        db, project2["id"], runner["id"],
+        run_mode="isolated_write", guard_mode="strict",
+        targets=[{"file_path": docs_file, "symbol": "edit_caption"}],
+    )
+    assert same["allow"] is False
+    assert len(same["conflicts"]) == 1
+    assert same["conflicts"][0]["reason"] == "symbol_locked"
+    assert same["conflicts"][0]["holder"] == holder["id"]
+
+
+@pytest.mark.asyncio
+async def test_check_research_run_guard_off_or_empty_targets_never_touches_claims(db):
+    project, runner = await _session(db, "guard-noop")
+    off_result = await run_db.check_research_run_guard(
+        db, project["id"], runner["id"],
+        run_mode="isolated_write", guard_mode="off",
+        targets=[{"file_path": "anything.py", "symbol": None}],
+    )
+    assert off_result == {
+        "checked": False, "allow": True, "guard_mode": "off", "results": [], "conflicts": [],
+    }
+    empty_targets = await run_db.check_research_run_guard(
+        db, project["id"], runner["id"],
+        run_mode="isolated_write", guard_mode="strict", targets=[],
+    )
+    assert empty_targets["checked"] is False
+    assert empty_targets["allow"] is True
+
+
+@pytest.mark.asyncio
+async def test_check_research_run_guard_fails_open_on_an_expired_write_lock(db):
+    """An expired claim must never block -- get_file_claims sweeps expired
+    file_locks before returning, so a strict check against a path whose only
+    lock has already lapsed must see it as clear (the documented fail-open/
+    degraded policy for stale claim data), and that clearance is visible
+    directly in the returned verdict (reason=None, holder=None)."""
+    project, holder = await _session(db, "guard-expired-holder")
+    stale_path = "meridian/scratch/stale.py"
+    # Insert an ALREADY-EXPIRED whole-file lock directly (bypassing claim_file,
+    # which would refuse to hand back an expired lock in the first place).
+    await db.execute(
+        "INSERT INTO file_locks (id, file_path, session_id, claimed_at, expires_at) "
+        "VALUES (?, ?, ?, datetime('now', '-3 hours'), datetime('now', '-1 hours'))",
+        ("stale-lock-id", stale_path, holder["id"]),
+    )
+    await db.commit()
+
+    project2, runner = await _session(db, "guard-expired-runner")
+    result = await run_db.check_research_run_guard(
+        db, project2["id"], runner["id"],
+        run_mode="isolated_write", guard_mode="strict",
+        targets=[{"file_path": stale_path, "symbol": None}],
+    )
+    assert result["allow"] is True
+    assert result["conflicts"] == []
+    assert result["results"][0]["reason"] == "clear"
+    assert result["results"][0]["holder"] is None

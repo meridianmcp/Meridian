@@ -61,6 +61,13 @@ RESEARCH_RUN_TERMINAL_STATUSES = frozenset(
 RUN_MODES = frozenset({"read_only", "isolated_write"})
 RUN_DISPOSITIONS = frozenset({"keep", "discard", "promote"})
 
+# --- symbol-lock guard (W2-A, 260ead1f -- reuses meridian.claim_guard) ------
+# Opt-in, off by default: a research run pays zero evaluation cost unless a
+# caller explicitly asks for warn/strict. See evaluate_research_run_guard
+# below for the full off/warn/strict contract.
+RESEARCH_RUN_GUARD_MODES = frozenset({"off", "warn", "strict"})
+DEFAULT_GUARD_MODE = "off"
+
 # --- byte/length bounds -----------------------------------------------------
 MAX_RECEIPT_BYTES = 16_000
 
@@ -133,6 +140,30 @@ def validate_disposition(value: object, *, required: bool = True) -> "str | None
             f"disposition must be one of {sorted(RUN_DISPOSITIONS)}, got {value!r}"
         )
     return disposition
+
+
+def validate_guard_mode(value: object) -> str:
+    """Normalize and validate the optional symbol-lock guard mode (260ead1f).
+
+    ``off`` (the default when ``value`` is ``None``): the guard performs NO
+    evaluation at all and never touches the claims table -- a research run
+    must stay frictionless by default, exactly like every other opt-in
+    contract in this module (``disposition`` aside, which is required-explicit
+    for a different reason -- see :func:`validate_disposition`).
+    ``warn``: the guard evaluates a target against live file/symbol claims
+    but never blocks -- a conflict is surfaced for visibility only.
+    ``strict``: the guard evaluates and blocks a run whose declared write
+    surface conflicts with a live whole-file or same-symbol claim held by
+    another session.
+    """
+    if value is None:
+        return DEFAULT_GUARD_MODE
+    mode = value.strip().lower() if isinstance(value, str) else ""
+    if mode not in RESEARCH_RUN_GUARD_MODES:
+        raise ResearchRunError(
+            f"guard_mode must be one of {sorted(RESEARCH_RUN_GUARD_MODES)}, got {value!r}"
+        )
+    return mode
 
 
 def validate_turn_budget(value: object) -> int:
@@ -395,3 +426,92 @@ def is_run_expired(expires_at_iso: "str | None", *, now: "datetime | None" = Non
         expires = expires.replace(tzinfo=timezone.utc)
     now = now or datetime.now(timezone.utc)
     return expires < now
+
+
+# ---------------------------------------------------------------------------
+# Symbol-lock guard (W2-A, 260ead1f) -- reuses meridian.claim_guard's pure
+# decision core rather than writing new guard logic from scratch (per this
+# sprint item's own brief). This module stays DB-free (see the module
+# docstring), so this function accepts an already-fetched ``claims`` payload
+# (the exact shape ``get_file_claims`` returns) -- see
+# :mod:`meridian.db.research_runs`'s ``check_research_run_guard`` for the
+# thin DB-touching wrapper that fetches ``claims`` and calls this per target.
+# ---------------------------------------------------------------------------
+
+
+def evaluate_research_run_guard(
+    claims: "dict[str, Any] | None",
+    session_id: str,
+    *,
+    guard_mode: str,
+    run_mode: str,
+    symbol: "str | None" = None,
+) -> dict[str, Any]:
+    """Wire :func:`meridian.claim_guard.evaluate_claim_guard` into the
+    research-run ``guard_mode`` contract (off/warn/strict).
+
+    A ``read_only`` run is ALWAYS evaluated in claim_guard's ``"read"`` mode,
+    regardless of ``guard_mode`` -- a read-only run must never acquire, or
+    even be evaluated for, a write lock (mirrors ``evaluate_claim_guard``'s
+    own read semantics: only another session's live whole-file WRITE lock
+    can block a read; a symbol claim or another session's read claim never
+    does). Any other ``run_mode`` (currently just ``isolated_write``) is
+    evaluated in ``"write"`` mode, optionally ``symbol``-scoped so two
+    sessions holding claims on DISJOINT symbols in the same file never
+    collide here -- this function never silently widens a symbol-scoped ask
+    into a whole-file check; it passes ``symbol`` straight through to
+    ``evaluate_claim_guard`` unmodified.
+
+    ``guard_mode="off"`` (the default -- see :func:`validate_guard_mode`) is
+    the ONLY branch that skips calling ``evaluate_claim_guard`` entirely:
+    ``{"checked": False, "allow": True, "guard_mode": "off", "conflict":
+    False, "reason": None, "holder": None, "claim_mode": None, "symbol":
+    None}``. A caller that never opts in pays zero evaluation cost.
+
+    ``guard_mode="warn"`` evaluates and ALWAYS allows (``allow`` is always
+    True) -- the verdict (``conflict``/``reason``/``holder``) is still
+    returned so the caller can surface the exact conflict and owning
+    session without blocking a lightweight probe.
+
+    ``guard_mode="strict"`` evaluates and returns ``evaluate_claim_guard``'s
+    own ``allow`` verbatim -- a real conflict blocks.
+
+    Malformed, unknown, or expired claim data is handled entirely by
+    ``evaluate_claim_guard``'s existing fail-open contract (a malformed
+    payload, or the absence of a live lock, always evaluates to
+    ``allow=True``) -- this function adds no additional interpretation of
+    that data, so the documented fail-open/degraded policy applies here
+    unchanged, and is visible in this function's own returned verdict.
+    """
+    from meridian.claim_guard import evaluate_claim_guard  # noqa: PLC0415 -- pure, no cycle risk
+
+    normalized_guard_mode = (guard_mode or DEFAULT_GUARD_MODE).strip().lower() \
+        if isinstance(guard_mode, str) else DEFAULT_GUARD_MODE
+    if normalized_guard_mode not in RESEARCH_RUN_GUARD_MODES:
+        normalized_guard_mode = DEFAULT_GUARD_MODE
+
+    if normalized_guard_mode == "off":
+        return {
+            "checked": False,
+            "allow": True,
+            "guard_mode": "off",
+            "conflict": False,
+            "reason": None,
+            "holder": None,
+            "claim_mode": None,
+            "symbol": None,
+        }
+
+    claim_mode = "read" if run_mode == "read_only" else "write"
+    verdict = evaluate_claim_guard(claims, session_id, mode=claim_mode, symbol=symbol)
+    conflict = not verdict["allow"]
+    return {
+        "checked": True,
+        "guard_mode": normalized_guard_mode,
+        "claim_mode": verdict["mode"],
+        "symbol": verdict["symbol"],
+        "reason": verdict["reason"],
+        "holder": verdict["holder"],
+        "conflict": conflict,
+        "allow": True if normalized_guard_mode == "warn" else verdict["allow"],
+    }

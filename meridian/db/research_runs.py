@@ -124,6 +124,76 @@ async def list_research_runs(
     return [run for row in rows if (run := _decode_run(row)) is not None]
 
 
+async def check_research_run_guard(
+    db: Any,
+    project_id: str,
+    session_id: str,
+    *,
+    run_mode: str,
+    guard_mode: str = "off",
+    targets: "list[dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
+    """Evaluate the optional symbol-lock guard (W2-A, 260ead1f) for a set of
+    file/symbol targets a research run is about to touch.
+
+    ``targets`` is a list of ``{"file_path": str, "symbol": str | None}``
+    dicts -- letting a caller that knows it only touches a specific symbol
+    check just that symbol, so two sessions holding claims on DISJOINT
+    symbols in the SAME file never collide here (each target is evaluated
+    independently via :func:`meridian.research_run.evaluate_research_run_guard`,
+    which never widens a symbol-scoped ask to a whole-file check).
+
+    ``guard_mode="off"`` (the default) short-circuits before touching the
+    claims table at all: ``{"checked": False, "allow": True, "guard_mode":
+    "off", "results": [], "conflicts": []}`` -- zero query cost, matching
+    this primitive's frictionless-by-default contract. The same applies when
+    ``targets`` is empty/omitted, regardless of ``guard_mode``.
+
+    This function only ever READS claims (via ``get_file_claims``) -- it
+    never calls ``claim_file``/``claim_symbol`` itself, so a read_only run's
+    guard check can never acquire a write lock, and neither can a check that
+    happens to run against an ``isolated_write`` run's declared paths.
+    """
+    normalized_guard_mode = model.validate_guard_mode(guard_mode)
+    if normalized_guard_mode == "off" or not targets:
+        return {
+            "checked": False,
+            "allow": True,
+            "guard_mode": normalized_guard_mode,
+            "results": [],
+            "conflicts": [],
+        }
+
+    from meridian import db as db_module  # noqa: PLC0415 -- avoid a package-init cycle
+
+    results: list[dict[str, Any]] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        file_path = str(target.get("file_path") or "").strip()
+        if not file_path:
+            continue
+        raw_symbol = target.get("symbol")
+        symbol = str(raw_symbol).strip() or None if raw_symbol else None
+        claims = await db_module.get_file_claims(db, file_path, project_id)
+        verdict = model.evaluate_research_run_guard(
+            claims, session_id,
+            guard_mode=normalized_guard_mode, run_mode=run_mode, symbol=symbol,
+        )
+        verdict = {**verdict, "file_path": file_path}
+        results.append(verdict)
+
+    conflicts = [r for r in results if r["conflict"]]
+    overall_allow = True if normalized_guard_mode == "warn" else not conflicts
+    return {
+        "checked": True,
+        "guard_mode": normalized_guard_mode,
+        "allow": overall_allow,
+        "results": results,
+        "conflicts": conflicts,
+    }
+
+
 async def start_research_run(
     db: Any,
     project_id: str,
@@ -135,6 +205,7 @@ async def start_research_run(
     turn_budget: int,
     ttl_seconds: "int | None" = None,
     is_isolated_worktree: bool = False,
+    guard_mode: str = "off",
 ) -> dict[str, Any]:
     """Create a new active research run.
 
@@ -142,6 +213,22 @@ async def start_research_run(
     (never inferred) required for ``mode="isolated_write"`` -- mirrors this
     module's "explicit, never inferred" convention for ``disposition``. A
     read-only run needs no such attestation and no ``claim_file``.
+
+    ``guard_mode`` (W2-A, 260ead1f) is the optional off/warn/strict
+    symbol-lock guard: ``"off"`` (the default) performs no check at all --
+    zero behavior change from before this guard existed. ``"warn"``/
+    ``"strict"`` check each of ``allowed_paths`` (whole-file -- this is the
+    only per-path information ``start_research_run`` has; a caller that
+    knows it only touches specific symbols should evaluate those directly
+    via :func:`check_research_run_guard` for true disjoint-symbol
+    concurrency) against live file/symbol claims held by OTHER sessions.
+    ``"warn"`` surfaces any conflict in the returned run's ``"guard"`` key
+    but never blocks; ``"strict"`` raises :class:`~meridian.research_run.ResearchRunError`
+    and creates no run at all when a conflict is found. A read_only run is
+    always guard-evaluated in read mode (see
+    :func:`meridian.research_run.evaluate_research_run_guard`) even when it
+    supplies ``allowed_paths`` -- it is never treated as requesting a write
+    lock.
     """
     await _require_session(db, project_id, session_id)
     fields = model.validate_run_fields(
@@ -153,6 +240,19 @@ async def start_research_run(
             "isolated_write mode requires is_isolated_worktree=True -- confirm the "
             "session is operating in an isolated git worktree (never the shared "
             "working tree) before starting an isolated-write research run"
+        )
+
+    normalized_guard_mode = model.validate_guard_mode(guard_mode)
+    guard_targets = [{"file_path": p, "symbol": None} for p in fields["allowed_paths"]]
+    guard = await check_research_run_guard(
+        db, project_id, session_id,
+        run_mode=fields["mode"], guard_mode=normalized_guard_mode, targets=guard_targets,
+    )
+    if normalized_guard_mode == "strict" and not guard["allow"]:
+        first = guard["conflicts"][0]
+        raise model.ResearchRunError(
+            f"guard_mode='strict' blocked this research run: {first['file_path']} "
+            f"is {first['reason']} by session {first['holder']}"
         )
 
     run_id = str(uuid.uuid4())
@@ -172,6 +272,7 @@ async def start_research_run(
     await db.commit()
     created = await _find(db, project_id, run_id)
     assert created is not None  # just written
+    created["guard"] = guard
     return created
 
 
