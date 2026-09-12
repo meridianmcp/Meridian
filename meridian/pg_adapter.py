@@ -5004,6 +5004,20 @@ async def _migrate_pg_scratch_research_runs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_scratch_research_runs_promoted_finding(conn: PostgresConnection) -> None:
+    """W1-F (0f0782d2) -- Postgres mirror of
+    meridian/db/migrations.py's _migrate_scratch_research_runs_promoted_finding.
+    Adds the ``promoted_finding_id`` idempotency column used by
+    meridian.db.research_runs.promote_research_run to avoid double-creating
+    a finding note on a retried promotion call. Postgres supports ADD
+    COLUMN IF NOT EXISTS natively -- no _column_exists probe needed, unlike
+    the SQLite side."""
+    await conn.executescript(
+        "ALTER TABLE scratch_research_runs "
+        "ADD COLUMN IF NOT EXISTS promoted_finding_id TEXT;"
+    )
+
+
 async def _migrate_pg_experiment_registry_columns(conn: PostgresConnection) -> None:
     """3f6b8715 -- Postgres mirror: three new columns on the PRE-EXISTING
     ``experiments`` table (hypothesis/status/creator_session_id). See
@@ -5098,6 +5112,38 @@ async def _migrate_pg_experiment_registry_runs(conn: PostgresConnection) -> None
         "ON experiment_events(experiment_id, created_at ASC);"
         "CREATE INDEX IF NOT EXISTS idx_experiment_events_run "
         "ON experiment_events(run_id, created_at ASC);"
+    )
+
+
+async def _migrate_pg_remote_tasks(conn: PostgresConnection) -> None:
+    """32d3d5de -- Postgres mirror of the Durable Remote Task primitive v1
+    register. See meridian/db/migrations.py's _migrate_remote_tasks for the
+    full schema rationale (including the reserved-but-unused
+    ``cost_estimate`` column note) and meridian/remote_exec.py for the
+    closed status vocabulary this table's ``status`` column holds."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS remote_tasks ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    sprint_item_id TEXT,"
+        "    host TEXT NOT NULL,"
+        "    command TEXT NOT NULL,"
+        "    pid INTEGER,"
+        "    status TEXT NOT NULL DEFAULT 'running',"
+        "    log_path TEXT,"
+        "    log_tail TEXT,"
+        "    cost_estimate TEXT,"
+        f"    started_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    completed_at TEXT,"
+        f"    last_heartbeat_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_remote_tasks_project_status "
+        "ON remote_tasks(project_id, status, last_heartbeat_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_remote_tasks_project_session "
+        "ON remote_tasks(project_id, session_id);"
     )
 
 
@@ -5417,8 +5463,10 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_lint_finding,
     _migrate_pg_structural_patch,
     _migrate_pg_scratch_research_runs,
+    _migrate_pg_scratch_research_runs_promoted_finding,
     _migrate_pg_session_recovery_registry,
     _migrate_pg_ai_log_export_config,
     _migrate_pg_experiment_registry_columns,
     _migrate_pg_experiment_registry_runs,
+    _migrate_pg_remote_tasks,
 )

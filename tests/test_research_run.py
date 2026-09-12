@@ -200,6 +200,34 @@ async def test_start_complete_and_idempotent_complete(db):
 
 
 @pytest.mark.asyncio
+async def test_complete_research_run_rejects_oversized_receipt_at_completion(db):
+    """W1-F (0f0782d2) -- the 16KB-cap-by-rejection policy documented in
+    meridian/research_run.py's module docstring must be enforced by
+    complete_research_run ITSELF (the real completion path), not merely by
+    the standalone validate_result_receipt function tested above. A run
+    that hits the cap must be REJECTED outright -- never silently truncated
+    -- and must NOT be left partially transitioned (still 'active', no
+    receipt persisted)."""
+    project, session = await _session(db, "research-run-oversized-completion")
+    run = await run_db.start_research_run(
+        db, project["id"], session["id"],
+        mode="read_only", repository_id="meridian-repo@main", turn_budget=5,
+    )
+    oversized_summary = "x" * model.MAX_RESULT_SUMMARY_CHARS
+    many_commands = [f"echo {'y' * 900}" for _ in range(30)]
+    with pytest.raises(model.ResearchRunError, match="16000-byte cap|16_000-byte cap|exceeds the 16000"):
+        await run_db.complete_research_run(
+            db, project["id"], session["id"], run_id=run["id"],
+            receipt={"result_summary": oversized_summary, "commands_run": many_commands},
+            disposition="keep",
+        )
+    unchanged = await run_db.get_research_run(db, project["id"], run_id=run["id"])
+    assert unchanged["status"] == "active"
+    assert unchanged["result_receipt"] is None
+    assert unchanged["disposition"] is None
+
+
+@pytest.mark.asyncio
 async def test_isolated_write_requires_worktree_attestation_and_allowed_paths(db):
     project, session = await _session(db, "research-run-isolated-write")
     with pytest.raises(ValueError, match="isolated_write mode requires is_isolated_worktree"):
@@ -370,6 +398,38 @@ async def test_promote_research_run_creates_a_finding(db):
     # Actually created and discoverable — not just returned inline.
     findings = await db_module.get_project_notes(db, project["id"], tag="finding")
     assert any(n["id"] == finding_note["id"] for n in findings)
+
+
+@pytest.mark.asyncio
+async def test_promote_research_run_is_idempotent_on_retry(db):
+    """W1-F (0f0782d2) -- a retried promote_research_run call on the SAME
+    run_id must return the EXISTING finding, never create a second one.
+    Guards against a flaky caller (dropped/timed-out response) or a simple
+    duplicate call silently double-creating findings for one run."""
+    project, session = await _session(db, "research-run-promote-idempotent")
+    run = await run_db.start_research_run(
+        db, project["id"], session["id"],
+        mode="read_only", repository_id="meridian-repo@main", turn_budget=5,
+    )
+    await run_db.complete_research_run(
+        db, project["id"], session["id"], run_id=run["id"],
+        receipt={"result_summary": "idempotency probe"}, disposition="promote",
+    )
+    first = await run_db.promote_research_run(db, project["id"], session["id"], run_id=run["id"])
+    assert "idempotent_retry" not in first
+    assert first["finding_id"] == first["finding"]["note"]["id"]
+
+    second = await run_db.promote_research_run(db, project["id"], session["id"], run_id=run["id"])
+    assert second["idempotent_retry"] is True
+    assert second["finding_id"] == first["finding_id"]
+    assert second["finding"]["note"]["id"] == first["finding"]["note"]["id"]
+
+    # Not just equal ids on the returned payload -- only ONE finding note
+    # was actually persisted for this run. get_project_notes omits `body`
+    # by default (5a5bba43 pull model), so bodies=True is required here.
+    findings = await db_module.get_project_notes(db, project["id"], tag="finding", bodies=True)
+    matching = [n for n in findings if run["id"] in (n["body"] or "")]
+    assert len(matching) == 1
 
 
 @pytest.mark.asyncio

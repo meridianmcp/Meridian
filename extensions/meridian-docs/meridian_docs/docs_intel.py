@@ -23807,3 +23807,394 @@ def repair_equation_batch(
         "applied_operations": applied_operations,
         "write_transaction": write_transaction,
     }
+
+
+# ---------------------------------------------------------------------------
+# 6bbce476 (W1-L) -- equation audit consolidation, Phase 1 of proposal
+# cfe4c6df ("Meridian Docs project proposal: equation and nomenclature
+# consistency contract").
+#
+# The proposal's six-phase plan opens with:
+#   "(1) consolidate local audit utilities into a deterministic JSON
+#   manifest with stable IDs, visible-number mapping, display/inline
+#   classification, and digests"
+#
+# This module already ships three read-only equation-audit utilities that
+# grew independently, for different purposes, at different times:
+#   - parse_docx_equations_local  -- raw OMML extraction (a80af3a0)
+#   - audit_equation_integrity    -- structural/numbering INTEGRITY
+#                                     findings + per-equation digests
+#                                     (3d0769ab, MDE-B1)
+#   - audit_equation_style        -- alignment/punctuation STYLE findings
+#                                     (4efc63fd)
+# audit_equation_contract is the single deterministic, dry-run-only entry
+# point Phase 1 asks for. It COMPOSES all three (never re-deriving
+# extraction or finding logic a second way -- the same discipline
+# audit_document/build_document_review already established for their own
+# domains), adds the display/inline classification and the
+# visible-number-vs-audit-serial distinction the proposal names by name as
+# a recurring source of confusion, and reports one unified
+# {violation_type, location, severity, suggested_fix} manifest instead of
+# three differently-shaped results a caller would have to reconcile by
+# hand.
+#
+# Phases 2-6 of the proposal (structural/numbering validation beyond what
+# MDE-B1 already covers, a notation manifest / nomenclature linter, typed
+# OMML builders + selected-proposal staged writes, render-proof
+# comparison, and CLI/MCP/provenance integration beyond the one MCP tool
+# this item adds) are explicitly OUT OF SCOPE here -- see sprint item
+# 6bbce476 and proposal cfe4c6df. audit_equation_contract is read-only in
+# EVERY code path: there is no write/apply mode in this phase, so
+# dry_run=False is rejected outright rather than silently behaving like
+# dry_run=True or attempting a write this phase does not implement.
+# ---------------------------------------------------------------------------
+
+#: Severity for each violation_type audit_equation_contract can emit.
+#: Numbering-identity defects (duplicate/gap/reference-structure-mismatch)
+#: and the two "the math itself is broken" integrity findings are "error";
+#: everything else (style preferences, scope ambiguity, a plaintext
+#: restatement alongside intact OMML) is "warning" -- nothing in Phase 1
+#: is fatal to the document, only worth a human's attention before
+#: submission.
+EQUATION_CONTRACT_VIOLATION_SEVERITY: dict[str, str] = {
+    EQUATION_FINDING_MISSING_OMML: "error",
+    EQUATION_FINDING_MERGED_OMML_SUSPECTED: "error",
+    EQUATION_FINDING_NUMBER_DUPLICATE: "error",
+    EQUATION_FINDING_NUMBER_GAP: "error",
+    EQUATION_FINDING_REFERENCE_STRUCTURE_MISMATCH: "error",
+    EQUATION_FINDING_PLAINTEXT_MATH_DUPLICATE: "warning",
+    EQUATION_FINDING_NUMBER_SCOPE_AMBIGUOUS: "warning",
+    "misaligned_equation": "warning",
+    "missing_trailing_punctuation": "warning",
+    "incorrect_trailing_punctuation": "warning",
+}
+
+#: Short, human-readable remediation hints keyed by violation_type. Never a
+#: repair, never applied automatically -- Phase 1 is read-only analysis
+#: only (see repair_equation_batch / MDE-B2 for the SEPARATE, already-
+#: existing draft-only staged repair path a future phase may wire this
+#: contract's findings into).
+EQUATION_CONTRACT_SUGGESTED_FIX: dict[str, str] = {
+    EQUATION_FINDING_MISSING_OMML: (
+        "Insert native OMML for this equation -- a plain-text stand-in "
+        "cannot be validated or rendered as math."
+    ),
+    EQUATION_FINDING_MERGED_OMML_SUSPECTED: (
+        "Split this <m:oMath> into separate equations at the detected "
+        "seam -- it looks like two equations were concatenated into one."
+    ),
+    EQUATION_FINDING_NUMBER_DUPLICATE: (
+        "Renumber one of the equations sharing this visible number so "
+        "each visible equation number is unique."
+    ),
+    EQUATION_FINDING_NUMBER_GAP: (
+        "Insert the missing equation number or renumber the sequence to "
+        "close the gap."
+    ),
+    EQUATION_FINDING_NUMBER_SCOPE_AMBIGUOUS: (
+        "Standardize on a single equation-numbering convention (flat, "
+        "sectioned, or lettered) throughout the document."
+    ),
+    EQUATION_FINDING_REFERENCE_STRUCTURE_MISMATCH: (
+        "Equations sharing the same visible number have different "
+        "structures -- confirm which is canonical and correct the other "
+        "reference(s)."
+    ),
+    EQUATION_FINDING_PLAINTEXT_MATH_DUPLICATE: (
+        "Remove the duplicated plaintext restatement of this equation "
+        "from the surrounding prose, or rewrite it as descriptive text."
+    ),
+    "misaligned_equation": (
+        "Change this paragraph's alignment to match the configured "
+        "equation_alignment style policy."
+    ),
+    "missing_trailing_punctuation": (
+        "Add trailing punctuation after the equation per the style "
+        "policy's equation_punctuation_chars."
+    ),
+    "incorrect_trailing_punctuation": (
+        "Correct the trailing punctuation after the equation to one of "
+        "the style policy's equation_punctuation_chars."
+    ),
+}
+
+#: audit_equation_style finding types that audit_equation_contract folds
+#: into its own manifest. Deliberately EXCLUDES that function's own
+#: "duplicate_equation_number"/"equation_number_gap" -- audit_equation_
+#: integrity's equivalent findings (EQUATION_FINDING_NUMBER_DUPLICATE /
+#: EQUATION_FINDING_NUMBER_GAP) are the single canonical source for that
+#: defect class in this consolidation, so the same numbering defect is
+#: never reported twice from two different underlying utilities.
+_EQUATION_CONTRACT_STYLE_ONLY_TYPES: tuple[str, ...] = (
+    "misaligned_equation",
+    "missing_trailing_punctuation",
+    "incorrect_trailing_punctuation",
+)
+
+
+def _equation_contract_display_kind(
+    root: "ET.Element", pattern: str, anchor: "str | None"
+) -> str:
+    """Classify one equation's rendered layout kind -- the "unreliable
+    display versus inline classification" problem the proposal calls out
+    by name.
+
+    ``"table-numbered"`` is returned unconditionally for that pattern (its
+    two-column layout is never ambiguous). For ``"standalone"``, the
+    containing paragraph is resolved by ``anchor`` and classified by
+    whether it carries any surrounding plain prose (``<w:t>``, which never
+    includes an equation's own ``<m:t>`` content -- see
+    :func:`_paragraph_prose_text`): a paragraph with no prose at all is a
+    ``"display"`` equation (the paragraph's only real content is the
+    math); any prose alongside it makes every equation in that paragraph
+    ``"inline"``. An anchor that cannot be resolved to one concrete
+    paragraph (e.g. a table-embedded standalone equation synthesized with
+    a ``tbl{N}``-style id -- see :func:`parse_docx_equations_local`), or
+    that resolves ambiguously (:class:`AmbiguousParagraphIdError`, a
+    Word-invalid duplicate ``w14:paraId``), is reported ``"unresolved"``
+    rather than guessed at.
+    """
+    if pattern != "standalone":
+        return "table-numbered"
+    try:
+        located = _find_para_by_id(root, anchor)
+    except AmbiguousParagraphIdError:
+        return "unresolved"
+    if located is None:
+        return "unresolved"
+    _body, para_elem, _idx = located
+    prose = _paragraph_prose_text(para_elem).strip()
+    return "inline" if prose else "display"
+
+
+def _equation_contract_violation(
+    *,
+    violation_type: str,
+    anchor: "str | list[str] | None",
+    section_path: "list[str] | None",
+    ordinal: "int | None",
+    docx_path: str,
+    detail: "dict[str, Any]",
+) -> "dict[str, Any]":
+    """Build one ``{violation_type, location, severity, suggested_fix,
+    detail}`` manifest entry. ``detail`` is carried through UNMODIFIED --
+    the original finding dict from whichever underlying utility produced
+    it, so no information is lost to this consolidation's normalization.
+    """
+    return {
+        "violation_type": violation_type,
+        "location": {
+            "anchor": anchor,
+            "section_path": section_path,
+            "ordinal": ordinal,
+            "docx_path": docx_path,
+        },
+        "severity": EQUATION_CONTRACT_VIOLATION_SEVERITY.get(violation_type, "warning"),
+        "suggested_fix": EQUATION_CONTRACT_SUGGESTED_FIX.get(
+            violation_type,
+            "Manual review required -- no automated suggestion available.",
+        ),
+        "detail": detail,
+    }
+
+
+def audit_equation_contract(
+    docx_path: str,
+    *,
+    project_id: "str | None" = None,
+    dry_run: bool = True,
+) -> "dict[str, Any]":
+    """6bbce476 (W1-L, Phase 1 of proposal cfe4c6df) -- read-only,
+    deterministic equation-contract audit: the single consolidation point
+    for this module's three previously-scattered equation-audit utilities
+    (:func:`parse_docx_equations_local`, :func:`audit_equation_integrity`,
+    :func:`audit_equation_style`).
+
+    Phase 1 ONLY -- see the module comment above this function and sprint
+    item 6bbce476. This function NEVER writes to ``docx_path`` under any
+    circumstances: there is no write/apply/staging-repair mode in this
+    phase (that is proposal phase 4, deliberately deferred), so
+    ``dry_run=False`` is rejected outright with an error rather than
+    silently behaving like ``dry_run=True`` or attempting a write this
+    phase does not implement.
+
+    For every detected equation, ``equations`` reports:
+      - ``equation_id`` -- a stable id derived from the equation's anchor
+        plus its position among equations sharing that anchor
+        (``"{anchor}#{n}"``). Deterministic across repeated calls against
+        unchanged document content; never random, never call-order
+        dependent beyond the document's own paragraph order.
+      - ``audit_serial`` -- this consolidation's own 0-based internal
+        counter (document order), assigned purely for stable
+        identification.
+      - ``visible_number`` -- the equation number that would actually
+        appear in the RENDERED document (e.g. ``"(3)"``), or ``None`` when
+        the equation carries no explicit number.
+
+      ``audit_serial`` and ``visible_number`` are deliberately DISTINCT
+      fields, never to be conflated: the proposal names "confusion between
+      visible equation numbers and audit serials" as a specific, recurring
+      defect class this consolidation exists to stop reproducing. A
+      display/inline equation with no table-numbered pairing always has
+      ``visible_number: None`` even though it still has a real
+      ``audit_serial`` -- that is expected, not a bug.
+
+      - ``pattern`` (``"standalone"`` | ``"table-numbered"``, from
+        :func:`parse_docx_equations_local`) and ``display_kind``
+        (``"display"`` | ``"inline"`` | ``"table-numbered"`` |
+        ``"unresolved"``, from :func:`_equation_contract_display_kind`) --
+        native-OMML classification, distinguishing inline from display per
+        the proposal's semantic contract.
+      - ``anchor``, ``section_path``, ``structure_hash``, ``flat_text``,
+        ``numbering_scope`` -- carried through unchanged from
+        :func:`audit_equation_integrity`'s own records (same digests, same
+        anchors -- never re-derived a second way).
+
+    ``violations`` is the unified, structured manifest the proposal asks
+    for: one entry per detected defect, shaped ``{violation_type,
+    location, severity, suggested_fix, detail}`` (see
+    :func:`_equation_contract_violation`) --
+      - ``violation_type``: one of :func:`audit_equation_integrity`'s
+        :data:`EQUATION_FINDING_TYPES` (the structural/numbering/integrity
+        layer -- treated as this consolidation's CANONICAL source for
+        numbering duplicates/gaps, since it additionally reports
+        ``equation_number_scope_ambiguous`` and
+        ``reference_structure_mismatch`` that a flat gap/duplicate check
+        alone would miss) plus :func:`audit_equation_style`'s STYLE-only
+        types in :data:`_EQUATION_CONTRACT_STYLE_ONLY_TYPES`
+        (``misaligned_equation``, ``missing_trailing_punctuation``,
+        ``incorrect_trailing_punctuation``) that the integrity audit does
+        not cover. ``audit_equation_style``'s OWN
+        ``duplicate_equation_number``/``equation_number_gap`` findings are
+        intentionally NOT re-reported here -- see
+        :data:`_EQUATION_CONTRACT_STYLE_ONLY_TYPES`'s docstring.
+      - ``location``: ``{anchor, section_path, ordinal, docx_path}`` --
+        enough to find the defect without re-parsing. ``section_path`` is
+        looked up from the matching equation record when the finding
+        itself doesn't already carry one and its anchor is a single
+        string (a multi-anchor finding such as
+        ``equation_number_duplicate`` reports ``anchor`` as the full list
+        instead, with ``section_path: None``).
+      - ``severity``: ``"error"`` | ``"warning"`` (see
+        :data:`EQUATION_CONTRACT_VIOLATION_SEVERITY`).
+      - ``suggested_fix``: a short, human-readable remediation hint (see
+        :data:`EQUATION_CONTRACT_SUGGESTED_FIX`) -- never a repair, never
+        applied automatically.
+      - ``detail``: the full underlying finding dict, unmodified.
+
+    Args:
+      docx_path:   Absolute path to the .docx file. Read-only in every
+                   code path -- never mutated, never opened for writing,
+                   regardless of what it finds.
+      project_id:  Optional Meridian project id, carried through onto the
+                   result for forward-compatible provenance/logging in a
+                   later phase (proposal phase 6). Never required and
+                   never consulted by this function's own logic.
+      dry_run:     Must be True. Reserved for a future write/apply mode
+                   (proposal phases 4-5); passing False returns
+                   ``{"error": ...}`` without touching the document.
+
+    Returns:
+      ``{status: "ok", docx_path, project_id, dry_run, source_fingerprint,
+      equation_count, equations, violations, violation_count,
+      violations_by_type, violations_by_severity}`` on success, or
+      ``{"error": <message>}`` when ``dry_run`` is False or the file
+      cannot be read/parsed.
+    """
+    if not dry_run:
+        return {
+            "error": (
+                "audit_equation_contract only supports dry_run=True in "
+                "this phase -- Phase 1 (sprint item 6bbce476) is "
+                "read-only analysis only; no repair/apply mode is "
+                "implemented yet"
+            ),
+        }
+
+    integrity = audit_equation_integrity(docx_path)
+    if integrity.get("error"):
+        return {"error": integrity["error"]}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    style_audit = audit_equation_style(docx_path)
+    style_findings = (
+        style_audit.get("findings", [])
+        if isinstance(style_audit, dict) and not style_audit.get("error")
+        else []
+    )
+
+    section_path_by_anchor: dict[str, list[str]] = {}
+    anchor_serials: dict[str, int] = {}
+    equations: list[dict[str, Any]] = []
+    for record in integrity["records"]:
+        anchor = record["anchor"]
+        section_path_by_anchor.setdefault(anchor, record["section_path"])
+        serial_within_anchor = anchor_serials.get(anchor, 0)
+        anchor_serials[anchor] = serial_within_anchor + 1
+        equations.append({
+            "equation_id": f"{anchor}#{serial_within_anchor}",
+            "audit_serial": record["ordinal"],
+            "visible_number": record["number"],
+            "anchor": anchor,
+            "pattern": record["pattern"],
+            "display_kind": _equation_contract_display_kind(root, record["pattern"], anchor),
+            "section_path": record["section_path"],
+            "structure_hash": record["structure_hash"],
+            "flat_text": record["flat_text"],
+            "numbering_scope": record["numbering_scope"],
+        })
+
+    violations: list[dict[str, Any]] = []
+    for finding in integrity["findings"]:
+        anchor = finding.get("anchor")
+        if anchor is None:
+            anchor = finding.get("anchors")
+        section_path = finding.get("section_path")
+        if section_path is None and isinstance(anchor, str):
+            section_path = section_path_by_anchor.get(anchor)
+        violations.append(_equation_contract_violation(
+            violation_type=finding["type"],
+            anchor=anchor,
+            section_path=section_path,
+            ordinal=finding.get("ordinal"),
+            docx_path=docx_path,
+            detail=finding,
+        ))
+
+    for finding in style_findings:
+        if finding["type"] not in _EQUATION_CONTRACT_STYLE_ONLY_TYPES:
+            continue  # numbering duplicate/gap already reported by the integrity audit above
+        anchor = finding.get("para_id")
+        section_path = section_path_by_anchor.get(anchor) if isinstance(anchor, str) else None
+        violations.append(_equation_contract_violation(
+            violation_type=finding["type"],
+            anchor=anchor,
+            section_path=section_path,
+            ordinal=finding.get("ordinal"),
+            docx_path=docx_path,
+            detail=finding,
+        ))
+
+    violations_by_type: dict[str, int] = {}
+    violations_by_severity: dict[str, int] = {}
+    for v in violations:
+        violations_by_type[v["violation_type"]] = violations_by_type.get(v["violation_type"], 0) + 1
+        violations_by_severity[v["severity"]] = violations_by_severity.get(v["severity"], 0) + 1
+
+    return {
+        "status": "ok",
+        "docx_path": docx_path,
+        "project_id": project_id,
+        "dry_run": True,
+        "source_fingerprint": integrity["source_fingerprint"],
+        "equation_count": integrity["equation_count"],
+        "equations": equations,
+        "violations": violations,
+        "violation_count": len(violations),
+        "violations_by_type": violations_by_type,
+        "violations_by_severity": violations_by_severity,
+    }

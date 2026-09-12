@@ -8550,14 +8550,16 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_lint_finding",
         "_migrate_pg_structural_patch",
         "_migrate_pg_scratch_research_runs",
+        "_migrate_pg_scratch_research_runs_promoted_finding",
         "_migrate_pg_session_recovery_registry",
         "_migrate_pg_ai_log_export_config",
         "_migrate_pg_experiment_registry_columns",
         "_migrate_pg_experiment_registry_runs",
+        "_migrate_pg_remote_tasks",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 167
+    assert len(allnames) == len(set(allnames)) == 169
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

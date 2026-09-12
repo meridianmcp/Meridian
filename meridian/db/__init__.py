@@ -1153,11 +1153,14 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_lint_finding(db)
     await _migrate_structural_patch(db)
     await _migrate_scratch_research_runs(db)
+    await _migrate_scratch_research_runs_promoted_finding(db)
     await _migrate_session_recovery_registry(db)
     await _migrate_ai_log_export_config(db)
     # 3f6b8715 -- W1-M Experiment Registry.
     await _migrate_experiment_registry_columns(db)
     await _migrate_experiment_registry_runs(db)
+    # 32d3d5de -- W1-E Durable Remote Task primitive v1.
+    await _migrate_remote_tasks(db)
     return db
 
 
