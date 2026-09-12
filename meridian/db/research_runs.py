@@ -27,6 +27,7 @@ _RUN_COLUMNS = (
     "id", "project_id", "creator_session_id", "mode", "allowed_paths_json",
     "repository_id", "status", "turn_budget", "started_at", "expires_at",
     "completed_at", "result_receipt_json", "disposition", "created_at", "updated_at",
+    "promoted_finding_id",
 )
 
 
@@ -353,6 +354,17 @@ async def promote_research_run(
     Raises ``ValueError`` when the run doesn't exist in this project, or
     when its stored ``disposition`` is not ``'promote'`` -- promotion is
     never inferred from a run merely being terminal/successful.
+
+    Idempotent on retry (W1-F, 0f0782d2): a run that has already been
+    promoted carries its finding's note id in ``promoted_finding_id``. A
+    second ``promote_research_run`` call on the SAME run_id returns that
+    EXISTING finding (``idempotent_retry=True``) instead of calling
+    ``save_finding`` again -- without this guard, a caller retrying after a
+    dropped/timed-out response (or simply calling promote twice by mistake)
+    would silently double-create a duplicate finding note for one run. If
+    the stored note id no longer resolves (e.g. the note was deleted via
+    ``delete_note``), promotion proceeds as fresh rather than erroring, and
+    the pointer is refreshed to the newly created note.
     """
     run = await _find(db, project_id, run_id)
     if run is None:
@@ -366,7 +378,29 @@ async def promote_research_run(
 
     from meridian import db as db_module  # noqa: PLC0415 -- avoid a package-init cycle
 
+    existing_finding_id = run.get("promoted_finding_id")
+    if existing_finding_id:
+        existing_note = await db_module.get_project_note(db, existing_finding_id)
+        if existing_note is not None:
+            return {
+                "run_id": run_id,
+                "finding_id": existing_finding_id,
+                "finding": {"note": existing_note},
+                "idempotent_retry": True,
+            }
+        # The recorded note id no longer resolves (e.g. deleted out-of-band)
+        # -- fall through and re-promote rather than returning a broken
+        # reference or raising.
+
     finding = await db_module.save_finding(
         db, project_id, _summarize_receipt_for_promotion(run), source_type="code",
     )
-    return {"run_id": run_id, "finding": finding}
+    finding_id = finding["note"]["id"]
+    now = model.utcnow_iso()
+    await db.execute(
+        "UPDATE scratch_research_runs SET promoted_finding_id = ?, updated_at = ? "
+        "WHERE project_id = ? AND id = ?",
+        (finding_id, now, project_id, run_id),
+    )
+    await db.commit()
+    return {"run_id": run_id, "finding_id": finding_id, "finding": finding}

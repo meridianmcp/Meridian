@@ -5004,6 +5004,20 @@ async def _migrate_pg_scratch_research_runs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_scratch_research_runs_promoted_finding(conn: PostgresConnection) -> None:
+    """W1-F (0f0782d2) -- Postgres mirror of
+    meridian/db/migrations.py's _migrate_scratch_research_runs_promoted_finding.
+    Adds the ``promoted_finding_id`` idempotency column used by
+    meridian.db.research_runs.promote_research_run to avoid double-creating
+    a finding note on a retried promotion call. Postgres supports ADD
+    COLUMN IF NOT EXISTS natively -- no _column_exists probe needed, unlike
+    the SQLite side."""
+    await conn.executescript(
+        "ALTER TABLE scratch_research_runs "
+        "ADD COLUMN IF NOT EXISTS promoted_finding_id TEXT;"
+    )
+
+
 async def _migrate_pg_experiment_registry_columns(conn: PostgresConnection) -> None:
     """3f6b8715 -- Postgres mirror: three new columns on the PRE-EXISTING
     ``experiments`` table (hypothesis/status/creator_session_id). See
@@ -5449,6 +5463,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_lint_finding,
     _migrate_pg_structural_patch,
     _migrate_pg_scratch_research_runs,
+    _migrate_pg_scratch_research_runs_promoted_finding,
     _migrate_pg_session_recovery_registry,
     _migrate_pg_ai_log_export_config,
     _migrate_pg_experiment_registry_columns,
