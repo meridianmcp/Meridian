@@ -1697,6 +1697,57 @@ def audit_equation_style(
 
 
 @mcp.tool()
+def audit_equation_contract(
+    docx_path: str,
+    project_id: str | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """6bbce476 (W1-L, Phase 1 of proposal cfe4c6df) -- read-only,
+    deterministic equation-contract audit: consolidates this module's three
+    previously-scattered equation-audit utilities (extract_equations /
+    parse_docx_equations_local, the raw-OOXML equation INTEGRITY auditor
+    behind audit_document's equation category, and audit_equation_style)
+    into ONE structured manifest instead of three differently-shaped
+    results a caller would have to reconcile by hand.
+
+    For every native OMML equation in the document, classifies inline vs.
+    display (vs. table-numbered) layout, and reports BOTH a stable
+    audit_serial (this function's own internal counter) and the equation's
+    visible_number (what actually appears in the rendered document, or
+    None when unnumbered) -- these are deliberately distinct fields, never
+    to be conflated. Every detected equation-structure defect is reported
+    as a structured entry: {violation_type, location, severity,
+    suggested_fix, detail}.
+
+    Phase 1 ONLY -- read-only analysis, never a repair. dry_run defaults
+    to True and is the ONLY supported mode in this phase: passing
+    dry_run=False returns {"error": ...} rather than writing anything or
+    silently behaving like dry_run=True. docx_path is never mutated in any
+    code path.
+
+    Args:
+      docx_path:   Absolute path to the .docx file. Read-only.
+      project_id:  Optional Meridian project id, carried through onto the
+                   result for forward-compatible provenance in a later
+                   phase. Never required.
+      dry_run:     Must be True in this phase (the default). False returns
+                   an error without touching the document.
+
+    Returns:
+      {status, docx_path, project_id, dry_run, source_fingerprint,
+      equation_count, equations, violations, violation_count,
+      violations_by_type, violations_by_severity} or {"error": <message>}.
+      See :func:`meridian_docs.docs_intel.audit_equation_contract` for the
+      full per-field contract.
+    """
+    return docs_intel.audit_equation_contract(
+        docx_path=docx_path,
+        project_id=project_id,
+        dry_run=dry_run,
+    )
+
+
+@mcp.tool()
 def get_journal_style_preset(journal: str) -> dict[str, Any]:
     """4544bbe5 — Look up a named publishing-convention style-policy preset
     (a "document profile" shorthand) instead of hand-writing a full
