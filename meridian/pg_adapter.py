@@ -5101,6 +5101,38 @@ async def _migrate_pg_experiment_registry_runs(conn: PostgresConnection) -> None
     )
 
 
+async def _migrate_pg_remote_tasks(conn: PostgresConnection) -> None:
+    """32d3d5de -- Postgres mirror of the Durable Remote Task primitive v1
+    register. See meridian/db/migrations.py's _migrate_remote_tasks for the
+    full schema rationale (including the reserved-but-unused
+    ``cost_estimate`` column note) and meridian/remote_exec.py for the
+    closed status vocabulary this table's ``status`` column holds."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS remote_tasks ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    sprint_item_id TEXT,"
+        "    host TEXT NOT NULL,"
+        "    command TEXT NOT NULL,"
+        "    pid INTEGER,"
+        "    status TEXT NOT NULL DEFAULT 'running',"
+        "    log_path TEXT,"
+        "    log_tail TEXT,"
+        "    cost_estimate TEXT,"
+        f"    started_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    completed_at TEXT,"
+        f"    last_heartbeat_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_remote_tasks_project_status "
+        "ON remote_tasks(project_id, status, last_heartbeat_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_remote_tasks_project_session "
+        "ON remote_tasks(project_id, session_id);"
+    )
+
+
 async def _migrate_pg_session_recovery_registry(conn: PostgresConnection) -> None:
     """cdd0ef6c -- Postgres mirror of the cross-client session recovery
     registry. See meridian/db/migrations.py's _migrate_session_recovery_registry
@@ -5421,4 +5453,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_ai_log_export_config,
     _migrate_pg_experiment_registry_columns,
     _migrate_pg_experiment_registry_runs,
+    _migrate_pg_remote_tasks,
 )

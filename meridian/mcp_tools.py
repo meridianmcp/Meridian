@@ -40,6 +40,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_external_job": 'get_external_job(project_id="abc-123", job_key="gps-slam-build")',
     "list_external_jobs": 'list_external_jobs(project_id="abc-123")',
     "complete_external_job": 'complete_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="succeeded", detail="verified output")',
+    "start_remote_task": 'start_remote_task(project_id="abc-123", session_id="session-uuid", host="gpu-pod-1", command="python train.py")',
+    "get_remote_task_status": 'get_remote_task_status(project_id="abc-123", job_id="job-uuid")',
+    "list_remote_tasks": 'list_remote_tasks(project_id="abc-123")',
     "register_session_recovery": 'register_session_recovery(project_id="abc-123", session_id="session-uuid", transport="remote_control", client_type="claude-code", local_identity={"local_session_id": "conv-1", "environment_id": "env-9"})',
     "list_resumable_sessions": 'list_resumable_sessions(project_id="abc-123")',
     "get_session_recovery": 'get_session_recovery(project_id="abc-123", session_id="session-uuid")',
@@ -1009,6 +1012,49 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
          "detail": {"type": "string"}, "metadata": {"type": "object"}},
          "required": ["session_id"]}},
+    {"name": "start_remote_task", "description":
+        "32d3d5de — Launch a long-running job on a remote host (e.g. a rented GPU "
+        "pod) over a short-lived SSH connection used ONLY to start it, never held "
+        "open: the command runs fully detached (nohup+setsid), so it survives the "
+        "launching connection dropping for any reason. Returns quickly (a few "
+        "hundred ms) with a job_id regardless of how long the underlying job "
+        "takes — poll get_remote_task_status separately to check on it. Do not "
+        "include credentials in command; use env vars already set on the remote "
+        "host instead.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "host": {"type": "string", "description": "SSH destination: hostname, user@host, or a configured ssh-config alias."},
+         "command": {"type": "string", "description": "Shell command to run on the remote host. Opaque — pipes/redirects/env assignments are all valid."},
+         "sprint_item_id": {"type": "string", "description": "Optional sprint item this job is doing work for."},
+         "ttl_seconds": {"type": "integer", "minimum": 60, "maximum": 2592000, "description": "Optional caller-declared time-to-live; validated but not yet enforced (no background poller in v1)."}},
+         "required": ["session_id", "host", "command"]}},
+    {"name": "get_remote_task_status", "description":
+        "32d3d5de — Open a FRESH SSH connection (never the launching one) and "
+        "determine a remote task's real status: completed (with the real exit "
+        "code), still running (PID alive), terminated-unexpectedly (PID gone, no "
+        "exit code — often OOM-kill or a host reset), connection-lost-but-"
+        "possibly-still-running (the SSH connection itself could not be "
+        "established, explicitly distinct from a failure), or unknown. Includes "
+        "a bounded log tail and elapsed time.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "job_id": {"type": "string"}},
+         "required": ["job_id"]}},
+    {"name": "list_remote_tasks", "description":
+        "32d3d5de — Read the project's persisted remote-task register (last-known "
+        "status only — no live SSH check is made; call get_remote_task_status for "
+        "that). By default terminal jobs are omitted so a new/resumed session "
+        "sees only work that may still need checking on.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string", "description": "Optional: restrict to jobs started by this session."},
+         "include_terminal": {"type": "boolean"},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+         "required": []}},
     {"name": "register_session_recovery", "description":
         "cdd0ef6c — Create or reaffirm (upsert + heartbeat) this session's entry in "
         "the cross-client session recovery registry, so another client/session can "
@@ -4251,6 +4297,7 @@ _READ_ONLY_TOOLS = {
     "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "get_external_job", "list_external_jobs",
+    "list_remote_tasks",
     "list_resumable_sessions", "get_session_recovery",
     "get_research_run", "list_research_runs",
     "get_experiment", "list_experiments", "get_experiment_run", "list_experiment_runs",
@@ -4361,6 +4408,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_external_job":         "session",
     "list_external_jobs":       "session",
     "complete_external_job":    "session",
+    "start_remote_task":        "session",
+    "get_remote_task_status":   "session",
+    "list_remote_tasks":        "session",
     "register_session_recovery": "session",
     "list_resumable_sessions":   "session",
     "get_session_recovery":      "session",
@@ -4638,6 +4688,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "complete_external_job":      "executor",
     "get_external_job":           "both",
     "list_external_jobs":         "both",
+    "start_remote_task":          "executor",
+    "get_remote_task_status":     "both",
+    "list_remote_tasks":          "both",
     "register_session_recovery":  "both",
     "list_resumable_sessions":    "both",
     "get_session_recovery":       "both",
@@ -4887,6 +4940,9 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_external_job":            "common-support",
     "list_external_jobs":          "common-support",
     "complete_external_job":       "common-support",
+    "start_remote_task":           "common-support",
+    "get_remote_task_status":      "common-support",
+    "list_remote_tasks":           "common-support",
     "start_research_run":          "common-support",
     "complete_research_run":       "common-support",
     "get_research_run":            "common-support",

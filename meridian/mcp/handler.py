@@ -4637,7 +4637,8 @@ async def _handle_session_tools(
     save_watchlist_query, list_watchlist_queries, run_watchlist_query,
     delete_watchlist_query, start_research_run, complete_research_run,
     get_research_run, list_research_runs, promote_research_run,
-    register_session_recovery, list_resumable_sessions, get_session_recovery.
+    register_session_recovery, list_resumable_sessions, get_session_recovery,
+    start_remote_task, get_remote_task_status, list_remote_tasks.
 
     81abd31f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4699,6 +4700,14 @@ async def _handle_session_tools(
         handle_list_resumable_sessions,
         handle_get_session_recovery,
     )
+    # 32d3d5de — W1-E Durable Remote Task primitive v1, a new sibling module
+    # beside session_tools.py's external-job handlers (same shape: thin
+    # wrapper over meridian/db/remote_tasks.py).
+    from .handlers.remote_task_tools import (  # noqa: PLC0415
+        handle_start_remote_task,
+        handle_get_remote_task_status,
+        handle_list_remote_tasks,
+    )
 
     # Tools that need no extra context beyond the standard five parameters.
     _standard_dispatch: dict[str, Any] = {
@@ -4735,6 +4744,10 @@ async def _handle_session_tools(
         # cdd0ef6c — cross-client session recovery registry.
         "list_resumable_sessions": handle_list_resumable_sessions,
         "get_session_recovery": handle_get_session_recovery,
+        # 32d3d5de — W1-E Durable Remote Task primitive v1.
+        "start_remote_task": handle_start_remote_task,
+        "get_remote_task_status": handle_get_remote_task_status,
+        "list_remote_tasks": handle_list_remote_tasks,
     }
 
     if name in _standard_dispatch:
