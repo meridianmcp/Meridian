@@ -8223,7 +8223,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // node_modules/preact/dist/preact.module.js
+  // ../../../node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -8482,7 +8482,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // node_modules/preact/hooks/dist/hooks.module.js
+  // ../../../node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8623,7 +8623,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -9476,7 +9476,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // node_modules/zustand/esm/vanilla.mjs
+  // ../../../node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
@@ -10160,6 +10160,7 @@ ${n2.tags || ""}`.toLowerCase();
       await updateLiveFeed(projectId);
       await loadRecentRuns(projectId);
     }
+    if (activeVtab === "experiments") await loadExperimentsTab(projectId);
     if (activeVtab === "team") await loadTeamTab(projectId);
     if (activeVtab === "notes") await loadNotesTab(projectId);
     if (activeVtab === "hitl") await loadHitlTab(projectId);
@@ -11493,7 +11494,9 @@ Current: ${current || "(none)"}`,
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-          <button class="vtab-btn" data-vtab="queue" title="Experiments">\u{1F477}</button>
+          <button class="vtab-btn" data-vtab="queue" title="Active Work">\u{1F477}</button>
+
+          <button class="vtab-btn" data-vtab="experiments" title="Experiments \u2014 trial registry, run drill-down &amp; event timeline">\u{1F9EA}</button>
 
           <button class="vtab-btn" data-vtab="hitl" title="Researcher Review Queue" style="position:relative">\u2753<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
 
@@ -11675,7 +11678,7 @@ Current: ${current || "(none)"}`,
 
             <div class="live-queue" id="live-queue-${project.id}">
 
-              <div class="live-empty">No experiments yet. Add a task above.</div>
+              <div class="live-empty">Nothing queued yet. Add a task above.</div>
 
             </div>
 
@@ -12129,6 +12132,30 @@ Current: ${current || "(none)"}`,
 
       </div>
 
+      <div class="drawer-panel" id="drawer-experiments-${project.id}">
+
+        <div class="drawer-header" style="justify-content:space-between">
+
+          <span style="display:flex;flex-direction:column;gap:1px">
+
+            <span>EXPERIMENTS \xB7 ${escapeHtml(project.name)}</span>
+
+            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Trial registry \u2014 runs, dispositions &amp; the event timeline (dead end / pivot / breakthrough)</span>
+
+          </span>
+
+          <button class="secondary" id="experiments-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px;font-family:var(--font-mono);font-size:11px" id="experiments-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading experiments\u2026</div>
+
+        </div>
+
+      </div>
+
       <div class="drawer-panel" id="drawer-notes-${project.id}">
 
         <div class="drawer-header" style="justify-content:space-between">
@@ -12578,6 +12605,7 @@ Current: ${current || "(none)"}`,
             clearInterval(p3._liveFeedInterval);
           }
           if (vtab === "live") loadLiveTab(project.id);
+          if (vtab === "experiments") loadExperimentsTab(project.id);
           if (vtab === "team") loadTeamTab(project.id);
           if (vtab === "notes") loadNotesTab(project.id);
           if (vtab === "hitl") loadHitlTab(project.id);
@@ -13474,7 +13502,7 @@ Current: ${current || "(none)"}`,
     if (!root) return;
     const live = tasks.filter((t3) => t3.status === "pending" || t3.status === "in_progress");
     if (!live.length) {
-      root.innerHTML = '<div class="live-empty">No experiments yet. Add a task above.</div>';
+      root.innerHTML = '<div class="live-empty">Nothing queued yet. Add a task above.</div>';
       return;
     }
     live.sort((a3, b2) => {
@@ -15267,6 +15295,163 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (statusFilter) statusFilter.onchange = render;
     if (refreshBtn) refreshBtn.onclick = render;
     render();
+  }
+  var _EXPERIMENT_EVENT_CHIP = {
+    dead_end: { bg: "#f87171", label: "DEAD END" },
+    pivot: { bg: "#fbbf24", label: "PIVOT" },
+    breakthrough: { bg: "#a78bfa", label: "BREAKTHROUGH" },
+    note: { bg: "#6b7280", label: "NOTE" },
+    milestone: { bg: "#4ade80", label: "MILESTONE" }
+  };
+  var _EXPERIMENT_RUN_STATUS_COLOR = {
+    active: "#60a5fa",
+    completed: "#4ade80",
+    abandoned: "#f87171",
+    expired: "#6b7280"
+  };
+  var _EXPERIMENT_DISPOSITION_COLOR = {
+    keep: "#4ade80",
+    discard: "#6b7280",
+    promote: "#a78bfa"
+  };
+  async function loadExperimentsTab(projectId) {
+    const body = document.getElementById(`experiments-body-${projectId}`);
+    const refreshBtn = document.getElementById(`experiments-refresh-${projectId}`);
+    if (!body) return;
+    if (refreshBtn && !refreshBtn._experimentsWired) {
+      refreshBtn._experimentsWired = true;
+      refreshBtn.onclick = () => loadExperimentsTab(projectId);
+    }
+    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading experiments\u2026</div>`;
+    let data;
+    try {
+      data = await projectApi(projectId, `/projects/${projectId}/experiments`);
+    } catch (e3) {
+      body.innerHTML = `<div style="color:#f87171;padding:10px">Failed to load experiments: ${escapeHtml(e3 && e3.message || String(e3))}</div>`;
+      return;
+    }
+    const experiments = data.experiments || [];
+    if (experiments.length === 0) {
+      body.innerHTML = `<div style="color:var(--muted);padding:14px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+      No experiments tracked yet. Start one with <code>start_experiment_run</code> in your research session.
+    </div>`;
+      return;
+    }
+    body.innerHTML = experiments.map((exp) => {
+      const statusLabel = escapeHtml(exp.status || "active");
+      const hypothesis = exp.hypothesis ? `<div style="padding:0 12px 8px;color:var(--muted);font-size:11px">${escapeHtml(exp.hypothesis)}</div>` : "";
+      return `
+      <div class="experiment-card" style="border:1px solid var(--border);border-radius:4px;margin-bottom:8px;background:var(--surface-2)">
+        <div class="experiment-header" data-exp-toggle="${escapeHtml(exp.id)}" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;cursor:pointer">
+          <span>
+            <span style="font-weight:600;color:var(--text)">${escapeHtml(exp.name)}</span>
+            <span style="color:var(--muted);font-size:10px;margin-left:8px">${statusLabel}</span>
+          </span>
+          <span data-exp-chevron="${escapeHtml(exp.id)}" style="color:var(--muted);font-size:10px">\u25BC</span>
+        </div>
+        ${hypothesis}
+        <div class="experiment-runs" id="experiment-runs-${escapeHtml(exp.id)}" style="display:none;border-top:1px solid var(--border);padding:8px 12px"></div>
+      </div>
+    `;
+    }).join("");
+    body.querySelectorAll("[data-exp-toggle]").forEach((headerEl) => {
+      headerEl.onclick = async () => {
+        const expId = headerEl.getAttribute("data-exp-toggle");
+        const runsDiv = document.getElementById(`experiment-runs-${expId}`);
+        const chevron = body.querySelector(`[data-exp-chevron="${expId}"]`);
+        if (!runsDiv) return;
+        const opening = runsDiv.style.display === "none";
+        runsDiv.style.display = opening ? "block" : "none";
+        if (chevron) chevron.textContent = opening ? "\u25B2" : "\u25BC";
+        if (opening && !runsDiv._loaded) {
+          runsDiv._loaded = true;
+          await _loadExperimentRuns(projectId, expId, runsDiv);
+        }
+      };
+    });
+  }
+  async function _loadExperimentRuns(projectId, experimentId, container) {
+    container.innerHTML = `<div style="color:var(--muted)">loading runs\u2026</div>`;
+    let data;
+    try {
+      data = await projectApi(projectId, `/projects/${projectId}/experiments/${experimentId}/runs`);
+    } catch (e3) {
+      container.innerHTML = `<div style="color:#f87171">Failed to load runs: ${escapeHtml(e3 && e3.message || String(e3))}</div>`;
+      return;
+    }
+    const runs = data.runs || [];
+    if (runs.length === 0) {
+      container.innerHTML = `<div style="color:var(--muted);padding:6px 0">No runs yet for this experiment.</div>`;
+      return;
+    }
+    container.innerHTML = runs.map((run) => {
+      const statusColor = _EXPERIMENT_RUN_STATUS_COLOR[run.status] || "var(--muted)";
+      const trial = run.trial_label ? `<span style="color:var(--text);margin-left:6px">${escapeHtml(run.trial_label)}</span>` : "";
+      const disposition = run.disposition ? `<span style="color:${_EXPERIMENT_DISPOSITION_COLOR[run.disposition] || "var(--muted)"};margin-left:6px;font-size:10px">[${escapeHtml(run.disposition)}]</span>` : "";
+      const outcome = run.outcome_summary ? `<div style="padding:0 10px 6px;color:var(--muted);font-size:10px">${escapeHtml(run.outcome_summary)}</div>` : "";
+      return `
+      <div class="experiment-run" style="border:1px solid var(--border);border-radius:4px;margin-bottom:6px;background:var(--surface-1)">
+        <div data-run-toggle="${escapeHtml(run.id)}" style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;cursor:pointer">
+          <span>
+            <span style="color:${statusColor};font-weight:600;font-size:10px;text-transform:uppercase">${escapeHtml(run.status)}</span>${trial}${disposition}
+          </span>
+          <span data-run-chevron="${escapeHtml(run.id)}" style="color:var(--muted);font-size:9px">\u25BC</span>
+        </div>
+        ${outcome}
+        <div class="run-events" id="run-events-${escapeHtml(run.id)}" style="display:none;border-top:1px solid var(--border);padding:8px 10px"></div>
+      </div>
+    `;
+    }).join("");
+    container.querySelectorAll("[data-run-toggle]").forEach((runEl) => {
+      runEl.onclick = async () => {
+        const runId = runEl.getAttribute("data-run-toggle");
+        const eventsDiv = document.getElementById(`run-events-${runId}`);
+        const chevron = container.querySelector(`[data-run-chevron="${runId}"]`);
+        if (!eventsDiv) return;
+        const opening = eventsDiv.style.display === "none";
+        eventsDiv.style.display = opening ? "block" : "none";
+        if (chevron) chevron.textContent = opening ? "\u25B2" : "\u25BC";
+        if (opening && !eventsDiv._loaded) {
+          eventsDiv._loaded = true;
+          await _loadExperimentEventTimeline(projectId, experimentId, runId, eventsDiv);
+        }
+      };
+    });
+  }
+  async function _loadExperimentEventTimeline(projectId, experimentId, runId, container) {
+    container.innerHTML = `<div style="color:var(--muted)">loading events\u2026</div>`;
+    let data;
+    try {
+      data = await projectApi(
+        projectId,
+        `/projects/${projectId}/experiments/${experimentId}/events?run_id=${encodeURIComponent(runId)}`
+      );
+    } catch (e3) {
+      container.innerHTML = `<div style="color:#f87171">Failed to load events: ${escapeHtml(e3 && e3.message || String(e3))}</div>`;
+      return;
+    }
+    const events = data.events || [];
+    if (events.length === 0) {
+      container.innerHTML = `<div style="color:var(--muted)">No events recorded for this run yet.</div>`;
+      return;
+    }
+    const items = events.map((ev) => {
+      const chip = _EXPERIMENT_EVENT_CHIP[ev.event_type] || { bg: "#6b7280", label: String(ev.event_type || "").toUpperCase() };
+      const label = ev.label ? `<span style="color:var(--muted);font-size:10px">${escapeHtml(ev.label)}</span>` : "";
+      const when = ev.created_at ? `<span style="color:var(--muted);font-size:9px;margin-left:auto">${escapeHtml(String(ev.created_at))}</span>` : "";
+      const eventBody = ev.body ? `<div style="color:var(--text);font-size:11px">${escapeHtml(ev.body)}</div>` : "";
+      return `
+      <div class="event-item" style="border-left:3px solid ${chip.bg};padding:4px 8px;background:var(--surface-1)">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
+          <span style="background:${chip.bg};color:#0b0b0f;font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px">${chip.label}</span>
+          ${label}
+          ${when}
+        </div>
+        ${eventBody}
+      </div>
+    `;
+    }).join("");
+    container.innerHTML = `<div class="event-timeline" style="display:flex;flex-direction:column;gap:6px">${items}</div>`;
   }
   async function loadTeamTab(projectId) {
     const body = document.getElementById(`team-body-${projectId}`);

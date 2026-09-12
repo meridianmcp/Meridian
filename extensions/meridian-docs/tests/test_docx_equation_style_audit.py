@@ -237,6 +237,22 @@ def test_resolve_style_policy_defaults():
         "heading_terminal_punctuation": None,
         "table_label_column_alignment": None,
         "table_data_column_alignment": None,
+        # 4d0ca929 -- journal-style-preset-oriented keys, all "not verified"
+        # sentinels (None or "unspecified") by default.
+        "heading_numbering_visible": None,
+        "heading_levels_max": None,
+        "emphasis_style": "unspecified",
+        "figure_caption_bold": None,
+        "table_caption_bold": None,
+        "figure_caption_label_punctuation": "unspecified",
+        "table_caption_label_punctuation": "unspecified",
+        "paragraph_indent_method": "unspecified",
+        "figure_dpi_minimum_general": None,
+        "figure_dpi_minimum_halftone": None,
+        "figure_dpi_minimum_line_art": None,
+        "figure_dpi_minimum_combination": None,
+        "si_reformatting_policy": "unspecified",
+        "citation_style": "unspecified",
     }
 
 
@@ -361,6 +377,194 @@ def test_resolve_style_policy_rejects_bad_table_column_alignment(key):
 
 
 # ---------------------------------------------------------------------------
+# resolve_style_policy -- 4d0ca929 journal-style-preset-oriented keys (the
+# fourteen keys added to back JOURNAL_STYLE_PRESETS' 27 new publisher
+# entries: heading numbering/depth, emphasis, caption boldness/punctuation,
+# paragraph indent, per-art-type figure DPI floors, SI reformatting policy,
+# citation style)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "heading_numbering_visible",
+        "heading_levels_max",
+        "figure_caption_bold",
+        "table_caption_bold",
+        "figure_dpi_minimum_general",
+        "figure_dpi_minimum_halftone",
+        "figure_dpi_minimum_line_art",
+        "figure_dpi_minimum_combination",
+    ],
+)
+def test_resolve_style_policy_bool_int_keys_default_none(key):
+    assert docs_intel.resolve_style_policy()[key] is None
+
+
+@pytest.mark.parametrize(
+    "key,default",
+    [
+        ("emphasis_style", "unspecified"),
+        ("figure_caption_label_punctuation", "unspecified"),
+        ("table_caption_label_punctuation", "unspecified"),
+        ("paragraph_indent_method", "unspecified"),
+        ("si_reformatting_policy", "unspecified"),
+        ("citation_style", "unspecified"),
+    ],
+)
+def test_resolve_style_policy_enum_keys_default_unspecified(key, default):
+    assert docs_intel.resolve_style_policy()[key] == default
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_resolve_style_policy_accepts_valid_heading_numbering_visible(value):
+    assert (
+        docs_intel.resolve_style_policy({"heading_numbering_visible": value})[
+            "heading_numbering_visible"
+        ]
+        == value
+    )
+
+
+@pytest.mark.parametrize("bad_value", [1, "yes", [], {}])
+def test_resolve_style_policy_rejects_bad_heading_numbering_visible(bad_value):
+    with pytest.raises(ValueError, match="heading_numbering_visible"):
+        docs_intel.resolve_style_policy({"heading_numbering_visible": bad_value})
+
+
+@pytest.mark.parametrize("value", [1, 4, None])
+def test_resolve_style_policy_accepts_valid_heading_levels_max(value):
+    assert (
+        docs_intel.resolve_style_policy({"heading_levels_max": value})["heading_levels_max"]
+        == value
+    )
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, "3", 1.5, True])
+def test_resolve_style_policy_rejects_bad_heading_levels_max(bad_value):
+    with pytest.raises(ValueError, match="heading_levels_max"):
+        docs_intel.resolve_style_policy({"heading_levels_max": bad_value})
+
+
+@pytest.mark.parametrize("valid_value", ["italic", "bold", "discouraged", "unspecified"])
+def test_resolve_style_policy_accepts_valid_emphasis_style(valid_value):
+    assert (
+        docs_intel.resolve_style_policy({"emphasis_style": valid_value})["emphasis_style"]
+        == valid_value
+    )
+
+
+def test_resolve_style_policy_rejects_bad_emphasis_style():
+    with pytest.raises(ValueError, match="emphasis_style"):
+        docs_intel.resolve_style_policy({"emphasis_style": "underline"})
+
+
+@pytest.mark.parametrize("key", ["figure_caption_bold", "table_caption_bold"])
+@pytest.mark.parametrize("value", [True, False, None])
+def test_resolve_style_policy_accepts_valid_caption_bold(key, value):
+    assert docs_intel.resolve_style_policy({key: value})[key] == value
+
+
+@pytest.mark.parametrize("key", ["figure_caption_bold", "table_caption_bold"])
+def test_resolve_style_policy_rejects_bad_caption_bold(key):
+    with pytest.raises(ValueError, match=key):
+        docs_intel.resolve_style_policy({key: "yes"})
+
+
+@pytest.mark.parametrize(
+    "key", ["figure_caption_label_punctuation", "table_caption_label_punctuation"]
+)
+@pytest.mark.parametrize("valid_value", ["period", "colon", "none", "unspecified"])
+def test_resolve_style_policy_accepts_valid_caption_label_punctuation(key, valid_value):
+    assert docs_intel.resolve_style_policy({key: valid_value})[key] == valid_value
+
+
+@pytest.mark.parametrize(
+    "key", ["figure_caption_label_punctuation", "table_caption_label_punctuation"]
+)
+def test_resolve_style_policy_rejects_bad_caption_label_punctuation(key):
+    with pytest.raises(ValueError, match=key):
+        docs_intel.resolve_style_policy({key: "semicolon"})
+
+
+@pytest.mark.parametrize(
+    "valid_value", ["tab", "space", "none", "automatic_style", "unspecified"]
+)
+def test_resolve_style_policy_accepts_valid_paragraph_indent_method(valid_value):
+    assert (
+        docs_intel.resolve_style_policy({"paragraph_indent_method": valid_value})[
+            "paragraph_indent_method"
+        ]
+        == valid_value
+    )
+
+
+def test_resolve_style_policy_rejects_bad_paragraph_indent_method():
+    with pytest.raises(ValueError, match="paragraph_indent_method"):
+        docs_intel.resolve_style_policy({"paragraph_indent_method": "hanging"})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "figure_dpi_minimum_general",
+        "figure_dpi_minimum_halftone",
+        "figure_dpi_minimum_line_art",
+        "figure_dpi_minimum_combination",
+    ],
+)
+@pytest.mark.parametrize("value", [1, 300, 1200, None])
+def test_resolve_style_policy_accepts_valid_figure_dpi_minimums(key, value):
+    assert docs_intel.resolve_style_policy({key: value})[key] == value
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "figure_dpi_minimum_general",
+        "figure_dpi_minimum_halftone",
+        "figure_dpi_minimum_line_art",
+        "figure_dpi_minimum_combination",
+    ],
+)
+@pytest.mark.parametrize("bad_value", [0, -300, "300", 1.5, True])
+def test_resolve_style_policy_rejects_bad_figure_dpi_minimums(key, bad_value):
+    with pytest.raises(ValueError, match=key):
+        docs_intel.resolve_style_policy({key: bad_value})
+
+
+@pytest.mark.parametrize("valid_value", ["as_received", "retypeset", "unspecified"])
+def test_resolve_style_policy_accepts_valid_si_reformatting_policy(valid_value):
+    assert (
+        docs_intel.resolve_style_policy({"si_reformatting_policy": valid_value})[
+            "si_reformatting_policy"
+        ]
+        == valid_value
+    )
+
+
+def test_resolve_style_policy_rejects_bad_si_reformatting_policy():
+    with pytest.raises(ValueError, match="si_reformatting_policy"):
+        docs_intel.resolve_style_policy({"si_reformatting_policy": "rewritten"})
+
+
+@pytest.mark.parametrize(
+    "valid_value",
+    ["numbered_superscript", "numbered_bracket", "author_date", "not_fixed", "unspecified"],
+)
+def test_resolve_style_policy_accepts_valid_citation_style(valid_value):
+    assert (
+        docs_intel.resolve_style_policy({"citation_style": valid_value})["citation_style"]
+        == valid_value
+    )
+
+
+def test_resolve_style_policy_rejects_bad_citation_style():
+    with pytest.raises(ValueError, match="citation_style"):
+        docs_intel.resolve_style_policy({"citation_style": "footnote"})
+
+
+# ---------------------------------------------------------------------------
 # get_journal_style_preset -- 4544bbe5 publishing-convention shorthand
 # ---------------------------------------------------------------------------
 
@@ -387,6 +591,189 @@ def test_get_journal_style_preset_jcshm_round_trips_through_resolve_style_policy
 def test_get_journal_style_preset_rejects_unknown_name():
     with pytest.raises(ValueError, match="unknown journal style preset"):
         docs_intel.get_journal_style_preset("not-a-real-journal")
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset -- 4d0ca929: 29 total presets (27 new publisher
+# presets added on top of the pre-existing default+jcshm pair), per
+# workspace proposals 3674c0c1 (round 1, 9 publishers) and 64266f13 (round
+# 2, 18 publishers). See the PROVENANCE NOTE above JOURNAL_STYLE_PRESETS in
+# docs_intel.py: neither proposal's own body actually contained literal
+# per-publisher field data, so every preset's concrete values below were
+# independently re-verified against a live publisher guidelines page during
+# this sprint item's own pass -- these tests check the values this pass
+# actually shipped, not a hypothetical "original" dataset.
+# ---------------------------------------------------------------------------
+
+_ALL_29_PRESET_NAMES = frozenset(
+    {
+        "default", "jcshm",
+        # round 1 (proposal 3674c0c1)
+        "nature", "elsevier", "ieee", "wiley", "acm", "mdpi", "plos",
+        "taylor_francis", "sage",
+        # round 2 (proposal 64266f13)
+        "springer", "frontiers", "hindawi", "cambridge_up", "oxford_up",
+        "de_gruyter", "cell_press", "acs", "aps", "aip", "rsc", "asce",
+        "asme", "emerald", "peerj", "optica", "science_aaas", "copernicus",
+    }
+)
+
+
+def test_journal_style_presets_key_set_is_exactly_the_expected_29():
+    assert set(docs_intel.JOURNAL_STYLE_PRESETS) == _ALL_29_PRESET_NAMES
+    assert len(docs_intel.JOURNAL_STYLE_PRESETS) == 29
+
+
+@pytest.mark.parametrize("name", sorted(_ALL_29_PRESET_NAMES))
+def test_get_journal_style_preset_resolves_every_preset_without_error(name):
+    preset = docs_intel.get_journal_style_preset(name)
+    # Fully resolved: every resolve_style_policy key present, and idempotent
+    # under re-resolution (round-trips cleanly, matching the jcshm contract).
+    assert set(preset) == set(docs_intel.resolve_style_policy())
+    assert docs_intel.resolve_style_policy(preset) == preset
+
+
+def test_get_journal_style_preset_nature():
+    preset = docs_intel.get_journal_style_preset("nature")
+    assert preset["citation_style"] == "numbered_superscript"
+    assert preset["figure_dpi_minimum_halftone"] == 300
+    assert preset["figure_dpi_minimum_line_art"] == 800
+
+
+def test_get_journal_style_preset_elsevier():
+    preset = docs_intel.get_journal_style_preset("elsevier")
+    assert preset["emphasis_style"] == "discouraged"
+    assert preset["si_reformatting_policy"] == "as_received"
+    assert preset["figure_dpi_minimum_halftone"] == 300
+    assert preset["figure_dpi_minimum_line_art"] == 1000
+    assert preset["figure_dpi_minimum_combination"] == 500
+
+
+def test_get_journal_style_preset_ieee():
+    preset = docs_intel.get_journal_style_preset("ieee")
+    assert preset["citation_style"] == "numbered_bracket"
+    assert preset["heading_levels_max"] == 4
+    # IEEE's own manual states heading enumeration is "desirable, but not
+    # required" -- an author preference, not a hard requirement -- so this
+    # is deliberately left unspecified rather than forced to True.
+    assert preset["heading_numbering_visible"] is None
+
+
+def test_get_journal_style_preset_springer():
+    preset = docs_intel.get_journal_style_preset("springer")
+    # Springer supports both author-date ("Harvard") and numbered citation
+    # styles depending on the journal -- an explicit defers-to-the-
+    # individual-journal fact, hence not_fixed rather than picking one.
+    assert preset["citation_style"] == "not_fixed"
+    assert preset["heading_levels_max"] == 3
+    assert preset["figure_dpi_minimum_halftone"] == 300
+    assert preset["figure_dpi_minimum_line_art"] == 800
+    assert preset["figure_dpi_minimum_combination"] == 600
+
+
+def test_get_journal_style_preset_hindawi():
+    preset = docs_intel.get_journal_style_preset("hindawi")
+    assert preset["citation_style"] == "numbered_bracket"
+    assert preset["figure_dpi_minimum_general"] == 300
+
+
+def test_get_journal_style_preset_case_insensitive_lookup():
+    """4d0ca929 -- get_journal_style_preset must resolve any preset name
+    case-insensitively."""
+    for name in ("Nature", "NATURE", "nAtUrE"):
+        assert docs_intel.get_journal_style_preset(name) == docs_intel.get_journal_style_preset(
+            "nature"
+        )
+    assert docs_intel.get_journal_style_preset("IEEE") == docs_intel.get_journal_style_preset(
+        "ieee"
+    )
+    assert docs_intel.get_journal_style_preset(
+        "Taylor_Francis"
+    ) == docs_intel.get_journal_style_preset("taylor_francis")
+    # Pre-existing presets are unaffected by the case-insensitivity change.
+    assert docs_intel.get_journal_style_preset("JCSHM") == docs_intel.get_journal_style_preset(
+        "jcshm"
+    )
+    assert docs_intel.get_journal_style_preset("Default") == docs_intel.get_journal_style_preset(
+        "default"
+    )
+
+
+def test_get_journal_style_preset_unknown_name_still_rejected_case_insensitively():
+    with pytest.raises(ValueError, match="unknown journal style preset"):
+        docs_intel.get_journal_style_preset("NOT-A-REAL-JOURNAL")
+
+
+def test_journal_style_presets_are_distinct_across_a_few_publishers():
+    """Sanity check that presets actually differ from each other rather than
+    all resolving to the same values (would silently defeat the point of
+    having 29 separate entries)."""
+    nature = docs_intel.get_journal_style_preset("nature")
+    elsevier = docs_intel.get_journal_style_preset("elsevier")
+    ieee = docs_intel.get_journal_style_preset("ieee")
+    hindawi = docs_intel.get_journal_style_preset("hindawi")
+
+    # citation_style: nature is superscript, elsevier never set it
+    # (unspecified), ieee/hindawi are both bracket -- distinct enough to
+    # prove these aren't all resolving to the same thing.
+    assert nature["citation_style"] == "numbered_superscript"
+    assert elsevier["citation_style"] == "unspecified"
+    assert ieee["citation_style"] == "numbered_bracket"
+    assert hindawi["citation_style"] == "numbered_bracket"
+    assert nature["citation_style"] != elsevier["citation_style"]
+    assert nature["citation_style"] != ieee["citation_style"]
+
+    assert nature["figure_dpi_minimum_line_art"] != elsevier["figure_dpi_minimum_line_art"]
+    # elsevier sets emphasis_style explicitly; nature/ieee/hindawi don't.
+    assert elsevier["emphasis_style"] == "discouraged"
+    assert nature["emphasis_style"] == "unspecified"
+    assert ieee["emphasis_style"] == "unspecified"
+    assert hindawi["emphasis_style"] == "unspecified"
+
+
+def test_get_journal_style_preset_taylor_francis_end_to_end():
+    """Full end-to-end resolve for a round-1 preset not otherwise asserted
+    field-by-field above."""
+    preset = docs_intel.get_journal_style_preset("taylor_francis")
+    assert preset == docs_intel.resolve_style_policy(
+        {
+            "figure_dpi_minimum_halftone": 300,
+            "figure_dpi_minimum_line_art": 600,
+        }
+    )
+
+
+def test_get_journal_style_preset_copernicus_end_to_end():
+    """Full end-to-end resolve for a round-2 preset not otherwise asserted
+    field-by-field above."""
+    preset = docs_intel.get_journal_style_preset("copernicus")
+    assert preset == docs_intel.resolve_style_policy(
+        {
+            "citation_style": "author_date",
+            "figure_dpi_minimum_general": 300,
+        }
+    )
+
+
+def test_get_journal_style_preset_science_aaas_citation_style_left_unspecified():
+    """Science/AAAS uses parenthetical italic numerals, which doesn't map
+    cleanly onto either numbered_superscript (not superscript) or
+    numbered_bracket (this schema means square brackets); citation_style is
+    deliberately left unspecified rather than force-fit."""
+    preset = docs_intel.get_journal_style_preset("science_aaas")
+    assert preset["citation_style"] == "unspecified"
+    assert preset["figure_dpi_minimum_halftone"] == 300
+    assert preset["figure_dpi_minimum_line_art"] == 600
+
+
+def test_get_journal_style_preset_acm_caption_boldness_left_unspecified():
+    """ACM's own sub-formats (sigconf vs. journal format) disagree on
+    figure/table caption boldness defaults -- proposal 3674c0c1's caveat --
+    so these are deliberately left unspecified rather than picking one."""
+    preset = docs_intel.get_journal_style_preset("acm")
+    assert preset["figure_caption_bold"] is None
+    assert preset["table_caption_bold"] is None
+    assert preset["citation_style"] == "numbered_bracket"
 
 
 # ---------------------------------------------------------------------------
