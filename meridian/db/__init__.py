@@ -12883,6 +12883,23 @@ from .proposal_lineage import (  # noqa: F401
 )
 
 
+# 4eedeef8 — RECONCILE: legacy proposal-predecessor-reference audit + opt-in
+# migration. Imported immediately after .proposal_lineage since it composes
+# get_workspace_proposals (workspace.py), get_proposal_lineage_links /
+# link_proposal_lineage (.proposal_lineage, just imported above), and
+# get_proposal_links / link_proposal_evidence (.proposal_links, imported
+# earlier still) — all already defined by this point. No new table: this
+# module only reads existing rows and writes through the already-hardened
+# link_proposal_lineage / link_proposal_evidence primitives.
+from .proposal_reconciliation import (  # noqa: F401
+    audit_legacy_proposal_lineage,
+    migrate_legacy_proposal_lineage,
+    audit_legacy_promotion_evidence,
+    migrate_legacy_promotion_evidence,
+    audit_legacy_proposal_references,
+)
+
+
 # eb2e44f8 — immutable wave base manifests for git worktrees (repo identity,
 # base branch/SHA, owning sprint item), checked by
 # meridian.worktree_merge_guard.validate_worktree_merge before a
