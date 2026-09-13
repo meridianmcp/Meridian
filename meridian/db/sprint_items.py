@@ -356,6 +356,23 @@ _ACTIVE_SPRINT_STATUSES = {
 # (e.g. a huge sprint board) rather than everyday completion calls.
 _ADVISORY_PHASE_TIMEOUT_S = 5.0
 
+
+async def _rollback_best_effort(db: aiosqlite.Connection) -> None:
+    """dcf78192 — a cancelled/failed advisory phase (wave-run bookkeeping,
+    post-commit side effects, continuation-input gathering) can leave the
+    SHARED connection mid-transaction: the core status write above has
+    already committed, but the advisory phase's own partial writes (or a
+    cancelled-mid-query state on the same connection) have not. Left
+    uncleared, the next caller to touch this connection can block waiting on
+    a lock the abandoned transaction still holds — the exact failure mode
+    this item was filed to close. Rolling back here is always safe (a no-op
+    if nothing is pending) and never raises, so it can never turn an
+    already-successful completion into a failure."""
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001 — best-effort; never let cleanup wedge completion
+        pass
+
 # Statuses that make an existing item a *blocking* duplicate when a new item
 # with a near-identical title is added. Only open/active work counts: a title
 # that overlaps a finished item (done / skipped / failed / pushed) is allowed
@@ -2481,8 +2498,9 @@ async def complete_sprint_item(
             )
         except asyncio.TimeoutError:
             _advisory_deferred = True
+            await _rollback_best_effort(db)
         except Exception:  # noqa: BLE001 — wave-run bookkeeping must never wedge completion
-            pass
+            await _rollback_best_effort(db)
         try:
             await asyncio.wait_for(
                 _run_post_commit_side_effects(db, project_id, item_id),
@@ -2490,8 +2508,9 @@ async def complete_sprint_item(
             )
         except asyncio.TimeoutError:
             _advisory_deferred = True
+            await _rollback_best_effort(db)
         except Exception:  # noqa: BLE001 — advisory only, never block completion
-            pass
+            await _rollback_best_effort(db)
         _mark_phase("post_commit_advisory")
         if _evidence_quality_warning or _stored_evidence_warning or _blocker_kind_completion_warning:
             result = dict(result)
@@ -2521,8 +2540,9 @@ async def complete_sprint_item(
             )
         except asyncio.TimeoutError:
             _advisory_deferred = True
+            await _rollback_best_effort(db)
         except Exception:  # noqa: BLE001 — advisory only, never block completion
-            pass
+            await _rollback_best_effort(db)
         _mark_phase("continuation_state")
         result = dict(result)
         if _advisory_deferred:
