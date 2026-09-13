@@ -96,6 +96,53 @@ def test_format_unresolved_symbol_target_marks_it():
     assert "unresolved" in line
 
 
+def test_format_resolved_range_target_with_repo_root_shows_companion_repo():
+    """W1-J — a companion-repo target's relative uri must never render as if
+    it lived in THIS project's own repo: the repo_root identity is surfaced
+    explicitly in the rendered line."""
+    line = handoff_module._format_resolved_pointer_target(
+        {
+            "resolved": True,
+            "selector_type": "range",
+            "uri": "src/chapter1.tex",
+            "range": {"start_line": 1, "end_line": 40},
+            "repo_root": "thesis-abc123def456",
+        }
+    )
+    assert "src/chapter1.tex" in line
+    assert "thesis-abc123def456" in line
+    assert "companion repo" in line
+
+
+def test_format_resolved_symbol_target_with_repo_root_shows_companion_repo():
+    line = handoff_module._format_resolved_pointer_target(
+        {
+            "resolved": True,
+            "selector_type": "symbol",
+            "uri": "src/lib.py",
+            "qualified_name": "lib.helper",
+            "file": "src/lib.py",
+            "repo_root": "companion-abc123",
+        }
+    )
+    assert "companion-abc123" in line
+
+
+def test_format_resolved_range_target_without_repo_root_no_companion_suffix():
+    """No repo_root -> no suffix at all — the pre-existing, unambiguous
+    same-repo rendering is byte-for-byte unchanged."""
+    line = handoff_module._format_resolved_pointer_target(
+        {
+            "resolved": True,
+            "selector_type": "range",
+            "uri": "meridian/db/__init__.py",
+            "range": {"start_line": 10, "end_line": 20},
+        }
+    )
+    assert "companion repo" not in line
+    assert line == "meridian/db/__init__.py:10-20"
+
+
 def test_format_resolved_pointer_flattens_targets():
     out = handoff_module._format_resolved_pointer(
         {

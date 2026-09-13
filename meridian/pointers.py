@@ -64,6 +64,36 @@ Windows drive letters, ``/``-vs-``\\`` separators, UNC hosts, and WSL
 reported "missing" purely because a later check ran under a different one.
 See that function's docstring for the full contract.
 
+``repo_root`` (W1-J) — names WHICH repository a target's ``uri`` is anchored
+to, for a **companion-repo pointer**: one whose ``uri`` lives in a different
+checkout than the repo hosting this Meridian project (e.g. a paper/thesis
+repo kept alongside the code repo). Without it, a relative ``uri`` is
+ambiguous the moment more than one repo is in play — is ``"src/chapter1.tex"``
+relative to THIS project's repo, or to a sibling checkout entirely? Storing a
+full absolute path to disambiguate is not an option: ``sprint_item_pointers``
+is project-shared, multi-machine state, and a raw local path leaks a
+machine's username/directory layout to every other session that opens the
+project — the same non-negotiable rule :mod:`meridian.capability_manifest`
+already enforces for manifest fields, and the same problem
+``projects.repo_identity`` (see :mod:`meridian.repo_scope`) solves for a
+project's OWN repo binding.
+
+``repo_root`` reuses that exact solution: whatever string the caller passes
+(a real local path, or an already-opaque label) is run through
+:func:`meridian.repo_scope.compute_repo_identity` — an ``f"{basename}-
+{sha256(normalized)[:12]}"`` fingerprint — before being stored; the raw
+input is never persisted, and the same real path always normalizes to the
+same identity (case/separator-insensitive), so two sessions on the same
+checkout agree without comparing raw strings. Omitting ``repo_root``
+entirely means the pre-existing, unambiguous default: the ``uri`` is
+anchored to the same repo hosting this Meridian project. A ``repo_root``
+identity cannot be reversed back into a real path, so the write-time
+``target_kind="existing"`` filesystem check below is SKIPPED (never falsely
+run against the WRONG repo's cwd, and never silently claimed as verified)
+for any target that declares one — resolving a companion-repo target
+against its real root requires an injected resolver, exactly like
+``remote_fs`` above has none by default.
+
 Selector variants — every selector carries an explicit ``"type"``; the field
 below is the type-specific key it also needs (443d9453):
 
@@ -642,11 +672,23 @@ def _validate_freshness(freshness: Any) -> dict[str, Any]:
     return out
 
 
+def _normalize_repo_root(raw: str) -> str:
+    """W1-J — turn a caller-supplied ``repo_root`` (a real local path, or an
+    already-opaque label) into the portable identity fingerprint that is
+    actually stored. See the module docstring's ``repo_root`` section for the
+    full rationale. Never raises: :func:`compute_repo_identity` only returns
+    ``None`` for an empty/whitespace-only input, which ``_validate_target``
+    already rejects before calling this."""
+    from .repo_scope import compute_repo_identity  # noqa: PLC0415 — avoid import cycle
+
+    return compute_repo_identity(raw) or raw
+
+
 def _validate_target(
     target: Any, *, path_exists: Callable[[str], bool] | None = None
 ) -> dict[str, Any]:
-    """Validate one ``{uri, selector, subSelector?, target_kind?}`` target; return
-    a normalized copy.
+    """Validate one ``{uri, selector, subSelector?, target_kind?, repo_root?}``
+    target; return a normalized copy.
 
     A ``subSelector`` at the TARGET level (a peer of ``selector``) is accepted as
     an alias for nesting it under the selector — some callers put it there per the
@@ -686,7 +728,22 @@ def _validate_target(
     else:
         kind = _DEFAULT_TARGET_KIND
 
-    if kind_explicit and kind == "existing" and _looks_like_local_path(uri):
+    # W1-J — repo_root: which companion repo a relative uri is anchored to.
+    # Validated/normalized BEFORE the existence check below, since its
+    # presence changes whether that check may run at all (see module
+    # docstring's "repo_root" section).
+    repo_root_present = "repo_root" in target and target["repo_root"] is not None
+    normalized_repo_root: str | None = None
+    if repo_root_present:
+        raw_repo_root = target["repo_root"]
+        if not isinstance(raw_repo_root, str) or not raw_repo_root.strip():
+            raise PointerValidationError("target repo_root must be a non-empty string")
+        normalized_repo_root = _normalize_repo_root(raw_repo_root.strip())
+
+    if (
+        kind_explicit and kind == "existing" and _looks_like_local_path(uri)
+        and not repo_root_present
+    ):
         checker = path_exists or os.path.exists
         # ba539706 — try uri under every normalized candidate spelling
         # (file:// stripped, separators flipped, Windows-drive <-> WSL
@@ -697,8 +754,17 @@ def _validate_target(
                 f"target_kind='existing' but no file exists at uri {uri!r} "
                 "(use target_kind='planned_new' for a file that does not exist yet)"
             )
+    # W1-J — a repo_root-bearing target's uri is relative to a DIFFERENT
+    # repo than this process's cwd: checking it here would check the WRONG
+    # root and produce a false "no file exists" rejection for a file that
+    # genuinely exists in the companion repo (the exact ambiguity bug this
+    # field closes). The check is skipped, not silently passed — never
+    # claimed as verified, exactly like every other "no resolver available"
+    # case in this module (e.g. remote_fs).
 
     out_target: dict[str, Any] = {"uri": uri, "selector": selector, "target_kind": kind}
+    if repo_root_present:
+        out_target["repo_root"] = normalized_repo_root
     # 62640241 — optional, additive universal freshness proof. Omitted
     # entirely when the caller didn't supply one — matches target_kind's own
     # backward-compat contract of never inventing a value that wasn't there.
@@ -1532,6 +1598,14 @@ async def resolve_pointer(
         if fstate is not None:
             outer["freshness_state"] = fstate
 
+        # W1-J — echo the target's declared repo_root identity (if any) onto
+        # the resolved shape, purely additive, so a renderer (e.g.
+        # handoff._format_resolved_pointer_target) can show WHICH companion
+        # repo a relative uri belongs to instead of rendering a bare,
+        # ambiguous path.
+        if target.get("repo_root"):
+            outer["repo_root"] = target["repo_root"]
+
         # subSelector — resolve the outer, then narrow. The subSelector is itself a
         # full selector (W3C hasSubSelector); resolve it against the SAME uri.
         sub = selector.get("subSelector")
@@ -2005,6 +2079,12 @@ def build_typed_pointer_record(
         }
         if not rtarget.get("resolved") and rtarget.get("reason"):
             entry["reason"] = rtarget["reason"]
+        # W1-J — echo the stored repo_root identity (if any) so a typed
+        # record consumer (generate_handoff's <sprint_item_pointers> clause,
+        # capability_contract's item_sprint_item_pointers) can see WHICH
+        # companion repo this target's uri is anchored to.
+        if raw_target.get("repo_root"):
+            entry["repo_root"] = raw_target["repo_root"]
         # 62640241 — echo the declared freshness proof (if the target had
         # one) and the LIVE freshness state resolve_pointer computed for it.
         declared_freshness = raw_target.get("freshness")

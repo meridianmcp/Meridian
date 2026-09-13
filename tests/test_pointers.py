@@ -414,6 +414,331 @@ async def test_db_pointer_target_kind_existing_real_path_allowed(db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# W1-J — repo_root: companion-repo pointers first-class
+# ---------------------------------------------------------------------------
+
+def test_repo_root_normalizes_to_portable_identity_not_raw_path():
+    """A raw local path passed as repo_root is NEVER stored verbatim — it is
+    converted to compute_repo_identity's one-way basename+hash fingerprint,
+    the same non-negotiable rule projects.repo_identity already enforces for
+    this project's OWN repo binding (never a machine-local absolute path in
+    project-shared state)."""
+    from meridian.repo_scope import compute_repo_identity
+
+    raw_path = r"C:\Users\alice\thesis-repo"
+    ptr = validate_pointer({
+        "source_type": "docs",
+        "targets": [{
+            "uri": "src/chapter1.tex",
+            "selector": {"type": "range", "start_line": 1, "end_line": 40},
+            "repo_root": raw_path,
+        }],
+    })
+    stored = ptr["targets"][0]["repo_root"]
+    assert stored == compute_repo_identity(raw_path)
+    assert raw_path not in stored
+    assert "alice" not in stored  # no username leakage into shared state
+
+
+def test_repo_root_same_path_different_spelling_normalizes_identically():
+    """Cross-platform/spelling equivalence (backslash vs forward slash, case)
+    must resolve to the SAME identity, exactly like compute_repo_identity's
+    own contract — otherwise two sessions on the same companion checkout
+    would silently disagree about which repo a pointer belongs to."""
+    def _mk(raw):
+        return validate_pointer({
+            "source_type": "docs",
+            "targets": [{"uri": "a.tex",
+                         "selector": {"type": "range", "start_line": 1, "end_line": 2},
+                         "repo_root": raw}],
+        })["targets"][0]["repo_root"]
+
+    a = _mk(r"C:\Repo\Thesis")
+    b = _mk("c:/repo/thesis/")
+    assert a == b
+
+
+def test_repo_root_omitted_leaves_target_shape_unchanged():
+    """Purely additive/opt-in: a target with no repo_root key gets no
+    repo_root key in the normalized output — matches target_kind/freshness's
+    own backward-compat contract."""
+    ptr = validate_pointer({
+        "source_type": "code",
+        "targets": [{"uri": "a.py", "selector": {"type": "range",
+                     "start_line": 1, "end_line": 2}}],
+    })
+    assert "repo_root" not in ptr["targets"][0]
+
+
+def test_repo_root_empty_string_rejected():
+    with pytest.raises(PointerValidationError, match="repo_root"):
+        validate_pointer({
+            "source_type": "docs",
+            "targets": [{"uri": "a.tex",
+                         "selector": {"type": "range", "start_line": 1, "end_line": 2},
+                         "repo_root": "   "}],
+        })
+
+
+def test_repo_root_non_string_rejected():
+    with pytest.raises(PointerValidationError, match="repo_root"):
+        validate_pointer({
+            "source_type": "docs",
+            "targets": [{"uri": "a.tex",
+                         "selector": {"type": "range", "start_line": 1, "end_line": 2},
+                         "repo_root": 12345}],
+        })
+
+
+def test_repo_root_target_kind_existing_check_is_skipped_not_falsely_rejected(tmp_path):
+    """THE BUG: before repo_root existed, a companion-repo pointer declaring
+    target_kind='existing' on a relative uri was checked against THIS
+    process's cwd — the wrong repo — and a file that genuinely exists in the
+    companion checkout was falsely rejected as missing. Reproduced here: the
+    relative uri does not exist under tmp_path/this test's cwd either, so the
+    OLD behavior (no repo_root skip) would raise; declaring repo_root must
+    make validation succeed instead of running that check at all."""
+    import os
+    relative_uri = "src/chapter1.tex"  # does not exist anywhere near cwd
+    assert not os.path.exists(relative_uri)  # sanity: the old check WOULD fail
+    # Confirm the OLD behavior really would have raised, by calling the
+    # existence check directly the same way _validate_target would without
+    # the repo_root skip: same uri, target_kind='existing', no repo_root.
+    with pytest.raises(PointerValidationError, match="target_kind='existing'"):
+        validate_pointer({
+            "source_type": "docs",
+            "targets": [{
+                "uri": relative_uri,
+                "selector": {"type": "range", "start_line": 1, "end_line": 10},
+                "target_kind": "existing",
+            }],
+        })
+    ptr = validate_pointer({
+        "source_type": "docs",
+        "targets": [{
+            "uri": relative_uri,
+            "selector": {"type": "range", "start_line": 1, "end_line": 10},
+            "target_kind": "existing",
+            "repo_root": str(tmp_path / "companion-repo"),
+        }],
+    })
+    assert ptr["targets"][0]["uri"] == relative_uri
+    assert ptr["targets"][0]["target_kind"] == "existing"
+    assert "repo_root" in ptr["targets"][0]
+
+
+def test_repo_root_without_target_kind_existing_still_normal_default():
+    """repo_root doesn't change target_kind's own default/opt-in semantics —
+    omitting target_kind still normalizes to 'existing' unchecked, exactly
+    like every other target."""
+    ptr = validate_pointer({
+        "source_type": "docs",
+        "targets": [{"uri": "src/chapter1.tex",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 10},
+                     "repo_root": "/home/alice/thesis"}],
+    })
+    assert ptr["targets"][0]["target_kind"] == "existing"
+
+
+@pytest.mark.asyncio
+async def test_resolve_pointer_echoes_repo_root_on_resolved_target():
+    """resolve_pointer must surface repo_root on the resolved shape so a
+    downstream renderer (handoff._format_resolved_pointer_target) can show
+    which companion repo a uri belongs to."""
+    ptr = validate_pointer({
+        "source_type": "docs",
+        "targets": [{"uri": "src/chapter1.tex",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 10},
+                     "repo_root": "/home/alice/thesis"}],
+    })
+    result = await resolve_pointer(None, ptr)
+    assert result["targets"][0]["repo_root"] == ptr["targets"][0]["repo_root"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_pointer_no_repo_root_key_omitted_from_resolved_target():
+    ptr = validate_pointer({
+        "source_type": "code",
+        "targets": [{"uri": "a.py", "selector": {"type": "range",
+                     "start_line": 1, "end_line": 2}}],
+    })
+    result = await resolve_pointer(None, ptr)
+    assert "repo_root" not in result["targets"][0]
+
+
+@pytest.mark.asyncio
+async def test_db_pointer_repo_root_round_trips(db, tmp_path):
+    """DB layer: repo_root survives add -> get, converted to an identity
+    fingerprint (never the raw path)."""
+    from meridian.repo_scope import compute_repo_identity
+
+    p = await db_module.create_project(db, "ptr-repo-root")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    raw_root = str(tmp_path / "companion-repo")
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "src/chapter1.tex",
+          "selector": {"type": "range", "start_line": 1, "end_line": 10},
+          "repo_root": raw_root}],
+    )
+    expected = compute_repo_identity(raw_root)
+    assert stored["targets"][0]["repo_root"] == expected
+    got = await db_module.get_sprint_item_pointers(db, item["id"])
+    assert got[0]["targets"][0]["repo_root"] == expected
+
+
+# ---------------------------------------------------------------------------
+# W1-J — relocate_sprint_item_pointer: atomic pointer relocation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_relocate_pointer_updates_targets_preserving_id_and_created_at(db):
+    """The core contract: relocate changes targets/source_type/label IN
+    PLACE — id/project_id/sprint_item_id/created_at never change, unlike a
+    delete_sprint_item_pointer + add_sprint_item_pointer pair."""
+    p = await db_module.create_project(db, "reloc-basic")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+        label="original",
+    )
+    pointer_id = stored["id"]
+    created_at = stored["created_at"]
+
+    updated = await db_module.relocate_sprint_item_pointer(
+        db, p["id"], pointer_id,
+        targets=[{"uri": "b.py", "selector": {"type": "range",
+                  "start_line": 5, "end_line": 6}}],
+    )
+    assert updated["id"] == pointer_id
+    assert updated["created_at"] == created_at
+    assert updated["project_id"] == p["id"]
+    assert updated["sprint_item_id"] == item["id"]
+    assert updated["targets"][0]["uri"] == "b.py"
+    # label wasn't passed -> untouched.
+    assert updated["label"] == "original"
+    # source_type wasn't passed -> untouched.
+    assert updated["source_type"] == "code"
+
+    # Re-fetching independently confirms it's the SAME row, not a new one.
+    all_pointers = await db_module.get_sprint_item_pointers(db, item["id"])
+    assert len(all_pointers) == 1
+    assert all_pointers[0]["id"] == pointer_id
+
+
+@pytest.mark.asyncio
+async def test_relocate_pointer_label_unset_vs_explicit_null(db):
+    """label uses the _UNSET-sentinel convention: omit it entirely to leave
+    the stored value untouched; pass it explicitly (including None) to
+    change/clear it."""
+    p = await db_module.create_project(db, "reloc-label")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+        label="keep-me",
+    )
+    # source_type-only change: label omitted -> stays "keep-me".
+    r1 = await db_module.relocate_sprint_item_pointer(
+        db, p["id"], stored["id"], source_type="docs",
+    )
+    assert r1["label"] == "keep-me"
+    assert r1["source_type"] == "docs"
+
+    # Explicit label=None clears it.
+    r2 = await db_module.relocate_sprint_item_pointer(
+        db, p["id"], stored["id"], label=None,
+    )
+    assert r2["label"] is None
+
+
+@pytest.mark.asyncio
+async def test_relocate_pointer_requires_at_least_one_field(db):
+    p = await db_module.create_project(db, "reloc-noop")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    )
+    with pytest.raises(ValueError):
+        await db_module.relocate_sprint_item_pointer(db, p["id"], stored["id"])
+
+
+@pytest.mark.asyncio
+async def test_relocate_pointer_nonexistent_id_returns_none(db):
+    p = await db_module.create_project(db, "reloc-missing")
+    result = await db_module.relocate_sprint_item_pointer(
+        db, p["id"], "not-a-real-pointer-id", source_type="docs",
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_relocate_pointer_cross_project_isolation_returns_none(db):
+    """A pointer_id that's real but belongs to a DIFFERENT project must not
+    be relocatable by naming the wrong project_id — mirrors efea329f's
+    cross-project isolation fix for get_sprint_item_pointers."""
+    p1 = await db_module.create_project(db, "reloc-proj-1")
+    p2 = await db_module.create_project(db, "reloc-proj-2")
+    item1 = await db_module.add_sprint_item(db, p1["id"], "v1", "item")
+    stored = await db_module.add_sprint_item_pointer(
+        db, p1["id"], item1["id"], "code",
+        [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    )
+    result = await db_module.relocate_sprint_item_pointer(
+        db, p2["id"], stored["id"], source_type="docs",
+    )
+    assert result is None
+    # The original pointer must be completely untouched.
+    still_there = await db_module.get_sprint_item_pointers(db, item1["id"])
+    assert still_there[0]["source_type"] == "code"
+
+
+@pytest.mark.asyncio
+async def test_relocate_pointer_invalid_new_targets_leaves_row_unchanged(db):
+    """Validation runs BEFORE the write — a malformed replacement targets
+    array must raise and leave the existing row completely untouched (same
+    fail-closed contract add_sprint_item_pointer already has)."""
+    p = await db_module.create_project(db, "reloc-invalid")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    )
+    with pytest.raises(ValueError):
+        await db_module.relocate_sprint_item_pointer(
+            db, p["id"], stored["id"],
+            targets=[{"uri": "b.py", "selector": {"type": "bogus_type"}}],
+        )
+    unchanged = await db_module.get_sprint_item_pointers(db, item["id"])
+    assert unchanged[0]["targets"][0]["uri"] == "a.py"
+
+
+@pytest.mark.asyncio
+async def test_relocate_pointer_repo_root_normalized_same_as_add(db, tmp_path):
+    """relocate_sprint_item_pointer validates new targets through the SAME
+    meridian.pointers.validate_pointer path add_sprint_item_pointer uses —
+    repo_root gets the same portable-identity normalization, not a raw path."""
+    from meridian.repo_scope import compute_repo_identity
+
+    p = await db_module.create_project(db, "reloc-repo-root")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "item")
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "src/ch1.tex", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    )
+    raw_root = str(tmp_path / "thesis-repo")
+    updated = await db_module.relocate_sprint_item_pointer(
+        db, p["id"], stored["id"],
+        targets=[{"uri": "src/ch1.tex",
+                  "selector": {"type": "range", "start_line": 1, "end_line": 2},
+                  "repo_root": raw_root}],
+    )
+    assert updated["targets"][0]["repo_root"] == compute_repo_identity(raw_root)
+
+
+# ---------------------------------------------------------------------------
 # Serialize / deserialize the JSON targets column
 # ---------------------------------------------------------------------------
 
@@ -2350,6 +2675,39 @@ def test_check_structural_validity_never_touches_real_filesystem():
     }
     valid, err = check_structural_validity(stored)
     assert valid is True and err is None
+
+
+def test_build_typed_pointer_record_echoes_repo_root():
+    """W1-J — the FULL typed record (rendered into generate_handoff's
+    <sprint_item_pointers> clause) must surface repo_root, so a receiving
+    executor can see WHICH companion repo a target's uri belongs to."""
+    stored = {"source_type": "docs", "targets": [{
+        "uri": "src/chapter1.tex",
+        "selector": {"type": "range", "start_line": 1, "end_line": 10},
+        "target_kind": "existing",
+        "repo_root": "thesis-abc123def456",
+    }]}
+    resolved = {"source_type": "docs", "targets": [{
+        "resolved": True, "selector_type": "range", "uri": "src/chapter1.tex",
+        "range": {"start_line": 1, "end_line": 10},
+        "repo_root": "thesis-abc123def456",
+    }]}
+    rec = build_typed_pointer_record(stored, resolved)
+    assert rec["targets"][0]["repo_root"] == "thesis-abc123def456"
+
+
+def test_build_typed_pointer_record_no_repo_root_key_when_absent():
+    stored = {"source_type": "code", "targets": [{
+        "uri": "a.py",
+        "selector": {"type": "range", "start_line": 1, "end_line": 2},
+        "target_kind": "existing",
+    }]}
+    resolved = {"source_type": "code", "targets": [{
+        "resolved": True, "selector_type": "range", "uri": "a.py",
+        "range": {"start_line": 1, "end_line": 2},
+    }]}
+    rec = build_typed_pointer_record(stored, resolved)
+    assert "repo_root" not in rec["targets"][0]
 
 
 def test_build_typed_pointer_record_target_resolved_true_for_fully_resolved_pointer():

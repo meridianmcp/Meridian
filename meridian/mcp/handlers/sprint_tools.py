@@ -2551,6 +2551,63 @@ async def handle_delete_sprint_item_pointer(
     return {"pointer_id": args["pointer_id"], "deleted": removed}
 
 
+async def handle_relocate_sprint_item_pointer(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: relocate_sprint_item_pointer.
+
+    W1-J — thin wrapper over
+    :func:`meridian.db.sprint_items.relocate_sprint_item_pointer`: the
+    atomic UPDATE (edit-via-replace) half of the pointer CRUD, closing the
+    gap ``delete_sprint_item_pointer``'s own docstring names ("a stored
+    pointer is immutable, so 'editing' one is delete-then-re-add") — see
+    that function's docstring for the full non-atomicity rationale.
+
+    ``project_id`` + ``pointer_id`` are required; at least one of
+    ``targets``/``source_type``/``label`` must also be supplied. ``label``
+    distinguishes "omitted" (keep the current value) from an explicit
+    ``null``/empty string (clear it) via the JSON key's presence in ``args``
+    — matching how ``patch_sprint_item``'s optional fields already behave
+    over this same MCP JSON-args boundary.
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    if not args.get("pointer_id"):
+        return {"error": "pointer_id is required"}
+    if args.get("targets") is None and args.get("source_type") is None and "label" not in args:
+        return {
+            "error": "at least one of targets/source_type/label is required "
+            "(nothing to relocate)"
+        }
+    validate_input_size(args.get("label"), "pointer label", 500)
+    # Only forward label when the caller supplied the key (mirrors every
+    # other _UNSET-sentinel optional field in this module, e.g.
+    # patch_sprint_item's wave/track/etc. above) — omitting it leaves the
+    # pointer's current label untouched; passing null/"" clears it.
+    _relocate_kwargs: dict[str, Any] = {
+        "targets": args.get("targets"),
+        "source_type": args.get("source_type"),
+    }
+    if "label" in args:
+        _relocate_kwargs["label"] = args.get("label")
+    try:
+        result = await db_module.relocate_sprint_item_pointer(
+            db,
+            args["project_id"],
+            args["pointer_id"],
+            **_relocate_kwargs,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if result is None:
+        return {"error": f"pointer not found in project: {args['pointer_id']}"}
+    return result
+
+
 async def handle_execute_batch(
     args: dict[str, Any],
     db: Any,

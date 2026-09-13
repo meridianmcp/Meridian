@@ -6207,12 +6207,26 @@ def _format_resolved_pointer_target(target: dict[str, Any]) -> str | None:
     carries nothing usable. Handles the resolved shapes emitted by pointers.
     resolve_pointer per selector_type (symbol/range/node_id/zotero_key/
     text_quote/finding_id) plus the unresolved ``{resolved: False, reason}`` case.
+
+    W1-J — a companion-repo target (one whose stored pointer declared a
+    ``repo_root``) gets an explicit ``[in companion repo <repo_root>]``
+    suffix on every uri-bearing rendering, so a relative path is never
+    silently presented as if it lived in the SAME repo as this Meridian
+    project — the exact ambiguity ``repo_root`` (see meridian.pointers'
+    module docstring) exists to close.
     """
     if not isinstance(target, dict):
         return None
     uri = str(target.get("uri") or "").strip()
     stype = target.get("selector_type")
     resolved = bool(target.get("resolved"))
+    # W1-J — a companion-repo target (pointers.resolve_pointer echoes the
+    # declared repo_root identity onto every resolved target) renders its
+    # uri with an explicit "in <repo_root>" suffix, so a bare relative path
+    # is never silently mistaken for one anchored to THIS project's own
+    # repo — the exact ambiguity the repo_root field exists to close.
+    repo_root = str(target.get("repo_root") or "").strip()
+    repo_suffix = f" [in companion repo {repo_root}]" if repo_root else ""
     if stype == "symbol":
         qn = str(target.get("qualified_name") or "").strip()
         file = str(target.get("file") or "").strip()
@@ -6222,17 +6236,17 @@ def _format_resolved_pointer_target(target: dict[str, Any]) -> str | None:
                 loc += f" — {file}"
             elif uri:
                 loc += f" — {uri}"
-            return loc
+            return loc + repo_suffix
         base = f"`{qn}`" if qn else (uri or "(symbol)")
-        return f"{base} — unresolved ({target.get('reason') or 'no match'})"
+        return f"{base} — unresolved ({target.get('reason') or 'no match'}){repo_suffix}"
     if stype == "range":
         rng = target.get("range") or {}
         sl, el = rng.get("start_line"), rng.get("end_line")
         span = f":{sl}-{el}" if sl is not None and el is not None else ""
-        return f"{uri or '(file)'}{span}"
+        return f"{uri or '(file)'}{span}{repo_suffix}"
     if stype == "node_id":
         nid = target.get("id")
-        base = f"{uri or '(doc)'} #{nid}"
+        base = f"{uri or '(doc)'} #{nid}{repo_suffix}"
         return base if resolved else f"{base} — unresolved"
     if stype == "zotero_key":
         key = target.get("key")
@@ -6251,7 +6265,7 @@ def _format_resolved_pointer_target(target: dict[str, Any]) -> str | None:
         return f"finding {fid}" + ("" if resolved else " — unresolved")
     # Unknown / malformed target — surface the uri + reason if any.
     if uri:
-        return uri if resolved else f"{uri} — unresolved"
+        return f"{uri}{repo_suffix}" if resolved else f"{uri} — unresolved{repo_suffix}"
     return None
 
 
