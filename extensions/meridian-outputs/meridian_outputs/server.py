@@ -41,6 +41,22 @@ table, the two-tier launch strategy, and the ``local_only``/``unavailable``
 convention it introduces. This tool never touches ``search_outputs``/
 ``register_output_paths``, which remain exactly as they were.
 
+Item 19917525 added the first-class derived-artifact cache
+(``get_cached_derived_variant``/``put_cached_derived_variant``/
+``invalidate_derived_variant``/``invalidate_stale_derived_variants``/
+``evict_derived_cache``/``get_derived_cache_stats``/
+``get_derived_cache_convergence_state``) -- a real, persisted, keyed cache
+from ``(source_path, variant, params)`` to derived-artifact bytes, with
+LRU eviction and signature/hash-verified invalidation. See
+:mod:`meridian_outputs.derived_cache` for the full contract; bytes cross
+this MCP boundary base64-encoded (JSON has no native binary type). The
+in-process "render once, serve from cache thereafter" primitive
+(``derived_cache.get_or_render_variant``, which takes a Python callback and
+therefore cannot be exposed as an MCP tool) is a package-level import, not
+wired here -- callers that already run in-process (this package's own
+future renderers, or a sibling extension importing this package directly)
+use that; a remote MCP client uses the get/put pair below instead.
+
 This is the wave-1 stopgap for local outputs indexing.  The hosted-aware
 smart-routing layer (item 1365e01a) is deliberately out of scope here.
 
@@ -55,6 +71,7 @@ Security notes:
 """
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -63,6 +80,7 @@ from . import (
     annotate,
     artifact_registry,
     classify,
+    derived_cache,
     file_inspector,
     fingerprint,
     outputs_local,
@@ -1262,6 +1280,213 @@ def script_content_hash(script_path: str) -> str | None:
       moved, permissions) -- never raises.
     """
     return fingerprint.script_content_hash(script_path)
+
+
+@mcp.tool()
+def get_cached_derived_variant(
+    outputs_dir: str,
+    source_path: str,
+    variant: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Look up one cached derived variant of ``source_path`` (item 19917525),
+    verified fresh against the source's CURRENT on-disk state before ever
+    being returned as a hit.
+
+    See :func:`meridian_outputs.derived_cache.get_cached_variant` for the
+    full verification contract (fast stat-only path, content-hash fallback,
+    and the exact ``reason`` values). Cached bytes cross this MCP boundary
+    base64-encoded (``data_base64``) -- JSON has no native binary type.
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      source_path:   The file this derived artifact was rendered from.
+      variant:       Variant/recipe name this cache entry was stored under
+                    (e.g. "thumbnail_256").
+      params:        The rendering params that were used, if any -- part of
+                    the cache key, so a lookup with different params for the
+                    same source+variant is a genuine miss.
+
+    Returns:
+      ``{"hit", "reason", "data_base64", "entry", "key"}``. ``data_base64``
+      is ``None`` on a miss. ``entry`` is the manifest row (metadata only,
+      no bytes) on a hit, else ``None``.
+    """
+    result = derived_cache.get_cached_variant(outputs_dir, source_path, variant, params)
+    data = result.pop("data", None)
+    result["data_base64"] = base64.b64encode(data).decode("ascii") if data is not None else None
+    return result
+
+
+@mcp.tool()
+def put_cached_derived_variant(
+    outputs_dir: str,
+    source_path: str,
+    variant: str,
+    data_base64: str,
+    params: dict[str, Any] | None = None,
+    content_type: str | None = None,
+    file_extension: str = ".bin",
+    owner: str | None = None,
+) -> dict[str, Any]:
+    """Persist a rendered derived variant of ``source_path`` to the cache
+    (item 19917525), recording the source's signature and content hash AT
+    THIS MOMENT.
+
+    See :func:`meridian_outputs.derived_cache.put_cached_variant` for the
+    full contract. Written under
+    ``<outputs_dir>/.meridian-outputs-cache/derived/`` -- the same
+    ``.meridian-outputs-cache/`` convention every other ledger in this
+    package already uses, so ``get_cache_quota_status`` sees this cache's
+    disk usage for free.
+
+    Args:
+      outputs_dir:      Absolute path to the outputs directory.
+      source_path:      The file this derived artifact was rendered from.
+      variant:          Variant/recipe name (part of the cache key).
+      data_base64:      The derived artifact's bytes, base64-encoded (JSON
+                        has no native binary type).
+      params:           Rendering params (part of the cache key).
+      content_type:     Optional MIME-ish label, stored for callers'
+                        convenience (not interpreted here).
+      file_extension:   Extension for the on-disk artifact file.
+      owner:            Optional caller identity, recorded for audit only
+                        (e.g. a benchmark's single-cache-owner discipline) --
+                        never enforced as a lock.
+
+    Returns:
+      The persisted manifest entry (metadata only, no bytes).
+    """
+    data = base64.b64decode(data_base64)
+    entry = derived_cache.put_cached_variant(
+        outputs_dir, source_path, variant, data,
+        params=params, content_type=content_type,
+        file_extension=file_extension, owner=owner,
+    )
+    return entry.to_dict()
+
+
+@mcp.tool()
+def invalidate_derived_variant(
+    outputs_dir: str,
+    source_path: str,
+    variant: str | None = None,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Explicitly purge cached derived variant(s) of ``source_path`` (item
+    19917525). ``variant=None`` purges EVERY cached variant for this source
+    path; a specific ``variant`` (with optional ``params``) purges only
+    that exact entry.
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      source_path:   The source file whose cached variant(s) to purge.
+      variant:       Specific variant to purge, or None for all variants of
+                    this source.
+      params:        Params identifying the specific entry (only used with
+                    an explicit ``variant``).
+
+    Returns:
+      ``{"removed_keys": [...], "removed_count": int}``.
+    """
+    removed = derived_cache.invalidate_variant(outputs_dir, source_path, variant, params)
+    return {"removed_keys": removed, "removed_count": len(removed)}
+
+
+@mcp.tool()
+def invalidate_stale_derived_variants(outputs_dir: str) -> dict[str, Any]:
+    """Purge every cached derived variant whose SOURCE is currently flagged
+    stale by the existing ``fingerprint`` staleness ledger (item 19917525).
+
+    Composes with :func:`check_staleness` rather than duplicating it: an
+    unchanged output file's own bytes can never reveal that the SCRIPT
+    which produced it has since changed, but a derived variant rendered
+    from that output (e.g. a thumbnail) would otherwise keep being served
+    from cache forever. Call this after fixing a generating script (the
+    same trigger ``find_stale_by_script`` targets) to force every
+    downstream derived variant to be re-rendered on next request.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+
+    Returns:
+      ``{"stale_sources_checked", "invalidated_keys"}``.
+    """
+    return derived_cache.invalidate_stale_sources(outputs_dir)
+
+
+@mcp.tool()
+def evict_derived_cache(
+    outputs_dir: str,
+    max_bytes: int | None = None,
+    max_files: int | None = None,
+) -> dict[str, Any]:
+    """Real LRU eviction over the derived-artifact cache (item 19917525):
+    removes the oldest-accessed entries (and their on-disk artifact files)
+    until both an optional byte budget and an optional file-count budget
+    are satisfied.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      max_bytes:    Optional byte budget (None = unbounded).
+      max_files:    Optional file-count budget (None = unbounded).
+
+    Returns:
+      ``{"evicted_count", "evicted_keys", "freed_bytes", "remaining_count",
+      "remaining_bytes"}``. A no-op (both budgets None, or nothing over
+      budget) returns zero counts, never an error.
+    """
+    return derived_cache.evict_to_budget(outputs_dir, max_bytes=max_bytes, max_files=max_files)
+
+
+@mcp.tool()
+def get_derived_cache_stats(outputs_dir: str) -> dict[str, Any]:
+    """Aggregate, read-only summary of the derived-artifact cache (item
+    19917525): entry/byte counts, total hits, distinct variants, and the
+    age range of what is currently persisted.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+
+    Returns:
+      ``{"outputs_dir", "entry_count", "total_bytes", "total_hits",
+      "distinct_variants", "oldest_created_at", "newest_created_at"}``.
+    """
+    return derived_cache.get_cache_stats(outputs_dir)
+
+
+@mcp.tool()
+def get_derived_cache_convergence_state(
+    outputs_dir: str,
+    max_bytes: int | None = None,
+    max_files: int | None = None,
+) -> dict[str, Any]:
+    """Real, checkable convergence state for the derived-artifact cache
+    (item 19917525) -- NOT the same question ``get_convergence_state``
+    answers for the (walk-based) search index.
+
+    This cache has no background walk; "converged" here means the on-disk
+    manifest is genuinely readable AND every artifact file it references
+    actually exists on disk -- i.e. the persisted cache is self-consistent,
+    not merely present. Intended for a benchmark/qualification harness (see
+    item 28448a5c) to confirm a freshly-written cache is real and valid
+    before trusting any timing/throughput figure measured against it.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      max_bytes:    Optional byte budget forwarded to the embedded quota
+                    report.
+      max_files:    Optional file-count budget forwarded to the embedded
+                    quota report.
+
+    Returns:
+      ``{"outputs_dir", "converged", "manifest_readable", "entry_count",
+      "total_bytes", "missing_artifact_keys", "quota", "last_write_at",
+      "reason"}``.
+    """
+    return derived_cache.get_convergence_state(
+        outputs_dir, max_bytes=max_bytes, max_files=max_files,
+    ).to_dict()
 
 
 @mcp.tool()
