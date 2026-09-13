@@ -7332,19 +7332,60 @@ def get_convergence_state(
     ``outputs_dir``. Does NOT trigger a rebuild -- purely reads current
     state, so it's cheap and safe to poll.
 
-    ``subtree`` (optional): scope the answer to a sub-path, not just the
-    whole ``outputs_dir`` -- see :meth:`OutputsFtsIndex.get_convergence_state`.
+    e23eeda6 -- ``subtree`` resolution now mirrors :func:`search_outputs`
+    EXACTLY: when given, this routes through the same :func:`get_subtree_index`
+    a ``search_outputs(outputs_dir, ..., subtree=subtree)`` call for the
+    identical path would use, and reads THAT index's own convergence state
+    (no further ``subtree=`` filter needed -- the returned index already
+    represents exactly that directory). Fixes the real "false-converged"
+    gap this item was opened to close: before this fix, a ``subtree``
+    argument here was answered from the WHOLE-ROOT index's own walk
+    progress via a best-effort scan-boundary heuristic
+    (:meth:`OutputsFtsIndex.get_convergence_state`'s ``subtree`` param) --
+    an entirely DIFFERENT object, with its own separate on-disk cache, than
+    the independently-converging subtree index ``search_outputs``'s own
+    ``subtree`` argument actually searches. The two could -- and, on the
+    real incident behind this item, did -- disagree: the root-index
+    heuristic could report ``converged=True`` for a subtree whose OWN
+    dedicated index (the one that will actually service a scoped search)
+    had never been built, or vice versa, making the tool's own documented
+    advice ("call get_convergence_state before trusting a zero-hit
+    search_outputs result") unsound specifically in subtree mode. A caller
+    that wants the OTHER question -- "how far has the AMBIENT whole-root
+    walk gotten through this subtree so far", independent of whether a
+    dedicated subtree index has ever been requested -- still has that via
+    :meth:`OutputsFtsIndex.get_directory_progress` /
+    :meth:`OutputsFtsIndex.get_convergence_state` called directly on a root
+    instance; this module-level wrapper now answers the OTHER, tool-facing
+    question: "is the exact index a scoped search_outputs call would use
+    for this subtree itself converged".
 
-    Returns ``{"error": ...}`` if ``outputs_dir`` doesn't exist; otherwise
-    the :class:`ConvergenceState` as a dict -- including ``index_lock``
-    (a52216e2): who currently holds this index's write lock (pid/hostname/
-    session_id/started_at/heartbeat_at) and whether that owner looks active
-    or stale. Never triggers any indexing and never disturbs a live writer.
+    Validation matches ``search_outputs``'s own subtree contract: a
+    ``subtree`` that doesn't exist, or isn't ``outputs_dir`` itself or a
+    path underneath it, returns ``{"error": ...}`` instead of a (previously
+    possible) nonsensical heuristic answer about an unrelated directory.
+
+    Returns ``{"error": ...}`` if ``outputs_dir`` (or a given ``subtree``)
+    doesn't exist or is out of scope; otherwise the :class:`ConvergenceState`
+    as a dict -- including ``index_lock`` (a52216e2): who currently holds
+    this index's write lock (pid/hostname/session_id/started_at/
+    heartbeat_at) and whether that owner looks active or stale. Never
+    triggers any indexing (construction + best-effort ancestor-seeding only,
+    same as ``get_subtree_index`` itself -- no ``rebuild()`` call) and never
+    disturbs a live writer.
     """
     if not outputs_dir or not os.path.isdir(outputs_dir):
         return {"error": f"outputs_dir does not exist: {outputs_dir}"}
+    if subtree:
+        if not os.path.isdir(subtree):
+            return {"error": f"subtree does not exist: {subtree}"}
+        try:
+            index = get_subtree_index(outputs_dir, subtree)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return index.get_convergence_state().to_dict()
     index = _get_cached_index(outputs_dir)
-    return index.get_convergence_state(subtree=subtree).to_dict()
+    return index.get_convergence_state().to_dict()
 
 
 def get_cache_quota_status(

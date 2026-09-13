@@ -134,10 +134,15 @@ def _normalize_max_planning_turns(raw: Any, *, policy_mode: str) -> int:
     return min(MAX_PLANNING_TURNS_CEILING, turns)
 
 
+_SCOPE_DECISION_CATEGORY = "SCOPE"
+
+
 def build_execution_policy(
     raw_executor_config: dict[str, Any] | None,
     *,
     execution_mode: str | None = None,
+    role: str | None = None,
+    pinned_decisions: "list[dict[str, Any]] | None" = None,
 ) -> dict[str, Any]:
     """Build the canonical, machine-readable execution policy contract.
 
@@ -169,15 +174,49 @@ def build_execution_policy(
       sequence), not something a config can turn off.
     * ``genuine_blocker_escalation`` — the escalation rule text: when
       request_hitl is (and is not) appropriate.
+
+    W1-G (G3) — a stale project-level ``execution_mode='autonomous'``
+    posture must never silently outrank an explicit human-set planning
+    boundary. Two independent, additive signals force the EFFECTIVE policy
+    to 'relaxed' regardless of the raw ``execution_mode``, and are surfaced
+    back to the caller (never a silent downgrade):
+
+    * ``role == "planner"`` — a planning session must never see
+      ``no_confirmation=True`` / claim-all posture.
+    * any entry in ``pinned_decisions`` whose ``category`` is ``"SCOPE"`` —
+      the project's pinned-decision "constitution" (``pin_decision``)
+      explicitly constrains execution scope (e.g. "one item at a time",
+      "no auto-submission", "human literature gate"). ``scope_decision_ids``
+      names exactly which pinned decisions triggered it.
+
+    Omitting both ``role`` and ``pinned_decisions`` (every pre-G3 call site)
+    reproduces the exact pre-G3 output — this is purely additive.
     """
     policy_mode = normalize_execution_policy_mode(execution_mode)
     is_immediate = policy_mode == "immediate"
+
+    scope_decision_ids = [
+        d.get("id")
+        for d in (pinned_decisions or [])
+        if isinstance(d, dict)
+        and (d.get("category") or "").strip().upper() == _SCOPE_DECISION_CATEGORY
+        and d.get("id")
+    ]
+    downgrade_reason: str | None = None
+    if is_immediate and (role or "").strip().lower() == "planner":
+        is_immediate = False
+        downgrade_reason = "planner_role"
+    elif is_immediate and scope_decision_ids:
+        is_immediate = False
+        downgrade_reason = "pinned_scope_decision"
+    effective_mode = "immediate" if is_immediate else "relaxed"
+
     cfg = raw_executor_config if isinstance(raw_executor_config, dict) else {}
     max_planning_turns = _normalize_max_planning_turns(
-        cfg.get("max_planning_turns"), policy_mode=policy_mode
+        cfg.get("max_planning_turns"), policy_mode=effective_mode
     )
-    return {
-        "execution_mode": policy_mode,
+    policy: dict[str, Any] = {
+        "execution_mode": effective_mode,
         "max_planning_turns": max_planning_turns,
         "required_first_action": (
             REQUIRED_FIRST_ACTION_IMMEDIATE if is_immediate else REQUIRED_FIRST_ACTION_RELAXED
@@ -187,6 +226,12 @@ def build_execution_policy(
         "claim_before_edit": True,
         "genuine_blocker_escalation": GENUINE_BLOCKER_ESCALATION_RULE,
     }
+    if downgrade_reason:
+        policy["downgraded_from_autonomous"] = True
+        policy["downgrade_reason"] = downgrade_reason
+        if scope_decision_ids:
+            policy["scope_decision_ids"] = scope_decision_ids
+    return policy
 
 
 # ---------------------------------------------------------------------------

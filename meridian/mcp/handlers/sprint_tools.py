@@ -13,7 +13,8 @@ the original if/elif chain.  All 20 tools are extracted:
   get_parallelizable_groups, assign_sprint_waves, analyze_sprint,
   claim_sprint_item, add_subtask, split_sprint_item, merge_sprint_items,
   complete_sprint_item, add_sprint_item_pointer, get_sprint_item_pointers,
-  resolve_sprint_item_pointers, delete_sprint_item_pointer.
+  resolve_sprint_item_pointers, delete_sprint_item_pointer,
+  proposal_to_handoff (73499c59).
 
 Handler-level helper functions (e.g. ``_infer_touches_resources``) are
 imported lazily inside each function body to keep the import graph acyclic
@@ -2258,6 +2259,72 @@ async def handle_add_sprint_item_pointer(
         )
     except ValueError as exc:
         return {"error": str(exc)}
+
+
+async def handle_proposal_to_handoff(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: proposal_to_handoff.
+
+    73499c59 — one-call orchestration command: decompose an existing
+    workspace/project proposal into real sprint items (each created via
+    ``db.add_sprint_item`` — the SAME function the ``add_sprint_item`` tool
+    itself calls), attach a durable pointer from each created item back to
+    the source proposal (via ``db.add_sprint_item_pointer`` — same as the
+    ``add_sprint_item_pointer`` tool), and — unless ``skip_handoff`` is set —
+    generate a handoff scoped to exactly those items (via
+    ``handoff.generate_handoff``). Returns a typed proposal-run receipt (see
+    :mod:`meridian.proposal_handoff`'s module docstring for the full
+    contract) carrying the created item ids, pointer ids, any HITL gate this
+    call raised, and the resulting executable/non-executable status — a
+    direct passthrough of ``generate_handoff``'s own unified proposal-run-
+    scope contract, never a second, independently-computed verdict.
+
+    ``items`` — required, a non-empty list of ``{"title": str, ...}`` specs;
+    see :func:`meridian.proposal_handoff.proposal_to_handoff`'s own docstring
+    for the accepted per-entry fields (any subset of ``add_sprint_item``'s
+    own keyword arguments) and the ``"$<index>"`` sibling-``depends_on``
+    convention. A malformed entry (missing title, or a duplicate-title hit)
+    is recorded on the receipt's ``skipped_items`` rather than aborting the
+    whole batch.
+    """
+    from ...proposal_handoff import proposal_to_handoff  # noqa: PLC0415
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    if not args.get("proposal_id"):
+        return {"error": "proposal_id is required"}
+    items = args.get("items")
+    if not isinstance(items, list) or not items:
+        return {
+            "error": (
+                "items must be a non-empty list of {title, ...} sprint-item "
+                "specs decomposed from the proposal"
+            )
+        }
+    validate_input_size(args.get("override_reason"), "override_reason", 5_000)
+
+    try:
+        receipt = await proposal_to_handoff(
+            db, args["project_id"], args["proposal_id"], items, data_dir,
+            tenant_id=_mcp_tenant_id,
+            session_id=args.get("session_id"),
+            actor=args.get("actor") or args.get("session_id"),
+            version=args.get("version"),
+            mode=args.get("mode") or "goal",
+            skip_handoff=bool(args.get("skip_handoff", False)),
+            force=bool(args.get("force", False)),
+            override_reason=args.get("override_reason"),
+        )
+    except ValueError as exc:
+        # Empty items / proposal not found / project not found — fail
+        # closed with a clean {error}, mirroring every other handler above.
+        return {"error": str(exc)}
+    return receipt.to_dict()
 
 
 async def handle_get_sprint_item_pointers(

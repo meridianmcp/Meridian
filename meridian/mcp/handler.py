@@ -4837,7 +4837,7 @@ async def _handle_sprint_tools(
     get_sprint_item_pointers, resolve_sprint_item_pointers,
     delete_sprint_item_pointer, execute_batch, complete_wave_gate, configure_wave_gate,
     start_wave_run, finalize_wave_run, resume_wave, batch_read, batch_mutate,
-    reconcile_stale_claims.
+    reconcile_stale_claims, proposal_to_handoff.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4877,6 +4877,7 @@ async def _handle_sprint_tools(
         handle_batch_read,
         handle_batch_mutate,
         handle_reconcile_stale_claims,
+        handle_proposal_to_handoff,
     )
 
     _standard_dispatch: dict[str, Any] = {
@@ -4910,6 +4911,7 @@ async def _handle_sprint_tools(
         "batch_read": handle_batch_read,
         "batch_mutate": handle_batch_mutate,
         "reconcile_stale_claims": handle_reconcile_stale_claims,
+        "proposal_to_handoff": handle_proposal_to_handoff,
     }
 
     if name in _standard_dispatch:
@@ -6117,6 +6119,36 @@ async def _handle_plugin_tools(
     return _MISS
 
 
+def _set_active_repo_diagnostic_suffix(tenant: dict[str, Any] | None) -> str:
+    """W1-G (G6) — best-effort actionable diagnostic detail appended to a
+    set_active_repo failure message.
+
+    The DNABERT-incident proposal's exact complaint: "gave no correlation
+    ID, tunnel owner, endpoint, or actionable diagnostic explaining why that
+    process was not the tunnel visible to the MCP server." get_tunnel_
+    diagnostics (f1e0df55) already computes exactly that layered snapshot
+    (run_id, tunnel_process.cross_instance_owner, per-slot state/
+    remediation) — this reuses its builder synchronously (build_tunnel_
+    diagnostics performs no network/DB round trip) so a failing
+    set_active_repo call surfaces the SAME correlation id / owner
+    information inline, without a second get_tunnel_diagnostics round trip.
+
+    Never raises: diagnostic collection failing must never mask the real
+    error, so any failure here degrades to an empty suffix (the exact
+    pre-G6 message)."""
+    try:
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+        diag = _tunnel_mod.build_tunnel_diagnostics(tenant, None)
+        owner = (diag.get("tunnel_process") or {}).get("cross_instance_owner")
+        return (
+            f" [diagnostic: run_id={diag.get('run_id')}, "
+            f"tenant_id={diag.get('tenant_id')}, cross_instance_owner={owner!r} "
+            "— call get_tunnel_diagnostics for the full snapshot]"
+        )
+    except Exception:  # noqa: BLE001 — diagnostics are best-effort, never fatal
+        return ""
+
+
 async def _handle_tunnel_tools(
     name: str,
     args: dict[str, Any],
@@ -6177,10 +6209,12 @@ async def _handle_tunnel_tools(
             raise ValueError(
                 "tunnel not connected — run `meridian --tunnel` in your terminal "
                 "to start the tunnel, then retry"
+                + _set_active_repo_diagnostic_suffix(tenant)
             )
         if result.get("status") == "error":
             raise ValueError(
                 f"tunnel error while switching repo: {result.get('message', 'unknown error')}"
+                + _set_active_repo_diagnostic_suffix(tenant)
             )
         # Also expand the FS connector's allowed roots so filesystem tools can
         # access the new repo path without requiring --repo to be set at startup.

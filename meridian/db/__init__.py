@@ -1161,6 +1161,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_experiment_registry_runs(db)
     # 32d3d5de -- W1-E Durable Remote Task primitive v1.
     await _migrate_remote_tasks(db)
+    # W1-G (G1) -- projects.repo_identity: canonical repo binding.
+    await _migrate_repo_identity(db)
     return db
 
 
@@ -1250,6 +1252,47 @@ async def set_project_execution_mode(
     )
     await db.commit()
     return await get_project(db, project_id)
+
+
+async def set_project_repo_identity(
+    db: aiosqlite.Connection, project_id: str, repo_path: str
+) -> dict[str, Any] | None:
+    """W1-G (G1) — bind a project to a canonical repository identity.
+
+    ``repo_path`` is the CALLER's local checkout path; it is never persisted
+    verbatim (never a machine-local absolute path in project-shared,
+    multi-machine state) — only the derived, one-way
+    :func:`meridian.repo_scope.compute_repo_identity` fingerprint is stored.
+    Returns the updated project dict, or ``None`` if not found. A falsy/
+    unresolvable ``repo_path`` is a no-op (returns the project unchanged) —
+    never persists a null/empty identity over a real one.
+    """
+    from meridian.repo_scope import compute_repo_identity  # noqa: PLC0415
+
+    identity = compute_repo_identity(repo_path)
+    if not identity:
+        return await get_project(db, project_id)
+    await db.execute(
+        "UPDATE projects SET repo_identity = ? WHERE id = ?",
+        (identity, project_id),
+    )
+    await db.commit()
+    return await get_project(db, project_id)
+
+
+async def get_project_repo_identity(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """W1-G (G1) — read a project's bound repo identity, or ``None`` if the
+    project was never bound (or does not exist)."""
+    async with db.execute(
+        "SELECT repo_identity FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    val = row["repo_identity"] if isinstance(row, dict) else row[0]
+    return val or None
 
 
 async def get_project(
@@ -8700,6 +8743,13 @@ async def list_worktrees_pending_cleanup(
 _SUGGESTED_DECISION_CATEGORIES = {
     "STRATEGIC", "COMPETITIVE", "TECHNICAL", "TACTICAL",
     "BUSINESS", "PRODUCT", "ARCHITECTURAL",
+    # W1-G (G3) — a decision that constrains EXECUTION scope/policy itself
+    # (e.g. "planner role only", "one item at a time", "no auto-submission",
+    # "human literature gate required"). executor_config.build_execution_
+    # policy treats a pinned SCOPE decision as authoritative over a stale
+    # project-level execution_mode='autonomous' posture — see that
+    # function's docstring.
+    "SCOPE",
 }
 
 # 366317e9 — decision priority drives dashboard ordering + context-injection
@@ -12830,6 +12880,23 @@ from .proposal_lineage import (  # noqa: F401
     get_proposal_descendants,
     create_proposal_successor,
     compare_proposal_versions,
+)
+
+
+# 4eedeef8 — RECONCILE: legacy proposal-predecessor-reference audit + opt-in
+# migration. Imported immediately after .proposal_lineage since it composes
+# get_workspace_proposals (workspace.py), get_proposal_lineage_links /
+# link_proposal_lineage (.proposal_lineage, just imported above), and
+# get_proposal_links / link_proposal_evidence (.proposal_links, imported
+# earlier still) — all already defined by this point. No new table: this
+# module only reads existing rows and writes through the already-hardened
+# link_proposal_lineage / link_proposal_evidence primitives.
+from .proposal_reconciliation import (  # noqa: F401
+    audit_legacy_proposal_lineage,
+    migrate_legacy_proposal_lineage,
+    audit_legacy_promotion_evidence,
+    migrate_legacy_promotion_evidence,
+    audit_legacy_proposal_references,
 )
 
 

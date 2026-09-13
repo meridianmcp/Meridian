@@ -2788,6 +2788,7 @@ def _loop_enabled_from_settings(
 def _execution_policy_from_settings(
     proj_settings: dict[str, Any] | None,
     execution_mode: str,
+    pinned_decisions: "list[dict[str, Any]] | None" = None,
 ) -> dict[str, Any]:
     """75ac1c8e — resolve the canonical execution policy dict for this project.
 
@@ -2797,10 +2798,17 @@ def _execution_policy_from_settings(
     Delegates to ``executor_config.build_execution_policy`` — see that
     docstring for the field contract. Never raises: a non-dict/missing
     executor_config degrades to the mode's defaults.
+
+    W1-G (G3) — ``pinned_decisions`` (optional, default ``None``) is
+    forwarded to ``build_execution_policy`` so a pinned ``category="SCOPE"``
+    decision downgrades a stale ``execution_mode='autonomous'`` posture to
+    'relaxed' in the RENDERED handoff too, not just start_session. Omitting
+    it (every pre-G3 call site) reproduces the exact prior output.
     """
     cfg = (proj_settings or {}).get("executor_config") or {}
     return build_execution_policy(
-        cfg if isinstance(cfg, dict) else {}, execution_mode=execution_mode
+        cfg if isinstance(cfg, dict) else {}, execution_mode=execution_mode,
+        pinned_decisions=pinned_decisions,
     )
 
 
@@ -12954,9 +12962,13 @@ async def generate_handoff(
         version=_effective_version,
         # 75ac1c8e — canonical execution policy (bounds planning, forces the
         # first required action); executor_config.max_planning_turns override
-        # honored via _execution_policy_from_settings.
+        # honored via _execution_policy_from_settings. W1-G (G3) — pinned_
+        # decisions is already fetched above for the <pinned_decisions> tag;
+        # threading it here too means a pinned SCOPE decision downgrades a
+        # stale autonomous posture in the rendered /goal, not just start_session.
         execution_policy=_execution_policy_from_settings(
-            proj_settings, _effective_execution_mode
+            proj_settings, _effective_execution_mode,
+            pinned_decisions=pinned_decisions,
         ),
         # eb8b6894 — opt-in STRICT pointer gate: excludes an item whose
         # durable pointer row exists but never actually resolved.
@@ -13478,12 +13490,25 @@ async def _generate_planner_handoff(
     # 5a5bba43 — planner brief renders note bodies, so request the full rows.
     notes = await _safe(db_module.get_project_notes(db, project_id, bodies=True), [])
     strategic = _select_strategic_notes(notes)
-    pending_items = await _safe(
-        db_module.get_sprint_items(db, project_id, status="pending"), []
+    # W1-G (G4) — pending_items and in_progress_items used to come from TWO
+    # SEPARATE get_sprint_items(status=...) queries. Between those two calls
+    # another live session could claim (pending -> in_progress) or unclaim
+    # an item, so the same item could render under BOTH "_Pending:_" and
+    # "_In progress:_" (or under neither) — a genuinely contradictory
+    # handoff, the exact class of bug this item's proposal flags. Fetching
+    # ONCE and partitioning in Python guarantees the two lists are always
+    # mutually exclusive and reflect ONE consistent point-in-time snapshot,
+    # matching the single-snapshot pattern generate_handoff's full/delta
+    # path already uses for the identical pending/in_progress split.
+    _sprint_items_snapshot = await _safe(
+        db_module.get_sprint_items(db, project_id), []
     )
-    in_progress_items = await _safe(
-        db_module.get_sprint_items(db, project_id, status="in_progress"), []
-    )
+    pending_items = [
+        it for it in _sprint_items_snapshot if it.get("status") == "pending"
+    ]
+    in_progress_items = [
+        it for it in _sprint_items_snapshot if it.get("status") == "in_progress"
+    ]
     tasks = await _safe(db_module.get_tasks(db, project_id, limit=10), [])
     hitl = await _safe(
         db_module.list_hitl_requests(db, project_id, status="pending"), []

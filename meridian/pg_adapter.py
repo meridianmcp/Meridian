@@ -5181,6 +5181,17 @@ async def _migrate_pg_session_recovery_registry(conn: PostgresConnection) -> Non
     )
 
 
+async def _migrate_pg_repo_identity(conn: PostgresConnection) -> None:
+    """W1-G (G1) -- Postgres mirror of db.migrations._migrate_repo_identity:
+    projects.repo_identity, a nullable derived fingerprint (never a raw
+    machine-local absolute path -- see meridian.repo_scope.compute_repo_
+    identity) binding a project to a canonical repository checkout. ADD
+    COLUMN IF NOT EXISTS so re-running is a no-op."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS repo_identity TEXT"
+    )
+
+
 async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     """7c96d41b — Postgres mirror of the paper_contract schema: the
     first-class versioned editorial-intent document for Meridian's
@@ -5469,4 +5480,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_experiment_registry_columns,
     _migrate_pg_experiment_registry_runs,
     _migrate_pg_remote_tasks,
+    _migrate_pg_repo_identity,
 )

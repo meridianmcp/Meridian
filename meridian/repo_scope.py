@@ -36,6 +36,7 @@ silent default.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -134,3 +135,44 @@ def validate_repo_scope(
             )
 
     return resolved
+
+
+def compute_repo_identity(repo_path: "str | Path | None") -> "str | None":
+    """W1-G (G1) — derive a project-shared, cross-machine 'repo identity'
+    string from a local repository path.
+
+    ``projects.repo_identity`` is project-shared, multi-machine state (it
+    travels through the dashboard/API to every session/machine that opens
+    the project) — the same non-negotiable rule ``capability_manifest.py``
+    already enforces for manifest fields applies here: never persist a
+    machine-local absolute path (or a secret) into shared state. A raw
+    ``C:\\Users\\alice\\project`` or ``/home/bob/project`` string leaks a
+    local username/directory layout to every other machine/session that can
+    see the project.
+
+    Instead this returns ``f"{basename}-{sha256(normalized_path)[:12]}"``:
+
+    * ``basename`` — the final path component (the repo folder's own name,
+      e.g. ``"paper"``) — a harmless, human-readable label, never a full path.
+    * the 12-hex-char suffix — a stable, deterministic fingerprint of the
+      FULL normalized path, so the SAME checkout on the SAME machine always
+      recomputes the IDENTICAL identity (this is what lets G2's CWD-mismatch
+      check compare "the repo this project is bound to" against "the repo
+      this session is running from" without ever storing either raw path) —
+      while remaining one-way: the stored value cannot be reversed back into
+      the original path.
+
+    Normalization lowercases and flips backslashes to forward slashes before
+    hashing, so trivial spelling differences that are the SAME path on
+    Windows (``C:\\Repo`` vs ``c:/Repo/``) hash identically. Returns ``None``
+    for an empty/missing/whitespace-only path — never raises.
+    """
+    if not repo_path:
+        return None
+    candidate = str(repo_path).strip().rstrip("\\/")
+    if not candidate:
+        return None
+    normalized = candidate.replace("\\", "/").lower()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    basename = normalized.rsplit("/", 1)[-1] or "repo"
+    return f"{basename}-{digest}"

@@ -206,6 +206,59 @@ this package, with no second codec.
 | `list_run_manifests` | List every run-manifest record started under an outputs directory |
 | `get_run_manifest_envelope` | Typed, lossless `RUN`-kind `ProvenanceEnvelope` for one run manifest |
 
+### Derived-artifact cache & fast variant rendering (item 19917525)
+
+`meridian_outputs.derived_cache` is a real, persisted, keyed cache from
+`(source_path, variant, params)` to derived-artifact bytes — e.g. a
+thumbnail, a resized preview, or a format conversion of a source output —
+distinct from every other cache/ledger in this package: `OutputsFtsIndex`
+caches search-index *instances*, not rendered bytes; `fingerprint`/
+`annotate` track staleness/reproducibility *metadata* for one path, never
+artifact bytes; and none of them let one source have many independently
+cached *variants*.
+
+Persisted under `<outputs_dir>/.meridian-outputs-cache/derived/` — the same
+`.meridian-outputs-cache/` convention every sibling ledger already uses, so
+`get_cache_quota_status` sees this cache's disk usage for free. A lookup
+first checks the source file's CHEAP signature (size + mtime, one `stat`
+call, no read) — an unchanged signature is a fast hit with no hash
+computed; only a changed signature falls back to a real content-hash
+comparison (reusing `fingerprint.script_content_hash`), so a copy/restore
+that touches mtime without changing bytes is still correctly served from
+cache. A genuinely changed or missing source is a confirmed miss — this
+cache never serves bytes it cannot verify against the current source.
+Eviction is real LRU by `last_accessed_at`, deleting on-disk artifact files
+as it goes. `invalidate_stale_derived_variants` composes with
+`fingerprint`'s existing script-staleness ledger rather than duplicating
+it: a generating script's content change invalidates every derived variant
+cached for outputs it tagged, even though the OUTPUT file's own bytes never
+changed.
+
+`derived_cache.get_or_render_variant` (Python-level only — it takes a
+callback, which cannot cross the MCP boundary) is the primary "fast variant
+rendering" primitive: it calls a caller-supplied `render_fn` exactly once
+per distinct `(source, variant, params)` combination and serves every
+subsequent request for that combination from cache. The MCP tools below
+expose the same cache to a remote client via an explicit get/put pair
+instead; bytes cross that boundary base64-encoded (JSON has no native
+binary type).
+
+`get_derived_cache_convergence_state` answers a different question than
+`get_convergence_state` above: this cache has no background walk, so
+"converged" means the on-disk manifest is genuinely readable AND every
+artifact file it references actually exists — i.e. the persisted cache is
+self-consistent, not merely present.
+
+| Tool | Description |
+|------|-------------|
+| `get_cached_derived_variant` | Look up one cached derived variant, verified fresh against the source's current on-disk state; returns base64-encoded bytes on a hit |
+| `put_cached_derived_variant` | Persist a rendered derived variant (base64-encoded bytes) to the cache, recording the source's signature and content hash at write time |
+| `invalidate_derived_variant` | Explicitly purge one cached variant, or every cached variant for a source path |
+| `invalidate_stale_derived_variants` | Purge every cached variant whose source is currently flagged stale by the existing `fingerprint` staleness ledger |
+| `evict_derived_cache` | Real LRU eviction by `last_accessed_at` against an optional byte and/or file-count budget |
+| `get_derived_cache_stats` | Aggregate entry/byte/hit counts and distinct variants currently persisted |
+| `get_derived_cache_convergence_state` | Real, checkable self-consistency snapshot: manifest readable and every referenced artifact file present on disk |
+
 ## Security
 
 - Secret files are excluded before indexing (`.env*`, `*.key`, `*secret*`,
