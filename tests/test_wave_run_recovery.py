@@ -654,3 +654,48 @@ async def test_claim_and_complete_fail_open_on_wave_run_bookkeeping_error(db, mo
         db, pid, item["id"], actor="sess-exec-3", exit_code=0,
     )
     assert completed["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_rolls_back_shared_connection_on_advisory_failure(
+    db, monkeypatch,
+):
+    """dcf78192 — a failing/cancelled advisory phase (wave-run bookkeeping,
+    post-commit side effects, continuation-input gathering) must roll back
+    the SHARED connection, not just swallow the exception. Left uncleared,
+    the abandoned transaction can block the NEXT caller on this same
+    connection waiting for a lock -- confirmed live in production tonight
+    (repeated complete_sprint_item timeouts on one item, resolved by adding
+    the rollback). This fails the underlying bookkeeping call directly
+    (rather than forcing a real 5s asyncio.wait_for timeout) so the test
+    stays fast; the fix applies identically to the except asyncio.TimeoutError
+    and except Exception branches, both of which now call the same
+    _rollback_best_effort helper."""
+    pid = await _project(db, "wrc-rollback-on-failure")
+    item = await db_module.add_sprint_item(db, pid, "v1", "FEAT: b")
+    await db_module.claim_sprint_item(db, pid, item["id"], actor="sess-exec-4")
+
+    from meridian.db import sprint_items as sprint_items_module
+
+    rollback_calls = []
+    _real_rollback = db.rollback
+
+    async def _counting_rollback(*args, **kwargs):
+        rollback_calls.append(1)
+        return await _real_rollback(*args, **kwargs)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("simulated post-commit side-effect failure")
+
+    monkeypatch.setattr(db, "rollback", _counting_rollback)
+    monkeypatch.setattr(
+        sprint_items_module, "_run_post_commit_side_effects", _boom,
+    )
+
+    completed = await db_module.complete_sprint_item(
+        db, pid, item["id"], actor="sess-exec-4", exit_code=0,
+    )
+    assert completed["status"] == "done"
+    assert len(rollback_calls) >= 1, (
+        "a failing advisory phase must roll back the shared connection"
+    )
