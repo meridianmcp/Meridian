@@ -12545,6 +12545,7 @@ from .sprint_items import (  # noqa: F401
     count_pending_sprint_items,
     count_sprint_items_awaiting_verification,
     delete_sprint_item_pointer,
+    relocate_sprint_item_pointer,
     evaluate_board_blockers,
     fail_sprint_item,
     fan_out_sprint_items,

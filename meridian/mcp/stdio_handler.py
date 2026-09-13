@@ -2053,6 +2053,13 @@ def build_mcp_server():
                     "required": ["sprint_item_id"],
                 },
             ),
+            # W1-J — _shared_tool() pulls the exact same schema HTTP/MCP already
+            # advertises (meridian/mcp_tools.py's _MCP_TOOLS_LIST), matching the
+            # execute_batch/release_sprint_item_claim precedent below rather than
+            # hand-duplicating an inputSchema block like the three pointer tools
+            # immediately above (a documented source of drift — see the
+            # start_session comment further down this file).
+            _shared_tool("relocate_sprint_item_pointer"),
             # 627187b8 — _shared_tool() pulls the exact same schema HTTP/MCP
             # already advertises (meridian/mcp_tools.py's _MCP_TOOLS_LIST) so
             # execute_batch's request/response contract can never drift between
@@ -2655,6 +2662,9 @@ def build_mcp_server():
                 "add_sprint_item",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
+                # W1-J — atomic pointer relocation; same share-dispatch-with-
+                # HTTP-MCP pattern as the three pointer tools immediately above.
+                "relocate_sprint_item_pointer",
                 # 88277b63 — durable external-job register; share dispatch
                 # with HTTP MCP so all three transports stay in sync.
                 "register_external_job", "update_external_job",

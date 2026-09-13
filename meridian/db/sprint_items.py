@@ -5716,6 +5716,130 @@ async def delete_sprint_item_pointer(
     return existed
 
 
+async def relocate_sprint_item_pointer(
+    db: aiosqlite.Connection,
+    project_id: str,
+    pointer_id: str,
+    *,
+    targets: list[dict[str, Any]] | None = None,
+    source_type: str | None = None,
+    label: Any = _UNSET,
+) -> dict[str, Any] | None:
+    """W1-J — atomically UPDATE an existing pointer's targets/source_type/label
+    IN PLACE, instead of the delete_sprint_item_pointer + add_sprint_item_pointer
+    workaround the pointer CRUD previously required to "move" or correct a
+    stored pointer (add_sprint_item_pointer's own docstring calls a stored
+    pointer "immutable" for exactly this reason).
+
+    That two-call workaround is non-atomic in three distinct ways this
+    function closes:
+
+    1. **Data-loss window**: an exception/crash between the delete and the
+       re-add permanently loses the pointer — there is no way to recover the
+       deleted row's targets/source_type/label once the delete commits.
+    2. **Visibility window**: a concurrent get_sprint_item_pointers call
+       landing between the two statements sees ZERO pointers for the item,
+       even though the caller never intended the item to be pointer-less.
+    3. **Identity churn**: delete-then-re-add necessarily mints a NEW
+       ``id``/``created_at`` — anything that referenced the pointer by its
+       stable id (a decision's evidence, an artifact-provenance link, a
+       human's saved reference) silently breaks.
+
+    This function is ONE ``UPDATE`` statement: ``id``/``project_id``/
+    ``sprint_item_id``/``created_at`` are preserved exactly, and there is no
+    window where the row is absent or only partially written.
+
+    At least one of ``targets``/``source_type``/``label`` must be supplied
+    (a no-op call raises ``ValueError``, mirroring add_sprint_item_pointer's
+    fail-closed style). Any omitted field keeps its CURRENT stored value —
+    ``label`` uses the same ``_UNSET`` sentinel ``patch_sprint_item`` already
+    uses elsewhere in this module: pass ``label=None`` explicitly to CLEAR
+    it, omit the keyword entirely to leave it untouched.
+
+    When ``targets`` IS supplied, the replacement is validated via
+    ``meridian.pointers.validate_pointer`` — the SAME validation
+    ``add_sprint_item_pointer`` applies (malformed selectors, a REAL
+    target_kind="existing" filesystem check, repo_root normalization, …) —
+    BEFORE the write, so a validation failure changes nothing. When
+    ``targets`` is OMITTED, the stored targets JSON is carried over
+    byte-for-byte and is deliberately NEVER re-run through that same
+    existence check: a stored pointer's ``targets`` always carries an
+    EXPLICIT ``target_kind`` (validate_pointer bakes in the "existing"
+    default at write time even when the ORIGINAL caller omitted the key —
+    see :func:`meridian.pointers.check_structural_validity`'s docstring for
+    the identical hazard), so blindly re-validating it here would silently
+    start disk-checking pointers that were never meant to be checked,
+    breaking every pre-existing pointer whose placeholder uri (a test
+    fixture, a not-yet-synced companion path) never pointed at a real file
+    on THIS machine. ``source_type`` alone is still checked for basic shape
+    (a non-empty string) either way.
+
+    Cross-project isolation (mirrors ``handle_get_sprint_item_pointers`` /
+    efea329f): ``project_id`` must match the pointer's own stored
+    ``project_id`` column. Returns ``None`` — never raises — when no pointer
+    with ``pointer_id`` exists in ``project_id`` (a foreign-project pointer
+    id is reported exactly like a nonexistent one, never distinguished, so a
+    caller can't use this to probe for another project's pointer ids).
+    Otherwise returns the updated, deserialized pointer dict (same shape
+    ``row_to_pointer`` produces for every other pointer read in this file).
+    """
+    from ..pointers import (  # noqa: PLC0415 — avoid an import cycle at module load
+        validate_pointer,
+        serialize_targets,
+        row_to_pointer,
+    )
+
+    if targets is None and source_type is None and label is _UNSET:
+        raise ValueError(
+            "relocate_sprint_item_pointer requires at least one of "
+            "targets/source_type/label"
+        )
+
+    async with db.execute(
+        "SELECT * FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    existing = _row_to_dict(row)
+    if not existing or existing.get("project_id") != project_id:
+        return None
+
+    merged_source_type = (
+        source_type if source_type is not None else existing["source_type"]
+    )
+    if not isinstance(merged_source_type, str) or not merged_source_type.strip():
+        raise ValueError("relocate_sprint_item_pointer: source_type must be a non-empty string")
+    merged_label = existing.get("label") if label is _UNSET else label
+
+    if targets is not None:
+        # Real validation, including a REAL target_kind="existing" filesystem
+        # check for any NEW target that explicitly declares one — exactly
+        # add_sprint_item_pointer's own contract, applied here because this
+        # targets array is genuinely fresh caller input.
+        normalized = validate_pointer(
+            {"source_type": merged_source_type, "targets": targets, "label": merged_label}
+        )
+        targets_json = serialize_targets(normalized["targets"])
+        final_source_type = normalized["source_type"]
+    else:
+        # Carry the stored targets over untouched — see the docstring above
+        # for why re-validating already-normalized stored data would be a
+        # correctness regression, not a safety improvement.
+        targets_json = existing["targets"]
+        final_source_type = merged_source_type.strip()
+
+    await db.execute(
+        "UPDATE sprint_item_pointers SET source_type = ?, targets = ?, label = ? "
+        "WHERE id = ?",
+        (final_source_type, targets_json, merged_label, pointer_id),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+    ) as cur:
+        updated_row = await cur.fetchone()
+    return row_to_pointer(_row_to_dict(updated_row) or {})
+
+
 # ---------------------------------------------------------------------------
 # SECTION 5: Lines 8251-8270 — resource-to-sprint-item lookup
 # ---------------------------------------------------------------------------

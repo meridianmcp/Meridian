@@ -67,6 +67,7 @@ EXPECTED_HANDLER_NAMES = [
     "handle_get_sprint_item_pointers",
     "handle_resolve_sprint_item_pointers",
     "handle_delete_sprint_item_pointer",
+    "handle_relocate_sprint_item_pointer",
 ]
 
 TOOLS_IN_GROUP = [
@@ -90,6 +91,7 @@ TOOLS_IN_GROUP = [
     "get_sprint_item_pointers",
     "resolve_sprint_item_pointers",
     "delete_sprint_item_pointer",
+    "relocate_sprint_item_pointer",
 ]
 
 
@@ -1193,6 +1195,95 @@ async def test_delete_sprint_item_pointer_handler_direct(db):
         db, _DATA_DIR, None, None
     )
     assert "deleted" in result
+
+
+# ---------------------------------------------------------------------------
+# relocate_sprint_item_pointer (W1-J)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_relocate_sprint_item_pointer_missing_project_id(db):
+    result = await mh._handle_sprint_tools(
+        "relocate_sprint_item_pointer",
+        {"pointer_id": "some-id", "source_type": "docs"},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+    assert "project_id" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_relocate_sprint_item_pointer_missing_pointer_id(db, project):
+    result = await mh._handle_sprint_tools(
+        "relocate_sprint_item_pointer",
+        {"project_id": project["id"], "source_type": "docs"},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+    assert "pointer_id" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_relocate_sprint_item_pointer_no_fields_provided(db, project):
+    result = await mh._handle_sprint_tools(
+        "relocate_sprint_item_pointer",
+        {"project_id": project["id"], "pointer_id": "some-id"},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_relocate_sprint_item_pointer_nonexistent(db, project):
+    result = await mh._handle_sprint_tools(
+        "relocate_sprint_item_pointer",
+        {"project_id": project["id"], "pointer_id": "00000000-0000-0000-0000-000000000000",
+         "source_type": "docs"},
+        db, _DATA_DIR, None, None
+    )
+    assert result is not mh._MISS
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_relocate_sprint_item_pointer_dispatch_success(db, project, sprint_item):
+    stored = await st_mod.handle_add_sprint_item_pointer(
+        {"project_id": project["id"], "sprint_item_id": sprint_item["id"],
+         "source_type": "code",
+         "targets": [{"uri": "a.py", "selector": {"type": "range",
+                      "start_line": 1, "end_line": 2}}]},
+        db, _DATA_DIR, None, None,
+    )
+    result = await mh._handle_sprint_tools(
+        "relocate_sprint_item_pointer",
+        {"project_id": project["id"], "pointer_id": stored["id"],
+         "targets": [{"uri": "b.py", "selector": {"type": "range",
+                      "start_line": 3, "end_line": 4}}]},
+        db, _DATA_DIR, None, None
+    )
+    assert result is not mh._MISS
+    assert result["id"] == stored["id"]
+    assert result["targets"][0]["uri"] == "b.py"
+
+
+@pytest.mark.asyncio
+async def test_relocate_sprint_item_pointer_handler_direct_cross_project(db, project, sprint_item):
+    """A pointer_id real in a DIFFERENT project must not be relocatable by
+    naming the wrong project_id (mirrors resolve/get_sprint_item_pointers'
+    cross-project isolation)."""
+    stored = await st_mod.handle_add_sprint_item_pointer(
+        {"project_id": project["id"], "sprint_item_id": sprint_item["id"],
+         "source_type": "code",
+         "targets": [{"uri": "a.py", "selector": {"type": "range",
+                      "start_line": 1, "end_line": 2}}]},
+        db, _DATA_DIR, None, None,
+    )
+    other_project = await db_module.create_project(db, "relocate-other-proj")
+    result = await st_mod.handle_relocate_sprint_item_pointer(
+        {"project_id": other_project["id"], "pointer_id": stored["id"], "source_type": "docs"},
+        db, _DATA_DIR, None, None
+    )
+    assert "error" in result
 
 
 # ---------------------------------------------------------------------------

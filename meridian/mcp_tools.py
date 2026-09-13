@@ -76,6 +76,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "delete_sprint_item_pointer": 'delete_sprint_item_pointer(pointer_id="pointer-uuid")',
+    "relocate_sprint_item_pointer": 'relocate_sprint_item_pointer(project_id="abc-123", pointer_id="pointer-uuid", targets=[{"uri": "src/chapter1.tex", "selector": {"type": "range", "start_line": 1, "end_line": 40}, "repo_root": "/home/alice/thesis-repo"}])',
     "execute_batch": 'execute_batch(project_id="abc-123", operation="sprint_items", entries=[{"title": "Add rate limiting", "correlation_key": "a"}, {"title": "Add retry backoff", "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-05-batch-1")',
     "batch_read": 'batch_read(project_id="abc-123", requests=[{"request_id": "items", "adapter": "sprint_board", "operation": "get_sprint_items", "args": {"status": "pending"}}, {"request_id": "ptrs", "adapter": "sprint_board", "operation": "get_sprint_item_pointers", "args": {"sprint_item_id": "item-uuid"}, "depends_on": ["items"]}])',
     "batch_mutate": 'batch_mutate(project_id="abc-123", entries=[{"kind": "sprint_item_update", "item_id": "item-uuid", "priority": "high", "correlation_key": "a"}, {"kind": "sprint_item_pointer", "sprint_item_id": "item-uuid", "source_type": "file", "targets": [{"uri": "meridian/db/batch_management.py"}], "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-07-mutate-1")',
@@ -1879,7 +1880,19 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "\"stale\"|\"unknown\"|\"unavailable\"|\"ambiguous\"}. Purely additive/opt-in; "
         "resolve_sprint_item_pointers recomputes a LIVE freshness_state for directory/"
         "git/remote_fs/artifact/text_quote targets by comparing this declared proof "
-        "against what resolution finds right now. Malformed pointers are rejected with a "
+        "against what resolution finds right now. A target may ALSO carry an optional "
+        "repo_root (W1-J) naming WHICH repo a relative uri is anchored to, for a "
+        "companion-repo pointer whose uri lives in a different checkout than the one "
+        "hosting this Meridian project (e.g. a paper repo alongside the code repo). "
+        "Never send a raw absolute path here — pass the actual local path (or any "
+        "stable label) you want the uri anchored to; it is converted to a portable, "
+        "one-way identity fingerprint (basename + a content hash, never reversible "
+        "back to the input) before being stored, the same scheme projects.repo_identity "
+        "already uses for this project's OWN repo binding. Omitting repo_root means the "
+        "pre-existing default: the uri is anchored to this same Meridian project's repo. "
+        "A repo_root-bearing target's target_kind=\"existing\" filesystem check is "
+        "SKIPPED (never falsely run against the wrong repo's cwd) rather than checked or "
+        "silently assumed verified. Malformed pointers are rejected with a "
         "clear error: a bad/missing selector.type, a missing required selector field "
         "(e.g. node_id without \"id\", git without ref or commit, a subSelector with no "
         "\"type\", an invalid target_kind or freshness.state, or target_kind=\"existing\" "
@@ -1890,8 +1903,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
          "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | web | experiment | … (free text)."},
          "targets": {"type": "array", "description":
-             "Non-empty array of {uri, selector, subSelector?, target_kind?, freshness?} "
-             "targets. Each selector is an object carrying an explicit \"type\" plus that "
+             "Non-empty array of {uri, selector, subSelector?, target_kind?, freshness?, "
+             "repo_root?} targets. Each selector is an object carrying an explicit \"type\" plus that "
              "type's field(s): range {\"type\":\"range\", start_line, end_line, "
              "start_char?, end_char?}; symbol {\"type\":\"symbol\", qualified_name}; "
              "node_id {\"type\":\"node_id\", id} (field is \"id\", NOT \"value\"); "
@@ -1909,7 +1922,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
              "filesystem) or \"planned_new\" (a file not created yet — exempt from that "
              "check). freshness (62640241) is an optional {content_hash?, "
              "source_revision?, resolver_version?, captured_at?, state?} proof of what "
-             "the source looked like at capture time.",
+             "the source looked like at capture time. repo_root (W1-J) is an optional "
+             "string naming which COMPANION repo a relative uri is anchored to (a "
+             "different checkout than this Meridian project's own repo); never send a "
+             "raw absolute path — it is converted to a one-way identity fingerprint "
+             "before storage, and disables the target_kind='existing' filesystem check "
+             "for that target (checking it against this process's cwd would check the "
+             "wrong repo).",
              "items": {"type": "object"}},
          "label": {"type": "string", "description": "Optional human-readable label for the pointer."}},
          "required": ["sprint_item_id", "source_type", "targets"]}},
@@ -1955,12 +1974,51 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["sprint_item_id"]}},
     {"name": "delete_sprint_item_pointer", "description":
         "2976e168 — delete ONE generic pointer from a sprint item by its pointer id "
-        "(the id returned by add_sprint_item_pointer / get_sprint_item_pointers). A "
-        "stored pointer is immutable, so 'editing' one is delete-then-re-add. "
+        "(the id returned by add_sprint_item_pointer / get_sprint_item_pointers). "
         "Idempotent: returns {pointer_id, deleted:false} when no pointer had that id, "
-        "rather than erroring.",
+        "rather than erroring. To CHANGE a pointer's targets/source_type/label in "
+        "place instead — preserving its id/created_at, and without the data-loss/"
+        "visibility window a delete-then-re-add pair has — use "
+        "relocate_sprint_item_pointer (W1-J); reserve this tool for when you actually "
+        "want the pointer gone.",
      "inputSchema": {"type": "object", "properties": {
          "pointer_id": {"type": "string", "description": "The id of the pointer to delete."}},
+         "required": ["pointer_id"]}},
+    {"name": "relocate_sprint_item_pointer", "description":
+        "W1-J — atomically UPDATE an existing generic pointer's targets/source_type/"
+        "label IN PLACE (a single UPDATE statement), replacing the delete_sprint_item_"
+        "pointer + add_sprint_item_pointer workaround the pointer CRUD previously "
+        "required to 'move' or correct a stored pointer. That two-call workaround is "
+        "non-atomic: an exception between the delete and the re-add permanently loses "
+        "the pointer, a concurrent get_sprint_item_pointers call in that window sees "
+        "ZERO pointers for the item, and the pointer's id/created_at change — breaking "
+        "anything that referenced it by its stable id (a decision's evidence, an "
+        "artifact-provenance link). This tool preserves id/project_id/sprint_item_id/"
+        "created_at exactly and never has a window where the row is absent. At least "
+        "one of targets/source_type/label is required; an omitted field keeps its "
+        "CURRENT stored value (pass label explicitly — including null/empty — to "
+        "change or clear it; omit the key entirely to leave it untouched). When "
+        "targets IS supplied, the replacement is validated exactly like "
+        "add_sprint_item_pointer BEFORE the write (same malformed-pointer errors, same "
+        "target_kind/freshness/repo_root rules — see that tool's description for the "
+        "full target shape) — a validation failure changes nothing; when targets is "
+        "omitted, the stored targets are carried over untouched (never re-run through "
+        "that same filesystem check — a stored pointer's target_kind is a normalized "
+        "artifact of prior validation, not fresh input to re-verify). Cross-project "
+        "safe: returns {error} when pointer_id doesn't exist in project_id, exactly "
+        "like a nonexistent pointer id (never distinguishes a foreign-project pointer "
+        "from a missing one).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "pointer_id": {"type": "string", "description": "The id of the pointer to relocate (from add_sprint_item_pointer / get_sprint_item_pointers)."},
+         "targets": {"type": "array", "description":
+             "Optional replacement targets array — same {uri, selector, subSelector?, "
+             "target_kind?, freshness?, repo_root?} shape as add_sprint_item_pointer. "
+             "Omit to keep the pointer's current targets.",
+             "items": {"type": "object"}},
+         "source_type": {"type": "string", "description": "Optional replacement source_type. Omit to keep the pointer's current source_type."},
+         "label": {"type": "string", "description": "Optional replacement label. Pass it explicitly (even null/empty) to change or clear it; omit the key entirely to leave the current label untouched."}},
          "required": ["pointer_id"]}},
     {"name": "execute_batch", "description":
         "627187b8 — run a HOMOGENEOUS batch of management writes (all entries the "
@@ -4390,7 +4448,7 @@ _READ_ONLY_TOOLS = {
     # ff1843dc — proposal lineage read-only queries.
     "get_proposal_lineage", "compare_proposal_versions",
 }
-_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
+_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "relocate_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
 # MCP directory metadata: these tools contact a public third-party service
 # rather than only reading Meridian's own state.  Keep this separate from the
@@ -4525,6 +4583,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_sprint_item_pointers":      "sprint-management",
     "resolve_sprint_item_pointers":  "sprint-management",
     "delete_sprint_item_pointer":    "sprint-management",
+    "relocate_sprint_item_pointer":  "sprint-management",
     "execute_batch":                 "sprint-management",
     "batch_read":                    "sprint-management",
     "batch_mutate":                  "sprint-management",
@@ -4703,6 +4762,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_sprint_item_pointers":      "both",
     "resolve_sprint_item_pointers":  "both",
     "delete_sprint_item_pointer":    "executor",
+    "relocate_sprint_item_pointer":  "both",
     "execute_batch":                 "both",
     "batch_read":                    "both",
     "batch_mutate":                  "both",
@@ -5023,6 +5083,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "merge_sprint_items":         "common-support",
     "split_sprint_item":          "common-support",
     "add_sprint_item_pointer":    "common-support",
+    "relocate_sprint_item_pointer": "common-support",
     "execute_batch":              "common-support",
     "batch_read":                 "common-support",
     "batch_mutate":               "common-support",
