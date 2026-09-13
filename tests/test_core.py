@@ -19296,17 +19296,73 @@ async def test_thinking_mcp_roundtrip(db, tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_log_task_unknown_session_raises_clean_error(db, tmp_path):
-    """log_task with a bogus session_id raises a human-readable ValueError."""
+async def test_log_task_unknown_session_auto_registers(db, tmp_path):
+    """W1-I — log_task with a previously-unseen session_id now auto-registers
+    a session under that EXACT id instead of hard-rejecting it.
+
+    Supersedes 26c38b8e's original hard-reject: see
+    db_module.ensure_session_registered's docstring for the rationale (a
+    caller with an already-minted, stable session_id that never separately
+    called start_session/register_session previously had its very first
+    log_task call fail outright with no self-service recovery).
+    """
     from meridian.mcp.handler import _dispatch_mcp_tool
     p = await db_module.create_project(db, "hotfix-logtask")
-    with pytest.raises(ValueError, match="start_session first"):
+    sid = "00000000-0000-0000-0000-000000000000"
+    task = await _dispatch_mcp_tool(
+        "log_task",
+        {
+            "session_id": sid,
+            "project_id": p["id"],
+            "description": "should now succeed via auto-registration",
+        },
+        db, str(tmp_path), tenant=None,
+    )
+    assert task["session_id"] == sid
+    assert task["description"] == "should now succeed via auto-registration"
+    async with db.execute("SELECT * FROM sessions WHERE id = ?", (sid,)) as cur:
+        row = await cur.fetchone()
+    session = db_module._row_to_dict(row)
+    assert session is not None
+    assert session["project_id"] == p["id"]
+    assert session["session_type"] == "worker"
+
+
+@pytest.mark.asyncio
+async def test_log_task_empty_session_id_raises_clean_error(db, tmp_path):
+    """26c38b8e's 'human-readable error, not a raw DB failure' contract still
+    holds for a genuinely-missing session_id — an empty string must never be
+    silently auto-registered as a real session identity."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    p = await db_module.create_project(db, "hotfix-logtask-empty")
+    with pytest.raises(ValueError, match="session_id is required"):
         await _dispatch_mcp_tool(
             "log_task",
             {
-                "session_id": "00000000-0000-0000-0000-000000000000",
+                "session_id": "",
                 "project_id": p["id"],
                 "description": "should fail",
+            },
+            db, str(tmp_path), tenant=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_log_task_cross_project_session_id_raises_clean_error(db, tmp_path):
+    """26c38b8e's 'clean, human-readable error' contract still holds for a
+    genuinely-wrong session_id: one already registered under a DIFFERENT
+    project. Auto-registration must never silently reassign or clobber it."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    p1 = await db_module.create_project(db, "hotfix-logtask-proj1")
+    p2 = await db_module.create_project(db, "hotfix-logtask-proj2")
+    sess = await db_module.register_session(db, p1["id"], "existing-session")
+    with pytest.raises(ValueError, match="different project"):
+        await _dispatch_mcp_tool(
+            "log_task",
+            {
+                "session_id": sess["id"],
+                "project_id": p2["id"],
+                "description": "should fail — wrong project",
             },
             db, str(tmp_path), tenant=None,
         )
