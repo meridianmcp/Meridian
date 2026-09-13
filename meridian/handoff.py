@@ -285,6 +285,62 @@ def _hash_goal_body(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+# W1-H — the ONE literal wrapper _build_quick_start_goal itself ever emits
+# (see its `_loop_prefix = "/loop " if loop_enabled else ""`, spliced in
+# BEFORE the /goal line and therefore already baked into the body that gets
+# hashed at mint time — line ~3643/4061/4427). A host-side re-delivery/
+# wakeup mechanism (the `/loop` skill re-firing a paused prompt) can add or
+# strip exactly this wrapper when it re-presents a paused /goal block,
+# independently of whatever the PROJECT's own loop_enabled setting baked in
+# at mint time — producing a legitimate body whose bytes differ from the
+# minted one by nothing but this one literal prefix. Matched with a little
+# whitespace tolerance (a host may collapse/pad the space differently) but
+# ONLY when immediately followed by "/goal", so this can never accidentally
+# eat real content.
+_LOOP_REDELIVERY_PREFIX_RE = re.compile(r"^/loop[ \t]+(?=/goal\b)")
+_LOOP_REDELIVERY_CANONICAL_PREFIX = "/loop "
+
+
+def _loop_redelivery_body_variants(body: str) -> list[str]:
+    """W1-H — body variants to try against a stored ``body_hash``, robust to
+    the ``/loop`` re-delivery wrapper (see module comment above) being added
+    or stripped between mint time and verification.
+
+    Returns ``[body]`` when the wrapper is irrelevant (most bodies — e.g.
+    wave-run manifests, or a /goal that already matches byte-for-byte).
+    Otherwise also returns the ONE alternate form: the wrapper stripped (if
+    present) or the exact canonical wrapper prepended (if the body looks
+    like a bare "/goal" block missing it). Only ever adds/removes this ONE
+    known literal — every other byte of `body` is untouched — so a body
+    that has been genuinely tampered with anywhere else still fails both
+    variants exactly as before this normalization existed.
+    """
+    variants = [body]
+    _stripped = _LOOP_REDELIVERY_PREFIX_RE.sub("", body, count=1)
+    if _stripped != body:
+        variants.append(_stripped)
+    elif body.lstrip().startswith("/goal"):
+        # Body looks like a goal block with no /loop wrapper at all — try
+        # the canonical form WITH it, in case the wrapper was stripped
+        # during re-delivery rather than added.
+        variants.append(_LOOP_REDELIVERY_CANONICAL_PREFIX + body)
+    return variants
+
+
+def _body_hash_matches(body: str, expected_hash: str) -> bool:
+    """W1-H — True when ``body`` (or a ``/loop``-wrapper-normalized variant
+    of it, see :func:`_loop_redelivery_body_variants`) hashes to
+    ``expected_hash``. Used by :func:`verify_handoff_token`'s body-integrity
+    check instead of a single direct ``_hash_goal_body(body) ==
+    expected_hash`` comparison, so a genuine re-delivered body that only
+    differs by that one known wrapper is not reported as ``body_mismatch``.
+    """
+    return any(
+        _hash_goal_body(variant) == expected_hash
+        for variant in _loop_redelivery_body_variants(body)
+    )
+
+
 async def mint_handoff_token(
     db: Any, project_id: str, *, body: str | None = None,
 ) -> str:
@@ -572,6 +628,15 @@ async def verify_handoff_token(
       the presented body, not in the token, so the legitimate holder of the
       CORRECT body must still be able to verify successfully afterward.
 
+      W1-H — the comparison is done via :func:`_body_hash_matches`, not a
+      bare hash equality: a presented body that differs from the minted one
+      by nothing but the literal ``/loop `` re-delivery wrapper (see
+      :func:`_loop_redelivery_body_variants`) still verifies as ``ok``. This
+      closes a false-positive ``body_mismatch`` a genuine ``/loop``-wrapped
+      re-delivery/wakeup of a paused /goal could otherwise trigger, without
+      widening what counts as a match for any OTHER difference in the body —
+      only that one known literal prefix is tolerated.
+
     f46372e8 — every non-"ok" result also carries a structured ``recovery``
     dict: ``{signal, message, next_step, next_step_hint}`` (see
     ``_HANDOFF_TOKEN_RECOVERY``/``_handoff_token_failure``). This closes the
@@ -646,7 +711,7 @@ async def verify_handoff_token(
             # against. Deliberately does NOT consume the token (see docstring)
             # so the legitimate holder of the correct body can still verify.
             if row_body_hash and body is not None:
-                if _hash_goal_body(body) != row_body_hash:
+                if not _body_hash_matches(body, row_body_hash):
                     return _handoff_token_failure("body_mismatch")
             # Consume: mark single-use (and stamp consumed_at, b763d2ba) so a
             # second verification is rejected as "already_consumed" — not
@@ -675,7 +740,7 @@ async def verify_handoff_token(
     # efaa918a — same body-integrity check as the DB path above; does not
     # consume the entry on mismatch.
     if entry.get("body_hash") and body is not None:
-        if _hash_goal_body(body) != entry["body_hash"]:
+        if not _body_hash_matches(body, entry["body_hash"]):
             return _handoff_token_failure("body_mismatch")
     entry["consumed"] = True
     entry["consumed_at"] = now
@@ -3730,8 +3795,17 @@ def _build_quick_start_goal(
             )
     _hard_blocked_note = ""
     if _hard_blocked_items:
-        _hb_ids = ", ".join(it["id"] for it in _hard_blocked_items if it.get("id"))
-        _hb_n = len(_hard_blocked_items)
+        # W1-H — count derived from the SAME id-filtered list the joined
+        # string below renders, not the raw item list: an item missing an
+        # `id` (never expected from a real DB row, but not structurally
+        # impossible) was previously silently dropped from `_hb_ids` while
+        # still counted in `_hb_n`, so `count="N"` could exceed the number
+        # of ids actually listed in the same tag — the exact "count that
+        # does not match what was actually omitted" defect. See the four
+        # sibling `<excluded_*>` blocks below for the identical fix.
+        _hb_id_list = [it["id"] for it in _hard_blocked_items if it.get("id")]
+        _hb_ids = ", ".join(_hb_id_list)
+        _hb_n = len(_hb_id_list)
         _hard_blocked_note = (
             f'\n<excluded_superseded count="{_hb_n}">'
             f"{_xml_escape(_hb_ids)}"
@@ -3824,8 +3898,11 @@ def _build_quick_start_goal(
     # Build the structured exclusion note — empty string when nothing excluded.
     _excluded_unprospected_note = ""
     if _excluded_unprospected:
-        _exc_ids = ", ".join(it["id"] for it in _excluded_unprospected if it.get("id"))
-        _exc_n = len(_excluded_unprospected)
+        # W1-H — count from the id-filtered list, matching `_exc_ids` (see
+        # the `_hard_blocked_note` comment above for the defect this closes).
+        _exc_id_list = [it["id"] for it in _excluded_unprospected if it.get("id")]
+        _exc_ids = ", ".join(_exc_id_list)
+        _exc_n = len(_exc_id_list)
         _excluded_unprospected_note = (
             f'\n<excluded_unprospected count="{_exc_n}">'
             f"{_xml_escape(_exc_ids)}"
@@ -3875,8 +3952,11 @@ def _build_quick_start_goal(
                 _scope_exclusion_reason_by_id.setdefault(_it["id"], "wave_gate_pending")
     _excluded_wave_gate_note = ""
     if _excluded_wave_gated:
-        _exc_ids = ", ".join(it["id"] for it in _excluded_wave_gated if it.get("id"))
-        _exc_n = len(_excluded_wave_gated)
+        # W1-H — count from the id-filtered list, matching `_exc_ids` (see
+        # the `_hard_blocked_note` comment above for the defect this closes).
+        _exc_id_list = [it["id"] for it in _excluded_wave_gated if it.get("id")]
+        _exc_ids = ", ".join(_exc_id_list)
+        _exc_n = len(_exc_id_list)
         _boundaries = sorted({
             it["_blocking_gate"].get("wave_end")
             for it in _excluded_wave_gated
@@ -3929,8 +4009,14 @@ def _build_quick_start_goal(
                 _scope_exclusion_reason_by_id.setdefault(_it["id"], "dependency_not_satisfied")
     _excluded_dependency_note = ""
     if _excluded_dependency_blocked:
-        _dep_exc_ids = ", ".join(it["id"] for it in _excluded_dependency_blocked if it.get("id"))
-        _dep_exc_n = len(_excluded_dependency_blocked)
+        # W1-H — count from the id-filtered list, matching `_dep_exc_ids`
+        # (see the `_hard_blocked_note` comment above for the defect this
+        # closes).
+        _dep_exc_id_list = [
+            it["id"] for it in _excluded_dependency_blocked if it.get("id")
+        ]
+        _dep_exc_ids = ", ".join(_dep_exc_id_list)
+        _dep_exc_n = len(_dep_exc_id_list)
         _excluded_dependency_note = (
             f'\n<excluded_dependency_not_satisfied count="{_dep_exc_n}">'
             f"{_xml_escape(_dep_exc_ids)}"
