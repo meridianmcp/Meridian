@@ -4837,7 +4837,7 @@ async def _handle_sprint_tools(
     get_sprint_item_pointers, resolve_sprint_item_pointers,
     delete_sprint_item_pointer, execute_batch, complete_wave_gate, configure_wave_gate,
     start_wave_run, finalize_wave_run, resume_wave, batch_read, batch_mutate,
-    reconcile_stale_claims.
+    reconcile_stale_claims, proposal_to_handoff.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4877,6 +4877,7 @@ async def _handle_sprint_tools(
         handle_batch_read,
         handle_batch_mutate,
         handle_reconcile_stale_claims,
+        handle_proposal_to_handoff,
     )
 
     _standard_dispatch: dict[str, Any] = {
@@ -4910,6 +4911,7 @@ async def _handle_sprint_tools(
         "batch_read": handle_batch_read,
         "batch_mutate": handle_batch_mutate,
         "reconcile_stale_claims": handle_reconcile_stale_claims,
+        "proposal_to_handoff": handle_proposal_to_handoff,
     }
 
     if name in _standard_dispatch:
