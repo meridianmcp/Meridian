@@ -1428,6 +1428,87 @@ async def handle_reconcile_stale_claims(
     )
 
 
+async def handle_release_sprint_item_claim(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: release_sprint_item_claim.
+
+    W1-I — thin wrapper over
+    :func:`meridian.db.sprint_items.release_sprint_item_claim`. Lets a LIVE
+    session voluntarily give up a claim it decided not to work on — distinct
+    from ``reconcile_stale_claims``, which is for a claim whose owning
+    session is dead/abandoned. Returns a structured
+    ``{"blocked": True, "error": ...}`` dict — never raises — for
+    ``NOT_IN_PROGRESS`` / ``NOT_CLAIM_OWNER`` / ``RACE_LOST``; see that
+    function's docstring for the full contract.
+
+    ``session_id`` (required) is the calling session's own identity — only
+    the session recorded as the item's current ``actor`` may release its own
+    claim; pass ``force=true`` to release a different live session's claim
+    anyway (audited either way). ``reason`` (optional) is recorded in the
+    audit trail only, never written to the item's own ``notes``.
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    if not args.get("session_id"):
+        return {"error": "session_id is required"}
+    result = await db_module.release_sprint_item_claim(
+        db, args["project_id"], args["item_id"], args["session_id"],
+        reason=args.get("reason"),
+        force=bool(args.get("force")),
+    )
+    if result is None:
+        return {"error": "sprint item not found in this project"}
+    return result
+
+
+async def handle_transfer_sprint_item_claim(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: transfer_sprint_item_claim.
+
+    W1-I — thin wrapper over
+    :func:`meridian.db.sprint_items.transfer_sprint_item_claim`. Hands a LIVE
+    ``in_progress`` claim off to a different actor/session directly, without
+    a reset-to-pending-then-reclaim cycle (so no window where a third
+    session could race to claim the item out from under the intended
+    recipient). Returns a structured ``{"blocked": True, "error": ...}``
+    dict — never raises — for ``NOT_IN_PROGRESS`` / ``NOT_CLAIM_OWNER`` /
+    ``SAME_ACTOR`` / ``RACE_LOST``; see that function's docstring for the
+    full contract, including the optional file/symbol resource-lock
+    migration when ``to_session_id`` is supplied.
+
+    ``session_id`` (required) is the calling (current-owner) session's own
+    identity. ``to_actor`` (required) is the new owner's identity.
+    ``to_session_id`` (optional) additionally migrates any declared
+    ``touches_resources`` file/symbol locks to the new session. Pass
+    ``force=true`` to transfer a different live session's claim anyway.
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    if not args.get("session_id"):
+        return {"error": "session_id is required (the current claiming session)"}
+    if not args.get("to_actor"):
+        return {"error": "to_actor is required (the new claim owner)"}
+    result = await db_module.transfer_sprint_item_claim(
+        db, args["project_id"], args["item_id"], args["session_id"], args["to_actor"],
+        to_session_id=args.get("to_session_id"),
+        reason=args.get("reason"),
+        force=bool(args.get("force")),
+    )
+    if result is None:
+        return {"error": "sprint item not found in this project"}
+    return result
+
+
 async def handle_claim_parallel_batch(
     args: dict[str, Any],
     db: Any,

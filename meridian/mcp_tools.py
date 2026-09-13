@@ -107,6 +107,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
     "reconcile_stale_claims": 'reconcile_stale_claims(project_id="abc-123", dry_run=true)',
+    "release_sprint_item_claim": 'release_sprint_item_claim(project_id="abc-123", item_id="item-uuid", session_id="session-uuid", reason="wrong scope for this session")',
+    "transfer_sprint_item_claim": 'transfer_sprint_item_claim(project_id="abc-123", item_id="item-uuid", session_id="session-uuid", to_actor="other-session-uuid")',
     "assign_sprint_waves": 'assign_sprint_waves(project_id="abc-123")',
     "start_wave_run": 'start_wave_run(project_id="abc-123", version="v0.2.5", wave_label="wave-2", item_ids=["item-uuid-a", "item-uuid-b"], failure_modes={"item-uuid-a": "stop"})',
     "finalize_wave_run": 'finalize_wave_run(wave_run_id="run-uuid", evidence={"status": "ok", "exit_code": 0, "passed": 1780, "failed": 0}, expected_revision_hash="sha256:...")',
@@ -2886,6 +2888,55 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "actor": {"type": "string", "description": "Recorded as who ran the sweep, for the audit trail. Omit to leave unattributed."},
          "repo_root": {"type": "string", "description": "Self-hosted only: enables the worktree-pid and strict-completion-evidence liveness signals. Defaults to the server's own repo root when omitted."}},
          "required": []}},
+    {"name": "release_sprint_item_claim", "description":
+        "W1-I — voluntarily release a LIVE in_progress claim on a sprint item back to "
+        "pending. Distinct from reconcile_stale_claims: that tool is for a claim whose "
+        "owning session is dead/abandoned (multi-signal liveness classification); this is "
+        "for a session that is still alive and has simply decided not to work the item "
+        "after all (wrong scope, superseded, claimed by mistake) and wants to hand it "
+        "back to the board cleanly instead of going silent and letting it eventually get "
+        "swept as stale. Only the session recorded as the item's current actor may "
+        "release its own claim — a mismatch is refused (NOT_CLAIM_OWNER) unless force=true "
+        "is explicitly passed. Also clears the item's claimed_at/actor columns (not just "
+        "status) and releases any file/symbol resource locks the claim held. Returns a "
+        "structured {blocked: true, error: ...} dict (NOT_IN_PROGRESS / NOT_CLAIM_OWNER / "
+        "RACE_LOST) rather than raising when it can't proceed; on success returns "
+        "{item_id, prior_actor, prior_claimed_at, released_resources, item}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "item_id": {"type": "string", "description": "The in_progress sprint item to release."},
+         "session_id": {"type": "string", "description": "The calling session's own identity. Must match the item's current actor unless force=true."},
+         "reason": {"type": "string", "description": "Optional human-readable reason, recorded in the audit trail only (never written to the item's own notes)."},
+         "force": {"type": "boolean", "description": "Release a DIFFERENT live session's claim anyway. Default false — an ownership mismatch is refused by default."}},
+         "required": ["item_id", "session_id"]}},
+    {"name": "transfer_sprint_item_claim", "description":
+        "W1-I — hand a LIVE in_progress claim on a sprint item off to a different "
+        "actor/session directly, without a reset-to-pending-then-reclaim cycle. The "
+        "item's status never leaves in_progress, so there is no window where a third "
+        "session could see it as pending and race to claim it out from under the "
+        "intended recipient — only actor/claimed_at (and, best-effort, the underlying "
+        "file/symbol resource locks) move to the new owner. Only the session recorded as "
+        "the item's current actor may transfer its own claim away — a mismatch is refused "
+        "(NOT_CLAIM_OWNER) unless force=true is explicitly passed. When to_session_id is "
+        "given and the item declares touches_resources, each declared file:/symbol: lock "
+        "is released under session_id and re-acquired under to_session_id via the same "
+        "claim_file/claim_symbol machinery claim_sprint_item itself uses (a symbol: "
+        "resource is released but not auto-reclaimed — re-acquiring a real AST-resolved "
+        "range needs the file's current content, which this call doesn't have; the "
+        "receiving session should claim_file(symbol=..., content=...) itself for those). "
+        "Returns a structured {blocked: true, error: ...} dict (NOT_IN_PROGRESS / "
+        "NOT_CLAIM_OWNER / SAME_ACTOR / RACE_LOST) rather than raising when it can't "
+        "proceed; on success returns {item_id, prior_actor, prior_claimed_at, new_actor, "
+        "transferred_resources, released_only_resources, item}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "item_id": {"type": "string", "description": "The in_progress sprint item to transfer."},
+         "session_id": {"type": "string", "description": "The calling (current-owner) session's own identity. Must match the item's current actor unless force=true."},
+         "to_actor": {"type": "string", "description": "The new claim owner's identity — the item's actor column is set to this."},
+         "to_session_id": {"type": "string", "description": "Optional: the new owner's live session id. When given, declared touches_resources file/symbol locks are also migrated from session_id to this session."},
+         "reason": {"type": "string", "description": "Optional human-readable reason, recorded in the audit trail only (never written to the item's own notes)."},
+         "force": {"type": "boolean", "description": "Transfer a DIFFERENT live session's claim anyway. Default false — an ownership mismatch is refused by default."}},
+         "required": ["item_id", "session_id", "to_actor"]}},
     {"name": "get_planning_brief", "description":
         "PLANNING SESSIONS: CALL THIS FIRST before anything else. "
         "Read-only: Return a compact planning context — sprint, north star, pending items, "
@@ -4456,6 +4507,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_sprint_progress":           "sprint-management",
     "reconcile_sprint_drift":        "sprint-management",
     "reconcile_stale_claims":        "sprint-management",
+    "release_sprint_item_claim":     "sprint-management",
+    "transfer_sprint_item_claim":    "sprint-management",
     "get_planning_brief":            "sprint-management",
     "get_parallelizable_groups":     "sprint-management",
     "assign_sprint_waves":           "sprint-management",
@@ -4726,6 +4779,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "analyze_sprint":            "planner",
     "reconcile_sprint_drift":    "planner",
     "reconcile_stale_claims":    "executor",
+    "release_sprint_item_claim": "executor",
+    "transfer_sprint_item_claim": "executor",
     "analyze_model_efficiency":  "planner",
     "set_sprint":                "planner",
     "set_goal":                  "planner",
@@ -5047,6 +5102,8 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "assign_sprint_waves":        "maintenance-only",
     "reconcile_sprint_drift":     "maintenance-only",
     "reconcile_stale_claims":     "maintenance-only",
+    "release_sprint_item_claim":  "maintenance-only",
+    "transfer_sprint_item_claim": "maintenance-only",
     "get_symbol_hotspots":        "maintenance-only",
     "get_symbol_claims":          "maintenance-only",
     # parallel coordination primitives (orchestrator-only)
@@ -5206,6 +5263,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "set_agent_instructions": "Set Agent Instructions",
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
     "reconcile_stale_claims": "Reconcile Stale Claims",
+    "release_sprint_item_claim": "Release Sprint Item Claim",
+    "transfer_sprint_item_claim": "Transfer Sprint Item Claim",
     "assign_sprint_waves": "Assign Sprint Waves",
     "complete_wave_gate": "Complete Wave Gate",
     "configure_wave_gate": "Configure Wave Gate",

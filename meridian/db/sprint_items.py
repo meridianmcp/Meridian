@@ -3859,6 +3859,370 @@ async def clear_stale_claim_metadata(
     return await get_sprint_item(db, item_id)
 
 
+# event_type recorded in action_audit_log for a live session's own voluntary
+# claim release / claim transfer (W1-I). Distinct from
+# RECONCILE_STALE_CLAIM_AUDIT_EVENT above: that event is for a DEAD/abandoned
+# claim reset by the staleness classifier or a human/bulk sweep; these two are
+# for a session that is still alive and either decided not to work the item
+# (release) or is deliberately handing it to a named successor (transfer).
+SPRINT_ITEM_CLAIM_RELEASED_AUDIT_EVENT = "sprint_item_claim_released"
+SPRINT_ITEM_CLAIM_TRANSFERRED_AUDIT_EVENT = "sprint_item_claim_transferred"
+
+
+async def release_sprint_item_claim(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    session_id: str,
+    *,
+    reason: str | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """W1-I — voluntarily release a LIVE ``in_progress`` claim back to ``pending``.
+
+    Distinct from :func:`reconcile_stale_claims` / :func:`classify_stale_claim`
+    / :func:`_reset_stale_claim`, which are for a claim whose owning session is
+    dead or unresponsive: this is for a session that is still alive and has
+    simply decided not to work the item after all (wrong scope, superseded by
+    other work, picked up by mistake) and wants to hand it back to the board
+    cleanly instead of just going silent and letting it eventually get swept
+    as stale.
+
+    Ownership is enforced: only the session recorded as the item's current
+    ``actor`` may release its own claim. A mismatch is refused
+    (``NOT_CLAIM_OWNER``) unless the caller explicitly passes ``force=True`` —
+    releasing someone else's live claim is unusual enough that it must be an
+    explicit, audited choice, never a silent default.
+
+    Returns:
+      * ``None`` if the item doesn't exist or belongs to a different project
+        (mirrors every other sprint-item function's not-found contract).
+      * A structured ``{"blocked": True, "error": ..., ...}`` dict for
+        ``NOT_IN_PROGRESS`` (nothing to release), ``NOT_CLAIM_OWNER``
+        (ownership mismatch, no ``force``), or ``RACE_LOST`` (the item
+        transitioned away from ``in_progress`` between the ownership check
+        and the write — e.g. a concurrent ``complete_sprint_item`` won first).
+      * On success: ``{"item_id", "prior_actor", "prior_claimed_at",
+        "released_resources", "item"}`` — ``released_resources`` lists the
+        ``touches_resources`` entries whose file/symbol lock was released
+        under the prior owner (best-effort; a release failure for one
+        resource never blocks the others or the overall release).
+
+    f007e59e note: like :func:`_reset_stale_claim`, this clears **both**
+    ``claimed_at`` and ``actor`` (not just ``status``) so a released item
+    never still looks claimed to ``get_parallelizable_groups`` or any other
+    live-state reader that checks those columns.
+    """
+    if not (session_id or "").strip():
+        raise ValueError("session_id is required")
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    if (item.get("status") or "") != "in_progress":
+        return {
+            "blocked": True,
+            "error": "NOT_IN_PROGRESS",
+            "reason": (
+                f"Sprint item is not in_progress (status={item.get('status')!r}) "
+                "— nothing to release."
+            ),
+            "item_id": item_id,
+            "status": item.get("status"),
+        }
+    prior_actor = item.get("actor")
+    prior_claimed_at = item.get("claimed_at")
+    if prior_actor and prior_actor != session_id and not force:
+        return {
+            "blocked": True,
+            "error": "NOT_CLAIM_OWNER",
+            "reason": (
+                f"Sprint item is claimed by a different actor ({prior_actor!r}), "
+                f"not the calling session ({session_id!r}) — only the claiming "
+                "session can voluntarily release its own claim. If that session "
+                "is dead/gone, use reconcile_stale_claims instead; to release "
+                "someone else's still-live claim anyway, pass force=true."
+            ),
+            "item_id": item_id,
+            "actor": prior_actor,
+        }
+    # TOCTOU-safe: only transitions FROM in_progress, mirroring
+    # _reset_stale_claim's own race-safety contract.
+    transitioned = await _transition_status(
+        db, project_id, item_id, "pending",
+        from_statuses=["in_progress"],
+    )
+    if transitioned is None:
+        _raced = await get_sprint_item(db, item_id)
+        return {
+            "blocked": True,
+            "error": "RACE_LOST",
+            "reason": (
+                "Item transitioned away from in_progress between the ownership "
+                "check and the release write (likely completed, reset, or "
+                "reclaimed concurrently) — release did not apply."
+            ),
+            "item_id": item_id,
+            "status": (_raced or {}).get("status"),
+        }
+    # f007e59e — also clear `actor`, not just `claimed_at`/status (see docstring).
+    await db.execute(
+        "UPDATE sprint_items SET claimed_at = NULL, actor = NULL "
+        "WHERE id = ? AND project_id = ?",
+        (item_id, project_id),
+    )
+    await db.commit()
+    _invalidate_sprint_items_cache(project_id)
+
+    # Release any file/symbol/resource locks the released claim held.
+    # Best-effort, same pattern as _reset_stale_claim: one bad resource id
+    # must never block the release of the others or of the item itself.
+    released: list[str] = []
+    if prior_actor:
+        try:
+            from meridian.db import release_file, release_resource, release_symbol  # noqa: PLC0415
+            for rid in parse_touches_resources(item.get("touches_resources")):
+                body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
+                try:
+                    if body.startswith("file:"):
+                        path = body[len("file:"):]
+                        if await release_file(db, path, prior_actor):
+                            released.append(rid)
+                    elif body.startswith("symbol:"):
+                        path, _, sym = body[len("symbol:"):].partition("::")
+                        if sym and await release_symbol(db, prior_actor, path, sym):
+                            released.append(rid)
+                        elif not sym and await release_file(db, path, prior_actor):
+                            released.append(rid)
+                    else:
+                        if await release_resource(db, body, prior_actor):
+                            released.append(rid)
+                except Exception:  # noqa: BLE001 — one bad resource id must not block the rest
+                    continue
+        except Exception:  # noqa: BLE001 — lock release is best-effort, never blocks the release
+            pass
+
+    from meridian.db import record_action_audit_event  # noqa: PLC0415
+    detail = json.dumps({
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "released_resources": released,
+        "reason": reason,
+        "forced": bool(force and prior_actor and prior_actor != session_id),
+        "released_by": session_id,
+    })
+    try:
+        await record_action_audit_event(
+            db, SPRINT_ITEM_CLAIM_RELEASED_AUDIT_EVENT,
+            project_id=project_id, actor=session_id, detail=detail,
+        )
+    except Exception:  # noqa: BLE001 — an audit-log hiccup must not undo an already-committed release
+        pass
+
+    updated = await get_sprint_item(db, item_id)
+    return {
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "released_resources": released,
+        "item": updated,
+    }
+
+
+async def transfer_sprint_item_claim(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    from_session_id: str,
+    to_actor: str,
+    *,
+    to_session_id: str | None = None,
+    reason: str | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """W1-I — hand a LIVE ``in_progress`` claim off to a different actor/session.
+
+    Distinct from a reset-to-pending-then-reclaim cycle
+    (:func:`release_sprint_item_claim` followed by :func:`claim_sprint_item`):
+    the item's ``status`` never leaves ``in_progress`` here, so there is no
+    window where a third session could see the item as ``pending`` and race
+    to claim it out from under the intended recipient. Only ``actor`` /
+    ``claimed_at`` (and, best-effort, the underlying file/symbol resource
+    locks) move to the new owner.
+
+    ``to_actor`` is the new owner's identity (required — this is what the
+    item's ``actor`` column is set to). ``to_session_id`` is optional: when
+    given AND the item declares ``touches_resources``, this function also
+    releases each declared ``file:``/``symbol:`` lock under
+    ``from_session_id`` and re-acquires it under ``to_session_id`` (via the
+    same ``claim_file``/``claim_symbol`` machinery ``claim_sprint_item``
+    itself uses) — so the receiving session doesn't also need to separately
+    re-claim every file. A ``symbol:`` resource is released but NOT
+    automatically re-claimed: re-acquiring a real AST-resolved symbol range
+    needs the file's current content, which this db-layer function has no
+    filesystem access to obtain — the receiving session should call
+    ``claim_file(symbol=..., content=...)`` itself for those. When
+    ``to_session_id`` is omitted (e.g. handing off to a human name, or a
+    session that hasn't started yet), locks are released under
+    ``from_session_id`` but not re-acquired; the item still stays
+    ``in_progress`` under ``to_actor`` throughout.
+
+    Ownership is enforced exactly like :func:`release_sprint_item_claim`:
+    only the session recorded as the item's current ``actor`` may transfer
+    its own claim away, unless ``force=True`` is explicitly passed.
+
+    Returns:
+      * ``None`` if the item doesn't exist or belongs to a different project.
+      * A structured ``{"blocked": True, "error": ..., ...}`` dict for
+        ``NOT_IN_PROGRESS``, ``NOT_CLAIM_OWNER``, ``SAME_ACTOR`` (``to_actor``
+        already owns the claim — nothing to transfer), or ``RACE_LOST``.
+      * On success: ``{"item_id", "prior_actor", "prior_claimed_at",
+        "new_actor", "transferred_resources", "released_only_resources",
+        "item"}``.
+    """
+    if not (to_actor or "").strip():
+        raise ValueError("to_actor is required")
+    if not (from_session_id or "").strip():
+        raise ValueError("from_session_id is required")
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    if (item.get("status") or "") != "in_progress":
+        return {
+            "blocked": True,
+            "error": "NOT_IN_PROGRESS",
+            "reason": (
+                f"Sprint item is not in_progress (status={item.get('status')!r}) "
+                "— nothing to transfer."
+            ),
+            "item_id": item_id,
+            "status": item.get("status"),
+        }
+    prior_actor = item.get("actor")
+    prior_claimed_at = item.get("claimed_at")
+    if prior_actor and prior_actor != from_session_id and not force:
+        return {
+            "blocked": True,
+            "error": "NOT_CLAIM_OWNER",
+            "reason": (
+                f"Sprint item is claimed by a different actor ({prior_actor!r}), "
+                f"not the calling session ({from_session_id!r}) — only the "
+                "claiming session can transfer its own claim away. To transfer "
+                "someone else's still-live claim anyway, pass force=true."
+            ),
+            "item_id": item_id,
+            "actor": prior_actor,
+        }
+    if (to_actor or "").strip() == (prior_actor or "").strip():
+        return {
+            "blocked": True,
+            "error": "SAME_ACTOR",
+            "reason": "to_actor is already the current claim owner — nothing to transfer.",
+            "item_id": item_id,
+            "actor": prior_actor,
+        }
+
+    # Move resource locks BEFORE flipping the item's actor column, mirroring
+    # _reset_stale_claim's own best-effort (never-blocks-the-transition)
+    # contract for lock handling.
+    transferred: list[str] = []
+    released_only: list[str] = []
+    try:
+        from meridian.db import release_file, release_symbol, claim_file  # noqa: PLC0415
+        for rid in parse_touches_resources(item.get("touches_resources")):
+            body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
+            try:
+                if body.startswith("file:"):
+                    path = body[len("file:"):]
+                    _rel = await release_file(db, path, from_session_id)
+                    if to_session_id:
+                        _claim_res = await claim_file(db, path, to_session_id, item_id=item_id)
+                        if _claim_res.get("claimed"):
+                            transferred.append(rid)
+                        elif _rel:
+                            released_only.append(rid)
+                    elif _rel:
+                        released_only.append(rid)
+                elif body.startswith("symbol:"):
+                    path, _, sym = body[len("symbol:"):].partition("::")
+                    if sym:
+                        # Symbol-grain re-acquisition needs the file's current
+                        # content to re-resolve the AST range (see docstring)
+                        # — release only, never auto-reclaimed here.
+                        if await release_symbol(db, from_session_id, path, sym):
+                            released_only.append(rid)
+                    else:
+                        _rel = await release_file(db, path, from_session_id)
+                        if to_session_id:
+                            _claim_res = await claim_file(db, path, to_session_id, item_id=item_id)
+                            if _claim_res.get("claimed"):
+                                transferred.append(rid)
+                            elif _rel:
+                                released_only.append(rid)
+                        elif _rel:
+                            released_only.append(rid)
+            except Exception:  # noqa: BLE001 — one bad resource id must not block the rest
+                continue
+    except Exception:  # noqa: BLE001 — lock migration is best-effort, never blocks the transfer
+        pass
+
+    updated = await _transition_status(
+        db, project_id, item_id, "in_progress",
+        from_statuses=["in_progress"],
+        actor=to_actor,
+        claimed_at_now=True,
+    )
+    if updated is None:
+        # Raced away from in_progress between the ownership check and this
+        # write (e.g. a concurrent complete_sprint_item won first). Any locks
+        # already moved above are left in their new state — matches
+        # _reset_stale_claim's own contract of never rolling back a
+        # best-effort lock change on a lost race.
+        _raced = await get_sprint_item(db, item_id)
+        return {
+            "blocked": True,
+            "error": "RACE_LOST",
+            "reason": (
+                "Item transitioned away from in_progress between the ownership "
+                "check and the transfer write (likely completed or reset "
+                "concurrently) — transfer did not apply."
+            ),
+            "item_id": item_id,
+            "status": (_raced or {}).get("status"),
+        }
+
+    from meridian.db import record_action_audit_event  # noqa: PLC0415
+    detail = json.dumps({
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "new_actor": to_actor,
+        "from_session_id": from_session_id,
+        "to_session_id": to_session_id,
+        "transferred_resources": transferred,
+        "released_only_resources": released_only,
+        "reason": reason,
+        "forced": bool(force and prior_actor and prior_actor != from_session_id),
+    })
+    try:
+        await record_action_audit_event(
+            db, SPRINT_ITEM_CLAIM_TRANSFERRED_AUDIT_EVENT,
+            project_id=project_id, actor=from_session_id, detail=detail,
+        )
+    except Exception:  # noqa: BLE001 — an audit-log hiccup must not undo an already-committed transfer
+        pass
+
+    return {
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "new_actor": to_actor,
+        "transferred_resources": transferred,
+        "released_only_resources": released_only,
+        "item": updated,
+    }
+
+
 async def fail_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,

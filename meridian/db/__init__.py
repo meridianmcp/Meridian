@@ -3029,6 +3029,100 @@ async def register_session(
     return session
 
 
+async def ensure_session_registered(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session_id: str,
+    *,
+    name: str | None = None,
+    human_id: str | None = None,
+    session_type: str = "worker",
+    agent_framework: str = "claude_code",
+    client_type: str | None = None,
+) -> dict[str, Any]:
+    """W1-I — return the session row for ``session_id``, auto-registering one
+    under that EXACT id first if none exists yet.
+
+    Closes a real, confirmed gap: several MCP tool call paths require a
+    caller-supplied ``session_id`` to already correspond to a row
+    ``register_session`` created, and hard-reject an unrecognised one instead
+    of ever creating it — ``log_task``'s hosted/HTTP dispatch
+    (``meridian/mcp/handler.py``'s ``_handle_task_tools``) is the confirmed
+    case: before this function existed, it raised ``"session not found —
+    call start_session first to register your session before calling
+    log_task"`` for any session_id that never went through
+    ``start_session``/``register_session``. That is a real problem for a
+    caller that already has a stable, externally-minted session_id (e.g. an
+    orchestrator that mints an id up front and hands it to a worker that
+    calls straight into ``log_task``/``claim_sprint_item`` without ever
+    separately registering) — its very first call always failed outright
+    with no self-service recovery.
+
+    Unlike :func:`register_session` (which always mints a FRESH id via
+    :func:`_new_id`), this inserts under the CALLER'S OWN ``session_id`` —
+    the point is to make an already-in-use identifier valid, not to hand
+    back a different one the caller then has to notice and switch to.
+
+    Idempotent: if a session with this id already exists, it is returned
+    UNCHANGED — no field is overwritten and ``last_seen`` is not bumped here
+    (a caller that also wants a liveness bump should call
+    :func:`update_session_seen` separately, exactly as ``log_task`` already
+    does on its own session_id after this check).
+
+    A cross-project id collision (the row exists but for a DIFFERENT
+    ``project_id``) raises ``ValueError`` rather than silently either
+    returning the other project's session or clobbering it — a session id is
+    a project-scoped identity everywhere else in this codebase, so silently
+    accepting a mismatch here would create exactly the inconsistency those
+    other lookups don't tolerate.
+
+    ``session_type`` defaults to ``"worker"`` (not ``register_session``'s
+    ``"human"``): a session_id showing up unregistered at a tool boundary is,
+    in practice, almost always an automated executor/orchestrator identity
+    that never went through the normal interactive ``start_session`` flow,
+    not a human clicking through a UI.
+    """
+    async with db.execute(
+        "SELECT * FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        existing_row = await cur.fetchone()
+    existing = _row_to_dict(existing_row)
+    if existing is not None:
+        if existing.get("project_id") != project_id:
+            raise ValueError(
+                f"session {session_id!r} is already registered under a "
+                f"different project ({existing.get('project_id')!r}, not "
+                f"{project_id!r}) — cannot auto-register it here."
+            )
+        return existing
+    if session_type not in {"human", "worker"}:
+        raise ValueError(f"invalid session_type: {session_type!r}")
+    resolved_name = (name or "").strip() or f"auto-{session_id[:8]}"
+    await db.execute(
+        "INSERT INTO sessions (id, project_id, name, human_id, session_type, "
+        "agent_framework, client_type) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (id) DO NOTHING",
+        (session_id, project_id, resolved_name, human_id, session_type,
+         agent_framework, client_type),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    registered = _row_to_dict(row)
+    if registered is None:
+        # Should be unreachable (we just committed the INSERT and no other
+        # writer can DELETE a brand-new row this fast) — fail loudly rather
+        # than returning a fabricated dict that doesn't reflect a real row.
+        raise RuntimeError(f"failed to auto-register session {session_id!r}")
+    _publish_project_event(project_id, "session_started", {
+        "session_id": session_id, "session_name": resolved_name,
+        "human_id": human_id, "auto_registered": True,
+    })
+    return registered
+
+
 async def generate_default_session_name(
     db: aiosqlite.Connection,
     project_id: str,
@@ -12501,6 +12595,12 @@ from .sprint_items import (  # noqa: F401
     RECONCILE_STALE,
     RECONCILE_AMBIGUOUS,
     RECONCILE_NOT_APPLICABLE,
+    # W1-I — voluntary live-claim release/transfer (distinct from the
+    # stale-claim reconciliation above, which is for a dead/abandoned claim)
+    release_sprint_item_claim,
+    transfer_sprint_item_claim,
+    SPRINT_ITEM_CLAIM_RELEASED_AUDIT_EVENT,
+    SPRINT_ITEM_CLAIM_TRANSFERRED_AUDIT_EVENT,
     # Public classes
     SprintItemClaimMismatch,
     SprintItemEvidenceRequired,

@@ -3101,14 +3101,23 @@ async def _handle_task_tools(
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
-        async with db.execute(
-            "SELECT id FROM sessions WHERE id = ?", (_log_sid,)
-        ) as _cur:
-            if not await _cur.fetchone():
-                raise ValueError(
-                    "session not found — call start_session first to register "
-                    "your session before calling log_task"
-                )
+        if not (_log_sid or "").strip():
+            raise ValueError(
+                "session_id is required — call start_session first to obtain one"
+            )
+        # W1-I — auto-register a previously-unseen session_id instead of
+        # hard-rejecting it (26c38b8e's original "session not found — call
+        # start_session first" reject is superseded here). See
+        # db_module.ensure_session_registered's docstring for the full
+        # rationale: a caller with an already-minted, stable session_id that
+        # never separately called start_session/register_session previously
+        # had its very first log_task call fail outright with no
+        # self-service recovery. A session_id already registered under a
+        # DIFFERENT project still raises a clean, actionable ValueError
+        # (never silently reassigned or clobbered) — preserving 26c38b8e's
+        # "human-readable error, not a raw DB failure" contract for that
+        # genuinely-wrong case.
+        await db_module.ensure_session_registered(db, args["project_id"], _log_sid)
         task = await db_module.log_task(
             db, args["session_id"], args["project_id"],
             args["description"], args.get("status", "done"),
@@ -4837,7 +4846,8 @@ async def _handle_sprint_tools(
     get_sprint_item_pointers, resolve_sprint_item_pointers,
     delete_sprint_item_pointer, execute_batch, complete_wave_gate, configure_wave_gate,
     start_wave_run, finalize_wave_run, resume_wave, batch_read, batch_mutate,
-    reconcile_stale_claims, proposal_to_handoff.
+    reconcile_stale_claims, release_sprint_item_claim,
+    transfer_sprint_item_claim, proposal_to_handoff.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4877,6 +4887,8 @@ async def _handle_sprint_tools(
         handle_batch_read,
         handle_batch_mutate,
         handle_reconcile_stale_claims,
+        handle_release_sprint_item_claim,
+        handle_transfer_sprint_item_claim,
         handle_proposal_to_handoff,
     )
 
@@ -4911,6 +4923,8 @@ async def _handle_sprint_tools(
         "batch_read": handle_batch_read,
         "batch_mutate": handle_batch_mutate,
         "reconcile_stale_claims": handle_reconcile_stale_claims,
+        "release_sprint_item_claim": handle_release_sprint_item_claim,
+        "transfer_sprint_item_claim": handle_transfer_sprint_item_claim,
         "proposal_to_handoff": handle_proposal_to_handoff,
     }
 

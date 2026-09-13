@@ -2067,6 +2067,11 @@ def build_mcp_server():
             # stale-claim reconciliation sweep, dispatched via _dispatch_mcp_tool
             # in the shared elif tuple below (mirrors batch_read/batch_mutate).
             _shared_tool("reconcile_stale_claims"),
+            # W1-I — same _shared_tool() schema-parity pattern: voluntary
+            # live-claim release/transfer, dispatched via _dispatch_mcp_tool
+            # in the shared elif tuple below (mirrors reconcile_stale_claims).
+            _shared_tool("release_sprint_item_claim"),
+            _shared_tool("transfer_sprint_item_claim"),
             # 325276f8 — was a hand-duplicated inputSchema that had drifted from
             # the canonical one in meridian/mcp_tools.py: it was missing "compact"
             # and "mode" entirely, and its "role" enum only allowed "executor"
@@ -2674,6 +2679,9 @@ def build_mcp_server():
                 # 56e9b3c7 — bulk stale-claim reconciliation sweep; share
                 # dispatch with HTTP MCP so all three transports stay in sync.
                 "reconcile_stale_claims",
+                # W1-I — voluntary live-claim release/transfer; same
+                # share-dispatch-with-HTTP-MCP pattern as reconcile_stale_claims.
+                "release_sprint_item_claim", "transfer_sprint_item_claim",
             ):
                 # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
                 result = await _dispatch_mcp_tool(
