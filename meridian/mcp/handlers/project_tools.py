@@ -513,10 +513,50 @@ async def handle_start_session(
                 (_policy_project or {}).get("execution_mode")
             )
             _policy_exec_cfg = await db_module.get_executor_config(db, _pid)
+            # W1-G (G3) — a planner-role session, or a project with a pinned
+            # SCOPE decision, must never see an effective claim-all/
+            # no-confirmation policy just because the raw project-level
+            # execution_mode is (still) 'autonomous'. See
+            # build_execution_policy's own docstring for the precedence
+            # rule. Best-effort: get_pinned_decisions failing degrades to
+            # "no scope decisions known" rather than breaking start_session.
+            try:
+                _policy_pinned = await db_module.get_pinned_decisions(db, _pid)
+            except Exception:  # noqa: BLE001
+                _policy_pinned = []
             result["execution_policy"] = build_execution_policy(
                 _policy_exec_cfg, execution_mode=_policy_mode,
+                role=args.get("role"), pinned_decisions=_policy_pinned,
             )
-    except Exception:  # noqa: BLE001 — execution policy is best-effort
+            # W1-G (G1/G2) — bind/verify this project's canonical repo
+            # identity against the calling session's cwd, when supplied.
+            # Omitting cwd (every pre-G1/G2 caller) is a complete no-op.
+            _cwd = str(args.get("cwd") or "").strip()
+            if _cwd:
+                from meridian.repo_scope import compute_repo_identity  # noqa: PLC0415
+                _observed_identity = compute_repo_identity(_cwd)
+                _stored_identity = (_policy_project or {}).get("repo_identity")
+                if _observed_identity and not _stored_identity:
+                    # First cwd ever reported for this project — this
+                    # becomes its canonical repo identity.
+                    await db_module.set_project_repo_identity(db, _pid, _cwd)
+                elif (
+                    _observed_identity
+                    and _stored_identity
+                    and _stored_identity != _observed_identity
+                ):
+                    result["cwd_mismatch_warning"] = {
+                        "message": (
+                            "This session's working directory does not "
+                            "match the repository this project was "
+                            "previously registered against — verify you "
+                            "are in the correct checkout before making "
+                            "changes."
+                        ),
+                        "expected_repo_identity": _stored_identity,
+                        "observed_repo_identity": _observed_identity,
+                    }
+    except Exception:  # noqa: BLE001 — execution policy / repo identity are best-effort
         pass
     return result
 
