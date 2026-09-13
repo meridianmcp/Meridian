@@ -263,17 +263,24 @@ def get_convergence_state(
     Args:
       outputs_dir:  Absolute path to the outputs directory.
       subtree:      Optional sub-path of ``outputs_dir``. When given, scopes
-                    the answer to that subtree specifically (has THIS
-                    sub-path been fully covered by the walk so far), using
-                    the SAME cached root index -- does not spin up a
-                    separate subtree index (see ``search_outputs``'s
-                    ``subtree`` param for that).
+                    the answer to that subtree specifically, using the SAME
+                    independently-converging subtree index a
+                    ``search_outputs(outputs_dir, ..., subtree=subtree)``
+                    call for this exact path would use (e23eeda6 -- fixed:
+                    this used to consult the whole-root index's own walk
+                    progress via a best-effort heuristic instead, a
+                    DIFFERENT object from the dedicated subtree index
+                    ``search_outputs`` actually searches, which could -- and
+                    did -- disagree with it). Must be ``outputs_dir`` itself
+                    or a path underneath it and must exist on disk; anything
+                    else returns ``{"error": ...}`` rather than a
+                    heuristic-derived answer about an unrelated directory.
 
     Returns:
       {outputs_dir, subtree, converged, walk_complete, scan_boundary,
       pending_count, indexed_count, expected_count, last_error, fts_pending,
       partial, index_lock, never_walked}, or {error: ...} if ``outputs_dir``
-      doesn't exist.
+      (or a given ``subtree``) doesn't exist or is out of scope.
       ``index_lock`` (a52216e2): a read-only snapshot of this index's
       single-writer lock/lease -- {held, pid, hostname, session_id,
       started_at, heartbeat_at, age_seconds, lock_mode, pid_alive, is_stale,

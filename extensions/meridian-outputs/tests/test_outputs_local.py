@@ -8501,6 +8501,97 @@ class TestConvergenceState:
             idx.close()
 
 
+class TestModuleWrapperSubtreeResolution:
+    """e23eeda6 -- regression coverage for the "scoped subtree resolution
+    and convergence truthfulness" fix: the module-level get_convergence_state
+    wrapper (the function actually exposed as the ``get-convergence-state``
+    MCP tool) must resolve a ``subtree`` argument to the SAME dedicated
+    index :func:`search_outputs`'s own ``subtree`` argument uses, not to a
+    heuristic reading of the whole-root index's unrelated walk progress.
+    Before this fix these were two entirely different OutputsFtsIndex
+    objects (separate on-disk caches, separate walk state) that could
+    disagree about whether a subtree was actually converged.
+    """
+
+    @duckdb_required
+    def test_subtree_answer_reflects_the_dedicated_subtree_index(
+        self, tmp_path: Path,
+    ) -> None:
+        """A subtree whose OWN dedicated index has real, unresolved pending
+        work must be reported as not-converged by the module-level wrapper
+        -- even though the ROOT index (a completely different object, never
+        even constructed here) has no idea any of this exists. Before the
+        fix, this call consulted the root index instead and would have
+        reported ``never_walked``/root-derived state that has nothing to do
+        with the actual subtree index a scoped search_outputs call uses.
+        """
+        sub = tmp_path / "defense_plots"
+        sub.mkdir()
+        (sub / "a.csv").write_text("col\nvalue=1\n", encoding="utf-8")
+
+        # Build the dedicated subtree index directly (mirrors what
+        # search_outputs(subtree=...) does internally) and inject a pending
+        # entry onto THAT specific index -- never touching/creating a root
+        # index for tmp_path at all.
+        sub_idx = OL.get_subtree_index(str(tmp_path), str(sub))
+        sub_idx.rebuild()
+        assert sub_idx.get_convergence_state().converged is True
+        sub_idx._pending_stale[str(sub / "a.csv")] = (1.0, 1)
+
+        state = OL.get_convergence_state(str(tmp_path), subtree=str(sub))
+        assert "error" not in state
+        assert state["converged"] is False, (
+            "module-level get_convergence_state(subtree=...) must read the "
+            "SAME dedicated subtree index search_outputs(subtree=...) uses, "
+            "not a heuristic answer derived from an unrelated root index"
+        )
+        assert state["pending_count"] == 1
+
+    @duckdb_required
+    def test_subtree_answer_matches_search_outputs_subtree_convergence(
+        self, tmp_path: Path,
+    ) -> None:
+        """The module-level wrapper and search_outputs's own embedded
+        convergence field must describe the SAME index for the SAME
+        subtree -- the core consistency contract this item restores."""
+        sub = tmp_path / "defense_plots"
+        sub.mkdir()
+        for i in range(5):
+            (sub / f"f{i}.csv").write_text(f"col\nvalue={i}\n", encoding="utf-8")
+
+        sub_idx = OL.get_subtree_index(str(tmp_path), str(sub))
+        sub_idx._max_batch = 1
+        sub_idx._max_batch_overridden = True
+
+        search_result = OL.search_outputs(str(tmp_path), "value", subtree=str(sub))
+        wrapper_state = OL.get_convergence_state(str(tmp_path), subtree=str(sub))
+
+        assert search_result["convergence"]["converged"] == wrapper_state["converged"]
+        assert (
+            search_result["convergence"]["indexed_count"]
+            == wrapper_state["indexed_count"]
+        )
+
+    def test_subtree_missing_returns_error(self, tmp_path: Path) -> None:
+        result = OL.get_convergence_state(str(tmp_path), subtree=str(tmp_path / "nope"))
+        assert "error" in result
+
+    def test_subtree_outside_root_returns_error(
+        self, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory,
+    ) -> None:
+        other = tmp_path_factory.mktemp("outside_root_e23eeda6")
+        result = OL.get_convergence_state(str(tmp_path), subtree=str(other))
+        assert "error" in result
+
+    @duckdb_required
+    def test_subtree_equal_to_root_still_works(self, tmp_path: Path) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        OL.search_outputs(str(tmp_path), "col")
+        state = OL.get_convergence_state(str(tmp_path), subtree=str(tmp_path))
+        assert "error" not in state
+        assert state["converged"] is True
+
+
 class TestWalkErrorSurfacedInConvergence:
     """6af1518d requirement 1: 'last error (if the walk hit something it
     couldn't read)' -- _walk_safe_output_files's on_error hook must be wired
