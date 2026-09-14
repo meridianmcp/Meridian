@@ -1,3 +1,17 @@
+// 07f753b2 — CONTROL-PLANE-UI: relationship/proposal/artifact-manifest
+// browser helpers (data shaping, role gating, redaction, pagination) —
+// kept in a standalone module so they're unit-testable without a DOM.
+import {
+  buildRelationshipRows,
+  canViewControlPlane,
+  classifyArtifactHealth,
+  displaySafe,
+  isArtifactsUnavailable,
+  type ArtifactsEnvelope,
+  type ControlPlaneRole,
+  type RelationshipProject,
+} from './dashboard-control-plane';
+
 // 02dbd8b4 — runtime configuration generation status (tunnel/executor
 // settings). Pure formatter for the `config_generation` record the server
 // attaches to GET/PUT /tunnel/plugins, POST/DELETE /tunnel/plugins/custom, and
@@ -3335,6 +3349,100 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       } catch (e: any) { alert('Error: ' + e); } finally { sprintAdd.disabled = false; }
     };
 
+    // ── 07f753b2 — Relationship & Artifact Explorer (Control Plane) ───────
+    // Thin DOM/fetch glue only; all data shaping, role gating, and
+    // pagination math lives in dashboard-control-plane.ts (unit-tested
+    // there) so this stays simple to review.
+    (function initControlPlanePanel(role: ControlPlaneRole) {
+      const section = document.getElementById('cp-section');
+      if (!section) return;
+      if (!canViewControlPlane(role)) { section.style.display = 'none'; return; }
+
+      const panels: Record<string, HTMLElement | null> = {
+        relationships: document.getElementById('cp-panel-relationships'),
+        proposals: document.getElementById('cp-panel-proposals'),
+        artifacts: document.getElementById('cp-panel-artifacts'),
+      };
+      const loaded: Record<string, boolean> = { relationships: false, proposals: false, artifacts: false };
+
+      async function loadRelationships() {
+        const el = panels.relationships;
+        if (!el) return;
+        try {
+          const data = await api('/control-plane/relationships');
+          const rows = buildRelationshipRows(data.scope, (data.projects || []) as RelationshipProject[]);
+          el.innerHTML = rows.length
+            ? rows.map(r => `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);padding-left:${r.depth * 14}px">`
+                + `<span>${r.depth ? '↳ ' : ''}${escapeHtml(displaySafe(r.project.name || r.project.id))}</span>`
+                + `<span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(r.scopeLabel)}</span>`
+                + `</div>`).join('')
+            : '<div style="color:var(--muted)">No projects visible in this scope.</div>';
+        } catch (e: any) {
+          el.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+        }
+      }
+
+      async function loadProposals() {
+        const el = panels.proposals;
+        if (!el) return;
+        try {
+          const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=20`);
+          const items = data.items || [];
+          el.innerHTML = items.length
+            ? items.map((p: any) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)">`
+                + `<div>${escapeHtml(p.title || '')} <span style="color:var(--muted);font-size:9px">${escapeHtml(p.status || '')}</span></div>`
+                + `<div style="color:var(--muted);font-size:9px">${escapeHtml((p.body || '').slice(0, 160))}</div>`
+                + `</div>`).join('')
+            : '<div style="color:var(--muted)">No proposals in scope.</div>';
+        } catch (e: any) {
+          el.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+        }
+      }
+
+      async function loadArtifacts() {
+        const el = panels.artifacts;
+        if (!el) return;
+        try {
+          const data = (await api('/control-plane/artifacts?limit=50')) as ArtifactsEnvelope;
+          if (isArtifactsUnavailable(data)) {
+            el.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : 'Not available.')}</div>`;
+            return;
+          }
+          const items = data.items || [];
+          el.innerHTML = items.length
+            ? items.map((rec: any) => {
+                const health = classifyArtifactHealth(rec);
+                const ident = displaySafe(rec.path || rec.run_id || rec.artifact_id || '(unknown)');
+                return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)">`
+                  + `<span>[${escapeHtml(rec.record_kind)}] ${escapeHtml(ident)}</span>`
+                  + `<span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(health)}</span>`
+                  + `</div>`;
+              }).join('')
+            : '<div style="color:var(--muted)">No run manifests, provenance records, or registered artifacts found.</div>';
+        } catch (e: any) {
+          el.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+        }
+      }
+
+      const loaders: Record<string, () => Promise<void>> = {
+        relationships: loadRelationships, proposals: loadProposals, artifacts: loadArtifacts,
+      };
+
+      function activateTab(tab: string) {
+        Object.keys(panels).forEach(k => { if (panels[k]) panels[k]!.style.display = (k === tab) ? '' : 'none'; });
+        section!.querySelectorAll('.cp-tab-btn').forEach(btn => {
+          (btn as HTMLElement).classList.toggle('active', (btn as HTMLElement).dataset.cptab === tab);
+        });
+        if (!loaded[tab]) { loaded[tab] = true; loaders[tab](); }
+      }
+
+      section.querySelectorAll('.cp-tab-btn').forEach(btn => {
+        (btn as HTMLElement).onclick = () => activateTab((btn as HTMLElement).dataset.cptab || 'relationships');
+      });
+
+      activateTab('relationships');
+    })(_activeRole);
+
   }, 0);
 
 
@@ -3487,6 +3595,18 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         <input id="ws-sprint-title" type="text" placeholder="What needs doing" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
         <button id="ws-sprint-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
       </div>
+    </div>
+    <div id="cp-section" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+      <div style="font-size:10px;color:var(--text);margin-bottom:2px">Relationship &amp; Artifact Explorer</div>
+      <div style="font-size:9px;color:var(--muted);margin-bottom:8px">Permission-aware, read-only. Only records you're authorized to see are ever shown here — see docs/control-plane-relationship-and-artifact-view.md.</div>
+      <div style="display:flex;gap:6px;margin-bottom:8px">
+        <button class="secondary cp-tab-btn active" data-cptab="relationships" style="font-size:9px;padding:3px 8px">Relationships</button>
+        <button class="secondary cp-tab-btn" data-cptab="proposals" style="font-size:9px;padding:3px 8px">Proposals</button>
+        <button class="secondary cp-tab-btn" data-cptab="artifacts" style="font-size:9px;padding:3px 8px">Artifacts &amp; Manifests</button>
+      </div>
+      <div id="cp-panel-relationships" class="cp-panel" style="font-size:10px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading…</div></div>
+      <div id="cp-panel-proposals" class="cp-panel" style="display:none;font-size:10px;font-family:var(--font-mono)"></div>
+      <div id="cp-panel-artifacts" class="cp-panel" style="display:none;font-size:10px;font-family:var(--font-mono)"></div>
     </div>
   </div>`;
 

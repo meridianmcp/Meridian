@@ -747,6 +747,15 @@ No auth required.
 | `DELETE` | `/config/connections/{name}` | v1.9.x — remove a named connection profile from meridian.toml |
 
 
+### `/control-plane`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/control-plane/artifacts` | Paginated, read-only, redacted view of run manifests, provenance |
+| `GET` | `/control-plane/proposals` | Paginated, read-only, redacted view of workspace/project proposals |
+| `GET` | `/control-plane/relationships` | Permission-aware workspace -> project -> one-level-subproject tree |
+
+
 ### `/dashboard`
 
 | Method | Path | Description |

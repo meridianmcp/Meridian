@@ -453,3 +453,163 @@ def test_openai_tunnel_capability_entry_round_trips_via_mcp_set_get(client):
     get_result = _result(_mcp_call(client, "get_capability_manifest", {"project_id": pid}))
     ids = [c["id"] for c in get_result["capabilities"]]
     assert ota.OPENAI_TUNNEL_CAPABILITY_ID in ids
+
+
+# ---------------------------------------------------------------------------
+# 74c591b6 (RESEARCH-OS WAVE B) — reconcile raw manifest PERSISTENCE (this
+# module, already correct) with EFFECTIVE CONTRACT RESOLUTION: before this
+# fix, db.get_effective_capability_profile (and the MCP tool it backs) knew
+# nothing about the project_capabilities table at all -- a project that had
+# only ever called set_capability_manifest got "capabilities: [],
+# layers_applied: []" back from get_effective_capability_profile even though
+# the SAME manifest was already correctly folded into start_session's
+# capability_contract (via capability_contract._resolve_effective_
+# capabilities' own, independent reconciliation). Confirmed live against the
+# real meridian-build project (5787cc92-ba7d-4788-b17c-28ab7938b839) during
+# this item's investigation: get_capability_manifest returned four populated
+# local-first capabilities while get_effective_capability_profile reported
+# layers_applied: [] for the identical project.
+# ---------------------------------------------------------------------------
+
+def _local_first_capabilities():
+    """The four RESEARCH-OS WAVE A capabilities as actually persisted on the
+    live meridian-build project at the time this item was worked (manifest
+    hash dbaa1f5b7c43b936eeab624740c5283e5ca8424237f90137e5b3060c17ae9c18,
+    re-verified current via get_capability_manifest during this item -- the
+    hash recorded in the item's own notes, 4b3bd53b..., had already gone
+    stale by the time this item was claimed)."""
+    return [
+        {
+            "id": "code_prospecting",
+            "purpose": "Structural code investigation with a local semantic/BM25 fallback when graph or Serena access is unavailable.",
+            "required_tools": ["codebase-memory/Serena"],
+            "fallback_chain": ["search_code_semantic", "search_code"],
+            "availability_policy": "degraded_ok",
+        },
+        {
+            "id": "outputs_provenance",
+            "purpose": "Output discovery, provenance, and artifact identity checks for research results.",
+            "required_tools": ["meridian-outputs"],
+            "fallback_chain": ["local_outputs"],
+            "availability_policy": "degraded_ok",
+        },
+        {
+            "id": "research_evidence_envelope",
+            "purpose": "Lossless research evidence and provenance exchange for claims, citations, artifacts, and handoffs.",
+            "required_tools": ["meridian-outputs:research_evidence"],
+            "fallback_chain": ["local-json-xml"],
+            "availability_policy": "degraded_ok",
+        },
+        {
+            "id": "research_retrieval",
+            "purpose": "Bounded academic and prior-art retrieval for research planning and evidence capture; optional for implementation-only waves.",
+            "required_tools": ["paper_search"],
+            "fallback_chain": ["github_search", "social_search"],
+            "availability_policy": "degraded_ok",
+        },
+    ]
+
+
+async def test_get_effective_capability_profile_reports_raw_manifest_as_applied_layer(db):
+    """The core reconciliation fix: after set_project_capability_manifest,
+    db.get_effective_capability_profile must report the manifest's
+    capabilities as applied -- not the pre-fix empty result."""
+    project = await db_module.create_project(db, "cap-reconcile-raw-manifest")
+    saved = await db_module.set_project_capability_manifest(
+        db, project["id"], _local_first_capabilities(),
+    )
+
+    effective = await db_module.get_effective_capability_profile(db, project["id"])
+
+    assert effective["layers_applied"] == ["raw_manifest"]
+    assert [c["id"] for c in effective["capabilities"]] == [
+        "code_prospecting", "outputs_provenance",
+        "research_evidence_envelope", "research_retrieval",
+    ]
+    assert effective["capabilities"] == saved["capabilities"]
+    assert effective["capability_sources"] == {
+        "code_prospecting": "raw_manifest",
+        "outputs_provenance": "raw_manifest",
+        "research_evidence_envelope": "raw_manifest",
+        "research_retrieval": "raw_manifest",
+    }
+    # No capability_profiles-table layer was ever set for this project --
+    # nothing to override, so no overrides/disables are recorded.
+    assert effective["overrides"] == []
+    assert effective["disabled"] == []
+
+
+async def test_get_effective_capability_profile_empty_manifest_reports_no_layers(db):
+    """Negative case: a project with NO raw manifest and no profile layers
+    still resolves to the exact pre-fix empty result (byte-identical
+    non-regression for the common "nothing declared yet" case)."""
+    project = await db_module.create_project(db, "cap-reconcile-empty")
+    effective = await db_module.get_effective_capability_profile(db, project["id"])
+    assert effective["capabilities"] == []
+    assert effective["layers_applied"] == []
+
+
+async def test_get_effective_capability_profile_real_profile_layer_still_overrides_raw_manifest(db):
+    """A genuine capability_profiles-table layer (set_capability_profile) is
+    MORE specific than the raw manifest and must still win -- the raw
+    manifest fix must not make it un-overridable."""
+    project = await db_module.create_project(db, "cap-reconcile-override")
+    await db_module.set_project_capability_manifest(
+        db, project["id"], [_valid_capability(id="research_retrieval", required_tools=["paper_search"])],
+    )
+    await db_module.set_capability_profile(
+        db, "project", project["id"],
+        capabilities=[_valid_capability(id="research_retrieval", required_tools=["OVERRIDDEN"])],
+    )
+
+    effective = await db_module.get_effective_capability_profile(db, project["id"])
+    assert effective["layers_applied"] == ["raw_manifest", "project"]
+    assert effective["capabilities"][0]["required_tools"] == ["OVERRIDDEN"]
+    assert effective["capability_sources"]["research_retrieval"] == "project"
+
+
+def test_mcp_get_effective_capability_profile_reflects_raw_manifest_after_set_capability_manifest(client):
+    """End-to-end MCP surface: the exact sequence the live meridian-build
+    project exercised (set_capability_manifest, then
+    get_effective_capability_profile) must agree, closing the gap this
+    item's own preflight notes reported."""
+    pid = client.post("/projects", json={"name": "mcp-cap-reconcile"}).json()["id"]
+    set_result = _result(_mcp_call(client, "set_capability_manifest", {
+        "project_id": pid, "capabilities": _local_first_capabilities(),
+    }))
+    assert "error" not in set_result
+
+    effective = _result(_mcp_call(client, "get_effective_capability_profile", {"project_id": pid}))
+    assert "raw_manifest" in effective["layers_applied"]
+    assert {c["id"] for c in effective["capabilities"]} == {
+        "code_prospecting", "outputs_provenance",
+        "research_evidence_envelope", "research_retrieval",
+    }
+
+
+async def test_capability_contract_effective_still_agrees_with_get_effective_capability_profile(db):
+    """The two consumers this item's notes flagged as disagreeing --
+    capability_contract.build_capability_contract's own "effective" section
+    and the standalone get_effective_capability_profile call -- must now
+    report the SAME capability set for the SAME project state (they may
+    still legitimately disagree on the `source` label, since the contract's
+    "raw_manifest" vs "profile_inheritance" distinction is about which layer
+    contributed, not about the resolved content)."""
+    from meridian import capability_contract as cc
+
+    project = await db_module.create_project(db, "cap-reconcile-parity")
+    await db_module.set_project_capability_manifest(db, project["id"], _local_first_capabilities())
+
+    effective_profile = await db_module.get_effective_capability_profile(db, project["id"])
+    contract = await cc.build_capability_contract(db, project["id"])
+
+    assert (
+        [c["id"] for c in effective_profile["capabilities"]]
+        == [c["id"] for c in contract["effective"]["capabilities"]]
+    )
+    assert contract["effective"]["source"] == "raw_manifest"
+    # All four capabilities are degraded_ok -- none block executability even
+    # with availability unresolved (no tenant/live_inventory in this pure
+    # build_capability_contract call).
+    assert contract["executable"] is True
+    assert contract["executable_reasons"] == []

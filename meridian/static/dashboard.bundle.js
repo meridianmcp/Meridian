@@ -2409,6 +2409,88 @@
   } catch {
   }
 
+  // meridian/static/dashboard-subprojects.ts
+  function normParent(pid) {
+    if (pid == null) return null;
+    const s3 = String(pid).trim();
+    return s3 ? s3 : null;
+  }
+  function flattenHierarchy(projects) {
+    const byId = /* @__PURE__ */ new Map();
+    for (const p3 of projects) byId.set(p3.id, p3);
+    const childrenOf = /* @__PURE__ */ new Map();
+    const topLevel = [];
+    for (const p3 of projects) {
+      const parentId = normParent(p3.parent_project_id);
+      const parent = parentId ? byId.get(parentId) : void 0;
+      if (parent && !normParent(parent.parent_project_id)) {
+        let bucket = childrenOf.get(parentId);
+        if (!bucket) {
+          bucket = [];
+          childrenOf.set(parentId, bucket);
+        }
+        bucket.push(p3);
+      } else {
+        topLevel.push(p3);
+      }
+    }
+    const rows = [];
+    for (const p3 of topLevel) {
+      rows.push({ project: p3, depth: 0 });
+      const kids = childrenOf.get(p3.id);
+      if (kids) {
+        for (const kid of kids) rows.push({ project: kid, depth: 1 });
+      }
+    }
+    return rows;
+  }
+  function hasSubprojects(projects, projectId) {
+    return projects.some((p3) => normParent(p3.parent_project_id) === projectId);
+  }
+  function eligibleParents(projects, projectId) {
+    if (hasSubprojects(projects, projectId)) return [];
+    const self = projects.find((p3) => p3.id === projectId);
+    const currentParent = self ? normParent(self.parent_project_id) : null;
+    return projects.filter((p3) => {
+      if (p3.id === projectId) return false;
+      if (normParent(p3.parent_project_id)) return false;
+      if (p3.id === currentParent) return false;
+      return true;
+    });
+  }
+
+  // meridian/static/dashboard-control-plane.ts
+  function canViewControlPlane(role) {
+    return role === "owner" || role === "admin" || role === "member" || role === "viewer";
+  }
+  function buildRelationshipRows(workspaceScope, projects) {
+    return flattenHierarchy(projects).map((row) => ({
+      project: row.project,
+      depth: row.depth,
+      scopeLabel: row.depth === 0 ? workspaceScope === "workspace" ? "workspace" : "project (scoped)" : "subproject"
+    }));
+  }
+  var _ABS_PATH_RE = /^(?:[A-Za-z]:[\\/]|\/|\\\\)/;
+  function displaySafe(value) {
+    if (typeof value !== "string") return value == null ? "" : String(value);
+    if (_ABS_PATH_RE.test(value)) {
+      const parts = value.replace(/\\/g, "/").split("/");
+      return parts[parts.length - 1] || "(redacted path)";
+    }
+    return value;
+  }
+  function classifyArtifactHealth(record) {
+    const status = String(record.status || record.lifecycle_state || "").toLowerCase();
+    if (["resolved", "complete", "verified", "active"].includes(status)) return "ok";
+    if (["unresolved", "orphaned", "missing", "not_found"].includes(status)) return "missing";
+    if (["hash_mismatch", "stale", "superseded"].includes(status)) return "stale";
+    if (["ambiguous", "quarantined", "retired"].includes(status)) return "quarantined";
+    return "unknown";
+  }
+  function isArtifactsUnavailable(envelope) {
+    return !envelope || envelope.available !== true;
+  }
+
   // meridian/static/dashboard-settings.ts
   function formatTunnelConfigGenerationStatus(info) {
     if (!info || typeof info !== "object" || info.generation == null) {
@@ -4860,6 +4942,82 @@ project_id = "${displayPid}"`;
             sprintAdd.disabled = false;
           }
         };
+        (function initControlPlanePanel(role) {
+          const section = document.getElementById("cp-section");
+          if (!section) return;
+          if (!canViewControlPlane(role)) {
+            section.style.display = "none";
+            return;
+          }
+          const panels = {
+            relationships: document.getElementById("cp-panel-relationships"),
+            proposals: document.getElementById("cp-panel-proposals"),
+            artifacts: document.getElementById("cp-panel-artifacts")
+          };
+          const loaded = { relationships: false, proposals: false, artifacts: false };
+          async function loadRelationships() {
+            const el2 = panels.relationships;
+            if (!el2) return;
+            try {
+              const data = await api("/control-plane/relationships");
+              const rows = buildRelationshipRows(data.scope, data.projects || []);
+              el2.innerHTML = rows.length ? rows.map((r3) => `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);padding-left:${r3.depth * 14}px"><span>${r3.depth ? "\u21B3 " : ""}${escapeHtml(displaySafe(r3.project.name || r3.project.id))}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(r3.scopeLabel)}</span></div>`).join("") : '<div style="color:var(--muted)">No projects visible in this scope.</div>';
+            } catch (e3) {
+              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+            }
+          }
+          async function loadProposals() {
+            const el2 = panels.proposals;
+            if (!el2) return;
+            try {
+              const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=20`);
+              const items = data.items || [];
+              el2.innerHTML = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
+            } catch (e3) {
+              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+            }
+          }
+          async function loadArtifacts() {
+            const el2 = panels.artifacts;
+            if (!el2) return;
+            try {
+              const data = await api("/control-plane/artifacts?limit=50");
+              if (isArtifactsUnavailable(data)) {
+                el2.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : "Not available.")}</div>`;
+                return;
+              }
+              const items = data.items || [];
+              el2.innerHTML = items.length ? items.map((rec) => {
+                const health = classifyArtifactHealth(rec);
+                const ident = displaySafe(rec.path || rec.run_id || rec.artifact_id || "(unknown)");
+                return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)"><span>[${escapeHtml(rec.record_kind)}] ${escapeHtml(ident)}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(health)}</span></div>`;
+              }).join("") : '<div style="color:var(--muted)">No run manifests, provenance records, or registered artifacts found.</div>';
+            } catch (e3) {
+              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+            }
+          }
+          const loaders = {
+            relationships: loadRelationships,
+            proposals: loadProposals,
+            artifacts: loadArtifacts
+          };
+          function activateTab2(tab) {
+            Object.keys(panels).forEach((k3) => {
+              if (panels[k3]) panels[k3].style.display = k3 === tab ? "" : "none";
+            });
+            section.querySelectorAll(".cp-tab-btn").forEach((btn) => {
+              btn.classList.toggle("active", btn.dataset.cptab === tab);
+            });
+            if (!loaded[tab]) {
+              loaded[tab] = true;
+              loaders[tab]();
+            }
+          }
+          section.querySelectorAll(".cp-tab-btn").forEach((btn) => {
+            btn.onclick = () => activateTab2(btn.dataset.cptab || "relationships");
+          });
+          activateTab2("relationships");
+        })(_activeRole);
       }, 0);
       html += "</div></details>";
       html += _secHtml("tools-ref", "MCP Tools Reference");
@@ -4994,6 +5152,18 @@ project_id = "${displayPid}"`;
         <input id="ws-sprint-title" type="text" placeholder="What needs doing" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
         <button id="ws-sprint-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
       </div>
+    </div>
+    <div id="cp-section" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+      <div style="font-size:10px;color:var(--text);margin-bottom:2px">Relationship &amp; Artifact Explorer</div>
+      <div style="font-size:9px;color:var(--muted);margin-bottom:8px">Permission-aware, read-only. Only records you're authorized to see are ever shown here \u2014 see docs/control-plane-relationship-and-artifact-view.md.</div>
+      <div style="display:flex;gap:6px;margin-bottom:8px">
+        <button class="secondary cp-tab-btn active" data-cptab="relationships" style="font-size:9px;padding:3px 8px">Relationships</button>
+        <button class="secondary cp-tab-btn" data-cptab="proposals" style="font-size:9px;padding:3px 8px">Proposals</button>
+        <button class="secondary cp-tab-btn" data-cptab="artifacts" style="font-size:9px;padding:3px 8px">Artifacts &amp; Manifests</button>
+      </div>
+      <div id="cp-panel-relationships" class="cp-panel" style="font-size:10px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading\u2026</div></div>
+      <div id="cp-panel-proposals" class="cp-panel" style="display:none;font-size:10px;font-family:var(--font-mono)"></div>
+      <div id="cp-panel-artifacts" class="cp-panel" style="display:none;font-size:10px;font-family:var(--font-mono)"></div>
     </div>
   </div>`;
       if (!isHostedMode() && _allRepoPaths.length > 0) {
@@ -8223,7 +8393,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // ../../../node_modules/preact/dist/preact.module.js
+  // node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -8482,7 +8652,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // ../../../node_modules/preact/hooks/dist/hooks.module.js
+  // node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8623,7 +8793,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -9476,7 +9646,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // ../../../node_modules/zustand/esm/vanilla.mjs
+  // node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
@@ -9658,56 +9828,6 @@ ${n2.tags || ""}`.toLowerCase();
     } catch {
       return void 0;
     }
-  }
-
-  // meridian/static/dashboard-subprojects.ts
-  function normParent(pid) {
-    if (pid == null) return null;
-    const s3 = String(pid).trim();
-    return s3 ? s3 : null;
-  }
-  function flattenHierarchy(projects) {
-    const byId = /* @__PURE__ */ new Map();
-    for (const p3 of projects) byId.set(p3.id, p3);
-    const childrenOf = /* @__PURE__ */ new Map();
-    const topLevel = [];
-    for (const p3 of projects) {
-      const parentId = normParent(p3.parent_project_id);
-      const parent = parentId ? byId.get(parentId) : void 0;
-      if (parent && !normParent(parent.parent_project_id)) {
-        let bucket = childrenOf.get(parentId);
-        if (!bucket) {
-          bucket = [];
-          childrenOf.set(parentId, bucket);
-        }
-        bucket.push(p3);
-      } else {
-        topLevel.push(p3);
-      }
-    }
-    const rows = [];
-    for (const p3 of topLevel) {
-      rows.push({ project: p3, depth: 0 });
-      const kids = childrenOf.get(p3.id);
-      if (kids) {
-        for (const kid of kids) rows.push({ project: kid, depth: 1 });
-      }
-    }
-    return rows;
-  }
-  function hasSubprojects(projects, projectId) {
-    return projects.some((p3) => normParent(p3.parent_project_id) === projectId);
-  }
-  function eligibleParents(projects, projectId) {
-    if (hasSubprojects(projects, projectId)) return [];
-    const self = projects.find((p3) => p3.id === projectId);
-    const currentParent = self ? normParent(self.parent_project_id) : null;
-    return projects.filter((p3) => {
-      if (p3.id === projectId) return false;
-      if (normParent(p3.parent_project_id)) return false;
-      if (p3.id === currentParent) return false;
-      return true;
-    });
   }
 
   // meridian/static/dashboard.ts

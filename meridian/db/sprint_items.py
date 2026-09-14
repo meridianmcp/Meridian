@@ -6537,6 +6537,17 @@ async def get_parallelizable_groups(
     e08fee30 — within the safe-parallel ordering, higher-priority eligible items
     are placed first so urgent work colors into the earliest groups.
 
+    7e7d9a43 — items matching :func:`_is_hard_blocked_sprint_item`
+    (``blocker_kind in ('superseded', 'systemic_invalidated_run')``) or
+    :func:`_is_deferred` (a future ``deferred_until``) are excluded from
+    ``groups``/``eligible`` the same way, and reported in ``quarantined``
+    (a list of ``{id, title, reason, deferred_until?}``) plus
+    ``quarantined_count`` — never in a claimable group, never silently
+    dropped. This mirrors the identical predicate applied to
+    ``handoff.py``'s ``/goal`` pending-item list and continuation manifest,
+    and to :func:`assign_sprint_waves` below, so no consumer of any of these
+    can disagree about which items are genuinely claimable right now.
+
     99c0c1be — the return dict also carries deterministic PARALLELISM
     diagnostics computed by :func:`meridian.executor_config.resolve_parallelism`
     against the first (largest, resource-conflict-free) group:
@@ -6568,15 +6579,42 @@ async def get_parallelizable_groups(
     # 5a85a78f — also filter out milestone_type='human' and MANUAL-titled items;
     # get_sprint_items only gates on blocker_kind, not the other two manual signals.
     items = [it for it in items if not _is_manual_sprint_item(it)]
-    # 524e73e6 — also exclude blocker_kind in ('superseded',
-    # 'systemic_invalidated_run'): a hard gate claim_sprint_item enforces,
-    # but get_sprint_items's include_manual_blocker only ever strips
-    # 'manual'. Without this, a superseded/invalidated item could still be
-    # advertised here as a parallel-safe batch member even though claiming
-    # it will deterministically fail.
-    items = [it for it in items if not _is_hard_blocked_sprint_item(it)]
     if version is not None:
         items = [it for it in items if it.get("version") == version]
+    # 7e7d9a43 — QUARANTINE, in one unified pass: blocker_kind in
+    # ('superseded', 'systemic_invalidated_run') (524e73e6 — a hard gate
+    # claim_sprint_item enforces, but get_sprint_items's include_manual_blocker
+    # only ever strips 'manual') AND future-``deferred_until`` items — the
+    # sibling gap 524e73e6 never closed here: unlike get_sprint_items
+    # (include_deferred=False) and assign_sprint_waves's own deferred check,
+    # this function had NO deferred filter at all, so a backburnered item
+    # (e.g. deferred_until="2030-01-01T00:00:00Z") could still be advertised
+    # as a parallel-safe batch member. Either class of item would
+    # deterministically fail claim_sprint_item's own gate (f89d440f/
+    # cc3864bd hard-blocked gate, dec69708 deferral gate) a moment later.
+    # Recorded in ``quarantined`` below — excluded from ``groups``/
+    # ``eligible`` entirely, but never silently dropped, same "excluded but
+    # surfaced" convention as ``blocked``/``resource_blocked`` further down.
+    quarantined: list[dict[str, Any]] = []
+    _non_quarantined_items: list[dict[str, Any]] = []
+    for it in items:
+        if _is_hard_blocked_sprint_item(it):
+            quarantined.append({
+                "id": it.get("id"),
+                "title": it.get("title", ""),
+                "reason": it.get("blocker_kind"),
+            })
+            continue
+        if _is_deferred(it):
+            quarantined.append({
+                "id": it.get("id"),
+                "title": it.get("title", ""),
+                "reason": "deferred",
+                "deferred_until": it.get("deferred_until"),
+            })
+            continue
+        _non_quarantined_items.append(it)
+    items = _non_quarantined_items
     claimable_statuses = {"pending", "todo"}
     candidates: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
@@ -6845,6 +6883,11 @@ async def get_parallelizable_groups(
         "resource_blocked_count": len({b["id"] for b in resource_blocked}),
         "plan_generation": plan_generation,
         "recomputed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # 7e7d9a43 — hard-blocked (superseded/systemic_invalidated_run) and
+        # future-deferred items excluded above, surfaced here so a caller
+        # never mistakes "absent from groups" for "this id doesn't exist".
+        "quarantined": quarantined,
+        "quarantined_count": len(quarantined),
     }
 
 
@@ -7849,12 +7892,21 @@ async def assign_sprint_waves(
 
     Returns ``{version, wave_count, assigned, waves: {'wave-1': [ids...], ...},
     blocked_count, undeclared_count, urgent_wave_count, urgent_assigned,
-    cycles, graph_digest}``.
+    cycles, graph_digest, quarantined, quarantined_count}``.
     ``blocked_count`` now counts items whose dependency is not yet DONE (they
     are still projected into a future wave, not truly dropped). ``waves``
     includes both the ``wave-N`` sequential labels and any ``wave-urgent*``
     labels — the two families are merged in the returned mapping but remain
     distinguishable by their key prefix.
+
+    7e7d9a43 — ``quarantined`` (a list of ``{id, title, reason,
+    deferred_until?}``) is every pending/todo item excluded from labelling
+    because it is hard-blocked (``blocker_kind in ('superseded',
+    'systemic_invalidated_run')``) or future-deferred: such an item never
+    receives a ``wave-N``/``wave-urgent*`` label (so it can never appear in
+    a "next wave" directive), but is surfaced here rather than silently
+    vanishing — same convention as :func:`get_parallelizable_groups`'s own
+    ``quarantined`` field, which this mirrors exactly.
 
     ``cycles`` (05553946) — every distinct ``depends_on`` cycle found among
     the eligible item set (see ``meridian.dependency_graph.
@@ -7888,11 +7940,40 @@ async def assign_sprint_waves(
     # 5a67c8e0 — also exclude deferred items: a future ``deferred_until`` leaves
     # status='pending' untouched (see claim_sprint_item / _is_deferred), so without
     # this check a backburnered item would still get labelled into a real wave.
-    candidates = [
-        it for it in items
-        if (it.get("status") or "pending") in claimable_statuses
-        and not _is_deferred(it)
-    ]
+    # 7e7d9a43 — also exclude hard-blocked items (blocker_kind in
+    # ('superseded', 'systemic_invalidated_run'), 524e73e6): the sibling gap
+    # get_parallelizable_groups already closed but this function never did —
+    # a superseded/invalidated item could still be persisted a real wave-N/
+    # wave-urgent label below (via patch_sprint_item) even though claiming it
+    # will deterministically fail. Deliberately kept IN ``items`` (used for
+    # by_id_all/by_id_status dependency-frontier bookkeeping just below and
+    # for cycles/graph_digest above) — only excluded from ``candidates`` (the
+    # set that actually gets labelled) — so a real item depending on a
+    # hard-blocked parent still sees that parent's true (non-done) status
+    # instead of a false "dependency satisfied" from the parent silently
+    # vanishing out of the lookup table. Recorded in ``quarantined``, same
+    # "excluded but surfaced" convention ``get_parallelizable_groups`` uses.
+    quarantined: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    for it in items:
+        if (it.get("status") or "pending") not in claimable_statuses:
+            continue
+        if _is_hard_blocked_sprint_item(it):
+            quarantined.append({
+                "id": it.get("id"),
+                "title": it.get("title", ""),
+                "reason": it.get("blocker_kind"),
+            })
+            continue
+        if _is_deferred(it):
+            quarantined.append({
+                "id": it.get("id"),
+                "title": it.get("title", ""),
+                "reason": "deferred",
+                "deferred_until": it.get("deferred_until"),
+            })
+            continue
+        candidates.append(it)
 
     # ── Urgent carve-out (f78d7644) ─────────────────────────────────────────────
     # Ready urgent items (dependency satisfied, or no dependency) never enter the
@@ -7969,6 +8050,8 @@ async def assign_sprint_waves(
             "urgent_assigned": urgent_assigned,
             "cycles": cycles,
             "graph_digest": graph_digest,
+            "quarantined": quarantined,
+            "quarantined_count": len(quarantined),
         }
 
     max_topo = max(depth_map.values())
@@ -8063,6 +8146,8 @@ async def assign_sprint_waves(
         "urgent_assigned": urgent_assigned,
         "cycles": cycles,
         "graph_digest": graph_digest,
+        "quarantined": quarantined,
+        "quarantined_count": len(quarantined),
     }
 
 

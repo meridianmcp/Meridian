@@ -402,3 +402,170 @@ async def test_check_capability_availability_derives_inventory_when_not_supplied
     )
     assert len(result) == 1
     assert result[0]["status"] == ca.STATUS_MISSING
+
+
+# ---------------------------------------------------------------------------
+# 74c591b6 (RESEARCH-OS WAVE B) — local_first_live_inventory /
+# check_local_first_availability / summarize_availability: an explicit,
+# opt-in, tenant-free availability check. Verifies research_retrieval's
+# ONLY required tool (paper_search, a native Meridian MCP tool) genuinely
+# resolves "available" with zero DB/tenant/tunnel context, while a
+# tunnel-dependent capability honestly reports its real (unreachable)
+# status rather than a faked success -- never auto-wired into
+# capability_contract._resolve_availability's bare default path (that
+# stays "unknown" by construction; see the dedicated no-regression test
+# below).
+# ---------------------------------------------------------------------------
+
+def _research_retrieval_capability(**overrides):
+    base = {
+        "id": "research_retrieval",
+        "purpose": "Bounded academic and prior-art retrieval for research planning and evidence capture.",
+        "required_tools": ["paper_search"],
+        "fallback_chain": ["github_search", "social_search"],
+        "availability_policy": "degraded_ok",
+    }
+    base.update(overrides)
+    return cm.normalize_capability(base)
+
+
+def test_local_first_live_inventory_is_tunnel_free_with_real_builtins():
+    inv = ca.local_first_live_inventory()
+    assert inv["tunnel_reachable"] is False
+    assert inv["plugins"] == {}
+    assert inv["stdio_registry"] == {}
+    assert isinstance(inv["builtin_tools"], set)
+    # paper_search is a native, always-in-process Meridian MCP tool -- this
+    # is what lets research_retrieval resolve locally with no tunnel at all.
+    assert "paper_search" in inv["builtin_tools"]
+
+
+def test_check_local_first_availability_resolves_native_tool_capability_available():
+    result = ca.check_local_first_availability([_research_retrieval_capability()])
+    assert result == {"available": ["research_retrieval"], "missing": [], "degraded": []}
+
+
+def test_check_local_first_availability_honestly_degrades_tunnel_dependent_capability():
+    """A capability whose required tool genuinely needs a live tunnel (no
+    tenant/tunnel context here) must NOT be reported as available -- this
+    is an honest local floor, never a blanket success."""
+    tunnel_cap = _cap(id="code_prospecting", required_tools=["codebase-memory/Serena"], availability_policy="degraded_ok")
+    result = ca.check_local_first_availability([tunnel_cap])
+    assert result == {"available": [], "missing": [], "degraded": ["code_prospecting"]}
+
+
+def test_check_local_first_availability_required_tunnel_dependent_capability_reports_missing():
+    """Same tunnel-dependent tool, but 'required' policy -- fail-closed to
+    missing, not degraded, matching evaluate_capability_availability's own
+    policy-aware contract."""
+    tunnel_cap = _cap(id="outputs_provenance", required_tools=["meridian-outputs"], availability_policy="required")
+    result = ca.check_local_first_availability([tunnel_cap])
+    assert result == {"available": [], "missing": ["outputs_provenance"], "degraded": []}
+
+
+def test_check_local_first_availability_four_local_first_capabilities_only_research_retrieval_resolves():
+    """The exact RESEARCH-OS WAVE B scenario: of the four local-first
+    capabilities, only research_retrieval's tool (paper_search) is native --
+    the other three genuinely depend on a tunnel/plugin this snapshot has no
+    way to confirm, so they degrade honestly (all four are degraded_ok)."""
+    capabilities = [
+        _cap(id="code_prospecting", required_tools=["codebase-memory/Serena"],
+             fallback_chain=["search_code_semantic", "search_code"], availability_policy="degraded_ok"),
+        _cap(id="outputs_provenance", required_tools=["meridian-outputs"],
+             fallback_chain=["local_outputs"], availability_policy="degraded_ok"),
+        _cap(id="research_evidence_envelope", required_tools=["meridian-outputs:research_evidence"],
+             fallback_chain=["local-json-xml"], availability_policy="degraded_ok"),
+        _research_retrieval_capability(),
+    ]
+    result = ca.check_local_first_availability(capabilities)
+    assert result["available"] == ["research_retrieval"]
+    assert result["missing"] == []
+    assert sorted(result["degraded"]) == [
+        "code_prospecting", "outputs_provenance", "research_evidence_envelope",
+    ]
+
+
+def test_summarize_availability_buckets_by_status_policy_aware():
+    evaluated = [
+        {"capability_id": "a", "availability_policy": "required", "status": ca.STATUS_AVAILABLE},
+        {"capability_id": "b", "availability_policy": "required", "status": ca.STATUS_MISSING},
+        {"capability_id": "c", "availability_policy": "degraded_ok", "status": ca.STATUS_DEGRADED},
+        {"capability_id": "d", "availability_policy": "degraded_ok", "status": ca.STATUS_UNKNOWN},
+        {"capability_id": "e", "availability_policy": "required", "status": ca.STATUS_UNKNOWN},
+    ]
+    result = ca.summarize_availability(evaluated)
+    assert result["available"] == ["a"]
+    assert result["missing"] == ["b", "e"]  # e: unknown + required -> fail-closed missing
+    assert result["degraded"] == ["c", "d"]  # d: unknown + degraded_ok -> fail-open degraded
+
+
+def test_summarize_availability_empty_and_malformed_entries_are_skipped():
+    assert ca.summarize_availability([]) == {"available": [], "missing": [], "degraded": []}
+    assert ca.summarize_availability([{}, {"capability_id": None}, "not-a-dict"]) == {
+        "available": [], "missing": [], "degraded": [],
+    }
+
+
+async def test_build_capability_contract_with_local_first_checker_is_executable_and_honest(db):
+    """Integration proof for RESEARCH-OS WAVE B's acceptance bar: injecting
+    check_local_first_availability (the existing, already-tested
+    availability_checker seam -- capability_contract.build_capability_contract)
+    for the real four-capability local-first manifest reports executable=True
+    with research_retrieval genuinely resolved as available, never a faked
+    success for the tunnel-dependent capabilities."""
+    from meridian import capability_contract as cc
+
+    project = await db_module.create_project(db, "cap-avail-local-first-contract")
+    await db_module.set_project_capability_manifest(db, project["id"], [
+        {
+            "id": "code_prospecting", "purpose": "code prospecting",
+            "required_tools": ["codebase-memory/Serena"],
+            "fallback_chain": ["search_code_semantic", "search_code"],
+            "availability_policy": "degraded_ok",
+        },
+        {
+            "id": "outputs_provenance", "purpose": "outputs provenance",
+            "required_tools": ["meridian-outputs"],
+            "fallback_chain": ["local_outputs"],
+            "availability_policy": "degraded_ok",
+        },
+        {
+            "id": "research_evidence_envelope", "purpose": "evidence envelope",
+            "required_tools": ["meridian-outputs:research_evidence"],
+            "fallback_chain": ["local-json-xml"],
+            "availability_policy": "degraded_ok",
+        },
+        {
+            "id": "research_retrieval", "purpose": "research retrieval",
+            "required_tools": ["paper_search"],
+            "fallback_chain": ["github_search", "social_search"],
+            "availability_policy": "degraded_ok",
+        },
+    ])
+
+    contract = await cc.build_capability_contract(
+        db, project["id"], availability_checker=ca.check_local_first_availability,
+    )
+
+    assert contract["availability"]["status"] == "checked"
+    assert contract["availability"]["available"] == ["research_retrieval"]
+    assert sorted(contract["availability"]["degraded"]) == [
+        "code_prospecting", "outputs_provenance", "research_evidence_envelope",
+    ]
+    assert contract["availability"]["missing"] == []
+    assert contract["executable"] is True
+    assert contract["executable_reasons"] == []
+
+
+def test_resolve_availability_bare_default_is_unaffected_by_local_first_checker():
+    """Non-regression: check_local_first_availability is an explicit opt-in
+    only. capability_contract._resolve_availability's bare default (no
+    injected checker, no tenant/live_inventory) must still degrade to
+    "unknown" -- the documented contract every existing capability_contract
+    test pins (test_contract_empty_manifest_degrades_cleanly,
+    test_contract_unknown_availability_fails_closed_for_required)."""
+    from meridian import capability_contract as cc
+
+    result, status = cc._resolve_availability([_research_retrieval_capability()])
+    assert status == "unknown"
+    assert result is None

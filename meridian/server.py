@@ -922,6 +922,7 @@ from .routes.decisions import router as _decisions_router    # noqa: E402
 from .routes.handoff import router as _handoff_router        # noqa: E402
 from .routes.admin import router as _admin_router            # noqa: E402
 from .routes.workspace import router as _workspace_router    # noqa: E402
+from .routes.control_plane import router as _control_plane_router  # noqa: E402
 from .routes.auth import router as _auth_router              # noqa: E402
 from .routes.files import router as _files_router            # noqa: E402
 from .routes.export import router as _export_router          # noqa: E402
@@ -947,6 +948,7 @@ app.include_router(_decisions_router)
 app.include_router(_handoff_router)
 app.include_router(_admin_router)
 app.include_router(_workspace_router)
+app.include_router(_control_plane_router)
 app.include_router(_auth_router)
 app.include_router(_files_router)
 app.include_router(_export_router)
