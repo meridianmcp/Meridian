@@ -72,6 +72,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_flag_registry": 'get_flag_registry(root_dir="/repo/src")',
     "link_flag_to_section": 'link_flag_to_section(project_id="abc-123", doc="thesis/chapter4.docx", element_id="el-uuid-here", flag_name="DT_ONLY_WIDTH", value=1, default=0, source_file="pipeline/gt.py", source_line=142)',
     "get_flag_drift": 'get_flag_drift(project_id="abc-123", root_dir="/repo/src", doc="thesis/chapter4.docx")',
+    "register_docx_derivative": 'register_docx_derivative(project_id="abc-123", session_id="sess-1", source_path="thesis/chapter1.docx", derivative_path="exports/chapter1.pdf", source_content_hash="a1b2c3...", generating_tool="pandoc 3.1")',
+    "verify_docx_diff": 'verify_docx_diff(project_id="abc-123", derivative_id="deriv-uuid", current_source_content_hash="a1b2c3...")',
+    "promote_docx_candidate": 'promote_docx_candidate(project_id="abc-123", session_id="sess-1", derivative_id="deriv-uuid")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -1773,6 +1776,70 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "element_id": {"type": "string", "description": "Optional: scope to links recorded against one specific doc_elements id."},
          "flag_name": {"type": "string", "description": "Optional: scope to links recorded for one flag name — the reverse query, omit 'doc' to search project-wide."}},
          "required": []}},
+    {"name": "register_docx_derivative", "description":
+        "W1-K — record that derivative_path (e.g. a rendered PDF/DOCX export) "
+        "was generated FROM source_path at a known content state. "
+        "source_content_hash is the CALLER-computed content hash of the source "
+        "document at generation time (the server never reads either file itself "
+        "— hash it locally, e.g. sha256, before calling this). Always creates a "
+        "NEW row with status='candidate' — re-rendering the same source/"
+        "derivative pair over time is expected and never overwrites a prior "
+        "registration; use promote_docx_candidate to make one candidate the "
+        "accepted derivative for its source. generating_tool names the tool/"
+        "script that produced it (e.g. 'pandoc 3.1' or 'export_pdf.py'); "
+        "generated_at defaults to now (UTC) when omitted. Returns "
+        "{derivative: {...}} including the new derivative_id.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "source_path": {"type": "string", "description": "Path to the canonical .docx source document. Need not be project-relative — a docx source routinely lives outside the repo."},
+         "derivative_path": {"type": "string", "description": "Path to the derivative .docx document generated from source_path."},
+         "source_content_hash": {"type": "string", "description": "Caller-computed content hash of source_path's CURRENT bytes at generation time. Required — this is the provenance anchor verify_docx_diff later compares against."},
+         "derivative_content_hash": {"type": "string", "description": "Optional caller-computed content hash of derivative_path's bytes at generation time."},
+         "generating_tool": {"type": "string", "description": "Name/version of the tool or script that generated this derivative."},
+         "generated_at": {"type": "string", "description": "ISO-8601 timestamp the derivative was generated. Defaults to now (UTC) when omitted."},
+         "notes": {"type": "string", "description": "Optional free-text note about this derivative."}},
+         "required": ["session_id", "source_path", "derivative_path", "source_content_hash"]}},
+    {"name": "verify_docx_diff", "description":
+        "W1-K — compare a registered docx derivative's recorded source hash "
+        "against the CALLER-supplied CURRENT hash of the source document's "
+        "on-disk bytes (compute it locally, e.g. sha256, immediately before "
+        "calling this) and report whether the derivative is stale — i.e. "
+        "whether the source has changed since this derivative was generated. "
+        "Optionally also pass current_derivative_content_hash to detect the "
+        "derivative itself having drifted out of band. Never errors on a "
+        "'stale' verdict — that is a normal, expected result, not a failure. "
+        "Persists the verdict onto the derivative row (last_verified_at / "
+        "last_verify_is_stale / last_verify_reason) as an audit trail; never "
+        "changes the derivative's status itself. Returns {derivative_id, "
+        "is_stale, source_changed, derivative_changed, reason, derivative}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "derivative_id": {"type": "string"},
+         "current_source_content_hash": {"type": "string", "description": "Caller-computed content hash of source_path's CURRENT on-disk bytes, computed fresh right before this call. Required."},
+         "current_derivative_content_hash": {"type": "string", "description": "Optional caller-computed content hash of derivative_path's CURRENT on-disk bytes."}},
+         "required": ["derivative_id", "current_source_content_hash"]}},
+    {"name": "promote_docx_candidate", "description":
+        "W1-K — explicitly promote a status='candidate' docx derivative to be "
+        "THE accepted derivative for its source_path, demoting whatever "
+        "derivative previously held that role (if any) to status='superseded' "
+        "in the same call — a real state transition with an audit trail "
+        "(promoted_at/promoted_by_session_id on the newly-accepted row; "
+        "superseded_at/superseded_by_derivative_id on the demoted one), "
+        "mirroring promote_experiment_run's promotion-pattern precedent. "
+        "Idempotent on an already-accepted derivative (mirrors "
+        "promote_research_run's idempotency guard): a repeat call on the same "
+        "derivative_id returns the existing accepted state unchanged "
+        "(idempotent_retry=true), never a duplicate transition or an error. "
+        "Rejects with {error} when the derivative's status is 'superseded' — "
+        "a superseded derivative can never be re-promoted; register a fresh "
+        "candidate instead. Returns {derivative_id, derivative, "
+        "superseded_derivative_id, idempotent_retry}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"},
+         "derivative_id": {"type": "string"}},
+         "required": ["derivative_id"]}},
     {"name": "prospect_symbol", "description":
         "2ce5bc76 — ROBUST symbol prospecting with a three-rung fallback chain: "
         "tries codebase__search_graph FIRST (fast, graph-indexed); when it returns "
@@ -3500,8 +3567,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "status='abandoned'. outcome_summary and disposition (keep|discard|"
         "promote) are explicit and REQUIRED — rejected with {error} when "
         "missing/empty, even on a retry against an already-terminal run. "
-        "result_receipt is bounded to 32KB and REJECTED (never truncated) past "
-        "that cap. HARD INVARIANT: this call always writes an experiment_events "
+        "result_receipt is bounded to 32KB; past that cap it is spilled to durable "
+        "object storage (local content-addressed storage today, transparently "
+        "upgrading to Tigris when configured) and replaced with a small pointer — "
+        "never truncated, and rejected outright only if the spill itself fails. "
+        "HARD INVARIANT: this call always writes an experiment_events "
         "row when the run newly reaches a terminal state here — status='abandoned' "
         "or an outcome_summary containing 'dead end'/'failed' (case-insensitive) "
         "auto-writes {event_type:'dead_end'}.",
@@ -4689,6 +4759,12 @@ _TOOL_CATEGORY: dict[str, str] = {
     "ingest_document_structure":      "docx",
     "link_flag_to_section":           "docx",
     "get_flag_drift":                 "docx",
+    # W1-K — derivative-document (DOCX) provenance tracking: categorized
+    # alongside the rest of the docx tool family above (same keyword-affinity
+    # gate on the /goal text, category "docx").
+    "register_docx_derivative":       "docx",
+    "verify_docx_diff":               "docx",
+    "promote_docx_candidate":         "docx",
     # file locking
     "claim_file":               "file-locking",
     "release_file":             "file-locking",
@@ -4792,6 +4868,15 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "link_table_caption":        "executor",
     "ingest_document_structure": "executor",
     "link_flag_to_section":      "executor",
+    # W1-K — derivative-document provenance: register/promote are write
+    # actions an executor performs (mirrors insert_equation/link_flag_to_section
+    # immediately above); verify is a check either role may want, "both",
+    # mirroring get_flag_drift's own role_relevance, and promotion is "both"
+    # mirroring promote_research_run/promote_experiment_run's precedent (an
+    # executor runs the generation; a planner may review before promoting).
+    "register_docx_derivative":  "executor",
+    "verify_docx_diff":          "both",
+    "promote_docx_candidate":    "both",
     "annotate_outputs":          "executor",
     "log_task":                  "executor",
     "generate_handoff":          "executor",
@@ -5246,6 +5331,11 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "resolve_citations":          "maintenance-only",
     "link_flag_to_section":       "maintenance-only",
     "get_flag_drift":             "maintenance-only",
+    # W1-K — derivative-document provenance: docx write-back family, same
+    # tier as the rest of the docx tools immediately above.
+    "register_docx_derivative":   "maintenance-only",
+    "verify_docx_diff":           "maintenance-only",
+    "promote_docx_candidate":     "maintenance-only",
     # workspace management (cross-project admin)
     "add_workspace_note":              "maintenance-only",
     "get_workspace_notes":             "maintenance-only",
@@ -5367,6 +5457,9 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "get_flag_registry": "Get Flag Registry",
     "link_flag_to_section": "Link Flag to Section",
     "get_flag_drift": "Get Flag Drift",
+    "register_docx_derivative": "Register Docx Derivative",
+    "verify_docx_diff": "Verify Docx Diff",
+    "promote_docx_candidate": "Promote Docx Candidate",
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }

@@ -1163,6 +1163,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_remote_tasks(db)
     # W1-G (G1) -- projects.repo_identity: canonical repo binding.
     await _migrate_repo_identity(db)
+    # W1-K -- derivative-document (DOCX) provenance tracking.
+    await _migrate_docx_derivatives(db)
     return db
 
 

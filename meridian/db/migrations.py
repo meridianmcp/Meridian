@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname', '_migrate_sprint_item_prospect_bypass', '_migrate_handoff_tokens', '_migrate_wave_gate_results', '_migrate_wave_gate_configs', '_migrate_server_logs', '_migrate_custom_hooks', '_migrate_sprint_item_require_verification', '_migrate_sprint_item_verifications_table', '_migrate_proposal_github_issue', '_migrate_sprint_item_required_tool', '_migrate_sprint_item_github_issue_link', '_migrate_manual_issue_screening_toggle', '_migrate_action_audit_log_table', '_migrate_manual_issue_content_log_table', '_migrate_workspace_tool_priority_map', '_migrate_sprint_item_github_channel', '_migrate_workspace_claim_verification_mode', '_migrate_handoff_tokens_consumed_at', '_migrate_board_snapshot_revisions', '_migrate_wave_runs', '_migrate_handoff_tokens_body_hash', '_migrate_project_capabilities', '_migrate_capability_profiles', '_migrate_sprint_item_tool_requirements', '_migrate_sprint_item_artifact_declaration', '_migrate_sprint_item_require_strict_evidence', '_migrate_handoffs_invalidation', '_migrate_handoff_corrections_table', '_migrate_profile_layers', '_migrate_wave_gate_results_version_unique', '_migrate_wave_gate_configs_version_unique', '_migrate_proposal_project_scope', '_migrate_external_job_register', '_migrate_scratch_research_runs', '_migrate_scratch_research_runs_promoted_finding', '_migrate_session_recovery_registry', '_migrate_experiment_registry_columns', '_migrate_experiment_registry_runs', '_migrate_remote_tasks', '_migrate_repo_identity']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_device_codes_denied_polled', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_migrate_project_parent_id', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_pending_goal', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives', '_migrate_project_status_priority', '_migrate_signup_attempts', '_migrate_user_session_metadata', '_migrate_provision_queue', '_migrate_codebase_graph_entities', '_migrate_insights_table', '_migrate_sprint_item_slug', '_migrate_sprint_item_nickname', '_migrate_capture_insight_notes_to_insights', '_migrate_blog_posts_tenant', '_migrate_session_goal_compliance', '_migrate_sprint_item_pointers', '_migrate_sprint_item_deferral', '_migrate_sprint_item_priority_blocker', '_migrate_sprint_item_wave', '_migrate_mcp_rate_counters', '_migrate_workspace_proposals', '_migrate_pending_goal_at', '_migrate_file_patch_counters', '_migrate_session_activity', '_migrate_sprint_item_resources_amended', '_migrate_connection_events', '_migrate_redis_overage_fields', '_migrate_sprint_version_descriptions', '_migrate_workspace_settings_active_session_threshold', '_migrate_sprint_item_sprint_name', '_migrate_proposal_slug_nickname', '_migrate_decision_slug_nickname', '_migrate_note_nickname', '_migrate_sprint_item_prospect_bypass', '_migrate_handoff_tokens', '_migrate_wave_gate_results', '_migrate_wave_gate_configs', '_migrate_server_logs', '_migrate_custom_hooks', '_migrate_sprint_item_require_verification', '_migrate_sprint_item_verifications_table', '_migrate_proposal_github_issue', '_migrate_sprint_item_required_tool', '_migrate_sprint_item_github_issue_link', '_migrate_manual_issue_screening_toggle', '_migrate_action_audit_log_table', '_migrate_manual_issue_content_log_table', '_migrate_workspace_tool_priority_map', '_migrate_sprint_item_github_channel', '_migrate_workspace_claim_verification_mode', '_migrate_handoff_tokens_consumed_at', '_migrate_board_snapshot_revisions', '_migrate_wave_runs', '_migrate_handoff_tokens_body_hash', '_migrate_project_capabilities', '_migrate_capability_profiles', '_migrate_sprint_item_tool_requirements', '_migrate_sprint_item_artifact_declaration', '_migrate_sprint_item_require_strict_evidence', '_migrate_handoffs_invalidation', '_migrate_handoff_corrections_table', '_migrate_profile_layers', '_migrate_wave_gate_results_version_unique', '_migrate_wave_gate_configs_version_unique', '_migrate_proposal_project_scope', '_migrate_external_job_register', '_migrate_scratch_research_runs', '_migrate_scratch_research_runs_promoted_finding', '_migrate_session_recovery_registry', '_migrate_experiment_registry_columns', '_migrate_experiment_registry_runs', '_migrate_remote_tasks', '_migrate_repo_identity', '_migrate_docx_derivatives']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -4751,3 +4751,72 @@ async def _migrate_repo_identity(db: aiosqlite.Connection) -> None:
     _migrate_add_column_if_missing.
     """
     await _migrate_add_column_if_missing(db, "projects", "repo_identity", "TEXT")
+
+
+async def _migrate_docx_derivatives(db: aiosqlite.Connection) -> None:
+    """W1-K -- derivative-document (DOCX) provenance tracking.
+
+    A single row per registered derivative -- distinct registrations of the
+    same source/derivative pair over time are all legitimate (re-renders,
+    retries, competing candidates) and are never merged, so this is a plain
+    append/update-in-place table, no companion event-log (mirrors
+    ``_migrate_scratch_research_runs``'s exact same reasoning for why no
+    second table is needed here either). Every column this feature will ever
+    need is included in this single CREATE TABLE up front -- unlike
+    ``scratch_research_runs``' ``promoted_finding_id`` (added in a later,
+    separate migration, 0f0782d2), there is no pre-existing production table
+    to avoid disrupting here, so there is no reason to split this into two
+    migrations.
+
+    See :mod:`meridian.db.docx_derivatives` for the full read/write API and
+    :mod:`meridian.docx_derivative` for field validation.
+
+    Columns:
+      - ``source_path`` / ``derivative_path``: the tracked document paths
+        (opaque strings -- may be absolute; see ``meridian.docx_derivative``'s
+        module docstring for why project-relative is NOT enforced here).
+      - ``source_content_hash`` / ``derivative_content_hash``: caller-supplied
+        content hashes at registration time (the server never computes these
+        itself -- see the same module docstring).
+      - ``status``: 'candidate' (default) | 'accepted' | 'superseded'.
+      - ``last_verified_at`` / ``last_verify_is_stale`` / ``last_verify_reason``:
+        the most recent ``verify_docx_diff`` verdict, persisted as a
+        lightweight audit trail; NULL until the first verify call.
+      - ``promoted_at`` / ``promoted_by_session_id``: set by
+        ``promote_docx_candidate`` when this row becomes the accepted
+        derivative for its source.
+      - ``superseded_at`` / ``superseded_by_derivative_id``: set on a
+        previously-accepted row when a DIFFERENT derivative for the same
+        source is promoted over it.
+
+    Mirrored on Postgres by ``pg_adapter._migrate_pg_docx_derivatives``.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS docx_derivatives (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            creator_session_id TEXT NOT NULL REFERENCES sessions(id),
+            source_path TEXT NOT NULL,
+            derivative_path TEXT NOT NULL,
+            source_content_hash TEXT NOT NULL,
+            derivative_content_hash TEXT,
+            generating_tool TEXT,
+            generated_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'candidate',
+            notes TEXT,
+            last_verified_at TEXT,
+            last_verify_is_stale INTEGER,
+            last_verify_reason TEXT,
+            promoted_at TEXT,
+            promoted_by_session_id TEXT,
+            superseded_at TEXT,
+            superseded_by_derivative_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docx_derivatives_project_source "
+        "ON docx_derivatives(project_id, source_path, status)"
+    )
+    await db.commit()

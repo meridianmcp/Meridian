@@ -6826,6 +6826,36 @@ async def _handle_experiment_tools(
     return _MISS
 
 
+async def _handle_docx_derivative_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: W1-K derivative-document (DOCX) provenance tooling --
+    register_docx_derivative, verify_docx_diff, promote_docx_candidate. A new
+    sibling dispatch group (own module, own group function), matching
+    _handle_experiment_tools' precedent immediately above rather than growing
+    _handle_session_tools further -- see
+    meridian/mcp/handlers/docx_derivative_tools.py's module docstring."""
+    from .handlers.docx_derivative_tools import (  # noqa: PLC0415
+        handle_register_docx_derivative,
+        handle_verify_docx_diff,
+        handle_promote_docx_candidate,
+    )
+
+    _standard_dispatch: dict[str, Any] = {
+        "register_docx_derivative": handle_register_docx_derivative,
+        "verify_docx_diff": handle_verify_docx_diff,
+        "promote_docx_candidate": handle_promote_docx_candidate,
+    }
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+    return _MISS
+
+
 # a2a027cf — bounded dispatch-level budget for complete_sprint_item,
 # comfortably under the ~60s client-side timeouts observed in the field
 # (HTTP, stdio, and connector/mcp-remote transports all funnel through this
@@ -7093,6 +7123,7 @@ async def _dispatch_mcp_tool(
         _handle_outputs_tools,
         _handle_code_index_tools,
         _handle_experiment_tools,
+        _handle_docx_derivative_tools,
     )
     # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
     # Repeated live reports: an MCP client (HTTP/stdio/connector — this

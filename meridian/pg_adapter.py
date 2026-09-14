@@ -5192,6 +5192,39 @@ async def _migrate_pg_repo_identity(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_docx_derivatives(conn: PostgresConnection) -> None:
+    """W1-K -- Postgres mirror of db.migrations._migrate_docx_derivatives:
+    derivative-document (DOCX) provenance tracking. See that function's
+    docstring for the full column-by-column rationale; every column is
+    included up front in this single CREATE TABLE, same as the SQLite side."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS docx_derivatives ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    creator_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    source_path TEXT NOT NULL,"
+        "    derivative_path TEXT NOT NULL,"
+        "    source_content_hash TEXT NOT NULL,"
+        "    derivative_content_hash TEXT,"
+        "    generating_tool TEXT,"
+        "    generated_at TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'candidate',"
+        "    notes TEXT,"
+        "    last_verified_at TEXT,"
+        "    last_verify_is_stale INTEGER,"
+        "    last_verify_reason TEXT,"
+        "    promoted_at TEXT,"
+        "    promoted_by_session_id TEXT,"
+        "    superseded_at TEXT,"
+        "    superseded_by_derivative_id TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_docx_derivatives_project_source "
+        "ON docx_derivatives(project_id, source_path, status);"
+    )
+
+
 async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     """7c96d41b — Postgres mirror of the paper_contract schema: the
     first-class versioned editorial-intent document for Meridian's
@@ -5481,4 +5514,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_experiment_registry_runs,
     _migrate_pg_remote_tasks,
     _migrate_pg_repo_identity,
+    _migrate_pg_docx_derivatives,
 )

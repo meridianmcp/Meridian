@@ -22,10 +22,13 @@ Silent abandonment of a run is not allowed.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from typing import Any
 
 from meridian import experiment as model
+from meridian import tigris_adapter
+from meridian.secret_redaction import check_for_secrets
 
 _EXPERIMENT_COLUMNS = (
     "id", "project_id", "name", "config_template", "created_by",
@@ -67,6 +70,32 @@ def _json_loads(raw: "str | None") -> Any:
 
 def _json_dumps(value: "Any | None") -> "str | None":
     return json.dumps(value, ensure_ascii=False, sort_keys=True) if value is not None else None
+
+
+def _default_data_dir() -> str:
+    """Same server-wide local data directory every other local artifact in
+    this repo already uses -- mirrors ``meridian.routes.oauth``'s own
+    ``os.environ.get("MERIDIAN_DATA_DIR", "data")`` lookup exactly, so a
+    caller that omits ``data_dir`` (e.g. an existing test calling
+    :func:`complete_experiment_run` without it) still resolves to the same
+    directory the rest of the server would use."""
+    return os.environ.get("MERIDIAN_DATA_DIR", "data")
+
+
+def _encode_receipt_bytes(value: "dict[str, Any]") -> "bytes | None":
+    """Canonical JSON encoding of a receipt dict, or ``None`` if it is not
+    JSON-serializable -- mirrors ``model.validate_result_receipt``'s own
+    encoding exactly (same separators/sort order) so the byte length this
+    computes agrees with the length that function would reject on. Returns
+    ``None`` rather than raising so the caller can fall through to
+    ``model.validate_result_receipt`` for the actual error message on a
+    genuinely non-serializable value."""
+    try:
+        return json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
 
 
 def _decode_experiment(row: Any) -> "dict[str, Any] | None":
@@ -208,6 +237,38 @@ async def get_experiment_run(
 ) -> "dict[str, Any] | None":
     """Fetch one run by id, scoped to ``project_id``."""
     return await _find_run(db, project_id, run_id)
+
+
+async def resolve_result_receipt(
+    db: Any, project_id: str, *, run_id: str, data_dir: "str | None" = None,
+) -> "dict[str, Any] | None":
+    """Return a run's full ``result_receipt``, transparently resolving a
+    spilled pointer (see :func:`complete_experiment_run`'s docstring) back
+    to its original content.
+
+    Returns the stored receipt UNCHANGED when it was never spilled (the
+    common case -- most receipts fit inline). Returns ``None`` when the run
+    has no receipt at all, OR -- best-effort, matching
+    :mod:`meridian.tigris_adapter`'s own graceful-degradation contract --
+    when a spilled payload can no longer be retrieved. Raises ``ValueError``
+    only if ``run_id`` does not exist in this project (mirrors every other
+    lookup function in this module); never raises for a storage-layer
+    failure on the resolve side itself.
+    """
+    run = await _find_run(db, project_id, run_id)
+    if run is None:
+        raise ValueError(f"experiment run {run_id!r} not found in project {project_id!r}")
+    receipt = run.get("result_receipt")
+    if not isinstance(receipt, dict) or not receipt.get("spilled"):
+        return receipt
+    raw = await tigris_adapter.fetch_spilled_payload(data_dir or _default_data_dir(), receipt)
+    if raw is None:
+        return None
+    try:
+        resolved = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return resolved if isinstance(resolved, dict) else None
 
 
 async def list_experiment_runs(
@@ -375,6 +436,7 @@ async def complete_experiment_run(
     disposition: str,
     result_receipt: "dict[str, Any] | None" = None,
     status: str = "completed",
+    data_dir: "str | None" = None,
 ) -> "dict[str, Any]":
     """Finalize a run as ``completed`` or ``abandoned`` (see
     meridian.experiment's module docstring, deviation 3, for why ``status``
@@ -395,6 +457,35 @@ async def complete_experiment_run(
     'failed' (case-insensitive substring), auto-writes
     ``{event_type: 'dead_end', label: 'auto', body: outcome_summary}``, in
     the SAME transaction as the status update.
+
+    37dd1004 (W1-N) -- TIGRIS SPILL PATH FOR OVERSIZED RECEIPTS: a
+    ``result_receipt`` whose canonical JSON encoding exceeds
+    ``model.MAX_RESULT_RECEIPT_BYTES`` (32KB) is no longer an automatic
+    ``ExperimentError`` here. Before validating, this function checks the
+    encoded size itself; when it is over the cap, the ORIGINAL receipt is
+    scanned with ``check_for_secrets`` (the same hard-reject gate
+    ``model.validate_result_receipt`` already applies to a receipt that
+    fits inline -- deliberately NOT downgraded to soft/silent redaction
+    just because a receipt happens to be oversized) and, if clean, spilled
+    out-of-line via :func:`meridian.tigris_adapter.spill_oversized_payload`.
+    On a successful spill, the small POINTER record
+    (``{"spilled": True, "backend": ..., "content_hash": ..., "size": ...}``
+    -- see that function's docstring for the exact shape) is stored in
+    ``result_receipt_json`` in place of the full oversized blob -- no schema
+    change, no new column, just a smaller JSON object in the SAME column.
+    Use :func:`resolve_result_receipt` to transparently read it back.
+
+    If the spill itself fails for any reason (storage backend also
+    unavailable), this FAILS CLOSED: falls through to
+    ``model.validate_result_receipt``'s normal behavior, which raises
+    ``ExperimentError`` for the oversized receipt exactly as before this
+    item -- a spill failure never silently drops the caller's data, and
+    never silently accepts an oversized receipt inline either.
+
+    ``data_dir`` defaults to the same ``MERIDIAN_DATA_DIR``-derived
+    directory every other local artifact in this repo uses (see
+    :func:`_default_data_dir`) when omitted, so existing callers that never
+    pass it keep working unchanged.
     """
     project_id = (project_id or "").strip()
     # Validate FIRST, unconditionally -- see docstring above.
@@ -410,7 +501,37 @@ async def complete_experiment_run(
         return run
 
     await _require_session(db, project_id, session_id)
-    validated_receipt = model.validate_result_receipt(result_receipt)
+
+    receipt_to_validate = result_receipt
+    if isinstance(result_receipt, dict):
+        encoded = _encode_receipt_bytes(result_receipt)
+        if encoded is not None and len(encoded) > model.MAX_RESULT_RECEIPT_BYTES:
+            # Hard-reject secret-shaped content BEFORE it ever reaches a
+            # storage backend -- same posture model.validate_result_receipt
+            # already applies to a receipt that fits inline; being oversized
+            # must never downgrade this to silent redaction.
+            check_for_secrets(
+                encoded.decode("utf-8", errors="ignore"),
+                context="experiment run result_receipt (oversized, pre-spill)",
+            )
+            spill = await tigris_adapter.spill_oversized_payload(
+                data_dir or _default_data_dir(), project_id, encoded,
+                content_type="application/json",
+            )
+            if spill.get("spilled"):
+                receipt_to_validate = {
+                    "spilled": True,
+                    "backend": spill["backend"],
+                    "content_hash": spill.get("content_hash"),
+                    "size": spill.get("size"),
+                    "content_type": spill.get("content_type"),
+                    "project_id": project_id,
+                }
+                if "key" in spill:
+                    receipt_to_validate["key"] = spill["key"]
+            # else: fall through -- model.validate_result_receipt below
+            # raises its normal oversized-cap ExperimentError (fail closed).
+    validated_receipt = model.validate_result_receipt(receipt_to_validate)
 
     now = model.utcnow_iso()
     await db.execute(
