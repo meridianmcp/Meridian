@@ -140,6 +140,38 @@ async def test_assign_sprint_waves_skips_deferred_items(db):
 
 
 @pytest.mark.asyncio
+async def test_assign_sprint_waves_skips_hard_blocked_items(db):
+    """7e7d9a43 — a superseded/systemic_invalidated_run item must NOT receive
+    a wave label either, the mirror-image gap of the deferred-item test
+    above: get_parallelizable_groups already excluded hard-blocked items
+    (524e73e6) but assign_sprint_waves never did, so such an item could
+    still be persisted a real wave-N/wave-urgent label even though claiming
+    it will deterministically fail. See
+    tests/test_7e7d9a43_quarantine_predicate.py for the full coverage
+    (including the new `quarantined` reporting field and dependency-frontier
+    interaction) — this is the focused regression test living alongside the
+    sibling deferred-item test in this file.
+    """
+    pid = await _project(db)
+    superseded = await db_module.add_sprint_item(
+        db, pid, "v1", "superseded approach", blocker_kind="superseded", force=True,
+    )
+    normal = await db_module.add_sprint_item(db, pid, "v1", "normal item")
+
+    result = await db_module.assign_sprint_waves(db, pid)
+
+    r_superseded = await db_module.get_sprint_item(db, superseded["id"])
+    r_normal = await db_module.get_sprint_item(db, normal["id"])
+
+    assert r_superseded["wave"] is None
+    assert superseded["id"] not in {
+        item_id for ids in result["waves"].values() for item_id in ids
+    }
+    assert r_normal["wave"] is not None
+    assert result["assigned"] == 1
+
+
+@pytest.mark.asyncio
 async def test_assign_sprint_waves_idempotent(db):
     pid = await _project(db)
     await db_module.add_sprint_item(db, pid, "v1", "solo", touches_resources=["file:x.py"])

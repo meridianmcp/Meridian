@@ -8816,6 +8816,17 @@ async def build_continuation_manifest(
         recompute this fresh, not wait for a hash the edit itself wouldn't
         move).
 
+      - ``deferred_pending_ids`` (7e7d9a43) — up to
+        :data:`_CONTINUATION_MANIFEST_ID_CAP` ``{"id", "deferred_until"}``
+        entries for items that are ``status in ('pending', 'todo')`` but have
+        a future ``deferred_until`` (``_is_deferred``). Same "excluded from
+        ``pending_item_ids``/``pending_count`` but surfaced here, never
+        silently dropped" treatment as ``hard_blocked_pending_ids`` above —
+        this manifest previously had NO deferred exclusion at all, so a
+        resuming session could be handed a backburnered id
+        ``claim_sprint_item``'s own deferral gate (dec69708) would then
+        refuse.
+
         07229675 originally passed this dict through VERBATIM — unlike
         every other per-item field in this manifest, nothing capped it, so
         on a board where most non-done items classify as blocked (e.g. the
@@ -8945,14 +8956,47 @@ async def build_continuation_manifest(
     # deterministically refuse. Reuses the SAME predicate _build_quick_start_goal
     # already applies to the /goal text, so this manifest can't disagree with
     # what the goal itself would advertise as claimable.
+    # 7e7d9a43 — same treatment for future-``deferred_until`` items: this
+    # manifest never excluded them before (unlike _build_quick_start_goal's
+    # own backburner/deferred exclusion, 0a65f5cc), so a resuming session
+    # could be handed a backburnered id claim_sprint_item's own deferral gate
+    # (dec69708) would then refuse. Excluded from claimable_pending_ids /
+    # pending_count, surfaced in deferred_pending instead of silently
+    # dropped — same "excluded but surfaced" convention as hard_blocked_pending.
+    #
+    # ``snapshot["items"]`` (build_board_snapshot) never carries
+    # ``deferred_until`` in its documented per-item field list, so a
+    # deferred item can't be detected from the snapshot alone — a small,
+    # best-effort side fetch (same project+version scope) resolves it.
+    # Fail-open (matches every other enrichment step in this function): a
+    # fetch failure just means the deferred check degrades to "nothing
+    # deferred" rather than breaking the whole manifest.
+    _deferred_until_by_id: dict[str, Any] = {}
+    try:
+        _raw_items_for_deferred = await db_module.get_sprint_items(
+            db, project_id, version=effective_version,
+        )
+        _deferred_until_by_id = {
+            it["id"]: it.get("deferred_until")
+            for it in _raw_items_for_deferred
+            if it.get("id") and _is_deferred(it)
+        }
+    except Exception:  # noqa: BLE001 — best-effort enrichment, never fatal
+        _deferred_until_by_id = {}
     claimable_pending_ids = [
         it.get("id") for it in pending_items
         if not _is_hard_blocked_sprint_item(it)
+        and it.get("id") not in _deferred_until_by_id
     ]
     hard_blocked_pending = [
         {"id": it.get("id"), "blocker_kind": it.get("blocker_kind")}
         for it in pending_items
         if _is_hard_blocked_sprint_item(it)
+    ]
+    deferred_pending = [
+        {"id": it.get("id"), "deferred_until": _deferred_until_by_id.get(it.get("id"))}
+        for it in pending_items
+        if not _is_hard_blocked_sprint_item(it) and it.get("id") in _deferred_until_by_id
     ]
 
     capped_pending_ids = claimable_pending_ids[:_CONTINUATION_MANIFEST_ID_CAP]
@@ -8996,6 +9040,7 @@ async def build_continuation_manifest(
         "pending_count": len(claimable_pending_ids),
         "pending_item_ids": capped_pending_ids,
         "hard_blocked_pending_ids": hard_blocked_pending[:_CONTINUATION_MANIFEST_ID_CAP],
+        "deferred_pending_ids": deferred_pending[:_CONTINUATION_MANIFEST_ID_CAP],
         "blocker_summary": _cap_blocker_summary(snapshot.get("blocker_summary")),
         "hitl_gated_item_ids": hitl_gated_item_ids,
     }
