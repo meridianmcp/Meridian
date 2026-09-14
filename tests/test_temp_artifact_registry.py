@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -516,7 +517,7 @@ class TestCheckArtifact:
 # ---------------------------------------------------------------------------
 
 class TestCrossReferenceSoftDependency:
-    def test_unavailable_when_meridian_outputs_not_importable(self, tmp_path):
+    def test_unavailable_when_meridian_outputs_not_importable(self, tmp_path, monkeypatch):
         """This test environment (tests/ -- the main pixi suite) does not
         have meridian_outputs on sys.path: extensions/meridian-outputs is
         never pip-installed into the main pixi env (its own tests import it
@@ -526,7 +527,19 @@ class TestCrossReferenceSoftDependency:
         that optionally-installed extension. See
         extensions/meridian-outputs/tests/test_temp_artifacts_reconciliation.py
         for the case where meridian_outputs IS importable.
+
+        Several other files in this same suite (e.g. test_mde5_evidence_lossless.py,
+        test_research_evidence_envelope.py) do an unscoped, process-lifetime
+        `sys.path.insert(0, ".../extensions/meridian-outputs")` at module import
+        time so THEIR OWN tests can `import meridian_outputs`. In a full xdist
+        run that can land this test on the same worker process, making the
+        real ambient import succeed and this assertion depend on test
+        scheduling order rather than on the code path under test. Force the
+        unavailable case deterministically: a `None` entry in `sys.modules`
+        makes Python's import machinery raise ImportError immediately,
+        before consulting sys.path at all.
         """
+        monkeypatch.setitem(sys.modules, "meridian_outputs", None)
         entry = TA.register_artifact(str(tmp_path), name="a", script_path=str(tmp_path / "a.py"))
         result = TA.cross_reference_outputs_fingerprint(
             str(tmp_path), entry["artifact_id"], str(tmp_path / "outputs"),
