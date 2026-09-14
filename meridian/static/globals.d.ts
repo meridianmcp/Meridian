@@ -95,6 +95,9 @@ declare global {
   const loadDocumentReview: any;
   const renderDocumentReview: any;
   const wireDocumentReviewButtons: any;
+  const fetchJournalStylePresets: any;
+  const journalPresetSelectHtml: any;
+  const journalPresetOptionsHtml: any;
   const loadTimeline: any;
   const loadSprintBoard: any;
   const saveFile: any;

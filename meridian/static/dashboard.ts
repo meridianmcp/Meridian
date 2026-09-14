@@ -7886,6 +7886,12 @@ async function loadDocumentsTab(projectId: any) {
     peeks = (((pk && pk.peeks) || []) as any[]);
   } catch (_) { peeks = []; }
 
+  // 9c1a3fd2 — journal-style presets for the per-document review dropdown.
+  // fetchJournalStylePresets never throws (resolves to [] on any failure —
+  // extension not installed, network error), so no try/catch needed here;
+  // an empty catalog just renders the dropdown with only "No journal check".
+  const journalPresets = await fetchJournalStylePresets();
+
   const _srcBadge = (src: any) => {
     const s = String(src || 'local').toLowerCase();
     const label = s.includes('onedrive') ? 'OneDrive'
@@ -7927,7 +7933,8 @@ async function loadDocumentsTab(projectId: any) {
           ? `<div style="margin-top:6px;display:flex;gap:6px">
               <button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button>
               ${String(fp).toLowerCase().endsWith('.docx')
-                ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>`
+                ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>
+                   ${journalPresetSelectHtml(did, journalPresets)}`
                 : ''}
             </div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div><div id="doc-review-${escapeHtml(did)}" data-fp="${escapeHtml(String(fp))}" style="margin-top:6px"></div>`
           : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path — structure view unavailable.</div>'}

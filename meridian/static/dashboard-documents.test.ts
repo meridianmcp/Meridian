@@ -5,6 +5,14 @@
 // truncation), missing IDs (not_found locator), and mixed native/legacy
 // captions (caption category + type label).
 import { describe, expect, it } from "vitest";
+// journalPresetOptionsHtml/journalPresetSelectHtml call the ambient global
+// escapeHtml (bundled app-wide by esbuild at runtime — see this file's own
+// header comment on the window re-exposure convention). Under vitest each
+// module is isolated, so it must be registered explicitly: importing
+// dashboard-utils for its side effect runs its own `Object.assign(window,
+// {escapeHtml, ...})`, after which the bare `escapeHtml` identifier resolves
+// via jsdom's global object exactly like it does in the real bundled app.
+import "./dashboard-utils";
 import {
   groupFindingsByCategory,
   summarizeLocator,
@@ -12,10 +20,13 @@ import {
   isReviewEmpty,
   isReviewStale,
   isReviewError,
+  journalPresetOptionsHtml,
+  journalPresetSelectHtml,
   REVIEW_CATEGORY_ORDER,
   type ReviewFinding,
   type ReviewLocator,
   type DocumentReviewResult,
+  type JournalStylePresetInfo,
 } from "./dashboard-documents";
 
 const resolvedLocator = (over: Partial<ReviewLocator> = {}): ReviewLocator => ({
@@ -240,5 +251,75 @@ describe("review-level state helpers", () => {
     expect(isReviewError({ error: "file not found on server: x.docx" })).toBe(true);
     expect(isReviewError({ status: "ok" })).toBe(false);
     expect(isReviewError(undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// journalPresetOptionsHtml / journalPresetSelectHtml — 9c1a3fd2 preset picker.
+// ---------------------------------------------------------------------------
+describe("journalPresetOptionsHtml", () => {
+  const presets: JournalStylePresetInfo[] = [
+    { name: "nature", source: "built_in", shadows_builtin: false },
+    { name: "jcshm", source: "built_in", shadows_builtin: false },
+  ];
+
+  it("always leads with a selected-by-default 'No journal check' option", () => {
+    const html = journalPresetOptionsHtml([]);
+    expect(html).toContain('<option value="" selected>No journal check</option>');
+  });
+
+  it("lists built-in presets sorted by name, value = name", () => {
+    const html = journalPresetOptionsHtml(presets);
+    const jcshmIndex = html.indexOf("jcshm");
+    const natureIndex = html.indexOf("nature");
+    expect(jcshmIndex).toBeGreaterThan(-1);
+    expect(jcshmIndex).toBeLessThan(natureIndex); // alphabetical: jcshm before nature
+    expect(html).toContain('<option value="jcshm">jcshm</option>');
+  });
+
+  it("labels a user preset that shadows a built-in as '(custom)', distinct from the built-in it amends", () => {
+    const html = journalPresetOptionsHtml([
+      { name: "jcshm", source: "user", shadows_builtin: true },
+    ]);
+    expect(html).toContain('<option value="jcshm">jcshm (custom)</option>');
+  });
+
+  it("a user preset NOT shadowing any built-in gets no '(custom)' suffix", () => {
+    const html = journalPresetOptionsHtml([
+      { name: "my_lab_house_style", source: "user", shadows_builtin: false },
+    ]);
+    expect(html).toContain('<option value="my_lab_house_style">my_lab_house_style</option>');
+  });
+
+  it("marks the currently-selected preset (not the default) as selected, for Re-check re-rendering", () => {
+    const html = journalPresetOptionsHtml(presets, "jcshm");
+    expect(html).toContain('<option value="">No journal check</option>');
+    expect(html).toContain('<option value="jcshm" selected>jcshm</option>');
+  });
+
+  it("null/undefined presets never throws — degrades to just the default option", () => {
+    expect(() => journalPresetOptionsHtml(null)).not.toThrow();
+    expect(() => journalPresetOptionsHtml(undefined)).not.toThrow();
+    expect(journalPresetOptionsHtml(null)).toContain("No journal check");
+  });
+
+  it("escapes a preset name that contains HTML-significant characters", () => {
+    const html = journalPresetOptionsHtml([
+      { name: '<script>"</script>', source: "user", shadows_builtin: false },
+    ]);
+    expect(html).not.toContain("<script>");
+  });
+});
+
+describe("journalPresetSelectHtml", () => {
+  it("scopes the <select> to one document via data-did, matching wireDocumentReviewButtons' lookup", () => {
+    const html = journalPresetSelectHtml("doc-42", []);
+    expect(html).toContain('class="doc-review-journal-select"');
+    expect(html).toContain('data-did="doc-42"');
+  });
+
+  it("escapes the document id", () => {
+    const html = journalPresetSelectHtml('"><script>evil()</script>', []);
+    expect(html).not.toContain("<script>evil()</script>");
   });
 });

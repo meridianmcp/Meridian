@@ -315,6 +315,8 @@ def get_document_review(
     docx_path: str,
     expected_source_fingerprint: str | None = None,
     include_render_check: bool = False,
+    journal: str | None = None,
+    user_presets_path: str | None = None,
 ) -> dict[str, Any]:
     """b67ec6b5 -- non-mutating DOCX review: findings grouped by category
     (structure/equation/caption/section_page/ownership/provenance/
@@ -324,21 +326,41 @@ def get_document_review(
     alone.
 
     Composes existing read-only primitives (audit_equation_style,
-    scan_stale_notes, a read-only legacy-plaintext-caption detector, and
-    optionally check_render_capability) rather than re-deriving detection or
-    anchor-resolution logic. Pass expected_source_fingerprint (a value
-    previously returned as source_fingerprint) to detect the document having
-    changed since a stashed review -- a mismatch returns
-    ``{"status": "stale", ...}`` with empty findings instead of resolving
-    against what may now be the wrong document. include_render_check opts
-    into a live render-capability probe (slow/backend-dependent -- never run
-    implicitly); only a "failed" render status becomes a finding. See
-    :func:`meridian_docs.docs_intel.build_document_review` for the full
-    contract. No DOCX writes -- read-only in every code path.
+    audit_caption_style, scan_stale_notes, a read-only legacy-plaintext-
+    caption detector, and optionally check_render_capability) rather than
+    re-deriving detection or anchor-resolution logic. Pass
+    expected_source_fingerprint (a value previously returned as
+    source_fingerprint) to detect the document having changed since a
+    stashed review -- a mismatch returns ``{"status": "stale", ...}`` with
+    empty findings instead of resolving against what may now be the wrong
+    document. include_render_check opts into a live render-capability probe
+    (slow/backend-dependent -- never run implicitly); only a "failed" render
+    status becomes a finding.
+
+    9c1a3fd2 -- pass ``journal`` (any name get_journal_style_preset resolves,
+    e.g. "jcshm") to also run the equation- and caption-style checks against
+    that journal's verified formatting rules -- omit it and this tool
+    behaves exactly as before (no style_policy, so audit_equation_style/
+    audit_caption_style contribute zero findings). ``user_presets_path``
+    extends the lookup to a user-saved preset (see
+    save_user_journal_style_preset); it is ignored unless ``journal`` is
+    also given. Raises via a structured ``{"error": ...}`` result (never a
+    exception escaping this tool) when ``journal`` doesn't resolve to a
+    known preset. See :func:`meridian_docs.docs_intel.build_document_review`
+    for the full contract. No DOCX writes -- read-only in every code path.
     """
+    style_policy = None
+    if journal is not None:
+        try:
+            style_policy = docs_intel.get_journal_style_preset(
+                journal, user_presets_path=user_presets_path
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
     return docs_intel.build_document_review(
         docx_path,
         expected_source_fingerprint=expected_source_fingerprint,
+        style_policy=style_policy,
         include_render_check=include_render_check,
     )
 
@@ -1697,6 +1719,57 @@ def audit_equation_style(
 
 
 @mcp.tool()
+def audit_caption_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """8e2f4a17 — Audit every figure/table caption's LABEL formatting
+    (boldness, punctuation immediately after the number) against a
+    style_policy/journal preset; returns structured findings, not free text.
+
+    Closes a real gap: figure_caption_bold / table_caption_bold /
+    figure_caption_label_punctuation / table_caption_label_punctuation have
+    existed on resolve_style_policy() and every JOURNAL_STYLE_PRESETS entry
+    since 4d0ca929, but nothing ever read them back against a document —
+    this is that missing consumer. Caption detection is text-and-style based
+    (paragraph style name contains "caption" AND the text starts with a
+    "Fig."/"Table" label), not SEQ-field based, so it also works on
+    documents where figures/tables are numbered with a plain bold text run
+    instead of Word's automatic caption field (common in a heavily
+    hand-edited or raw-XML-spliced document).
+
+    Three finding types, each skipped entirely when the corresponding policy
+    key is unset (None / "unspecified" — no verified rule, don't guess):
+      caption_label_not_bold /
+      caption_label_unexpectedly_bold          — the "Fig. N"/"Table N"
+        label's runs aren't (aren't NOT) all bold, per
+        figure_caption_bold/table_caption_bold.
+      caption_label_punctuation_mismatch       — the character right after
+        the number isn't the expected period/colon/none, per
+        figure_caption_label_punctuation/table_caption_label_punctuation.
+      caption_terminal_punctuation_mismatch    — the LAST character of the
+        caption's full text isn't what's expected, per
+        figure_caption_terminal_punctuation/table_caption_terminal_punctuation
+        (independent of the label check above — a publisher can forbid both
+        separately, e.g. JCSHM forbids punctuation after the number AND at
+        the end of the caption).
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides, or pass
+                     get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {docx_path, caption_count, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_caption_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
 def audit_equation_contract(
     docx_path: str,
     project_id: str | None = None,
@@ -1748,7 +1821,10 @@ def audit_equation_contract(
 
 
 @mcp.tool()
-def get_journal_style_preset(journal: str) -> dict[str, Any]:
+def get_journal_style_preset(
+    journal: str,
+    user_presets_path: str | None = None,
+) -> dict[str, Any]:
     """4544bbe5 — Look up a named publishing-convention style-policy preset
     (a "document profile" shorthand) instead of hand-writing a full
     style_policy override dict.
@@ -1756,23 +1832,109 @@ def get_journal_style_preset(journal: str) -> dict[str, Any]:
     The returned dict is the FULLY RESOLVED policy (every
     resolve_style_policy key populated), ready to pass straight through as
     style_policy= to insert_figure_block, insert_caption,
-    audit_equation_style, insert_equation, insert_highlighted_note,
-    write_section, or insert_table.
+    audit_equation_style, audit_caption_style, insert_equation,
+    insert_highlighted_note, write_section, or insert_table.
+
+    8e2f4a17 — journal is no longer limited to the ~29 built-in presets.
+    Pass user_presets_path to also resolve names saved via
+    save_user_journal_style_preset (or hand-authored in the same JSON
+    shape). A user preset sharing a built-in's name AMENDS it (merged on
+    top, not a full replace) — see save_user_journal_style_preset and
+    list_journal_style_presets for the rest of this CRUD surface.
 
     Args:
-      journal: Preset name — currently "default" (built-in defaults, named
-        for explicit selection) or "jcshm" (a representative academic-
-        journal convention: centered captions/equations, no terminal
-        punctuation on headings, label-left/data-center table columns).
+      journal: Preset name — a built-in (see list_journal_style_presets
+        with no user_presets_path for the full catalog: default, jcshm, and
+        ~28 more publisher presets covering Nature/Elsevier/IEEE/Wiley/ACM/
+        MDPI/PLOS/Springer/etc.) or, when user_presets_path is given, a
+        name defined in that file.
+      user_presets_path: Optional path to a user-maintained JSON presets
+        file. Omit to resolve only against the built-in catalog.
 
     Returns:
       The resolved style policy dict for journal, or {error: <message>} if
-      journal names no known preset.
+      journal names no known preset (built-in or user-supplied) or the user
+      presets file is malformed.
     """
     try:
-        return docs_intel.get_journal_style_preset(journal)
+        return docs_intel.get_journal_style_preset(journal, user_presets_path=user_presets_path)
     except ValueError as exc:
         return {"error": str(exc)}
+
+
+@mcp.tool()
+def list_journal_style_presets(user_presets_path: str | None = None) -> dict[str, Any]:
+    """8e2f4a17 — Enumerate every journal-style preset get_journal_style_preset
+    can currently resolve: the ~29 built-ins, plus (when user_presets_path
+    is given) every preset defined in that user's JSON file, each tagged
+    with its source and whether it shadows a built-in of the same name.
+
+    Args:
+      user_presets_path: Optional path to a user presets JSON file. Omit to
+        list only the built-in catalog.
+
+    Returns:
+      {presets: [{name, source, shadows_builtin}, ...], builtin_count,
+      user_count} or {error: <message>} if the user presets file exists but
+      is malformed.
+    """
+    return docs_intel.list_journal_style_presets(user_presets_path=user_presets_path)
+
+
+@mcp.tool()
+def save_user_journal_style_preset(
+    name: str,
+    overrides: dict[str, Any],
+    path: str,
+) -> dict[str, Any]:
+    """8e2f4a17 — Validate and persist one user-defined journal-style
+    preset into a JSON file, so it becomes resolvable by name via
+    get_journal_style_preset(name, user_presets_path=path) from then on.
+    Creates the file (and any missing parent directory) if needed; updates
+    just this one entry if the file already exists, preserving every other
+    preset already in it.
+
+    overrides is validated through the same resolve_style_policy path every
+    built-in preset goes through — a malformed override is rejected before
+    anything is written, never silently saved as a broken preset.
+
+    name may match a built-in preset's name — get_journal_style_preset then
+    AMENDS the built-in (merges this override dict on top of it) rather
+    than replacing it outright, so saving e.g. a table-caption correction
+    for "jcshm" doesn't drop that preset's already-verified figure-caption
+    facts.
+
+    Args:
+      name:      The preset name (case-insensitive at lookup time; stored
+                 exactly as given).
+      overrides: A style_policy override dict — only the keys you want to
+                 set; see resolve_style_policy's docstring for the full key
+                 catalog and valid values for each.
+      path:      Path to the user presets JSON file (existing or new).
+
+    Returns:
+      {status: "ok", name, path, preset_count} or {error: <message>} if
+      overrides fails validation.
+    """
+    return docs_intel.save_user_journal_style_preset(name=name, overrides=overrides, path=path)
+
+
+@mcp.tool()
+def delete_user_journal_style_preset(name: str, path: str) -> dict[str, Any]:
+    """8e2f4a17 — Remove one named preset from a user presets JSON file
+    (every other entry preserved). A no-op, not an error, if the file
+    doesn't exist or doesn't contain name.
+
+    Args:
+      name: The preset name, matched EXACTLY (case-sensitive) against the
+        file's own keys.
+      path: Path to the user presets JSON file.
+
+    Returns:
+      {status: "ok", name, path, deleted: bool, preset_count} or
+      {error: <message>} if the file exists but isn't valid JSON.
+    """
+    return docs_intel.delete_user_journal_style_preset(name=name, path=path)
 
 
 @mcp.tool()

@@ -8631,6 +8631,8 @@ def _style_policy_defaults() -> dict[str, Any]:
         "table_caption_bold": None,
         "figure_caption_label_punctuation": "unspecified",
         "table_caption_label_punctuation": "unspecified",
+        "figure_caption_terminal_punctuation": None,
+        "table_caption_terminal_punctuation": None,
         "paragraph_indent_method": "unspecified",
         "figure_dpi_minimum_general": None,
         "figure_dpi_minimum_halftone": None,
@@ -8722,6 +8724,27 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
       table_caption_label_punctuation (str): 4d0ca929 -- same as
                                     ``figure_caption_label_punctuation`` but
                                     for table labels.
+      figure_caption_terminal_punctuation (str | None): 8e2f4a17 -- same
+                                    mechanism as ``heading_terminal_punctuation``
+                                    (see above), applied to the END of a
+                                    figure caption's full text instead of a
+                                    heading: ``None`` means "no policy, don't
+                                    check"; ``""`` enforces "no trailing
+                                    punctuation on the caption at all"; a
+                                    non-empty string enforces that exact
+                                    trailing character/string. Deliberately a
+                                    SEPARATE key from
+                                    ``figure_caption_label_punctuation`` --
+                                    the two are independent publisher rules
+                                    ("no punctuation after the number" vs "no
+                                    punctuation at the end of the caption")
+                                    that happen to co-occur in some style
+                                    guides (JCSHM states both) but are
+                                    logically distinct and independently
+                                    settable.
+      table_caption_terminal_punctuation (str | None): 8e2f4a17 -- same as
+                                    ``figure_caption_terminal_punctuation``
+                                    but for table captions.
       paragraph_indent_method (str): 4d0ca929 -- one of "tab"/"space"/
                                     "none"/"automatic_style"/"unspecified" --
                                     how the publisher indents body
@@ -8848,6 +8871,11 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
                 f"{sorted(_VALID_CAPTION_LABEL_PUNCTUATION)}"
             )
 
+    for key in ("figure_caption_terminal_punctuation", "table_caption_terminal_punctuation"):
+        value = policy[key]
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"style policy {key!r} must be a string or None")
+
     if policy["paragraph_indent_method"] not in _VALID_PARAGRAPH_INDENT_METHODS:
         raise ValueError(
             "style policy 'paragraph_indent_method' must be one of "
@@ -8963,6 +8991,28 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
     # figure/table captions, centered display equations with required
     # trailing punctuation, headings with no terminal punctuation, and a
     # label-left/data-center table layout.
+    # jcshm -- Journal of Civil Structural Health Monitoring (Springer,
+    # journal id 13349). The figure_caption_bold / figure_caption_label_
+    # punctuation / heading_numbering_visible / heading_levels_max /
+    # citation_style keys below were added 2026-09-14, independently
+    # verified against link.springer.com/journal/13349/submission-guidelines
+    # (the live "Submission guidelines" page, section "Figure Captions" for
+    # the caption keys, "Headings" for the two heading keys, "Citation" for
+    # citation_style). NOTE ON HOW THIS WAS FETCHED, for anyone repeating
+    # this verification: a stateless WebFetch-style single request loops
+    # forever through idp.springer.com's auth-cookie redirect (no cookie
+    # jar to complete the bounce) even though the page is genuinely public
+    # -- an interactive browser session (persistent cookies) loads it on the
+    # first try. See workspace proposal cb7bd76e for the general version of
+    # this problem across other publishers (Elsevier/Wiley/MDPI each gate
+    # differently, and this specific workaround does NOT generalize to
+    # them). table_caption_bold and table_caption_label_punctuation are
+    # deliberately left "unspecified"/None -- the guidelines' "Tables"
+    # section does not restate the Figure Captions section's punctuation/
+    # boldness rule for tables specifically; by-convention extension to
+    # tables is plausible but was not independently confirmed, so per this
+    # catalog's own no-guessing discipline it stays unverified rather than
+    # assumed identical.
     "jcshm": {
         "caption_centered": True,
         "equation_alignment": "center",
@@ -8971,6 +9021,12 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
         "heading_terminal_punctuation": "",
         "table_label_column_alignment": "left",
         "table_data_column_alignment": "center",
+        "figure_caption_bold": True,
+        "figure_caption_label_punctuation": "none",
+        "figure_caption_terminal_punctuation": "",
+        "heading_numbering_visible": True,
+        "heading_levels_max": 3,
+        "citation_style": "numbered_bracket",
     },
 
     # -- Round 1 (proposal 3674c0c1) -----------------------------------
@@ -9390,7 +9446,10 @@ _JOURNAL_STYLE_PRESET_LOOKUP: dict[str, str] = {
 }
 
 
-def get_journal_style_preset(journal: str) -> dict[str, Any]:
+def get_journal_style_preset(
+    journal: str,
+    user_presets_path: str | None = None,
+) -> dict[str, Any]:
     """4544bbe5 -- look up a named publishing-convention style-policy preset.
 
     This is the "shorthand" half of the document-profile surface: instead of
@@ -9398,9 +9457,9 @@ def get_journal_style_preset(journal: str) -> dict[str, Any]:
     convention, they pass a short name here and get back a ready-to-use,
     already-validated policy dict suitable for ``style_policy=`` on
     :func:`insert_figure_block`, :func:`insert_caption`,
-    :func:`audit_equation_style`, :func:`insert_equation_local`,
-    :func:`insert_highlighted_note`, :func:`write_section`, or
-    :func:`insert_table`.
+    :func:`audit_equation_style`, :func:`audit_caption_style`,
+    :func:`insert_equation_local`, :func:`insert_highlighted_note`,
+    :func:`write_section`, or :func:`insert_table`.
 
     The returned dict is the FULLY RESOLVED policy (every key populated,
     unset keys filled from :func:`_style_policy_defaults`) -- not the raw
@@ -9409,29 +9468,300 @@ def get_journal_style_preset(journal: str) -> dict[str, Any]:
 
     4d0ca929 -- ``journal`` is resolved CASE-INSENSITIVELY: ``"Nature"``,
     ``"NATURE"``, and ``"nature"`` all resolve to the same ``"nature"``
-    preset. The lookup itself (:data:`_JOURNAL_STYLE_PRESET_LOOKUP`) is
-    derived from :data:`JOURNAL_STYLE_PRESETS`'s own keys at import time,
-    so it can never list a name :data:`JOURNAL_STYLE_PRESETS` doesn't have.
+    preset. The built-in lookup (:data:`_JOURNAL_STYLE_PRESET_LOOKUP`) is
+    derived from :data:`JOURNAL_STYLE_PRESETS`'s own keys at import time, so
+    it can never list a name :data:`JOURNAL_STYLE_PRESETS` doesn't have.
+
+    8e2f4a17 -- ``user_presets_path``, when given, makes the preset catalog
+    USER-EXTENSIBLE instead of only the hand-maintained built-in dict above.
+    Confirmed gap (workspace proposal cb7bd76e, the same investigation that
+    added :func:`audit_caption_style`): a user preparing a submission for a
+    venue not in :data:`JOURNAL_STYLE_PRESETS` (or who has independently
+    verified a correction to a built-in one) had no way to register their
+    own preset short of editing this module directly. Pass the path to a
+    JSON file written by :func:`save_user_journal_style_preset` (or
+    hand-authored in the same shape: ``{"<name>": {<override dict>}, ...}``)
+    and its entries are merged ON TOP of the built-in catalog -- a user
+    preset with the SAME name as a built-in one (e.g. a user's own verified
+    ``"jcshm"`` override) takes priority for this lookup, without mutating
+    :data:`JOURNAL_STYLE_PRESETS` itself (each call re-reads the file fresh
+    -- no caching, so an edit takes effect on the very next lookup, same
+    "no sidecar can go stale" discipline as :func:`audit_document`). A
+    missing file at ``user_presets_path`` is NOT an error -- it's treated as
+    "no user presets yet", identical to omitting the argument -- but a file
+    that exists and fails to parse as JSON, or whose top-level shape isn't
+    ``{name: {...}}``, DOES raise, since silently ignoring a malformed user
+    file could make a real per-user configuration mistake invisible.
 
     Args:
-      journal: One of the keys in :data:`JOURNAL_STYLE_PRESETS`, in any
-        case (e.g. ``"default"``, ``"jcshm"``, ``"Nature"``, ``"IEEE"``).
+      journal: A preset name -- either a built-in key in
+        :data:`JOURNAL_STYLE_PRESETS` or a name defined in the file at
+        ``user_presets_path`` -- in any case (e.g. ``"default"``,
+        ``"jcshm"``, ``"Nature"``, ``"my_lab_house_style"``).
+      user_presets_path: Optional path to a user-maintained JSON presets
+        file (see :func:`load_user_journal_style_presets`). Presets in this
+        file are merged on top of the built-in catalog and take priority on
+        a name collision.
 
     Returns:
       The resolved style policy dict for ``journal``.
 
     Raises:
-      ValueError: ``journal`` is not a known preset name (case-
-        insensitively), or (should the preset itself ever be malformed)
-        the preset fails :func:`resolve_style_policy` validation.
+      ValueError: ``journal`` is not a known preset name (built-in or
+        user-supplied, case-insensitively), the user presets file exists
+        but is malformed, or (should a preset itself ever be malformed) the
+        preset fails :func:`resolve_style_policy` validation.
     """
-    canonical = _JOURNAL_STYLE_PRESET_LOOKUP.get(journal.lower())
+    user_presets = (
+        load_user_journal_style_presets(user_presets_path)
+        if user_presets_path
+        else {}
+    )
+
+    # 8e2f4a17 -- a user preset sharing a built-in's name (case-insensitive)
+    # AMENDS it (merged on top of the built-in's own override dict) rather
+    # than fully replacing it -- caught by this function's own test suite:
+    # a first implementation here did a flat dict-level replace, which
+    # silently dropped every already-verified built-in fact the user's
+    # override didn't happen to also restate (e.g. saving a table-caption
+    # correction for "jcshm" reverted figure_caption_bold from its verified
+    # True back to the schema default None, since the user's override dict
+    # never mentioned that key at all). A user genuinely starting a same-
+    # named preset over from scratch can still do so -- just include every
+    # key they want in their override dict; this only changes what happens
+    # to keys they DIDN'T mention.
+    builtin_lower_map = {name.lower(): name for name in JOURNAL_STYLE_PRESETS}
+    combined: dict[str, dict[str, Any]] = dict(JOURNAL_STYLE_PRESETS)
+    for user_name, user_overrides in user_presets.items():
+        builtin_canonical = builtin_lower_map.get(user_name.lower())
+        if builtin_canonical is not None:
+            combined[builtin_canonical] = {
+                **JOURNAL_STYLE_PRESETS[builtin_canonical],
+                **user_overrides,
+            }
+        else:
+            combined[user_name] = user_overrides
+
+    lookup = {name.lower(): name for name in combined}
+    canonical = lookup.get(journal.lower())
     if canonical is None:
         raise ValueError(
             f"unknown journal style preset {journal!r}; known presets: "
-            f"{sorted(JOURNAL_STYLE_PRESETS)}"
+            f"{sorted(combined)}"
         )
-    return resolve_style_policy(JOURNAL_STYLE_PRESETS[canonical])
+    return resolve_style_policy(combined[canonical])
+
+
+def load_user_journal_style_presets(path: str) -> dict[str, dict[str, Any]]:
+    """8e2f4a17 -- read a user-maintained journal-style-preset JSON file:
+    ``{"<preset name>": {<style_policy override dict>}, ...}``.
+
+    A missing file returns ``{}`` (treated as "no user presets defined
+    yet", not an error -- so a caller can pass a not-yet-created path
+    unconditionally on a fresh setup). A file that EXISTS but is not valid
+    JSON, or whose top level isn't an object mapping names to override
+    dicts, raises -- a real configuration mistake should never be silently
+    swallowed into "no presets". Each individual preset's override dict is
+    validated through :func:`resolve_style_policy` (the SAME fail-closed
+    path every built-in :data:`JOURNAL_STYLE_PRESETS` entry goes through --
+    there is no separate/weaker validation surface for user presets), so a
+    malformed override in the file raises immediately, naming which preset
+    was bad, rather than accepting garbage that would only surface as a
+    confusing failure later at some unrelated call site.
+
+    Args:
+      path: Path to the JSON file.
+
+    Returns:
+      ``{preset_name: override_dict}`` -- raw override dicts (NOT
+      individually resolved against defaults; :func:`get_journal_style_preset`
+      does that resolution at lookup time), keyed exactly as written in the
+      file (case is preserved here; :func:`get_journal_style_preset` does
+      the case-insensitive matching).
+
+    Raises:
+      ValueError: the file exists but is not valid JSON, its top level is
+        not an object, any value is not an object, or any preset's override
+        dict fails :func:`resolve_style_policy` validation.
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"user journal style presets file is not valid JSON: {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"user journal style presets file must contain a JSON object "
+            f"mapping preset names to override dicts: {path}"
+        )
+    for name, override in raw.items():
+        if not isinstance(override, dict):
+            raise ValueError(
+                f"user journal style preset {name!r} in {path} must be a "
+                f"JSON object (style policy override dict), got {type(override).__name__}"
+            )
+        try:
+            resolve_style_policy(override)
+        except ValueError as exc:
+            raise ValueError(f"user journal style preset {name!r} in {path} is invalid: {exc}") from exc
+    return raw
+
+
+def save_user_journal_style_preset(
+    name: str,
+    overrides: dict[str, Any],
+    path: str,
+) -> dict[str, Any]:
+    """8e2f4a17 -- validate and persist ONE user-defined journal-style
+    preset into the JSON file :func:`load_user_journal_style_presets` /
+    :func:`get_journal_style_preset` read from, creating the file (and any
+    missing parent directory) if it doesn't exist yet, or updating just this
+    one named entry (every other existing preset in the file is preserved
+    untouched) if it does.
+
+    Validates ``overrides`` through :func:`resolve_style_policy` BEFORE
+    writing anything -- same fail-closed discipline as every write path in
+    this module (a malformed override never reaches disk as if it were a
+    saved, usable preset).
+
+    ``name`` may shadow a built-in :data:`JOURNAL_STYLE_PRESETS` key (e.g.
+    saving a corrected ``"jcshm"``) -- :func:`get_journal_style_preset`
+    resolves user presets with priority over built-ins by design, so this
+    is the supported way to override one.
+
+    Args:
+      name: The preset name (matched case-insensitively at lookup time by
+        :func:`get_journal_style_preset`; stored here exactly as given).
+      overrides: A style_policy override dict -- the same shape as a
+        :data:`JOURNAL_STYLE_PRESETS` entry (only the keys you want to set;
+        unset keys resolve to the built-in defaults at lookup time via
+        :func:`resolve_style_policy`, exactly like a built-in preset).
+      path: Path to the user presets JSON file (existing or new).
+
+    Returns:
+      ``{status: "ok", name, path, preset_count}`` (``preset_count`` is the
+      total number of presets now in the file, including this one) or
+      ``{"error": <message>}`` when ``overrides`` fails validation.
+    """
+    try:
+        resolve_style_policy(overrides)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    existing: dict[str, dict[str, Any]] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except json.JSONDecodeError:
+            pass  # overwritten below with a well-formed file containing at least this preset
+
+    existing[name] = overrides
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(existing, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+    return {"status": "ok", "name": name, "path": path, "preset_count": len(existing)}
+
+
+def delete_user_journal_style_preset(name: str, path: str) -> dict[str, Any]:
+    """8e2f4a17 -- remove ONE named preset from a user presets JSON file
+    (every other entry is preserved). A no-op (not an error) if the file
+    doesn't exist or doesn't contain ``name`` -- deleting something already
+    absent reaches the same end state either way.
+
+    Args:
+      name: The preset name, matched EXACTLY (case-sensitive) against the
+        file's own keys -- unlike :func:`get_journal_style_preset`'s
+        case-insensitive lookup, this avoids accidentally deleting a
+        differently-cased entry the caller didn't name.
+      path: Path to the user presets JSON file.
+
+    Returns:
+      ``{status: "ok", name, path, deleted: bool, preset_count}`` --
+      ``deleted`` is False when ``name`` wasn't present (file untouched in
+      that case). ``{"error": <message>}`` if the file exists but isn't
+      valid JSON.
+    """
+    if not os.path.exists(path):
+        return {"status": "ok", "name": name, "path": path, "deleted": False, "preset_count": 0}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            existing = json.load(fh)
+    except json.JSONDecodeError as exc:
+        return {"error": f"user journal style presets file is not valid JSON: {path}: {exc}"}
+    if not isinstance(existing, dict):
+        return {"error": f"user journal style presets file must contain a JSON object: {path}"}
+
+    deleted = name in existing
+    if deleted:
+        del existing[name]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+    return {
+        "status": "ok", "name": name, "path": path,
+        "deleted": deleted, "preset_count": len(existing),
+    }
+
+
+def list_journal_style_presets(user_presets_path: str | None = None) -> dict[str, Any]:
+    """8e2f4a17 -- enumerate every preset :func:`get_journal_style_preset`
+    can currently resolve, built-in and user-defined, each tagged with its
+    source and (for a shadowed built-in) whether a user override is active.
+
+    Args:
+      user_presets_path: Optional path to a user presets JSON file (see
+        :func:`load_user_journal_style_presets`). Omit to list only the
+        built-in catalog.
+
+    Returns:
+      ``{presets: [{name, source, shadows_builtin}, ...], builtin_count,
+      user_count}`` where ``source`` is ``"built_in"`` or ``"user"``, and
+      ``shadows_builtin`` is True only for a user preset whose name
+      case-insensitively matches a built-in one (see
+      :func:`get_journal_style_preset`'s priority rule). Sorted by name.
+      ``{"error": <message>}`` if the user presets file exists but is
+      malformed.
+    """
+    try:
+        user_presets = (
+            load_user_journal_style_presets(user_presets_path)
+            if user_presets_path
+            else {}
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    builtin_lower = {n.lower() for n in JOURNAL_STYLE_PRESETS}
+    entries = [
+        {"name": name, "source": "built_in", "shadows_builtin": False}
+        for name in JOURNAL_STYLE_PRESETS
+        if name.lower() not in {n.lower() for n in user_presets}
+    ]
+    entries += [
+        {
+            "name": name,
+            "source": "user",
+            "shadows_builtin": name.lower() in builtin_lower,
+        }
+        for name in user_presets
+    ]
+    entries.sort(key=lambda e: e["name"].lower())
+    return {
+        "presets": entries,
+        "builtin_count": len(JOURNAL_STYLE_PRESETS),
+        "user_count": len(user_presets),
+    }
 
 
 def _paragraph_alignment(para_elem: ET.Element) -> str | None:
@@ -9678,6 +10008,279 @@ def audit_equation_style(
     return {
         "docx_path": docx_path,
         "equation_count": len(equations),
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8e2f4a17 -- audit_caption_style(): closes a real, confirmed dead-schema gap.
+# figure_caption_bold / table_caption_bold / figure_caption_label_punctuation
+# / table_caption_label_punctuation have existed in resolve_style_policy()
+# and JOURNAL_STYLE_PRESETS since 4d0ca929, but NOTHING in this module ever
+# read them back against a real document -- a fully-populated preset would
+# still have caught nothing. Discovered 2026-09-14 preparing a real JCSHM
+# submission: the manuscript had 23 caption-punctuation violations (a
+# trailing/label period JCSHM's own guidelines explicitly forbid) that no
+# prior audit pass caught, because no audit pass ever checked. This function
+# is the missing consumer, modeled directly on audit_equation_style's own
+# shape (same style_policy contract, same skip-when-unset gating, same
+# structured-findings-never-free-text return shape).
+# ---------------------------------------------------------------------------
+
+def _is_caption_style(style: str | None) -> bool:
+    """True if ``style`` names a caption-role paragraph style: Word's
+    built-in "Caption", or any custom/renamed style whose name contains
+    "caption" (case-insensitive) -- tolerant of localized or hand-renamed
+    style names, the same way :func:`_is_heading` tolerates "Heading 1" vs
+    "heading1" vs a custom "H1" is deliberately NOT matched (a heading style
+    must literally start with "heading"; a caption style must literally
+    contain "caption") since unlike headings, caption styles are commonly
+    given fully custom names in real documents (e.g. "FigCaption",
+    "SI Caption") that still contain the word itself.
+    """
+    return bool(style) and "caption" in str(style).lower()
+
+
+# Matches a caption label at the start of a caption paragraph's text: "Fig."/
+# "Figure"/"Table", optional space, a number (allowing an "S" prefix for
+# Supplementary Information numbering like "S56", and a trailing letter for
+# sub-parts like "12a"), then captures whatever single punctuation character
+# (period or colon) immediately follows -- or none. Deliberately does NOT
+# require the SEQ-field machinery _is_figure_caption/_is_table_caption rely
+# on elsewhere in this module: a document produced or hand-edited outside
+# Word's "Insert Caption" feature (e.g. built via raw-XML splicing, where SEQ
+# fields are fragile to keep in sync -- exactly how the JCSHM document this
+# function was written against was produced) numbers its captions with a
+# plain bold "Fig. N" text run instead, and would be invisible to a
+# SEQ-field-only detector.
+_CAPTION_LABEL_RE = re.compile(
+    r"^(Fig(?:ure)?\.?|Table)\s*(S?\d+[A-Za-z]?)\s*([.:]?)",
+    re.IGNORECASE,
+)
+
+
+def _run_is_bold(r: ET.Element) -> bool:
+    """True if run ``r`` has ``<w:rPr><w:b/></w:rPr>`` (or ``<w:b w:val="true"/>``
+    /``"1"``) -- i.e. explicit direct bold formatting. Does NOT resolve
+    inherited boldness from the paragraph's style definition (checking that
+    would require walking styles.xml's inheritance chain, out of scope for
+    this direct-formatting check) -- a caption whose boldness comes only from
+    its style, not a direct run property, reads as ``False`` here. In
+    practice every caption convention seen in this codebase's own documents
+    applies bold as a direct run property on the label runs specifically
+    (never via the style), so this is not a practical limitation for the
+    documents this function was built against, but is a real one worth
+    knowing about for a style-driven document this hasn't been tested on.
+    """
+    rpr = r.find(_q(_W, "rPr"))
+    if rpr is None:
+        return False
+    b = rpr.find(_q(_W, "b"))
+    if b is None:
+        return False
+    val = b.get(_q(_W, "val"))
+    return val not in ("0", "false", "none")
+
+
+def audit_caption_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """8e2f4a17 -- audit every figure/table caption's LABEL formatting
+    (boldness of the "Fig. N"/"Table N" label, and the punctuation
+    immediately following the number) against
+    ``style_policy["figure_caption_bold"]`` / ``["table_caption_bold"]`` /
+    ``["figure_caption_label_punctuation"]`` / ``["table_caption_label_punctuation"]``.
+
+    Caption detection is TEXT-and-STYLE based (:func:`_is_caption_style` +
+    :data:`_CAPTION_LABEL_RE`), not SEQ-field based like
+    :func:`_is_figure_caption`/:func:`_is_table_caption` elsewhere in this
+    module -- see :func:`_is_caption_style`'s docstring for why. A paragraph
+    is treated as a caption when BOTH: its paragraph style name contains
+    "caption", AND its text (all ``<w:t>`` runs concatenated) begins with a
+    recognized "Fig."/"Figure"/"Table" label pattern. A "Caption"-styled
+    paragraph whose text doesn't match the label pattern (e.g. a stray blank
+    caption-styled paragraph) is silently skipped, not flagged -- this
+    function only checks captions it can positively identify, never guesses.
+
+    Two finding categories, each individually gated on its own policy key
+    being set to a non-"leave unchecked" value (``None``/"unspecified" means
+    "no verified rule for this key" -- skip that check entirely, exactly
+    like :func:`audit_equation_style`'s own ``equation_punctuation_required``
+    gate):
+
+      * ``caption_label_not_bold`` / ``caption_label_unexpectedly_bold`` --
+        the label text's runs are not ALL bold (or, symmetrically, ARE bold
+        when the policy expects non-bold), gated on
+        ``figure_caption_bold``/``table_caption_bold`` being non-``None``.
+        Only checks DIRECT run-level bold (see :func:`_run_is_bold`); does
+        not resolve style-inherited boldness.
+      * ``caption_label_punctuation_mismatch`` -- the character immediately
+        after the number doesn't match the expected
+        "period"/"colon"/"none", gated on
+        ``figure_caption_label_punctuation``/``table_caption_label_punctuation``
+        being something other than "unspecified".
+      * ``caption_terminal_punctuation_mismatch`` -- the LAST character of
+        the caption's full text doesn't match
+        ``figure_caption_terminal_punctuation``/``table_caption_terminal_punctuation``
+        (``None`` skips this check; ``""`` enforces "no trailing punctuation
+        at all"). Independent of the label-punctuation check above -- a
+        publisher can and does forbid both separately (JCSHM: no punctuation
+        after the number AND no punctuation ending the caption).
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style policy
+                     via :func:`resolve_style_policy`. Pass
+                     ``get_journal_style_preset("jcshm")`` (or any other
+                     preset name) directly, or a hand-written override dict.
+
+    Returns:
+      ``{docx_path, caption_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the file
+      cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+    w_r = _q(_W, "r")
+
+    findings: list[dict[str, Any]] = []
+    caption_count = 0
+    punct_name_by_char = {".": "period", ":": "colon", "": "none"}
+
+    for index, p in enumerate(body.findall(w_p)):
+        ppr = p.find(w_pPr)
+        style: str | None = None
+        if ppr is not None:
+            pstyle = ppr.find(w_pStyle)
+            if pstyle is not None:
+                style = pstyle.get(w_val)
+        if not _is_caption_style(style):
+            continue
+
+        text = "".join(t.text or "" for t in p.iter(w_t))
+        m = _CAPTION_LABEL_RE.match(text.strip())
+        if not m:
+            continue
+
+        caption_count += 1
+        kind = "figure" if m.group(1).lower().startswith("fig") else "table"
+        # rstrip: when there's no label punctuation, _CAPTION_LABEL_RE's
+        # trailing \s* consumes the separator space before the caption's
+        # description text into group(0) (e.g. "Fig. 1 " for "Fig. 1
+        # Description..."). That space is not semantically part of the bold
+        # label -- it's the boundary between the bold label run and the
+        # normal-weight description run -- so it must NOT count toward
+        # label_len below, or the description's first (correctly non-bold)
+        # run gets blamed for "un-bolding" a single boundary space,
+        # producing a false caption_label_not_bold finding on every
+        # correctly-formatted caption in the document (caught exactly this
+        # way testing against the real JCSHM manuscript/SI: 17 and 71 false
+        # positives respectively before this rstrip was added).
+        label_text = m.group(0).rstrip()
+        punct_char = m.group(3)
+        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+
+        bold_key = "figure_caption_bold" if kind == "figure" else "table_caption_bold"
+        expected_bold = policy[bold_key]
+        if expected_bold is not None:
+            label_len = len(label_text)
+            covered = 0
+            all_bold = True
+            for r in p.findall(w_r):
+                rt = "".join(t.text or "" for t in r.findall(w_t))
+                if not rt:
+                    continue
+                take = min(len(rt), max(0, label_len - covered))
+                if take <= 0:
+                    break
+                if not _run_is_bold(r):
+                    all_bold = False
+                covered += take
+            actual_bold = all_bold and covered >= label_len
+            if actual_bold != expected_bold:
+                findings.append({
+                    "type": "caption_label_not_bold" if expected_bold else "caption_label_unexpectedly_bold",
+                    "para_id": para_id,
+                    "index": index,
+                    "kind": kind,
+                    "label_text": label_text,
+                    "expected_bold": expected_bold,
+                    "actual_bold": actual_bold,
+                })
+
+        punct_key = (
+            "figure_caption_label_punctuation" if kind == "figure"
+            else "table_caption_label_punctuation"
+        )
+        expected_punct = policy[punct_key]
+        if expected_punct != "unspecified":
+            actual_punct = punct_name_by_char.get(punct_char, "none")
+            if actual_punct != expected_punct:
+                findings.append({
+                    "type": "caption_label_punctuation_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "kind": kind,
+                    "label_text": label_text,
+                    "expected_punctuation": expected_punct,
+                    "actual_punctuation": actual_punct,
+                })
+
+        # 8e2f4a17 -- SEPARATE from the label-punctuation check above: this
+        # checks the END of the caption's full text (e.g. the "." in "...for
+        # Each Comparison Method."), not the number label. A publisher can
+        # (and JCSHM does) forbid both independently -- see
+        # figure_caption_terminal_punctuation's docstring in
+        # resolve_style_policy for why these are two keys, not one.
+        term_key = (
+            "figure_caption_terminal_punctuation" if kind == "figure"
+            else "table_caption_terminal_punctuation"
+        )
+        expected_terminal = policy[term_key]
+        if expected_terminal is not None:
+            full_text = text.strip()
+            last_char = full_text[-1] if full_text else ""
+            actual_terminal = last_char if last_char in _HEADING_TERMINAL_PUNCT_CHARS else ""
+            if actual_terminal != expected_terminal:
+                findings.append({
+                    "type": "caption_terminal_punctuation_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "kind": kind,
+                    "caption_text": full_text[-80:],
+                    "expected_terminal_punctuation": expected_terminal,
+                    "actual_terminal_punctuation": actual_terminal,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "caption_count": caption_count,
         "findings": findings,
         "finding_count": len(findings),
         "findings_by_type": findings_by_type,
@@ -19366,10 +19969,18 @@ def build_document_review(
 
     * ``equation``   -- :func:`audit_equation_style` findings (alignment,
                         trailing punctuation, numbering).
-    * ``caption``     -- :func:`_legacy_plaintext_caption_findings` (a
-                        plain-text "Figure N"/"Table N" paragraph with no SEQ
-                        field -- what :func:`retrofit_plaintext_captions`
-                        would convert, reported without mutating).
+    * ``caption``     -- TWO independent sources, both reported: (1)
+                        :func:`audit_caption_style` (9c1a3fd2) -- publisher
+                        style-policy findings for captions that already have
+                        a Caption-styled paragraph (label bold/punctuation,
+                        terminal punctuation), gated per-key on
+                        ``style_policy`` the same way the equation findings
+                        above are, so it's a no-op when ``style_policy`` is
+                        omitted; and (2) :func:`_legacy_plaintext_caption_findings`
+                        (a plain-text "Figure N"/"Table N" paragraph with no
+                        SEQ field and no Caption style at all -- what
+                        :func:`retrofit_plaintext_captions` would convert,
+                        reported without mutating).
     * ``provenance``  -- :func:`scan_stale_notes` findings (placeholder/TODO
                         text that may now be outdated).
     * ``render_integrity`` -- :func:`render_gate.check_render_capability`,
@@ -19440,6 +20051,32 @@ def build_document_review(
             findings.append({
                 "category": "equation",
                 "severity": _review_finding_severity("equation", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    # 9c1a3fd2 -- publisher-style caption findings (bold/label-punctuation/
+    # terminal-punctuation), gated the SAME way as eq_audit above: every key
+    # audit_caption_style checks defaults to None/"unspecified" (no verified
+    # rule -- skip), so passing no style_policy (the pre-9c1a3fd2 behavior)
+    # yields zero findings from this call, identical to before it existed.
+    # This was the missing consumer of build_document_review's own
+    # style_policy parameter for captions -- style_policy already reached
+    # audit_equation_style above, but never audit_caption_style, despite the
+    # sprint item (b3fa6019) that built audit_caption_style specifically to
+    # close the "verified journal facts never reach an enforcement path"
+    # gap. Runs ALONGSIDE (not instead of) _legacy_plaintext_caption_findings
+    # below -- that one detects an un-SEQ-tagged "Figure N" paragraph that
+    # never got a caption style at all; this one checks the FORMATTING of a
+    # caption that already has one. Both are real, independent "caption"
+    # category findings on the same document.
+    style_caption_audit = audit_caption_style(docx_path, style_policy)
+    if isinstance(style_caption_audit, dict) and not style_caption_audit.get("error"):
+        for f in style_caption_audit.get("findings", []):
+            findings.append({
+                "category": "caption",
+                "severity": _review_finding_severity("caption", f["type"]),
                 "type": f["type"],
                 "para_id": f.get("para_id"),
                 "detail": f,

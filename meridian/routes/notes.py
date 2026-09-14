@@ -1,12 +1,13 @@
 """Project notes (per-project wiki) routes — extracted from server.py."""
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db, validate_input_size, _MANUAL_NOTE_LINT
+from .._deps import _db, _data_dir, validate_input_size, _MANUAL_NOTE_LINT
 from .. import db as db_module
 
 router = APIRouter()
@@ -108,12 +109,70 @@ def _resolve_document_review_builder():
     return fn if callable(fn) else None
 
 
+def _resolve_journal_style_preset_getter():
+    """9c1a3fd2 -- best-effort import of
+    ``meridian_docs.docs_intel.get_journal_style_preset``, and (for the
+    catalog dropdown) ``list_journal_style_presets``. Same degrade-to-None
+    discipline as ``_resolve_document_review_builder`` above: an uninstalled
+    or broken extension must never break this route, only make the
+    journal-preset feature unavailable.
+    """
+    try:
+        from meridian_docs import docs_intel as _meridian_docs_intel  # noqa: PLC0415
+    except ModuleNotFoundError:
+        return None, None
+    except Exception:  # noqa: BLE001 — a broken extension must never break this route
+        return None, None
+    getter = getattr(_meridian_docs_intel, "get_journal_style_preset", None)
+    lister = getattr(_meridian_docs_intel, "list_journal_style_presets", None)
+    return (
+        getter if callable(getter) else None,
+        lister if callable(lister) else None,
+    )
+
+
+def _journal_style_presets_path(request: Request) -> str:
+    """9c1a3fd2 -- one workspace-wide user journal-style-presets file per
+    self-hosted instance, alongside the rest of this server's on-disk state
+    (same ``_data_dir(request)`` convention ``handoff.py`` already uses).
+    Not project-scoped: a submission's target journal doesn't change per
+    project, and a user's own verified corrections to a preset are equally
+    valid across every project on this server.
+    """
+    return os.path.join(_data_dir(request), "journal_style_presets.json")
+
+
+@router.get("/journal-style-presets")
+async def list_journal_style_presets_endpoint(request: Request) -> dict[str, Any]:
+    """9c1a3fd2 -- catalog for the journal-preset picker on the document
+    review panel: every built-in preset plus this server's user-saved ones,
+    each tagged ``source`` ("built_in"/"user") and ``shadows_builtin``. See
+    ``meridian_docs.docs_intel.list_journal_style_presets`` for the shape.
+    Returns ``{"error": ...}`` (never a 500) when the meridian-docs
+    extension isn't installed on this server.
+    """
+    _getter, lister = _resolve_journal_style_preset_getter()
+    if lister is None:
+        return {
+            "error": (
+                "the meridian-docs extension is not installed on this server; "
+                "journal style presets are unavailable. Install it "
+                "(pip install -e extensions/meridian-docs)."
+            ),
+        }
+    try:
+        return lister(user_presets_path=_journal_style_presets_path(request))
+    except Exception as exc:  # noqa: BLE001 — surface inline, never a 500
+        return {"error": f"could not list journal style presets: {exc}"}
+
+
 @router.get("/projects/{project_id}/document-review")
 async def document_review_endpoint(
     project_id: str,
     request: Request,
     path: str,
     expected_source_fingerprint: str | None = None,
+    journal: str | None = None,
 ) -> dict[str, Any]:
     """b67ec6b5 — non-mutating DOCX review for the dashboard review panel.
 
@@ -132,10 +191,20 @@ async def document_review_endpoint(
     review — a mismatch returns ``{"status": "stale", ...}`` rather than
     resolving findings against what may now be the wrong document.
 
+    9c1a3fd2 — pass ``?journal=jcshm`` (or any name
+    ``list_journal_style_presets`` reports, built-in or user-saved on this
+    server) to also check the document against that journal's verified
+    formatting rules (equation style + caption bold/punctuation). Omit it
+    and this route behaves exactly as before 9c1a3fd2 — no style_policy, so
+    those two finding sources contribute nothing, identical to the prior
+    response shape. An unknown ``journal`` name returns ``{"error": ...}``
+    naming the known presets rather than silently falling back to unchecked.
+
     Returns ``{"error": ...}`` (never a 500) when: the project doesn't
     exist (404 instead — same as document_structure_endpoint), ``path`` is
-    missing, the file can't be read/parsed, or the meridian-docs extension
-    is not installed on this server.
+    missing, ``journal`` doesn't resolve to a known preset, the file can't
+    be read/parsed, or the meridian-docs extension is not installed on this
+    server.
     """
     db = await _db(request)
     project = await db_module.get_project(db, project_id)
@@ -148,6 +217,9 @@ async def document_review_endpoint(
     fingerprint = (expected_source_fingerprint or "").strip() or None
     if fingerprint is not None:
         validate_input_size(fingerprint, "expected_source_fingerprint", 200)
+    journal_name = (journal or "").strip() or None
+    if journal_name is not None:
+        validate_input_size(journal_name, "journal", 200)
 
     builder = _resolve_document_review_builder()
     if builder is None:
@@ -159,8 +231,26 @@ async def document_review_endpoint(
                 "via the meridian-docs MCP server's get_document_review tool."
             ),
         }
+    style_policy = None
+    if journal_name is not None:
+        preset_getter, _lister = _resolve_journal_style_preset_getter()
+        if preset_getter is None:
+            return {
+                "error": (
+                    "the meridian-docs extension is not installed on this server; "
+                    "journal style presets are unavailable."
+                ),
+            }
+        try:
+            style_policy = preset_getter(
+                journal_name, user_presets_path=_journal_style_presets_path(request)
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
     try:
-        result = builder(fp, expected_source_fingerprint=fingerprint)
+        result = builder(
+            fp, expected_source_fingerprint=fingerprint, style_policy=style_policy
+        )
     except FileNotFoundError:
         return {"error": f"file not found on server: {fp}"}
     except Exception as exc:  # noqa: BLE001 — surface parse errors inline, never a 500

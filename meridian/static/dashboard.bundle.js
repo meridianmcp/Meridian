@@ -7501,6 +7501,31 @@ ${n2.tags || ""}`.toLowerCase();
     warning: "var(--warning, #d29922)",
     info: "var(--muted)"
   };
+  function journalPresetOptionsHtml(presets, selected = "") {
+    const opts = (presets || []).slice().sort((a3, b2) => a3.name.localeCompare(b2.name));
+    let html = `<option value=""${selected ? "" : " selected"}>No journal check</option>`;
+    for (const p3 of opts) {
+      const label = p3.source === "user" && p3.shadows_builtin ? `${p3.name} (custom)` : p3.name;
+      const sel = p3.name === selected ? " selected" : "";
+      html += `<option value="${escapeHtml(p3.name)}"${sel}>${escapeHtml(label)}</option>`;
+    }
+    return html;
+  }
+  function journalPresetSelectHtml2(did, presets) {
+    return `<select class="doc-review-journal-select" data-did="${escapeHtml(did)}" title="Check against a journal's verified style rules" style="font-size:9px;padding:1px 4px;max-width:140px">${journalPresetOptionsHtml(presets)}</select>`;
+  }
+  var _journalPresetsCache = null;
+  async function fetchJournalStylePresets2(forceRefresh = false) {
+    if (_journalPresetsCache && !forceRefresh) return _journalPresetsCache;
+    try {
+      const result = await api("/journal-style-presets");
+      const presets = result && Array.isArray(result.presets) ? result.presets : [];
+      _journalPresetsCache = presets;
+      return presets;
+    } catch (_e) {
+      return [];
+    }
+  }
   var MAX_PREVIEW_CHARS = 140;
   function truncatePreview(text, max = MAX_PREVIEW_CHARS) {
     const s3 = String(text || "");
@@ -7693,18 +7718,26 @@ ${n2.tags || ""}`.toLowerCase();
       });
     });
   }
-  async function loadDocumentReview(projectId, filePath, targetId, expectedFingerprint) {
+  async function loadDocumentReview(projectId, filePath, targetId, expectedFingerprint, journal) {
     const target = document.getElementById(targetId);
     if (!target) return;
     target.innerHTML = '<span style="font-size:9px;color:var(--muted)">loading review\u2026</span>';
     try {
       let url = `/projects/${projectId}/document-review?path=${encodeURIComponent(filePath)}`;
       if (expectedFingerprint) url += `&expected_source_fingerprint=${encodeURIComponent(expectedFingerprint)}`;
+      if (journal) url += `&journal=${encodeURIComponent(journal)}`;
       const review = await api(url);
       renderDocumentReview(review, targetId);
     } catch (e3) {
       target.innerHTML = `<span style="font-size:9px;color:var(--error)">Review failed: ${escapeHtml(String(e3))}</span>`;
     }
+  }
+  function _selectedJournalFor(root, did) {
+    let value = "";
+    root.querySelectorAll(".doc-review-journal-select").forEach((el2) => {
+      if (el2.getAttribute("data-did") === did) value = el2.value || "";
+    });
+    return value;
   }
   function wireDocumentReviewButtons2(projectId, root = document) {
     root.querySelectorAll(".doc-review-btn").forEach((btn) => {
@@ -7712,7 +7745,8 @@ ${n2.tags || ""}`.toLowerCase();
         const fp = btn.getAttribute("data-fp") || "";
         const did = btn.getAttribute("data-did") || "";
         const targetId = `doc-review-${did}`;
-        await loadDocumentReview(projectId, fp, targetId);
+        const journal = _selectedJournalFor(root, did);
+        await loadDocumentReview(projectId, fp, targetId, null, journal);
       });
     });
     root.querySelectorAll(".review-recheck-btn").forEach((btn) => {
@@ -7721,8 +7755,10 @@ ${n2.tags || ""}`.toLowerCase();
         const target = document.getElementById(targetId);
         const fp = target ? target.getAttribute("data-fp") || "" : "";
         if (!fp) return;
+        const did = targetId.startsWith("doc-review-") ? targetId.slice("doc-review-".length) : "";
+        const journal = _selectedJournalFor(root, did);
         const prevFingerprint = _reviewFingerprints.get(targetId) || null;
-        await loadDocumentReview(projectId, fp, targetId, prevFingerprint);
+        await loadDocumentReview(projectId, fp, targetId, prevFingerprint, journal);
       });
     });
   }
@@ -7736,7 +7772,10 @@ ${n2.tags || ""}`.toLowerCase();
       isReviewError,
       renderDocumentReview,
       loadDocumentReview,
-      wireDocumentReviewButtons: wireDocumentReviewButtons2
+      wireDocumentReviewButtons: wireDocumentReviewButtons2,
+      journalPresetOptionsHtml,
+      journalPresetSelectHtml: journalPresetSelectHtml2,
+      fetchJournalStylePresets: fetchJournalStylePresets2
     });
   } catch (e3) {
   }
@@ -14621,6 +14660,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     } catch (_2) {
       peeks = [];
     }
+    const journalPresets = await fetchJournalStylePresets();
     const _srcBadge = (src) => {
       const s3 = String(src || "local").toLowerCase();
       const label = s3.includes("onedrive") ? "OneDrive" : s3.includes("gdrive") || s3.includes("google") ? "GDrive" : src || "local";
@@ -14652,7 +14692,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t3) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(String(t3))}</span>`).join("")}</div>` : ""}
         ${fp ? `<div style="margin-top:6px;display:flex;gap:6px">
               <button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button>
-              ${String(fp).toLowerCase().endsWith(".docx") ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>` : ""}
+              ${String(fp).toLowerCase().endsWith(".docx") ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>
+                   ${journalPresetSelectHtml(did, journalPresets)}` : ""}
             </div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div><div id="doc-review-${escapeHtml(did)}" data-fp="${escapeHtml(String(fp))}" style="margin-top:6px"></div>` : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path \u2014 structure view unavailable.</div>'}
       </div>`;
       }

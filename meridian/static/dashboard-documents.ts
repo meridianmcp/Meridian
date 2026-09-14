@@ -49,6 +49,12 @@ export interface ReviewFinding {
   locator?: ReviewLocator | null;
 }
 
+export interface JournalStylePresetInfo {
+  name: string;
+  source: string; // "built_in" | "user"
+  shadows_builtin: boolean;
+}
+
 export interface DocumentReviewResult {
   status?: string;
   docx_path?: string;
@@ -83,6 +89,63 @@ export const REVIEW_SEVERITY_COLOR: Record<string, string> = {
   warning: 'var(--warning, #d29922)',
   info: 'var(--muted)',
 };
+
+// ---------------------------------------------------------------------------
+// 9c1a3fd2 — journal-preset picker for the review panel. GET /projects/{id}/
+// document-review now accepts an optional ?journal= (see notes.py), which
+// threads a verified publisher style policy into audit_equation_style AND
+// audit_caption_style so their findings appear in this same panel's
+// "Equations"/"Captions" sections — no new panel, no new finding shape,
+// just an optional extra source feeding the one that already exists.
+// ---------------------------------------------------------------------------
+
+/** Render-safe <option> list for a journal-preset <select>, always led by
+ *  a "No journal check" default (empty value — omits ?journal= entirely,
+ *  the pre-9c1a3fd2 behavior). A user preset shadowing a built-in name is
+ *  labeled "(custom)" so it's visibly distinct from the built-in it amends. */
+export function journalPresetOptionsHtml(
+  presets: JournalStylePresetInfo[] | null | undefined,
+  selected: string = '',
+): string {
+  const opts = (presets || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+  let html = `<option value=""${selected ? '' : ' selected'}>No journal check</option>`;
+  for (const p of opts) {
+    const label = p.source === 'user' && p.shadows_builtin ? `${p.name} (custom)` : p.name;
+    const sel = p.name === selected ? ' selected' : '';
+    html += `<option value="${escapeHtml(p.name)}"${sel}>${escapeHtml(label)}</option>`;
+  }
+  return html;
+}
+
+/** The <select> control itself, scoped to one document row via data-did
+ *  (read back by wireDocumentReviewButtons at click time — no separate
+ *  state to keep in sync with the DOM). */
+export function journalPresetSelectHtml(did: string, presets: JournalStylePresetInfo[] | null | undefined): string {
+  return `<select class="doc-review-journal-select" data-did="${escapeHtml(did)}" title="Check against a journal's verified style rules" style="font-size:9px;padding:1px 4px;max-width:140px">${journalPresetOptionsHtml(presets)}</select>`;
+}
+
+let _journalPresetsCache: JournalStylePresetInfo[] | null = null;
+
+/** Fetch the journal-preset catalog (built-in + this server's user-saved
+ *  ones) for populating journalPresetSelectHtml. Cached for the page's
+ *  lifetime after the first successful call — presets don't change from
+ *  under a loaded Documents tab in normal use, and re-fetching per document
+ *  row would be wasteful. Never throws: an extension-not-installed server,
+ *  a network error, or a malformed response all resolve to `[]`, which
+ *  renders as just the "No journal check" option — the feature degrades
+ *  invisibly rather than breaking the Documents tab. Pass `forceRefresh` to
+ *  bypass the cache (e.g. after saving a new user preset elsewhere). */
+export async function fetchJournalStylePresets(forceRefresh: boolean = false): Promise<JournalStylePresetInfo[]> {
+  if (_journalPresetsCache && !forceRefresh) return _journalPresetsCache;
+  try {
+    const result = await api('/journal-style-presets');
+    const presets = (result && Array.isArray(result.presets)) ? result.presets : [];
+    _journalPresetsCache = presets;
+    return presets;
+  } catch (_e) {
+    return [];
+  }
+}
 
 const MAX_PREVIEW_CHARS = 140;
 
@@ -334,13 +397,16 @@ export function renderDocumentReview(review: DocumentReviewResult | null | undef
  * Fetch + render the DOCX review for one document into `#${targetId}`.
  * `expectedFingerprint` re-checks against a previously-seen
  * source_fingerprint (passed by the "Re-check" button); omit for a fresh,
- * unconditional review.
+ * unconditional review. `journal` (9c1a3fd2) additionally checks against a
+ * named journal-style preset (see journalPresetSelectHtml) — omit or pass
+ * '' for the pre-9c1a3fd2 behavior (no style_policy).
  */
 export async function loadDocumentReview(
   projectId: string,
   filePath: string,
   targetId: string,
   expectedFingerprint?: string | null,
+  journal?: string | null,
 ): Promise<void> {
   const target = document.getElementById(targetId);
   if (!target) return;
@@ -348,6 +414,7 @@ export async function loadDocumentReview(
   try {
     let url = `/projects/${projectId}/document-review?path=${encodeURIComponent(filePath)}`;
     if (expectedFingerprint) url += `&expected_source_fingerprint=${encodeURIComponent(expectedFingerprint)}`;
+    if (journal) url += `&journal=${encodeURIComponent(journal)}`;
     const review = await api(url);
     renderDocumentReview(review, targetId);
   } catch (e: any) {
@@ -355,16 +422,30 @@ export async function loadDocumentReview(
   }
 }
 
+/** Find the journal-preset <select> for document `did` under `root`, by
+ *  scanning `data-did` rather than building a CSS attribute selector out of
+ *  an untrusted id string. Returns '' (no journal check) when absent. */
+function _selectedJournalFor(root: ParentNode, did: string): string {
+  let value = '';
+  root.querySelectorAll('.doc-review-journal-select').forEach((el: any) => {
+    if (el.getAttribute('data-did') === did) value = el.value || '';
+  });
+  return value;
+}
+
 /** Wire "Review findings" / "Re-check" buttons scoped under `root` (defaults
  *  to the whole document) — called after the Documents tab re-renders its
- *  document cards. */
+ *  document cards. Each click reads the sibling journal-preset <select>
+ *  (9c1a3fd2) fresh, so changing the dropdown before "Re-check" applies the
+ *  new selection rather than repeating the original check. */
 export function wireDocumentReviewButtons(projectId: string, root: ParentNode = document): void {
   root.querySelectorAll('.doc-review-btn').forEach((btn: any) => {
     btn.addEventListener('click', async () => {
       const fp = btn.getAttribute('data-fp') || '';
       const did = btn.getAttribute('data-did') || '';
       const targetId = `doc-review-${did}`;
-      await loadDocumentReview(projectId, fp, targetId);
+      const journal = _selectedJournalFor(root, did);
+      await loadDocumentReview(projectId, fp, targetId, null, journal);
     });
   });
   root.querySelectorAll('.review-recheck-btn').forEach((btn: any) => {
@@ -373,8 +454,10 @@ export function wireDocumentReviewButtons(projectId: string, root: ParentNode = 
       const target = document.getElementById(targetId);
       const fp = target ? target.getAttribute('data-fp') || '' : '';
       if (!fp) return;
+      const did = targetId.startsWith('doc-review-') ? targetId.slice('doc-review-'.length) : '';
+      const journal = _selectedJournalFor(root, did);
       const prevFingerprint = _reviewFingerprints.get(targetId) || null;
-      await loadDocumentReview(projectId, fp, targetId, prevFingerprint);
+      await loadDocumentReview(projectId, fp, targetId, prevFingerprint, journal);
     });
   });
 }
@@ -386,5 +469,6 @@ try {
     groupFindingsByCategory, summarizeLocator, truncatePreview,
     isReviewEmpty, isReviewStale, isReviewError,
     renderDocumentReview, loadDocumentReview, wireDocumentReviewButtons,
+    journalPresetOptionsHtml, journalPresetSelectHtml, fetchJournalStylePresets,
   });
 } catch (e) { /* non-browser test environment */ }

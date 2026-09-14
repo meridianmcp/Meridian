@@ -246,6 +246,10 @@ def test_resolve_style_policy_defaults():
         "table_caption_bold": None,
         "figure_caption_label_punctuation": "unspecified",
         "table_caption_label_punctuation": "unspecified",
+        # 8e2f4a17 -- independent of the label-punctuation keys above: the
+        # LAST character of the caption's full text, not the number label.
+        "figure_caption_terminal_punctuation": None,
+        "table_caption_terminal_punctuation": None,
         "paragraph_indent_method": "unspecified",
         "figure_dpi_minimum_general": None,
         "figure_dpi_minimum_halftone": None,
