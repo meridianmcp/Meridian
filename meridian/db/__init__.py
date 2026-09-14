@@ -2069,13 +2069,32 @@ async def get_effective_capability_profile(
 ) -> dict[str, Any]:
     """Resolve the merged capability profile across all applicable layers (02038afe).
 
-    Walks workspace -> user -> project -> sprint_version -> item (least to
-    most specific — see meridian.capability_profile.merge_layers), skipping
-    any layer that has no applicable scope_id (e.g. no ``user_scope_id``
-    given, or no ``sprint_item_id`` so there's no sprint_version/item layer).
-    Read-only: never persists anything. Raises ValueError for an unknown
-    project_id, or an unknown sprint_item_id / one that belongs to a
-    different project.
+    Walks raw_manifest -> workspace -> user -> project -> sprint_version ->
+    item (least to most specific — see meridian.capability_profile.merge_layers),
+    skipping any layer that has no applicable scope_id (e.g. no
+    ``user_scope_id`` given, or no ``sprint_item_id`` so there's no
+    sprint_version/item layer). Read-only: never persists anything. Raises
+    ValueError for an unknown project_id, or an unknown sprint_item_id / one
+    that belongs to a different project.
+
+    74c591b6 — folds the OLDER, project-scoped raw capability manifest
+    (649e095f: the ``project_capabilities`` table, set via
+    ``set_project_capability_manifest`` / the ``set_capability_manifest`` MCP
+    tool) in as its own explicit ``"raw_manifest"`` layer, LEAST specific of
+    all (even less specific than ``workspace``). Before this fix, a project
+    that had only ever called ``set_capability_manifest`` -- the common case,
+    since the newer 02038afe layered ``capability_profiles`` table is a
+    separate, opt-in mechanism almost nothing has populated -- got back
+    ``capabilities: []`` / ``layers_applied: []`` here even though that same
+    manifest genuinely IS applied by
+    ``capability_contract.build_capability_contract`` (137b88a3's own,
+    independent raw-manifest reconciliation). That left this function (and
+    the ``get_effective_capability_profile`` MCP tool it backs) contradicting
+    the trusted ``start_session``/``generate_handoff`` capability_contract for
+    the exact same project state. ``layers_applied`` only records
+    ``"raw_manifest"`` when the manifest actually has capabilities, so a
+    project with no manifest and no profile layers still resolves to the
+    exact pre-fix empty result.
     """
     project = await get_project(db, project_id)
     if project is None:
@@ -2092,6 +2111,9 @@ async def get_effective_capability_profile(
             )
         sprint_version = item.get("version")
 
+    raw_manifest = await get_project_capability_manifest(db, project_id)
+    raw_manifest_capabilities = raw_manifest.get("capabilities") or []
+
     layer_scopes: list[tuple[str, str | None]] = [
         ("workspace", workspace_scope_id),
         ("user", user_scope_id),
@@ -2100,8 +2122,12 @@ async def get_effective_capability_profile(
         ("item", sprint_item_id),
     ]
 
-    layers_for_merge: list[dict[str, Any]] = []
-    layers_applied: list[str] = []
+    layers_for_merge: list[dict[str, Any]] = [{
+        "layer": "raw_manifest",
+        "capabilities": raw_manifest_capabilities,
+        "disabled_capability_ids": [],
+    }]
+    layers_applied: list[str] = ["raw_manifest"] if raw_manifest_capabilities else []
     for layer_name, scope_id in layer_scopes:
         if not scope_id:
             continue

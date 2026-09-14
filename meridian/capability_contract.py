@@ -21,6 +21,13 @@ richer integration points:
   fixed this call site, which previously auto-discovered a guessed function
   name on ``meridian.capability_profile`` that was never actually defined
   there, leaving ``effective_source`` permanently stuck at ``"raw_manifest"``.
+  74c591b6 went one layer deeper: ``db.get_effective_capability_profile``
+  itself never knew about the raw ``project_capabilities`` manifest (a
+  DIFFERENT table than ``capability_profiles``), so the
+  ``get_effective_capability_profile`` MCP tool reported "no applied layers"
+  for a manifest-only project even while this module's own reconciliation
+  already showed it applied. That function now folds the raw manifest in as
+  its own least-specific ``"raw_manifest"`` layer, so both consumers agree.
 * **ac80aaaf** (live availability probing against the tunnel/tool inventory)
   has LANDED as its own module (``meridian.capability_availability`` +
   ``mcp/handlers/project_tools.py``'s ``_build_live_inventory`` /
@@ -62,7 +69,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import capability_manifest as _cm
-from . import capability_profile as _capability_profile
 from . import db as db_module
 from . import pointers as _pointers
 from . import tool_requirements as _tool_requirements
@@ -397,32 +403,33 @@ async def _resolve_effective_capabilities(
     which left ``effective_source`` permanently stuck at ``"raw_manifest"`` in
     production even after profile inheritance shipped.
 
-    IMPORTANT: ``db.get_effective_capability_profile`` resolves ONLY the
-    ``capability_profiles`` table's layers (workspace/user/project/
-    sprint_version/item, set via ``set_capability_profile``) -- it has no
-    knowledge of ``requested`` (the older 649e095f ``project_capabilities``
-    raw-manifest row, set via ``set_project_capability_manifest``/
-    ``set_capability_manifest``). The two are independent stores, and most
-    projects populate only the raw manifest and have never called
-    ``set_capability_profile`` at all. Blindly returning the profile
-    resolver's output AS "effective" would silently DROP every raw-manifest
-    capability id that no profile layer happens to also declare -- including
-    ``availability_policy: "required"`` ids the ``executable``/
-    ``missing_required`` check below reads straight out of
-    ``effective_capabilities`` (see :func:`build_capability_contract`), so a
-    real "required" capability could silently stop being enforced. So:
+    74c591b6 (RESEARCH-OS WAVE B): ``db.get_effective_capability_profile``
+    itself now folds ``requested`` (the older 649e095f ``project_capabilities``
+    raw-manifest row) in as its own least-specific ``"raw_manifest"`` layer --
+    see that function's docstring. Before that fix it resolved ONLY the
+    ``capability_profiles`` table's layers and had no knowledge of the raw
+    manifest at all, so a project that had only ever called
+    ``set_capability_manifest`` (the common case; most projects have never
+    called ``set_capability_profile``) got ``capabilities: []`` /
+    ``layers_applied: []`` back from that function (and the
+    ``get_effective_capability_profile`` MCP tool it backs) even though this
+    module's OWN parallel reconciliation below already correctly folded the
+    raw manifest into ``effective_capabilities``. The two code paths agreed
+    on the end RESULT but disagreed on what ``get_effective_capability_profile``
+    itself reported -- confusing for anything that called that tool directly
+    (dashboards, other executors) instead of going through this contract.
 
-    * No profile layer has contributed anything for this project (the
-      common case today) -> degrade to ``requested`` unchanged, source
-      ``"raw_manifest"`` -- byte-identical to the pre-fix degraded output
-      when nothing from 02038afe applies.
-    * A profile layer DID contribute something -> merge it on top of
-      ``requested`` via :func:`capability_profile.merge_layers` (the SAME
-      pure merge primitive ``get_effective_capability_profile`` itself
-      uses), with the raw manifest as the least-specific layer and the
-      resolved profile as the most-specific override -- so a profile can
-      refine/override individual ids, but an id only the raw manifest
-      declares is never silently lost. Source ``"profile_inheritance"``.
+    Now that the DB function folds the raw manifest in itself,
+    ``profile["layers_applied"]`` containing ONLY ``"raw_manifest"`` (or
+    nothing) means no *actual* ``capability_profiles``-table layer
+    contributed anything -- there is nothing to layer on top of the manifest,
+    so this degrades to ``requested`` unchanged, source ``"raw_manifest"``,
+    byte-identical to the pre-74c591b6 behavior for that common case. Once a
+    real layer contributes (``layers_applied`` has an entry other than
+    ``"raw_manifest"``), ``profile["capabilities"]`` IS already the fully
+    resolved effective list (raw manifest as base, profile layers layered on
+    top, most-specific wins) -- returned directly, source
+    ``"profile_inheritance"``, with no need to merge it again here.
 
     Guarded broadly so a DB error (unknown project, pre-migration schema,
     etc.) degrades to ``"raw_manifest"`` rather than breaking the mandatory
@@ -439,21 +446,21 @@ async def _resolve_effective_capabilities(
         profile = await db_module.get_effective_capability_profile(db, project_id)
     except Exception:  # noqa: BLE001 — DB error must never crash the contract
         return requested, "raw_manifest"
-    profile_capabilities = profile.get("capabilities") if isinstance(profile, dict) else None
-    if not isinstance(profile_capabilities, list) or not profile_capabilities:
+    if not isinstance(profile, dict):
+        return requested, "raw_manifest"
+    layers_applied = profile.get("layers_applied") or []
+    if not any(layer != "raw_manifest" for layer in layers_applied):
         # No workspace/user/project/sprint_version/item profile layer has
         # anything to contribute -- nothing to layer on top of the raw
-        # manifest, so degrade to it directly rather than claiming a
-        # "profile_inheritance" source that did not actually change anything.
+        # manifest (which db.get_effective_capability_profile already folds
+        # in as its own "raw_manifest" layer), so degrade to `requested`
+        # directly rather than claiming a "profile_inheritance" source that
+        # did not actually change anything.
         return requested, "raw_manifest"
-    try:
-        merged, *_rest = _capability_profile.merge_layers([
-            {"layer": "raw_manifest", "capabilities": requested, "disabled_capability_ids": []},
-            {"layer": "capability_profile", "capabilities": profile_capabilities, "disabled_capability_ids": []},
-        ])
-    except Exception:  # noqa: BLE001 — malformed profile data must never crash the contract
+    profile_capabilities = profile.get("capabilities")
+    if not isinstance(profile_capabilities, list) or not profile_capabilities:
         return requested, "raw_manifest"
-    return merged, "profile_inheritance"
+    return profile_capabilities, "profile_inheritance"
 
 
 def _resolve_availability(

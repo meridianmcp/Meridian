@@ -313,3 +313,126 @@ def evaluate_manifest_availability(
 ) -> list[dict[str, Any]]:
     """:func:`evaluate_capability_availability` applied to a whole manifest's capabilities list."""
     return [evaluate_capability_availability(c, inventory) for c in (manifest_capabilities or [])]
+
+
+def summarize_availability(evaluated: list[dict[str, Any]]) -> dict[str, Any]:
+    """Bucket :func:`evaluate_manifest_availability`'s per-capability verdicts
+    into the ``{available, missing, degraded}`` capability-id-list shape
+    ``capability_contract.build_capability_contract``'s ``AvailabilityChecker``
+    interface expects (an ``availability_checker`` callable passed to that
+    function, or returned by :func:`check_local_first_availability` below).
+
+    Fail-closed, policy-aware: a capability whose live status could not
+    actually be confirmed (``STATUS_UNKNOWN`` -- an unrecognized tool
+    reference, a naming mismatch, or the degenerate empty-``required_tools``
+    case) is NEVER silently reported as available. It is bucketed the same
+    way an unconfirmed tunnel-backed tool already is: ``missing`` for a
+    ``required``/``optional`` capability (fail-closed), ``degraded`` for a
+    ``degraded_ok`` capability (fail-open into a reduced/read-only mode, per
+    that policy's documented contract).
+
+    Deterministic: each bucket is a sorted list of capability ids, never
+    input order, so two evaluations of the identical underlying state
+    summarize byte-identically.
+    """
+    available: list[str] = []
+    missing: list[str] = []
+    degraded: list[str] = []
+    for entry in evaluated or []:
+        if not isinstance(entry, dict):
+            continue
+        cap_id = entry.get("capability_id")
+        if not cap_id:
+            continue
+        status = entry.get("status")
+        policy = entry.get("availability_policy") or "required"
+        if status == STATUS_AVAILABLE:
+            available.append(cap_id)
+        elif status == STATUS_DEGRADED:
+            degraded.append(cap_id)
+        elif status == STATUS_MISSING:
+            missing.append(cap_id)
+        else:
+            # STATUS_UNKNOWN (or any status this adapter doesn't recognize
+            # yet) -- fail closed rather than silently dropping the
+            # capability out of every bucket.
+            if policy == "degraded_ok":
+                degraded.append(cap_id)
+            else:
+                missing.append(cap_id)
+    return {
+        "available": sorted(available),
+        "missing": sorted(missing),
+        "degraded": sorted(degraded),
+    }
+
+
+def local_first_live_inventory() -> dict[str, Any]:
+    """Tenant/tunnel-free live-inventory snapshot: native, always-in-process
+    Meridian MCP tools only -- no plugins, no stdio identities, tunnel
+    presumed unreachable (74c591b6, RESEARCH-OS WAVE B).
+
+    This is the "local-first" floor a self-hosted or offline-tunnel session
+    can always evaluate against, with zero DB/tenant/network access: a
+    capability whose *entire* ``required_tools`` list is satisfied by a
+    native tool -- e.g. ``research_retrieval``'s ``paper_search`` -- resolves
+    to a genuine ``available`` verdict (see :func:`classify_tool`'s own
+    builtin-tool branch, which is unconditional and needs no tunnel state at
+    all), rather than staying permanently unverified. A capability that
+    genuinely depends on a tunnel-backed plugin (Serena, codebase-memory,
+    meridian-outputs, ...) still correctly resolves ``missing``/``degraded``
+    here, since no tunnel is reachable from this snapshot -- this is an
+    HONEST local floor, never a blanket "everything is available."
+
+    Best-effort: any failure importing the static tool manifest degrades to
+    an empty builtin-tools set (every plugin-backed capability then reports
+    unrecognized/unconfirmed per policy) rather than raising.
+    """
+    try:
+        from meridian.mcp_tools import _MCP_TOOLS_LIST  # noqa: PLC0415
+        from meridian.tool_manifest import build_tool_manifest  # noqa: PLC0415
+
+        manifest = build_tool_manifest(_MCP_TOOLS_LIST)
+        builtin_tools = {
+            t["name"] for t in manifest.get("tools", []) if isinstance(t, dict) and t.get("name")
+        }
+    except Exception:  # noqa: BLE001 — a local-first probe must never crash the caller
+        builtin_tools = set()
+    return {
+        "tunnel_reachable": False,
+        "builtin_tools": builtin_tools,
+        "plugins": {},
+        "stdio_registry": {},
+    }
+
+
+def check_local_first_availability(capabilities: list[dict[str, Any]]) -> dict[str, Any]:
+    """Explicit, opt-in, tenant-free availability check (74c591b6).
+
+    Classifies each declared capability's tools against
+    :func:`local_first_live_inventory` via :func:`evaluate_manifest_availability`,
+    then buckets the result via :func:`summarize_availability` -- the exact
+    ``{available, missing, degraded}`` shape
+    ``capability_contract.build_capability_contract``'s ``availability_checker``
+    kwarg expects, so a caller passes this straight through:
+    ``build_capability_contract(db, project_id,
+    availability_checker=capability_availability.check_local_first_availability)``.
+
+    Deliberately NOT auto-discovered by
+    ``capability_contract._resolve_availability``'s own guessed sibling-module
+    lookup (that lookup is named ``check_availability``, not this) -- wiring
+    a real check into the bare, no-context default path would change the
+    documented "unknown until a caller supplies real tenant/tunnel context"
+    contract every existing capability_contract test pins (see
+    ``tests/test_capability_contract.py::test_contract_empty_manifest_degrades_cleanly``
+    and ``::test_contract_unknown_availability_fails_closed_for_required``).
+    This function is instead an explicit, honest, always-available fallback
+    a caller opts into -- exactly the "local-first" floor RESEARCH-OS WAVE B
+    calls for: a capability whose only required tool is native (like
+    ``research_retrieval``'s ``paper_search``) genuinely resolves
+    ``available`` with no tunnel/tenant at all, while a tunnel-dependent
+    capability honestly reports its real (unreachable-tunnel) status rather
+    than a faked success.
+    """
+    evaluated = evaluate_manifest_availability(capabilities, local_first_live_inventory())
+    return summarize_availability(evaluated)
