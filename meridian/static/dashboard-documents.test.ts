@@ -4,7 +4,7 @@
 // snapshots, duplicate text (ambiguous locator), long paragraphs (preview
 // truncation), missing IDs (not_found locator), and mixed native/legacy
 // captions (caption category + type label).
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 // journalPresetOptionsHtml/journalPresetSelectHtml call the ambient global
 // escapeHtml (bundled app-wide by esbuild at runtime — see this file's own
 // header comment on the window re-exposure convention). Under vitest each
@@ -22,6 +22,7 @@ import {
   isReviewError,
   journalPresetOptionsHtml,
   journalPresetSelectHtml,
+  fetchJournalStylePresets,
   REVIEW_CATEGORY_ORDER,
   type ReviewFinding,
   type ReviewLocator,
@@ -321,5 +322,60 @@ describe("journalPresetSelectHtml", () => {
   it("escapes the document id", () => {
     const html = journalPresetSelectHtml('"><script>evil()</script>', []);
     expect(html).not.toContain("<script>evil()</script>");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchJournalStylePresets — 9c1a3fd2 preset catalog fetch. `api` is the
+// ambient global set up by dashboard-core.ts's own `Object.assign(window,
+// {api, ...})` at runtime; stub it the same way dashboard-settings-lazy.test.ts
+// stubs it for _loadSettingsAccountPane.
+// ---------------------------------------------------------------------------
+describe("fetchJournalStylePresets", () => {
+  afterEach(() => {
+    delete (globalThis as any).api;
+    delete (window as any).api;
+  });
+
+  it("resolves to result.presets on a successful fetch", async () => {
+    const presets: JournalStylePresetInfo[] = [{ name: "jcshm", source: "built_in", shadows_builtin: false }];
+    const apiStub = vi.fn(async (_url: string) => ({ presets }));
+    (globalThis as any).api = apiStub;
+    (window as any).api = apiStub;
+
+    await expect(fetchJournalStylePresets()).resolves.toEqual(presets);
+    expect(apiStub).toHaveBeenCalledWith("/journal-style-presets");
+  });
+
+  // b67ec6b5/9c1a3fd2 cache-staleness fix: an earlier version memoized the
+  // result for the page's lifetime, so a preset saved elsewhere (e.g. the
+  // separate save_user_journal_style_preset MCP surface) in the same browser
+  // session never showed up without a full reload. Guard against that
+  // regression returning: every call must hit the network.
+  it("calls the API again on every call rather than caching across calls", async () => {
+    const apiStub = vi.fn(async (_url: string) => ({ presets: [] }));
+    (globalThis as any).api = apiStub;
+    (window as any).api = apiStub;
+
+    await fetchJournalStylePresets();
+    await fetchJournalStylePresets();
+
+    expect(apiStub).toHaveBeenCalledTimes(2);
+  });
+
+  it("a throwing api resolves to [] rather than rejecting", async () => {
+    const apiStub = vi.fn(async (_url: string) => { throw new Error("network down"); });
+    (globalThis as any).api = apiStub;
+    (window as any).api = apiStub;
+
+    await expect(fetchJournalStylePresets()).resolves.toEqual([]);
+  });
+
+  it("a response with a missing or mistyped presets field resolves to [] rather than throwing", async () => {
+    const apiStub = vi.fn(async (_url: string) => ({ presets: "not-an-array" }));
+    (globalThis as any).api = apiStub;
+    (window as any).api = apiStub;
+
+    await expect(fetchJournalStylePresets()).resolves.toEqual([]);
   });
 });

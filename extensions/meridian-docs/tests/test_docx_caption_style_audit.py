@@ -276,11 +276,43 @@ def test_get_document_review_wrapper_unknown_journal_returns_inline_error(tmp_pa
     assert "not-a-real-journal" in result["error"]
 
 
+def test_get_document_review_wrapper_malformed_user_presets_file_returns_inline_error(tmp_path):
+    """Same malformed-file scenario as
+    test_get_journal_style_preset_malformed_user_presets_file_raises, but
+    routed through server.get_document_review's journal=/user_presets_path=
+    wrapper: server.py catches only ValueError from get_journal_style_preset
+    to produce {"error": ...} (see the unknown-journal-name case above), so a
+    malformed *file* must degrade the same way an unknown *name* does, not
+    escape as an unhandled exception."""
+    p = tmp_path / "bad.json"
+    p.write_text("{not json", encoding="utf-8")
+    path = _write_docx(tmp_path, _doc(_caption_para("Fig. 1", " ok")))
+    result = server.get_document_review(path, journal="jcshm", user_presets_path=str(p))
+    assert "error" in result
+
+
 def test_get_document_review_wrapper_omitting_journal_is_unchanged(tmp_path):
     """No journal= -- identical to calling build_document_review directly
     with no style_policy (the pre-9c1a3fd2 wrapper behavior)."""
     path = _write_docx(tmp_path, _doc(_caption_para("Fig. 1.", " Ends with a period.")))
     assert server.get_document_review(path) == docs_intel.build_document_review(path)
+
+
+def test_get_document_review_wrapper_empty_journal_matches_omitted_journal(tmp_path):
+    """Regression: journal="" must behave exactly like journal omitted (the
+    pre-9c1a3fd2 no-style-policy shape), matching
+    meridian/routes/notes.py's document_review_endpoint's own
+    `journal_name = (journal or "").strip() or None` normalization. A first
+    implementation here treated "" as an explicit-but-unknown preset name
+    and returned {"error": "unknown journal style preset ''..."} instead --
+    a real divergence between the two "resolve journal to style_policy"
+    call sites caught by an adversarial review pass, not by this test
+    originally (it did not exist yet)."""
+    path = _write_docx(tmp_path, _doc(_caption_para("Fig. 1.", " Ends with a period.")))
+    empty = server.get_document_review(path, journal="")
+    omitted = server.get_document_review(path)
+    assert "error" not in empty
+    assert empty == omitted
 
 
 # ---------------------------------------------------------------------------
@@ -341,10 +373,14 @@ def test_build_document_review_surfaces_caption_style_findings_with_journal_poli
     assert "caption_label_punctuation_mismatch" in types
     assert "caption_terminal_punctuation_mismatch" in types
     assert review["findings_by_category"]["caption"] == len(caption_findings)
-    # Every caption-style finding still gets a locator, same as every other
-    # build_document_review finding -- never a raw para_id with no locator.
+    # Every caption-style finding still gets a RESOLVED locator, same as every
+    # other build_document_review finding -- para_id must actually reach
+    # _resolve_anchor_query, not silently degrade to the not_applicable
+    # fallback (which is also a real dict, so "locator is not None" alone
+    # can't tell the two apart).
     for f in caption_findings:
-        assert "locator" in f and f["locator"] is not None
+        assert f["locator"]["status"] == "resolved"
+        assert f["locator"]["target_para_id"] == "00000001"
 
 
 def test_build_document_review_compliant_caption_produces_no_caption_style_findings(tmp_path):
@@ -378,6 +414,18 @@ def test_load_user_presets_malformed_json_raises(tmp_path):
     p.write_text("{not json", encoding="utf-8")
     with pytest.raises(ValueError, match="not valid JSON"):
         docs_intel.load_user_journal_style_presets(str(p))
+
+
+def test_get_journal_style_preset_malformed_user_presets_file_raises(tmp_path):
+    """get_journal_style_preset calls load_user_journal_style_presets with no
+    try/except (docs_intel.py), relying on this ValueError propagating
+    unmodified up to callers like server.get_document_review -- only the
+    loader itself was covered for the malformed-file case above, leaving the
+    propagation through get_journal_style_preset unverified."""
+    p = tmp_path / "bad.json"
+    p.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        docs_intel.get_journal_style_preset("jcshm", user_presets_path=str(p))
 
 
 def test_load_user_presets_wrong_top_level_shape_raises(tmp_path):

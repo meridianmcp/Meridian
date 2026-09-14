@@ -7514,14 +7514,10 @@ ${n2.tags || ""}`.toLowerCase();
   function journalPresetSelectHtml2(did, presets) {
     return `<select class="doc-review-journal-select" data-did="${escapeHtml(did)}" title="Check against a journal's verified style rules" style="font-size:9px;padding:1px 4px;max-width:140px">${journalPresetOptionsHtml(presets)}</select>`;
   }
-  var _journalPresetsCache = null;
-  async function fetchJournalStylePresets2(forceRefresh = false) {
-    if (_journalPresetsCache && !forceRefresh) return _journalPresetsCache;
+  async function fetchJournalStylePresets2() {
     try {
       const result = await api("/journal-style-presets");
-      const presets = result && Array.isArray(result.presets) ? result.presets : [];
-      _journalPresetsCache = presets;
-      return presets;
+      return result && Array.isArray(result.presets) ? result.presets : [];
     } catch (_e) {
       return [];
     }
@@ -7749,17 +7745,17 @@ ${n2.tags || ""}`.toLowerCase();
         await loadDocumentReview(projectId, fp, targetId, null, journal);
       });
     });
-    root.querySelectorAll(".review-recheck-btn").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const targetId = btn.getAttribute("data-target") || "";
-        const target = document.getElementById(targetId);
-        const fp = target ? target.getAttribute("data-fp") || "" : "";
-        if (!fp) return;
-        const did = targetId.startsWith("doc-review-") ? targetId.slice("doc-review-".length) : "";
-        const journal = _selectedJournalFor(root, did);
-        const prevFingerprint = _reviewFingerprints.get(targetId) || null;
-        await loadDocumentReview(projectId, fp, targetId, prevFingerprint, journal);
-      });
+    root.addEventListener("click", async (e3) => {
+      const btn = e3.target && e3.target.closest && e3.target.closest(".review-recheck-btn");
+      if (!btn || !root.contains(btn)) return;
+      const targetId = btn.getAttribute("data-target") || "";
+      const target = document.getElementById(targetId);
+      const fp = target ? target.getAttribute("data-fp") || "" : "";
+      if (!fp) return;
+      const did = targetId.startsWith("doc-review-") ? targetId.slice("doc-review-".length) : "";
+      const journal = _selectedJournalFor(root, did);
+      const prevFingerprint = _reviewFingerprints.get(targetId) || null;
+      await loadDocumentReview(projectId, fp, targetId, prevFingerprint, journal);
     });
   }
   try {

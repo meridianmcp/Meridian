@@ -19,10 +19,22 @@ already use for docx_integrity_gate.
 """
 from __future__ import annotations
 
+import os
+
 from meridian.routes import notes as notes_routes
+
+# Recorders for the user_presets_path the route actually passes into
+# get_journal_style_preset / list_journal_style_presets -- without these the
+# fakes below would silently accept the pre-9c1a3fd2 call shape (no
+# user_presets_path at all) via their own default, and the route wiring
+# could regress with no test failing. Cleared at the top of each test that
+# reads them.
+_style_policy_calls: list[str | None] = []
+_list_presets_calls: list[str | None] = []
 
 
 def _fake_style_policy(journal: str, user_presets_path: str | None = None) -> dict:
+    _style_policy_calls.append(user_presets_path)
     if journal.lower() != "jcshm":
         raise ValueError(f"unknown journal style preset {journal!r}; known presets: ['jcshm']")
     return {"figure_caption_bold": True, "figure_caption_label_punctuation": "none"}
@@ -47,6 +59,7 @@ def _fake_build_document_review(docx_path, *, expected_source_fingerprint=None, 
 
 
 def _fake_list_presets(user_presets_path: str | None = None) -> dict:
+    _list_presets_calls.append(user_presets_path)
     return {
         "presets": [{"name": "jcshm", "source": "built_in", "shadows_builtin": False}],
         "builtin_count": 1, "user_count": 0,
@@ -56,12 +69,17 @@ def _fake_list_presets(user_presets_path: str | None = None) -> dict:
 def test_document_review_journal_param_reaches_style_policy(client, monkeypatch, tmp_path):
     """Passing ?journal=jcshm resolves a style_policy and threads it into
     build_document_review; omitting it keeps the pre-9c1a3fd2 shape (no
-    style_policy, so the fake builder above returns zero findings)."""
+    style_policy, so the fake builder above returns zero findings). Also
+    confirms the route's own workspace user_presets_path (not just the
+    journal name) actually reaches the preset getter -- see finding 1 of
+    9c1a3fd2's review."""
+    _style_policy_calls.clear()
     monkeypatch.setattr(notes_routes, "_resolve_document_review_builder", lambda: _fake_build_document_review)
     monkeypatch.setattr(
         notes_routes, "_resolve_journal_style_preset_getter",
         lambda: (_fake_style_policy, _fake_list_presets),
     )
+    expected_presets_path = os.path.join(str(tmp_path), "journal_style_presets.json")
     docx_path = tmp_path / "ms.docx"
     docx_path.write_bytes(b"not a real docx -- fake builder never opens it")
     pid = client.post("/projects", json={"name": "journal-review"}).json()["id"]
@@ -80,6 +98,7 @@ def test_document_review_journal_param_reaches_style_policy(client, monkeypatch,
     body = r1.json()
     assert body["finding_count"] == 1
     assert body["findings"][0]["type"] == "caption_label_not_bold"
+    assert _style_policy_calls[-1] == expected_presets_path
 
     # Unknown journal -- structured inline error, never a 500.
     r2 = client.get(
@@ -89,6 +108,7 @@ def test_document_review_journal_param_reaches_style_policy(client, monkeypatch,
     assert r2.status_code == 200
     assert "error" in r2.json()
     assert "not-a-real-journal" in r2.json()["error"]
+    assert _style_policy_calls[-1] == expected_presets_path
 
 
 def test_document_review_journal_without_extension_installed(client, monkeypatch, tmp_path):
@@ -107,9 +127,33 @@ def test_document_review_journal_without_extension_installed(client, monkeypatch
     assert "not installed" in r.json()["error"]
 
 
-def test_journal_style_presets_catalog_endpoint(client, monkeypatch):
+def test_document_review_journal_presets_unavailable(client, monkeypatch, tmp_path):
+    """meridian-docs IS installed (builder resolves) but
+    _resolve_journal_style_preset_getter() returns (None, None) -- e.g. an
+    older/partial install missing get_journal_style_preset. Distinct from
+    test_document_review_journal_without_extension_installed above, which
+    monkeypatches the builder itself to None and so never reaches this
+    branch at all; see finding 2 of 9c1a3fd2's review."""
+    monkeypatch.setattr(notes_routes, "_resolve_document_review_builder", lambda: _fake_build_document_review)
+    monkeypatch.setattr(notes_routes, "_resolve_journal_style_preset_getter", lambda: (None, None))
+    docx_path = tmp_path / "ms.docx"
+    docx_path.write_bytes(b"not a real docx -- fake builder never opens it")
+    pid = client.post("/projects", json={"name": "presets-unavailable"}).json()["id"]
+    r = client.get(
+        f"/projects/{pid}/document-review",
+        params={"path": str(docx_path), "journal": "jcshm"},
+    )
+    assert r.status_code == 200
+    assert "error" in r.json()
+    assert "journal style presets are unavailable" in r.json()["error"]
+
+
+def test_journal_style_presets_catalog_endpoint(client, monkeypatch, tmp_path):
     """GET /journal-style-presets powers the picker dropdown: built-in +
-    user presets, each tagged with source/shadows_builtin."""
+    user presets, each tagged with source/shadows_builtin. Also confirms
+    the route's own workspace user_presets_path reaches the lister, not
+    just an unused default -- see finding 1 of 9c1a3fd2's review."""
+    _list_presets_calls.clear()
     monkeypatch.setattr(
         notes_routes, "_resolve_journal_style_preset_getter",
         lambda: (_fake_style_policy, _fake_list_presets),
@@ -119,6 +163,7 @@ def test_journal_style_presets_catalog_endpoint(client, monkeypatch):
     body = r.json()
     assert body["builtin_count"] == 1
     assert body["presets"][0]["name"] == "jcshm"
+    assert _list_presets_calls[-1] == os.path.join(str(tmp_path), "journal_style_presets.json")
 
 
 def test_journal_style_presets_catalog_without_extension_installed(client, monkeypatch):

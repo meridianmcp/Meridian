@@ -350,10 +350,19 @@ def get_document_review(
     for the full contract. No DOCX writes -- read-only in every code path.
     """
     style_policy = None
-    if journal is not None:
+    # 9c1a3fd2 review fix -- normalize journal the SAME way
+    # meridian/routes/notes.py's document_review_endpoint does
+    # (journal_name = (journal or "").strip() or None). Before this fix,
+    # journal="" here fell into the `is not None` branch and failed the
+    # whole call with an "unknown journal style preset ''" error, while the
+    # HTTP route silently treated "" as "no journal" and returned a normal
+    # review -- the two duplicated resolution paths diverged on the exact
+    # same input. Caught by an adversarial review pass.
+    journal_name = (journal or "").strip() or None
+    if journal_name is not None:
         try:
             style_policy = docs_intel.get_journal_style_preset(
-                journal, user_presets_path=user_presets_path
+                journal_name, user_presets_path=user_presets_path
             )
         except ValueError as exc:
             return {"error": str(exc)}

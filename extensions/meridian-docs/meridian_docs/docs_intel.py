@@ -9581,8 +9581,12 @@ def load_user_journal_style_presets(path: str) -> dict[str, dict[str, Any]]:
 
     Raises:
       ValueError: the file exists but is not valid JSON, its top level is
-        not an object, any value is not an object, or any preset's override
-        dict fails :func:`resolve_style_policy` validation.
+        not an object, any value is not an object, any preset's override
+        dict fails :func:`resolve_style_policy` validation, or the file
+        cannot be opened (e.g. ``path`` names a directory, or is
+        unreadable) -- the latter reaches every MCP/HTTP caller through
+        their existing ``except ValueError`` handling instead of escaping
+        as a raw, unhandled OSError.
     """
     if not os.path.exists(path):
         return {}
@@ -9591,6 +9595,8 @@ def load_user_journal_style_presets(path: str) -> dict[str, dict[str, Any]]:
             raw = json.load(fh)
     except json.JSONDecodeError as exc:
         raise ValueError(f"user journal style presets file is not valid JSON: {path}: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"user journal style presets file could not be read: {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError(
             f"user journal style presets file must contain a JSON object "
@@ -10165,11 +10171,24 @@ def audit_caption_style(
     w_t = _q(_W, "t")
     w_r = _q(_W, "r")
 
+    # Reuse the SAME native>synth>positional three-tier id scheme
+    # document_content_tree / _find_para_by_id use (see _find_para_by_id's
+    # docstring), rather than inventing a caption-local one -- otherwise the
+    # para_id emitted here never matches the para_id build_document_review's
+    # `records` carry for the same paragraph (most real captions have a
+    # synth id, not a native w14:paraId), and the locator step downstream
+    # reports a spurious "not_found" for an otherwise-correct finding.
+    from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+
+    synth_map = _build_synth_id_map(body)
+
     findings: list[dict[str, Any]] = []
     caption_count = 0
     punct_name_by_char = {".": "period", ":": "colon", "": "none"}
 
-    for index, p in enumerate(body.findall(w_p)):
+    for index, p in enumerate(body):
+        if p.tag != w_p:
+            continue
         ppr = p.find(w_pPr)
         style: str | None = None
         if ppr is not None:
@@ -10200,7 +10219,7 @@ def audit_caption_style(
         # positives respectively before this rstrip was added).
         label_text = m.group(0).rstrip()
         punct_char = m.group(3)
-        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        para_id = p.get(_q(_W14, "paraId")) or synth_map.get(id(p)) or f"p{index}"
 
         bold_key = "figure_caption_bold" if kind == "figure" else "table_caption_bold"
         expected_bold = policy[bold_key]

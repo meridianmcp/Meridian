@@ -124,24 +124,21 @@ export function journalPresetSelectHtml(did: string, presets: JournalStylePreset
   return `<select class="doc-review-journal-select" data-did="${escapeHtml(did)}" title="Check against a journal's verified style rules" style="font-size:9px;padding:1px 4px;max-width:140px">${journalPresetOptionsHtml(presets)}</select>`;
 }
 
-let _journalPresetsCache: JournalStylePresetInfo[] | null = null;
-
 /** Fetch the journal-preset catalog (built-in + this server's user-saved
- *  ones) for populating journalPresetSelectHtml. Cached for the page's
- *  lifetime after the first successful call — presets don't change from
- *  under a loaded Documents tab in normal use, and re-fetching per document
- *  row would be wasteful. Never throws: an extension-not-installed server,
- *  a network error, or a malformed response all resolve to `[]`, which
- *  renders as just the "No journal check" option — the feature degrades
- *  invisibly rather than breaking the Documents tab. Pass `forceRefresh` to
- *  bypass the cache (e.g. after saving a new user preset elsewhere). */
-export async function fetchJournalStylePresets(forceRefresh: boolean = false): Promise<JournalStylePresetInfo[]> {
-  if (_journalPresetsCache && !forceRefresh) return _journalPresetsCache;
+ *  ones) for populating journalPresetSelectHtml. Always hits the network —
+ *  an earlier version memoized this for the page's lifetime, but presets can
+ *  be added/edited via the separate save_user_journal_style_preset MCP
+ *  surface in the same browser session with nothing in this file able to
+ *  know that happened, so a page-lifetime cache could only ever go stale,
+ *  never get invalidated. It's one small GET per Documents-tab load. Never
+ *  throws: an extension-not-installed server, a network error, or a
+ *  malformed response all resolve to `[]`, which renders as just the "No
+ *  journal check" option — the feature degrades invisibly rather than
+ *  breaking the Documents tab. */
+export async function fetchJournalStylePresets(): Promise<JournalStylePresetInfo[]> {
   try {
     const result = await api('/journal-style-presets');
-    const presets = (result && Array.isArray(result.presets)) ? result.presets : [];
-    _journalPresetsCache = presets;
-    return presets;
+    return (result && Array.isArray(result.presets)) ? result.presets : [];
   } catch (_e) {
     return [];
   }
@@ -434,11 +431,18 @@ function _selectedJournalFor(root: ParentNode, did: string): string {
 }
 
 /** Wire "Review findings" / "Re-check" buttons scoped under `root` (defaults
- *  to the whole document) — called after the Documents tab re-renders its
- *  document cards. Each click reads the sibling journal-preset <select>
+ *  to the whole document) — called once, after the Documents tab re-renders
+ *  its document cards. Each click reads the sibling journal-preset <select>
  *  (9c1a3fd2) fresh, so changing the dropdown before "Re-check" applies the
- *  new selection rather than repeating the original check. */
-export function wireDocumentReviewButtons(projectId: string, root: ParentNode = document): void {
+ *  new selection rather than repeating the original check.
+ *
+ *  ".review-recheck-btn" is wired via delegation on `root` rather than a
+ *  querySelectorAll+forEach loop like ".doc-review-btn" above: it doesn't
+ *  exist in the DOM yet at wiring time — renderDocumentReview only injects
+ *  one later, inside its isReviewStale branch, well after this function's
+ *  one-time call — so a direct-binding loop here would always find zero of
+ *  them and the button would render dead. */
+export function wireDocumentReviewButtons(projectId: string, root: Document | Element = document): void {
   root.querySelectorAll('.doc-review-btn').forEach((btn: any) => {
     btn.addEventListener('click', async () => {
       const fp = btn.getAttribute('data-fp') || '';
@@ -448,17 +452,17 @@ export function wireDocumentReviewButtons(projectId: string, root: ParentNode = 
       await loadDocumentReview(projectId, fp, targetId, null, journal);
     });
   });
-  root.querySelectorAll('.review-recheck-btn').forEach((btn: any) => {
-    btn.addEventListener('click', async () => {
-      const targetId = btn.getAttribute('data-target') || '';
-      const target = document.getElementById(targetId);
-      const fp = target ? target.getAttribute('data-fp') || '' : '';
-      if (!fp) return;
-      const did = targetId.startsWith('doc-review-') ? targetId.slice('doc-review-'.length) : '';
-      const journal = _selectedJournalFor(root, did);
-      const prevFingerprint = _reviewFingerprints.get(targetId) || null;
-      await loadDocumentReview(projectId, fp, targetId, prevFingerprint, journal);
-    });
+  root.addEventListener('click', async (e: any) => {
+    const btn = e.target && e.target.closest && e.target.closest('.review-recheck-btn');
+    if (!btn || !root.contains(btn)) return;
+    const targetId = btn.getAttribute('data-target') || '';
+    const target = document.getElementById(targetId);
+    const fp = target ? target.getAttribute('data-fp') || '' : '';
+    if (!fp) return;
+    const did = targetId.startsWith('doc-review-') ? targetId.slice('doc-review-'.length) : '';
+    const journal = _selectedJournalFor(root, did);
+    const prevFingerprint = _reviewFingerprints.get(targetId) || null;
+    await loadDocumentReview(projectId, fp, targetId, prevFingerprint, journal);
   });
 }
 
