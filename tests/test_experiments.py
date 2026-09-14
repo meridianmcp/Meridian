@@ -467,18 +467,29 @@ async def test_complete_run_validates_even_on_already_terminal_run(db):
 
 
 @pytest.mark.asyncio
-async def test_oversized_result_receipt_raises_valueerror(db):
+async def test_oversized_result_receipt_spills_via_tigris_adapter(db, tmp_path, monkeypatch):
+    """37dd1004 (W1-N) superseded the old "always raise" contract this test
+    used to assert: complete_experiment_run now spills an oversized receipt
+    out-of-line (meridian.tigris_adapter) and stores a small pointer instead
+    of rejecting the whole completion outright. See
+    tests/test_37dd1004_experiment_receipt_spill.py for the full spill/
+    resolve/fail-closed coverage; model.validate_result_receipt itself is
+    UNCHANGED and still raises when called directly on an oversized dict
+    (test_validate_result_receipt_rejects_over_32kb_deterministically,
+    above) -- only what complete_experiment_run does BEFORE reaching that
+    function changed."""
+    monkeypatch.delenv("TIGRIS_ENABLED", raising=False)
     project, session = await _session(db, "exp-oversized-receipt")
     experiment = await exp_db.create_experiment(db, project["id"], session["id"], name="Receipt probe")
     run = await exp_db.start_experiment_run(db, project["id"], session["id"], experiment_id=experiment["id"])
-    with pytest.raises(ValueError, match="32768-byte cap|32_768-byte cap"):
-        await exp_db.complete_experiment_run(
-            db, project["id"], session["id"],
-            run_id=run["id"], outcome_summary="fine", disposition="keep",
-            result_receipt={"blob": "x" * 40_000},
-        )
-    unchanged = await exp_db.get_experiment_run(db, project["id"], run_id=run["id"])
-    assert unchanged["status"] == "active"
+    completed = await exp_db.complete_experiment_run(
+        db, project["id"], session["id"],
+        run_id=run["id"], outcome_summary="fine", disposition="keep",
+        result_receipt={"blob": "x" * 40_000}, data_dir=str(tmp_path),
+    )
+    assert completed["status"] == "completed"
+    assert completed["result_receipt"]["spilled"] is True
+    assert completed["result_receipt"]["backend"] == "local"
 
 
 # ---------------------------------------------------------------------------

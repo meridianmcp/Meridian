@@ -3567,8 +3567,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "status='abandoned'. outcome_summary and disposition (keep|discard|"
         "promote) are explicit and REQUIRED — rejected with {error} when "
         "missing/empty, even on a retry against an already-terminal run. "
-        "result_receipt is bounded to 32KB and REJECTED (never truncated) past "
-        "that cap. HARD INVARIANT: this call always writes an experiment_events "
+        "result_receipt is bounded to 32KB; past that cap it is spilled to durable "
+        "object storage (local content-addressed storage today, transparently "
+        "upgrading to Tigris when configured) and replaced with a small pointer — "
+        "never truncated, and rejected outright only if the spill itself fails. "
+        "HARD INVARIANT: this call always writes an experiment_events "
         "row when the run newly reaches a terminal state here — status='abandoned' "
         "or an outcome_summary containing 'dead end'/'failed' (case-insensitive) "
         "auto-writes {event_type:'dead_end'}.",

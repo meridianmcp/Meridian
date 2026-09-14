@@ -135,6 +135,7 @@ async def handle_complete_experiment_run(
             disposition=args.get("disposition"),
             result_receipt=args.get("result_receipt"),
             status=args.get("status", "completed"),
+            data_dir=data_dir,
         )
     except ValueError as exc:
         return {"error": str(exc)}
