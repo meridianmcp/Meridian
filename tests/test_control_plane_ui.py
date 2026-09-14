@@ -376,12 +376,25 @@ class TestArtifactsUnavailable:
             assert "tunnel" in body["reason"].lower()
             assert body["items"] == []
 
-    def test_self_hosted_missing_extension_reports_unavailable(self, client):
+    def test_self_hosted_missing_extension_reports_unavailable(self, client, monkeypatch):
         """meridian_outputs is a genuinely separate, optionally-installed
         extension (confirmed during prospecting: `import meridian_outputs`
         raises ModuleNotFoundError in the core pixi env) — this must degrade
-        gracefully, never 500 the whole dashboard."""
-        assert "meridian_outputs" not in sys.modules or True  # documents the assumption
+        gracefully, never 500 the whole dashboard.
+
+        Several other files in this same suite (e.g. test_mde5_evidence_lossless.py,
+        test_research_os_end_to_end.py) do an unscoped, process-lifetime
+        `sys.path.insert(0, ".../extensions/meridian-outputs")` at module import
+        time so THEIR OWN tests can `import meridian_outputs`. In a full xdist
+        run, that can land this test on the same worker process, making the
+        real ambient `import meridian_outputs` succeed regardless of whether
+        the package is actually installed — that used to make this assertion
+        depend on test scheduling order. Force the unavailable case
+        deterministically instead of relying on ambient sys.path state: a
+        `None` entry in `sys.modules` makes Python's import machinery raise
+        ImportError immediately, before consulting sys.path at all.
+        """
+        monkeypatch.setitem(sys.modules, "meridian_outputs", None)
         r = client.get("/control-plane/artifacts")
         assert r.status_code == 200, r.text
         body = r.json()
