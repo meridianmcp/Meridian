@@ -268,3 +268,57 @@ self-consistent, not merely present.
   (threading + optional cross-process portalocker).
 - Same inputs always produce the same results (deterministic path ordering,
   stable sort, no non-reproducible set/dict iteration in output paths).
+
+## BM25/Tantivy dependency, cold-start, and fallback contract (MDE-6)
+
+`search_outputs` normally ranks hits with a real BM25 engine (Tantivy). That
+engine has two ways to be unavailable this call, and both are handled the
+same way: **never crash, never silently return an empty result
+indistinguishable from a genuine zero-hit answer.**
+
+1. **Missing dependency.** `tantivy` (and `xxhash`, used for fast content
+   hashing) are real, declared dependencies (see `pixi.toml`/
+   `pyproject.toml`) — not soft/best-effort imports. `verify_search_
+   dependencies()` in `outputs_local.py` confirms both are actually
+   importable, once per process (cached), and logs a clear, actionable
+   WARNING if not — never a bare, easy-to-miss `ImportError` several frames
+   deep inside a broad `except Exception`.
+2. **Cold-start / corrupted index.** Opening a Tantivy index directory that
+   is missing, freshly created, or genuinely corrupted (a truncated
+   `meta.json`, an incompatible on-disk format left by a Tantivy version
+   change, filesystem damage) never crashes the server. A corrupted
+   directory is quarantined (renamed aside, timestamped, never deleted) and
+   a fresh empty index is opened at the original path — the same
+   "self-heal without losing data" philosophy the write-lock and row-cache
+   machinery elsewhere in this package already follow. Content that was
+   only in the old Tantivy segments (never the DuckDB metadata table, which
+   is unaffected) is simply re-added by the next incremental rebuild.
+
+Whenever Tantivy can't serve a `search_outputs` call for either reason (or
+any other uncaught error in the BM25 path), the call falls back to a
+**deterministic, non-BM25 search**: a case-insensitive substring match
+against the same indexed content/path columns, ordered by path ascending —
+a fixed, reproducible order with no ranking ambiguity. This is a real,
+correctness-first fallback, not a ranking engine — expect availability over
+relevance quality.
+
+Every `search_outputs` response carries a `backend` field so a caller (or
+test) can tell which engine actually served the hits, without guessing from
+the presence/absence of other fields:
+
+- `backend` — always present: `tantivy` (BM25 ranking served this call) or
+  `deterministic_fallback` (substring match did, for one of the reasons
+  above).
+- `backend_reason` — present alongside `backend: deterministic_fallback`;
+  explains why.
+- `tantivy_lock_warning` — present specifically for a single-writer lock
+  conflict (self-heals once the other writer finishes).
+- `tantivy_index_warning` — present for the OTHER two Tantivy failure modes
+  (cold-start rebuild from corruption, or the dependency being unavailable)
+  — distinct from a lock conflict, which does not necessarily self-heal on
+  its own.
+
+A fallback hit's `bm25` field is `None` (never a fabricated BM25-shaped
+number) and its `score` is a fixed marker (1.0, halved for archival) —
+never compare a fallback hit's score against a real BM25 score from a
+healthy index.

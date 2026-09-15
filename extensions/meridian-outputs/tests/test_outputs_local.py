@@ -7004,6 +7004,18 @@ class TestTantivyLockHandling:
     def test_locked_index_does_not_raise_and_sets_actionable_message(
         self, tmp_path: Path,
     ) -> None:
+        """MDE-6 update: a lock conflict used to make search() return a
+        bare ``[]`` -- best-effort/no-crash, but indistinguishable from a
+        genuine zero-hit answer (the exact "false zero-hit result" MDE-6's
+        acceptance criteria call out for lock-contention specifically).
+        search() now falls back to a real, deterministic substring search
+        over the same already-persisted DuckDB content instead, so a
+        caller still gets the row it already knows about. The lock
+        conflict itself is untouched: still never raises out of
+        rebuild()/search(), and still leaves the same actionable message
+        behind on ``_last_tantivy_error`` (now also classified via
+        ``_last_tantivy_error_kind``).
+        """
         (tmp_path / "data.csv").write_text("term,value\n1,2", encoding="utf-8")
         db_path = OL._resolve_index_db_path(str(tmp_path))
         idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
@@ -7015,12 +7027,21 @@ class TestTantivyLockHandling:
             count = idx.rebuild()
             assert isinstance(count, int)
             hits = idx.search("term")
-            assert hits == []  # best-effort contract preserved: no crash
+            # MDE-6: no false zero-hit -- the row was already persisted to
+            # DuckDB before the (locked) Tantivy commit was even attempted,
+            # so the deterministic fallback must still find it.
+            assert hits, (
+                "a lock conflict must not hide already-persisted, "
+                "genuinely matching content behind a false zero-hit result"
+            )
+            assert any("data.csv" in h["path"] for h in hits)
+            assert idx._last_search_backend == "deterministic_fallback"
             assert idx._last_tantivy_error is not None, (
                 "a lock conflict must leave a clear, actionable message "
                 "behind, not disappear silently"
             )
             assert "lock" in idx._last_tantivy_error.lower()
+            assert idx._last_tantivy_error_kind == "lock_conflict"
         finally:
             idx.close()
             del blocking_writer
