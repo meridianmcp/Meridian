@@ -8322,6 +8322,63 @@ def _cell_has_omath(tc: ET.Element) -> bool:
     return tc.find(f".//{_qm('oMath')}") is not None
 
 
+def _match_table_numbered_row(
+    cells: list[ET.Element],
+) -> tuple[ET.Element | None, str | None, bool]:
+    """9c1a3fd2 -- locate the (anchor_cell, number_text) pairing in a
+    numbered-equation table row, tolerating a leading indent/spacer cell.
+
+    The original implementation (both here and in audit_equation_integrity's
+    own copy of this same check) hardcoded ``cells[0]`` as the equation cell
+    and ``cells[1]`` as the number cell -- correct for a plain 2-column
+    [equation, number] row, but a real JCSHM manuscript caught this false:
+    Word's own "insert equation numbering" convention commonly produces a
+    3-column row instead -- [empty indent spacer, equation, number] -- and
+    cells[0] there is the EMPTY spacer, not the equation. Every equation in
+    that row was silently misclassified as "standalone" (number=None),
+    which cascaded into 28 false ``equation_number_gap`` findings on a
+    document whose equations were, in fact, numbered correctly and
+    completely (1)-(30) -- caught by manually cross-checking every "(N)"
+    occurrence in the raw document.xml against its actual table-cell
+    position before trusting the tool's own output.
+
+    Generalizes to: the number lives in the LAST cell (right-aligned in
+    every observed template, 2- or 3-column); the equation lives in
+    whichever EARLIER cell actually carries an <m:oMath> -- found by
+    position, not assumed at a fixed index, so any number of leading
+    spacer/label cells works, not just exactly one.
+
+    Returns ``(anchor_cell, number_text, has_omath)``:
+      - ``(cell, "(N)", True)``     -- a genuine numbered equation row;
+        ``cell`` is the one actually carrying the <m:oMath>.
+      - ``(cell, "(N)", False)``    -- the LAST cell matches the number
+        pattern but NO earlier cell has any <m:oMath> at all -- a real
+        "numbered but the equation itself is missing" case. ``cell`` here
+        is a best-guess anchor (the cell immediately before the number
+        cell -- cells[0] for a plain 2-column row, matching every prior
+        caller's expectation) used ONLY to report a sensible location for
+        the finding, never treated as carrying real equation content.
+      - ``(None, None, False)``    -- not a numbered-equation row at all
+        (fewer than 2 cells, or the last cell isn't a parenthesized
+        number) -- an ordinary content table, left untouched. Distinguish
+        this "not a numbered row" case from the "numbered but missing"
+        case above by ``anchor_cell is None`` (never by ``has_omath``
+        alone) -- an ordinary table row and a broken numbered row both
+        have ``has_omath=False``, but only one should be reported.
+    """
+    if len(cells) < 2:
+        return None, None, False
+    number_text = _cell_text(cells[-1]).strip()
+    if not _EQ_NUMBER_RE.match(number_text):
+        return None, None, False
+    omath_idx = next(
+        (i for i, c in enumerate(cells[:-1]) if _cell_has_omath(c)), None
+    )
+    if omath_idx is not None:
+        return cells[omath_idx], number_text, True
+    return cells[-2], number_text, False
+
+
 def parse_docx_equations_local(
     source: str | bytes | bytearray,
 ) -> list[dict[str, Any]]:
@@ -8347,12 +8404,16 @@ def parse_docx_equations_local(
        (including inside table cells that are not numbered-equation tables).
        ``number`` is ``None``.
 
-    2. **table-numbered**: a <w:tbl> row where the first cell contains an
-       <m:oMath> and the second cell contains a parenthesised equation number
-       (e.g. "(1)", "(2a)").  The number is extracted and associated as the
-       equation's ``number`` field.  The ``para_id`` is synthesized from the
-       table's position in the body (``tbl{body_child_index}``) unless the cell
-       paragraph has a real w14:paraId.
+    2. **table-numbered**: a <w:tbl> row whose LAST cell contains a
+       parenthesised equation number (e.g. "(1)", "(2a)") and some EARLIER
+       cell contains an <m:oMath> (see :func:`_match_table_numbered_row` --
+       found by position, not assumed at a fixed index, so a leading empty
+       indent/spacer cell before the equation, e.g. [spacer, equation,
+       number], is recognized exactly like a plain [equation, number] row).
+       The number is extracted and associated as the equation's ``number``
+       field.  The ``para_id`` is synthesized from the table's position in
+       the body (``tbl{body_child_index}``) unless the cell paragraph has a
+       real w14:paraId.
 
     A document with no equations returns [].
     """
@@ -8400,33 +8461,35 @@ def parse_docx_equations_local(
             p_global_idx += 1
 
         elif child.tag == w_tbl:
-            # Check every row for the equation-with-numbering pattern:
-            # first cell has oMath, second cell has a parenthesised number.
+            # Check every row for the equation-with-numbering pattern: some
+            # earlier cell has oMath (position-found, not assumed at cells[0]
+            # -- a leading empty indent/spacer cell is a real, common
+            # template shape, see _match_table_numbered_row), last cell has
+            # a parenthesised number.
             for tr in child.findall(f".//{w_tr}"):
                 cells = tr.findall(w_tc)
-                if len(cells) >= 2 and _cell_has_omath(cells[0]):
-                    number_text = _cell_text(cells[1]).strip()
-                    if _EQ_NUMBER_RE.match(number_text):
-                        # Table-numbered equation.
-                        # Use the first paragraph's para_id inside the cell, or synth.
-                        cell0_para = cells[0].find(w_p)
-                        if cell0_para is not None:
-                            para_id = cell0_para.get(w14_para_id) or f"tbl{body_child_idx}"
-                        else:
-                            para_id = f"tbl{body_child_idx}"
-                        for omath_el in cells[0].iter(m_omath):
-                            equations.append({
-                                "ordinal": ordinal,
-                                "para_id": para_id,
-                                "omml_raw": ET.tostring(omath_el, encoding="unicode"),
-                                "pattern": "table-numbered",
-                                "number": number_text,
-                                "flat_text": _omml_flatten_text_local(
-                                    ET.tostring(omath_el, encoding="unicode")
-                                ),
-                            })
-                            ordinal += 1
-                        continue  # handled — don't fall through to standalone scan
+                eq_cell, number_text, has_omath = _match_table_numbered_row(cells)
+                if has_omath:
+                    # Table-numbered equation.
+                    # Use the first paragraph's para_id inside the cell, or synth.
+                    cell0_para = eq_cell.find(w_p)
+                    if cell0_para is not None:
+                        para_id = cell0_para.get(w14_para_id) or f"tbl{body_child_idx}"
+                    else:
+                        para_id = f"tbl{body_child_idx}"
+                    for omath_el in eq_cell.iter(m_omath):
+                        equations.append({
+                            "ordinal": ordinal,
+                            "para_id": para_id,
+                            "omml_raw": ET.tostring(omath_el, encoding="unicode"),
+                            "pattern": "table-numbered",
+                            "number": number_text,
+                            "flat_text": _omml_flatten_text_local(
+                                ET.tostring(omath_el, encoding="unicode")
+                            ),
+                        })
+                        ordinal += 1
+                    continue  # handled — don't fall through to standalone scan
 
                 # Not a numbered-equation table row — scan any oMath as standalone.
                 for omath_el in tr.iter(m_omath):
@@ -9853,7 +9916,7 @@ def audit_equation_style(
        positions produce). Its paragraph-level ``w:jc`` (missing == "left")
        is compared against ``style_policy["equation_alignment"]``. Inline
        equations mixed into running prose, and table-numbered equations
-       (whose 2-column layout has its own alignment conventions), are
+       (whose row layout has its own alignment conventions), are
        intentionally excluded -- neither has one well-defined "expected"
        paragraph alignment.
 
@@ -9952,6 +10015,8 @@ def audit_equation_style(
         if preceding:
             continue  # inline equation mixed with prose -- no alignment/punctuation check
 
+        trailing_text = _trailing_text_after_omath(para_elem, omath_el)
+
         actual_alignment = _paragraph_alignment(para_elem) or "left"
         expected_alignment = policy["equation_alignment"]
         if actual_alignment != expected_alignment:
@@ -9964,8 +10029,7 @@ def audit_equation_style(
             })
 
         if policy["equation_punctuation_required"]:
-            trailing = _trailing_text_after_omath(para_elem, omath_el)
-            stripped = trailing.rstrip()
+            stripped = trailing_text.rstrip()
             if not stripped:
                 findings.append({
                     "type": "missing_trailing_punctuation",
@@ -9978,7 +10042,7 @@ def audit_equation_style(
                     "type": "incorrect_trailing_punctuation",
                     "para_id": eq["para_id"],
                     "ordinal": eq["ordinal"],
-                    "actual_trailing_text": trailing,
+                    "actual_trailing_text": trailing_text,
                     "actual_char": stripped[-1],
                     "expected_punctuation_chars": policy["equation_punctuation_chars"],
                 })
@@ -23642,29 +23706,38 @@ def audit_equation_integrity(source: "str | bytes | bytearray") -> "dict[str, An
         elif child.tag == w_tbl:
             for tr in child.findall(f".//{w_tr}"):
                 cells = tr.findall(w_tc)
-                if len(cells) < 2:
+                # 9c1a3fd2 -- was hardcoded cells[0]=equation/cells[1]=number,
+                # which misses a leading empty indent/spacer cell (a real,
+                # common template shape -- see _match_table_numbered_row's
+                # docstring). anchor_cell is None only for "not a numbered
+                # row at all" (skip, ordinary content table); a genuinely
+                # numbered-but-empty row still gets an anchor_cell (a
+                # best-guess position) so EQUATION_FINDING_MISSING_OMML can
+                # report a real location instead of falling back to a
+                # generic tbl{idx} anchor for every case.
+                eq_cell, number_text, has_omath = _match_table_numbered_row(cells)
+                if eq_cell is None:
                     continue
-                number_text = _cell_text(cells[1]).strip()
-                if not _EQ_NUMBER_RE.match(number_text):
-                    continue
-                cell0_para = cells[0].find(w_p)
+                cell0_para = eq_cell.find(w_p)
                 anchor = (
                     (cell0_para.get(w14_para_id) if cell0_para is not None else None)
                     or f"tbl{body_child_idx}"
                 )
-                if not _cell_has_omath(cells[0]):
+                if not has_omath:
                     findings.append({
                         "type": EQUATION_FINDING_MISSING_OMML,
                         "anchor": anchor,
                         "pattern": "table-numbered",
                         "section_path": section_path,
                         "number": number_text,
-                        "plain_text": _cell_text(cells[0]).strip(),
+                        "plain_text": " ".join(
+                            _cell_text(c).strip() for c in cells[:-1]
+                        ).strip(),
                     })
                     continue
 
-                row_prose = "".join(_cell_text(c) for i, c in enumerate(cells) if i != 0)
-                omaths = cells[0].findall(f".//{m_omath}")
+                row_prose = "".join(_cell_text(c) for c in cells if c is not eq_cell)
+                omaths = eq_cell.findall(f".//{m_omath}")
                 for omath_el in omaths:
                     _record_equation(
                         anchor=anchor, pattern="table-numbered", section_path=section_path,

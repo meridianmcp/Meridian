@@ -284,6 +284,31 @@ def test_table_numbered_row_with_no_omml_in_equation_cell_is_flagged():
     assert result["equation_count"] == 0
 
 
+def test_table_numbered_row_with_leading_spacer_and_no_omml_is_still_flagged():
+    """9c1a3fd2 -- same defect shape as the plain 2-column test above, but
+    with a leading empty indent/spacer cell (the real 3-column [spacer,
+    equation, number] template caught against a live JCSHM manuscript).
+    The anchor must resolve to the actual equation-position cell (index -2,
+    i.e. the cell immediately before the number) rather than collapsing to
+    a generic tbl{idx} fallback -- the whole point of reporting an anchor
+    at all is so a reader knows WHERE to look."""
+    body = (
+        '<w:tbl><w:tr>'
+        '<w:tc><w:p/></w:tc>'
+        '<w:tc><w:p w14:paraId="BBB00099"><w:r><w:t>F=ma</w:t></w:r></w:p></w:tc>'
+        '<w:tc><w:p><w:r><w:t>(4)</w:t></w:r></w:p></w:tc>'
+        '</w:tr></w:tbl>'
+    )
+    raw = _zip_docx(_doc(body))
+    result = docs_intel.audit_equation_integrity(raw)
+    findings = _findings_of_type(result, "missing_omml")
+    assert len(findings) == 1
+    assert findings[0]["anchor"] == "BBB00099"
+    assert findings[0]["pattern"] == "table-numbered"
+    assert findings[0]["number"] == "(4)"
+    assert result["equation_count"] == 0
+
+
 def test_ordinary_prose_paragraph_is_never_flagged_as_missing_omml():
     raw = _zip_docx(_doc(
         '<w:p w14:paraId="AAA00015"><w:r><w:t>'

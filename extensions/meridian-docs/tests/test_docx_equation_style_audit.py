@@ -190,6 +190,40 @@ def _numbered_row(para_id: str, number_text: str) -> str:
     </w:tr>'''
 
 
+def _numbered_row_with_spacer(para_id: str, number_text: str) -> str:
+    """9c1a3fd2 -- the 3-column [empty indent spacer, equation, number]
+    template Word's own equation-numbering commands commonly produce
+    (caught against a real JCSHM manuscript), as opposed to _numbered_row's
+    plain 2-column [equation, number] shape."""
+    return f'''    <w:tr>
+      <w:tc><w:p/></w:tc>
+      <w:tc><w:p w14:paraId="{para_id}">{_SIMPLE_OMATH}</w:p></w:tc>
+      <w:tc><w:p><w:r><w:t>{number_text}</w:t></w:r></w:p></w:tc>
+    </w:tr>'''
+
+
+_SPACER_NUMBERED_DOC = _doc(
+    "    <w:tbl>\n"
+    + _numbered_row_with_spacer("EQS001", "(1)") + "\n"
+    + _numbered_row_with_spacer("EQS002", "(2)") + "\n"
+    + _numbered_row_with_spacer("EQS003", "(3)") + "\n"
+    "    </w:tbl>"
+)
+
+# A genuinely non-equation 3-column content table -- must NOT be
+# misdetected as a numbered-equation row just because it has 3 cells;
+# neither the middle nor any other cell has an <m:oMath>, and the last
+# cell's text doesn't match the parenthesized-number pattern.
+_ORDINARY_3COL_TABLE_DOC = _doc(
+    "    <w:tbl>\n"
+    "    <w:tr>\n"
+    "      <w:tc><w:p><w:r><w:t>Method</w:t></w:r></w:p></w:tc>\n"
+    "      <w:tc><w:p><w:r><w:t>MAE</w:t></w:r></w:p></w:tc>\n"
+    "      <w:tc><w:p><w:r><w:t>RMSE</w:t></w:r></w:p></w:tc>\n"
+    "    </w:tr>\n"
+    "    </w:tbl>"
+)
+
 _DUPLICATE_NUMBERS_DOC = _doc(
     "    <w:tbl>\n"
     + _numbered_row("EQD001", "(1)") + "\n"
@@ -1000,6 +1034,41 @@ def test_audit_table_numbered_equations_excluded_from_alignment_check(tmp_path):
     types = {f["type"] for f in result["findings"]}
     assert "misaligned_equation" not in types
     assert "missing_trailing_punctuation" not in types
+
+
+def test_table_numbered_row_with_leading_spacer_cell_extracts_the_number(tmp_path):
+    """9c1a3fd2 regression -- a real JCSHM manuscript's equation-numbering
+    table rows are [empty indent spacer, equation, number], not the plain
+    [equation, number] the original implementation assumed at fixed
+    cells[0]/cells[1] indices. Every equation in a spacer-led row was
+    silently misclassified as "standalone" (number=None), which cascaded
+    into false equation_number_gap findings for every number 1..N even
+    though the document's real numbering was complete and correct."""
+    path = _write_docx(tmp_path, _SPACER_NUMBERED_DOC)
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    equations = docs_intel.parse_docx_equations_local(raw)
+    numbered = [eq for eq in equations if eq["pattern"] == "table-numbered"]
+    assert [eq["number"] for eq in numbered] == ["(1)", "(2)", "(3)"]
+    assert [eq["para_id"] for eq in numbered] == ["EQS001", "EQS002", "EQS003"]
+
+    result = docs_intel.audit_equation_style(path)
+    assert result["findings_by_type"] == {}, result["findings"]
+
+
+def test_ordinary_3column_content_table_not_misdetected_as_numbered_equations(tmp_path):
+    """A real (non-equation) 3-column table must not be swept up by the
+    spacer-tolerant table-numbered detection just because it happens to
+    have 3 cells -- neither an <m:oMath> nor a parenthesized-number last
+    cell is present, so every cell should be scanned as ordinary content
+    (i.e. contributes zero equations, not a false table-numbered one)."""
+    path = _write_docx(tmp_path, _ORDINARY_3COL_TABLE_DOC)
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    equations = docs_intel.parse_docx_equations_local(raw)
+    assert equations == []
+    result = docs_intel.audit_equation_style(path)
+    assert result["findings_by_type"] == {}
 
 
 # ---------------------------------------------------------------------------
