@@ -1507,7 +1507,19 @@ def _xxh3_file(path: str) -> str | None:
     an opaque equality token (which is exactly how
     :func:`classify_canonical_archival` already uses it) and never assume a
     fixed length or algorithm.
+
+    MDE-6 -- the missing-dependency degrade used to be entirely silent (a
+    bare ``except ImportError: return _sha256_file(path)`` with no log line
+    at all): functionally correct, but a caller/operator had no way to know
+    xxhash wasn't actually in use short of profiling. Consulting the cached
+    :func:`verify_search_dependencies` result first surfaces a clear, one-
+    time-per-process WARNING (already logged by that function) instead --
+    and doubles as a cheap dict lookup in place of a repeated failing
+    ``import`` attempt on every call once the dependency is confirmed
+    absent.
     """
+    if not verify_search_dependencies()["xxhash"]["available"]:
+        return _sha256_file(path)
     try:
         import xxhash  # noqa: PLC0415 -- optional, lazy
     except ImportError:
@@ -2748,6 +2760,102 @@ def _resolve_duckdb_memory_limit_bytes(
 
 
 # ---------------------------------------------------------------------------
+# MDE-6 -- BM25/Tantivy dependency verification (startup-visible, cached)
+# ---------------------------------------------------------------------------
+
+#: Module-level cache for :func:`verify_search_dependencies`, populated on
+#: first call so a diagnostic is logged (at WARNING, not DEBUG) exactly once
+#: per process rather than on every single search/rebuild call.
+_SEARCH_DEPENDENCY_CACHE: dict[str, dict[str, Any]] | None = None
+
+
+def _probe_optional_dependency(module_name: str, install_hint: str) -> dict[str, Any]:
+    """Best-effort import probe for one optional dependency.
+
+    Never raises -- an unexpected probe failure (anything beyond the
+    expected ``ImportError``) itself degrades to ``available=False`` with
+    the probe's own error recorded, mirroring every other lazy-import
+    optional-dependency pattern already in this module (see
+    :func:`_xxh3_file`, :func:`_blake3_file`, :func:`npy_metadata`).
+    """
+    try:
+        module = __import__(module_name)
+    except Exception as exc:  # noqa: BLE001 -- any import-time failure counts
+        return {
+            "available": False,
+            "version": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "install_hint": install_hint,
+        }
+    return {
+        "available": True,
+        "version": getattr(module, "__version__", None),
+        "error": None,
+        "install_hint": None,
+    }
+
+
+def verify_search_dependencies(force: bool = False) -> dict[str, dict[str, Any]]:
+    """MDE-6 -- confirm the BM25 search stack's real, declared dependencies
+    (``tantivy``, ``xxhash`` -- see pixi.toml/pyproject.toml, item 52cbe5d8)
+    are actually importable in THIS environment, with a clear, actionable
+    diagnostic surfaced at WARNING level.
+
+    Prior gap: both dependencies were only ever consulted via a bare, deeply
+    nested ``import tantivy`` / ``import xxhash`` inside a broad
+    ``except Exception``/``except ImportError`` -- functionally fine as a
+    graceful degrade (xxhash already fell back to :func:`_sha256_file`;
+    tantivy calls were wrapped in best-effort ``except Exception`` blocks
+    that already never crashed), but the ONLY trace a missing dependency
+    left behind was a DEBUG-level log line deep inside
+    :meth:`OutputsFtsIndex.search`/``rebuild`` -- easy to miss, and
+    indistinguishable at a glance from any other transient failure. This
+    function makes the check explicit, first-class, and cached (so it costs
+    one import attempt per process, not one per call), and callers (
+    :meth:`OutputsFtsIndex._connect_tantivy`, :meth:`OutputsFtsIndex.search`)
+    consult the cached result BEFORE attempting a Tantivy operation, so a
+    genuinely missing dependency is diagnosed once, loudly, up front --
+    never silently swallowed.
+
+    Returns a dict keyed by dependency name, each value shaped
+    ``{available, version, error, install_hint}`` -- ``version``/``error``/
+    ``install_hint`` are ``None`` when ``available`` is ``True``. Pass
+    ``force=True`` to re-probe (e.g. after an environment change mid-process,
+    such as a test installing/uninstalling a stub module) instead of trusting
+    the cached result.
+    """
+    global _SEARCH_DEPENDENCY_CACHE
+    if _SEARCH_DEPENDENCY_CACHE is not None and not force:
+        return _SEARCH_DEPENDENCY_CACHE
+
+    result = {
+        "tantivy": _probe_optional_dependency(
+            "tantivy",
+            "install the declared dependency (`pixi install`, or "
+            "`pip install tantivy>=0.22`) -- until then, search_outputs() "
+            "degrades to a deterministic, non-ranked substring search "
+            "instead of BM25 ranking",
+        ),
+        "xxhash": _probe_optional_dependency(
+            "xxhash",
+            "install the declared dependency (`pixi install`, or "
+            "`pip install xxhash>=3.4`) -- until then, content hashing "
+            "falls back to slower SHA-256 (functionally equivalent, no "
+            "data loss, no behavior change beyond speed)",
+        ),
+    }
+    for name, info in result.items():
+        if not info["available"]:
+            _log.warning(
+                "meridian_outputs: optional dependency %r is not importable "
+                "(%s). %s",
+                name, info["error"], info["install_hint"],
+            )
+    _SEARCH_DEPENDENCY_CACHE = result
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 9a18a2b2 -- Tantivy single-writer lock conflict handling
 # ---------------------------------------------------------------------------
 
@@ -2787,6 +2895,131 @@ def _is_tantivy_lock_conflict(exc: BaseException) -> bool:
     """
     text = str(exc).lower()
     return any(marker in text for marker in _TANTIVY_LOCK_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# MDE-6 -- Tantivy cold-start / corrupted-index hardening
+# ---------------------------------------------------------------------------
+
+class TantivyIndexUnavailable(Exception):
+    """Raised when Tantivy cannot be opened at all this call -- either the
+    optional dependency itself isn't importable (see
+    :func:`verify_search_dependencies`), or the on-disk index directory is
+    corrupted/unreadable AND a fresh cold-start rebuild attempt (see
+    :func:`_quarantine_corrupted_tantivy_dir`) also failed.
+
+    Distinct from :class:`TantivyLockConflict`: a lock conflict means a
+    healthy index is temporarily owned by another writer (self-heals once
+    that writer finishes); this means Tantivy itself cannot currently serve
+    BM25 queries for this index at all this call. Callers (
+    :meth:`OutputsFtsIndex.search`) catch this specifically to switch to the
+    deterministic, non-BM25 fallback search (see
+    :meth:`OutputsFtsIndex._deterministic_fallback_search`) rather than
+    returning an empty, indistinguishable-from-"no matches" result.
+    """
+
+
+def _quarantine_corrupted_tantivy_dir(tdir: str) -> str | None:
+    """Best-effort rename-aside of a Tantivy index directory that failed to
+    open for a reason OTHER than a lock conflict (see
+    :func:`_is_tantivy_lock_conflict`) -- i.e. a corrupted/truncated
+    ``meta.json``, an incompatible on-disk format left by a Tantivy version
+    upgrade/downgrade, or filesystem damage.
+
+    Renaming (not deleting) preserves the corrupted segments for forensics
+    while immediately freeing the ORIGINAL path for a brand-new, empty index
+    -- the same "never lose data, never block progress" philosophy the
+    write-lock fallback (see the module-level IndexFileLock discussion) and
+    the DuckDB row-cache both already follow elsewhere in this module.
+
+    Returns the quarantine path on success, or ``None`` if the rename itself
+    failed (e.g. cross-device link, permissions) -- the caller falls back to
+    reusing the same (still-corrupted) directory in that case, which fails
+    closed with a clear diagnostic rather than silently succeeding on data
+    that didn't actually move.
+    """
+    quarantine = f"{tdir.rstrip(os.sep)}.corrupt-{int(time.time())}-{os.getpid()}"
+    try:
+        os.replace(tdir, quarantine)
+    except OSError:
+        _log.debug(
+            "OutputsFtsIndex: could not quarantine corrupted Tantivy dir %r",
+            tdir, exc_info=True,
+        )
+        return None
+    return quarantine
+
+
+def _open_tantivy_index_cold_start_safe(
+    schema: Any, tdir: str | None,
+) -> tuple[Any, str | None]:
+    """Open a Tantivy index, treating a missing/fresh/corrupted directory as
+    a cold start to recover from rather than a crash to propagate.
+
+    Returns ``(index, cold_start_warning)`` where ``cold_start_warning`` is
+    ``None`` on a clean open (the overwhelmingly common case: a fresh empty
+    directory, or a healthy existing index) and a human-readable message
+    when the directory had to be quarantined and rebuilt from scratch.
+
+    Raises :class:`TantivyIndexUnavailable` only when the index cannot be
+    opened even after quarantining a corrupted directory and starting a
+    fresh one in its place -- e.g. the quarantine rename itself failed AND
+    the original path is unrecoverably damaged, or ``tdir``'s parent
+    directory itself is no longer writable. This is the one case a caller
+    MUST treat as "Tantivy is unavailable this call", not merely degraded.
+
+    A genuine single-writer :class:`TantivyLockConflict` is NOT raised from
+    here -- that failure mode only ever surfaces from ``index.writer()``
+    (see :meth:`OutputsFtsIndex._connect_tantivy`), never from opening the
+    ``Index`` object itself, so this function does not need to (and must
+    not) special-case it.
+    """
+    import tantivy  # noqa: PLC0415
+
+    if tdir is None:
+        # ':memory:' mode -- a pure-RAM index has no on-disk corruption to
+        # cold-start recover from; any failure here is a genuine dependency
+        # problem, not a cold-start case.
+        try:
+            return tantivy.Index(schema), None
+        except Exception as exc:  # noqa: BLE001
+            raise TantivyIndexUnavailable(
+                f"Tantivy in-memory index could not be created: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    try:
+        return tantivy.Index(schema, path=tdir), None
+    except Exception as exc:  # noqa: BLE001
+        quarantine_path = _quarantine_corrupted_tantivy_dir(tdir)
+        _log.warning(
+            "OutputsFtsIndex: Tantivy index at %r failed to open (%s: %s) -- "
+            "treating this as a corrupted/incompatible on-disk index rather "
+            "than crashing; quarantined to %r and starting a fresh empty "
+            "index at the original path",
+            tdir, type(exc).__name__, exc, quarantine_path,
+        )
+        try:
+            os.makedirs(tdir, exist_ok=True)
+            fresh_index = tantivy.Index(schema, path=tdir)
+        except Exception as exc2:  # noqa: BLE001
+            raise TantivyIndexUnavailable(
+                f"Tantivy index at {tdir!r} could not be opened, and a "
+                f"fresh cold-start rebuild after quarantining the original "
+                f"(to {quarantine_path!r}) also failed: "
+                f"{type(exc2).__name__}: {exc2}"
+            ) from exc2
+        warning = (
+            f"Tantivy index at {tdir!r} was corrupted or unreadable "
+            f"({type(exc).__name__}: {exc}) and has been quarantined to "
+            f"{quarantine_path!r}; a fresh empty index now lives at the "
+            "original path so cold-start/restart never crashes. Previously "
+            "indexed search content for this run is gone from the FTS "
+            "index (the DuckDB metadata table is unaffected and unrelated "
+            "rows are never lost) and will be re-added automatically as "
+            "the next incremental rebuild re-commits its delta."
+        )
+        return fresh_index, warning
 
 
 class OutputsFtsIndex:
@@ -3129,6 +3362,25 @@ class OutputsFtsIndex:
         # last attempt to open/reuse the Tantivy writer succeeded (or none
         # was ever attempted yet).
         self._last_tantivy_error: str | None = None
+        # MDE-6 -- classifies WHAT _last_tantivy_error describes, without
+        # string-matching the message itself: "lock_conflict" (another
+        # writer holds the index -- self-heals once it releases),
+        # "cold_start_rebuild" (a corrupted/incompatible on-disk index was
+        # quarantined and rebuilt fresh this call), "dependency_unavailable"
+        # (tantivy itself isn't importable), or None (no error currently
+        # recorded). search_outputs() uses this to surface the right field
+        # name -- only a genuine lock conflict is reported as
+        # tantivy_lock_warning (preserving that field's existing, narrower
+        # meaning); the other two are reported as tantivy_index_warning.
+        self._last_tantivy_error_kind: str | None = None
+        # MDE-6 -- which backend actually served the most recent search()
+        # call: "tantivy" (BM25) or "deterministic_fallback" (substring
+        # match, used whenever Tantivy is unavailable/corrupted/missing its
+        # dependency -- see _deterministic_fallback_search). Defaults to
+        # "tantivy" since that's the intended/normal backend before any
+        # search has run.
+        self._last_search_backend: str = "tantivy"
+        self._last_search_backend_reason: str | None = None
         # 49b97a6a -- set True when _check_hash_algo_version() (called from
         # _connect()) detects this db_path's outputs_index table predates
         # the xxHash swap (984b237c) and needs a one-time full re-hash.
@@ -4185,14 +4437,42 @@ class OutputsFtsIndex:
         :class:`TantivyLockConflict` with an actionable message that
         :attr:`_last_tantivy_error` records for callers (search_outputs()
         surfaces it as ``result["tantivy_lock_warning"]``).
+
+        MDE-6 -- two additional failure modes are hardened here, both
+        BEFORE the lock-conflict handling above (which only ever concerns
+        ``index.writer()``, never opening the ``Index`` object itself):
+
+        1. Dependency verification: :func:`verify_search_dependencies` is
+           consulted first. A genuinely missing/broken ``tantivy`` install
+           raises :class:`TantivyIndexUnavailable` immediately, with the
+           diagnostic already logged (once, at WARNING) by that function --
+           never a bare, easy-to-miss ``ImportError`` several frames deep.
+        2. Cold-start/corrupted-index hardening: opening the on-disk index
+           directory itself (a fresh/empty directory, a healthy existing
+           one, or -- the new case -- a corrupted/incompatible one) is
+           delegated to :func:`_open_tantivy_index_cold_start_safe`, which
+           quarantines and rebuilds from scratch rather than raising, so a
+           corrupted index directory can never crash the server. Its
+           warning (if any) is recorded on :attr:`_last_tantivy_error`
+           under the same precedent as the lock-conflict message,
+           distinguished via :attr:`_last_tantivy_error_kind` so callers/
+           tests can tell the two apart without string-matching.
         """
         if self._tantivy_index is None:
-            import tantivy  # noqa: PLC0415
+            dependencies = verify_search_dependencies()
+            if not dependencies["tantivy"]["available"]:
+                message = (
+                    "Tantivy is not available in this environment "
+                    f"({dependencies['tantivy']['error']}). "
+                    f"{dependencies['tantivy']['install_hint']}"
+                )
+                self._last_tantivy_error = message
+                self._last_tantivy_error_kind = "dependency_unavailable"
+                raise TantivyIndexUnavailable(message)
             schema = self._tantivy_schema()
             tdir = self._tantivy_dir()
-            index = (
-                tantivy.Index(schema, path=tdir) if tdir is not None
-                else tantivy.Index(schema)
+            index, cold_start_warning = _open_tantivy_index_cold_start_safe(
+                schema, tdir,
             )
             try:
                 # c73c0dd7 -- explicit heap_size (default 512MB, up from
@@ -4212,9 +4492,17 @@ class OutputsFtsIndex:
                     "once the other writer releases the lock."
                 )
                 self._last_tantivy_error = message
+                self._last_tantivy_error_kind = "lock_conflict"
                 _log.warning("OutputsFtsIndex._connect_tantivy: %s", message)
                 raise TantivyLockConflict(message) from exc
-            self._last_tantivy_error = None
+            self._last_tantivy_error = cold_start_warning
+            self._last_tantivy_error_kind = (
+                "cold_start_rebuild" if cold_start_warning is not None else None
+            )
+            if cold_start_warning is not None:
+                _log.warning(
+                    "OutputsFtsIndex._connect_tantivy: %s", cold_start_warning,
+                )
             self._tantivy_index = index
             self._tantivy_writer = writer
         return self._tantivy_index, self._tantivy_writer
@@ -6313,9 +6601,18 @@ class OutputsFtsIndex:
         migration check (8163816e) needs it to read pre-existing DuckDB rows,
         and because callers/tests hold a bound reference to this method and
         call it as ``_rebuild_fts(con)``.
+
+        MDE-6 -- ``_connect_tantivy()`` is called BEFORE ``import tantivy``
+        here (previously the reverse): that method now runs the explicit
+        :func:`verify_search_dependencies` check and raises the clearly-
+        diagnosed :class:`TantivyIndexUnavailable` when the dependency is
+        genuinely missing, rather than this method's own bare
+        ``import tantivy`` raising an undiagnosed ``ImportError`` first and
+        bypassing that check (and its once-per-process cached WARNING log)
+        entirely.
         """
-        import tantivy  # noqa: PLC0415
         index, writer = self._connect_tantivy()
+        import tantivy  # noqa: PLC0415
         deletes, self._pending_tantivy_deletes = self._pending_tantivy_deletes, set()
         upserts, self._pending_tantivy_upserts = self._pending_tantivy_upserts, {}
         if deletes or upserts:
@@ -6356,6 +6653,21 @@ class OutputsFtsIndex:
         _rebuild_fts()'s per-row cost here is the right moment.  Once built,
         _fts_pending is cleared and _fts_built is set so subsequent calls
         skip the build entirely (warm path).
+
+        MDE-6 -- "best-effort: errors yield []" used to mean exactly that: a
+        genuinely corrupted index, a missing Tantivy dependency, or a lock
+        conflict all produced the SAME silent empty list as a real zero-hit
+        query, indistinguishable from each other. That is a false zero-hit
+        result -- unsafe for any caller doing an existence/dedup check. Any
+        failure reaching the Tantivy BM25 path now falls through to
+        :meth:`_deterministic_fallback_search` (a real, deterministic,
+        non-ranked substring search over the same DuckDB metadata table)
+        instead of an unconditional ``[]`` -- see
+        :attr:`_last_search_backend`/:attr:`_last_search_backend_reason`,
+        surfaced by ``search_outputs()`` as ``backend``/``backend_reason``.
+        A genuinely empty Tantivy result set (the query legitimately matched
+        nothing) is NOT routed through the fallback -- that ``[]`` is a
+        real answer, not a degraded one.
         """
         q = (query or "").strip()
         if not q:
@@ -6391,6 +6703,12 @@ class OutputsFtsIndex:
                 searcher = index.searcher()
                 parsed_query = index.parse_query(q, ["content"])
                 tantivy_hits = searcher.search(parsed_query, safe_limit).hits
+                # MDE-6 -- reaching this point means the Tantivy BM25 engine
+                # itself ran successfully this call; a genuinely empty result
+                # here is a real "no matches" answer, not a degraded one, so
+                # it is NOT routed through the deterministic fallback below.
+                self._last_search_backend = "tantivy"
+                self._last_search_backend_reason = None
                 if not tantivy_hits:
                     return []
                 bm25_by_path: dict[str, float] = {}
@@ -6416,9 +6734,36 @@ class OutputsFtsIndex:
                 relation = self._read_connect().execute(sql, list(bm25_by_path.keys()))
                 columns = [c[0] for c in relation.description]
                 fetched = relation.fetchall()
-            except Exception:  # noqa: BLE001
-                _log.debug("OutputsFtsIndex.search failed", exc_info=True)
-                return []
+            except Exception as exc:  # noqa: BLE001
+                # MDE-6 -- the BM25/Tantivy path itself failed this call
+                # (missing dependency, corrupted index that couldn't even
+                # cold-start recover, lock conflict, or anything else) --
+                # degrade to a real, deterministic, non-BM25 search instead
+                # of a silent [] indistinguishable from "no matches".
+                reason = f"{type(exc).__name__}: {exc}"
+                _log.debug(
+                    "OutputsFtsIndex.search: tantivy backend failed (%s) -- "
+                    "falling back to deterministic substring search",
+                    reason, exc_info=True,
+                )
+                # Deliberately NOT touched here: _last_tantivy_error /
+                # _last_tantivy_error_kind. Those two are scoped strictly to
+                # _connect_tantivy()'s own three classified outcomes (lock
+                # conflict / cold-start rebuild / dependency unavailable) --
+                # see their docstrings. `reason` here may be any of those
+                # (already recorded by _connect_tantivy itself when
+                # applicable) or something unrelated entirely (e.g. a
+                # searcher/query-level failure after a successful connect);
+                # _last_search_backend/_last_search_backend_reason (set by
+                # _deterministic_fallback_search below) is the general,
+                # always-set-on-fallback signal for THIS call regardless of
+                # cause -- keeping the two concerns separate avoids a generic
+                # failure being misreported under the more specific
+                # tantivy_index_warning/tantivy_lock_warning field names.
+                return self._deterministic_fallback_search(
+                    q, limit=safe_limit, include_archival=include_archival,
+                    reason=reason,
+                )
         hits: list[dict[str, Any]] = []
         for row in fetched:
             rec = dict(zip(columns, row))
@@ -6447,6 +6792,110 @@ class OutputsFtsIndex:
                 "mtime": rec.get("mtime"),
             })
         hits.sort(key=lambda h: h["score"], reverse=True)
+        return hits
+
+    def _deterministic_fallback_search(
+        self, query: str, *, limit: int, include_archival: bool, reason: str,
+    ) -> list[dict[str, Any]]:
+        """MDE-6 -- deterministic, non-BM25 search used whenever the Tantivy
+        backend is unavailable this call (missing dependency, a corrupted
+        index that couldn't even cold-start recover, an uncaught error --
+        see :meth:`search`'s except clause), instead of silently returning
+        ``[]`` indistinguishable from a genuine zero-hit answer.
+
+        Deliberately NOT a ranking engine -- correctness/availability over
+        relevance quality, and documented as such (see the module's
+        README). Performs a case-insensitive substring match against both
+        ``content`` and ``path`` directly in DuckDB (the same metadata
+        table Tantivy hits are hydrated from in :meth:`search`), ordered by
+        ``path`` ascending: a fixed, reproducible order with no scoring
+        ambiguity, unlike a ranking tie-break would need. This satisfies
+        the "guarantee deterministic fallback search when Tantivy/Arrow/
+        portalocker is unavailable" MDE-6 acceptance requirement.
+
+        ``score``/``bm25`` are set to a fixed marker (1.0/0.5-archival and
+        ``None`` respectively) rather than a fabricated relevance number --
+        a caller must never mistake a fallback hit's score for a real BM25
+        score comparable across calls or against a genuine BM25 hit from a
+        healthy index.
+
+        Overfetches a bounded multiple of ``limit`` (rather than either the
+        whole table or a bare ``LIMIT limit``) so the post-fetch archival
+        filter still has enough candidates to fill the caller's requested
+        count without an unbounded full-table scan on a huge tree.
+
+        Records the backend/reason on :attr:`_last_search_backend`/
+        :attr:`_last_search_backend_reason` so ``search_outputs()`` can
+        surface both to the caller as ``backend``/``backend_reason``.
+        Best-effort like every other path in this class: a failure inside
+        this method itself degrades to ``[]``, never raises -- there is no
+        further fallback below this one.
+        """
+        self._last_search_backend = "deterministic_fallback"
+        self._last_search_backend_reason = reason
+        try:
+            con = self._read_connect()
+        except Exception:  # noqa: BLE001
+            try:
+                con = self._connect()
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._deterministic_fallback_search: no "
+                    "usable DuckDB connection", exc_info=True,
+                )
+                return []
+        # Escape LIKE metacharacters in the raw query so a user-supplied
+        # '%'/'_' is matched LITERALLY, never interpreted as a SQL wildcard
+        # (DuckDB LIKE/ILIKE semantics -- unrelated to the psycopg3 '%%'
+        # convention used elsewhere in the wider Meridian codebase, since
+        # this module speaks DuckDB directly, never Postgres).
+        escaped = (
+            query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+        overfetch = max(limit * 5, limit + 20)
+        sql = (
+            "SELECT path, content, mtime, sha256, size, generating_script, "
+            "kind, is_archival, canonical_path, csv_columns, json_keys "
+            "FROM outputs_index "
+            "WHERE content ILIKE ? ESCAPE '\\' OR path ILIKE ? ESCAPE '\\' "
+            "ORDER BY path ASC LIMIT ?"
+        )
+        try:
+            relation = con.execute(sql, [pattern, pattern, overfetch])
+            columns = [c[0] for c in relation.description]
+            fetched = relation.fetchall()
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "OutputsFtsIndex._deterministic_fallback_search: query "
+                "failed", exc_info=True,
+            )
+            return []
+        hits: list[dict[str, Any]] = []
+        for row in fetched:
+            rec = dict(zip(columns, row))
+            is_arch = bool(rec.get("is_archival"))
+            if is_arch and not include_archival:
+                continue
+            hits.append({
+                "path": rec["path"],
+                "score": 0.5 if is_arch else 1.0,
+                "bm25": None,
+                "is_archival": is_arch,
+                "canonical_path": rec.get("canonical_path"),
+                "kind": rec.get("kind"),
+                "generating_script": rec.get("generating_script"),
+                "csv_columns": (
+                    json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+                ),
+                "json_keys": (
+                    json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+                ),
+                "size": rec.get("size"),
+                "mtime": rec.get("mtime"),
+            })
+            if len(hits) >= limit:
+                break
         return hits
 
     # ------------------------------------------------------------------
@@ -7816,6 +8265,14 @@ def search_outputs(
     for hit in hits:
         hit["annotations"] = index.get_annotations_for_path(hit["path"])
     result["hits"] = hits
+    # MDE-6 -- which engine actually served THIS call's hits: "tantivy"
+    # (BM25-ranked) or "deterministic_fallback" (substring match, ordered by
+    # path -- see OutputsFtsIndex._deterministic_fallback_search). Always
+    # present (not conditional) so a caller can rely on this field existing
+    # rather than treating its absence as "must have been tantivy".
+    result["backend"] = index._last_search_backend
+    if index._last_search_backend_reason:
+        result["backend_reason"] = index._last_search_backend_reason
     if index.last_rebuild_partial:
         result["partial"] = True
         # 81a0b23d -- last_rebuild_partial was already tracked internally
@@ -7834,13 +8291,27 @@ def search_outputs(
         # caller knows to re-invoke (the next search() call will build FTS).
         result["fts_pending"] = True
         result["partial"] = True
-    if index._last_tantivy_error:
+    if index._last_tantivy_error_kind == "lock_conflict":
         # 9a18a2b2 -- Tantivy's single-writer lock was held by another
         # writer during this call. rebuild()/search() already degraded
         # gracefully (never raised), but a caller silently getting fewer/no
         # hits with no indication why isn't actionable -- surface the same
         # clear message OutputsFtsIndex already logged at WARNING.
         result["tantivy_lock_warning"] = index._last_tantivy_error
+    elif index._last_tantivy_error_kind in ("cold_start_rebuild", "dependency_unavailable"):
+        # MDE-6 -- the OTHER two _connect_tantivy()-classified causes (a
+        # corrupted index that was quarantined and cold-start-rebuilt, or
+        # the tantivy dependency itself being unavailable) are deliberately
+        # surfaced under a DIFFERENT field name than tantivy_lock_warning --
+        # neither is a lock conflict, and conflating them would mislead a
+        # caller into expecting the same "self-heals once the other writer
+        # finishes" behavior a lock conflict has. Gated on the CLASSIFIED
+        # kind (not merely "an error string happens to be set") so a
+        # search()-level failure unrelated to _connect_tantivy (e.g. a
+        # searcher/query-level error after a successful connect) is never
+        # mislabeled as one of these two specific causes -- see
+        # ``backend``/``backend_reason`` above for that general case.
+        result["tantivy_index_warning"] = index._last_tantivy_error
     if index.last_lock_error:
         # a52216e2 -- the write lock itself could not be acquired this call
         # (real cross-process contention against an active owner, or an
