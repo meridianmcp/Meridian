@@ -9435,6 +9435,54 @@ def test_dashboard_js_renders_session_summary_in_live_tab(client):
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_devlog_write_never_touches_real_repo(db, tmp_path):
+    """Regression for a real bug found 2026-09-15: a test using the bare
+    ``db`` fixture (no ``client``) that calls checkpoint() with a completed
+    task reaches server._finalize_session_md -> md_anchors.apply_append,
+    which falls back to the REAL repo root when MERIDIAN_MD_ROOT is unset --
+    silently appending to this checkout's actual DEVLOG.md and creating a
+    real git commit as a side effect of running the test suite. Confirmed
+    live in a cherry-pick landing worktree (two stray "docs: meridian
+    auto-update" commits with fixture session names baked into real
+    DEVLOG.md history). The fix is the autouse `_isolate_md_root` fixture in
+    conftest.py; this test verifies the write actually lands under
+    MERIDIAN_MD_ROOT (tmp_path here), never under the real repo, independent
+    of that autouse fixture continuing to exist."""
+    import meridian.server as srv
+    from meridian import md_anchors as md_anchors_module
+
+    # md_root()'s OWN fallback formula when MERIDIAN_MD_ROOT is unset -- but
+    # this test's autouse _isolate_md_root fixture already sets that env var
+    # (like every test), so calling md_root() here would just return
+    # tmp_path too. Replicate the no-override formula directly to get the
+    # REAL repo path this bug used to write to.
+    real_repo_devlog = Path(md_anchors_module.__file__).resolve().parent.parent / "DEVLOG.md"
+    real_repo_mtime_before = real_repo_devlog.stat().st_mtime if real_repo_devlog.exists() else None
+
+    p = await db_module.create_project(db, "ckpt-devlog-isolation-test")
+    s = await db_module.register_session(db, p["id"], "ckpt-devlog-isolation-session")
+    await db_module.log_task(db, s["id"], p["id"], "Did something devlog-worthy", status="done")
+    await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": p["id"]}, db, str(tmp_path)
+    )
+
+    # The write must land under MERIDIAN_MD_ROOT (== tmp_path, via the
+    # autouse _isolate_md_root fixture), never the real repo.
+    isolated_devlog = tmp_path / "DEVLOG.md"
+    assert isolated_devlog.exists(), "checkpoint's DEVLOG append should land under MERIDIAN_MD_ROOT"
+    assert "ckpt-devlog-isolation-session" in isolated_devlog.read_text(encoding="utf-8")
+
+    # The real repo's DEVLOG.md must be untouched by this test.
+    if real_repo_mtime_before is None:
+        assert not real_repo_devlog.exists() or "ckpt-devlog-isolation-session" not in real_repo_devlog.read_text(encoding="utf-8")
+    else:
+        assert real_repo_devlog.stat().st_mtime == real_repo_mtime_before, (
+            "checkpoint must never write to the real repo's DEVLOG.md during tests"
+        )
+        assert "ckpt-devlog-isolation-session" not in real_repo_devlog.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_writes_session_summary(db, tmp_path):
     """checkpoint() writes a non-empty session_summary to the sessions table."""
     import meridian.server as srv
