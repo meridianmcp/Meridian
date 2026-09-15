@@ -326,9 +326,10 @@ def get_document_review(
     alone.
 
     Composes existing read-only primitives (audit_equation_style,
-    audit_caption_style, scan_stale_notes, a read-only legacy-plaintext-
-    caption detector, and optionally check_render_capability) rather than
-    re-deriving detection or anchor-resolution logic. Pass
+    audit_caption_style, audit_table_style, scan_stale_notes, a read-only
+    legacy-plaintext-caption detector, and optionally
+    check_render_capability) rather than re-deriving detection or
+    anchor-resolution logic. Pass
     expected_source_fingerprint (a value previously returned as
     source_fingerprint) to detect the document having changed since a
     stashed review -- a mismatch returns ``{"status": "stale", ...}`` with
@@ -338,10 +339,12 @@ def get_document_review(
     status becomes a finding.
 
     9c1a3fd2 -- pass ``journal`` (any name get_journal_style_preset resolves,
-    e.g. "jcshm") to also run the equation- and caption-style checks against
-    that journal's verified formatting rules -- omit it and this tool
-    behaves exactly as before (no style_policy, so audit_equation_style/
-    audit_caption_style contribute zero findings). ``user_presets_path``
+    e.g. "jcshm") to also run the equation-, caption-, and table-style
+    checks against that journal's verified formatting rules -- omit it and
+    this tool behaves exactly as before (no style_policy, so
+    audit_equation_style/audit_caption_style/audit_table_style contribute
+    zero style-gated findings; audit_table_style's header-repeat and
+    blank-line checks still run unconditionally). ``user_presets_path``
     extends the lookup to a user-saved preset (see
     save_user_journal_style_preset); it is ignored unless ``journal`` is
     also given. Raises via a structured ``{"error": ...}`` result (never a
@@ -1779,6 +1782,50 @@ def audit_caption_style(
 
 
 @mcp.tool()
+def audit_table_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """9c1a3fd2 — Audit every real, CAPTIONED content table (a Caption-
+    styled "Table N"/"Table SN" paragraph immediately followed, possibly
+    after blank spacer paragraphs, by a table) for three structural/style
+    defects: misalignment, a missing page-break header-row-repeat, and a
+    redundant blank paragraph between the caption and its table.
+
+    Deliberately scoped to CAPTIONED tables only (same text-and-style
+    detection audit_caption_style uses), not every table in the document —
+    a real document's table count is usually dominated by un-captioned
+    equation-numbering layout tables, which have different formatting
+    needs entirely and would swamp this audit if included.
+
+    Three finding types, each skipped/unconditional as noted:
+      table_misaligned              — the table's own alignment doesn't
+        match style_policy["table_alignment"]. Skipped entirely when that
+        key is unset (None — no verified rule, don't guess).
+      table_header_not_repeating    — the table's first row doesn't repeat
+        at the top of a page-break continuation. Unconditional: a
+        structural correctness property, not a style preference.
+      blank_line_before_table       — one or more blank paragraphs sit
+        between the caption and the table it captions. Also unconditional
+        — redundant double-spacing on top of the Caption style's own
+        spacing-after, not a style choice.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides, or pass
+                     get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {docx_path, table_count, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_table_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
 def audit_equation_contract(
     docx_path: str,
     project_id: str | None = None,
@@ -1841,8 +1888,9 @@ def get_journal_style_preset(
     The returned dict is the FULLY RESOLVED policy (every
     resolve_style_policy key populated), ready to pass straight through as
     style_policy= to insert_figure_block, insert_caption,
-    audit_equation_style, audit_caption_style, insert_equation,
-    insert_highlighted_note, write_section, or insert_table.
+    audit_equation_style, audit_caption_style, audit_table_style,
+    insert_equation, insert_highlighted_note, write_section, or
+    insert_table.
 
     8e2f4a17 — journal is no longer limited to the ~29 built-in presets.
     Pass user_presets_path to also resolve names saved via

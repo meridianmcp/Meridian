@@ -271,6 +271,7 @@ def test_resolve_style_policy_defaults():
         "heading_terminal_punctuation": None,
         "table_label_column_alignment": None,
         "table_data_column_alignment": None,
+        "table_alignment": None,
         # 4d0ca929 -- journal-style-preset-oriented keys, all "not verified"
         # sentinels (None or "unspecified") by default.
         "heading_numbering_visible": None,

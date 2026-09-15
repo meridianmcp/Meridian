@@ -8663,6 +8663,19 @@ def _style_policy_defaults() -> dict[str, Any]:
     sites and tests) sees byte-identical output to before this change; a
     caller opts into the new behavior only by supplying a non-``None`` value.
 
+    9c1a3fd2 -- ``table_alignment`` closes a gap :func:`insert_table` had
+    since its own creation: it never wrote a table-level ``<w:tblPr><w:jc>``
+    at all, so every newly inserted table defaulted to Word's own
+    left-aligned table justification -- caught not by inspection but by a
+    real JCSHM manuscript/SI pair where the overwhelming majority of tables
+    (38/42 and 48/76 respectively) turned out to be genuinely left-aligned
+    for exactly this reason. Same ``None``-default, opt-in-only discipline
+    as the two ``table_*_column_alignment`` keys above (byte-identical
+    output for any caller that doesn't set it); the ``"jcshm"`` preset sets
+    it to ``"center"``, verified against every pre-existing, already-correct
+    content table in both real documents (100% used ``center``, 0% used any
+    other value).
+
     4d0ca929 -- fourteen more keys back the "journal style preset" catalog in
     :data:`JOURNAL_STYLE_PRESETS` below, so a preset can express publisher
     facts beyond the original caption/equation/heading/table knobs: heading
@@ -8687,6 +8700,7 @@ def _style_policy_defaults() -> dict[str, Any]:
         "heading_terminal_punctuation": None,
         "table_label_column_alignment": None,
         "table_data_column_alignment": None,
+        "table_alignment": None,
         "heading_numbering_visible": None,
         "heading_levels_max": None,
         "emphasis_style": "unspecified",
@@ -8761,6 +8775,19 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
                                     ``table_label_column_alignment`` but for
                                     every column after column 0 ("data
                                     columns") of a newly inserted table.
+      table_alignment (str | None): 9c1a3fd2 -- one of "left"/"center"/
+                                    "right"/"both" -- the table-level
+                                    ``<w:tblPr><w:jc>`` :func:`insert_table`
+                                    writes (and :func:`audit_table_style`
+                                    treats as "correct"). ``None`` (the
+                                    default) adds no ``w:jc`` at all,
+                                    matching pre-9c1a3fd2 behavior (Word's
+                                    own default, effectively left-aligned) --
+                                    distinct from ``table_label_column_alignment``/
+                                    ``table_data_column_alignment`` above,
+                                    which set alignment on individual CELL
+                                    paragraphs, not the table's own position
+                                    on the page.
       heading_numbering_visible (bool | None): 4d0ca929 -- whether the
                                     publisher requires a visible decimal/
                                     numeric heading scheme (e.g. "1.2.3").
@@ -8890,7 +8917,10 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
             "style policy 'heading_terminal_punctuation' must be a string or None"
         )
 
-    for key in ("table_label_column_alignment", "table_data_column_alignment"):
+    for key in (
+        "table_label_column_alignment", "table_data_column_alignment",
+        "table_alignment",
+    ):
         value = policy[key]
         if value is not None and value not in _VALID_EQUATION_ALIGNMENTS:
             raise ValueError(
@@ -9084,6 +9114,7 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
         "heading_terminal_punctuation": "",
         "table_label_column_alignment": "left",
         "table_data_column_alignment": "center",
+        "table_alignment": "center",
         "figure_caption_bold": True,
         "figure_caption_label_punctuation": "none",
         "figure_caption_terminal_punctuation": "",
@@ -10364,6 +10395,182 @@ def audit_caption_style(
     return {
         "docx_path": docx_path,
         "caption_count": caption_count,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+def audit_table_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """9c1a3fd2 -- audit every real, CAPTIONED content table (a Caption-
+    styled "Table N"/"Table SN" paragraph immediately followed -- possibly
+    after a run of blank spacer paragraphs -- by a <w:tbl>) for three
+    structural/style defects a real JCSHM manuscript+SI pair turned out to
+    have at real scale, none caught by any existing audit before this one.
+
+    Deliberately scoped to CAPTIONED tables only, via the same
+    :func:`_is_caption_style` + :data:`_CAPTION_LABEL_RE` text-and-style
+    detection :func:`audit_caption_style` uses -- NOT every ``<w:tbl>`` in
+    the document. A real document's table COUNT is dominated by
+    un-captioned equation-numbering layout tables (a JCSHM manuscript with
+    5 real content tables had 42 ``<w:tbl>`` elements total; the other 37
+    were equation rows -- see :func:`_match_table_numbered_row`), which
+    have entirely different, already-correct-by-construction formatting
+    needs and would swamp/misrepresent a caption-scoped audit if included.
+
+    Three finding types, in document order:
+
+      * ``table_misaligned`` -- the table's own ``<w:tblPr><w:jc>``
+        (missing == effectively "left", Word's own default) doesn't match
+        ``style_policy["table_alignment"]``. Gated on that key being
+        non-``None`` (a verified fact about ONE specific alignment), the
+        same "unverified means don't guess" discipline as every other
+        style-policy-gated check in this module.
+      * ``table_header_not_repeating`` -- the table's first row lacks
+        ``<w:tblHeader/>``, so it will NOT repeat at the top of a
+        page-break continuation (Word's "repeat header rows" feature).
+        Unconditional (not style-policy-gated) -- a structural correctness
+        property every real multi-row table wants regardless of journal,
+        not a style preference, mirroring :func:`audit_equation_style`'s
+        own unconditional ``equation_number_gap``/``duplicate_equation_number``
+        checks.
+      * ``blank_line_before_table`` -- one or more blank paragraphs sit
+        between the caption and the table it captions. Also unconditional:
+        the Caption style already carries its own non-zero spacing-after
+        in every real document checked, so a manual blank paragraph on top
+        of that is redundant double-spacing, not a style choice -- found
+        in 32/32 SI tables (0/5 manuscript tables) in the same real
+        document pair this function was built against.
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style
+                     policy via :func:`resolve_style_policy`. Pass
+                     ``get_journal_style_preset("jcshm")`` (or any other
+                     preset name) directly, or a hand-written override
+                     dict.
+
+    Returns:
+      ``{docx_path, table_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the
+      file cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_tbl = _q(_W, "tbl")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+    w_tr = _q(_W, "tr")
+    w_trPr = _q(_W, "trPr")
+    w_tblHeader = _q(_W, "tblHeader")
+    w_tblPr = _q(_W, "tblPr")
+    w_jc = _q(_W, "jc")
+
+    children = list(body)
+
+    def _para_text(p: ET.Element) -> str:
+        return "".join(t.text or "" for t in p.iter(w_t))
+
+    def _is_blank_p(el: ET.Element) -> bool:
+        return el.tag == w_p and not _para_text(el).strip()
+
+    findings: list[dict[str, Any]] = []
+    table_count = 0
+
+    for index, el in enumerate(children):
+        if el.tag != w_p:
+            continue
+        ppr = el.find(w_pPr)
+        style: str | None = None
+        if ppr is not None:
+            pstyle = ppr.find(w_pStyle)
+            if pstyle is not None:
+                style = pstyle.get(w_val)
+        if not _is_caption_style(style):
+            continue
+        text = _para_text(el).strip()
+        m = _CAPTION_LABEL_RE.match(text)
+        if not m or not m.group(1).lower().startswith("table"):
+            continue
+
+        # Find the table this caption belongs to: skip any run of blank
+        # spacer paragraphs immediately after the caption, then require a
+        # <w:tbl> -- a caption not immediately (module blanks) followed by
+        # a table isn't this audit's business (e.g. a table referenced only
+        # in body prose, or one this scan's simple adjacency rule can't
+        # safely attribute).
+        j = index + 1
+        blanks_skipped = 0
+        while j < len(children) and _is_blank_p(children[j]):
+            blanks_skipped += 1
+            j += 1
+        if j >= len(children) or children[j].tag != w_tbl:
+            continue
+        tbl = children[j]
+        table_count += 1
+        para_id = el.get(_q(_W14, "paraId")) or f"p{index}"
+
+        if blanks_skipped > 0:
+            findings.append({
+                "type": "blank_line_before_table",
+                "para_id": para_id,
+                "index": index,
+                "blank_paragraph_count": blanks_skipped,
+            })
+
+        first_tr = tbl.find(w_tr)
+        has_header = False
+        if first_tr is not None:
+            trpr = first_tr.find(w_trPr)
+            has_header = trpr is not None and trpr.find(w_tblHeader) is not None
+        if first_tr is not None and not has_header:
+            findings.append({
+                "type": "table_header_not_repeating",
+                "para_id": para_id,
+                "index": index,
+            })
+
+        expected_alignment = policy["table_alignment"]
+        if expected_alignment is not None:
+            tblpr = tbl.find(w_tblPr)
+            jc = tblpr.find(w_jc) if tblpr is not None else None
+            actual_alignment = jc.get(w_val) if jc is not None else None
+            if actual_alignment != expected_alignment:
+                findings.append({
+                    "type": "table_misaligned",
+                    "para_id": para_id,
+                    "index": index,
+                    "expected_alignment": expected_alignment,
+                    "actual_alignment": actual_alignment,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "table_count": table_count,
         "findings": findings,
         "finding_count": len(findings),
         "findings_by_type": findings_by_type,
@@ -16772,6 +16979,12 @@ def insert_table(
                          on every column after column 0 ("data columns").
                          Both default to ``None`` (no ``w:jc`` added at all
                          -- byte-identical to pre-4544bbe5 behavior).
+                         9c1a3fd2 -- ``table_alignment`` sets the TABLE's own
+                         ``<w:tblPr><w:jc>`` (its position on the page --
+                         left/center/right/both), distinct from the two
+                         per-column keys above. Also defaults to ``None``
+                         (no ``w:jc`` at the table level -- Word's own
+                         default, left-aligned).
 
     Returns:
         ``{status, table_index, row_count, col_count, anchor_para_id,
@@ -16841,6 +17054,19 @@ def insert_table(
     ET.SubElement(tblPr, _q(_W, "tblStyle")).set(_q(_W, "val"), "TableGrid")
     ET.SubElement(tblPr, _q(_W, "tblW")).set(_q(_W, "w"), "0")
     tblPr.find(_q(_W, "tblW")).set(_q(_W, "type"), "auto")
+    # 9c1a3fd2 -- table_alignment must be added HERE, right after tblW and
+    # before tblGrid/rows are even built, not appended later: CT_TblPrBase
+    # requires w:jc to immediately follow w:tblW (before tblCellSpacing/
+    # tblInd/tblBorders/...). A real manuscript+SI pair caught this the hard
+    # way -- a first attempt at adding table centering (in a one-off script,
+    # not this function) inserted <w:jc> as tblPr's FIRST child instead,
+    # which Word's COM object model happened to tolerate on read, but is a
+    # real, avoidable schema violation; this function has never had this bug
+    # (it never wrote w:jc into tblPr at all before 9c1a3fd2), so get the
+    # position right from the start rather than bolt it on wrong and rely on
+    # readers being lenient.
+    if policy["table_alignment"] is not None:
+        ET.SubElement(tblPr, _q(_W, "jc")).set(_q(_W, "val"), policy["table_alignment"])
     tblGrid = ET.SubElement(tbl, _W_TBLGRID)
     for _ in range(cols):
         ET.SubElement(tblGrid, _W_GRIDCOL).set(_q(_W, "w"), str(col_width))
@@ -19980,10 +20206,12 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
 #: Fixed category set the dashboard groups findings by. Always present in
 #: ``findings_by_category`` (count 0 when nothing was found/checked) so a
 #: caller can render a stable set of section headers rather than guessing
-#: which categories exist for a given document profile -- "structure",
-#: "section_page", and "ownership" have no v1 detector yet (framework-
-#: agnostic first version -- see the sprint item notes) and always report 0
-#: until a future item adds one.
+#: which categories exist for a given document profile -- "section_page"
+#: and "ownership" have no v1 detector yet (framework-agnostic first
+#: version -- see the sprint item notes) and always report 0 until a future
+#: item adds one. "structure" (9c1a3fd2) is populated by
+#: :func:`audit_table_style`'s findings, wired into
+#: :func:`build_document_review` below.
 REVIEW_CATEGORIES: tuple[str, ...] = (
     "structure", "equation", "caption", "section_page", "ownership",
     "provenance", "render_integrity",
@@ -20073,8 +20301,13 @@ def build_document_review(
                         finding, "rendered"/"unavailable-with-reason" do
                         not -- mirrors ``docx_integrity_gate``'s "can't
                         confirm never manufactures a finding" rule).
-    * ``structure`` / ``section_page`` / ``ownership`` -- reserved, always 0
-                        in this first version (see :data:`REVIEW_CATEGORIES`).
+    * ``structure``   -- :func:`audit_table_style` (9c1a3fd2) findings:
+                        table misalignment (gated on
+                        ``style_policy["table_alignment"]``), missing
+                        header-row-repeat, and a redundant blank paragraph
+                        between a table's caption and the table itself.
+    * ``section_page`` / ``ownership`` -- reserved, always 0 in this first
+                        version (see :data:`REVIEW_CATEGORIES`).
 
     Every finding with a ``para_id`` is enriched with a ``locator`` --
     resolved via :func:`_resolve_anchor_query` (the SAME function
@@ -20173,6 +20406,24 @@ def build_document_review(
             "para_id": f.get("para_id"),
             "detail": f,
         })
+
+    # 9c1a3fd2 -- structure findings (table misalignment/header-repeat/
+    # blank-line-before-table), the first REVIEW_CATEGORIES entry to move
+    # off its "always 0, reserved" placeholder. Gated the same way as the
+    # caption/equation style audits above: audit_table_style's own
+    # table_alignment check is opt-in on style_policy, while its header-
+    # repeat and blank-line checks are unconditional structural facts, not
+    # style preferences -- see audit_table_style's docstring.
+    table_style_audit = audit_table_style(docx_path, style_policy)
+    if isinstance(table_style_audit, dict) and not table_style_audit.get("error"):
+        for f in table_style_audit.get("findings", []):
+            findings.append({
+                "category": "structure",
+                "severity": _review_finding_severity("structure", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
 
     stale_notes = scan_stale_notes(docx_path)
     if isinstance(stale_notes, dict) and not stale_notes.get("error"):
