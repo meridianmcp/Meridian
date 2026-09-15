@@ -201,9 +201,13 @@ fpdf2 = ">=2.7"
 model2vec = ">=0.3"
 psutil = ">=5.9"
 
+[feature.docs.pypi-dependencies]
+meridian-docs-mcp = { path = "extensions/meridian-docs", editable = true }
+
 [environments]
 dev = { features = ["dev"], solve-group = "default" }
 semantic = { features = ["semantic"], solve-group = "default" }
+docs = { features = ["docs"], solve-group = "default" }
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
