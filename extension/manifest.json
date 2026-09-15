@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Meridian LaTeX — Structural Overleaf Assistant",
+  "version": "0.0.1",
+  "description": "Reads and edits Overleaf's live .tex structure (sections, tables, equations, citations, figures) rather than raw text — prototype for the Digital Science Catalyst Grant submission.",
+  "permissions": ["activeTab", "storage", "scripting"],
+  "host_permissions": ["https://www.overleaf.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.overleaf.com/project/*"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Meridian LaTeX"
+  }
+}
