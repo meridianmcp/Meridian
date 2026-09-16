@@ -2428,6 +2428,88 @@ def insert_highlighted_note(
 
 
 @mcp.tool()
+def flag_for_review(
+    docx_path: str,
+    anchor: str | dict[str, Any],
+    note: str,
+    highlight_color: str = "yellow",
+    author: str = "Meridian",
+    initials: str = "M",
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """7c3e4b9a — Flag a location in a .docx for human review: a native
+    highlight on every run of the anchored paragraph PLUS a real Word
+    comment explaining what needs attention, anchored to that same
+    paragraph, written in ONE atomic operation.
+
+    Replaces the ad-hoc pattern of hand-rolling a raw-zip script every time
+    a document needed a flagged spot for a reviewer: this handles comment-
+    infrastructure creation (word/comments.xml, the [Content_Types].xml
+    override, the document.xml.rels relationship) whether the document has
+    zero pre-existing comments or already has some, safe comment-id
+    allocation either way, the highlight, and post-write structural
+    verification, through the exact same code paths insert_word_comment /
+    highlight_document_matches already use and this module's test suite
+    already covers.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor:           Either a raw paragraph id (str — w14:paraId, the
+                        sp<hash> synth id, or legacy p{N}, same schemes
+                        locate_anchor/insert_word_comment already resolve),
+                        OR a locate_anchor-style query dict (e.g.
+                        {"text": "..."}, {"caption_label": "Figure 3"},
+                        {"section_path": "3.2.4", "text": "..."}) resolved
+                        read-only before anything is written. A query that
+                        resolves ambiguously, to nothing, or to a table/
+                        table-cell target is refused with the full locator
+                        detail attached (locate_result) — never guessed.
+      note:             The comment's text (must be non-empty).
+      highlight_color:  A native <w:highlight w:val="..."> value, validated
+                        against the same allow-list resolve_style_policy
+                        already enforces for note_highlight_color. Default
+                        "yellow".
+      author, initials: Recorded on the Word comment, same as
+                        insert_word_comment.
+      index_db_path:    If supplied, the sidecar is invalidated and the flag
+                        is recorded into the same docx_internal_notes table
+                        insert_highlighted_note's mode="comment" path uses
+                        (note id "_MComment<comment_id>"), so
+                        list_internal_notes surfaces it too.
+      allow_degraded_render / degraded_render_reason: the same audited
+                        opt-in insert_word_comment / insert_figure_block
+                        expose for "no render backend available in this
+                        environment" — required together.
+      session_id: 273df573 — identifies the calling Meridian session to the
+        tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+        meridian/routes/tunnel.py). Not forwarded to docs_intel; has no
+        effect when this tool is invoked outside Meridian's tunnel (e.g.
+        standalone `uvx meridian-docs`).
+
+    Returns {status: "flagged", comment_id, note_id, text, anchor_para_id,
+    highlighted_run_count, highlight_color, author, initials, docx_path,
+    render_status, render_verified, ...} on success, or {"error": <message>,
+    ...} on any validation, resolution, write, or verification failure — the
+    file is left untouched on a validation/resolution failure, and either
+    correctly written or safely restored on a write/verification failure.
+    """
+    return docs_intel.flag_for_review(
+        docx_path=docx_path,
+        anchor=anchor,
+        note=note,
+        highlight_color=highlight_color,
+        author=author,
+        initials=initials,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
 def list_internal_notes(index_db_path: str) -> list[dict[str, Any]]:
     """65c8eb31 — List internal-author-note paragraphs recorded in the sidecar.
 

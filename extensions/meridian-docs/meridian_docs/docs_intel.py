@@ -19216,12 +19216,15 @@ def search_document_xml(
     return results
 
 
-def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) -> bool:
-    run_text = _search_element_text(run)
-    if not run_text:
-        return False
-    if not any(re.search(re.escape(term), run_text, re.IGNORECASE) for term in terms):
-        return False
+def _set_run_highlight(run: ET.Element, color: str) -> None:
+    """Apply native ``<w:highlight w:val="color"/>`` to a single run's ``w:rPr``,
+    creating ``w:rPr`` first if the run doesn't already have one.
+
+    Extracted from :func:`_highlight_run_if_matching` so
+    :func:`_highlight_paragraph_runs` (an unconditional, whole-paragraph
+    variant used by :func:`flag_for_review`) shares the exact same
+    rPr/highlight-element construction instead of a second copy.
+    """
     r_pr = run.find(_q(_W, "rPr"))
     if r_pr is None:
         r_pr = ET.Element(_q(_W, "rPr"))
@@ -19230,7 +19233,34 @@ def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) ->
     if highlight is None:
         highlight = ET.SubElement(r_pr, _q(_W, "highlight"))
     highlight.set(_q(_W, "val"), color)
+
+
+def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) -> bool:
+    run_text = _search_element_text(run)
+    if not run_text:
+        return False
+    if not any(re.search(re.escape(term), run_text, re.IGNORECASE) for term in terms):
+        return False
+    _set_run_highlight(run, color)
     return True
+
+
+def _highlight_paragraph_runs(paragraph: ET.Element, color: str) -> int:
+    """Apply native ``<w:highlight>`` to EVERY run inside ``paragraph``,
+    unconditionally (no text-matching gate) -- the whole-paragraph-anchor
+    granularity :func:`flag_for_review` needs, mirroring the whole-paragraph
+    granularity :func:`insert_word_comment` already uses for its
+    ``commentRangeStart``/``commentRangeEnd`` markers.
+
+    Returns the number of runs highlighted (0 for an empty paragraph --
+    not an error; a caller may legitimately flag an empty placeholder
+    paragraph for review).
+    """
+    count = 0
+    for run in paragraph.iter(_q(_W, "r")):
+        _set_run_highlight(run, color)
+        count += 1
+    return count
 
 
 def highlight_document_matches(
@@ -19362,49 +19392,35 @@ def _next_word_comment_id(document_root: ET.Element, comments_root: ET.Element |
     return max(ids, default=-1) + 1
 
 
-def insert_word_comment(
-    docx_path: str,
+def _stage_word_comment(
+    raw: bytes,
+    root: ET.Element,
+    paragraph: ET.Element,
     text: str,
-    anchor_para_id: str,
-    author: str = "Meridian",
-    initials: str = "M",
-    allow_degraded_render: bool = False,
-    degraded_render_reason: str | None = None,
-) -> dict[str, Any]:
-    """Insert a real Word comment anchored to an existing paragraph.
+    author: str,
+    initials: str,
+) -> tuple[dict[str, bytes], int]:
+    """Build the ``updated_parts`` staging dict for ONE native Word comment
+    anchored to ``paragraph`` (already resolved by the caller), plus the
+    freshly-minted comment id.
 
-    ddd79188 follow-up -- once the comment parts are staged, verified
-    (ZIP/XML/relationship/media integrity via
-    :func:`_save_docx_with_new_parts_stdlib`), and promoted, a real Word/COM
-    (or LibreOffice) render-capability check also runs against the
-    just-written file (:func:`_enforce_render_verification`), mirroring the
-    same gate :func:`insert_figure_block` / :func:`merge_draft_into_canonical`
-    already enforce. ``allow_degraded_render`` / ``degraded_render_reason``
-    are the same audited opt-in those functions expose for the "no render
-    backend available in this environment" case.
+    Extracted verbatim out of :func:`insert_word_comment` (5bab074/W2-C, no
+    behavior change) so both it and :func:`flag_for_review` mint comment
+    ids, create-or-extend ``word/comments.xml``, and wire the
+    ``document.xml.rels`` relationship + ``[Content_Types].xml`` override
+    through the exact same code path, instead of a second, drift-prone copy
+    of this plumbing.
+
+    Mutates ``root``/``paragraph`` IN PLACE (splices in
+    ``commentRangeStart``/``commentRangeEnd``/``commentReference`` around
+    the paragraph's existing content) but does NOT write anything to disk --
+    the caller stages the returned ``updated_parts`` via
+    :func:`_save_docx_with_new_parts_stdlib` itself. This lets a caller that
+    also needs to mutate ``word/document.xml`` further before writing (e.g.
+    :func:`flag_for_review` applying a run highlight to the SAME paragraph)
+    fold every edit into ONE single-part write/verify/promote instead of two
+    separate ones.
     """
-    if not text or not str(text).strip():
-        return {"error": "text must be a non-empty string"}
-    if not author or not str(author).strip():
-        return {"error": "author must be a non-empty string"}
-    if allow_degraded_render and not (
-        degraded_render_reason and str(degraded_render_reason).strip()
-    ):
-        return {
-            "error": (
-                "degraded_render_reason is required and must be non-empty "
-                "when allow_degraded_render=True -- an audited degrade with "
-                "no stated reason is not auditable and is refused"
-            )
-        }
-    try:
-        raw, root = _load_docx_xml_stdlib(docx_path)
-    except (OSError, ValueError) as exc:
-        return {"error": str(exc)}
-    found = _find_para_by_id(root, anchor_para_id)
-    if found is None:
-        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
-    _body, paragraph, _child_index = found
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         comments_part = "word/comments.xml"
         try:
@@ -19504,6 +19520,59 @@ def insert_word_comment(
             b'<?xml version="1.0" encoding="UTF-8"?>\n'
             + ET.tostring(content_types_root, encoding="utf-8")
         )
+    return updated_parts, comment_id
+
+
+def insert_word_comment(
+    docx_path: str,
+    text: str,
+    anchor_para_id: str,
+    author: str = "Meridian",
+    initials: str = "M",
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """Insert a real Word comment anchored to an existing paragraph.
+
+    ddd79188 follow-up -- once the comment parts are staged, verified
+    (ZIP/XML/relationship/media integrity via
+    :func:`_save_docx_with_new_parts_stdlib`), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file (:func:`_enforce_render_verification`), mirroring the
+    same gate :func:`insert_figure_block` / :func:`merge_draft_into_canonical`
+    already enforce. ``allow_degraded_render`` / ``degraded_render_reason``
+    are the same audited opt-in those functions expose for the "no render
+    backend available in this environment" case.
+
+    The actual comment-part plumbing (id allocation, comments.xml
+    create-or-extend, rels/content-types wiring) lives in
+    :func:`_stage_word_comment`, shared with :func:`flag_for_review`.
+    """
+    if not text or not str(text).strip():
+        return {"error": "text must be a non-empty string"}
+    if not author or not str(author).strip():
+        return {"error": "author must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}
+    found = _find_para_by_id(root, anchor_para_id)
+    if found is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _body, paragraph, _child_index = found
+
+    updated_parts, comment_id = _stage_word_comment(raw, root, paragraph, text, author, initials)
+
     with _docx_promotion_lock(docx_path):
         try:
             _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
@@ -20193,6 +20262,430 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
         "query_count": len(queries),
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# 7c3e4b9a -- flag_for_review: the recurring "flag this spot for a human to
+# look at" pattern several editing sessions had to hand-roll every time as a
+# throwaway raw-zip script (open the .docx, string-replace inside
+# word/document.xml, create word/comments.xml from scratch by hand when the
+# document had none yet, re-zip, and hope nothing else broke) instead of
+# using a real, tested, reusable meridian-docs tool. This is that tool.
+#
+# ONE call does what previously took three: resolve an anchor (a raw
+# w14:paraId/synth id, OR a locate_anchor-style {section_path/section_text/
+# caption_label/text/...} query so a caller can flag "the paragraph
+# containing this phrase" without a separate lookup step), apply a native
+# <w:highlight> to every run in that paragraph, AND attach a real Word
+# comment explaining what needs attention -- anchored to that SAME
+# paragraph, in ONE atomic write.
+#
+# Deliberately reuses, rather than reimplements:
+#   - locate_anchor's own query resolution (the exact same read-only
+#     resolver plan_batch_transform/build_prose_edit_packet already build
+#     on) for the dict-query anchor form;
+#   - _stage_word_comment (the comment-id-allocation/comments.xml-create-or-
+#     extend/rels/content-types plumbing factored out of insert_word_comment
+#     itself, 5bab074/W2-C) for the comment half -- so a document with ZERO
+#     pre-existing comments and one that already has some are both handled
+#     by the exact same, already-covered code path, not a new copy of it;
+#   - _highlight_paragraph_runs (built on the same _set_run_highlight
+#     primitive highlight_document_matches uses) for the highlight half;
+#   - _save_docx_with_new_parts_stdlib + _docx_promotion_lock +
+#     _enforce_render_verification for the write itself -- the same staged
+#     verify-then-promote transaction, structural (ZIP/XML/relationship)
+#     integrity gate, and real Word/COM-or-LibreOffice render-capability
+#     check every other multi-part writer in this module already goes
+#     through. No fresh, unverified ElementTree round-trip.
+# ---------------------------------------------------------------------------
+
+
+def _verify_flag_write(
+    docx_path: str,
+    *,
+    comment_id: int,
+    expected_text: str,
+    anchor_para_id: str,
+    highlight_color: str,
+    expect_highlight: bool,
+) -> dict[str, Any] | None:
+    """Post-write verification for :func:`flag_for_review`, mirroring
+    :func:`_verify_note_write`'s "re-read fresh from disk, never trust the
+    in-memory tree that was just serialized" discipline.
+
+    Confirms, independently of the write path that produced them:
+
+      1. the target paragraph (re-resolved by ``anchor_para_id`` -- body
+         positions can shift, ids don't) carries a run with
+         ``<w:highlight w:val=highlight_color>`` whenever ``expect_highlight``
+         is True (the paragraph had at least one run to highlight at write
+         time);
+      2. that SAME paragraph -- not merely somewhere in the document --
+         carries a ``commentRangeStart``/``commentRangeEnd``/
+         ``commentReference`` trio for ``comment_id``;
+      3. ``word/comments.xml`` has a ``<w:comment w:id=comment_id>`` whose
+         text matches ``expected_text`` exactly.
+
+    Returns ``None`` when every check passes, or an ``{"error": ...}`` dict
+    on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    found = _find_para_by_id(root2, anchor_para_id)
+    if found is None:
+        return {
+            "error": (
+                "post-write verification failed: anchor paragraph "
+                f"{anchor_para_id!r} was not found in {docx_path} after "
+                "the write"
+            )
+        }
+    _body2, paragraph2, _idx2 = found
+    w_id = _q(_W, "id")
+    comment_id_str = str(comment_id)
+
+    if expect_highlight:
+        has_highlight = any(
+            highlight.get(_q(_W, "val")) == highlight_color
+            for run in paragraph2.iter(_q(_W, "r"))
+            for highlight in run.iter(_q(_W, "highlight"))
+        )
+        if not has_highlight:
+            return {
+                "error": (
+                    "post-write verification failed: no run in the anchor "
+                    f"paragraph ({anchor_para_id!r}) carries "
+                    f"<w:highlight w:val={highlight_color!r}> in "
+                    f"{docx_path} after the write"
+                )
+            }
+
+    has_start = any(
+        el.get(w_id) == comment_id_str
+        for el in paragraph2.iter(_q(_W, "commentRangeStart"))
+    )
+    has_end = any(
+        el.get(w_id) == comment_id_str
+        for el in paragraph2.iter(_q(_W, "commentRangeEnd"))
+    )
+    has_ref = any(
+        el.get(w_id) == comment_id_str
+        for el in paragraph2.iter(_q(_W, "commentReference"))
+    )
+    if not (has_start and has_end and has_ref):
+        return {
+            "error": (
+                "post-write verification failed: comment range markers for "
+                f"comment_id {comment_id} were not found anchored to "
+                f"paragraph {anchor_para_id!r} in {docx_path} after the "
+                "write"
+            )
+        }
+
+    try:
+        with zipfile.ZipFile(docx_path) as archive:
+            comments_part = "word/comments.xml"
+            try:
+                rels_root = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+                for relation in rels_root.findall(_q(_REL_NS, "Relationship")):
+                    if relation.get("Type") == _COMMENTS_REL_TYPE:
+                        target = relation.get("Target", "comments.xml").lstrip("/")
+                        comments_part = (
+                            target if target.startswith("word/") else f"word/{target}"
+                        )
+                        break
+            except (KeyError, ET.ParseError):
+                pass
+            comments_root = ET.fromstring(archive.read(comments_part))
+    except (OSError, KeyError, ET.ParseError, zipfile.BadZipFile) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read the "
+                f"comments part of {docx_path} after writing it: {exc}"
+            )
+        }
+
+    comment_el = next(
+        (
+            c for c in comments_root.findall(_q(_W, "comment"))
+            if c.get(w_id) == comment_id_str
+        ),
+        None,
+    )
+    if comment_el is None:
+        return {
+            "error": (
+                f"post-write verification failed: comment id {comment_id} "
+                f"not found in {docx_path}'s comments part after the write"
+            )
+        }
+    actual_text = "".join(t.text or "" for t in comment_el.iter(_q(_W, "t")))
+    if actual_text != expected_text:
+        return {
+            "error": (
+                "post-write verification failed: comment text mismatch "
+                f"(comment_id {comment_id}) (expected {expected_text!r}, "
+                f"got {actual_text!r})"
+            )
+        }
+    return None
+
+
+def flag_for_review(
+    docx_path: str,
+    anchor: str | dict[str, Any],
+    note: str,
+    highlight_color: str = "yellow",
+    author: str = "Meridian",
+    initials: str = "M",
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """7c3e4b9a -- flag a location in a .docx for human review: a native
+    ``<w:highlight>`` on every run of the anchored paragraph PLUS a real
+    Word comment explaining what needs attention, anchored to that same
+    paragraph, in ONE atomic write. See the module comment above this
+    function for the full "why this exists" writeup.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor:           Either a raw paragraph id (``str`` -- a native
+                        ``w14:paraId``, the ``sp<hash>`` synth id, or the
+                        legacy ``p{N}`` form -- same three schemes
+                        :func:`_find_para_by_id` already resolves), OR a
+                        ``dict`` :func:`locate_anchor`-style query (e.g.
+                        ``{"text": "..."}``, ``{"section_path": "3.2.4",
+                        "text": "..."}``, ``{"caption_label": "Figure 3"}``)
+                        resolved via a fresh, read-only :func:`locate_anchor`
+                        call before anything is written. A query that
+                        resolves ambiguously, to nothing, or to a table/
+                        table-cell element (paragraph-only tool) is refused
+                        with the full locator detail attached -- never
+                        guessed.
+      note:             The comment's text (must be non-empty).
+      highlight_color:  A native ``<w:highlight w:val="...">`` value --
+                        validated against the same
+                        :data:`_VALID_HIGHLIGHT_COLORS` allow-list
+                        :func:`resolve_style_policy` already enforces for
+                        ``note_highlight_color``. Default ``"yellow"``.
+      author, initials: Recorded on the Word comment, same as
+                        :func:`insert_word_comment`.
+      index_db_path:    If supplied, the sidecar's cached mtime is
+                        invalidated and the flag is recorded into the same
+                        ``docx_internal_notes`` table
+                        :func:`insert_highlighted_note`'s ``mode="comment"``
+                        path uses (so :func:`list_internal_notes` surfaces
+                        it too), under note id ``_MComment<comment_id>``.
+      allow_degraded_render / degraded_render_reason: the same audited
+                        opt-in :func:`insert_figure_block` /
+                        :func:`insert_word_comment` expose for "no render
+                        backend available in this environment" -- required
+                        together; see :func:`_enforce_render_verification`
+                        for the full three-state contract.
+
+    Returns ``{status: "flagged", comment_id, note_id, text, anchor_para_id,
+    element_type, section_path, highlighted_run_count, highlight_color,
+    author, initials, docx_path, source_fingerprint?, render_status,
+    render_verified, ...}`` on success, or ``{"error": <message>, ...}`` on
+    any validation, resolution, write, or verification failure -- the file
+    is left untouched on a validation/resolution failure, and either
+    correctly written or safely restored (see
+    :func:`_safe_restore_after_verification_failure`) on a write/
+    verification failure.
+    """
+    if not note or not str(note).strip():
+        return {"error": "note must be a non-empty string"}
+    if highlight_color not in _VALID_HIGHLIGHT_COLORS:
+        return {
+            "error": (
+                "highlight_color must be one of "
+                f"{sorted(_VALID_HIGHLIGHT_COLORS)}, got {highlight_color!r}"
+            )
+        }
+    if not author or not str(author).strip():
+        return {"error": "author must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    expected_source_fingerprint: str | None = None
+    element_type: str | None = None
+    section_path: str | None = None
+
+    if isinstance(anchor, str):
+        if not anchor.strip():
+            return {"error": "anchor must be a non-empty para_id string, or a query dict"}
+        anchor_para_id = anchor
+    elif isinstance(anchor, dict):
+        if not anchor:
+            return {"error": "anchor query dict must be non-empty"}
+        located = locate_anchor(docx_path, anchor)
+        if located.get("error"):
+            return {"error": f"anchor resolution failed: {located['error']}"}
+        status = located.get("status")
+        if status != "resolved":
+            return {
+                "error": (
+                    f"anchor query did not resolve to exactly one location "
+                    f"(status={status!r}) -- narrow the query and retry"
+                ),
+                "locate_result": located,
+            }
+        if located.get("element_type") in ("table", "table_cell"):
+            return {
+                "error": (
+                    "anchor resolved to a "
+                    f"{located['element_type']!r} element (para_id "
+                    f"{located.get('target_para_id')!r}) -- flag_for_review "
+                    "only supports paragraph/heading/caption anchors, not "
+                    "table or table-cell targets"
+                ),
+                "locate_result": located,
+            }
+        anchor_para_id = located["target_para_id"]
+        expected_source_fingerprint = located.get("source_fingerprint")
+        element_type = located.get("element_type")
+        section_path = located.get("section_path")
+    else:
+        return {"error": f"anchor must be a str para_id or a query dict, got {type(anchor).__name__}"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if expected_source_fingerprint is not None:
+        current_fingerprint = _source_fingerprint(raw)
+        if current_fingerprint != expected_source_fingerprint:
+            return {
+                "error": (
+                    f"{docx_path} changed between anchor resolution and "
+                    "this write -- refusing to flag a possibly-stale "
+                    "location; re-resolve the anchor and retry"
+                ),
+                "expected_source_fingerprint": expected_source_fingerprint,
+                "source_fingerprint": current_fingerprint,
+            }
+
+    found = _find_para_by_id(root, anchor_para_id)
+    if found is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _body, paragraph, _child_index = found
+
+    note_clean = str(note).strip()
+    highlighted_run_count = _highlight_paragraph_runs(paragraph, highlight_color)
+
+    updated_parts, comment_id = _stage_word_comment(
+        raw, root, paragraph, note_clean, author, initials
+    )
+    note_id = f"_MComment{comment_id}"
+
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+
+        verify_error = _verify_flag_write(
+            docx_path,
+            comment_id=comment_id,
+            expected_text=note_clean,
+            anchor_para_id=anchor_para_id,
+            highlight_color=highlight_color,
+            expect_highlight=highlighted_run_count > 0,
+        )
+        if verify_error is not None:
+            # 5988a5bb-style CAS safety -- see insert_highlighted_note's own
+            # identical guard for the full rationale: never blindly restore
+            # over a different, already-promoted concurrent writer's work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["comment_id"] = comment_id
+            verify_error["note_id"] = note_id
+            verify_error["anchor_para_id"] = anchor_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["comment_id"] = comment_id
+            render_error["note_id"] = note_id
+            render_error["anchor_para_id"] = anchor_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    if index_db_path and os.path.exists(index_db_path):
+        _upsert_sidecar_note(index_db_path, note_id, note_clean, anchor_para_id)
+
+    result = {
+        "status": "flagged",
+        "comment_id": comment_id,
+        "note_id": note_id,
+        "text": note_clean,
+        "anchor_para_id": anchor_para_id,
+        "highlighted_run_count": highlighted_run_count,
+        "highlight_color": highlight_color,
+        "author": str(author).strip(),
+        "initials": str(initials or "").strip()[:9],
+        "docx_path": docx_path,
+        **render_info,
+    }
+    if element_type is not None:
+        result["element_type"] = element_type
+    if section_path is not None:
+        result["section_path"] = section_path
+    if expected_source_fingerprint is not None:
+        result["source_fingerprint"] = expected_source_fingerprint
+    return result
 
 
 # ---------------------------------------------------------------------------
