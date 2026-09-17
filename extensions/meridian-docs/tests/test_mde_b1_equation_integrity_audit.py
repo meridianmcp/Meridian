@@ -371,6 +371,43 @@ def test_number_gap_is_flagged():
     assert findings[0]["missing_number"] == 2
 
 
+def test_continued_numbering_from_a_companion_document_has_no_gap():
+    """df716454 -- a real SI document's equations legitimately continue its
+    companion manuscript's own numbering (e.g. 39-94 continuing 1-38). The
+    gap check must scope its expected range to the numbers actually
+    OBSERVED, not assume every document starts at 1 -- so a contiguous
+    39, 40, 41 must produce zero equation_number_gap findings, not 38 false
+    ones for "missing" numbers 1 through 38."""
+    body = (
+        "<w:tbl>\n"
+        + _numbered_row("AAA00121", _omath(inner=_run("a")), "(39)") + "\n"
+        + _numbered_row("AAA00122", _omath(inner=_run("b")), "(40)") + "\n"
+        + _numbered_row("AAA00123", _omath(inner=_run("c")), "(41)") + "\n"
+        "</w:tbl>"
+    )
+    raw = _zip_docx(_doc(body))
+    result = docs_intel.audit_equation_integrity(raw)
+    assert _findings_of_type(result, "equation_number_gap") == []
+
+
+def test_continued_numbering_from_a_companion_document_still_flags_real_gap():
+    """Companion-document continuation (not starting at 1) must not mask a
+    GENUINE internal gap: 39, 40, 41, then a jump to 44 -- 42 and 43 are
+    really missing and must still be reported, and ONLY those two."""
+    body = (
+        "<w:tbl>\n"
+        + _numbered_row("AAA00124", _omath(inner=_run("a")), "(39)") + "\n"
+        + _numbered_row("AAA00125", _omath(inner=_run("b")), "(40)") + "\n"
+        + _numbered_row("AAA00126", _omath(inner=_run("c")), "(41)") + "\n"
+        + _numbered_row("AAA00127", _omath(inner=_run("d")), "(44)") + "\n"
+        "</w:tbl>"
+    )
+    raw = _zip_docx(_doc(body))
+    result = docs_intel.audit_equation_integrity(raw)
+    findings = _findings_of_type(result, "equation_number_gap")
+    assert sorted(f["missing_number"] for f in findings) == [42, 43]
+
+
 def test_alpha_suffixed_numbers_do_not_produce_a_spurious_gap():
     """(1), (2), (2a) -- the 'a' suffix is a legitimate sub-numbering
     convention, not a gap."""

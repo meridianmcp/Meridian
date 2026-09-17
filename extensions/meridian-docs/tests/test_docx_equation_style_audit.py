@@ -238,6 +238,31 @@ _GAP_NUMBERS_DOC = _doc(
     "    </w:tbl>"
 )
 
+# df716454 -- a document (e.g. a supplementary-information file) whose
+# equation numbering legitimately CONTINUES a companion document's own
+# sequence instead of starting at 1. No internal gap here -- 39, 40, 41 are
+# contiguous -- so this must produce ZERO equation_number_gap findings, not
+# 38 false ones for "missing" numbers 1-38.
+_CONTINUED_NUMBERING_NO_GAP_DOC = _doc(
+    "    <w:tbl>\n"
+    + _numbered_row("EQC001", "(39)") + "\n"
+    + _numbered_row("EQC002", "(40)") + "\n"
+    + _numbered_row("EQC003", "(41)") + "\n"
+    "    </w:tbl>"
+)
+
+# Same continued-numbering scenario, but with a genuine internal gap: 39, 40,
+# 41, then a jump to 44 -- 42 and 43 are really missing and must still be
+# flagged, even though the sequence doesn't start at 1.
+_CONTINUED_NUMBERING_WITH_GAP_DOC = _doc(
+    "    <w:tbl>\n"
+    + _numbered_row("EQC101", "(39)") + "\n"
+    + _numbered_row("EQC102", "(40)") + "\n"
+    + _numbered_row("EQC103", "(41)") + "\n"
+    + _numbered_row("EQC104", "(44)") + "\n"
+    "    </w:tbl>"
+)
+
 _ALPHA_SUFFIX_DOC = _doc(
     "    <w:tbl>\n"
     + _numbered_row("EQA001", "(1)") + "\n"
@@ -1022,6 +1047,30 @@ def test_audit_equation_number_gap(tmp_path):
     assert result["findings_by_type"] == {"equation_number_gap": 1}
     finding = result["findings"][0]
     assert finding["missing_number"] == 2
+
+
+def test_audit_equation_numbering_continuing_a_companion_document_has_no_gap(tmp_path):
+    """df716454 regression -- a real SI document's equations legitimately
+    and correctly continue its companion manuscript's own numbering (e.g.
+    39-94 continuing 1-38). The gap check must scope its expected range to
+    the numbers actually OBSERVED (39..41 here), never assume every
+    document starts at 1 -- so this must report zero findings, not 38 false
+    "missing_number" findings for 1 through 38."""
+    path = _write_docx(tmp_path, _CONTINUED_NUMBERING_NO_GAP_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["findings"] == []
+
+
+def test_audit_equation_numbering_continuing_a_companion_document_still_flags_real_gap(tmp_path):
+    """Companion-document continuation (not starting at 1) must not mask a
+    GENUINE internal gap: 39, 40, 41, then a jump to 44 -- 42 and 43 are
+    really missing and must still be reported, and ONLY those two (not 1-38
+    below the observed start)."""
+    path = _write_docx(tmp_path, _CONTINUED_NUMBERING_WITH_GAP_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["findings_by_type"] == {"equation_number_gap": 2}
+    missing = sorted(f["missing_number"] for f in result["findings"])
+    assert missing == [42, 43]
 
 
 def test_audit_alphabetic_suffix_does_not_create_false_gap_or_duplicate(tmp_path):

@@ -10328,9 +10328,13 @@ def audit_equation_style(
        :func:`parse_docx_equations_local` already detects), numbers are
        compared whitespace-normalized for exact duplicates, and each number's
        LEADING integer (``"2a"`` -> ``2``) is checked for a contiguous
-       1..max sequence. Non-numeric labels (``"(A.1)"``, ``"(eq3)"``) still
-       participate in duplicate detection but are excluded from gap
-       detection (no well-defined "next integer").
+       sequence spanning the OBSERVED min..max range -- never assumed to
+       start at 1, since a document's numbering may legitimately continue a
+       companion document's own sequence (see the resolution note inline at
+       the ``expected_range`` computation below). Non-numeric labels
+       (``"(A.1)"``, ``"(eq3)"``) still participate in duplicate detection
+       but are excluded from gap detection (no well-defined "next
+       integer").
 
     Args:
       docx_path:     Absolute path to the .docx file. Read-only -- this
@@ -10461,7 +10465,17 @@ def audit_equation_style(
         if v is not None
     })
     if leading_ints:
-        expected_range = set(range(1, leading_ints[-1] + 1))
+        # df716454 -- the expected range is scoped to the OBSERVED numbers
+        # (leading_ints[0]..leading_ints[-1]), never hardcoded to start at
+        # 1. A document's equation numbering may legitimately continue a
+        # companion document's own sequence (e.g. an SI running 39-94 right
+        # after its manuscript's 1-38) -- that is undetectable from a
+        # single document and must never be flagged as 38 missing numbers.
+        # A genuine gap INSIDE the observed range (39,40,41, then a jump to
+        # 44 -- 42/43 missing) is still flagged normally. When numbering
+        # starts at 1 (the common case) this is identical to the prior
+        # hardcoded-1 behavior.
+        expected_range = set(range(leading_ints[0], leading_ints[-1] + 1))
         for missing in sorted(expected_range - set(leading_ints)):
             findings.append({"type": "equation_number_gap", "missing_number": missing})
 
@@ -11019,6 +11033,15 @@ def audit_heading_style(
     findings: list[dict[str, Any]] = []
     heading_count = 0
 
+    # df716454 -- parsed ONCE per document (not per heading) so that a
+    # heading with no direct <w:pPr>/<w:spacing> override can still resolve
+    # its EFFECTIVE spacing by cascading up its named style's w:basedOn
+    # chain, instead of the actual value being incorrectly treated as
+    # None/"unset" just because it lives in the style definition rather
+    # than as a direct per-paragraph override. See
+    # _effective_spacing_from_chain for the cascade-resolution rule.
+    styles_chain = _parse_styles_xml_chain(_raw)
+
     for index, p in enumerate(body):
         if p.tag != w_p:
             continue
@@ -11038,8 +11061,20 @@ def audit_heading_style(
 
         if 1 <= level <= 3:
             spacing = ppr.find(w_spacing) if ppr is not None else None
-            actual_before = _twips_attr(spacing.get(w_before) if spacing is not None else None)
-            actual_after = _twips_attr(spacing.get(w_after) if spacing is not None else None)
+            direct_before = _twips_attr(spacing.get(w_before) if spacing is not None else None)
+            direct_after = _twips_attr(spacing.get(w_after) if spacing is not None else None)
+            # A direct per-paragraph override always wins; only fall back to
+            # the cascaded style-chain value for whichever edge (before/
+            # after) has NO direct override of its own -- each edge
+            # resolves independently, matching how Word itself cascades
+            # w:before and w:after as separate properties.
+            cascaded_before = cascaded_after = None
+            if direct_before is None or direct_after is None:
+                cascaded_before, cascaded_after = _effective_spacing_from_chain(
+                    styles_chain, style,
+                )
+            actual_before = direct_before if direct_before is not None else cascaded_before
+            actual_after = direct_after if direct_after is not None else cascaded_after
 
             expected_before = policy[f"heading_spacing_before_h{level}_twips"]
             if expected_before is not None and actual_before != expected_before:
@@ -11088,6 +11123,154 @@ def audit_heading_style(
         "findings_by_type": findings_by_type,
         "policy": policy,
     }
+
+
+def _parse_styles_xml_chain(raw: bytes) -> dict[str, dict[str, Any]] | None:
+    """df716454 -- parse ``word/styles.xml`` ONCE into a reusable
+    ``{style_id: {"based_on": <style_id str | None>,
+    "spacing_before_twips": <int | None>,
+    "spacing_after_twips": <int | None>}}`` map, plus a synthetic ``""``
+    (empty-string) key holding ``<w:docDefaults>``'s own paragraph spacing --
+    Word's final fallback when neither a paragraph nor any style in its
+    ``w:basedOn`` chain sets an edge.
+
+    Backing primitive for :func:`_effective_spacing_from_chain`, which walks
+    the ``based_on`` links this returns to resolve one style's EFFECTIVE
+    (cascaded) spacing. Kept separate from :func:`_style_definition_facts`
+    (which reads one style's OWN direct definition, for
+    :func:`audit_cross_document_consistency`'s different
+    diff-two-documents purpose) because chain resolution needs the
+    ``w:basedOn`` link that helper never reads, and because parsing once per
+    document -- not once per heading paragraph -- matters for a document
+    with many headings.
+
+    Returns ``None`` when ``word/styles.xml`` is absent from the package or
+    malformed -- callers must never guess a cascaded value for a document
+    they can't positively read, mirroring every other "unverified means
+    don't check" gate in this module.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            if "word/styles.xml" not in zf.namelist():
+                return None
+            data = zf.read("word/styles.xml")
+    except zipfile.BadZipFile:
+        return None
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return None
+
+    w_style = _q(_W, "style")
+    w_styleId_attr = _q(_W, "styleId")
+    w_basedOn = _q(_W, "basedOn")
+    w_pPr = _q(_W, "pPr")
+    w_spacing = _q(_W, "spacing")
+    w_before = _q(_W, "before")
+    w_after = _q(_W, "after")
+    w_val = _q(_W, "val")
+    w_docDefaults = _q(_W, "docDefaults")
+    w_pPrDefault = _q(_W, "pPrDefault")
+
+    def _spacing_from_ppr(ppr: ET.Element | None) -> tuple[int | None, int | None]:
+        if ppr is None:
+            return None, None
+        spacing = ppr.find(w_spacing)
+        if spacing is None:
+            return None, None
+        before_raw = spacing.get(w_before)
+        after_raw = spacing.get(w_after)
+        before = (
+            int(before_raw)
+            if before_raw is not None and before_raw.lstrip("-").isdigit()
+            else None
+        )
+        after = (
+            int(after_raw)
+            if after_raw is not None and after_raw.lstrip("-").isdigit()
+            else None
+        )
+        return before, after
+
+    chain: dict[str, dict[str, Any]] = {}
+    for style in root.iter(w_style):
+        style_id = style.get(w_styleId_attr)
+        if not style_id:
+            continue
+        based_on_el = style.find(w_basedOn)
+        based_on = based_on_el.get(w_val) if based_on_el is not None else None
+        before, after = _spacing_from_ppr(style.find(w_pPr))
+        chain[style_id] = {
+            "based_on": based_on,
+            "spacing_before_twips": before,
+            "spacing_after_twips": after,
+        }
+
+    doc_defaults_before = doc_defaults_after = None
+    doc_defaults_el = root.find(w_docDefaults)
+    if doc_defaults_el is not None:
+        ppr_default_el = doc_defaults_el.find(w_pPrDefault)
+        if ppr_default_el is not None:
+            doc_defaults_before, doc_defaults_after = _spacing_from_ppr(
+                ppr_default_el.find(w_pPr)
+            )
+    chain[""] = {
+        "based_on": None,
+        "spacing_before_twips": doc_defaults_before,
+        "spacing_after_twips": doc_defaults_after,
+    }
+    return chain
+
+
+def _effective_spacing_from_chain(
+    chain: dict[str, dict[str, Any]] | None,
+    style_id: str | None,
+    max_depth: int = 20,
+) -> tuple[int | None, int | None]:
+    """df716454 -- resolve ``style_id``'s EFFECTIVE (cascaded) paragraph
+    ``w:spacing`` before/after, walking ``chain`` (from
+    :func:`_parse_styles_xml_chain`) up ``w:basedOn`` links. Each edge
+    (before / after) is resolved INDEPENDENTLY -- Word cascades each one up
+    its own nearest ancestor that sets it, not as a single all-or-nothing
+    unit, so a style that sets only ``w:before`` still lets ``w:after``
+    keep walking past it. Falls back to the chain's ``""`` (docDefaults)
+    entry when neither ``style_id`` nor any ancestor sets an edge.
+
+    Returns ``(None, None)`` when ``chain`` is ``None`` (no readable
+    ``word/styles.xml``) or ``style_id`` is falsy -- "unverified means don't
+    guess", the same contract as :func:`_style_definition_facts`.
+    ``max_depth`` guards against a malformed/cyclic ``w:basedOn`` chain
+    (an authoring bug in the document, not something this resolver should
+    hang on) rather than being a normally-reached limit.
+    """
+    if not chain or not style_id:
+        return None, None
+
+    before = after = None
+    seen: set[str] = set()
+    current: str | None = style_id
+    depth = 0
+    while current and current not in seen and depth < max_depth:
+        seen.add(current)
+        entry = chain.get(current)
+        if entry is None:
+            break
+        if before is None:
+            before = entry["spacing_before_twips"]
+        if after is None:
+            after = entry["spacing_after_twips"]
+        if before is not None and after is not None:
+            return before, after
+        current = entry["based_on"]
+        depth += 1
+
+    doc_defaults = chain.get("")
+    if doc_defaults is not None:
+        if before is None:
+            before = doc_defaults["spacing_before_twips"]
+        if after is None:
+            after = doc_defaults["spacing_after_twips"]
+    return before, after
 
 
 def _style_definition_facts(raw: bytes, style_id_or_name: str) -> dict[str, Any] | None:
@@ -25018,8 +25201,8 @@ _EQ_SHAPE_PURE_INT = re.compile(r"^\(\s*(\d+)[a-zA-Z]?\s*\)$")
 def _classify_equation_number_shape(number_text: "str | None") -> "dict[str, Any] | None":
     """Classify one equation-number LABEL's SHAPE for numbering-scope
     tracking -- distinct from :func:`_leading_equation_number`'s single
-    leading integer (used for flat 1..N gap detection): a document may
-    legitimately use more than one numbering CONVENTION at once (flat
+    leading integer (used for flat observed-min..max gap detection): a
+    document may legitimately use more than one numbering CONVENTION at once (flat
     ``(1)``, sectioned ``(2.3)``, appendix ``(A.1)``) and mixing them is a
     scope-ambiguity SIGNAL, not automatically an error.
 
@@ -25446,7 +25629,15 @@ def audit_equation_integrity(source: "str | bytes | bytearray") -> "dict[str, An
         if value is not None
     })
     if flat_shape_numbers:
-        expected_range = set(range(1, flat_shape_numbers[-1] + 1))
+        # df716454 -- same fix as audit_equation_style's own gap check:
+        # scope the expected range to the OBSERVED numbers
+        # (flat_shape_numbers[0]..flat_shape_numbers[-1]) instead of
+        # hardcoding a start of 1, so a document whose numbering legitimately
+        # continues a companion document's sequence (e.g. an SI starting at
+        # 39) isn't flagged with dozens of false "missing" numbers below its
+        # true starting point. A genuine gap inside the observed range is
+        # still flagged normally.
+        expected_range = set(range(flat_shape_numbers[0], flat_shape_numbers[-1] + 1))
         for missing in sorted(expected_range - set(flat_shape_numbers)):
             findings.append({
                 "type": EQUATION_FINDING_NUMBER_GAP,

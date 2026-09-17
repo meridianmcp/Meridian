@@ -84,6 +84,63 @@ def _body_para(text: str, para_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# df716454 bug fix -- styles.xml fixtures for cascaded (style-inherited)
+# heading spacing, as opposed to a direct per-paragraph <w:spacing>
+# override. A real manuscript's headings correctly rely on their named
+# style rather than overriding it directly, and the pre-fix implementation
+# only ever read the direct override, incorrectly treating the inherited
+# value as "unset" and flagging a false mismatch.
+# ---------------------------------------------------------------------------
+
+def _style_def(
+    style_id: str,
+    based_on: str | None = None,
+    before: int | None = None,
+    after: int | None = None,
+) -> str:
+    based_on_xml = f'<w:basedOn w:val="{based_on}"/>' if based_on else ""
+    attrs = ""
+    if before is not None:
+        attrs += f' w:before="{before}"'
+    if after is not None:
+        attrs += f' w:after="{after}"'
+    spacing_xml = f"<w:spacing{attrs}/>" if attrs else ""
+    ppr_xml = f"<w:pPr>{spacing_xml}</w:pPr>" if spacing_xml else ""
+    return f'<w:style w:type="paragraph" w:styleId="{style_id}">{based_on_xml}{ppr_xml}</w:style>'
+
+
+def _doc_defaults(before: int | None = None, after: int | None = None) -> str:
+    attrs = ""
+    if before is not None:
+        attrs += f' w:before="{before}"'
+    if after is not None:
+        attrs += f' w:after="{after}"'
+    spacing_xml = f"<w:spacing{attrs}/>" if attrs else ""
+    return f"<w:docDefaults><w:pPrDefault><w:pPr>{spacing_xml}</w:pPr></w:pPrDefault></w:docDefaults>"
+
+
+def _styles_xml(styles_body: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:styles {_NS_HEADER}>
+{styles_body}
+</w:styles>"""
+
+
+def _zip_docx_with_styles(document_xml: str, styles_xml: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", document_xml)
+        zf.writestr("word/styles.xml", styles_xml)
+    return buf.getvalue()
+
+
+def _write_docx_with_styles(tmp_path, document_xml: str, styles_xml: str, name: str = "sample.docx") -> str:
+    path = tmp_path / name
+    path.write_bytes(_zip_docx_with_styles(document_xml, styles_xml))
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
 # Detection: per-level spacing, in isolation
 # ---------------------------------------------------------------------------
 
@@ -198,6 +255,130 @@ def test_non_heading_paragraph_ignored(tmp_path):
     )
     assert result["heading_count"] == 0
     assert result["finding_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# df716454 bug fix -- cascaded (style-inherited) spacing resolution.
+# ---------------------------------------------------------------------------
+
+def test_spacing_inherited_from_own_style_definition_not_flagged(tmp_path):
+    """The exact real-manuscript false positive this fixes: a heading with
+    NO direct <w:spacing> override correctly relies on its named style, and
+    that style's OWN definition in styles.xml already matches the policy --
+    this must NOT be flagged."""
+    body = _heading_para(1, "Introduction", "00000001")  # no direct spacing
+    styles = _styles_xml(_style_def("Heading1", before=480, after=240))
+    path = _write_docx_with_styles(tmp_path, _doc(body), styles)
+    result = docs_intel.audit_heading_style(
+        path,
+        style_policy={
+            "heading_spacing_before_h1_twips": 480,
+            "heading_spacing_after_h1_twips": 240,
+        },
+    )
+    assert result["findings"] == []
+
+
+def test_spacing_resolves_up_basedon_chain(tmp_path):
+    """Heading1 itself sets no spacing but is w:basedOn a parent style that
+    does -- the cascade must walk the chain, not stop at the immediate
+    style."""
+    body = _heading_para(1, "Introduction", "00000001")
+    styles = _styles_xml(
+        _style_def("Heading1", based_on="HeadingBase")
+        + _style_def("HeadingBase", before=480, after=240)
+    )
+    path = _write_docx_with_styles(tmp_path, _doc(body), styles)
+    result = docs_intel.audit_heading_style(
+        path,
+        style_policy={
+            "heading_spacing_before_h1_twips": 480,
+            "heading_spacing_after_h1_twips": 240,
+        },
+    )
+    assert result["findings"] == []
+
+
+def test_spacing_inherited_from_style_mismatch_still_flagged(tmp_path):
+    """The cascade resolves a real (non-None) value from the style -- and
+    that value is reported as actual_spacing_before_twips when it genuinely
+    doesn't match the policy, not silently swallowed."""
+    body = _heading_para(1, "Introduction", "00000001")
+    styles = _styles_xml(_style_def("Heading1", before=240, after=240))
+    path = _write_docx_with_styles(tmp_path, _doc(body), styles)
+    result = docs_intel.audit_heading_style(
+        path, style_policy={"heading_spacing_before_h1_twips": 480}
+    )
+    f = next(f for f in result["findings"] if f["type"] == "heading_spacing_before_mismatch")
+    assert f["actual_spacing_before_twips"] == 240
+
+
+def test_direct_override_wins_over_cascaded_style_value(tmp_path):
+    """A direct per-paragraph override always takes precedence over
+    whatever the style cascade would otherwise resolve."""
+    body = _heading_para(1, "Introduction", "00000001", before=999, after=240)
+    styles = _styles_xml(_style_def("Heading1", before=480, after=240))
+    path = _write_docx_with_styles(tmp_path, _doc(body), styles)
+    result = docs_intel.audit_heading_style(
+        path,
+        style_policy={
+            "heading_spacing_before_h1_twips": 480,
+            "heading_spacing_after_h1_twips": 240,
+        },
+    )
+    types = {f["type"] for f in result["findings"]}
+    assert types == {"heading_spacing_before_mismatch"}
+    f = next(f for f in result["findings"] if f["type"] == "heading_spacing_before_mismatch")
+    assert f["actual_spacing_before_twips"] == 999
+
+
+def test_before_and_after_edges_resolve_independently(tmp_path):
+    """A direct override for w:before only must not block w:after from
+    still falling back to the cascaded style value -- each edge resolves
+    independently, mirroring how Word itself cascades them."""
+    body = _heading_para(1, "Introduction", "00000001", before=480)  # after unset
+    styles = _styles_xml(_style_def("Heading1", after=240))
+    path = _write_docx_with_styles(tmp_path, _doc(body), styles)
+    result = docs_intel.audit_heading_style(
+        path,
+        style_policy={
+            "heading_spacing_before_h1_twips": 480,
+            "heading_spacing_after_h1_twips": 240,
+        },
+    )
+    assert result["findings"] == []
+
+
+def test_docdefaults_fallback_when_neither_paragraph_nor_style_sets_spacing(tmp_path):
+    """Word's own final fallback: neither the paragraph nor its style (nor
+    any ancestor) sets spacing, but <w:docDefaults> does -- the cascade
+    must fall all the way back to that."""
+    body = _heading_para(1, "Introduction", "00000001")
+    styles = _styles_xml(
+        _doc_defaults(before=480, after=240) + _style_def("Heading1")
+    )
+    path = _write_docx_with_styles(tmp_path, _doc(body), styles)
+    result = docs_intel.audit_heading_style(
+        path,
+        style_policy={
+            "heading_spacing_before_h1_twips": 480,
+            "heading_spacing_after_h1_twips": 240,
+        },
+    )
+    assert result["findings"] == []
+
+
+def test_no_spacing_anywhere_is_still_none(tmp_path):
+    """Genuinely unset everywhere (no direct override, no style spacing, no
+    docDefaults) must still resolve to None, not a guessed value."""
+    body = _heading_para(1, "Introduction", "00000001")
+    styles = _styles_xml(_style_def("Heading1"))
+    path = _write_docx_with_styles(tmp_path, _doc(body), styles)
+    result = docs_intel.audit_heading_style(
+        path, style_policy={"heading_spacing_before_h1_twips": 480}
+    )
+    f = next(f for f in result["findings"] if f["type"] == "heading_spacing_before_mismatch")
+    assert f["actual_spacing_before_twips"] is None
 
 
 # ---------------------------------------------------------------------------
