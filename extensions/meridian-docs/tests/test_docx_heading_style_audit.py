@@ -7,9 +7,13 @@ ever fires when write_section authors NEW heading content.
 Also covers:
   - build_document_review's "structure" category now also carries
     audit_heading_style findings (alongside audit_table_style's).
-  - The jcshm preset's six heading_spacing_*_h{1,2,3}_twips values, per this
-    session's real Tier-1 PDF-baseline measurement (H1: 2 body-lines
-    before/1 after; H2 IDENTICAL to H3: 1 body-line before/1 after).
+  - The jcshm preset's six heading_spacing_*_h{1,2,3}_twips values: H1 and
+    the four *_before_h{2,3} values per this session's real Tier-1 PDF-
+    baseline measurement (H1: 2 body-lines before/1 after; H2 IDENTICAL to
+    H3: 1 body-line before). after_h2/after_h3 were corrected 240 -> 120 on
+    2026-09-17 (df716454) after that PDF measurement proved collapse-
+    vulnerable for *-after specifically -- see docs_intel.py's jcshm preset
+    comment for the live-CSS/sn-jnl.cls evidence.
 
 All tests use synthetic .docx bytes built inline -- no real files, no
 network. Mirrors test_docx_table_style_audit.py's fixture conventions.
@@ -481,9 +485,14 @@ def test_jcshm_preset_heading_spacing_values():
     assert policy["heading_spacing_before_h1_twips"] == 480
     assert policy["heading_spacing_after_h1_twips"] == 240
     assert policy["heading_spacing_before_h2_twips"] == 240
-    assert policy["heading_spacing_after_h2_twips"] == 240
+    # after_h2/after_h3 corrected 240 -> 120 (df716454, 2026-09-17): the live
+    # JCSHM article CSS (.c-article__sub-heading{margin:24px 0 8px} = 8px =
+    # 120tw) and Springer Nature's sn-jnl.cls (\subsection/\subsubsection
+    # afterskip = 6pt = 120tw) independently converge on 120, superseding
+    # the collapse-vulnerable PDF line-count measurement that had said 240.
+    assert policy["heading_spacing_after_h2_twips"] == 120
     assert policy["heading_spacing_before_h3_twips"] == 240
-    assert policy["heading_spacing_after_h3_twips"] == 240
+    assert policy["heading_spacing_after_h3_twips"] == 120
     # H3 must equal H2, not be half of it -- the specific real measurement
     # finding this preset encodes.
     assert policy["heading_spacing_before_h2_twips"] == policy["heading_spacing_before_h3_twips"]

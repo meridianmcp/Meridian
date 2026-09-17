@@ -9461,6 +9461,28 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
     # real motivating case for audit_cross_document_consistency: this
     # session found the SI's BodyText/Normal styles explicitly set to 12pt
     # by eye, a mismatch no existing tooling would have caught.
+    # df716454 (2026-09-17 correction) -- heading_spacing_after_h2_twips and
+    # heading_spacing_after_h3_twips corrected 240 -> 120 (before_h2/before_h3
+    # and all h1 values are unaffected). The PDF-baseline line-count
+    # measurement documented above cannot cleanly separate a heading's own
+    # after-spacing from the following paragraph's own before-spacing under
+    # rendered spacing collapse -- exactly the failure mode that makes a
+    # line-count measurement unreliable for *-after keys specifically (the
+    # *-before keys aren't exposed to that ambiguity and stay at the
+    # measured 240). Two independent, non-rendering sources -- re-verified
+    # live in this session, not just re-read from a prior report -- converge
+    # exactly on 120 twips (6pt) for H2/H3-after: (1) a live JCSHM article's
+    # own CSS (link.springer.com/article/10.1007/s13349-024-00789-7):
+    # .c-article-section__title{margin-bottom:16px} for H1-after == the
+    # already-agreed 240tw (calibrates the source as transferable), vs.
+    # .c-article__sub-heading{margin:24px 0 8px} == 8px = 120tw for H2/H3-
+    # after; (2) Springer Nature's own sn-jnl.cls \@startsection afterskip
+    # args: \subsection/\subsubsection = 6pt = 120tw (its \section = 9pt
+    # does not match the docx H1 value, so only the H2/H3 absolute
+    # convergence is trusted from this source). Both real submission
+    # documents (staging/jcshm_v58_section2_refs_indent_ooxml_safe_20260904,
+    # review44/review63 candidates, 107 headings) already carry 120 twips --
+    # this preset default was the stale artifact, not the documents.
     "jcshm": {
         "caption_centered": True,
         "equation_alignment": "center",
@@ -9479,9 +9501,9 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
         "heading_spacing_before_h1_twips": 480,
         "heading_spacing_after_h1_twips": 240,
         "heading_spacing_before_h2_twips": 240,
-        "heading_spacing_after_h2_twips": 240,
+        "heading_spacing_after_h2_twips": 120,
         "heading_spacing_before_h3_twips": 240,
-        "heading_spacing_after_h3_twips": 240,
+        "heading_spacing_after_h3_twips": 120,
         "body_text_font_family": "Times New Roman",
         "body_text_font_size_pt": 10,
     },
