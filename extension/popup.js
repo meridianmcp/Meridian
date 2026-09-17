@@ -346,6 +346,61 @@ async function checkCm6Access() {
   });
 }
 
+/**
+ * "Insert test edit at document start" -- diagnostic-only exercise of the
+ * new write-dispatch primitive (MERIDIAN_LATEX_APPLY_EDITS ->
+ * content_script.js's applyEditsViaMainWorld -> injected.js's applyEdits ->
+ * view.dispatch). Deliberately minimal: a single `{from: 0, to: 0, insert}`
+ * edit, not a claim-integrated editing flow -- that's separate, later work
+ * once this primitive is proven (write-back-spec.md section 4, point 2).
+ * Shows the full structured result (applied/verified/reason) rather than
+ * collapsing it to a yes/no, so a failed validation or readback mismatch is
+ * visible, not silently swallowed.
+ */
+function setApplyEditResult(text, cls) {
+  const el = document.getElementById("apply-edit-result");
+  el.hidden = false;
+  el.textContent = text;
+  el.className = cls || "";
+}
+
+async function applyTestEdit() {
+  const input = document.getElementById("test-edit-text");
+  const text = input.value;
+  if (!text) {
+    setApplyEditResult("Type some text first.", "error");
+    return;
+  }
+
+  setApplyEditResult("Applying test edit…");
+  const tab = await getActiveOverleafTab();
+  if (!tab) {
+    setApplyEditResult("Not on an Overleaf project page.", "error");
+    return;
+  }
+
+  chrome.tabs.sendMessage(
+    tab.id,
+    { type: "MERIDIAN_LATEX_APPLY_EDITS", edits: [{ from: 0, to: 0, insert: text }] },
+    (resp) => {
+      if (chrome.runtime.lastError || !resp) {
+        setApplyEditResult("No response from content script — try reloading the Overleaf tab.", "error");
+        return;
+      }
+      if (!resp.applied) {
+        setApplyEditResult(`Not applied: ${resp.reason || "unknown reason"}`, "error");
+        return;
+      }
+      const verified = Array.isArray(resp.verified) ? resp.verified : [];
+      const allVerified = verified.length > 0 && verified.every(Boolean);
+      setApplyEditResult(
+        `Applied.\nnewLength: ${resp.newLength}\nverified: ${JSON.stringify(verified)}`,
+        allVerified ? "ok" : "warning",
+      );
+    },
+  );
+}
+
 // Best-effort release-all-for-this-holder on popup unload. chrome.runtime
 // doesn't reliably fire an event when a popup closes, so this is paired
 // with releaseStaleClaimsOnOpen() above as the other half of "belt and
@@ -364,4 +419,5 @@ window.addEventListener("pagehide", () => {
 document.getElementById("refresh").addEventListener("click", check);
 document.getElementById("get-outline").addEventListener("click", getOutline);
 document.getElementById("check-cm6").addEventListener("click", checkCm6Access);
+document.getElementById("apply-test-edit").addEventListener("click", applyTestEdit);
 check();

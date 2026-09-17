@@ -52,6 +52,12 @@ const CM6_REQUEST_SOURCE = "meridian-latex-content";
 const CM6_RESPONSE_SOURCE = "meridian-latex-injected";
 const CM6_PROBE_TIMEOUT_MS = 2000;
 
+// Write-dispatch primitive (see injected.js's applyEdits/write-back-spec.md).
+// Same MAIN-world bridge, a different request/response message pair.
+const APPLY_EDITS_REQUEST_TYPE = "meridian-latex-apply-edits";
+const APPLY_EDITS_RESPONSE_TYPE = "meridian-latex-apply-edits-result";
+const APPLY_EDITS_TIMEOUT_MS = 2000;
+
 // BUG FIXED 2026-09-17 (found by re-reading this code after a real, live
 // timeout report -- "Timed out waiting for the injected page script to
 // respond"): this used to append the <script> tag and fire
@@ -91,11 +97,24 @@ function injectMainWorldScript() {
   return mainWorldScriptReady;
 }
 
-/** Relays a doc-info request into the page's MAIN world and waits for
- * injected.js's response, with a timeout so a broken/missing injected
- * script never hangs the popup forever. Resolves (never rejects) to a
- * `{found, ...}` shaped object either way. */
-function getCM6Info() {
+/**
+ * Generic relay: sends a `{source: CM6_REQUEST_SOURCE, type: requestType, ...payload}`
+ * postMessage into the page's MAIN world (injecting injected.js first if it
+ * hasn't run yet) and waits for a same-window response shaped
+ * `{source: CM6_RESPONSE_SOURCE, type: responseType, ...}`, with a timeout so
+ * a broken/missing injected script never hangs the popup forever.
+ *
+ * Resolves (never rejects) either way. On timeout or injection failure it
+ * resolves `{...failureShape, reason}` -- `failureShape` lets each caller
+ * pick the right "nothing happened" shape for its own protocol (`{found:
+ * false}` for the read probe, `{applied: false}` for the write-dispatch
+ * primitive) without this helper needing to know which one it's relaying.
+ *
+ * Shared by getCM6Info() (read probe) and applyEditsViaMainWorld() (write
+ * dispatch) -- both request/response pairs use this same bridge mechanics,
+ * only the message types, payload, and failure shape differ.
+ */
+function relayToMainWorld(requestType, responseType, payload, failureShape, timeoutMs) {
   return new Promise((resolve) => {
     let settled = false;
 
@@ -112,24 +131,48 @@ function getCM6Info() {
       // shaped exactly like our own protocol.
       if (event.source !== window) return;
       const msg = event.data;
-      if (!msg || msg.source !== CM6_RESPONSE_SOURCE || msg.type !== CM6_RESPONSE_TYPE) return;
+      if (!msg || msg.source !== CM6_RESPONSE_SOURCE || msg.type !== responseType) return;
       const { source: _source, type: _type, ...info } = msg;
       finish(info);
     }
 
     const timer = setTimeout(() => {
-      finish({ found: false, reason: "Timed out waiting for the injected page script to respond." });
-    }, CM6_PROBE_TIMEOUT_MS);
+      finish({ ...failureShape, reason: "Timed out waiting for the injected page script to respond." });
+    }, timeoutMs);
 
     window.addEventListener("message", onMessage);
     injectMainWorldScript()
       .then(() => {
-        window.postMessage({ source: CM6_REQUEST_SOURCE, type: CM6_REQUEST_TYPE }, window.location.origin);
+        window.postMessage(
+          Object.assign({ source: CM6_REQUEST_SOURCE, type: requestType }, payload),
+          window.location.origin,
+        );
       })
       .catch((err) => {
-        finish({ found: false, reason: `Failed to inject page script: ${err.message}` });
+        finish({ ...failureShape, reason: `Failed to inject page script: ${err.message}` });
       });
   });
+}
+
+/** Relays a doc-info request into the page's MAIN world. Resolves to a
+ * `{found, ...}` shaped object. */
+function getCM6Info() {
+  return relayToMainWorld(CM6_REQUEST_TYPE, CM6_RESPONSE_TYPE, {}, { found: false }, CM6_PROBE_TIMEOUT_MS);
+}
+
+/** Relays a write-dispatch request (`edits: [{from, to, insert}, ...]`) into
+ * the page's MAIN world. Resolves to `{applied, verified?, newLength?}` on
+ * success or `{applied: false, reason}` on any failure -- see injected.js's
+ * applyEdits() for the validation/dispatch/readback-verification logic that
+ * produces this. */
+function applyEditsViaMainWorld(edits) {
+  return relayToMainWorld(
+    APPLY_EDITS_REQUEST_TYPE,
+    APPLY_EDITS_RESPONSE_TYPE,
+    { edits },
+    { applied: false },
+    APPLY_EDITS_TIMEOUT_MS,
+  );
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -143,6 +186,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === "MERIDIAN_LATEX_GET_CM6_INFO") {
     getCM6Info().then(sendResponse);
+    return true;
+  }
+  if (message?.type === "MERIDIAN_LATEX_APPLY_EDITS") {
+    applyEditsViaMainWorld(message.edits).then(sendResponse);
     return true;
   }
   return false;

@@ -17,6 +17,14 @@
         font-family: ui-monospace, monospace; white-space: pre-wrap; }
       #cm6-info.ok { background: #e6f4ea; color: #1e7e34; }
       #cm6-info.error { background: #fdecea; color: #a12622; }
+      .section-divider { border-top: 1px solid #ddd; margin: 14px 0 8px; }
+      .diagnostic-warning { font-size: 11px; color: #a12622; margin-bottom: 6px; }
+      #test-edit-text { width: 100%; box-sizing: border-box; padding: 6px; margin-top: 4px; font: 12px ui-monospace, monospace; }
+      #apply-edit-result { padding: 8px; border-radius: 6px; background: #f2f2f2; margin-top: 8px;
+        font-family: ui-monospace, monospace; white-space: pre-wrap; font-size: 11px; }
+      #apply-edit-result.ok { background: #e6f4ea; color: #1e7e34; }
+      #apply-edit-result.warning { background: #fff8e1; color: #8a6100; }
+      #apply-edit-result.error { background: #fdecea; color: #a12622; }
       #nodes { margin-top: 8px; max-height: 320px; overflow-y: auto; }
       .node-row { padding: 6px 8px; border-radius: 6px; background: #f8f8f8; margin-top: 6px; }
       .node-label { display: block; font-size: 12px; word-break: break-word; margin-bottom: 4px; }
@@ -36,6 +44,17 @@
     <div id="nodes" hidden></div>
     <button id="check-cm6">Check CM6 access</button>
     <div id="cm6-info" hidden></div>
+
+    <div class="section-divider"></div>
+    <h1>Write-back diagnostic</h1>
+    <div class="diagnostic-warning">
+      Test/diagnostic feature only -- inserts the text below at the very
+      start of the live document. Do not point this at a real manuscript;
+      use a disposable test project.
+    </div>
+    <input id="test-edit-text" type="text" placeholder="Text to insert at document start" />
+    <button id="apply-test-edit">Insert test edit at document start</button>
+    <div id="apply-edit-result" hidden></div>
   </body>
   <script src="popup.js"></script>
 </html>
