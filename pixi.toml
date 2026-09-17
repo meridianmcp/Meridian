@@ -193,6 +193,12 @@ soundfile = ">=0.13.1, <0.14"
 google-api-python-client = ">=2.197.0, <3"
 google-auth-oauthlib = ">=1.4.0, <2"
 fpdf2 = ">=2.7"
+# 4e4c3817 -- Windows tray/GUI installer (meridian-tray.exe). Build-time only,
+# same as pyinstaller above: pystray/Pillow must be IMPORTABLE in this
+# environment for PyInstaller to trace and bundle them into the frozen exe,
+# but nothing outside that build step (and the frozen exe itself) needs them.
+pystray = ">=0.19"
+Pillow = ">=10.0"
 
 # Local-only semantic code-search environment. Keep model2vec out of the
 # default and hosted/prod environments; Claude Desktop can opt into this
@@ -246,6 +252,7 @@ test-fast = "python scripts/run_tests.py tests/test_core.py tests/test_new_v25.p
 worktree-hygiene = "python -m meridian.worktree_hygiene --repo-root ."
 build-exe = "pyinstaller meridian.spec --clean"
 build-connect = "pyinstaller meridian-connect.spec --clean"
+build-tray = "pyinstaller meridian-tray.spec --clean"
 smoke-bundle = "node scripts/smoke_bundle.mjs"
 demo = "python scripts/demo.py"
 test-mcp = "python scripts/test_mcp.py"
