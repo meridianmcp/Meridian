@@ -21,10 +21,22 @@ fi
 sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)"
 url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count"
 [ -n "$sid" ] && url="$url?session_id=$sid"
+# 41f26499 — a Meridian-unreachable window (or a malformed/empty response)
+# used to fail open SILENTLY here, which could abandon this session's file
+# claims with no visible signal (they then only clear via the file-claim 2h
+# TTL). Fail-open behavior is UNCHANGED (still exit 0) but now surfaces a
+# clear stderr warning so the human/agent notices instead of silently
+# continuing.
 resp="$(curl -sf --max-time 5 "$url" 2>/dev/null || true)"
-[ -z "$resp" ] && exit 0
+if [ -z "$resp" ]; then
+  echo "Meridian (41f26499): could not reach $MERIDIAN_URL to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again." >&2
+  exit 0
+fi
 pending="$(printf '%s' "$resp" | grep -oE '"pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
-[ -z "$pending" ] && exit 0
+if [ -z "$pending" ]; then
+  echo "Meridian (41f26499): got an empty or malformed response from $MERIDIAN_URL - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again." >&2
+  exit 0
+fi
 if [ "$pending" -gt 0 ] 2>/dev/null; then
   echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
   exit 2
