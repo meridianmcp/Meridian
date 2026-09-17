@@ -270,6 +270,131 @@ def test_locate_anchor_unknown_caption_label_not_found(doc_path):
 
 
 # ---------------------------------------------------------------------------
+# 3f9a1c72 -- caption_label loose-prefix fallback for manually-typed captions
+# that never got a real Word SEQ field (e.g. Supplementary Information
+# figures numbered "Fig. S47" on a separate, hand-typed track), plus
+# find_caption_paragraph's delegation to the same resolver.
+# ---------------------------------------------------------------------------
+
+_SI_DOC_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="{_W}"
+    xmlns:w14="{_W14}">
+  <w:body>
+    <w:p w14:paraId="P0000001">
+      <w:r><w:t xml:space="preserve">Intro text mentioning Fig. S47 in passing, not as a caption.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="S0000001">
+      <w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Fig. S47: </w:t></w:r>
+      <w:r><w:t xml:space="preserve">Additional panel showing the control condition.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="S0000002">
+      <w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Table S3. </w:t></w:r>
+      <w:r><w:t xml:space="preserve">Summary of supplementary measurements.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="S0000003">
+      <w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Fig. S9 </w:t></w:r>
+      <w:r><w:t xml:space="preserve">first duplicate-numbered SI panel.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="S0000004">
+      <w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Fig. S9 </w:t></w:r>
+      <w:r><w:t xml:space="preserve">second duplicate-numbered SI panel (a real authoring error).</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+@pytest.fixture()
+def si_doc_path(tmp_path):
+    return _write_docx(tmp_path, _SI_DOC_XML, name="si_doc.docx")
+
+
+def test_locate_anchor_caption_label_falls_back_to_manually_typed_label(si_doc_path):
+    result = docs_intel.locate_anchor(si_doc_path, {"caption_label": "Fig. S47"})
+    assert result["status"] == "resolved"
+    assert result["target_para_id"] == "S0000001"
+    # It's a plain paragraph (no real SEQ field) -- honestly reported as
+    # such, not mislabeled as a real figure_caption element.
+    assert result["element_type"] == "paragraph"
+
+
+def test_locate_anchor_caption_label_fallback_is_punctuation_and_case_insensitive(si_doc_path):
+    for variant in ("fig s47", "FIG.S47", "Fig  S47:", "fig. s47"):
+        result = docs_intel.locate_anchor(si_doc_path, {"caption_label": variant})
+        assert result["status"] == "resolved", variant
+        assert result["target_para_id"] == "S0000001", variant
+
+
+def test_locate_anchor_caption_label_fallback_requires_leading_prefix_not_substring(si_doc_path):
+    # P0000001 merely MENTIONS "Fig. S47" mid-sentence -- must not match;
+    # only S0000001, whose own text actually STARTS with the label, should.
+    result = docs_intel.locate_anchor(si_doc_path, {"caption_label": "Fig. S47"})
+    assert result["target_para_id"] == "S0000001"
+    assert result["target_para_id"] != "P0000001"
+
+
+def test_locate_anchor_caption_label_fallback_matches_table_style_label(si_doc_path):
+    result = docs_intel.locate_anchor(si_doc_path, {"caption_label": "Table S3"})
+    assert result["status"] == "resolved"
+    assert result["target_para_id"] == "S0000002"
+
+
+def test_locate_anchor_caption_label_fallback_ambiguous_on_duplicate_label(si_doc_path):
+    result = docs_intel.locate_anchor(si_doc_path, {"caption_label": "Fig. S9"})
+    assert result["status"] == "ambiguous"
+    candidate_ids = {c["target_para_id"] for c in result["candidates"]}
+    assert candidate_ids == {"S0000003", "S0000004"}
+
+
+def test_locate_anchor_caption_label_fallback_not_found_when_nothing_matches(si_doc_path):
+    result = docs_intel.locate_anchor(si_doc_path, {"caption_label": "Fig. S999"})
+    assert result["status"] == "not_found"
+
+
+def test_locate_anchor_caption_label_real_seq_field_still_takes_priority(doc_path):
+    # Regression guard: the strict SEQ-field path (existing, pre-3f9a1c72
+    # behavior) must still resolve real captions exactly as before -- the
+    # fallback only ever engages when the strict path finds NOTHING.
+    result = docs_intel.locate_anchor(doc_path, {"caption_label": "Table 1"})
+    assert result["status"] == "resolved"
+    assert result["target_para_id"] == "T0000001"
+    assert result["element_type"] == "table_caption"
+
+
+def test_find_caption_paragraph_delegates_to_locate_anchor(si_doc_path):
+    result = docs_intel.find_caption_paragraph(si_doc_path, "Fig. S47")
+    assert result["status"] == "resolved"
+    assert result["target_para_id"] == "S0000001"
+    assert result == docs_intel.locate_anchor(si_doc_path, {"caption_label": "Fig. S47"})
+
+
+def test_find_caption_paragraph_resolves_real_seq_numbered_caption(doc_path):
+    result = docs_intel.find_caption_paragraph(doc_path, "Figure 1")
+    assert result["status"] == "resolved"
+    assert result["target_para_id"] == "F0000001"
+
+
+def test_find_caption_paragraph_not_found(si_doc_path):
+    result = docs_intel.find_caption_paragraph(si_doc_path, "Fig. S999")
+    assert result["status"] == "not_found"
+
+
+def test_find_caption_paragraph_rejects_empty_label(si_doc_path):
+    result = docs_intel.find_caption_paragraph(si_doc_path, "   ")
+    assert "error" in result
+
+
+def test_find_caption_paragraph_server_wrapper_delegates(si_doc_path):
+    from meridian_docs import server
+
+    result = server.find_caption_paragraph(si_doc_path, "Fig. S47")
+    assert result["status"] == "resolved"
+    assert result["target_para_id"] == "S0000001"
+
+
+# ---------------------------------------------------------------------------
 # Direct para_id lookup, including round-tripping a synthetic table-cell id
 # returned by an earlier query.
 # ---------------------------------------------------------------------------

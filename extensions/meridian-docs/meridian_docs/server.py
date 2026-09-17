@@ -311,6 +311,34 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
 
 
 @mcp.tool()
+def find_caption_paragraph(document_path: str, label: str) -> dict[str, Any]:
+    """3f9a1c72 — Find the paragraph whose caption label says exactly
+    `label` (e.g. "Figure 3", "Table 2", "Fig. S47", "Table S3"). A pure,
+    read-only delegation to locate_anchor(document_path, {"caption_label":
+    label}) under a discoverable name, so a caller reaches for a real
+    function instead of re-deriving caption lookup with a hand-rolled
+    document.xml string search.
+
+    Resolves BOTH real Word-numbered captions (tracked by an actual "SEQ
+    Figure"/"SEQ Table" field) AND manually-typed labels that never got a
+    real SEQ field at all — e.g. Supplementary Information captions like
+    "Fig. S47" — via a loose, prefix-anchored fallback match against the
+    paragraph's own leading text (punctuation/whitespace-insensitive),
+    engaged only when no real SEQ-field caption matches.
+
+    Args:
+      document_path: Document to search. Never opened for writing.
+      label:          The caption label to find.
+
+    Returns the same shape locate_anchor returns: {status: "resolved",
+    target_para_id, element_type, ...} on a unique match, {status:
+    "ambiguous", candidates, ...}, {status: "not_found", ...}, or
+    {"error": ...}.
+    """
+    return docs_intel.find_caption_paragraph(document_path=document_path, label=label)
+
+
+@mcp.tool()
 def get_document_review(
     docx_path: str,
     expected_source_fingerprint: str | None = None,
@@ -982,6 +1010,54 @@ def find_image_paragraph(
     return docs_intel.find_image_paragraph(
         docx_path=docx_path,
         figure_index=figure_index,
+    )
+
+
+@mcp.tool()
+def extract_paragraph_images(
+    docx_path: str,
+    anchor: str | dict[str, Any],
+    out_dir: str | None = None,
+) -> dict[str, Any]:
+    """b2e6a7d0 — Extract EVERY image embedded in one paragraph to real
+    files on disk, with basic metadata, so the resulting paths can be
+    handed straight to an image-capable Read instead of hand-rolling a
+    disposable zip/blip/rId-resolution script every time a figure needs to
+    actually be looked at.
+
+    Blip-complete by construction: walks every <w:drawing> in the anchored
+    paragraph and every <a:blip> within each — never just the first blip in
+    the paragraph. (A prior hand-rolled audit script in this project had
+    exactly that "first blip only" bug and produced 18 false-positive
+    findings before a cross-check caught it — this tool is built so that
+    bug class cannot recur here.)
+
+    Args:
+      docx_path: Absolute path to the .docx file. Never mutated.
+      anchor:     Either a raw paragraph id (str — w14:paraId, sp<hash>
+                 synth id, or legacy p{N}), OR a locate_anchor-style query
+                 dict (e.g. {"text": "..."}, {"caption_label": "Figure 3"})
+                 resolved read-only first. A query resolving ambiguously,
+                 to nothing, or to a table/table-cell target is refused
+                 with the full locator detail attached. Only images inside
+                 THIS one paragraph are returned — a multi-paragraph
+                 composite (side-by-side images sharing one caption) needs
+                 one call per member paragraph.
+      out_dir:    Directory to write extracted image files into (created if
+                 missing). Defaults to a fresh tempfile.mkdtemp directory.
+
+    Returns {status: "extracted"|"no_images", anchor_para_id, image_count,
+    images: [{blip_index, relationship_id, media_part, extracted_path,
+    file_size_bytes, pixel_width?, pixel_height?, displayed_extent_emu?,
+    displayed_extent_inches?}], out_dir, docx_path} — one bad image
+    reference carries its own {"error": ...} instead of aborting the whole
+    call. Top-level {"error": <message>} only for validation, anchor-
+    resolution, or whole-file failure.
+    """
+    return docs_intel.extract_paragraph_images(
+        docx_path=docx_path,
+        anchor=anchor,
+        out_dir=out_dir,
     )
 
 

@@ -6000,6 +6000,267 @@ def find_image_paragraph(
     }
 
 
+def _resolve_relationship_target(rels_root: ET.Element, relationship_id: str) -> str | None:
+    """Resolve a ``word/_rels/document.xml.rels`` relationship id to its
+    normalized ``word/...`` package part path.
+
+    ``Target`` values are conventionally relative to ``word/`` (e.g.
+    ``"media/image3.png"`` -> ``"word/media/image3.png"``); an already
+    ``word/``-rooted target is returned as-is. An ``External`` relationship
+    (``TargetMode="External"``, e.g. a linked-not-embedded image, or a
+    hyperlink) has no local package part to resolve to and returns
+    ``None``, same as an unknown relationship id.
+    """
+    for rel in rels_root:
+        if rel.get("Id") == relationship_id:
+            if rel.get("TargetMode") == "External":
+                return None
+            target = (rel.get("Target") or "").lstrip("/")
+            if not target:
+                return None
+            return target if target.startswith("word/") else f"word/{target}"
+    return None
+
+
+def extract_paragraph_images(
+    docx_path: str,
+    anchor: str | dict[str, Any],
+    out_dir: str | None = None,
+) -> dict[str, Any]:
+    """b2e6a7d0 -- extract EVERY image embedded in one paragraph to real
+    files on disk, with basic metadata, so a caller can hand the resulting
+    paths straight to an image-capable Read instead of hand-rolling a
+    disposable "open the docx as a zip, find the blip, resolve rId -> media
+    via rels, dump the bytes" script every time a figure needs to actually
+    be LOOKED AT (compare a figure against its caption, check panel order,
+    spot a wrong/swapped image, ...) -- the recurring pattern this session
+    hit repeatedly.
+
+    Blip-complete BY CONSTRUCTION: walks every ``<w:drawing>`` in the
+    anchored paragraph and, within each, every ``<a:blip>`` it contains
+    (almost always exactly one, but never assumed to be) -- NOT just the
+    first ``<a:blip>`` in the paragraph. A prior hand-rolled audit script in
+    this same session had a ``blip_rid(p)`` helper that returned only the
+    FIRST blip per paragraph, silently dropping legitimate 2nd/3rd/4th
+    panel images and producing 18 false-positive findings before an
+    independent cross-check caught it -- this function is built specifically
+    so that bug class cannot recur here. (Separately, ``audit_document``'s
+    own ``orphan_image``/``_verify_image_ownership`` checks were confirmed
+    to already walk every blip per paragraph via
+    :func:`_image_paragraph_relationship_ids` -- no fix needed there; this
+    function is new functionality, not a fix to those.)
+
+    Args:
+      docx_path:  Absolute path to the .docx file. Never mutated -- this is
+                  a pure read/export.
+      anchor:      Either a raw paragraph id (str -- w14:paraId, the
+                  sp<hash> synth id, or legacy p{N}, the same schemes
+                  :func:`_find_para_by_id`/:func:`flag_for_review` already
+                  resolve), OR a :func:`locate_anchor`-style query dict
+                  (e.g. ``{"text": "..."}``, ``{"caption_label": "Figure
+                  3"}``) resolved read-only first. A query that resolves
+                  ambiguously, to nothing, or to a table/table-cell target
+                  is refused with the full locator detail attached -- never
+                  guessed. Only images inside THIS one paragraph are
+                  returned -- a multi-paragraph composite figure (this
+                  codebase's own side-by-side-images convention; see
+                  ``_direct_body_image_paragraphs``) needs one call per
+                  member paragraph.
+      out_dir:     Directory to write extracted image files into. Created
+                  if missing. Defaults to a fresh ``tempfile.mkdtemp``
+                  directory when omitted.
+
+    Returns ``{status: "extracted"|"no_images", anchor_para_id,
+    element_type?, section_path?, image_count, images: [...], out_dir,
+    docx_path}`` where each entry in ``images`` is ``{blip_index,
+    relationship_id, media_part, extracted_path, file_size_bytes,
+    pixel_width?, pixel_height?, displayed_extent_emu?,
+    displayed_extent_inches?}`` in document order (1-based ``blip_index``),
+    or ``{..., "error": <message>}`` in place of the extraction fields for
+    one image whose relationship/media part is dangling or unreadable --
+    a single bad reference among several good images never aborts the
+    whole call. Top-level ``{"error": <message>}`` only for a validation,
+    anchor-resolution, or whole-file failure.
+    """
+    element_type: str | None = None
+    section_path: str | None = None
+
+    if isinstance(anchor, str):
+        if not anchor.strip():
+            return {"error": "anchor must be a non-empty para_id string, or a query dict"}
+        anchor_para_id = anchor
+    elif isinstance(anchor, dict):
+        if not anchor:
+            return {"error": "anchor query dict must be non-empty"}
+        located = locate_anchor(docx_path, anchor)
+        if located.get("error"):
+            return {"error": f"anchor resolution failed: {located['error']}"}
+        status = located.get("status")
+        if status != "resolved":
+            return {
+                "error": (
+                    f"anchor query did not resolve to exactly one location "
+                    f"(status={status!r}) -- narrow the query and retry"
+                ),
+                "locate_result": located,
+            }
+        if located.get("element_type") in ("table", "table_cell"):
+            return {
+                "error": (
+                    "anchor resolved to a "
+                    f"{located['element_type']!r} element (para_id "
+                    f"{located.get('target_para_id')!r}) -- "
+                    "extract_paragraph_images only supports paragraph/"
+                    "heading/caption anchors, not table or table-cell targets"
+                ),
+                "locate_result": located,
+            }
+        anchor_para_id = located["target_para_id"]
+        element_type = located.get("element_type")
+        section_path = located.get("section_path")
+    else:
+        return {"error": f"anchor must be a str para_id or a query dict, got {type(anchor).__name__}"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    found = _find_para_by_id(root, anchor_para_id)
+    if found is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _body, paragraph, _child_index = found
+
+    drawings = list(paragraph.iter(_q(_W, "drawing")))
+    if not drawings:
+        result = {
+            "status": "no_images",
+            "anchor_para_id": anchor_para_id,
+            "image_count": 0,
+            "images": [],
+            "out_dir": out_dir,
+            "docx_path": docx_path,
+        }
+        if element_type is not None:
+            result["element_type"] = element_type
+        if section_path is not None:
+            result["section_path"] = section_path
+        return result
+
+    if out_dir is None:
+        out_dir = tempfile.mkdtemp(prefix="meridian_docx_images_")
+    else:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            return {"error": f"could not create out_dir {out_dir!r}: {exc}"}
+
+    safe_para = re.sub(r"[^A-Za-z0-9_-]", "_", anchor_para_id) or "para"
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            names = set(archive.namelist())
+            try:
+                rels_root = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+            except (KeyError, ET.ParseError):
+                rels_root = ET.Element(_q(_REL_NS, "Relationships"))
+
+            images: list[dict[str, Any]] = []
+            blip_index = 0
+            for drawing in drawings:
+                container = drawing.find(_q(_WP, "inline"))
+                if container is None:
+                    container = drawing.find(_q(_WP, "anchor"))
+                extent_el = (
+                    container.find(_q(_WP, "extent")) if container is not None else None
+                )
+                extent_cx = extent_cy = None
+                if extent_el is not None:
+                    try:
+                        extent_cx = int(extent_el.get("cx", ""))
+                        extent_cy = int(extent_el.get("cy", ""))
+                    except ValueError:
+                        extent_cx = extent_cy = None
+
+                # Blip-complete: every <a:blip> in THIS drawing, not just
+                # the first -- see this function's own docstring for why.
+                for blip in drawing.iter(_q(_A, "blip")):
+                    blip_index += 1
+                    entry: dict[str, Any] = {
+                        "blip_index": blip_index,
+                        "relationship_id": blip.get(_q(_IMAGE_REL_NS, "embed")),
+                    }
+                    if extent_cx is not None and extent_cy is not None:
+                        entry["displayed_extent_emu"] = {"cx": extent_cx, "cy": extent_cy}
+                        entry["displayed_extent_inches"] = {
+                            "width": round(extent_cx / _EMU_PER_INCH, 3),
+                            "height": round(extent_cy / _EMU_PER_INCH, 3),
+                        }
+
+                    relationship_id = entry["relationship_id"]
+                    if not relationship_id:
+                        entry["error"] = "blip has no r:embed relationship id"
+                        images.append(entry)
+                        continue
+
+                    media_part = _resolve_relationship_target(rels_root, relationship_id)
+                    if media_part is None:
+                        entry["error"] = (
+                            f"relationship {relationship_id!r} not found (or is "
+                            "an external target) in "
+                            "word/_rels/document.xml.rels"
+                        )
+                        images.append(entry)
+                        continue
+                    entry["media_part"] = media_part
+                    if media_part not in names:
+                        entry["error"] = (
+                            f"referenced media part {media_part!r} is missing "
+                            "from the .docx package"
+                        )
+                        images.append(entry)
+                        continue
+
+                    media_bytes = archive.read(media_part)
+                    extension = os.path.splitext(media_part)[1].lower()
+                    out_name = f"{safe_para}_image{blip_index}{extension}"
+                    out_path = os.path.join(out_dir, out_name)
+                    try:
+                        with open(out_path, "wb") as fh:
+                            fh.write(media_bytes)
+                    except OSError as exc:
+                        entry["error"] = (
+                            f"could not write extracted image to {out_path}: {exc}"
+                        )
+                        images.append(entry)
+                        continue
+
+                    entry["extracted_path"] = out_path
+                    entry["file_size_bytes"] = len(media_bytes)
+                    dims = _image_dimensions_px(media_bytes, extension)
+                    if dims is not None:
+                        entry["pixel_width"], entry["pixel_height"] = dims
+                    images.append(entry)
+    except zipfile.BadZipFile as exc:
+        return {"error": f"{docx_path} is not a readable ZIP package: {exc}"}
+
+    result = {
+        "status": "extracted",
+        "anchor_para_id": anchor_para_id,
+        "image_count": len(images),
+        "images": images,
+        "out_dir": out_dir,
+        "docx_path": docx_path,
+    }
+    if element_type is not None:
+        result["element_type"] = element_type
+    if section_path is not None:
+        result["section_path"] = section_path
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public caption API: insert / edit / remove
 # ---------------------------------------------------------------------------
@@ -19987,6 +20248,37 @@ def _equation_pseudo_record(eq: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# 3f9a1c72 -- caption_label loose-prefix fallback for captions NOT tracked
+# by a real Word SEQ field. The strict caption_label match above (via
+# r["caption_label"], populated only for element_kind figure_caption/
+# table_caption -- see _is_figure_caption/_is_table_caption) requires an
+# actual "SEQ Figure"/"SEQ Table" field instruction in the paragraph. Many
+# real documents' Supplementary Information figures/tables are numbered on
+# a SEPARATE, manually-typed track ("Fig. S47", "Table S3") rather than
+# Word's own auto-numbering SEQ field -- those paragraphs have NO
+# caption_label at all in this scheme and were previously unreachable via
+# caption_label queries, forcing callers back to raw text search (or a
+# hand-rolled script) to find them. This normalizes whitespace/periods/
+# colons on both sides so "Fig. S47", "Fig S47", "FIG.S47:" all match the
+# same paragraph, but still requires the query to be a PREFIX of the
+# paragraph's own text (not merely present anywhere in it) -- matching the
+# "this caption's own leading label says exactly this" semantic
+# caption_label is meant to express, not a generic substring search wearing
+# a caption_label costume.
+_CAPTION_LABEL_NORMALIZE_RE = re.compile(r"[\s.:]+")
+
+
+def _normalize_caption_label_text(text: str) -> str:
+    return _CAPTION_LABEL_NORMALIZE_RE.sub(" ", (text or "").strip()).strip().casefold()
+
+
+def _leading_caption_label_matches(record_text: str, query_label: str) -> bool:
+    query_norm = _normalize_caption_label_text(query_label)
+    if not query_norm:
+        return False
+    return _normalize_caption_label_text(record_text).startswith(query_norm)
+
+
 def _resolve_anchor_query(
     records: list[dict[str, Any]],
     equations: list[dict[str, Any]],
@@ -20102,6 +20394,22 @@ def _resolve_anchor_query(
             parsed_candidate = _parse_caption_label(r["caption_label"])
             if parsed_query and parsed_candidate and parsed_query == parsed_candidate:
                 caption_candidates.append(r)
+        if not caption_candidates:
+            # 3f9a1c72 -- no real SEQ-field caption matched; fall back to a
+            # loose "this paragraph's own leading text starts with the
+            # query label" match (see _leading_caption_label_matches) so a
+            # manually-typed SI caption like "Fig. S47: ..." -- which never
+            # gets a caption_label from the strict SEQ-field path at all --
+            # is still reachable via caption_label instead of forcing a
+            # caller back to raw text search. Scoped to paragraph/caption
+            # element kinds only (never headings/tables/equations), so this
+            # stays a caption-shaped fallback rather than a generic text
+            # search under a different name.
+            caption_candidates = [
+                r for r in scope
+                if r.get("element_kind") in ("paragraph", "figure_caption", "table_caption")
+                and _leading_caption_label_matches(r.get("text") or "", str(caption_label_query))
+            ]
         if not caption_candidates:
             return _not_found_anchor_result(
                 f"no caption matched {caption_label_query!r}",
@@ -20262,6 +20570,44 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
         "query_count": len(queries),
         "results": results,
     }
+
+
+def find_caption_paragraph(document_path: str, label: str) -> dict[str, Any]:
+    """3f9a1c72 -- named, discoverable entry point for "find the paragraph
+    whose caption label says exactly this" -- a pure, read-only delegation
+    to ``locate_anchor(document_path, {"caption_label": label})``.
+
+    Exists so a caller (or a future session under time pressure) reaches
+    for a real, obviously-named function instead of re-deriving caption
+    lookup from scratch with a hand-rolled document.xml string search --
+    the exact pattern that repeatedly produced throwaway scripts before
+    this item. Resolves BOTH real Word-numbered captions ("Figure 3",
+    "Table 2" -- via ``r"^\\s*(figure|table)\\s+(.+?)\\s*$"``-style SEQ-field
+    matching) AND manually-typed labels that never got a real ``SEQ``
+    field at all (e.g. Supplementary Information captions like "Fig. S47",
+    "Table S3" -- via :func:`_leading_caption_label_matches`'s loose,
+    prefix-anchored fallback, engaged only when no real SEQ-field caption
+    matches). See :func:`locate_anchor`'s own module-level query-key
+    contract comment for the full resolved-anchor result shape.
+
+    Args:
+      document_path: Document to search. Never opened for writing.
+      label:          The caption label to find, e.g. "Figure 3", "Table 2",
+                       "Fig. S47", "Table S3". Matched against the SAME
+                       normalization ``_parse_caption_label`` /
+                       :func:`_leading_caption_label_matches` already use
+                       (case-insensitive; punctuation/whitespace-insensitive
+                       for the fallback path).
+
+    Returns the SAME shape :func:`locate_anchor` returns: ``{status:
+    "resolved", target_para_id, element_type, ...}`` on a unique match,
+    ``{status: "ambiguous", candidates, ...}`` when more than one caption's
+    leading text matches the query, or ``{status: "not_found", ...}`` /
+    ``{"error": ...}``.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return {"error": "label must be a non-empty string"}
+    return locate_anchor(document_path, {"caption_label": label})
 
 
 # ---------------------------------------------------------------------------
