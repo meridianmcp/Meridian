@@ -57,28 +57,61 @@ OOXML-Graph, the MS thesis), not owned by any one of them.
 - **`extension/`** — Chrome MV3 extension, loadable unpacked
   (`chrome://extensions` → Developer mode → Load unpacked → select this
   folder). Content script reads Overleaf's live CodeMirror 6 editor DOM
-  (`.cm-content .cm-line`). **Not yet verified against a real, logged-in
-  Overleaf session** — the DOM selector is built from Overleaf's public
-  open-source repo, not confirmed live. This is the first thing to check by
-  hand: load the extension, open one of your own real Overleaf projects, and
-  see whether the popup reports a real line/char count.
+  (`.cm-content .cm-line`). **Verified against a real, logged-in Overleaf
+  session (2026-09-17)** — the `.cm-content .cm-line` selector guess was
+  correct on the first try; the popup's "Re-check" button reported a real
+  line/char count against a live project.
+
+  The popup's **"Get structural outline"** button now does the real
+  end-to-end loop: reads the live editor text via the content script, POSTs
+  it to the local engine server (`engine/src/server.js`, see below), and
+  shows a real per-kind node count back in the popup. This is the first
+  actual read-path proof that extension → engine → structured output works
+  against live Overleaf content, not just a static file on disk.
 
 ## What's real right now vs. what's next
 
 Real: the parser, the outline extraction, running against the actual
-manuscript. Real: an extension that loads and can read Overleaf's editor DOM
-(pending your own live verification). Not yet built: the write-back half
-(claim a node, edit it, verify the hash — mirroring meridian-docs' region
-claim + lease model), and the background service worker doesn't call the
-engine yet (no HTTP server on the engine side yet — next step once the
-extension side is confirmed working against a live session).
+manuscript. Real: the extension reads Overleaf's live editor DOM — verified
+against a real, logged-in session. Real (2026-09-17): the full read-path
+loop — extension → local engine server (`engine/src/server.js`, plain
+Node `http`, zero new dependencies) → structured outline → back in the
+popup — proven end-to-end against live Overleaf content, not just a file on
+disk.
+
+Not yet built: the write-back half (claim a node, edit it, verify the hash
+— mirroring meridian-docs' region claim + lease model). The engine server
+only has one endpoint (`POST /outline`, read-only) — no write/edit
+operations exist yet at any layer (engine, server, or extension).
+
+## Running the local engine server
+
+The popup's "Get structural outline" button needs `engine/src/server.js`
+running locally first:
+```
+cd engine
+node src/server.js
+```
+Listens on `http://127.0.0.1:8471` by default (override with
+`MERIDIAN_LATEX_PORT`). The extension's `manifest.json` already declares
+`host_permissions` for that origin. If the popup shows a fetch error, this
+is almost always "the server isn't running" — start it and click
+"Get structural outline" again (no need to reload the extension itself for
+that, only for content_script.js/background.js/manifest.json changes).
 
 ## Manual steps only you can do
 
-- Load the extension unpacked in your own Chrome and confirm it reads a real
-  Overleaf project (no credentials needed from me — just your own logged-in
-  browser).
+- Load the extension unpacked in your own Chrome (done, 2026-09-17 — ID
+  `nccfjgpohlompmimgpiemjnpelehiilg` on this machine) and reload it at
+  `chrome://extensions` whenever `content_script.js`/`background.js`/
+  `manifest.json` change (a content-script change also needs the target
+  Overleaf tab refreshed to re-inject — the extension doesn't retroactively
+  patch an already-open tab). `popup.html`/`popup.js` need no reload —
+  popups rebuild fresh from disk every time they're opened.
+- Start `engine/src/server.js` locally before using "Get structural
+  outline" (see above) — it does not run automatically.
 - Chrome Web Store Developer Dashboard registration (one-time $5 fee, Google
   account) — only needed at actual publish time, not for local dev/testing.
 - Nothing else needs a sign-in yet: the engine only touches local `.tex`
-  files, and `unified-latex` is a public, no-auth npm package.
+  files / live-read Overleaf DOM text, and `unified-latex` is a public,
+  no-auth npm package.

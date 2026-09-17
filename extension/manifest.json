@@ -4,7 +4,7 @@
   "version": "0.0.1",
   "description": "Reads and edits Overleaf's live .tex structure (sections, tables, equations, citations, figures) rather than raw text — prototype for the Digital Science Catalyst Grant submission.",
   "permissions": ["activeTab", "storage", "scripting"],
-  "host_permissions": ["https://www.overleaf.com/*"],
+  "host_permissions": ["https://www.overleaf.com/*", "http://127.0.0.1:8471/*"],
   "background": {
     "service_worker": "background.js"
   },
