@@ -8,13 +8,25 @@
 # autonomous agent via pip/npm/uvx and its arbitrary setup/postinstall code runs,
 # with no human ever seeing the package name before it lands on disk.
 #
-# BLOCKS (exit 2, fail-closed) any pip/pip3/npm/uvx install invocation naming a
-# package NOT already declared in this repo's manifests (pyproject.toml,
-# package.json) or in .claude\hooks\verified_packages.txt (a durable allowlist
-# appended to after a real registry lookup or explicit request_hitl approval).
+# BLOCKS (exit 2, fail-closed) any pip/pip3/py/npm/uvx/pixi/conda/poetry/pipx
+# install invocation naming a package NOT already declared in this repo's
+# manifests (pyproject.toml, package.json, pixi.toml [dependencies] /
+# [pypi-dependencies] and their per-feature tables) or in
+# .claude\hooks\verified_packages.txt (a durable allowlist appended to after a
+# real registry lookup or explicit request_hitl approval).
+#
+# 8fae0e17 -- pixi is THIS repo's actual package manager (pixi.toml,
+# AGENTS.md/CLAUDE.md) but was entirely unrecognized until this fix: "pixi
+# add" names a new package exactly like "npm install <name>"; "pixi install"
+# (no package arg) installs from pixi.lock/pixi.toml, exactly like bare
+# "npm ci", so it is always allowed. conda install / poetry add / pipx
+# install / "py -m pip install" are the same install-verb-plus-package-args
+# shape and are recognized too. Bare "pixi run <task>" (e.g. "pixi run test")
+# is NOT an install command and is never matched by the pixi pattern below.
 #
 # Manifest-only installs (-r requirements.txt, bare "npm install"/"npm ci",
-# local/editable installs) are always allowed.
+# "pixi install", "conda install --file environment.yml", local/editable
+# installs) are always allowed.
 #
 # Best-effort command parsing, not a full shell grammar -- a speed bump for the
 # common case, not a sandbox. Fails OPEN on parse ambiguity outside the specific
@@ -41,6 +53,7 @@ $RepoRoot = Split-Path (Split-Path $ScriptDir -Parent) -Parent
 $AllowList = Join-Path $ScriptDir 'verified_packages.txt'
 $PyProject = Join-Path $RepoRoot 'pyproject.toml'
 $PackageJson = Join-Path $RepoRoot 'package.json'
+$PixiToml = Join-Path $RepoRoot 'pixi.toml'
 
 function Normalize-PkgName {
     param([string]$Name)
@@ -49,7 +62,7 @@ function Normalize-PkgName {
 }
 
 # Package managers/build tools themselves are always safe to (re)install.
-$BuiltinKnown = @('pip', 'pip3', 'setuptools', 'wheel', 'pip-tools', 'uv', 'npm', 'npx', 'corepack')
+$BuiltinKnown = @('pip', 'pip3', 'setuptools', 'wheel', 'pip-tools', 'uv', 'npm', 'npx', 'corepack', 'pixi', 'conda', 'poetry', 'pipx')
 
 $KnownSet = New-Object System.Collections.Generic.HashSet[string]
 foreach ($n in $BuiltinKnown) { [void]$KnownSet.Add((Normalize-PkgName $n)) }
@@ -64,6 +77,26 @@ if (Test-Path $PyProject) {
 if (Test-Path $PackageJson) {
     Get-Content $PackageJson | ForEach-Object {
         if ($_ -match '^\s*"([^"]+)"\s*:\s*"') {
+            [void]$KnownSet.Add((Normalize-PkgName $Matches[1]))
+        }
+    }
+}
+if (Test-Path $PixiToml) {
+    # pixi.toml is real TOML (unlike pyproject.toml's array-of-quoted-strings
+    # dependency lists) -- package names are bare, unquoted keys inside
+    # specific tables: [dependencies], [pypi-dependencies], and their
+    # per-feature counterparts [feature.<name>.dependencies] /
+    # [feature.<name>.pypi-dependencies]. Track the current [section] and
+    # only collect keys while inside one of those tables, so a top-level key
+    # like "name" under [workspace] is never misread as a package name.
+    $InDepSection = $false
+    Get-Content $PixiToml | ForEach-Object {
+        $line = $_
+        if ($line -match '^\[(dependencies|pypi-dependencies|feature\.[^\]]+\.dependencies|feature\.[^\]]+\.pypi-dependencies)\]\s*$') {
+            $InDepSection = $true
+        } elseif ($line -match '^\[') {
+            $InDepSection = $false
+        } elseif ($InDepSection -and ($line -match '^([A-Za-z0-9][A-Za-z0-9_.\-]*)\s*=')) {
             [void]$KnownSet.Add((Normalize-PkgName $Matches[1]))
         }
     }
@@ -102,6 +135,11 @@ $PipValueFlags = @('-r', '--requirement', '-c', '--constraint', '-i', '--index-u
     '--proxy', '--retries', '--timeout', '--trusted-host', '--python', '--config-settings')
 $NpmValueFlags = @('--registry', '--scope', '--tag', '--save-prefix', '--workspace', '-w', '--prefix',
     '--cache', '--userconfig')
+$PixiValueFlags = @('--manifest-path', '-f', '--feature', '--platform', '--host', '--build', '--git',
+    '--branch', '--tag', '--rev', '--subdir')
+$CondaValueFlags = @('-n', '--name', '-p', '--prefix', '-c', '--channel')
+$PoetryValueFlags = @('-G', '--group', '-E', '--extras', '--source', '--python', '--platform')
+$PipxValueFlags = @('--index-url', '--python', '--spec', '--pip-args', '--suffix')
 
 $Flagged = $null
 $Manager = $null
@@ -185,6 +223,98 @@ function Check-UvxSegment {
     }
 }
 
+function Check-PixiSegment {
+    param([string]$Rest)
+    # "pixi add" takes one or more positional package specs, e.g.
+    # "pixi add numpy pandas==2.2 --feature dev". There is no manifest-file
+    # flag to bypass wholesale (unlike pip's -r) -- every named package is
+    # checked, same as npm install/add.
+    $tokens = $Rest -split '\s+' | Where-Object { $_ -ne '' }
+    $skipNext = $false
+    foreach ($tok in $tokens) {
+        if ($skipNext) { $skipNext = $false; continue }
+        if (Test-IsFlag $tok) {
+            if ($PixiValueFlags -contains $tok) { $skipNext = $true }
+            continue
+        }
+        if (Test-IsLocalPath $tok) { continue }
+        $pkgname = ($tok -replace '[<>=!~; ].*', '') -replace '\[.*', ''
+        if (-not $pkgname) { continue }
+        if (-not (Test-Known $pkgname)) {
+            $script:Flagged = $pkgname
+            return
+        }
+    }
+}
+
+function Check-CondaSegment {
+    param([string]$Rest)
+    # "conda install --file environment.yml" installs from an already-vetted
+    # manifest file, not a new named package -- allow wholesale, same as
+    # pip's -r/--requirement bypass.
+    if ($Rest -match '(^|\s)--file(\s|$)') { return }
+    $tokens = $Rest -split '\s+' | Where-Object { $_ -ne '' }
+    $skipNext = $false
+    foreach ($tok in $tokens) {
+        if ($skipNext) { $skipNext = $false; continue }
+        if (Test-IsFlag $tok) {
+            if ($CondaValueFlags -contains $tok) { $skipNext = $true }
+            continue
+        }
+        if (Test-IsLocalPath $tok) { continue }
+        $pkgname = ($tok -replace '[<>=!~; ].*', '') -replace '\[.*', ''
+        if (-not $pkgname) { continue }
+        if (-not (Test-Known $pkgname)) {
+            $script:Flagged = $pkgname
+            return
+        }
+    }
+}
+
+function Check-PoetrySegment {
+    param([string]$Rest)
+    # "poetry add" takes one or more positional specs, e.g.
+    # "poetry add requests@^2.31 --group dev".
+    $tokens = $Rest -split '\s+' | Where-Object { $_ -ne '' }
+    $skipNext = $false
+    foreach ($tok in $tokens) {
+        if ($skipNext) { $skipNext = $false; continue }
+        if (Test-IsFlag $tok) {
+            if ($PoetryValueFlags -contains $tok) { $skipNext = $true }
+            continue
+        }
+        if (Test-IsLocalPath $tok) { continue }
+        $pkgname = (($tok -replace '[<>=!~; ].*', '') -replace '\[.*', '') -replace '@.*', ''
+        if (-not $pkgname) { continue }
+        if (-not (Test-Known $pkgname)) {
+            $script:Flagged = $pkgname
+            return
+        }
+    }
+}
+
+function Check-PipxSegment {
+    param([string]$Rest)
+    # "pipx install <spec>" names exactly one tool, same shape as uvx.
+    $tokens = $Rest -split '\s+' | Where-Object { $_ -ne '' }
+    $skipNext = $false
+    $pkg = $null
+    foreach ($tok in $tokens) {
+        if ($skipNext) { $skipNext = $false; continue }
+        if (Test-IsFlag $tok) {
+            if ($PipxValueFlags -contains $tok) { $skipNext = $true }
+            continue
+        }
+        if (-not $pkg) { $pkg = $tok }
+    }
+    if (-not $pkg) { return }
+    $pkgname = (($pkg -replace '[<>=!~; ].*', '') -replace '\[.*', '') -replace '@.*', ''
+    if (-not $pkgname) { return }
+    if (-not (Test-Known $pkgname)) {
+        $script:Flagged = $pkgname
+    }
+}
+
 # Split on &&, ||, ; into segments so each sub-command is inspected independently.
 $segments = [regex]::Split($cmd, '&&|\|\||;')
 
@@ -193,9 +323,9 @@ foreach ($seg in $segments) {
     $segTrim = $seg.Trim()
     if (-not $segTrim) { continue }
 
-    if ($segTrim -match '^(python3?\s+-m\s+)?pip3?\s+install(\s|$)') {
+    if ($segTrim -match '^((python3?|py)\s+-m\s+)?pip3?\s+install(\s|$)') {
         $Manager = 'pip'
-        $restStr = $segTrim -replace '^(python3?\s+-m\s+)?pip3?\s+install\s*', ''
+        $restStr = $segTrim -replace '^((python3?|py)\s+-m\s+)?pip3?\s+install\s*', ''
         Check-PipSegment $restStr
     } elseif ($segTrim -match '^npm\s+(install|i|add|ci)(\s|$)') {
         $Manager = 'npm'
@@ -209,6 +339,28 @@ foreach ($seg in $segments) {
         $Manager = 'uvx'
         $restStr = $segTrim -replace '^uvx\s*', ''
         Check-UvxSegment $restStr
+    } elseif ($segTrim -match '^pixi\s+add(\s|$)') {
+        $Manager = 'pixi'
+        $restStr = $segTrim -replace '^pixi\s+add\s*', ''
+        Check-PixiSegment $restStr
+    } elseif ($segTrim -match '^pixi\s+install(\s|$)') {
+        # "pixi install" (no package arg -- that's "pixi add" above) installs
+        # from pixi.lock/pixi.toml, same as bare "npm ci". Deliberately does
+        # NOT match "pixi run ..." (e.g. "pixi run test"), which is not an
+        # install command at all.
+        $Manager = 'pixi'
+    } elseif ($segTrim -match '^conda\s+install(\s|$)') {
+        $Manager = 'conda'
+        $restStr = $segTrim -replace '^conda\s+install\s*', ''
+        Check-CondaSegment $restStr
+    } elseif ($segTrim -match '^poetry\s+add(\s|$)') {
+        $Manager = 'poetry'
+        $restStr = $segTrim -replace '^poetry\s+add\s*', ''
+        Check-PoetrySegment $restStr
+    } elseif ($segTrim -match '^pipx\s+install(\s|$)') {
+        $Manager = 'pipx'
+        $restStr = $segTrim -replace '^pipx\s+install\s*', ''
+        Check-PipxSegment $restStr
     }
 }
 
@@ -221,7 +373,7 @@ if ($Flagged) {
         "confirm it is the real, actively-maintained project -- not a typosquat -- then append the exact name " +
         "to .claude\hooks\verified_packages.txt and retry; or (2) call request_hitl(project_id, question) for " +
         "explicit human confirmation, then add it to the allowlist once approved. Packages already declared in " +
-        "pyproject.toml/package.json are pre-approved and never blocked."
+        "pyproject.toml/package.json/pixi.toml are pre-approved and never blocked."
     )
     exit 2
 }
