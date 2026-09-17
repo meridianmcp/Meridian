@@ -12,7 +12,8 @@
     "test": "node --test src/"
   },
   "dependencies": {
+    "@unified-latex/unified-latex-types": "^1.8.4",
     "@unified-latex/unified-latex-util-parse": "^1.8.4",
-    "@unified-latex/unified-latex-types": "^1.8.4"
+    "better-sqlite3": "^13.0.3"
   }
 }
