@@ -29,6 +29,30 @@ jobs:
           name: meridian-windows
           path: dist/meridian.exe
 
+  # 4e4c3817 -- Windows-only tray/GUI installer (meridian-tray.exe). Wraps
+  # LocalRunner (899936dd) to supervise the real HTTP server as a child
+  # process; see meridian/tray_main.py's own module docstring. Windows-only
+  # because the sprint item itself scopes this as a Windows tray app --
+  # Linux/macOS users keep using the existing meridian.exe / install.ps1
+  # paths unchanged.
+  build-tray:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.79.0
+          cache: true
+      - name: Install UPX (binary compression)
+        run: choco install upx -y --no-progress
+      - name: Build Windows tray executable
+        run: pixi run -e dev build-tray
+      - name: Upload tray artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meridian-tray-windows
+          path: dist/meridian-tray.exe
+
   build-linux:
     runs-on: ubuntu-latest
     steps:
@@ -113,7 +137,7 @@ jobs:
           path: ${{ matrix.artifact }}
 
   release:
-    needs: [build-windows, build-linux, build-mac-arm64, build-connect]
+    needs: [build-windows, build-tray, build-linux, build-mac-arm64, build-connect]
     # 80f1d4bc — run as long as we weren't cancelled, even if a build variant
     # failed, so one flaky/unbuildable platform can't SKIP the whole release.
     # With fail_on_unmatched_files:false the release ships whatever actually built.
@@ -136,6 +160,7 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             dist-artifacts/meridian-windows/meridian.exe
+            dist-artifacts/meridian-tray-windows/meridian-tray.exe
             dist-artifacts/meridian-linux/meridian-linux
             dist-artifacts/meridian-mac-arm64/meridian-mac-arm64
             dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux
