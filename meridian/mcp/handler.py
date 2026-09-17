@@ -6856,6 +6856,43 @@ async def _handle_docx_derivative_tools(
     return _MISS
 
 
+async def _handle_paper_contract_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: 7c96d41b paper_contract editorial-intent tooling --
+    create_paper_contract, get_paper_contract, create_paper_contract_revision,
+    list_paper_contract_revisions, approve_paper_contract_revision,
+    get_current_paper_contract_content. A new sibling dispatch group (own
+    module, own group function), matching _handle_docx_derivative_tools'
+    precedent immediately above rather than growing an existing group --
+    see meridian/mcp/handlers/paper_contract_tools.py's module docstring."""
+    from .handlers.paper_contract_tools import (  # noqa: PLC0415
+        handle_create_paper_contract,
+        handle_get_paper_contract,
+        handle_create_paper_contract_revision,
+        handle_list_paper_contract_revisions,
+        handle_approve_paper_contract_revision,
+        handle_get_current_paper_contract_content,
+    )
+
+    _standard_dispatch: dict[str, Any] = {
+        "create_paper_contract": handle_create_paper_contract,
+        "get_paper_contract": handle_get_paper_contract,
+        "create_paper_contract_revision": handle_create_paper_contract_revision,
+        "list_paper_contract_revisions": handle_list_paper_contract_revisions,
+        "approve_paper_contract_revision": handle_approve_paper_contract_revision,
+        "get_current_paper_contract_content": handle_get_current_paper_contract_content,
+    }
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+    return _MISS
+
+
 # a2a027cf — bounded dispatch-level budget for complete_sprint_item,
 # comfortably under the ~60s client-side timeouts observed in the field
 # (HTTP, stdio, and connector/mcp-remote transports all funnel through this
@@ -7124,6 +7161,7 @@ async def _dispatch_mcp_tool(
         _handle_code_index_tools,
         _handle_experiment_tools,
         _handle_docx_derivative_tools,
+        _handle_paper_contract_tools,
     )
     # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
     # Repeated live reports: an MCP client (HTTP/stdio/connector — this

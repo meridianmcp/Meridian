@@ -75,6 +75,12 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "register_docx_derivative": 'register_docx_derivative(project_id="abc-123", session_id="sess-1", source_path="thesis/chapter1.docx", derivative_path="exports/chapter1.pdf", source_content_hash="a1b2c3...", generating_tool="pandoc 3.1")',
     "verify_docx_diff": 'verify_docx_diff(project_id="abc-123", derivative_id="deriv-uuid", current_source_content_hash="a1b2c3...")',
     "promote_docx_candidate": 'promote_docx_candidate(project_id="abc-123", session_id="sess-1", derivative_id="deriv-uuid")',
+    "create_paper_contract": 'create_paper_contract(project_id="abc-123", paper_key="main-paper", title="DNABERT-2 error correction")',
+    "get_paper_contract": 'get_paper_contract(project_id="abc-123", paper_key="main-paper")',
+    "create_paper_contract_revision": 'create_paper_contract_revision(project_id="abc-123", contract_id="contract-uuid", content={"working_title": "DNABERT-2 error correction", "target_venue": "PLOS Computational Biology", "style_guide": "Figure diagrams: navy for chrome, blue for repeated main-path blocks, amber for one-off ops, gray for passive/masked, teal for final output."}, change_summary="Add figure color-convention section to style guide")',
+    "list_paper_contract_revisions": 'list_paper_contract_revisions(project_id="abc-123", contract_id="contract-uuid")',
+    "approve_paper_contract_revision": 'approve_paper_contract_revision(project_id="abc-123", revision_id="revision-uuid", approved_by_human_id="adam")',
+    "get_current_paper_contract_content": 'get_current_paper_contract_content(project_id="abc-123", paper_key="main-paper")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
@@ -1840,6 +1846,99 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string"},
          "derivative_id": {"type": "string"}},
          "required": ["derivative_id"]}},
+    {"name": "create_paper_contract", "description":
+        "7c96d41b — create the stable (project_id, paper_key) identity a "
+        "paper_contract's editorial-intent revision ledger hangs off of. "
+        "Contains no editorial content itself — propose that separately with "
+        "create_paper_contract_revision. Not idempotent on paper_key: a "
+        "repeat call with the same key in the same project returns {error} "
+        "naming the existing contract's id; call get_paper_contract first if "
+        "you want get-or-create semantics. Returns {contract: {...}} "
+        "including the new contract_id, status='draft' (no revision "
+        "approved yet).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "paper_key": {"type": "string", "description": "Stable identifier for this manuscript within the project, e.g. 'main-paper' or a short slug. Unique per project."},
+         "title": {"type": "string"},
+         "created_by_human_id": {"type": "string"}},
+         "required": ["paper_key", "title"]}},
+    {"name": "get_paper_contract", "description":
+        "7c96d41b — read-only lookup of one paper_contract by contract_id "
+        "or by its natural key paper_key (pass exactly one, alongside "
+        "project_id). Returns {contract: {...}} including status "
+        "('draft'|'active'|'archived') and current_revision_id (null until "
+        "a revision has been approved) — or {contract: null} for a "
+        "nonexistent contract, never an error. To read the actual editorial "
+        "content of the currently-approved revision in one call, use "
+        "get_current_paper_contract_content instead.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "contract_id": {"type": "string"},
+         "paper_key": {"type": "string", "description": "Alternative to contract_id — the stable key passed to create_paper_contract. Exactly one of contract_id/paper_key is required."}},
+         "required": []}},
+    {"name": "create_paper_contract_revision", "description":
+        "7c96d41b — propose a new PENDING revision of a paper_contract's "
+        "editorial-intent content: working_title, target_venue, audience, "
+        "thesis, scope_in/scope_out, required_sections, style_guide "
+        "(free-text — figure/prose conventions, tone, whatever this "
+        "manuscript needs), citation_style, word_limit, constraints. This is "
+        "the proposal step only — a freshly created revision is NEVER "
+        "binding (an editorial session must not assume it) until a human "
+        "explicitly calls approve_paper_contract_revision, even when this "
+        "tool itself is called from an AI drafting session. Returns "
+        "{revision: {...}} including the new revision_id and "
+        "approval_status='pending'.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "contract_id": {"type": "string"},
+         "content": {"type": "object", "description": "The proposed PaperContractContent payload as a plain object — any subset of working_title, target_venue, audience, thesis, scope_in, scope_out, required_sections, style_guide, citation_style, word_limit, constraints. Must be non-empty."},
+         "change_summary": {"type": "string", "description": "Short human-readable note on what changed and why, for the revision history."},
+         "created_by": {"type": "string"}},
+         "required": ["contract_id", "content"]}},
+    {"name": "list_paper_contract_revisions", "description":
+        "7c96d41b — read-only: every revision in one contract's ledger, "
+        "oldest first, including pending/approved/rejected alike — the full "
+        "editorial history. Each entry's approval_status and (for approved "
+        "ones) approved_by_human_id/approved_at show who made what binding "
+        "and when. Returns {revisions: [...]}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "contract_id": {"type": "string"}},
+         "required": ["contract_id"]}},
+    {"name": "approve_paper_contract_revision", "description":
+        "7c96d41b — the human-approval gate: pin revision_id as its "
+        "contract's binding current_revision_id, the one snapshot an "
+        "editorial session should treat as authoritative from now on. "
+        "Requires a non-empty approved_by_human_id — an unattributed "
+        "approval would defeat the point of the gate, so only call this "
+        "with a real human identity/name that actually signed off (e.g. in "
+        "chat), never a placeholder. Supersedes the contract's previously-"
+        "approved revision, if any, and flips the contract's status to "
+        "'active'. Idempotent when the revision is already approved "
+        "(no-op success); rejects {error} when the revision is 'rejected' "
+        "(a dead end — propose a new revision instead of trying to revive "
+        "one). Returns {revision: {...}}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "revision_id": {"type": "string"},
+         "approved_by_human_id": {"type": "string", "description": "The real human who approved this revision — required, never a placeholder or an AI session's own identity."}},
+         "required": ["revision_id", "approved_by_human_id"]}},
+    {"name": "get_current_paper_contract_content", "description":
+        "7c96d41b — read-only convenience: resolve straight to the content "
+        "of a paper_contract's CURRENTLY APPROVED revision in one call, by "
+        "contract_id or paper_key, instead of chaining get_paper_contract -> "
+        "read current_revision_id -> fetch that revision by hand. Returns "
+        "{contract, revision, content}, where content is the plain "
+        "editorial-intent object (working_title, style_guide, scope_in/out, "
+        "etc.) — or content: null (never an error) when the contract "
+        "doesn't exist yet, or exists but has never had a revision approved "
+        "(status still 'draft'). This is the one call an editorial session "
+        "most wants: 'what is this paper actually allowed to be right now.'",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "contract_id": {"type": "string"},
+         "paper_key": {"type": "string", "description": "Alternative to contract_id. Exactly one of contract_id/paper_key is required."}},
+         "required": []}},
     {"name": "prospect_symbol", "description":
         "2ce5bc76 — ROBUST symbol prospecting with a three-rung fallback chain: "
         "tries codebase__search_graph FIRST (fast, graph-indexed); when it returns "
@@ -4517,6 +4616,9 @@ _READ_ONLY_TOOLS = {
     "preview_proposal_promotion",
     # ff1843dc — proposal lineage read-only queries.
     "get_proposal_lineage", "compare_proposal_versions",
+    # 7c96d41b — paper_contract read-only queries.
+    "get_paper_contract", "list_paper_contract_revisions",
+    "get_current_paper_contract_content",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "relocate_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
@@ -4765,6 +4867,17 @@ _TOOL_CATEGORY: dict[str, str] = {
     "register_docx_derivative":       "docx",
     "verify_docx_diff":               "docx",
     "promote_docx_candidate":         "docx",
+    # 7c96d41b — paper_contract editorial-intent tooling: "research" (not a
+    # new category) since "paper" is already a _KEYWORD_CATEGORY_AFFINITY
+    # trigger for "research", and these tools are about a manuscript's
+    # editorial scope/style, the same planning-level concern as the rest of
+    # the research category rather than docx's file-level provenance.
+    "create_paper_contract":               "research",
+    "get_paper_contract":                  "research",
+    "create_paper_contract_revision":      "research",
+    "list_paper_contract_revisions":       "research",
+    "approve_paper_contract_revision":     "research",
+    "get_current_paper_contract_content":  "research",
     # file locking
     "claim_file":               "file-locking",
     "release_file":             "file-locking",
@@ -4877,6 +4990,17 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "register_docx_derivative":  "executor",
     "verify_docx_diff":          "both",
     "promote_docx_candidate":    "both",
+    # 7c96d41b — paper_contract: setting/proposing editorial intent is a
+    # planning-boundary act (mirrors set_goal/create_project immediately
+    # below), but content is "very plausibly from an AI drafting session"
+    # per the module's own docstring, and reads are useful to either role —
+    # "both" throughout, same as verify/promote_docx_candidate above.
+    "create_paper_contract":               "both",
+    "get_paper_contract":                  "both",
+    "create_paper_contract_revision":      "both",
+    "list_paper_contract_revisions":       "both",
+    "approve_paper_contract_revision":     "both",
+    "get_current_paper_contract_content":  "both",
     "annotate_outputs":          "executor",
     "log_task":                  "executor",
     "generate_handoff":          "executor",
@@ -5336,6 +5460,14 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "register_docx_derivative":   "maintenance-only",
     "verify_docx_diff":           "maintenance-only",
     "promote_docx_candidate":     "maintenance-only",
+    # 7c96d41b — paper_contract: a planning-boundary tool family, same tier
+    # as set_goal/set_north_star/create_project above.
+    "create_paper_contract":               "maintenance-only",
+    "get_paper_contract":                  "maintenance-only",
+    "create_paper_contract_revision":      "maintenance-only",
+    "list_paper_contract_revisions":       "maintenance-only",
+    "approve_paper_contract_revision":     "maintenance-only",
+    "get_current_paper_contract_content":  "maintenance-only",
     # workspace management (cross-project admin)
     "add_workspace_note":              "maintenance-only",
     "get_workspace_notes":             "maintenance-only",
@@ -5460,6 +5592,12 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "register_docx_derivative": "Register Docx Derivative",
     "verify_docx_diff": "Verify Docx Diff",
     "promote_docx_candidate": "Promote Docx Candidate",
+    "create_paper_contract": "Create Paper Contract",
+    "get_paper_contract": "Get Paper Contract",
+    "create_paper_contract_revision": "Create Paper Contract Revision",
+    "list_paper_contract_revisions": "List Paper Contract Revisions",
+    "approve_paper_contract_revision": "Approve Paper Contract Revision",
+    "get_current_paper_contract_content": "Get Current Paper Contract Content",
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }
