@@ -52,13 +52,43 @@ const CM6_REQUEST_SOURCE = "meridian-latex-content";
 const CM6_RESPONSE_SOURCE = "meridian-latex-injected";
 const CM6_PROBE_TIMEOUT_MS = 2000;
 
+// BUG FIXED 2026-09-17 (found by re-reading this code after a real, live
+// timeout report -- "Timed out waiting for the injected page script to
+// respond"): this used to append the <script> tag and fire
+// window.postMessage(...) on the very next line, synchronously. Loading an
+// externally-sourced <script src> is ASYNCHRONOUS -- injected.js had not
+// actually executed yet (and so had not yet registered its own
+// window.addEventListener("message", ...)) by the time the request went
+// out, so the very first request after each page load was silently lost to
+// nobody listening, and the 2s timeout fired every time. Not flakiness --
+// a real race, reproducible on every load. Fixed by making
+// injectMainWorldScript() a promise that resolves on the script's own
+// `load` event, and only sending the postMessage request after that
+// resolves. A cached (already-injected) page resolves immediately.
+let mainWorldScriptReady = null;
+
 function injectMainWorldScript() {
-  if (document.documentElement.dataset.meridianLatexInjected) return;
-  document.documentElement.dataset.meridianLatexInjected = "1";
-  const script = document.createElement("script");
-  script.src = chrome.runtime.getURL("injected.js");
-  document.documentElement.appendChild(script);
-  script.remove();
+  if (mainWorldScriptReady) return mainWorldScriptReady;
+  if (document.documentElement.dataset.meridianLatexInjected === "1") {
+    mainWorldScriptReady = Promise.resolve();
+    return mainWorldScriptReady;
+  }
+  mainWorldScriptReady = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = chrome.runtime.getURL("injected.js");
+    script.onload = () => {
+      document.documentElement.dataset.meridianLatexInjected = "1";
+      script.remove();
+      resolve();
+    };
+    script.onerror = () => {
+      script.remove();
+      mainWorldScriptReady = null; // allow a retry on the next call
+      reject(new Error("injected.js failed to load"));
+    };
+    document.documentElement.appendChild(script);
+  });
+  return mainWorldScriptReady;
 }
 
 /** Relays a doc-info request into the page's MAIN world and waits for
@@ -92,8 +122,13 @@ function getCM6Info() {
     }, CM6_PROBE_TIMEOUT_MS);
 
     window.addEventListener("message", onMessage);
-    injectMainWorldScript();
-    window.postMessage({ source: CM6_REQUEST_SOURCE, type: CM6_REQUEST_TYPE }, window.location.origin);
+    injectMainWorldScript()
+      .then(() => {
+        window.postMessage({ source: CM6_REQUEST_SOURCE, type: CM6_REQUEST_TYPE }, window.location.origin);
+      })
+      .catch((err) => {
+        finish({ found: false, reason: `Failed to inject page script: ${err.message}` });
+      });
   });
 }
 
