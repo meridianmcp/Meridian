@@ -7519,10 +7519,22 @@ fi
 sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)".*/\\1/' || true)"
 url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count"
 [ -n "$sid" ] && url="$url?session_id=$sid"
+# 41f26499 — a Meridian-unreachable window (or a malformed/empty response)
+# used to fail open SILENTLY here, which could abandon this session's file
+# claims with no visible signal (they then only clear via the file-claim 2h
+# TTL). Fail-open behavior is UNCHANGED (still exit 0) but now surfaces a
+# clear stderr warning so the human/agent notices instead of silently
+# continuing.
 resp="$(curl -sf --max-time 5 "$url" 2>/dev/null || true)"
-[ -z "$resp" ] && exit 0
+if [ -z "$resp" ]; then
+  echo "Meridian (41f26499): could not reach $MERIDIAN_URL to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again." >&2
+  exit 0
+fi
 pending="$(printf '%s' "$resp" | grep -oE '"pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
-[ -z "$pending" ] && exit 0
+if [ -z "$pending" ]; then
+  echo "Meridian (41f26499): got an empty or malformed response from $MERIDIAN_URL - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again." >&2
+  exit 0
+fi
 if [ "$pending" -gt 0 ] 2>/dev/null; then
   echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
   exit 2
@@ -7564,14 +7576,34 @@ try { $payload = $raw | ConvertFrom-Json } catch { $payload = $null }
 if ($payload -and $payload.stop_hook_active -eq $true) { exit 0 }
 # b4ce3274 — forward the session id (when present) so the override budget is
 # counted per session, not per project.
+# 41f26499 — MUST use ${reqUrl} (braced) here, not bare $reqUrl: PowerShell
+# treats "?" as a legal bare-variable-name character, so "$reqUrl?session_id="
+# parsed as the (nonexistent, empty) variable $reqUrl?session_id followed by
+# literal "=", silently dropping the whole base URL and producing an invalid
+# URI. That sent Invoke-RestMethod down the catch branch below on every stop
+# with a session_id present -- i.e. always -- making this whole endpoint a
+# silent no-op on Windows. Caught while adding the warning below, which would
+# otherwise have falsely reported "server unreachable" on every normal stop.
 $reqUrl = "$Url/projects/$ProjectId/sprint/pending_count"
 if ($payload -and $payload.session_id) {
-    $reqUrl = "$reqUrl?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
+    $reqUrl = "${reqUrl}?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
 }
+# 41f26499 — a Meridian-unreachable window (or a malformed/empty response)
+# used to fail open SILENTLY here, which could abandon this session's file
+# claims with no visible signal (they then only clear via the file-claim 2h
+# TTL). Fail-open behavior is UNCHANGED (still exit 0) but now surfaces a
+# clear stderr warning so the human/agent notices instead of silently
+# continuing.
 try {
     $r = Invoke-RestMethod -Method GET -Uri $reqUrl -TimeoutSec 5
-} catch { exit 0 }
-if ($null -eq $r -or $null -eq $r.pending_count) { exit 0 }
+} catch {
+    [Console]::Error.WriteLine("Meridian (41f26499): could not reach $Url to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again.")
+    exit 0
+}
+if ($null -eq $r -or $null -eq $r.pending_count) {
+    [Console]::Error.WriteLine("Meridian (41f26499): got an empty or malformed response from $Url - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again.")
+    exit 0
+}
 $pending = [int]$r.pending_count
 if ($pending -gt 0) {
     [Console]::Error.WriteLine("Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping.")
