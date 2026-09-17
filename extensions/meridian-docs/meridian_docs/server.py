@@ -354,9 +354,9 @@ def get_document_review(
     alone.
 
     Composes existing read-only primitives (audit_equation_style,
-    audit_caption_style, audit_table_style, scan_stale_notes, a read-only
-    legacy-plaintext-caption detector, and optionally
-    check_render_capability) rather than re-deriving detection or
+    audit_caption_style, audit_table_style, audit_heading_style (df716454),
+    scan_stale_notes, a read-only legacy-plaintext-caption detector, and
+    optionally check_render_capability) rather than re-deriving detection or
     anchor-resolution logic. Pass
     expected_source_fingerprint (a value previously returned as
     source_fingerprint) to detect the document having changed since a
@@ -1902,6 +1902,89 @@ def audit_table_style(
 
 
 @mcp.tool()
+def audit_heading_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """df716454 — Audit every H1/H2/H3 heading for per-level spacing
+    (before/after, in twips) against a style_policy/journal preset, AND
+    flag existing headings that already violate
+    style_policy["heading_terminal_punctuation"] — the read-only
+    counterpart to _apply_heading_terminal_punctuation, which only fires
+    when NEW heading content is authored via write_section.
+
+    Three finding types, each skipped entirely when the corresponding
+    policy key is unset (None — no verified rule, don't guess):
+      heading_spacing_before_mismatch /
+      heading_spacing_after_mismatch   — a heading paragraph's own
+        <w:spacing w:before/w:after> doesn't match
+        style_policy["heading_spacing_before_h{level}_twips"] /
+        ["heading_spacing_after_h{level}_twips"] (level 1-3 only).
+      heading_terminal_punctuation_mismatch — the heading's current text
+        would change under _apply_heading_terminal_punctuation's own
+        normalization rule (i.e. it already violates the policy).
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides, or pass
+                     get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {docx_path, heading_count, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_heading_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
+def audit_cross_document_consistency(
+    manuscript_path: str,
+    si_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """df716454 — Diff specific style-DEFINITION values (word/styles.xml,
+    not paragraph instances) between a manuscript and its Supplementary
+    Information companion, and separately check the body-text style's font
+    against a style_policy/journal preset in each document.
+
+    Genuinely new shape versus every other audit_* tool: takes TWO docx
+    paths instead of one. Findings carry a "document" tag ("manuscript"/
+    "si") or both "manuscript_style_id"/"si_style_id" instead of a
+    para_id/locator — a style definition isn't anchored to one paragraph.
+
+    Two finding families, each skipped when the relevant style can't be
+    positively found in the document(s) being compared:
+      cross_document_style_mismatch     — the SAME conceptual style
+        (title/Heading0 spacing, body-text font, FigureImage spacing)
+        differs between the manuscript and the SI.
+      body_text_font_family_mismatch /
+      body_text_font_size_mismatch      — the body-text (Normal/BodyText)
+        style's font doesn't match style_policy["body_text_font_family"]/
+        ["body_text_font_size_pt"], checked independently in EACH document
+        (catches a real JCSHM SI found with 12pt body text against the
+        journal's own stated "10-point Times Roman" guideline).
+
+    Args:
+      manuscript_path: Absolute path to the manuscript .docx (read-only).
+      si_path:          Absolute path to the SI .docx (read-only).
+      style_policy:     Optional style policy overrides, or pass
+                        get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {manuscript_path, si_path, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_cross_document_consistency(
+        manuscript_path=manuscript_path,
+        si_path=si_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
 def audit_equation_contract(
     docx_path: str,
     project_id: str | None = None,
@@ -1965,8 +2048,8 @@ def get_journal_style_preset(
     resolve_style_policy key populated), ready to pass straight through as
     style_policy= to insert_figure_block, insert_caption,
     audit_equation_style, audit_caption_style, audit_table_style,
-    insert_equation, insert_highlighted_note, write_section, or
-    insert_table.
+    audit_heading_style, audit_cross_document_consistency, insert_equation,
+    insert_highlighted_note, write_section, or insert_table.
 
     8e2f4a17 — journal is no longer limited to the ~29 built-in presets.
     Pass user_presets_path to also resolve names saved via

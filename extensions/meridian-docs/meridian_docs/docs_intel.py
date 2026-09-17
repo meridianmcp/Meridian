@@ -8949,6 +8949,22 @@ def _style_policy_defaults() -> dict[str, Any]:
     guessed value -- exactly like ``heading_terminal_punctuation`` and the
     two ``table_*_column_alignment`` keys above. A caller that never touches
     these fourteen keys sees byte-identical behavior to before this change.
+
+    df716454 -- eight more keys back :func:`audit_heading_style` (per-level
+    H1/H2/H3 heading spacing) and :func:`audit_cross_document_consistency`
+    (body-text typography). ``heading_spacing_before_h{1,2,3}_twips`` /
+    ``heading_spacing_after_h{1,2,3}_twips`` express the paragraph-level
+    ``<w:spacing w:before/w:after>`` a heading of that level is expected to
+    carry, in TWIPS (1/20 pt) -- matching ``body_indent_twips``'s existing
+    unit convention above, the only other explicitly-unit-suffixed key in
+    this schema, rather than inventing a separate "body-line multiplier"
+    unit. ``body_text_font_family`` / ``body_text_font_size_pt`` express the
+    document's body-text paragraph style's (``Normal``/``BodyText``)
+    expected font: a real JCSHM manuscript/SI pair had the SI's body text at
+    12pt against JCSHM's own stated "10-point Times Roman" guideline -- a
+    real mismatch caught only by eye, never by tooling, before this. All
+    eight default to ``None``/``"unspecified"`` -- same "unverified means
+    don't guess" discipline as every key above.
     """
     return {
         "caption_centered": False,
@@ -8978,6 +8994,14 @@ def _style_policy_defaults() -> dict[str, Any]:
         "figure_dpi_minimum_combination": None,
         "si_reformatting_policy": "unspecified",
         "citation_style": "unspecified",
+        "heading_spacing_before_h1_twips": None,
+        "heading_spacing_after_h1_twips": None,
+        "heading_spacing_before_h2_twips": None,
+        "heading_spacing_after_h2_twips": None,
+        "heading_spacing_before_h3_twips": None,
+        "heading_spacing_after_h3_twips": None,
+        "body_text_font_family": None,
+        "body_text_font_size_pt": None,
     }
 
 
@@ -9127,6 +9151,23 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
                                     convention ("not_fixed" meaning the
                                     publisher's own guidance defers this to
                                     the individual journal).
+      heading_spacing_before_h1_twips / heading_spacing_after_h1_twips /
+      heading_spacing_before_h2_twips / heading_spacing_after_h2_twips /
+      heading_spacing_before_h3_twips / heading_spacing_after_h3_twips
+                                    (int>=0 | None): df716454 -- the
+                                    <w:spacing w:before>/<w:after> (in
+                                    twips) :func:`audit_heading_style`
+                                    expects on an H1/H2/H3 heading paragraph.
+                                    ``None`` (the default) skips that
+                                    level/edge's check entirely.
+      body_text_font_family (str | None): df716454 -- the font family
+                                    (<w:rFonts w:ascii>) expected on the
+                                    document's body-text paragraph style
+                                    (``Normal``/``BodyText``), checked by
+                                    :func:`audit_cross_document_consistency`.
+      body_text_font_size_pt (int | float | None): df716454 -- same as
+                                    ``body_text_font_family`` but for the
+                                    body-text style's font size in points.
 
     Raises:
       ValueError: an unknown key, or a value of the wrong type/out of range.
@@ -9259,6 +9300,38 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
             f"style policy 'citation_style' must be one of {sorted(_VALID_CITATION_STYLES)}"
         )
 
+    # df716454 -- validation for the eight audit_heading_style /
+    # audit_cross_document_consistency keys (see _style_policy_defaults()
+    # and the docstring above).
+    for key in (
+        "heading_spacing_before_h1_twips", "heading_spacing_after_h1_twips",
+        "heading_spacing_before_h2_twips", "heading_spacing_after_h2_twips",
+        "heading_spacing_before_h3_twips", "heading_spacing_after_h3_twips",
+    ):
+        value = policy[key]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(f"style policy {key!r} must be a non-negative int or None")
+
+    body_font_family = policy["body_text_font_family"]
+    if body_font_family is not None and (
+        not isinstance(body_font_family, str) or not body_font_family.strip()
+    ):
+        raise ValueError(
+            "style policy 'body_text_font_family' must be a non-empty string or None"
+        )
+
+    body_font_size = policy["body_text_font_size_pt"]
+    if body_font_size is not None and (
+        not isinstance(body_font_size, (int, float))
+        or isinstance(body_font_size, bool)
+        or body_font_size <= 0
+    ):
+        raise ValueError(
+            "style policy 'body_text_font_size_pt' must be a positive number or None"
+        )
+
     return policy
 
 
@@ -9367,6 +9440,27 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
     # tables is plausible but was not independently confirmed, so per this
     # catalog's own no-guessing discipline it stays unverified rather than
     # assumed identical.
+    # df716454 -- heading_spacing_*_h{1,2,3}_twips and body_text_font_*
+    # added 2026-09-17, from this session's own Tier-1 measurement against
+    # the real JCSHM manuscript/SI PDF baseline (not the submission-
+    # guidelines web page -- the guidelines page does not state numeric
+    # heading spacing, so this is a DIRECT PDF measurement, independent of
+    # the web-page-sourced keys above). Found: H1 = 2 body-lines before / 1
+    # body-line after; H2 and H3 measured IDENTICAL to each other -- both 1
+    # body-line before / 1 after (H3 is NOT half of H2 -- a plausible but
+    # wrong guess this measurement explicitly rules out). Converted to
+    # twips via OOXML's own font-size-independent "one line = 240 twips"
+    # convention (the same 240 used by <w:spacing w:line="240"
+    # w:lineRule="auto"> for single line spacing), matching this schema's
+    # only other explicitly-unit-suffixed key (body_indent_twips) rather
+    # than inventing a separate "body-line multiplier" unit: H1
+    # before=2*240=480/after=1*240=240; H2 before=240/after=240; H3
+    # before=240/after=240 (== H2, per the measurement above).
+    # body_text_font_family/body_text_font_size_pt = "Times New Roman"/10,
+    # per JCSHM's own submission guidelines ("10-point Times Roman") -- the
+    # real motivating case for audit_cross_document_consistency: this
+    # session found the SI's BodyText/Normal styles explicitly set to 12pt
+    # by eye, a mismatch no existing tooling would have caught.
     "jcshm": {
         "caption_centered": True,
         "equation_alignment": "center",
@@ -9382,6 +9476,14 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
         "heading_numbering_visible": True,
         "heading_levels_max": 3,
         "citation_style": "numbered_bracket",
+        "heading_spacing_before_h1_twips": 480,
+        "heading_spacing_after_h1_twips": 240,
+        "heading_spacing_before_h2_twips": 240,
+        "heading_spacing_after_h2_twips": 240,
+        "heading_spacing_before_h3_twips": 240,
+        "heading_spacing_after_h3_twips": 240,
+        "body_text_font_family": "Times New Roman",
+        "body_text_font_size_pt": 10,
     },
 
     # -- Round 1 (proposal 3674c0c1) -----------------------------------
@@ -10832,6 +10934,445 @@ def audit_table_style(
     return {
         "docx_path": docx_path,
         "table_count": table_count,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+def audit_heading_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """df716454 -- audit every heading paragraph (levels 1-3, via
+    :func:`_is_heading` + :func:`_heading_level`) for two families of
+    publisher-style defects, neither caught by any existing audit before
+    this one:
+
+      * ``heading_spacing_before_mismatch`` / ``heading_spacing_after_mismatch``
+        -- the heading paragraph's own ``<w:pPr><w:spacing w:before/w:after>``
+        (missing == unset, Word's own default) doesn't match
+        ``style_policy["heading_spacing_before_h{level}_twips"]`` /
+        ``["heading_spacing_after_h{level}_twips"]``. Gated per-key/per-level
+        (``None`` == "no verified rule for this level/edge -- don't guess"),
+        same discipline as every other style-policy-gated check in this
+        module. Only checked for levels 1-3 -- no policy keys exist for
+        H4+ or for H0/title (title-style spacing is a document-wide STYLE
+        DEFINITION property, checked separately by
+        :func:`audit_cross_document_consistency`, not a per-paragraph one).
+      * ``heading_terminal_punctuation_mismatch`` -- the READ-ONLY
+        counterpart to :func:`_apply_heading_terminal_punctuation`, which is
+        write-time-only (only fires when :func:`write_section` authors a NEW
+        heading -- an existing document's already-wrong headings were never
+        flagged before this). Reuses :func:`_apply_heading_terminal_punctuation`
+        itself rather than reimplementing its
+        :data:`_HEADING_TERMINAL_PUNCT_CHARS` stripping rule a second time:
+        a heading's current text is fed through the SAME normalization
+        :func:`write_section` would apply, and a finding is raised iff that
+        would actually change the text. Gated on
+        ``style_policy["heading_terminal_punctuation"]`` being non-``None``.
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style
+                     policy via :func:`resolve_style_policy`. Pass
+                     ``get_journal_style_preset("jcshm")`` (or any other
+                     preset name) directly, or a hand-written override
+                     dict.
+
+    Returns:
+      ``{docx_path, heading_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the file
+      cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+    w_spacing = _q(_W, "spacing")
+    w_before = _q(_W, "before")
+    w_after = _q(_W, "after")
+
+    def _twips_attr(value: str | None) -> int | None:
+        if value is None:
+            return None
+        stripped = value.lstrip("-")
+        return int(value) if stripped.isdigit() else None
+
+    findings: list[dict[str, Any]] = []
+    heading_count = 0
+
+    for index, p in enumerate(body):
+        if p.tag != w_p:
+            continue
+        ppr = p.find(w_pPr)
+        style: str | None = None
+        if ppr is not None:
+            pstyle = ppr.find(w_pStyle)
+            if pstyle is not None:
+                style = pstyle.get(w_val)
+        if not _is_heading(style):
+            continue
+
+        heading_count += 1
+        level = _heading_level(style)
+        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        text = "".join(t.text or "" for t in p.iter(w_t))
+
+        if 1 <= level <= 3:
+            spacing = ppr.find(w_spacing) if ppr is not None else None
+            actual_before = _twips_attr(spacing.get(w_before) if spacing is not None else None)
+            actual_after = _twips_attr(spacing.get(w_after) if spacing is not None else None)
+
+            expected_before = policy[f"heading_spacing_before_h{level}_twips"]
+            if expected_before is not None and actual_before != expected_before:
+                findings.append({
+                    "type": "heading_spacing_before_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "level": level,
+                    "expected_spacing_before_twips": expected_before,
+                    "actual_spacing_before_twips": actual_before,
+                })
+
+            expected_after = policy[f"heading_spacing_after_h{level}_twips"]
+            if expected_after is not None and actual_after != expected_after:
+                findings.append({
+                    "type": "heading_spacing_after_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "level": level,
+                    "expected_spacing_after_twips": expected_after,
+                    "actual_spacing_after_twips": actual_after,
+                })
+
+        expected_terminal = policy["heading_terminal_punctuation"]
+        if expected_terminal is not None:
+            normalized = _apply_heading_terminal_punctuation(text, policy)
+            if normalized != text:
+                findings.append({
+                    "type": "heading_terminal_punctuation_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "level": level,
+                    "heading_text": text,
+                    "expected_heading_text": normalized,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "heading_count": heading_count,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+def _style_definition_facts(raw: bytes, style_id_or_name: str) -> dict[str, Any] | None:
+    """df716454 -- read ``word/styles.xml`` and return a compact fact-set for
+    ONE named/keyed paragraph or character style definition: ``{style_id,
+    style_name, spacing_before_twips, spacing_after_twips, font_family,
+    font_size_pt}``.
+
+    Matches by ``w:styleId`` first (exact, case-insensitive), then by
+    ``<w:name w:val=...>`` (case-insensitive substring) as a fallback -- the
+    same two-tier "exact id, then tolerant name" approach
+    :func:`_is_caption_style`/:func:`_is_heading` use for style-name
+    tolerance elsewhere in this module. Returns ``None`` when no style in
+    ``word/styles.xml`` matches, or ``word/styles.xml`` itself is
+    absent/malformed/missing from the package -- callers must never guess a
+    fact for a style they can't positively find, mirroring every other
+    "unverified means don't check" gate in this module.
+
+    Backing helper for :func:`audit_cross_document_consistency`; not an MCP
+    tool itself (private, matching :func:`_docx_style_count`'s own
+    not-a-tool styles.xml reader right above it in this module).
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            if "word/styles.xml" not in zf.namelist():
+                return None
+            data = zf.read("word/styles.xml")
+    except zipfile.BadZipFile:
+        return None
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return None
+
+    w_style = _q(_W, "style")
+    w_styleId_attr = _q(_W, "styleId")
+    w_name = _q(_W, "name")
+    w_val = _q(_W, "val")
+    w_pPr = _q(_W, "pPr")
+    w_rPr = _q(_W, "rPr")
+    w_spacing = _q(_W, "spacing")
+    w_before = _q(_W, "before")
+    w_after = _q(_W, "after")
+    w_rFonts = _q(_W, "rFonts")
+    w_ascii = _q(_W, "ascii")
+    w_sz = _q(_W, "sz")
+
+    target = style_id_or_name.strip().lower()
+    match: ET.Element | None = None
+    for style in root.iter(w_style):
+        style_id = style.get(w_styleId_attr) or ""
+        if style_id.strip().lower() == target:
+            match = style
+            break
+    if match is None:
+        for style in root.iter(w_style):
+            name_el = style.find(w_name)
+            name_val = (name_el.get(w_val) if name_el is not None else None) or ""
+            if target and target in name_val.strip().lower():
+                match = style
+                break
+    if match is None:
+        return None
+
+    style_id = match.get(w_styleId_attr)
+    name_el = match.find(w_name)
+    style_name = name_el.get(w_val) if name_el is not None else None
+
+    spacing_before = spacing_after = None
+    ppr = match.find(w_pPr)
+    if ppr is not None:
+        spacing = ppr.find(w_spacing)
+        if spacing is not None:
+            before_raw = spacing.get(w_before)
+            after_raw = spacing.get(w_after)
+            if before_raw is not None and before_raw.lstrip("-").isdigit():
+                spacing_before = int(before_raw)
+            if after_raw is not None and after_raw.lstrip("-").isdigit():
+                spacing_after = int(after_raw)
+
+    font_family = font_size_pt = None
+    rpr = match.find(w_rPr)
+    if rpr is not None:
+        rfonts = rpr.find(w_rFonts)
+        if rfonts is not None:
+            font_family = rfonts.get(w_ascii)
+        sz = rpr.find(w_sz)
+        if sz is not None:
+            sz_raw = sz.get(w_val)
+            if sz_raw is not None and sz_raw.isdigit():
+                font_size_pt = int(sz_raw) / 2
+
+    return {
+        "style_id": style_id,
+        "style_name": style_name,
+        "spacing_before_twips": spacing_before,
+        "spacing_after_twips": spacing_after,
+        "font_family": font_family,
+        "font_size_pt": font_size_pt,
+    }
+
+
+def _resolve_style_facts_by_candidates(
+    raw: bytes, candidates: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """df716454 -- try each of ``candidates`` (style id or name) in turn via
+    :func:`_style_definition_facts`, returning the first match. Real
+    documents name the same conceptual style differently (``"Normal"`` vs a
+    custom ``"BodyText"``), so callers pass every plausible id/name rather
+    than assuming one.
+    """
+    for candidate in candidates:
+        facts = _style_definition_facts(raw, candidate)
+        if facts is not None:
+            return facts
+    return None
+
+
+#: df716454 -- style-id/name candidates for the document's body-text style,
+#: shared between _CROSS_DOC_STYLE_TARGETS below and the direct
+#: policy-comparison loop in audit_cross_document_consistency.
+_BODY_TEXT_STYLE_CANDIDATES: tuple[str, ...] = ("Normal", "BodyText")
+
+#: df716454 -- the fixed set of style-definition facts
+#: audit_cross_document_consistency diffs between two documents. Each entry
+#: names the style-id/name candidates to try (see
+#: _resolve_style_facts_by_candidates) and which _style_definition_facts
+#: fields are meaningful to compare for that style (spacing for
+#: title/figure-image styles -- layout facts; font family/size for the
+#: body-text style -- typography facts).
+_CROSS_DOC_STYLE_TARGETS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "title_style",
+        "candidates": ("Heading0", "Title"),
+        "compare_fields": ("spacing_before_twips", "spacing_after_twips"),
+    },
+    {
+        "key": "body_text_style",
+        "candidates": _BODY_TEXT_STYLE_CANDIDATES,
+        "compare_fields": ("font_family", "font_size_pt"),
+    },
+    {
+        "key": "figure_image_style",
+        "candidates": ("FigureImage",),
+        "compare_fields": ("spacing_before_twips", "spacing_after_twips"),
+    },
+)
+
+
+def audit_cross_document_consistency(
+    manuscript_path: str,
+    si_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """df716454 -- diff specific STYLE-DEFINITION values (``word/styles.xml``,
+    not paragraph instances) between a manuscript and its Supplementary
+    Information companion document, and separately check the body-text
+    style's font against the resolved ``style_policy``.
+
+    Genuinely new SHAPE versus every other ``audit_*`` function in this
+    module: those each take exactly one ``docx_path`` and are read-only over
+    ONE document's paragraph/table content. This one takes TWO paths and
+    compares STYLE DEFINITIONS, not paragraph instances -- there is
+    therefore no natural ``para_id`` to attach to a finding, and no locator
+    to resolve: :func:`build_document_review`'s own locator-resolution loop
+    (``_resolve_anchor_query``) operates against ONE parsed document at a
+    time, and a style definition isn't anchored to any single paragraph
+    anyway (many paragraphs across a document can share one style). This
+    function's return still matches the same finding-report SHAPE every
+    other audit uses (``findings`` / ``finding_count`` / ``findings_by_type``
+    / ``policy``) so a caller can compose it the same way, but each finding
+    carries either ``document`` (which of the two files: ``"manuscript"`` or
+    ``"si"``) for a policy-comparison finding, or both
+    ``manuscript_style_id``/``si_style_id`` for a cross-document mismatch --
+    never a fabricated ``para_id``/``locator``.
+
+    Two finding families:
+
+      * ``cross_document_style_mismatch`` -- for each of three fixed style
+        targets (title/``Heading0`` spacing, body-text font, ``FigureImage``
+        spacing -- see :data:`_CROSS_DOC_STYLE_TARGETS`), when the SAME
+        conceptual style is found (by id or name, tolerant of renaming) in
+        BOTH documents, its relevant fields are compared; a difference is a
+        finding. A style found in only one document (or neither) is silently
+        skipped for that target -- this function only compares facts it can
+        positively find in both files, never guesses.
+      * ``body_text_font_family_mismatch`` / ``body_text_font_size_mismatch``
+        -- the body-text style's font, checked INDEPENDENTLY against
+        ``style_policy["body_text_font_family"]``/``["body_text_font_size_pt"]``
+        in EACH document separately (not just against each other) --
+        catches the real motivating case this function was built for: a
+        real JCSHM SI whose ``BodyText``/``Normal`` style was 12pt against
+        JCSHM's own stated "10-point Times Roman" guideline, a mismatch
+        that would NOT necessarily show up as a manuscript-vs-SI diff if
+        the manuscript itself happened to also be wrong. Gated on the
+        corresponding policy key being non-``None``/``"unspecified"``, same
+        discipline as every other style-policy-gated check in this module.
+
+    Args:
+      manuscript_path: Absolute path to the manuscript .docx. Read-only.
+      si_path:          Absolute path to the Supplementary Information
+                        .docx. Read-only.
+      style_policy:     Optional overrides merged onto the default style
+                        policy via :func:`resolve_style_policy`. Pass
+                        ``get_journal_style_preset("jcshm")`` directly, or a
+                        hand-written override dict.
+
+    Returns:
+      ``{manuscript_path, si_path, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when either
+      file cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        with open(manuscript_path, "rb") as handle:
+            manuscript_raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    try:
+        with open(si_path, "rb") as handle:
+            si_raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    findings: list[dict[str, Any]] = []
+
+    for target in _CROSS_DOC_STYLE_TARGETS:
+        manuscript_facts = _resolve_style_facts_by_candidates(manuscript_raw, target["candidates"])
+        si_facts = _resolve_style_facts_by_candidates(si_raw, target["candidates"])
+        if manuscript_facts is None or si_facts is None:
+            continue
+        for field in target["compare_fields"]:
+            manuscript_value = manuscript_facts.get(field)
+            si_value = si_facts.get(field)
+            if manuscript_value is None or si_value is None:
+                continue
+            if manuscript_value != si_value:
+                findings.append({
+                    "type": "cross_document_style_mismatch",
+                    "style_key": target["key"],
+                    "field": field,
+                    "manuscript_style_id": manuscript_facts.get("style_id"),
+                    "si_style_id": si_facts.get("style_id"),
+                    "manuscript_value": manuscript_value,
+                    "si_value": si_value,
+                })
+
+    expected_family = policy["body_text_font_family"]
+    expected_size = policy["body_text_font_size_pt"]
+    if expected_family is not None or expected_size is not None:
+        for label, raw in (("manuscript", manuscript_raw), ("si", si_raw)):
+            facts = _resolve_style_facts_by_candidates(raw, _BODY_TEXT_STYLE_CANDIDATES)
+            if facts is None:
+                continue
+            actual_family = facts.get("font_family")
+            if expected_family is not None and actual_family is not None and actual_family != expected_family:
+                findings.append({
+                    "type": "body_text_font_family_mismatch",
+                    "document": label,
+                    "style_id": facts.get("style_id"),
+                    "expected_font_family": expected_family,
+                    "actual_font_family": actual_family,
+                })
+            actual_size = facts.get("font_size_pt")
+            if expected_size is not None and actual_size is not None and actual_size != expected_size:
+                findings.append({
+                    "type": "body_text_font_size_mismatch",
+                    "document": label,
+                    "style_id": facts.get("style_id"),
+                    "expected_font_size_pt": expected_size,
+                    "actual_font_size_pt": actual_size,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "manuscript_path": manuscript_path,
+        "si_path": si_path,
         "findings": findings,
         "finding_count": len(findings),
         "findings_by_type": findings_by_type,
@@ -21145,6 +21686,13 @@ def build_document_review(
                         ``style_policy["table_alignment"]``), missing
                         header-row-repeat, and a redundant blank paragraph
                         between a table's caption and the table itself.
+                        ALSO (df716454) :func:`audit_heading_style`
+                        findings: per-level H1/H2/H3 heading spacing
+                        (gated on the corresponding
+                        ``heading_spacing_before/after_h{level}_twips``
+                        key) and the read-only
+                        ``heading_terminal_punctuation_mismatch`` finding
+                        (gated on ``style_policy["heading_terminal_punctuation"]``).
     * ``section_page`` / ``ownership`` -- reserved, always 0 in this first
                         version (see :data:`REVIEW_CATEGORIES`).
 
@@ -21256,6 +21804,20 @@ def build_document_review(
     table_style_audit = audit_table_style(docx_path, style_policy)
     if isinstance(table_style_audit, dict) and not table_style_audit.get("error"):
         for f in table_style_audit.get("findings", []):
+            findings.append({
+                "category": "structure",
+                "severity": _review_finding_severity("structure", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    # df716454 -- heading-spacing (per-level H1/H2/H3) and read-only
+    # heading-terminal-punctuation findings, same "structure" category and
+    # gating discipline as the table-style findings just above.
+    heading_style_audit = audit_heading_style(docx_path, style_policy)
+    if isinstance(heading_style_audit, dict) and not heading_style_audit.get("error"):
+        for f in heading_style_audit.get("findings", []):
             findings.append({
                 "category": "structure",
                 "severity": _review_finding_severity("structure", f["type"]),

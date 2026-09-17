@@ -292,6 +292,17 @@ def test_resolve_style_policy_defaults():
         "figure_dpi_minimum_combination": None,
         "si_reformatting_policy": "unspecified",
         "citation_style": "unspecified",
+        # df716454 -- audit_heading_style / audit_cross_document_consistency
+        # keys, same "not verified" None-default discipline as every key
+        # above.
+        "heading_spacing_before_h1_twips": None,
+        "heading_spacing_after_h1_twips": None,
+        "heading_spacing_before_h2_twips": None,
+        "heading_spacing_after_h2_twips": None,
+        "heading_spacing_before_h3_twips": None,
+        "heading_spacing_after_h3_twips": None,
+        "body_text_font_family": None,
+        "body_text_font_size_pt": None,
     }
 
 
