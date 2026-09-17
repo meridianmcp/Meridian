@@ -47,25 +47,38 @@ from pathlib import Path
 import pytest
 
 
-def _find_main_repo() -> Path:
-    """Return the main repo root even when this test file lives inside a worktree.
+def _find_git_common_dir() -> Path:
+    """Return this checkout's real shared git-common-dir, however this test
+    file's own worktree happens to be laid out.
 
-    Mirrors tests/test_worktree_guard.py's own helper exactly.
+    FIXED during landing (2026-09-17): the original version of this helper
+    (copied from tests/test_worktree_guard.py's own pre-existing pattern)
+    guessed the main repo root by string-matching a `.claude/worktrees/<name>`
+    path convention -- which only holds for THIS project's own
+    Workflow-dispatched agent worktrees. It silently returns the wrong
+    directory (this worktree's own root, whose `.git` is a plain FILE, not a
+    directory) for any worktree at a different location -- confirmed live:
+    a landing worktree under a scratch temp directory (not under
+    `.claude/worktrees/`) made every `_lock_path_for` assertion fail, not
+    because the hook was wrong, but because this test's own path-guessing
+    heuristic was. decision 9ce6420e itself documents this repo having 19
+    real worktrees, several NOT under `.claude/worktrees/` at all (e.g.
+    `.codex/worktrees/c556`) -- so the guess was never fully general even
+    for this repo's own topology.
+
+    Fix: just ask git, the same way the hook itself does
+    (`git -C "$project_dir" rev-parse --git-common-dir`, worktree_guard.sh
+    line ~142) -- confirmed live this always returns an ABSOLUTE path for a
+    linked worktree, correctly, for any worktree location, with zero
+    path-guessing needed.
     """
-    here = Path(__file__).resolve()
-    candidate = here.parent.parent
-    parts = candidate.parts
-    try:
-        wt_idx = next(
-            i for i, p in enumerate(parts) if p == ".claude"
-            and i + 1 < len(parts) and parts[i + 1] == "worktrees"
-        )
-        return Path(*parts[:wt_idx])
-    except StopIteration:
-        return candidate
+    result = subprocess.run(
+        ["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "--git-common-dir"],
+        capture_output=True, text=True, check=True,
+    )
+    return Path(result.stdout.strip()).resolve()
 
 
-_REPO = _find_main_repo()
 _WORKTREE_ROOT = Path(__file__).resolve().parent.parent
 _HOOK_SH = _WORKTREE_ROOT / ".claude" / "hooks" / "worktree_guard.sh"
 _HOOK_PS1 = _WORKTREE_ROOT / ".claude" / "hooks" / "worktree_guard.ps1"
@@ -74,7 +87,32 @@ _HOOK_PS1 = _WORKTREE_ROOT / ".claude" / "hooks" / "worktree_guard.ps1"
 # (main tree included) resolves to the SAME directory, which is exactly the
 # property under test. Locks land under here, in a dedicated subdirectory,
 # and every test cleans up the specific lock file(s) it creates.
-_LOCK_ROOT = _REPO / ".git" / "meridian-locks"
+_GIT_COMMON_DIR = _find_git_common_dir()
+_LOCK_ROOT = _GIT_COMMON_DIR / "meridian-locks"
+
+# The main (non-worktree) tree's own working directory -- by git's own
+# convention, `.git` always lives directly inside it, so this is simply the
+# common-dir's parent. Used by the "does the lock check apply to a
+# main-tree session too" scenarios, which need a real working-tree path
+# (unlike _LOCK_ROOT, which is a `.git`-internal path).
+_MAIN_TREE_ROOT = _GIT_COMMON_DIR.parent
+
+# A SYNTHETIC worktree path matching the pre-existing a3984d96 boundary
+# check's own detection convention (a `.claude/worktrees/<name>` substring --
+# see worktree_guard.sh's own comment: "If CLAUDE_PROJECT_DIR does NOT
+# contain '.claude/worktrees/' the session is in the main tree -- fail
+# open"). That detection heuristic is a PRE-EXISTING, out-of-scope-for-71f597b7
+# limitation (it doesn't recognize this repo's OTHER real worktree
+# conventions either, e.g. `.codex/worktrees/` -- decision 9ce6420e's own
+# text notes this). It means passing this test file's own REAL location as
+# `claude_project_dir` only exercises the boundary check correctly when the
+# test file happens to live under `.claude/worktrees/` itself. Mirrors
+# tests/test_worktree_guard.py's own `_WORKTREE_DIR` fixture exactly, so the
+# "boundary check still works unmodified" tests below verify the REAL
+# detection convention regardless of where this test file itself is run
+# from (a landing/review worktree elsewhere, an agent's own
+# `.claude/worktrees/wf_*` worktree, or anywhere else).
+_SYNTHETIC_WORKTREE_DIR = str(_MAIN_TREE_ROOT / ".claude" / "worktrees" / "test-fixture-worktree-lock")
 
 
 def _find_git_capable_bash() -> str | None:
@@ -299,14 +337,14 @@ def test_sh_lock_check_applies_to_main_tree_session_too():
     rel = "_test_71f597b7_main_tree.py"
     _cleanup_lock(rel)
     try:
-        target = str(_REPO / rel)
+        target = str(_MAIN_TREE_ROOT / rel)
         payload_a = _make_payload("Edit", target, "session-A")
-        r1 = _run_sh(payload_a, claude_project_dir=str(_REPO))
+        r1 = _run_sh(payload_a, claude_project_dir=str(_MAIN_TREE_ROOT))
         assert r1.returncode == 0, "main-tree session's own first touch must be allowed"
         assert _lock_path_for(rel).exists()
 
         payload_b = _make_payload("Edit", target, "session-B")
-        r2 = _run_sh(payload_b, claude_project_dir=str(_REPO))
+        r2 = _run_sh(payload_b, claude_project_dir=str(_MAIN_TREE_ROOT))
         assert r2.returncode == 2, (
             "a second live session (even another main-tree session) touching "
             "the same repo-relative path must be blocked"
@@ -338,11 +376,11 @@ def test_sh_boundary_block_takes_precedence_over_lock_check():
     a3984d96), the new lock section must never run at all -- confirmed by
     checking no lockfile gets created for the (rejected) main-tree path."""
     rel = "conftest.py"  # tests/conftest.py already exists in the main tree
-    main_file = str(_REPO / "tests" / rel)
+    main_file = str(_MAIN_TREE_ROOT / "tests" / rel)
     _cleanup_lock(rel)
     try:
         payload = _make_payload("Edit", main_file, "session-A")
-        r = _run_sh(payload, claude_project_dir=str(_WORKTREE_ROOT))
+        r = _run_sh(payload, claude_project_dir=_SYNTHETIC_WORKTREE_DIR)
         assert r.returncode == 2
         assert "a3984d96" in r.stderr
         assert not _lock_path_for(rel).exists(), (
@@ -464,8 +502,8 @@ def test_ps1_fails_open_without_session_id():
 def test_ps1_boundary_block_still_works_unmodified():
     """The pre-existing a3984d96 boundary behavior must be byte-for-byte
     unaffected by this change when run through real PowerShell."""
-    main_file = str(_REPO / "tests" / "conftest.py")
+    main_file = str(_MAIN_TREE_ROOT / "tests" / "conftest.py")
     payload = _make_payload("Edit", main_file, "session-A")
-    r = _run_ps1(payload, claude_project_dir=str(_WORKTREE_ROOT))
+    r = _run_ps1(payload, claude_project_dir=_SYNTHETIC_WORKTREE_DIR)
     assert r.returncode == 2
     assert "a3984d96" in r.stderr
