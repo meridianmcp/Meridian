@@ -42,6 +42,23 @@ function findLiveClaim(db, projectId, nodeId, nowMs) {
   return null;
 }
 
+/** Any live SCOPED claim (never the whole-doc sentinel) on this project held
+ * by someone OTHER than `excludeHolder`. Used by leaseWholeDocument's rule 2
+ * (see its own comment) -- the whole-doc-vs-whole-doc case is already
+ * handled separately by leaseWholeDocument's own `existing` check above it,
+ * so this only needs to look at scoped rows. */
+function findAnyOtherLiveScopedClaim(db, projectId, excludeHolder, nowMs) {
+  const rows = db
+    .prepare(
+      "SELECT * FROM claims WHERE project_id = ? AND holder_token != ? AND node_id != ? AND released_at IS NULL ORDER BY claimed_at DESC"
+    )
+    .all(projectId, excludeHolder, WHOLE_DOCUMENT_LEASE_NODE_ID);
+  for (const row of rows) {
+    if (isLive(row, nowMs)) return row;
+  }
+  return null;
+}
+
 function insertClaimRow(db, { project_id, node_id, holder_token }) {
   ensureProjectRow(db, project_id);
   db.prepare(
@@ -184,12 +201,24 @@ export function leaseWholeDocument(db, { project_id, holder_token }) {
       return { leased: true };
     }
 
-    // Deliberately NOT checking for other holders' live SCOPED claims here.
-    // The spec's 5 conflict rules only say a live whole-doc lease blocks
-    // OTHER claims (rule 1) -- not the reverse. A scoped claim held by
-    // someone else does not block a new whole-document lease request; that
-    // asymmetry is exactly what write-back-spec.md section 2 says, not an
-    // oversight here.
+    // Rule 2 (gap found in review, 2026-09-17 -- write-back-spec.md's 5
+    // numbered rules never stated this, even though the spec's own header
+    // says the conflict model should mirror locks.py conceptually, and
+    // locks.py's acquire_docx_document_lease enforces exactly this): ANY
+    // other holder's live SCOPED claim also blocks a new whole-document
+    // lease. "I may rewrite the entire package" is incompatible with anyone
+    // else holding any claim on any part of it -- the same reasoning
+    // locks.py's own module comment gives for its identical rule.
+    const otherScoped = findAnyOtherLiveScopedClaim(db, project_id, holder_token, nowMs);
+    if (otherScoped) {
+      return {
+        leased: false,
+        reason:
+          "another holder has a live scoped claim on this project; a whole-document lease requires the project to be free of every other holder's claims first",
+        holder_token_of_conflict: otherScoped.holder_token,
+      };
+    }
+
     insertClaimRow(db, { project_id, node_id: WHOLE_DOCUMENT_LEASE_NODE_ID, holder_token });
     return { leased: true };
   } catch (err) {

@@ -67,6 +67,14 @@ is one local Node process on one machine.
 
 1. A live whole-document lease by ANY holder blocks every other holder's new
    claim (scoped or whole-doc) on that project.
+1b. Symmetrically: a live SCOPED claim by ANY holder also blocks a
+   DIFFERENT holder's new whole-document lease request (mirrors locks.py's
+   `acquire_docx_document_lease` exactly -- "I may rewrite the entire
+   package" is incompatible with anyone else holding any claim on any part
+   of it). The lease holder's OWN prior scoped claim does not block their
+   own lease request. *(Added during implementation review, 2026-09-17 --
+   the first draft of this spec omitted the reverse direction of rule 1,
+   which was a real coordination hole, not an intentional asymmetry.)*
 2. A live scoped claim on `node_id` X by holder A blocks holder B's claim on
    the SAME `node_id` X.
 3. Scoped claims on DIFFERENT `node_id`s coexist freely (the actual point of

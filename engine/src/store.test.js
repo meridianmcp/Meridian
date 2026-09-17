@@ -50,14 +50,30 @@ test("rule 1 (documented asymmetry): the SAME holder who holds the whole-doc lea
   assert.equal(aliceClaim.claimed, true);
 });
 
-test("documented asymmetry: a live SCOPED claim by another holder does NOT block a new whole-document lease request", () => {
+test("rule 2 (gap fixed in review): a live SCOPED claim by another holder DOES block a new whole-document lease request", () => {
   const db = freshStore();
   claimNode(db, { project_id: "p1", node_id: "heading:abc123", holder_token: "alice" });
 
-  // write-back-spec.md section 2 only lists the whole-doc-lease -> blocks ->
-  // other claims direction (rule 1); the reverse is not one of the 5 rules.
+  // Mirrors locks.py's acquire_docx_document_lease: any other holder's live
+  // claim -- lease or scoped -- blocks a new whole-document lease. The
+  // original write-back-spec.md draft omitted this as its own numbered
+  // rule; fixed here rather than left as a real coordination hole.
   const bob = leaseWholeDocument(db, { project_id: "p1", holder_token: "bob" });
-  assert.equal(bob.leased, true);
+  assert.equal(bob.leased, false);
+  assert.equal(bob.holder_token_of_conflict, "alice");
+
+  // alice's scoped claim must be untouched by bob's rejected attempt.
+  const claims = getLiveClaims(db, "p1");
+  assert.equal(claims.length, 1);
+  assert.equal(claims[0].node_id, "heading:abc123");
+});
+
+test("the SAME holder who holds a scoped claim CAN still take the whole-document lease (their own claim doesn't block themselves)", () => {
+  const db = freshStore();
+  claimNode(db, { project_id: "p1", node_id: "heading:abc123", holder_token: "alice" });
+
+  const alice = leaseWholeDocument(db, { project_id: "p1", holder_token: "alice" });
+  assert.equal(alice.leased, true);
 });
 
 // --- Rule 2: a live scoped claim on node_id X by holder A blocks holder
