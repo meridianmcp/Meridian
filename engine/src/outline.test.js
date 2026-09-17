@@ -85,6 +85,33 @@ test("a nested tabular inside a table float is now its own addressable node (doc
   assert.equal(tableKindNodes.length, 2);
 });
 
+test("two untitled same-level headings collide on content fingerprint and get disambiguated, not merged", () => {
+  const source = ["\\section{}", "\\section{}"].join("\n");
+  const nodes = outlineOf(source);
+  const headings = nodes.filter((n) => n.kind === "heading");
+  assert.equal(headings.length, 2);
+  assert.equal(headings[0].title, "(untitled)");
+  assert.equal(headings[1].title, "(untitled)");
+  // Both hash identically (same kind + level + "(untitled)"), so they are
+  // genuinely the same content fingerprint -- the second must get a
+  // disambiguating suffix rather than silently sharing an id with the
+  // first (which would make them indistinguishable to any caller).
+  assert.notEqual(headings[0].id, headings[1].id);
+  assert.equal(headings[1].id, `${headings[0].id}-dup2`);
+});
+
+test("a table/figure with neither caption nor label falls back to a position-derived id", () => {
+  const source = ["\\begin{figure}", "\\includegraphics{plot.png}", "\\end{figure}"].join("\n");
+  const nodes = outlineOf(source);
+  const figures = nodes.filter((n) => n.kind === "figure");
+  assert.equal(figures.length, 1);
+  assert.equal(figures[0].caption, null);
+  assert.equal(figures[0].label, null);
+  // Documented v1 fallback: no stable content to hash, so the id carries
+  // the positional-fallback marker instead of a real fingerprint.
+  assert.match(figures[0].id, /^figure:pos:L\d+:\d+$/);
+});
+
 test("headings, equations, and figures without refs are unaffected", () => {
   const source = [
     "\\section{Methods}",
