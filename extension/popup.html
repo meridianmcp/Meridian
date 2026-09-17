@@ -13,6 +13,10 @@
       #outline { padding: 8px; border-radius: 6px; background: #f2f2f2; margin-top: 8px;
         font-family: ui-monospace, monospace; white-space: pre-wrap; }
       #outline.error { background: #fdecea; color: #a12622; }
+      #cm6-info { padding: 8px; border-radius: 6px; background: #f2f2f2; margin-top: 8px;
+        font-family: ui-monospace, monospace; white-space: pre-wrap; }
+      #cm6-info.ok { background: #e6f4ea; color: #1e7e34; }
+      #cm6-info.error { background: #fdecea; color: #a12622; }
       #nodes { margin-top: 8px; max-height: 320px; overflow-y: auto; }
       .node-row { padding: 6px 8px; border-radius: 6px; background: #f8f8f8; margin-top: 6px; }
       .node-label { display: block; font-size: 12px; word-break: break-word; margin-bottom: 4px; }
@@ -30,6 +34,8 @@
     <button id="get-outline">Get structural outline</button>
     <div id="outline" hidden></div>
     <div id="nodes" hidden></div>
+    <button id="check-cm6">Check CM6 access</button>
+    <div id="cm6-info" hidden></div>
   </body>
   <script src="popup.js"></script>
 </html>

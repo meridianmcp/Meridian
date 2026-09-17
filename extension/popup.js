@@ -307,6 +307,45 @@ async function getOutline() {
   }
 }
 
+/**
+ * "Check CM6 access" -- diagnostic only, proving the MAIN-world
+ * findFromDOM mechanism works. Deliberately separate from "Get structural
+ * outline": this button never touches the local engine server, never reads
+ * the full document, and has no claim/release involvement. Read-only sanity
+ * check (doc length, line count, first ~200 chars) -- see the pinned
+ * Meridian decision on the write-back safe path (2026-09-17, project
+ * meridian-build) for why this is scaffolded as read-only-first.
+ */
+function setCm6Info(text, cls) {
+  const el = document.getElementById("cm6-info");
+  el.hidden = false;
+  el.textContent = text;
+  el.className = cls || "";
+}
+
+async function checkCm6Access() {
+  setCm6Info("Checking CM6 access…");
+  const tab = await getActiveOverleafTab();
+  if (!tab) {
+    setCm6Info("Not on an Overleaf project page.", "error");
+    return;
+  }
+  chrome.tabs.sendMessage(tab.id, { type: "MERIDIAN_LATEX_GET_CM6_INFO" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) {
+      setCm6Info("No response from content script — try reloading the Overleaf tab.", "error");
+      return;
+    }
+    if (!resp.found) {
+      setCm6Info(`Not found: ${resp.reason || "unknown reason"}`, "error");
+      return;
+    }
+    setCm6Info(
+      `EditorView found via findFromDOM.\nlength: ${resp.length}\nlines: ${resp.lines}\npreview: ${JSON.stringify(resp.preview)}`,
+      "ok",
+    );
+  });
+}
+
 // Best-effort release-all-for-this-holder on popup unload. chrome.runtime
 // doesn't reliably fire an event when a popup closes, so this is paired
 // with releaseStaleClaimsOnOpen() above as the other half of "belt and
@@ -324,4 +363,5 @@ window.addEventListener("pagehide", () => {
 
 document.getElementById("refresh").addEventListener("click", check);
 document.getElementById("get-outline").addEventListener("click", getOutline);
+document.getElementById("check-cm6").addEventListener("click", checkCm6Access);
 check();
