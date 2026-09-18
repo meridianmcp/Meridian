@@ -79,8 +79,17 @@ case "$norm_project" in
     */.claude/worktrees/*) is_worktree=1 ;;
 esac
 
-# Extract file_path from tool_input; fail open if absent.
+# Extract the edited path from tool_input; fail open if absent.
+# 6f07aa89: NotebookEdit's real schema field is notebook_path, not file_path --
+# Claude Code's own NotebookEdit tool_input never contains a file_path key at
+# all (verified against the tool's own parameter schema: notebook_path,
+# cell_id, cell_type, edit_mode, new_source -- no file_path). Falling back to
+# notebook_path when file_path is absent means NotebookEdit calls are still
+# boundary-checked instead of silently no-op'ing (fail-open) on every call.
 file_path="$(printf '%s' "$payload" | grep -oE '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')"
+if [ -z "$file_path" ]; then
+    file_path="$(printf '%s' "$payload" | grep -oE '"notebook_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')"
+fi
 [ -z "$file_path" ] && exit 0
 
 # Normalize file_path separators.
