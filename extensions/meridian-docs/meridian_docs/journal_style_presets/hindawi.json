@@ -1,0 +1,34 @@
+{
+  "meta": {
+    "journal": "hindawi",
+    "display_name": "Hindawi journals",
+    "publisher": "Hindawi",
+    "status": "partially_populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. CAVEAT (inherited from proposal 64266f13, not independently re-verified beyond the two journal pages checked): round-2 flagged that Hindawi's own guidance page can be silent on formatting specifics it fills in from a secondary signal -- Hindawi's CTAN LaTeX template -- rather than the guidelines page alone. This pass's search reached the guidelines pages directly (not the LaTeX template), which corroborates the DPI/citation facts below but did not itself need the template as a secondary signal for those two facts specifically. Marked partially_populated rather than silently upgraded to an unqualified tier 2, per this caveat.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_bracket",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "hindawi.com/journals/mis/guidelines/; hindawi.com/journals/cmi/guidelines/",
+        "quote": "references are numbered consecutively by order of first citation, cited in text via numbers in square brackets",
+        "note": "See meta.status_detail for the inherited CTAN-LaTeX-template substitution caveat."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "hindawi.com/journals/mis/guidelines/; hindawi.com/journals/cmi/guidelines/",
+        "quote": "at least 300 dpi, unless intentionally lower for scientific reasons",
+        "note": "See meta.status_detail for the inherited CTAN-LaTeX-template substitution caveat."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

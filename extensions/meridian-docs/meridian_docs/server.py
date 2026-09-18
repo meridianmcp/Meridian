@@ -2157,6 +2157,43 @@ def get_journal_style_preset(
 
 
 @mcp.tool()
+def get_journal_style_preset_provenance(journal: str) -> dict[str, Any]:
+    """docs-intel-journal-preset-externalization-20260918 — Return the full
+    EVIDENCE record backing one built-in journal-style preset: value, tier
+    (1=real official template/stylesheet source; 2=the journal's own live
+    guidelines page; 3=corroboration from real sampled articles;
+    4=generic/unsourced, explicitly needs verification), source citation,
+    and verified_date for every field that preset actually sets — not just
+    the resolved policy VALUES get_journal_style_preset returns.
+
+    Use this to audit how well-sourced a preset is before trusting it for a
+    real submission — e.g. to find every field still at tier 4 ("needs
+    verification"), or a field explicitly marked status: "open_question"
+    (see "jcshm"'s table_caption_bold, a genuinely unresolved question, not
+    merely "not yet researched").
+
+    Only covers BUILT-IN presets — unlike get_journal_style_preset, there is
+    no user_presets_path here: a user-authored preset (via
+    save_user_journal_style_preset) is a bare style_policy override dict
+    with no evidence schema of its own to report.
+
+    journal is resolved case-insensitively, matching get_journal_style_preset.
+
+    Args:
+      journal: A built-in preset name, in any case (e.g. "jcshm", "Nature",
+        "default").
+
+    Returns:
+      {"journal": <canonical key>, "meta": {...}, "fields": {...}} or
+      {"error": <message>} if journal names no known built-in preset.
+    """
+    try:
+        return docs_intel.get_journal_style_preset_provenance(journal)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
 def list_journal_style_presets(user_presets_path: str | None = None) -> dict[str, Any]:
     """8e2f4a17 — Enumerate every journal-style preset get_journal_style_preset
     can currently resolve: the ~29 built-ins, plus (when user_presets_path

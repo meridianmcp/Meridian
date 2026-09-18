@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "journal": "plos",
+    "display_name": "PLOS journals (PLOS ONE submission guidelines, representative)",
+    "publisher": "PLOS",
+    "status": "populated",
+    "status_detail": "Round 1 (workspace proposal 3674c0c1) migration. Verified 2026-09-11 against journals.plos.org/plosone/s/figures and journals.plos.org/plosone/s/submission-guidelines, treating PLOS ONE as representative of the PLOS family.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_bracket",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "journals.plos.org/plosone/s/submission-guidelines",
+        "note": "PLOS uses the ICMJE ('Vancouver') numbered-bracket citation convention."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "journals.plos.org/plosone/s/figures",
+        "note": "Figures must be 300-600 dpi; 300 is the floor value used here, not broken out by art type in the general guidance."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

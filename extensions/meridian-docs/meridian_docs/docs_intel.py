@@ -54,6 +54,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from . import ooxml_integrity, render_gate
@@ -8929,6 +8930,113 @@ _VALID_CITATION_STYLES = {
     "unspecified",
 }
 
+# docs-intel-journal-preset-externalization-20260918 -- companion to
+# JOURNAL_STYLE_PRESETS below: the full per-field EVIDENCE record (value +
+# tier + source + verified_date, plus the file's own "meta" block) for each
+# built-in preset, keyed the same way as JOURNAL_STYLE_PRESETS itself.
+# Populated as a side effect of _load_builtin_journal_style_presets() (same
+# file-walk pass, so there is no separate read of the JSON files just to
+# build this) -- see get_journal_style_preset_provenance for the lookup
+# surface over this dict. JOURNAL_STYLE_PRESETS itself carries only VALUES
+# (what resolve_style_policy needs); this dict carries the "how do we know"
+# behind each of those values, for a caller auditing preset trustworthiness
+# rather than just consuming the resolved policy.
+_JOURNAL_STYLE_PRESET_PROVENANCE: dict[str, dict[str, Any]] = {}
+
+
+def _load_builtin_journal_style_presets() -> dict[str, dict[str, Any]]:
+    """docs-intel-journal-preset-externalization-20260918 -- load the
+    built-in journal-style-preset catalog from per-journal JSON files under
+    ``journal_style_presets/`` (one file per preset, named ``"<key>.json"``)
+    instead of a single hand-maintained dict literal in this module.
+
+    This replaces the original 4d0ca929/4544bbe5 ``JOURNAL_STYLE_PRESETS``
+    dict literal (29 entries, one per publisher plus "default") with an
+    equivalent catalog assembled at IMPORT time from
+    ``journal_style_presets/<key>.json`` files, each shaped::
+
+        {
+          "meta": {"journal": ..., "display_name": ..., "publisher": ...,
+                    "status": "populated" | "partially_populated" | "baseline",
+                    "status_detail": ..., "last_verified": ...},
+          "fields": {
+            "<style_policy key>": {
+              "value": <the value, or null for an open/unresolved question>,
+              "tier": 1-4,
+              "source": {"type": ..., "citation": ..., ...},
+              "verified_date": ... or null,
+              "status": "open_question",   # optional
+            },
+            ...
+          },
+        }
+
+    Only each field's ``"value"`` feeds the returned style-policy override
+    dict -- a field a journal's preset never set is simply ABSENT from
+    ``"fields"``, matching how the old dict literal just omitted unset keys
+    and let them fall through to :func:`_style_policy_defaults`'s
+    ``None``/``"unspecified"`` sentinel; nothing here invents a value or a
+    tier for a key the preset never actually set.
+
+    Every extracted override dict is run through :func:`resolve_style_policy`
+    immediately, in this same loader pass -- FAIL-CLOSED at import time: a
+    malformed preset file (unknown style-policy key, out-of-range value,
+    wrong type) raises here, blocking the whole module from importing,
+    rather than surfacing later as a confusing error only when that one
+    preset happens to be looked up.
+
+    Also populates the module-level :data:`_JOURNAL_STYLE_PRESET_PROVENANCE`
+    dict (each file's full ``"meta"``/``"fields"``, unmodified) in this same
+    pass, so :func:`get_journal_style_preset_provenance` never has to
+    re-read the files itself.
+
+    Returns:
+      ``{<preset key>: <fully-resolved style-policy dict>, ...}`` -- one
+      entry per ``journal_style_presets/*.json`` file, keyed by that file's
+      stem (e.g. ``journal_style_presets/jcshm.json`` -> key ``"jcshm"``).
+
+    Raises:
+      ValueError: a preset file isn't valid JSON, isn't a JSON object with
+        ``"meta"``/``"fields"`` keys, or a field's ``"value"`` fails
+        :func:`resolve_style_policy` validation (unknown style-policy key or
+        an invalid value for a known one).
+    """
+    presets_dir = Path(__file__).parent / "journal_style_presets"
+    presets: dict[str, dict[str, Any]] = {}
+    provenance: dict[str, dict[str, Any]] = {}
+
+    for file_path in sorted(presets_dir.glob("*.json")):
+        key = file_path.stem
+        with open(file_path, "r", encoding="utf-8") as fh:
+            try:
+                data = json.load(fh)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"journal style preset file {file_path} is not valid JSON: {exc}"
+                ) from exc
+
+        if not isinstance(data, dict) or "meta" not in data or "fields" not in data:
+            raise ValueError(
+                f"journal style preset file {file_path} must be a JSON object "
+                f"with 'meta' and 'fields' keys"
+            )
+
+        fields = data["fields"]
+        if not isinstance(fields, dict):
+            raise ValueError(
+                f"journal style preset file {file_path}: 'fields' must be a JSON object"
+            )
+
+        overrides = {name: entry["value"] for name, entry in fields.items()}
+        # Fail-closed: an invalid value in ANY one preset file blocks the
+        # whole module from importing (see docstring above).
+        presets[key] = resolve_style_policy(overrides)
+        provenance[key] = {"journal": key, "meta": data["meta"], "fields": fields}
+
+    _JOURNAL_STYLE_PRESET_PROVENANCE.clear()
+    _JOURNAL_STYLE_PRESET_PROVENANCE.update(provenance)
+    return presets
+
 
 def _style_policy_defaults() -> dict[str, Any]:
     """Built-in defaults -- reproduce today's pre-4efc63fd behavior except
@@ -9447,584 +9555,44 @@ def _apply_heading_terminal_punctuation(heading_text: str, policy: dict[str, Any
 # oxford_up, de_gruyter, cell_press, acs, aps, aip, rsc, asce, asme, emerald,
 # peerj, optica, science_aaas, copernicus).
 #
-# PROVENANCE NOTE (important -- read before trusting a value below as
-# "verified per the cited proposal"): both proposals describe the new
-# schema (the fourteen keys added to _style_policy_defaults() /
-# resolve_style_policy() above), the publisher list, and an "evidence
-# basis" section naming one source URL per publisher -- but NEITHER
-# proposal's own body contains the literal per-publisher key/value data or
-# per-key quoted-sentence citations that its own text claims exist (both
-# are "raw"/unpromoted narrative write-ups, not a diff or code block, and
-# the worktree they describe having edited was never merged here). Rather
-# than fabricate specific values under a false appearance of having been
-# lifted from that description, every preset below was independently
-# verified against a live publisher guidelines page on 2026-09-11 during
-# this sprint item's own pass, with its own citation in the comment
-# directly above it -- sometimes the same source the proposal named,
-# sometimes a different page that surfaced the same or a more specific
-# fact. Where this pass could not independently confirm a fact, the
-# corresponding key is left at its "unspecified"/``None`` default rather
-# than guessed -- so a preset below may cover fewer keys than the
-# proposals' prose implies, and per-key values here may differ from
-# whatever the (unrecovered) original implementation actually contained.
+# docs-intel-journal-preset-externalization-20260918 -- the ~540-line dict
+# literal that used to live here (29 entries, one per publisher plus
+# "default", each hand-written with an in-code comment carrying its
+# evidence) has been EXTERNALIZED to journal_style_presets/<key>.json, one
+# file per preset. Each file carries the same override VALUES this dict
+# literal used to hold, plus a structured per-field evidence record (tier,
+# source citation/quote, verified_date, and an optional "open_question"
+# status) that the old comment-only convention could describe but never
+# make machine-readable -- see get_journal_style_preset_provenance below to
+# retrieve that evidence for a given preset. The PROVENANCE NOTE this
+# comment block used to carry (how the 27 non-jcshm presets below were
+# actually sourced, and which ones carry an explicitly-flagged closest-
+# available-official-signal substitution caveat: elsevier/acm in round 1,
+# hindawi/aip in round 2, plus asce/asme flagged for extra scrutiny) now
+# lives in each preset's own meta.status_detail / field-level source.note,
+# next to the facts it qualifies, rather than in one shared comment far
+# from any individual value. See _load_builtin_journal_style_presets above
+# for the loader (fail-closed at import time on a malformed preset file).
 #
-# Caveats the proposals explicitly flagged as closest-available-official-
-# signal substitutions (elsevier and acm in round 1; hindawi and aip in
-# round 2) are preserved as in-code comments on those specific presets
-# regardless of whether this pass's own search corroborated them. Round 2
-# separately flagged asce and asme for extra scrutiny -- not a substitution
-# issue, just direct relevance to the JCSHM thesis domain this whole
-# mechanism originated from -- noted on those two presets as well.
+# NOTE on WHERE the actual `JOURNAL_STYLE_PRESETS = ...` assignment lives:
+# not here. _load_builtin_journal_style_presets() now calls
+# resolve_style_policy() -- and therefore _style_policy_defaults() -- AT
+# IMPORT TIME (fail-closed), and _style_policy_defaults() references
+# _INTERNAL_NOTE_STYLE_DEFAULT / _INTERNAL_NOTE_HIGHLIGHT_COLOR (see that
+# function's own docstring), which are module globals defined much LATER
+# in this file's top-to-bottom execution order. The pre-externalization
+# dict literal never had this problem (it was static data, no function
+# calls), so it could sit here safely; the loader call cannot. The real
+# `JOURNAL_STYLE_PRESETS = _load_builtin_journal_style_presets()` /
+# `_JOURNAL_STYLE_PRESET_LOOKUP = {...}` assignments are placed just after
+# the _INTERNAL_NOTE_* constants below (search for
+# "JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] ="). Every consumer
+# (get_journal_style_preset, get_journal_style_preset_provenance,
+# list_journal_style_presets, save_user_journal_style_preset) only reads
+# these two names from inside a function body, resolved at CALL time, long
+# after the whole module has finished importing -- so this split is
+# invisible to every caller.
 # ---------------------------------------------------------------------------
-JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
-    # The built-in resolve_style_policy() defaults, addressable by name so a
-    # caller can request "default" explicitly instead of omitting style
-    # entirely -- useful when a document_profile's journal= comes from
-    # user-facing config where "no opinion" needs its own explicit value.
-    "default": {},
-    # A representative academic-journal convention bundle: centered
-    # figure/table captions, centered display equations with required
-    # trailing punctuation, headings with no terminal punctuation, and a
-    # label-left/data-center table layout.
-    # jcshm -- Journal of Civil Structural Health Monitoring (Springer,
-    # journal id 13349). The figure_caption_bold / figure_caption_label_
-    # punctuation / heading_numbering_visible / heading_levels_max /
-    # citation_style keys below were added 2026-09-14, independently
-    # verified against link.springer.com/journal/13349/submission-guidelines
-    # (the live "Submission guidelines" page, section "Figure Captions" for
-    # the caption keys, "Headings" for the two heading keys, "Citation" for
-    # citation_style). NOTE ON HOW THIS WAS FETCHED, for anyone repeating
-    # this verification: a stateless WebFetch-style single request loops
-    # forever through idp.springer.com's auth-cookie redirect (no cookie
-    # jar to complete the bounce) even though the page is genuinely public
-    # -- an interactive browser session (persistent cookies) loads it on the
-    # first try. See workspace proposal cb7bd76e for the general version of
-    # this problem across other publishers (Elsevier/Wiley/MDPI each gate
-    # differently, and this specific workaround does NOT generalize to
-    # them). table_caption_bold and table_caption_label_punctuation are
-    # deliberately left "unspecified"/None -- the guidelines' "Tables"
-    # section does not restate the Figure Captions section's punctuation/
-    # boldness rule for tables specifically; by-convention extension to
-    # tables is plausible but was not independently confirmed, so per this
-    # catalog's own no-guessing discipline it stays unverified rather than
-    # assumed identical.
-    # df716454 -- heading_spacing_*_h{1,2,3}_twips and body_text_font_*
-    # added 2026-09-17, from this session's own Tier-1 measurement against
-    # the real JCSHM manuscript/SI PDF baseline (not the submission-
-    # guidelines web page -- the guidelines page does not state numeric
-    # heading spacing, so this is a DIRECT PDF measurement, independent of
-    # the web-page-sourced keys above). Found: H1 = 2 body-lines before / 1
-    # body-line after; H2 and H3 measured IDENTICAL to each other -- both 1
-    # body-line before / 1 after (H3 is NOT half of H2 -- a plausible but
-    # wrong guess this measurement explicitly rules out). Converted to
-    # twips via OOXML's own font-size-independent "one line = 240 twips"
-    # convention (the same 240 used by <w:spacing w:line="240"
-    # w:lineRule="auto"> for single line spacing), matching this schema's
-    # only other explicitly-unit-suffixed key (body_indent_twips) rather
-    # than inventing a separate "body-line multiplier" unit: H1
-    # before=2*240=480/after=1*240=240; H2 before=240/after=240; H3
-    # before=240/after=240 (== H2, per the measurement above).
-    # body_text_font_family/body_text_font_size_pt = "Times New Roman"/10,
-    # per JCSHM's own submission guidelines ("10-point Times Roman") -- the
-    # real motivating case for audit_cross_document_consistency: this
-    # session found the SI's BodyText/Normal styles explicitly set to 12pt
-    # by eye, a mismatch no existing tooling would have caught.
-    # df716454 (2026-09-17 correction) -- heading_spacing_after_h2_twips and
-    # heading_spacing_after_h3_twips corrected 240 -> 120 (before_h2/before_h3
-    # and all h1 values are unaffected). The PDF-baseline line-count
-    # measurement documented above cannot cleanly separate a heading's own
-    # after-spacing from the following paragraph's own before-spacing under
-    # rendered spacing collapse -- exactly the failure mode that makes a
-    # line-count measurement unreliable for *-after keys specifically (the
-    # *-before keys aren't exposed to that ambiguity and stay at the
-    # measured 240). Two independent, non-rendering sources -- re-verified
-    # live in this session, not just re-read from a prior report -- converge
-    # exactly on 120 twips (6pt) for H2/H3-after: (1) a live JCSHM article's
-    # own CSS (link.springer.com/article/10.1007/s13349-024-00789-7):
-    # .c-article-section__title{margin-bottom:16px} for H1-after == the
-    # already-agreed 240tw (calibrates the source as transferable), vs.
-    # .c-article__sub-heading{margin:24px 0 8px} == 8px = 120tw for H2/H3-
-    # after; (2) Springer Nature's own sn-jnl.cls \@startsection afterskip
-    # args: \subsection/\subsubsection = 6pt = 120tw (its \section = 9pt
-    # does not match the docx H1 value, so only the H2/H3 absolute
-    # convergence is trusted from this source). Both real submission
-    # documents (staging/jcshm_v58_section2_refs_indent_ooxml_safe_20260904,
-    # review44/review63 candidates, 107 headings) already carry 120 twips --
-    # this preset default was the stale artifact, not the documents.
-    "jcshm": {
-        "caption_centered": True,
-        "equation_alignment": "center",
-        "equation_punctuation_required": True,
-        "equation_punctuation_chars": ".,;",
-        "heading_terminal_punctuation": "",
-        "table_label_column_alignment": "left",
-        "table_data_column_alignment": "center",
-        "table_alignment": "center",
-        "figure_caption_bold": True,
-        "figure_caption_label_punctuation": "none",
-        "figure_caption_terminal_punctuation": "",
-        # docs-intel-jcshm-linter-gap-cleanup-20260918 -- table_caption_label_punctuation
-        # and table_caption_terminal_punctuation populated 2026-09-18, extending the
-        # already-agreed figure convention above to tables: sourced from 22/22 real
-        # published JCSHM-article table captions sampled this session (zero exceptions --
-        # no terminal period, no punctuation after the number label) plus this session's
-        # own pre-submission QA sweep catching 2/37 real table captions in this project's
-        # own manuscript+SI with a stray trailing period that the other 35 did not carry.
-        # table_caption_bold is DELIBERATELY left unset (see the table_caption_bold
-        # discussion further up this dict, and _style_policy_defaults's schema default of
-        # None) -- it stays a genuinely OPEN question, not merely "unspecified pending
-        # future work": real published JCSHM articles bold the ENTIRE table caption
-        # (label + description), a DIFFERENT convention from figures (label-only bold per
-        # figure_caption_bold above), but JCSHM's own author-facing submission guidelines
-        # never state a table-caption bold rule the way they explicitly do for figures --
-        # so whether "bold the whole caption" is an author-submission-time requirement or
-        # a copyediting-stage transformation applied after acceptance is genuinely unknown
-        # from anything sourced this session. Even if that were resolved,
-        # audit_caption_style's existing caption_label_not_bold check only examines the
-        # LABEL run(s) (see its own label_len logic), not the full caption text -- so
-        # verifying a real "bold the whole caption" rule would also need a second,
-        # differently-scoped check, not just a policy value. Do not guess a value here;
-        # leave it None and let a future session resolve both the sourcing gap and (if
-        # resolved true) the separate whole-caption-bold detection gap together.
-        "table_caption_label_punctuation": "none",
-        "table_caption_terminal_punctuation": "",
-        "heading_numbering_visible": True,
-        "heading_levels_max": 3,
-        "citation_style": "numbered_bracket",
-        "heading_spacing_before_h1_twips": 480,
-        "heading_spacing_after_h1_twips": 240,
-        "heading_spacing_before_h2_twips": 240,
-        "heading_spacing_after_h2_twips": 120,
-        "heading_spacing_before_h3_twips": 240,
-        "heading_spacing_after_h3_twips": 120,
-        "body_text_font_family": "Times New Roman",
-        "body_text_font_size_pt": 10,
-        # docs-intel-jcshm-linter-gap-cleanup-20260918 -- abstract_word_count_min/max and
-        # keyword_count_min/max added 2026-09-18, from JCSHM's own live submission
-        # guidelines page (explicit, numeric, unambiguous rules, not inferred): Abstract
-        # 150-250 words, 4-6 Keywords. Neither was checked by any tooling before this --
-        # see audit_manuscript_structure.
-        "abstract_word_count_min": 150,
-        "abstract_word_count_max": 250,
-        "keyword_count_min": 4,
-        "keyword_count_max": 6,
-    },
-
-    # -- Round 1 (proposal 3674c0c1) -----------------------------------
-
-    # nature -- Nature Portfolio journals (Springer Nature).
-    # Verified 2026-09-11 against nature.com/nature/for-authors/formatting-
-    # guide and nature.com/nature/for-authors/final-submission: figures "in
-    # RGB color and at 300 dpi or higher resolution" for halftone/
-    # photographic images, with line art at 800-1200 dpi (floor used
-    # below); in-text citations are superscript numerals assigned in order
-    # of first appearance, placed after punctuation. heading_numbering_
-    # visible, emphasis_style, and the caption/SI/indent keys are left
-    # unspecified -- not addressed by the pages checked in this pass.
-    "nature": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 800,
-    },
-    # elsevier -- Elsevier "Your Paper Your Way" general Guide for Authors.
-    # Verified 2026-09-11 against elsevier.com/subject/next/guide-for-
-    # authors and elsevier.com/about/policies-and-standards/author/artwork-
-    # and-media-instructions/artwork-faq: "Use of italic or bold for
-    # emphasis within the text is discouraged"; Supplementary material is
-    # "published exactly as they are received" (as_received); figure DPI
-    # floors 300 (halftone), 1000 (line art), 500 (combination).
-    # CAVEAT (inherited from proposal 3674c0c1, not independently
-    # re-verified in this pass): round-1's own citation for emphasis_style
-    # was Elsevier's "Copyediting Specification for Authors v3.0", a
-    # book-authors document, used as the closest available official signal
-    # rather than a journal-specific guide -- flagged there as an
-    # imperfect substitution. This pass's own search independently found
-    # matching "discouraged" guidance on a general journal-facing guide-
-    # for-authors page, which corroborates but does not fully resolve that
-    # original caveat (a single generic page, not a per-journal check).
-    "elsevier": {
-        "emphasis_style": "discouraged",
-        "si_reformatting_policy": "as_received",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 1000,
-        "figure_dpi_minimum_combination": 500,
-    },
-    # ieee -- IEEE Editorial Style Manual for Authors.
-    # Verified 2026-09-11 against journals.ieeeauthorcenter.ieee.org/wp-
-    # content/uploads/sites/7/IEEE-Editorial-Style-Manual-for-Authors.pdf:
-    # in-text references are numbered in square brackets, reference list
-    # in citation order (not alphabetical); up to four heading levels are
-    # specified (Roman numerals / A. / 1) / a)). Section-heading
-    # enumeration is explicitly "desirable, but not required" per the
-    # manual, so heading_numbering_visible is left unspecified rather than
-    # forced to True -- this is a stated author preference, not a hard
-    # requirement.
-    "ieee": {
-        "citation_style": "numbered_bracket",
-        "heading_levels_max": 4,
-    },
-    # wiley -- Wiley Online Library author guidelines (general policy plus
-    # a representative per-journal figure example).
-    # Verified 2026-09-11 against onlinelibrary.wiley.com author-
-    # guidelines pages: Supporting Information "appears without editing or
-    # typesetting" once posted online (as_received); "references may be
-    # submitted in any style or format, as long as it is consistent
-    # throughout" for most Wiley journals (an explicit defers-to-the-
-    # individual-journal fact, hence not_fixed -- some journal families,
-    # e.g. chemistry/materials science, do have a house numbered style,
-    # but that is the exception this pass found, not the general rule);
-    # bitmap/photographic figures at least 300 dpi. The 600 dpi line-art
-    # floor below is drawn from a single representative journal's guidance
-    # (Annals of the New York Academy of Sciences) rather than a blanket
-    # cross-Wiley figure -- Wiley journals vary their own artwork
-    # instructions per title, so this is representative, not universal.
-    "wiley": {
-        "citation_style": "not_fixed",
-        "si_reformatting_policy": "as_received",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 600,
-    },
-    # acm -- ACM TAPS (The ACM Publishing System) author guide.
-    # Verified 2026-09-11 against acm.org/publications/taps/describing-
-    # figures and homes.cs.washington.edu/~spencer/taps: "the vast majority
-    # of ACM articles use numbered citations and references" (reference
-    # number in brackets), though SIGGRAPH/SIGPLAN-sponsored venues use
-    # author-year instead.
-    # CAVEAT (inherited from proposal 3674c0c1, not independently
-    # re-verified in this pass): round-1 flagged that ACM's own sub-
-    # formats (sigconf vs. the journal format) set opposite defaults for
-    # figure/table caption boldness, so figure_caption_bold and
-    # table_caption_bold are deliberately left unset here rather than
-    # picking one sub-format's default. citation_style below reflects the
-    # numbered-bracket majority convention, not the SIGGRAPH/SIGPLAN
-    # author-year exception -- callers targeting those venues should
-    # override it explicitly.
-    "acm": {
-        "citation_style": "numbered_bracket",
-    },
-    # mdpi -- MDPI author layout style guide.
-    # Verified 2026-09-11 against mdpi.com/authors/layout and mdpi-
-    # res.com/data/mdpi-author-layout-style-guide.pdf: figures are numbered
-    # by order of appearance and cited as numbers in square brackets,
-    # listed numerically; a single blanket figure-resolution floor of 600
-    # dpi is recommended (MDPI does not break this out by art type in its
-    # general guidance, hence figure_dpi_minimum_general rather than a
-    # per-type key).
-    "mdpi": {
-        "citation_style": "numbered_bracket",
-        "figure_dpi_minimum_general": 600,
-    },
-    # plos -- PLOS ONE submission guidelines (representative of the PLOS
-    # family).
-    # Verified 2026-09-11 against journals.plos.org/plosone/s/figures and
-    # journals.plos.org/plosone/s/submission-guidelines: PLOS uses the
-    # ICMJE ("Vancouver") numbered-bracket citation convention; figures
-    # must be 300-600 dpi (floor used below), not broken out by art type
-    # in the general guidance.
-    "plos": {
-        "citation_style": "numbered_bracket",
-        "figure_dpi_minimum_general": 300,
-    },
-    # taylor_francis -- Taylor & Francis Author Services electronic-artwork
-    # guidance.
-    # Verified 2026-09-11 against authorservices.taylorandfrancis.com/
-    # editorial-policies/images-and-figures/ and the Author Services
-    # "Submission of electronic artwork" PDF: photographic images need at
-    # least 300 dpi, "all other types of artwork" (including line art)
-    # need at least 600 dpi at final output size. citation_style is left
-    # unspecified -- the pages checked in this pass covered artwork
-    # submission only and did not state a citation convention (Taylor &
-    # Francis journals are known to vary this per title/subject area).
-    "taylor_francis": {
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 600,
-    },
-    # sage -- SAGE Publications "Preparing your manuscript" guidance.
-    # Verified 2026-09-11 against sagepub.com/journals/information-for-
-    # authors/preparing-your-manuscript and us.sagepub.com preparing-your-
-    # manuscript: figures need at least 300 dpi (blanket, not broken out
-    # by art type); "different SAGE journals use different citation
-    # styles" (Harvard, SBL, Chicago, etc. depending on title) -- an
-    # explicit defers-to-the-individual-journal fact, hence not_fixed.
-    "sage": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_general": 300,
-    },
-
-    # -- Round 2 (proposal 64266f13) -----------------------------------
-
-    # springer -- Springer Nature generic/journal-agnostic manuscript
-    # guidelines (round-2 proposal 64266f13 names this preset
-    # "springer_general"; this codebase uses the shorter "springer" key
-    # per this sprint item's own naming instructions).
-    # Verified 2026-09-11 against springernature.com/gp/authors manuscript
-    # guidelines and link.springer.com submission-guidelines pages: figure
-    # DPI floors of 300 (halftone), 800 (line art, preferably 1200), 600
-    # (combination); "no more than three levels of displayed headings" for
-    # journals; citations may be author-date ("Harvard system") or
-    # numbered, depending on the journal -- an explicit defers-to-the-
-    # individual-journal fact, hence not_fixed.
-    "springer": {
-        "citation_style": "not_fixed",
-        "heading_levels_max": 3,
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 800,
-        "figure_dpi_minimum_combination": 600,
-    },
-    # frontiers -- Frontiers author guidelines.
-    # Verified 2026-09-11 against frontiersin.org/guidelines/author-
-    # guidelines: all images need 300 dpi at final size (blanket); journals
-    # use either Harvard (author-date) or Vancouver (numbered) style
-    # depending on the journal -- an explicit defers-to-the-individual-
-    # journal fact, hence not_fixed.
-    "frontiers": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_general": 300,
-    },
-    # hindawi -- Hindawi journal guidelines.
-    # Verified 2026-09-11 directly against live Hindawi journal guideline
-    # pages (hindawi.com/journals/mis/guidelines/,
-    # hindawi.com/journals/cmi/guidelines/): bitmap figures need at least
-    # 300 dpi (blanket, "unless intentionally lower for scientific
-    # reasons"); references are numbered consecutively by order of first
-    # citation, cited in text via numbers in square brackets.
-    # CAVEAT (inherited from proposal 64266f13, not independently
-    # re-verified beyond the two journal pages checked): round-2 flagged
-    # that Hindawi's own guidance page can be silent on formatting
-    # specifics it fills in from a secondary signal -- Hindawi's CTAN
-    # LaTeX template -- rather than the guidelines page alone. This pass's
-    # search reached the guidelines pages directly (not the LaTeX
-    # template), which corroborates the DPI/citation facts above but did
-    # not itself need the template as a secondary signal for those two
-    # facts specifically.
-    "hindawi": {
-        "citation_style": "numbered_bracket",
-        "figure_dpi_minimum_general": 300,
-    },
-    # cambridge_up -- Cambridge University Press journals (general policy
-    # plus a representative per-journal example).
-    # Verified 2026-09-11 against cambridge.org/core/journals/philosophy-
-    # of-science/information/author-guidelines and cambridge.org/core/
-    # journals/language-in-society/information/author-instructions/
-    # preparing-your-materials: images need at least 300 dpi for
-    # submission (1200 dpi for line drawings once accepted); citation
-    # style varies by journal (author-date for some, e.g. Chicago-style
-    # Philosophy of Science; numeric for others) -- an explicit defers-to-
-    # the-individual-journal fact, hence not_fixed.
-    "cambridge_up": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 1200,
-    },
-    # oxford_up -- Oxford University Press journals, via Monthly Notices of
-    # the Royal Astronomical Society (MNRAS) Instructions to Authors as the
-    # representative example (matching proposal 64266f13's own sourcing
-    # choice).
-    # Verified 2026-09-11 against academic.oup.com/mnras/pages/
-    # General_Instructions: MNRAS uses the Harvard author-(year) citation
-    # style, with an alphabetically ordered reference list. Figure DPI is
-    # left unspecified -- the instructions page found in this pass covered
-    # numbering/citation conventions but not a specific resolution floor.
-    "oxford_up": {
-        "citation_style": "author_date",
-    },
-    # de_gruyter -- De Gruyter author/style-sheet guidance (De Gruyter
-    # publishes many distinct journal families -- Mouton, STEM, law, etc.
-    # -- each with its own style sheet, so the figures below are a
-    # conservative floor rather than a single blanket fact).
-    # Verified 2026-09-11 against degruyterbrill.com Instructions-for-
-    # Authors (Discrete Mathematics and Applications) and De Gruyter
-    # Mouton journal style-sheet PDFs: figure resolution requirements vary
-    # widely by imprint (300-1200 dpi depending on figure type and journal
-    # family); the STEM guidance's own blanket floor of 300 dpi is used
-    # below as the most conservative cross-imprint figure. Citation style
-    # also varies by publication (Vancouver preferred, Harvard or Chicago
-    # author-date acceptable for others) -- hence not_fixed.
-    "de_gruyter": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_general": 300,
-    },
-    # cell_press -- Cell Press (Elsevier-owned but editorially distinct --
-    # deliberately a separate preset from "elsevier").
-    # Verified 2026-09-11 against cell.com/information-for-authors/figure-
-    # guidelines: figure DPI floors of 300 (color/grayscale halftone) and
-    # 1000 (line art); citation style varies by title within Cell Press --
-    # Cell itself uses numbered superscript citations, while Cell Reports
-    # uses an author-date style -- an explicit cross-title inconsistency,
-    # hence not_fixed rather than picking one flagship title's convention.
-    "cell_press": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 1000,
-    },
-    # acs -- American Chemical Society (ACS Publications) author
-    # guidelines.
-    # Verified 2026-09-11 against researcher-resources.acs.org
-    # publish/author_guidelines pages: pixel-based images need at least
-    # 300 dpi (blanket); references are cited with superscript numbers,
-    # listed numerically by order of first appearance (per The ACS Style
-    # Guide, 3rd ed.).
-    "acs": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_general": 300,
-    },
-    # aps -- American Physical Society (Physical Review family) journals
-    # style guide.
-    # Verified 2026-09-11 against journals.aps.org/authors/style-basics and
-    # journals.aps.org/authors/references-physical-review-physical-review-
-    # letters: most Physical Review journals prefer superscript numbered
-    # citations (Physical Review Letters and a few others use inline
-    # bracketed numerals instead -- callers targeting PRL specifically
-    # should override citation_style to "numbered_bracket"). Figure DPI:
-    # the guide's own explicit number (600 dpi) is stated specifically for
-    # SCANNED images ("make scans with as high a resolution as possible,
-    # preferably 600 dpi or higher"), not as a blanket floor for every
-    # figure-creation method -- used below as figure_dpi_minimum_general
-    # with that caveat, since no separate non-scanned floor was stated.
-    "aps": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_general": 600,
-    },
-    # aip -- AIP Publishing author instructions.
-    # Verified 2026-09-11 against publishing.aip.org/resources/researchers/
-    # author-instructions/ and the annotated AIP Style Manual (Carleton
-    # College mirror): references are numbered in order of appearance,
-    # cited as superscript arabic numerals; figure DPI floors are broken
-    # out by art type -- halftones 264 dpi, line art / combination art 600
-    # dpi.
-    # CAVEAT (inherited from proposal 64266f13, not independently
-    # re-verified in this pass): round-2 noted an unspecified sub-journal
-    # inconsistency for AIP, the way ACM's round-1 preset flagged one for
-    # its own sub-formats. This pass's search reached AIP's general
-    # author-instructions and style-manual pages (not each individual AIP
-    # sub-journal's own guide -- e.g. Journal of Applied Physics vs.
-    # Applied Physics Letters each maintain separate pages), so the
-    # specific sub-journal inconsistency the proposal had in mind was not
-    # independently confirmed or refuted here.
-    "aip": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_halftone": 264,
-        "figure_dpi_minimum_line_art": 600,
-        "figure_dpi_minimum_combination": 600,
-    },
-    # rsc -- Royal Society of Chemistry, RSC Advances author guidelines
-    # (representative RSC journal).
-    # Verified 2026-09-11 against rsc.org/publishing/publish-with-us/
-    # publish-a-journal-article/rsc-advances: figures need at least 600
-    # dpi (TIFF, blanket floor); references use the RSC style -- numbered
-    # sequentially, cited as superscript numbers. emphasis_style and the
-    # caption-punctuation keys are left unspecified -- not addressed by
-    # the page checked in this pass (matching proposal 64266f13's own note
-    # that RSC's source didn't state these and the keys were left unset
-    # rather than guessed).
-    "rsc": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_general": 600,
-    },
-    # asce -- American Society of Civil Engineers journal format guide
-    # (directly relevant to the JCSHM thesis domain that originated this
-    # preset mechanism).
-    # Verified 2026-09-11 against the ASCE "Publishing in ASCE Journals: A
-    # Guide for Authors" PDF (peer.berkeley.edu/sites/default/files/
-    # ascejournalformat.pdf -- the same PEER-hosted PDF proposal 64266f13
-    # cited): figures need at least 300 dpi (blanket); in-text citations
-    # use the author-date method (e.g. "Smith 2004", "Smith and Jones
-    # 2004", no comma between author and year).
-    # NOTE (flagged in proposal 64266f13's review section for extra
-    # scrutiny -- not a substitution caveat): ASCE is one of the two
-    # publishers (with asme) called out as directly relevant to the JCSHM
-    # thesis domain this mechanism originated from. This pass's search
-    # corroborated citation style and figure DPI directly from the cited
-    # PDF but did not find emphasis-style or caption-punctuation facts,
-    # which are left unspecified rather than guessed.
-    "asce": {
-        "citation_style": "author_date",
-        "figure_dpi_minimum_general": 300,
-    },
-    # asme -- American Society of Mechanical Engineers journal guidelines
-    # (directly relevant to the JCSHM thesis domain that originated this
-    # preset mechanism).
-    # Verified 2026-09-11 against asme.org/publications-submissions/
-    # journals/information-for-authors/journal-guidelines/writing-a-
-    # research-paper and .../references: references are cited in
-    # numerical order with the numbered citation enclosed in brackets
-    # (bibliographic-entry formatting itself follows Chicago Manual of
-    # Style, but the in-text convention is numbered-bracket). Figure DPI
-    # is left unspecified -- the guidance found states figures "must have
-    # sufficient resolution to ensure text readability" without a specific
-    # numeric floor.
-    # NOTE (flagged in proposal 64266f13's review section for extra
-    # scrutiny -- not a substitution caveat): ASME is the other of the two
-    # publishers (with asce) called out as directly relevant to the JCSHM
-    # thesis domain this mechanism originated from.
-    "asme": {
-        "citation_style": "numbered_bracket",
-    },
-    # emerald -- Emerald Publishing author guidelines.
-    # Verified 2026-09-11 against emerald.com/journals/author-guidance/
-    # 1627/Emerald-Publishing-Author-Guidelines: halftones need 300 dpi;
-    # the majority of Emerald journals use the Harvard reference style
-    # (some use APA instead) -- both Harvard and APA are author-date-
-    # family conventions, so citation_style="author_date" is used here
-    # rather than not_fixed (unlike, e.g., springer/frontiers, where the
-    # alternative styles cross the numbered/author-date boundary).
-    "emerald": {
-        "citation_style": "author_date",
-        "figure_dpi_minimum_halftone": 300,
-    },
-    # peerj -- PeerJ author instructions.
-    # Verified 2026-09-11 against peerj.com/about/author-instructions/:
-    # figures need 300 dpi on resubmission (blanket; vector images have no
-    # minimum since they don't degrade when scaled); PeerJ uses an
-    # author-date citation format with an alphabetical bibliography.
-    "peerj": {
-        "citation_style": "author_date",
-        "figure_dpi_minimum_general": 300,
-    },
-    # optica -- Optica Publishing Group (formerly OSA) journal style guide.
-    # Verified 2026-09-11 against opg.optica.org/submit/style/
-    # style_traditional_journals.cfm: figures need 600 dpi (blanket);
-    # references use a numbered-bracket convention, "[1]" for the first
-    # reference cited, in order of appearance.
-    "optica": {
-        "citation_style": "numbered_bracket",
-        "figure_dpi_minimum_general": 600,
-    },
-    # science_aaas -- Science / Science Advances (AAAS) author guidelines
-    # (round-2 proposal 64266f13 names this preset "aaas_science"; this
-    # codebase uses "science_aaas" per this sprint item's own naming
-    # instructions).
-    # Verified 2026-09-11 against science.org/content/page/instructions-
-    # authors-new-research-articles and .../science-advances-information-
-    # authors: figures need at least 300 dpi for photographs, 600 dpi for
-    # line art; in-text references use numbers, but as ITALIC numerals
-    # inside PARENTHESES (e.g. "(1)", "(2, 3)", "(4-6)"), numbered in
-    # citation order. This does not cleanly match either
-    # "numbered_superscript" (not superscript) or "numbered_bracket" (this
-    # schema's enum means square brackets, not parentheses) -- rather than
-    # force-fit a punctuation-mismatched value, citation_style is left
-    # unspecified here; a caller targeting Science specifically should
-    # supply this convention directly via a style_policy override.
-    "science_aaas": {
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 600,
-    },
-    # copernicus -- Copernicus Publications manuscript-preparation guide.
-    # Verified 2026-09-11 against publications.copernicus.org/for_authors/
-    # manuscript_preparation.html: figures need 300 dpi (blanket); in-text
-    # citations use an author-date format, "(Author, Year)".
-    "copernicus": {
-        "citation_style": "author_date",
-        "figure_dpi_minimum_general": 300,
-    },
-}
-
-# 4d0ca929 -- case-insensitive name -> canonical-key lookup, built once at
-# import time from JOURNAL_STYLE_PRESETS itself (never hand-maintained
-# separately, so it can't drift out of sync with the preset dict above).
-_JOURNAL_STYLE_PRESET_LOOKUP: dict[str, str] = {
-    name.lower(): name for name in JOURNAL_STYLE_PRESETS
-}
 
 
 def get_journal_style_preset(
@@ -10131,6 +9699,63 @@ def get_journal_style_preset(
             f"{sorted(combined)}"
         )
     return resolve_style_policy(combined[canonical])
+
+
+def get_journal_style_preset_provenance(journal: str) -> dict[str, Any]:
+    """docs-intel-journal-preset-externalization-20260918 -- return the full
+    EVIDENCE record backing one built-in journal-style preset: value, tier
+    (1=real official template/stylesheet source; 2=the journal's own live
+    guidelines page; 3=corroboration from real sampled articles;
+    4=generic/unsourced, explicitly needs verification), source citation,
+    and verified_date for every field that preset actually sets -- not just
+    the resolved policy VALUES :func:`get_journal_style_preset` returns.
+
+    Use this to audit how well-sourced a preset is (or isn't) before
+    trusting it for a real submission -- e.g. to find every field still at
+    tier 4 ("needs verification"), or a field explicitly marked
+    ``status: "open_question"`` (see ``"jcshm"``'s ``table_caption_bold``,
+    a genuinely unresolved question, not merely "not yet researched").
+
+    Only covers BUILT-IN presets (:data:`JOURNAL_STYLE_PRESETS`'s own
+    catalog) -- unlike :func:`get_journal_style_preset`, there is no
+    ``user_presets_path`` here: a user-authored preset (via
+    :func:`save_user_journal_style_preset`) is a bare style_policy override
+    dict with no evidence schema of its own to report.
+
+    4d0ca929-style case-insensitive lookup, matching
+    :func:`get_journal_style_preset`'s own convention: ``"Nature"``,
+    ``"NATURE"``, and ``"nature"`` all resolve to the same record.
+
+    Args:
+      journal: A built-in preset name, in any case (e.g. ``"jcshm"``,
+        ``"Nature"``, ``"default"``).
+
+    Returns:
+      ``{"journal": <canonical key>, "meta": {...}, "fields": {...}}`` --
+      ``meta`` and ``fields`` are exactly that preset's
+      ``journal_style_presets/<key>.json`` file content (see
+      :func:`_load_builtin_journal_style_presets`'s docstring for the
+      shape); ``fields`` covers only the keys that preset's file actually
+      set (a key that preset never set is absent here too, same as it is
+      absent from the raw override values behind
+      :data:`JOURNAL_STYLE_PRESETS`).
+
+    Raises:
+      ValueError: ``journal`` is not a known BUILT-IN preset name
+        (case-insensitively).
+    """
+    canonical = _JOURNAL_STYLE_PRESET_LOOKUP.get(journal.lower())
+    if canonical is None:
+        raise ValueError(
+            f"unknown journal style preset {journal!r}; known presets: "
+            f"{sorted(JOURNAL_STYLE_PRESETS)}"
+        )
+    record = _JOURNAL_STYLE_PRESET_PROVENANCE[canonical]
+    return {
+        "journal": record["journal"],
+        "meta": record["meta"],
+        "fields": record["fields"],
+    }
 
 
 def load_user_journal_style_presets(path: str) -> dict[str, dict[str, Any]]:
@@ -14765,6 +14390,29 @@ _INTERNAL_NOTE_STYLE_DEFAULT = "MeridianInternalNote"
 _INTERNAL_NOTE_HIGHLIGHT_COLOR = "yellow"
 _INTERNAL_NOTE_BOOKMARK_PREFIX = "_MNote"
 _INTERNAL_NOTE_BOOKMARK_RE = re.compile(r"^_MNote(\d+)$")
+
+# docs-intel-journal-preset-externalization-20260918 -- built-in
+# journal-style-preset catalog (see _load_builtin_journal_style_presets and
+# the PROVENANCE comment above get_journal_style_preset, near the top of the
+# journal-style-preset section of this module, for the full picture). This
+# assignment deliberately lives HERE -- after _INTERNAL_NOTE_STYLE_DEFAULT /
+# _INTERNAL_NOTE_HIGHLIGHT_COLOR just above -- rather than up near
+# get_journal_style_preset itself: _load_builtin_journal_style_presets() now
+# calls resolve_style_policy() (and therefore _style_policy_defaults(),
+# which references those two constants) AT IMPORT TIME, fail-closed, so this
+# statement must execute at a point in the module's top-to-bottom load order
+# where they already exist as module globals. Every real caller reads
+# JOURNAL_STYLE_PRESETS / _JOURNAL_STYLE_PRESET_LOOKUP from inside a
+# function body (resolved at CALL time, long after the whole module has
+# finished importing), so this placement is invisible to all of them.
+JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = _load_builtin_journal_style_presets()
+
+# 4d0ca929 -- case-insensitive name -> canonical-key lookup, built once at
+# import time from JOURNAL_STYLE_PRESETS itself (never hand-maintained
+# separately, so it can't drift out of sync with the preset dict above).
+_JOURNAL_STYLE_PRESET_LOOKUP: dict[str, str] = {
+    name.lower(): name for name in JOURNAL_STYLE_PRESETS
+}
 
 # 563118d4 -- stale-note detection patterns. Deliberately broad: false
 # positives (flagging real prose that happens to contain "TBD") are cheap for

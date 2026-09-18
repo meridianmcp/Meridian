@@ -18,9 +18,11 @@ All tests use synthetic .docx bytes built inline -- no real files, no network.
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -879,6 +881,194 @@ def test_server_get_journal_style_preset_result_usable_as_style_policy(tmp_path)
     another tool's style_policy= parameter with no further transformation."""
     preset = server.get_journal_style_preset("jcshm")
     assert docs_intel.resolve_style_policy(preset) == preset
+
+
+# ---------------------------------------------------------------------------
+# docs-intel-journal-preset-externalization-20260918 -- JOURNAL_STYLE_PRESETS
+# is now loaded from journal_style_presets/<key>.json files at import time
+# (_load_builtin_journal_style_presets) instead of a hand-maintained dict
+# literal. Covers: every file loads/validates, the loader's output is
+# reproducible by independently re-reading the same files (catches a loader
+# bug, as distinct from a bad extraction file), the loader's output still
+# matches a frozen snapshot of the pre-migration dict literal's own resolved
+# output (the actual migration parity check, pinned as real test data so a
+# future accidental value change is caught), and the new provenance surface
+# (get_journal_style_preset_provenance / _JOURNAL_STYLE_PRESET_PROVENANCE).
+# ---------------------------------------------------------------------------
+
+_PRESETS_DIR = (
+    Path(docs_intel.__file__).parent / "journal_style_presets"
+)
+_PRE_MIGRATION_SNAPSHOT_PATH = (
+    Path(__file__).parent / "fixtures" / "journal_style_presets_pre_migration_snapshot.json"
+)
+
+
+def test_journal_style_presets_dir_has_exactly_the_expected_29_files():
+    names = {p.stem for p in _PRESETS_DIR.glob("*.json")}
+    assert names == _ALL_29_PRESET_NAMES
+    assert len(list(_PRESETS_DIR.glob("*.json"))) == 29
+
+
+@pytest.mark.parametrize("name", sorted(_ALL_29_PRESET_NAMES))
+def test_journal_style_preset_file_is_valid_and_well_shaped(name):
+    path = _PRESETS_DIR / f"{name}.json"
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    assert isinstance(data, dict)
+    assert "meta" in data and "fields" in data
+    assert data["meta"]["journal"] == name
+    assert isinstance(data["fields"], dict)
+    valid_policy_keys = set(docs_intel.resolve_style_policy())
+    for field_name, entry in data["fields"].items():
+        assert field_name in valid_policy_keys, (
+            f"{name}.json: {field_name!r} is not a real style_policy key"
+        )
+        assert "value" in entry
+        assert "tier" in entry and entry["tier"] in (1, 2, 3, 4)
+        assert "source" in entry
+        assert "verified_date" in entry
+
+
+@pytest.mark.parametrize("name", sorted(_ALL_29_PRESET_NAMES))
+def test_loader_output_matches_independent_recomputation_from_files(name):
+    """Re-derives the resolved policy directly from the JSON file (bypassing
+    _load_builtin_journal_style_presets entirely) and checks it matches what
+    the real loader produced -- catches a bug IN THE LOADER itself (wrong
+    field read, forgetting resolve_style_policy, etc.), as opposed to a bad
+    value in one preset's own JSON file."""
+    path = _PRESETS_DIR / f"{name}.json"
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    overrides = {field_name: entry["value"] for field_name, entry in data["fields"].items()}
+    expected = docs_intel.resolve_style_policy(overrides)
+    assert docs_intel.JOURNAL_STYLE_PRESETS[name] == expected
+
+
+def test_journal_style_presets_matches_pre_migration_snapshot():
+    """THE parity check (docs-intel-journal-preset-externalization-20260918):
+    tests/data/journal_style_presets_pre_migration_snapshot.json is a frozen
+    dump of resolve_style_policy(JOURNAL_STYLE_PRESETS[key]) for all 29 keys,
+    taken from the module's OWN pre-migration hardcoded dict literal before
+    it was deleted. The post-migration, file-backed JOURNAL_STYLE_PRESETS
+    must produce byte-for-byte the same resolved dict for every key,
+    including every key a given preset never explicitly set (both must
+    apply resolve_style_policy's defaults identically) -- any drift here is
+    a real migration bug (a value dropped, mistyped, or a tier/source field
+    that leaked into the runtime value dict), not a style choice."""
+    with open(_PRE_MIGRATION_SNAPSHOT_PATH, encoding="utf-8") as fh:
+        pre_migration = json.load(fh)
+
+    assert set(pre_migration) == set(docs_intel.JOURNAL_STYLE_PRESETS) == _ALL_29_PRESET_NAMES
+
+    mismatches = {}
+    for name in sorted(_ALL_29_PRESET_NAMES):
+        old = pre_migration[name]
+        new = docs_intel.JOURNAL_STYLE_PRESETS[name]
+        if old != new:
+            mismatches[name] = {
+                field: (old.get(field, "<MISSING>"), new.get(field, "<MISSING>"))
+                for field in sorted(set(old) | set(new))
+                if old.get(field, "<MISSING>") != new.get(field, "<MISSING>")
+            }
+    assert mismatches == {}, f"migration parity mismatches: {mismatches}"
+
+
+def test_journal_style_preset_provenance_covers_same_keys_as_presets():
+    assert set(docs_intel._JOURNAL_STYLE_PRESET_PROVENANCE) == set(docs_intel.JOURNAL_STYLE_PRESETS)
+
+
+def test_journal_style_preset_lookup_still_derives_from_presets_dict():
+    """4d0ca929 -- _JOURNAL_STYLE_PRESET_LOOKUP is built FROM
+    JOURNAL_STYLE_PRESETS' own keys, so it can never list a name
+    JOURNAL_STYLE_PRESETS doesn't have -- still true after externalization,
+    since both are populated by the same file-backed loader pass."""
+    assert docs_intel._JOURNAL_STYLE_PRESET_LOOKUP == {
+        name.lower(): name for name in docs_intel.JOURNAL_STYLE_PRESETS
+    }
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset_provenance -- docs-intel-journal-preset-
+# externalization-20260918
+# ---------------------------------------------------------------------------
+
+def test_get_journal_style_preset_provenance_jcshm_open_question_field():
+    """jcshm's table_caption_bold is a deliberately unresolved question, not
+    merely an unset field -- it must surface with status="open_question",
+    value None, and its explanatory note, not just be absent."""
+    provenance = docs_intel.get_journal_style_preset_provenance("jcshm")
+    assert provenance["journal"] == "jcshm"
+    assert "meta" in provenance
+    field = provenance["fields"]["table_caption_bold"]
+    assert field["value"] is None
+    assert field["status"] == "open_question"
+    assert field["tier"] == 4
+    assert "note" in field["source"]
+
+
+def test_get_journal_style_preset_provenance_regular_field_has_no_open_question_status():
+    provenance = docs_intel.get_journal_style_preset_provenance("jcshm")
+    field = provenance["fields"]["citation_style"]
+    assert field["value"] == "numbered_bracket"
+    assert "status" not in field
+
+
+def test_get_journal_style_preset_provenance_field_absent_when_never_set():
+    """A style_policy key jcshm's preset never touches (e.g. note_style,
+    which no built-in preset overrides) is entirely absent from "fields" --
+    not present with a null/default value."""
+    provenance = docs_intel.get_journal_style_preset_provenance("jcshm")
+    assert "note_style" not in provenance["fields"]
+
+
+def test_get_journal_style_preset_provenance_default_has_empty_fields():
+    provenance = docs_intel.get_journal_style_preset_provenance("default")
+    assert provenance["fields"] == {}
+    assert provenance["meta"]["status"] == "baseline"
+
+
+def test_get_journal_style_preset_provenance_case_insensitive_lookup():
+    assert docs_intel.get_journal_style_preset_provenance(
+        "JCSHM"
+    ) == docs_intel.get_journal_style_preset_provenance("jcshm")
+    assert docs_intel.get_journal_style_preset_provenance(
+        "Nature"
+    ) == docs_intel.get_journal_style_preset_provenance("nature")
+
+
+def test_get_journal_style_preset_provenance_rejects_unknown_name():
+    with pytest.raises(ValueError, match="unknown journal style preset"):
+        docs_intel.get_journal_style_preset_provenance("not-a-real-journal")
+
+
+def test_get_journal_style_preset_provenance_elsevier_caveat_preserved():
+    """The elsevier preset's emphasis_style carries a caveat inherited from
+    workspace proposal 3674c0c1 (a closest-available-official-signal
+    substitution, not independently re-verified in the round-1 pass) --
+    this must be preserved verbatim in the provenance record, and
+    meta.status must reflect it as partially_populated, not an unqualified
+    tier-2 fact."""
+    provenance = docs_intel.get_journal_style_preset_provenance("elsevier")
+    assert provenance["meta"]["status"] == "partially_populated"
+    emphasis_source = provenance["fields"]["emphasis_style"]["source"]
+    assert "CAVEAT" in emphasis_source["note"] or "caveat" in emphasis_source["note"].lower()
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset_provenance -- MCP tool boundary (server.py wrapper)
+# ---------------------------------------------------------------------------
+
+def test_server_get_journal_style_preset_provenance_delegates_to_docs_intel():
+    assert server.get_journal_style_preset_provenance(
+        "jcshm"
+    ) == docs_intel.get_journal_style_preset_provenance("jcshm")
+
+
+def test_server_get_journal_style_preset_provenance_unknown_name_returns_error_dict():
+    result = server.get_journal_style_preset_provenance("not-a-real-journal")
+    assert "error" in result
+    assert "not-a-real-journal" in result["error"]
 
 
 # ---------------------------------------------------------------------------

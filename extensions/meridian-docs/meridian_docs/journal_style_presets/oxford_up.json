@@ -1,0 +1,22 @@
+{
+  "meta": {
+    "journal": "oxford_up",
+    "display_name": "Oxford University Press journals, via Monthly Notices of the Royal Astronomical Society (MNRAS)",
+    "publisher": "Oxford University Press",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. MNRAS Instructions to Authors used as the representative example, matching proposal 64266f13's own sourcing choice. Figure DPI left unspecified/absent -- the instructions page found in this pass covered numbering/citation conventions but not a specific resolution floor.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "author_date",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "academic.oup.com/mnras/pages/General_Instructions",
+        "quote": "MNRAS uses the Harvard author-(year) citation style, with an alphabetically ordered reference list"
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

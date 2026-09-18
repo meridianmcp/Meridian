@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "journal": "acm",
+    "display_name": "ACM journals (TAPS -- The ACM Publishing System)",
+    "publisher": "ACM",
+    "status": "partially_populated",
+    "status_detail": "Round 1 (workspace proposal 3674c0c1) migration. citation_style was independently verified 2026-09-11 against acm.org/publications/taps/describing-figures and homes.cs.washington.edu/~spencer/taps ('the vast majority of ACM articles use numbered citations and references'), but reflects the numbered-bracket majority convention only, not the SIGGRAPH/SIGPLAN author-year exception. CAVEAT inherited from proposal 3674c0c1, not independently re-verified in this pass: ACM's own sub-formats (sigconf vs. the journal format) set opposite defaults for figure/table caption boldness, so figure_caption_bold and table_caption_bold are deliberately left absent from this preset (matching the original dict entry, which never set them) rather than picking one sub-format's default -- callers targeting SIGGRAPH/SIGPLAN venues should override citation_style explicitly too.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_bracket",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "acm.org/publications/taps/describing-figures and homes.cs.washington.edu/~spencer/taps",
+        "quote": "the vast majority of ACM articles use numbered citations and references",
+        "note": "Reflects the numbered-bracket majority convention (reference number in brackets), not the SIGGRAPH/SIGPLAN-sponsored-venue author-year exception -- callers targeting those venues should override explicitly. CAVEAT (inherited from proposal 3674c0c1, not independently re-verified in this pass): round-1 flagged that ACM's own sub-formats (sigconf vs. the journal format) set opposite defaults for figure/table caption boldness, so figure_caption_bold and table_caption_bold are deliberately left unset here rather than picking one sub-format's default."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}
