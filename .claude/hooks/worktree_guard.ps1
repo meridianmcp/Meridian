@@ -69,9 +69,18 @@ $normProject = $projectDir -replace '\\', '/'
 # Is this session inside a worktree, or the main tree?
 $isWorktreeSession = $normProject -match '/\.claude/worktrees/'
 
-# Extract file_path from tool_input; fail open if absent.
+# Extract the edited path from tool_input; fail open if absent.
+# 6f07aa89: NotebookEdit's real schema field is notebook_path, not file_path --
+# Claude Code's own NotebookEdit tool_input never contains a file_path key at
+# all (verified against the tool's own parameter schema: notebook_path,
+# cell_id, cell_type, edit_mode, new_source -- no file_path). Falling back to
+# notebook_path when file_path is absent means NotebookEdit calls are still
+# boundary-checked instead of silently no-op'ing (fail-open) on every call.
 $filePath = $null
-if ($obj.tool_input) { $filePath = [string]$obj.tool_input.file_path }
+if ($obj.tool_input) {
+    $filePath = [string]$obj.tool_input.file_path
+    if (-not $filePath) { $filePath = [string]$obj.tool_input.notebook_path }
+}
 if (-not $filePath) { exit 0 }
 
 # Normalize file_path separators.

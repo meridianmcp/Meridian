@@ -160,6 +160,22 @@ def _make_payload(tool: str, file_path: str) -> str:
     return json.dumps({"tool_name": tool, "tool_input": {"file_path": file_path}})
 
 
+def _make_notebook_payload(notebook_path: str) -> str:
+    """Build a PreToolUse payload shaped like a REAL NotebookEdit call.
+
+    Claude Code's own NotebookEdit tool schema requires `notebook_path` (and
+    `new_source`) -- it has no `file_path` key at all (additionalProperties:
+    false on the schema). The other _make_payload helper above builds a
+    synthetic {"file_path": ...} payload for NotebookEdit that a real Claude
+    Code session would never actually send; these tests instead exercise the
+    genuine field shape (6f07aa89).
+    """
+    return json.dumps({
+        "tool_name": "NotebookEdit",
+        "tool_input": {"notebook_path": notebook_path, "new_source": "print(1)"},
+    })
+
+
 # ---------------------------------------------------------------------------
 # Tests: fails open when no CLAUDE_PROJECT_DIR
 # ---------------------------------------------------------------------------
@@ -233,6 +249,65 @@ def test_hook_blocks_edit_of_sibling_worktree_file(tool):
         f"{tool}: editing a sibling worktree's file must be blocked"
     )
     assert "a3984d96" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Tests: 6f07aa89 -- NotebookEdit's REAL schema field is notebook_path, not
+# file_path. The parametrized NotebookEdit cases above all pass a synthetic
+# {"file_path": ...} payload (matching Edit/Write/MultiEdit's real shape, but
+# NOT NotebookEdit's), so they exercise the fallback path harmlessly but do
+# not, on their own, prove the guard handles a genuine NotebookEdit call.
+# These tests use _make_notebook_payload, which mirrors NotebookEdit's actual
+# tool_input schema (notebook_path + new_source, no file_path key at all).
+# ---------------------------------------------------------------------------
+
+@_needs_bash
+def test_hook_blocks_notebookedit_real_schema_outside_worktree():
+    """A genuine NotebookEdit payload (notebook_path, no file_path) targeting
+    the main tree from a worktree session must still be blocked (exit 2).
+
+    Before the 6f07aa89 fix, the guard only read tool_input.file_path, which
+    is absent from a real NotebookEdit call -- filePath would be empty and
+    the hook would fail open (exit 0), silently never enforcing the worktree
+    boundary for any real NotebookEdit call.
+    """
+    notebook_file = str(Path(_MAIN_FILE).with_suffix(".ipynb"))
+    payload = _make_notebook_payload(notebook_file)
+    r = _run_hook(payload, claude_project_dir=_WORKTREE_DIR)
+    assert r.returncode == 2, (
+        "a real NotebookEdit payload (notebook_path field) targeting the "
+        "main tree from a worktree session must be blocked"
+    )
+    assert "a3984d96" in r.stderr
+    assert "NotebookEdit" in r.stderr
+    # Not asserting the exact notebook_file substring here: on Windows the
+    # bash hook's raw (non-normalized) $file_path used in the error message
+    # carries JSON-escaped double backslashes, so a straight substring check
+    # against the single-backslash Python path would spuriously fail -- the
+    # same reason test_hook_blocks_edit_of_main_tree_file_from_worktree_session
+    # above checks for the worktree marker rather than the raw main-file path.
+    assert _WORKTREE_DIR in r.stderr or ".claude/worktrees/" in r.stderr
+
+
+@_needs_bash
+def test_hook_allows_notebookedit_real_schema_inside_worktree():
+    """A genuine NotebookEdit payload targeting a file inside the claimed
+    worktree must be allowed (exit 0)."""
+    notebook_file = str(Path(_WORKTREE_FILE).with_suffix(".ipynb"))
+    payload = _make_notebook_payload(notebook_file)
+    r = _run_hook(payload, claude_project_dir=_WORKTREE_DIR)
+    assert r.returncode == 0, (
+        "a real NotebookEdit payload inside the claimed worktree must be allowed"
+    )
+
+
+@_needs_bash
+def test_hook_fails_open_notebookedit_without_notebook_path_or_file_path():
+    """Neither field present (some other/unexpected shape) -- must still fail
+    open rather than raise or misbehave."""
+    payload = json.dumps({"tool_name": "NotebookEdit", "tool_input": {"new_source": "x"}})
+    r = _run_hook(payload, claude_project_dir=_WORKTREE_DIR)
+    assert r.returncode == 0, "must fail open when neither path field is present"
 
 
 # ---------------------------------------------------------------------------
