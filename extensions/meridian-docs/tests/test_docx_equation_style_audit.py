@@ -328,6 +328,13 @@ def test_resolve_style_policy_defaults():
         "heading_spacing_after_h3_twips": None,
         "body_text_font_family": None,
         "body_text_font_size_pt": None,
+        # docs-intel-jcshm-linter-gap-cleanup-20260918 -- audit_manuscript_
+        # structure's Abstract-word-count/Keywords-count keys, same
+        # "not verified" None-default discipline as every key above.
+        "abstract_word_count_min": None,
+        "abstract_word_count_max": None,
+        "keyword_count_min": None,
+        "keyword_count_max": None,
     }
 
 

@@ -136,6 +136,15 @@ _REFERENCES_RE = re.compile(
     re.IGNORECASE,
 )
 
+# docs-intel-jcshm-linter-gap-cleanup-20260918 -- matches a "Keywords:" /
+# "Key words:" / "Keyword:" line's leading label, so its position and the
+# term list following it can be found the same text-pattern way
+# _ABSTRACT_RE/_REFERENCES_RE already locate their own sections, rather
+# than assuming Keywords has a heading/style of its own (JCSHM's own
+# convention: a plain paragraph immediately after the Abstract body, no
+# dedicated heading style). Used by audit_manuscript_structure.
+_KEYWORDS_LABEL_RE = re.compile(r"^key\s*words?\s*[:.]?\s*", re.IGNORECASE)
+
 SectionType = str  # "abstract" | "toc" | "lof" | "main" | "appendix"
 
 
@@ -8965,6 +8974,16 @@ def _style_policy_defaults() -> dict[str, Any]:
     real mismatch caught only by eye, never by tooling, before this. All
     eight default to ``None``/``"unspecified"`` -- same "unverified means
     don't guess" discipline as every key above.
+
+    docs-intel-jcshm-linter-gap-cleanup-20260918 -- four more keys back
+    :func:`audit_manuscript_structure`: ``abstract_word_count_min``/
+    ``abstract_word_count_max``/``keyword_count_min``/``keyword_count_max``.
+    Same discipline as every key above -- all default to ``None`` (no
+    verified rule -- don't check the corresponding count at all), populated
+    only by a preset (e.g. ``"jcshm"``) that has sourced a real numeric
+    submission requirement. :func:`audit_reference_consistency`'s checks are
+    unconditional (structural correctness, not a style preference), so it
+    adds no new policy keys of its own.
     """
     return {
         "caption_centered": False,
@@ -9002,6 +9021,10 @@ def _style_policy_defaults() -> dict[str, Any]:
         "heading_spacing_after_h3_twips": None,
         "body_text_font_family": None,
         "body_text_font_size_pt": None,
+        "abstract_word_count_min": None,
+        "abstract_word_count_max": None,
+        "keyword_count_min": None,
+        "keyword_count_max": None,
     }
 
 
@@ -9168,6 +9191,19 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
       body_text_font_size_pt (int | float | None): df716454 -- same as
                                     ``body_text_font_family`` but for the
                                     body-text style's font size in points.
+      abstract_word_count_min / abstract_word_count_max (int>=1 | None):
+                                    docs-intel-jcshm-linter-gap-cleanup-
+                                    20260918 -- the inclusive word-count
+                                    range :func:`audit_manuscript_structure`
+                                    expects for the Abstract section's body
+                                    text. ``None`` (either bound) skips that
+                                    bound's check.
+      keyword_count_min / keyword_count_max (int>=1 | None): docs-intel-
+                                    jcshm-linter-gap-cleanup-20260918 -- same
+                                    as the abstract word-count keys above,
+                                    but for the number of comma/semicolon-
+                                    separated terms on the document's
+                                    "Keywords:" line.
 
     Raises:
       ValueError: an unknown key, or a value of the wrong type/out of range.
@@ -9332,6 +9368,20 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
             "style policy 'body_text_font_size_pt' must be a positive number or None"
         )
 
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 -- validation for
+    # audit_manuscript_structure's four count-range keys (see
+    # _style_policy_defaults() and the docstring above), same "positive int
+    # or None" shape as the figure_dpi_minimum_* keys validated above.
+    for key in (
+        "abstract_word_count_min", "abstract_word_count_max",
+        "keyword_count_min", "keyword_count_max",
+    ):
+        value = policy[key]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise ValueError(f"style policy {key!r} must be a positive int or None")
+
     return policy
 
 
@@ -9495,6 +9545,31 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
         "figure_caption_bold": True,
         "figure_caption_label_punctuation": "none",
         "figure_caption_terminal_punctuation": "",
+        # docs-intel-jcshm-linter-gap-cleanup-20260918 -- table_caption_label_punctuation
+        # and table_caption_terminal_punctuation populated 2026-09-18, extending the
+        # already-agreed figure convention above to tables: sourced from 22/22 real
+        # published JCSHM-article table captions sampled this session (zero exceptions --
+        # no terminal period, no punctuation after the number label) plus this session's
+        # own pre-submission QA sweep catching 2/37 real table captions in this project's
+        # own manuscript+SI with a stray trailing period that the other 35 did not carry.
+        # table_caption_bold is DELIBERATELY left unset (see the table_caption_bold
+        # discussion further up this dict, and _style_policy_defaults's schema default of
+        # None) -- it stays a genuinely OPEN question, not merely "unspecified pending
+        # future work": real published JCSHM articles bold the ENTIRE table caption
+        # (label + description), a DIFFERENT convention from figures (label-only bold per
+        # figure_caption_bold above), but JCSHM's own author-facing submission guidelines
+        # never state a table-caption bold rule the way they explicitly do for figures --
+        # so whether "bold the whole caption" is an author-submission-time requirement or
+        # a copyediting-stage transformation applied after acceptance is genuinely unknown
+        # from anything sourced this session. Even if that were resolved,
+        # audit_caption_style's existing caption_label_not_bold check only examines the
+        # LABEL run(s) (see its own label_len logic), not the full caption text -- so
+        # verifying a real "bold the whole caption" rule would also need a second,
+        # differently-scoped check, not just a policy value. Do not guess a value here;
+        # leave it None and let a future session resolve both the sourcing gap and (if
+        # resolved true) the separate whole-caption-bold detection gap together.
+        "table_caption_label_punctuation": "none",
+        "table_caption_terminal_punctuation": "",
         "heading_numbering_visible": True,
         "heading_levels_max": 3,
         "citation_style": "numbered_bracket",
@@ -9506,6 +9581,15 @@ JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
         "heading_spacing_after_h3_twips": 120,
         "body_text_font_family": "Times New Roman",
         "body_text_font_size_pt": 10,
+        # docs-intel-jcshm-linter-gap-cleanup-20260918 -- abstract_word_count_min/max and
+        # keyword_count_min/max added 2026-09-18, from JCSHM's own live submission
+        # guidelines page (explicit, numeric, unambiguous rules, not inferred): Abstract
+        # 150-250 words, 4-6 Keywords. Neither was checked by any tooling before this --
+        # see audit_manuscript_structure.
+        "abstract_word_count_min": 150,
+        "abstract_word_count_max": 250,
+        "keyword_count_min": 4,
+        "keyword_count_max": 6,
     },
 
     # -- Round 1 (proposal 3674c0c1) -----------------------------------
@@ -11578,6 +11662,381 @@ def audit_cross_document_consistency(
     return {
         "manuscript_path": manuscript_path,
         "si_path": si_path,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+def audit_manuscript_structure(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """docs-intel-jcshm-linter-gap-cleanup-20260918 -- audit the manuscript's
+    Abstract word count and Keywords count against
+    ``style_policy["abstract_word_count_min"/"_max"]`` /
+    ``["keyword_count_min"/"_max"]``. Neither fact was checked by any
+    tooling in this module before this: JCSHM's own live submission
+    guidelines state both as explicit, numeric, unambiguous rules (Abstract
+    150-250 words, 4-6 Keywords) that this project's own manuscript was
+    never automatically verified against.
+
+    Section location is TEXT-pattern based, the same discipline
+    :func:`document_outline`/:func:`_assign_section_types` already use for
+    front-matter classification (:data:`_ABSTRACT_RE`) rather than assuming
+    any particular heading STYLE name -- an "Abstract" heading is any
+    heading paragraph (:func:`_is_heading`) whose text matches
+    :data:`_ABSTRACT_RE`. The Abstract's body is every non-heading paragraph
+    between that heading and the next heading (any level) OR a recognised
+    "Keywords" line, whichever comes first. JCSHM's own convention puts the
+    Keywords line immediately after the Abstract body, inside the same
+    section (no heading of its own) -- so it is located the same
+    text-pattern way (:data:`_KEYWORDS_LABEL_RE`), not assumed to be a
+    heading either.
+
+    Two independently-gated finding types (``None`` bound == "no verified
+    rule for that bound -- don't check it"), each only raised when the
+    corresponding section was actually found (a document with no locatable
+    Abstract heading, or no locatable Keywords line, produces NO finding for
+    that half -- this function never guesses a count for something it could
+    not find, matching every other check in this module):
+
+      * ``abstract_word_count_out_of_range`` -- the Abstract body's
+        whitespace-split word count falls outside
+        ``[abstract_word_count_min, abstract_word_count_max]`` (either bound
+        may be ``None`` to leave that side unchecked).
+      * ``keyword_count_out_of_range`` -- the number of comma/semicolon-
+        separated terms on the Keywords line falls outside
+        ``[keyword_count_min, keyword_count_max]``.
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style
+                     policy via :func:`resolve_style_policy`. Pass
+                     ``get_journal_style_preset("jcshm")`` (or any other
+                     preset name) directly, or a hand-written override
+                     dict.
+
+    Returns:
+      ``{docx_path, abstract_word_count, keyword_count, findings,
+      finding_count, findings_by_type, policy}`` (either count is ``None``
+      when its section could not be located) or ``{"error": <message>}``
+      when the file cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+
+    paragraphs: list[tuple[str | None, str, str]] = []  # (style, text, para_id)
+    for index, p in enumerate(body):
+        if p.tag != w_p:
+            continue
+        ppr = p.find(w_pPr)
+        style: str | None = None
+        if ppr is not None:
+            pstyle = ppr.find(w_pStyle)
+            if pstyle is not None:
+                style = pstyle.get(w_val)
+        text = "".join(t.text or "" for t in p.iter(w_t))
+        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        paragraphs.append((style, text, para_id))
+
+    findings: list[dict[str, Any]] = []
+    abstract_word_count: int | None = None
+    keyword_count: int | None = None
+
+    abstract_heading_idx = next(
+        (
+            idx for idx, (style, text, _pid) in enumerate(paragraphs)
+            if _is_heading(style) and _ABSTRACT_RE.match(text.strip())
+        ),
+        None,
+    )
+
+    if abstract_heading_idx is not None:
+        abstract_para_id = paragraphs[abstract_heading_idx][2]
+        body_parts: list[str] = []
+        keywords_text: str | None = None
+        keywords_para_id: str | None = None
+
+        for style, text, para_id in paragraphs[abstract_heading_idx + 1:]:
+            if _is_heading(style):
+                break
+            stripped = text.strip()
+            km = _KEYWORDS_LABEL_RE.match(stripped)
+            if km:
+                keywords_text = stripped[km.end():]
+                keywords_para_id = para_id
+                break
+            body_parts.append(text)
+
+        abstract_full_text = " ".join(body_parts)
+        abstract_word_count = len(abstract_full_text.split())
+
+        min_words = policy["abstract_word_count_min"]
+        max_words = policy["abstract_word_count_max"]
+        if (min_words is not None and abstract_word_count < min_words) or (
+            max_words is not None and abstract_word_count > max_words
+        ):
+            findings.append({
+                "type": "abstract_word_count_out_of_range",
+                "para_id": abstract_para_id,
+                "actual_word_count": abstract_word_count,
+                "expected_min": min_words,
+                "expected_max": max_words,
+            })
+
+        if keywords_text is not None:
+            keyword_count = len([
+                term for term in re.split(r"[,;]", keywords_text) if term.strip()
+            ])
+            min_kw = policy["keyword_count_min"]
+            max_kw = policy["keyword_count_max"]
+            if (min_kw is not None and keyword_count < min_kw) or (
+                max_kw is not None and keyword_count > max_kw
+            ):
+                findings.append({
+                    "type": "keyword_count_out_of_range",
+                    "para_id": keywords_para_id,
+                    "actual_keyword_count": keyword_count,
+                    "expected_min": min_kw,
+                    "expected_max": max_kw,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "abstract_word_count": abstract_word_count,
+        "keyword_count": keyword_count,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+# docs-intel-jcshm-linter-gap-cleanup-20260918 -- constants for
+# audit_reference_consistency below. JCSHM's numbered_bracket in-text
+# citation convention: "[7]", "[3, 5]", "[3-7]" (comma-separated list
+# and/or hyphen/en-dash/em-dash range, all inside one bracket pair).
+_INTEXT_CITATION_RE = re.compile(r"\[(\d+(?:\s*[-–—,]\s*\d+)*)\]")
+_CITATION_RANGE_SEP_RE = re.compile(r"[-–—]")
+# A reference-list entry's own literal printed number, when the document's
+# text carries one (JCSHM's numbered_bracket convention applies to the list
+# itself, not just in-text markers) -- e.g. "[12] Smith, J. et al. ...".
+_BIB_ENTRY_NUMBER_RE = re.compile(r"^\s*\[(\d+)\]")
+
+
+def _expand_citation_numbers(group_text: str) -> set[int]:
+    """Expand one in-text citation's bracket contents (e.g. ``"3, 5"`` or
+    ``"3-7"`` or ``"12"``) into the individual reference numbers it denotes.
+    Used only by :func:`audit_reference_consistency` -- not a general-
+    purpose citation parser, specific to JCSHM's numbered_bracket
+    convention."""
+    numbers: set[int] = set()
+    for part in group_text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bounds = _CITATION_RANGE_SEP_RE.split(part)
+        if len(bounds) == 2 and bounds[0].strip().isdigit() and bounds[1].strip().isdigit():
+            lo, hi = int(bounds[0]), int(bounds[1])
+            if lo <= hi:
+                numbers.update(range(lo, hi + 1))
+        elif part.isdigit():
+            numbers.add(int(part))
+    return numbers
+
+
+def audit_reference_consistency(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """docs-intel-jcshm-linter-gap-cleanup-20260918 -- audit reference-list
+    <-> in-text-citation consistency for JCSHM's numbered_bracket citation
+    style: every in-text numbered citation (e.g. "[7]", "[3, 5]", "[3-7]")
+    has a matching reference-list entry, every reference-list entry is
+    cited somewhere in the body, and the reference list's own printed
+    numbering is sequential 1..N with no gaps or duplicates. This session's
+    own manual pre-submission QA pass found a real problem here that no
+    automated check existed for before this.
+
+    Deliberately NOT built on top of :func:`sync_bibliography` (that
+    function reconciles CSL_CITATION complex-field / Zotero author-date
+    citations only -- a different mechanism from JCSHM's plain numbered-
+    bracket in-text markers) or :func:`find_references_to`/
+    :data:`_LITERAL_REF_ALIASES` (those cover Figure/Table/Equation
+    cross-references, not bibliography citations) -- neither mechanism
+    applies to this domain, confirmed by direct inspection before writing
+    this function. Reuses :func:`_find_references_heading` +
+    :func:`_bibliography_entries_range` to locate the reference list itself,
+    the same way :func:`insert_bibliography_entry` already does.
+
+    Does NOT check citation first-appearance order (real published JCSHM
+    articles are genuinely mixed on that convention per this session's own
+    sampling) -- only the four structural facts below, all UNCONDITIONAL
+    (not style-policy-gated): a document either has a numbered reference
+    list that is internally consistent, or it has real, specific defects,
+    independent of any publisher style preference.
+
+      * ``reference_list_number_gap`` -- some integer between 1 and the
+        highest printed reference number has no corresponding entry.
+      * ``reference_list_duplicate_number`` -- the same printed reference
+        number appears on more than one entry.
+      * ``citation_missing_reference_entry`` -- an in-text citation number
+        has no reference-list entry with that number.
+      * ``reference_entry_never_cited`` -- a reference-list entry's number
+        is never cited anywhere in the body.
+
+    A reference-list entry's "printed number" is read from its own text
+    when it opens with a literal ``[N]`` marker (:data:`_BIB_ENTRY_NUMBER_RE`
+    -- JCSHM's numbered_bracket convention applied to the list itself, not
+    just in-text); an entry with no such literal marker (e.g. a Word
+    auto-numbered list with no cached literal digits in the XML) falls back
+    to its 1-based position among the list's non-empty entries --
+    positional numbering is trivially sequential by construction, so this
+    fallback can never itself manufacture a gap/duplicate finding; only the
+    cross-citation checks still meaningfully apply in that case.
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style
+                     policy via :func:`resolve_style_policy` (accepted for
+                     signature consistency with every other audit_*
+                     function in this module; no policy key currently gates
+                     any check here -- see the docstring above, these are
+                     structural facts, not style preferences).
+
+    Returns:
+      ``{docx_path, reference_count, citation_count, findings,
+      finding_count, findings_by_type, policy}`` or ``{"error": <message>}``
+      when the file cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_t = _q(_W, "t")
+
+    body_children = list(body)
+    heading_result = _find_references_heading(body)
+
+    ref_heading_idx: int | None = None
+    bib_start: int | None = None
+    bib_end: int | None = None
+    if heading_result is not None:
+        ref_heading_idx, _heading_el = heading_result
+        bib_start, bib_end = _bibliography_entries_range(body, ref_heading_idx)
+
+    cited_numbers: set[int] = set()
+    citation_first_para_id: dict[int, str] = {}
+
+    for index, p in enumerate(body_children):
+        if p.tag != w_p:
+            continue
+        if ref_heading_idx is not None and index == ref_heading_idx:
+            continue
+        if bib_start is not None and bib_start <= index < bib_end:
+            continue
+        text = "".join(t.text or "" for t in p.iter(w_t))
+        if "[" not in text:
+            continue
+        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        for m in _INTEXT_CITATION_RE.finditer(text):
+            for number in _expand_citation_numbers(m.group(1)):
+                cited_numbers.add(number)
+                citation_first_para_id.setdefault(number, para_id)
+
+    entry_count = 0
+    reference_numbers: dict[int, str] = {}
+    duplicate_numbers: set[int] = set()
+    if bib_start is not None:
+        for index in range(bib_start, bib_end):
+            p = body_children[index]
+            if p.tag != w_p:
+                continue
+            text = "".join(t.text or "" for t in p.iter(w_t)).strip()
+            if not text:
+                continue
+            entry_count += 1
+            para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+            m = _BIB_ENTRY_NUMBER_RE.match(text)
+            number = int(m.group(1)) if m else entry_count
+            if number in reference_numbers:
+                duplicate_numbers.add(number)
+            else:
+                reference_numbers[number] = para_id
+
+    findings: list[dict[str, Any]] = []
+
+    if reference_numbers:
+        highest = max(reference_numbers)
+        for missing in sorted(set(range(1, highest + 1)) - set(reference_numbers)):
+            findings.append({
+                "type": "reference_list_number_gap",
+                "para_id": None,
+                "missing_number": missing,
+            })
+        for dup in sorted(duplicate_numbers):
+            findings.append({
+                "type": "reference_list_duplicate_number",
+                "para_id": reference_numbers[dup],
+                "duplicate_number": dup,
+            })
+        for missing_entry in sorted(cited_numbers - set(reference_numbers)):
+            findings.append({
+                "type": "citation_missing_reference_entry",
+                "para_id": citation_first_para_id.get(missing_entry),
+                "citation_number": missing_entry,
+            })
+        for uncited in sorted(set(reference_numbers) - cited_numbers):
+            findings.append({
+                "type": "reference_entry_never_cited",
+                "para_id": reference_numbers[uncited],
+                "reference_number": uncited,
+            })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "reference_count": entry_count,
+        "citation_count": len(cited_numbers),
         "findings": findings,
         "finding_count": len(findings),
         "findings_by_type": findings_by_type,
@@ -21791,15 +22250,27 @@ def flag_for_review(
 #: Fixed category set the dashboard groups findings by. Always present in
 #: ``findings_by_category`` (count 0 when nothing was found/checked) so a
 #: caller can render a stable set of section headers rather than guessing
-#: which categories exist for a given document profile -- "section_page"
-#: and "ownership" have no v1 detector yet (framework-agnostic first
-#: version -- see the sprint item notes) and always report 0 until a future
-#: item adds one. "structure" (9c1a3fd2) is populated by
-#: :func:`audit_table_style`'s findings, wired into
-#: :func:`build_document_review` below.
+#: which categories exist for a given document profile -- "ownership" has
+#: no v1 detector yet (framework-agnostic first version -- see the sprint
+#: item notes) and always reports 0 until a future item adds one.
+#: "structure" (9c1a3fd2) is populated by :func:`audit_table_style`'s
+#: findings, wired into :func:`build_document_review` below.
+#:
+#: docs-intel-jcshm-linter-gap-cleanup-20260918 -- "section_page" is no
+#: longer a permanent 0: it is now populated by
+#: :func:`audit_manuscript_structure`'s Abstract-word-count/Keywords-count
+#: findings -- the closest existing category name-fit for manuscript
+#: front-matter structural requirements; there was no better-fitting
+#: existing category, and this finally gives "section_page" real content
+#: rather than adding yet another near-duplicate one. "citation" is a NEW
+#: category (not one of the original seven), added the same session, for
+#: :func:`audit_reference_consistency`'s reference-list<->in-text-citation
+#: findings -- deliberately its own category rather than folded into
+#: "caption"/"structure"/"section_page", none of which are really about
+#: bibliography integrity.
 REVIEW_CATEGORIES: tuple[str, ...] = (
     "structure", "equation", "caption", "section_page", "ownership",
-    "provenance", "render_integrity",
+    "provenance", "render_integrity", "citation",
 )
 
 
@@ -21814,7 +22285,33 @@ def _legacy_plaintext_caption_findings(
     exact text pattern :func:`retrofit_plaintext_captions` migrates. Never
     mutates the document; only reports what that primitive WOULD convert, so
     "mixed native/legacy captions" is visible without running the write.
+
+    docs-intel-jcshm-linter-gap-cleanup-20260918 -- whole-document gate: a
+    document that carries ZERO native (SEQ-field) figure_caption/
+    table_caption records at all is not a "some captions got missed"
+    situation -- it is a document whose own deliberate convention is plain
+    literal caption numbers, never SEQ fields, anywhere. Flagging every one
+    of those captions as a "legacy" migration candidate is a pure false
+    positive in that case (confirmed on this project's own real manuscript/
+    SI: the same 5 plaintext-caption findings fired, harmlessly, on every
+    single build_document_review pass all project, and were manually
+    re-verified as a non-issue 3+ separate times -- wasted verification
+    effort every time, never a real defect). There is no reliable PER-
+    CAPTION signal that distinguishes "this document's house style" from "a
+    caption that was supposed to get a SEQ field and didn't" -- only a
+    document-level one: if this document has ANY native caption elsewhere, a
+    plaintext one nearby genuinely looks like a missed migration and this
+    function's findings still fire exactly as before; if it has NONE, every
+    "Figure N"/"Table N" paragraph in it is presumed to be the document's
+    own house style and nothing is flagged.
     """
+    has_native_caption = any(
+        record.get("element_kind") in ("figure_caption", "table_caption")
+        for record in records
+    )
+    if not has_native_caption:
+        return []
+
     out: list[dict[str, Any]] = []
     for record in records:
         if record.get("element_kind") != "paragraph":
@@ -21840,6 +22337,24 @@ def _legacy_plaintext_caption_findings(
 def _review_finding_severity(category: str, finding_type: str) -> str:
     if category == "equation" and finding_type in (
         "duplicate_equation_number", "equation_number_gap",
+    ):
+        return "error"
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 -- reference-list
+    # numbering-integrity findings get the same "error" treatment as the
+    # equation numbering-integrity findings just above (a genuinely broken
+    # numbering scheme, not a style preference); the cross-citation checks
+    # (citation_missing_reference_entry / reference_entry_never_cited) fall
+    # through to the default "warning" below -- real, but editorial rather
+    # than a broken invariant. Abstract/Keywords count violations are
+    # "error" too: JCSHM's 150-250/4-6 are explicit numeric submission
+    # requirements, the same status as the equation checks above, not a
+    # soft style preference.
+    if category == "citation" and finding_type in (
+        "reference_list_number_gap", "reference_list_duplicate_number",
+    ):
+        return "error"
+    if category == "section_page" and finding_type in (
+        "abstract_word_count_out_of_range", "keyword_count_out_of_range",
     ):
         return "error"
     if category == "render_integrity":
@@ -21898,8 +22413,18 @@ def build_document_review(
                         key) and the read-only
                         ``heading_terminal_punctuation_mismatch`` finding
                         (gated on ``style_policy["heading_terminal_punctuation"]``).
-    * ``section_page`` / ``ownership`` -- reserved, always 0 in this first
-                        version (see :data:`REVIEW_CATEGORIES`).
+    * ``section_page`` -- (docs-intel-jcshm-linter-gap-cleanup-20260918)
+                        :func:`audit_manuscript_structure` findings:
+                        Abstract word count / Keywords count outside the
+                        configured range, gated on
+                        ``style_policy["abstract_word_count_min"/"_max"]``
+                        / ``["keyword_count_min"/"_max"]``.
+    * ``citation``      -- (docs-intel-jcshm-linter-gap-cleanup-20260918)
+                        :func:`audit_reference_consistency` findings:
+                        reference-list<->in-text-citation consistency.
+                        Unconditional, not style-policy-gated.
+    * ``ownership``     -- reserved, always 0 in this first version (see
+                        :data:`REVIEW_CATEGORIES`).
 
     Every finding with a ``para_id`` is enriched with a ``locator`` --
     resolved via :func:`_resolve_anchor_query` (the SAME function
@@ -22026,6 +22551,36 @@ def build_document_review(
             findings.append({
                 "category": "structure",
                 "severity": _review_finding_severity("structure", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 -- Abstract word count /
+    # Keywords count findings. Same wiring pattern as every audit_* call
+    # above; see REVIEW_CATEGORIES's own comment for why these land in
+    # "section_page" specifically.
+    manuscript_structure_audit = audit_manuscript_structure(docx_path, style_policy)
+    if isinstance(manuscript_structure_audit, dict) and not manuscript_structure_audit.get("error"):
+        for f in manuscript_structure_audit.get("findings", []):
+            findings.append({
+                "category": "section_page",
+                "severity": _review_finding_severity("section_page", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 -- reference-list <->
+    # in-text-citation consistency findings, own "citation" category (see
+    # REVIEW_CATEGORIES's own comment for why). Unconditional (not gated on
+    # style_policy) -- see audit_reference_consistency's own docstring.
+    reference_audit = audit_reference_consistency(docx_path, style_policy)
+    if isinstance(reference_audit, dict) and not reference_audit.get("error"):
+        for f in reference_audit.get("findings", []):
+            findings.append({
+                "category": "citation",
+                "severity": _review_finding_severity("citation", f["type"]),
                 "type": f["type"],
                 "para_id": f.get("para_id"),
                 "detail": f,

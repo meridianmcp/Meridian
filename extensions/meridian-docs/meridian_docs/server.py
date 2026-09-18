@@ -1985,6 +1985,84 @@ def audit_cross_document_consistency(
 
 
 @mcp.tool()
+def audit_manuscript_structure(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """docs-intel-jcshm-linter-gap-cleanup-20260918 — Audit the manuscript's
+    Abstract word count and Keywords count against
+    style_policy["abstract_word_count_min"/"_max"] /
+    ["keyword_count_min"/"_max"]. Neither fact was checked by any tooling
+    before this; JCSHM's own live submission guidelines state both as
+    explicit numeric rules (Abstract 150-250 words, 4-6 Keywords).
+
+    Section location is TEXT-pattern based (the Abstract heading is any
+    heading paragraph whose text matches the same _ABSTRACT_RE
+    document_outline already uses; the Keywords line is any paragraph
+    matching a "Keywords:"/"Key words:" label immediately after the
+    Abstract body) — not tied to any particular heading style name.
+
+    Two finding types, each skipped entirely when its policy bound(s) are
+    unset (None — no verified rule) or its section could not be located:
+      abstract_word_count_out_of_range — the Abstract body's word count
+        falls outside [abstract_word_count_min, abstract_word_count_max].
+      keyword_count_out_of_range — the Keywords line's comma/semicolon-
+        separated term count falls outside [keyword_count_min,
+        keyword_count_max].
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides, or pass
+                     get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {docx_path, abstract_word_count, keyword_count, findings,
+      finding_count, findings_by_type, policy} or {error: <message>}.
+    """
+    return docs_intel.audit_manuscript_structure(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
+def audit_reference_consistency(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """docs-intel-jcshm-linter-gap-cleanup-20260918 — Audit reference-list
+    <-> in-text-citation consistency for JCSHM's numbered_bracket citation
+    style: every in-text numbered citation ("[7]", "[3, 5]", "[3-7]") has a
+    matching reference-list entry, every reference-list entry is cited
+    somewhere, and the reference list's own printed numbering is
+    sequential 1..N with no gaps or duplicates. Does NOT check citation
+    first-appearance order (real published JCSHM articles are genuinely
+    mixed on that convention) — that stays an editorial judgment call.
+
+    Four finding types, all UNCONDITIONAL (not style-policy-gated —
+    structural correctness, not a style preference):
+      reference_list_number_gap        — a missing integer in 1..highest.
+      reference_list_duplicate_number  — the same printed number reused.
+      citation_missing_reference_entry — a cited number with no entry.
+      reference_entry_never_cited      — an entry never cited in the body.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides (accepted for
+                     signature consistency with every other audit_* tool;
+                     no key currently gates any check here).
+
+    Returns:
+      {docx_path, reference_count, citation_count, findings, finding_count,
+      findings_by_type, policy} or {error: <message>}.
+    """
+    return docs_intel.audit_reference_consistency(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
 def audit_equation_contract(
     docx_path: str,
     project_id: str | None = None,

@@ -338,6 +338,67 @@ def test_jcshm_preset_flags_a_real_violation_and_passes_a_compliant_caption(tmp_
 
 
 # ---------------------------------------------------------------------------
+# docs-intel-jcshm-linter-gap-cleanup-20260918 -- table_caption_label_
+# punctuation / table_caption_terminal_punctuation, populated in the jcshm
+# preset for the first time. Before this, both keys were absent from the
+# preset dict (resolving to "unspecified"/None via _style_policy_defaults),
+# so audit_caption_style's table-caption punctuation branch -- code that
+# already existed -- was a live no-op on every jcshm document: a real 2/37
+# table-caption stray-trailing-period defect in this project's own
+# manuscript/SI went unreported by the "clean" linter for exactly this
+# reason. This is a pure DATA-population regression test, not new logic.
+# ---------------------------------------------------------------------------
+
+def test_jcshm_preset_table_caption_punctuation_values():
+    policy = docs_intel.get_journal_style_preset("jcshm")
+    assert policy["table_caption_label_punctuation"] == "none"
+    assert policy["table_caption_terminal_punctuation"] == ""
+    # table_caption_bold stays a genuinely open, unresolved question -- see
+    # the code comment on the jcshm preset dict for why it must not be
+    # guessed.
+    assert policy["table_caption_bold"] is None
+
+
+def test_jcshm_preset_flags_real_table_caption_punctuation_violation(tmp_path):
+    """The exact real-manuscript defect this fix closes: a table caption
+    with a stray trailing period, previously invisible to the jcshm preset
+    because table_caption_terminal_punctuation resolved to None (skip)."""
+    policy = docs_intel.get_journal_style_preset("jcshm")
+    violating = _write_docx(
+        tmp_path,
+        _doc(_caption_para("Table 1.", " Summary statistics.")),
+        "violating_table.docx",
+    )
+    result = docs_intel.audit_caption_style(violating, style_policy=policy)
+    types = {f["type"] for f in result["findings"]}
+    assert "caption_label_punctuation_mismatch" in types
+    assert "caption_terminal_punctuation_mismatch" in types
+
+    compliant = _write_docx(
+        tmp_path,
+        _doc(_caption_para("Table 1", " Summary statistics")),
+        "compliant_table.docx",
+    )
+    result2 = docs_intel.audit_caption_style(compliant, style_policy=policy)
+    types2 = {f["type"] for f in result2["findings"]}
+    assert "caption_label_punctuation_mismatch" not in types2
+    assert "caption_terminal_punctuation_mismatch" not in types2
+
+
+def test_build_document_review_surfaces_table_caption_punctuation_with_jcshm_policy(tmp_path):
+    """End-to-end: the same table-caption punctuation defect surfaces in
+    build_document_review's "caption" category once style_policy carries the
+    now-populated jcshm preset -- the live dashboard path this was missing
+    from before this fix."""
+    policy = docs_intel.get_journal_style_preset("jcshm")
+    path = _write_docx(tmp_path, _doc(_caption_para("Table 1.", " Ends with a period.")))
+    review = docs_intel.build_document_review(path, style_policy=policy)
+    caption_findings = [f for f in review["findings"] if f["category"] == "caption"]
+    types = {f["type"] for f in caption_findings}
+    assert "caption_terminal_punctuation_mismatch" in types
+
+
+# ---------------------------------------------------------------------------
 # 9c1a3fd2 -- build_document_review wiring: audit_caption_style is now a
 # SOURCE for the review panel's "caption" category, gated by style_policy
 # exactly like audit_equation_style already was. Regression coverage for the
