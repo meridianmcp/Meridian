@@ -16,6 +16,15 @@
 //                    -> { leased: true } / { leased: false, reason, holder_token_of_conflict? }
 //   POST /release   { project_id, holder_token, node_id? }  -> { released: <count> }
 //   GET  /claims?project_id=...  -> { claims: [...] }  (live claims only)
+//   POST /provenance  { project_id, node_id, kind, field, old_value?, new_value, holder_token }
+//                    -> { recorded: true, id } / { recorded: false, reason }
+//                    (a durable local audit trail of applied edits -- see
+//                    provenance.js's header comment for why this is a local
+//                    ledger, not a live meridian-outputs call)
+//   GET  /provenance?project_id=...&unsynced_only=true  -> { provenance: [...] }
+//                    (for a later agent session to pull and push into
+//                    meridian-outputs itself, then mark synced)
+//   POST /provenance/mark-synced  { ids: [...] }  -> { marked: <count> }
 //   GET  /extension-version  -> { hash }  (mtime fingerprint of extension/,
 //                    for background.js's self-reload poll -- see below)
 //   GET  /health     ->  { ok: true }
@@ -34,6 +43,7 @@ import { outlineText } from "./outline.js";
 import { matchOutlines } from "./matching.js";
 import { openStore, getProject, upsertProject } from "./store.js";
 import { claimNode, leaseWholeDocument, releaseClaims, getLiveClaims } from "./claims.js";
+import { recordEdit, listProvenance, markSynced } from "./provenance.js";
 
 // One shared connection for the lifetime of this process -- matches the
 // spec's "one local Node process on one machine" framing (no pooling, no
@@ -197,6 +207,54 @@ const server = createServer(async (req, res) => {
       const result = releaseClaims(db, { project_id, holder_token, node_id });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String(err && err.message || err) }));
+    }
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/provenance") {
+    try {
+      const raw = await readBody(req);
+      const { project_id, node_id, kind, field, old_value, new_value, holder_token } = JSON.parse(raw);
+      const result = recordEdit(db, { project_id, node_id, kind, field, old_value, new_value, holder_token });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String(err && err.message || err) }));
+    }
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/provenance/mark-synced") {
+    try {
+      const raw = await readBody(req);
+      const { ids } = JSON.parse(raw);
+      const result = markSynced(db, ids);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String(err && err.message || err) }));
+    }
+    return;
+  }
+
+  if (req.method === "GET" && req.url && req.url.startsWith("/provenance")) {
+    try {
+      const url = new URL(req.url, "http://127.0.0.1");
+      const project_id = url.searchParams.get("project_id");
+      if (!project_id) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "missing 'project_id' query parameter" }));
+        return;
+      }
+      const unsynced_only = url.searchParams.get("unsynced_only") === "true";
+      const provenance = listProvenance(db, { project_id, unsynced_only });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ provenance }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: String(err && err.message || err) }));

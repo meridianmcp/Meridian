@@ -46,8 +46,20 @@ and tested, not a work-in-progress snapshot.
     document claim-lease conflict rules, mirroring meridian-docs'
     region-claim model conceptually but fully self-contained (no dependency
     on the Meridian server).
+  - `src/provenance.js` — a durable LOCAL audit trail (same SQLite store) of
+    every edit actually dispatched through `applyEdits`: which project,
+    which node, which field, old/new value, when. Distinct from `claims.js`
+    (a claim is "who's allowed to write right now"; a provenance row is
+    "what was actually written"). Deliberately does NOT call meridian-outputs
+    directly — `server.js` is a headless local Node process with no MCP
+    client of its own, so it can't. Instead it's a pull-based buffer: a
+    `synced_to_meridian_outputs` flag per row lets a LATER agent session (one
+    that genuinely has MCP access) pull unsynced rows and push them into
+    meridian-outputs itself. See "What's real" below for what's built vs.
+    what's still a manual/future step.
   - `src/server.js` — plain Node `http`, no framework. `POST /outline`,
     `POST /claim`, `POST /lease`, `POST /release`, `GET /claims`,
+    `POST /provenance`, `GET /provenance`, `POST /provenance/mark-synced`,
     `GET /extension-version` (for the extension's self-reload poll),
     `GET /health`. See its own header comment for the full contract.
   - `docs/write-back-spec.md` — the original write-back design doc (storage
@@ -177,7 +189,7 @@ and tested, not a work-in-progress snapshot.
   the first half of the README's own former "what's next" item on this
   exact gap.
 
-**Unit-tested (103/103 passing), NOT yet live-verified:**
+**Unit-tested (113/113 passing), NOT yet live-verified:**
 - **A second, independent way to write into a live Overleaf document: a
   direct Socket.IO 0.9.x + OT-protocol client (`src/socketio09/` +
   `src/overleaf-ot-client.js`), talking straight to Overleaf's real-time
@@ -197,6 +209,38 @@ and tested, not a work-in-progress snapshot.
   logically sound and thoroughly tested in isolation, not as proven against
   the real service — the same honesty standard this README already applies
   to every other capability above.
+- **A durable local audit trail of every applied edit (`src/provenance.js`,
+  new `provenance` table in `store.js`'s SQLite schema, `POST /provenance` /
+  `GET /provenance` / `POST /provenance/mark-synced` on `server.js`), wired
+  into `popup.js`'s `applyBatch()`.** Every queued edit's old value is
+  captured at queue time (before the user's typed replacement overwrites the
+  input); after a batch is dispatched and readback-verified, one provenance
+  row is recorded per edit (project, node, field, old/new value, holder,
+  timestamp) — best-effort and non-fatal, so a provenance-write failure can
+  never make a genuinely successful Overleaf edit look like it failed, and
+  never blocks releasing the claim. 10 new unit tests (record/list/mark-
+  synced logic, including a real FK-constraint interaction found and fixed
+  during implementation — see below). **Closes the design question the
+  README used to flag as unresolved** ("engine has no MCP access") by NOT
+  trying to make the engine call meridian-outputs directly: it can't (no MCP
+  client in a headless local Node process), so instead it buffers durably and
+  exposes `synced_to_meridian_outputs`/`GET /provenance?unsynced_only=true`
+  for a LATER agent session — one that genuinely has meridian-outputs access
+  — to pull and push through, then mark synced. **What's NOT done: that sync
+  step itself.** No agent session has yet actually pulled a real batch of
+  provenance rows and pushed them into meridian-outputs' `register_output_paths`/
+  `annotate_outputs`; the bridge exists and is tested on the local-buffer
+  side only. The `popup.js` wiring itself also hasn't been exercised through
+  an actual live click-through (same gap this README already notes for the
+  caption/label editing UI below — `applyBatch()`'s own logic was reasoned
+  through and syntax-checked, not driven end-to-end in a real popup).
+  A real bug caught while building this: SQLite's `REFERENCES` clause in
+  `store.js`'s schema turned out to be genuinely ENFORCED (better-sqlite3
+  defaults `PRAGMA foreign_keys=ON` — confirmed live, `db.pragma("foreign_keys",
+  {simple:true}) === 1`), not merely documentation-only as an earlier draft
+  of this same change assumed; `recordEdit()` calls `ensureProjectRow()`
+  first (mirroring `claims.js`'s `insertClaimRow`) so provenance can still be
+  recorded for a project row that doesn't exist yet, rather than throwing.
 
 **Deliberately not built yet, not silently assumed fine:**
 - **A bare inline/display-math `equation` node (CM6 "mathenv", no

@@ -52,6 +52,34 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 
 CREATE INDEX IF NOT EXISTS idx_claims_project ON claims (project_id, node_id);
+
+-- A durable, local audit trail of every edit actually dispatched through
+-- applyEdits (see provenance.js) -- distinct from Overleaf's own version
+-- history, and distinct from the claims table above (a claim is "who's
+-- allowed to write right now"; a provenance row is "what was actually
+-- written, and when"). This is the engine's OWN ledger, not a live
+-- meridian-outputs record: the engine is a headless local Node process with
+-- no MCP client of its own, so it cannot call meridian-outputs directly (see
+-- provenance.js's header comment). synced_to_meridian_outputs lets a later
+-- agent session pull unsynced rows via GET /provenance and push them into
+-- meridian-outputs itself, then mark them synced -- a pull-based bridge
+-- rather than the engine attempting to push.
+CREATE TABLE IF NOT EXISTS provenance (
+  id                         TEXT PRIMARY KEY,
+  project_id                 TEXT NOT NULL REFERENCES projects(project_id),
+  node_id                    TEXT NOT NULL,
+  kind                       TEXT NOT NULL,
+  field                      TEXT NOT NULL,
+  old_value                  TEXT,
+  new_value                  TEXT NOT NULL,
+  holder_token               TEXT NOT NULL,
+  recorded_at                TEXT NOT NULL,
+  synced_to_meridian_outputs INTEGER NOT NULL DEFAULT 0,
+  synced_at                  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_provenance_project ON provenance (project_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_provenance_unsynced ON provenance (synced_to_meridian_outputs);
 `;
 
 /**

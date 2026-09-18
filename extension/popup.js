@@ -302,6 +302,11 @@ function addEditSection(row, node) {
     input.type = "text";
     input.className = "edit-input";
     input.value = descriptor.get(node);
+    // Captured separately from input.value because by the time this field
+    // gets queued, input.value IS the new value the user typed -- this is
+    // the one place the pre-edit value is still available, for provenance
+    // recording (see toggleQueueNodeEdit/applyBatch).
+    input.dataset.originalValue = descriptor.get(node);
     fieldRow.appendChild(input);
 
     const saveBtn = document.createElement("button");
@@ -954,7 +959,7 @@ function toggleQueueNodeEdit(node, row, input, queueBtn, field) {
     showEditResult(row, "Type a non-empty value first.", "error");
     return;
   }
-  pendingBatch.set(key, { node, field, newValue, row, input, queueBtn });
+  pendingBatch.set(key, { node, field, newValue, oldValue: input.dataset.originalValue, row, input, queueBtn });
   input.disabled = true;
   queueBtn.textContent = "Queued (click to unqueue)";
   queueBtn.classList.add("queued");
@@ -1068,8 +1073,31 @@ async function applyBatch() {
       );
     }
 
-    // Step 5: release every queued node's claim and refresh the outline.
+    // Step 5: record provenance for every queued edit, then release each
+    // node's claim, and refresh the outline. Provenance recording is
+    // best-effort and never fatal here -- the actual write to Overleaf
+    // already succeeded and was readback-verified above; a local audit-log
+    // failure must not make that look like a failed edit, and must not block
+    // releasing the claim (see provenance.js's header comment for why this
+    // is a local ledger, not a live meridian-outputs call).
     for (const { entry } of resolved) {
+      try {
+        await fetch(`${ENGINE_URL}/provenance`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_id: currentProjectId,
+            node_id: entry.node.id,
+            kind: entry.node.kind,
+            field: entry.field,
+            old_value: entry.oldValue,
+            new_value: entry.newValue,
+            holder_token: currentHolderToken,
+          }),
+        });
+      } catch (err) {
+        console.warn("Provenance recording failed (edit itself already succeeded):", err);
+      }
       await fetch(`${ENGINE_URL}/release`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
