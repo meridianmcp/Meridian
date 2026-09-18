@@ -271,8 +271,9 @@ const EDITABLE_FIELDS = {
  * Renders the "edit this node" UI for a node whose claim just succeeded (or
  * was already held by this session on popup reopen) -- one text input per
  * PRESENT editable field (see EDITABLE_FIELDS), each seeded with that
- * field's current value plus its own "Save edit" button, since a claim
- * covers the whole node but caption/label are independently saveable.
+ * field's current value plus its own "Queue edit" button (see
+ * toggleQueueNodeEdit/applyBatch below), since a claim covers the whole
+ * node but caption/label are independently queueable/saveable.
  * Idempotent (checked via `.edit-section`) so it's safe to call from both
  * the fresh-claim path and the already-claimed-on-reopen path. No-ops for a
  * `node.kind` not in EDITABLE_FIELDS, or one whose fields are all absent --
@@ -305,8 +306,8 @@ function addEditSection(row, node) {
 
     const saveBtn = document.createElement("button");
     saveBtn.className = "save-edit-btn";
-    saveBtn.textContent = "Save edit";
-    saveBtn.addEventListener("click", () => saveNodeEdit(node, row, input, saveBtn, descriptor.field));
+    saveBtn.textContent = "Queue edit";
+    saveBtn.addEventListener("click", () => toggleQueueNodeEdit(node, row, input, saveBtn, descriptor.field));
     fieldRow.appendChild(saveBtn);
 
     section.appendChild(fieldRow);
@@ -390,6 +391,19 @@ function renderNodes(nodes, existingClaims) {
 }
 
 async function getOutline() {
+  // A non-empty pendingBatch here means either (a) applyBatch() already
+  // cleared it before calling getOutline() itself (the normal post-apply
+  // refresh -- this is a no-op in that case), or (b) something else
+  // triggered a re-render (manual "Get structural outline" click, a future
+  // auto-refresh) while edits were still queued. renderNodes() below is
+  // about to replace every row's DOM wholesale, which would orphan
+  // pendingBatch's row/input/queueBtn references -- discard rather than
+  // leave a stale, visually-inconsistent "queued" state pointing at
+  // detached elements.
+  if (pendingBatch.size > 0) {
+    pendingBatch.clear();
+    updateBatchBar();
+  }
   setOutline("Reading editor…");
   try {
     const tab = await getActiveOverleafTab();
@@ -846,27 +860,144 @@ async function computeFieldRange(tab, target, nodes, fieldName) {
   return { ok: false, reason: `Editing field "${fieldName}" on kind "${target.kind}" is not supported.` };
 }
 
+// --- Batched multi-node edit (README "what's next": batched transaction,
+// not permanent per-write confirmation; decision 28ebe1f0 design 1) -------
+//
+// Per-field "Queue edit" replaces the old immediate-dispatch "Save edit":
+// queuing several fields (across one or many claimed nodes) accumulates
+// them in `pendingBatch`, and ONE "Apply queued edits" click dispatches
+// every queued edit as a SINGLE CM6 transaction (view.dispatch already
+// accepts an array of ChangeSpecs, applied atomically -- injected.js's
+// applyEdits() has supported this since it was written; this is purely a
+// popup.js orchestration gap being closed, not a new engine/injected.js
+// capability). One confirmation for N edits, matching the intended UX the
+// README's "what's next" section described rather than the
+// validation-phase per-write dialog.
+//
+// `pendingBatch` is keyed by `${node.id}:${field}` so re-clicking "Queue
+// edit" on the same field updates its queued value in place instead of
+// creating a duplicate entry.
+const pendingBatch = new Map();
+
+function batchKey(nodeId, field) {
+  return `${nodeId}:${field}`;
+}
+
+function getBatchBarEl() {
+  return document.getElementById("batch-bar");
+}
+
+/** Re-renders the batch bar's summary/item list from `pendingBatch`'s
+ * current contents, showing/hiding the whole bar based on whether it's
+ * empty. Called after every queue/unqueue/apply/cancel. */
+function updateBatchBar() {
+  const bar = getBatchBarEl();
+  const summary = document.getElementById("batch-bar-summary");
+  const items = document.getElementById("batch-bar-items");
+
+  if (pendingBatch.size === 0) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  summary.textContent = `${pendingBatch.size} edit${pendingBatch.size === 1 ? "" : "s"} queued.`;
+  items.innerHTML = "";
+  for (const [key, entry] of pendingBatch) {
+    const itemRow = document.createElement("div");
+    itemRow.className = "batch-item-row";
+    const label = document.createElement("span");
+    label.textContent = `[${entry.node.kind}] ${entry.field}: "${entry.newValue}"`;
+    itemRow.appendChild(label);
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "batch-item-remove";
+    removeBtn.textContent = "Remove";
+    removeBtn.addEventListener("click", () => unqueueByKey(key));
+    itemRow.appendChild(removeBtn);
+    items.appendChild(itemRow);
+  }
+}
+
+/** Reverts one queued field's row UI back to its pre-queue state (button
+ * re-labeled "Queue edit", input re-enabled) -- shared by the explicit
+ * per-item "Remove" button and by toggling an already-queued field's own
+ * button back off. */
+function resetQueueUi(entry) {
+  entry.input.disabled = false;
+  entry.queueBtn.disabled = false;
+  entry.queueBtn.textContent = "Queue edit";
+  entry.queueBtn.classList.remove("queued");
+}
+
+function unqueueByKey(key) {
+  const entry = pendingBatch.get(key);
+  if (!entry) return;
+  pendingBatch.delete(key);
+  resetQueueUi(entry);
+  updateBatchBar();
+}
+
 /**
- * The real claim -> edit -> write -> release flow for one node (spec
- * points 3-5). `node` is the node object as it stood when the row's edit
- * box was rendered (i.e. at claim time or popup-reopen time) -- it is used
- * only as the LOOKUP KEY (`node.id`) into a fresh re-fetch below; every
- * actual offset/text computation uses the re-fetched, re-matched current
- * node, never anything read earlier. This mirrors the exact same
- * never-trust-a-stale-read discipline injected.js's applyEdits() already
- * applies at the CM6 layer -- this function is the layer above it that
- * re-verifies at the OUTLINE level before ever calling down into that.
+ * Per-field "Queue edit" button handler: queues the field's current input
+ * value (or, if already queued, un-queues it -- a toggle, same button).
+ * Does NOT touch the engine or the live document at all -- purely local
+ * state + UI until "Apply queued edits" runs. Validates non-empty input
+ * the same way the old immediate-save flow did.
  */
-async function saveNodeEdit(node, row, input, saveBtn, fieldName) {
+function toggleQueueNodeEdit(node, row, input, queueBtn, field) {
+  const key = batchKey(node.id, field);
+  if (pendingBatch.has(key)) {
+    unqueueByKey(key);
+    return;
+  }
   const newValue = input.value;
   if (!newValue.trim()) {
     showEditResult(row, "Type a non-empty value first.", "error");
     return;
   }
-
-  saveBtn.disabled = true;
+  pendingBatch.set(key, { node, field, newValue, row, input, queueBtn });
   input.disabled = true;
-  showEditResult(row, "Re-fetching the live outline before writing…");
+  queueBtn.textContent = "Queued (click to unqueue)";
+  queueBtn.classList.add("queued");
+  showEditResult(row, "", "");
+  updateBatchBar();
+}
+
+function showBatchResult(text, cls) {
+  const el = document.getElementById("batch-result");
+  el.hidden = false;
+  el.textContent = text;
+  el.className = cls || "";
+}
+
+function cancelBatch() {
+  for (const entry of pendingBatch.values()) resetQueueUi(entry);
+  pendingBatch.clear();
+  updateBatchBar();
+}
+
+/**
+ * The real claim -> edit -> write -> release flow, now for the WHOLE
+ * queued batch as one atomic operation (spec points 3-5, generalized from
+ * one node to N). Every queued entry's `node` is used only as a LOOKUP KEY
+ * into a SINGLE fresh re-fetch below; every actual offset/text computation
+ * uses that one fresh, re-matched outline, never anything read earlier --
+ * the same never-trust-a-stale-read discipline the old single-edit flow
+ * used, now applied once for the whole batch rather than once per edit.
+ *
+ * All-or-nothing by construction: if ANY queued entry fails to re-match or
+ * fails to locate its field on the live document, the WHOLE batch aborts
+ * before anything is dispatched -- no partial application. This mirrors
+ * injected.js's own applyEdits() contract (reject the whole array on any
+ * single bad edit) one layer up, at the outline-matching level.
+ */
+async function applyBatch() {
+  if (pendingBatch.size === 0) return;
+  const entries = [...pendingBatch.values()];
+  const applyBtn = document.getElementById("batch-apply-btn");
+  const cancelBtn = document.getElementById("batch-cancel-btn");
+  applyBtn.disabled = true;
+  cancelBtn.disabled = true;
+  showBatchResult(`Re-fetching the live outline before writing ${entries.length} edit(s)…`);
 
   try {
     const tab = await getActiveOverleafTab();
@@ -875,8 +1006,7 @@ async function saveNodeEdit(node, row, input, saveBtn, fieldName) {
       throw new Error("No active claim session for this project — re-open the popup and re-claim.");
     }
 
-    // Step 1: re-fetch the live outline fresh -- never the stale one from
-    // whenever the node was claimed (spec point 3).
+    // Step 1: ONE fresh outline re-fetch for the entire batch.
     const text = await getEditorText();
     const res = await fetch(`${ENGINE_URL}/outline`, {
       method: "POST",
@@ -889,63 +1019,75 @@ async function saveNodeEdit(node, row, input, saveBtn, fieldName) {
     }
     const { nodes, matched } = await res.json();
 
-    // Step 2: re-locate the SAME logical node via matchOutlines (already run
-    // server-side by POST /outline above). If its fingerprint id changed,
-    // that's a real signal the node's content moved/changed since it was
-    // claimed -- abort rather than blindly write to whatever now sits at
-    // the old id.
-    const entry = (matched || []).find((m) => m.oldId === node.id);
-    if (!entry) {
-      throw new Error(
-        "This node is no longer present in the live document (it may have been deleted, or the match " +
-          "was lost). Aborting the edit — release this claim and re-check the document.",
-      );
+    // Step 2 + 3: re-locate + compute a range for EVERY queued entry
+    // against that one fresh outline. Any single failure aborts the whole
+    // batch (all-or-nothing) -- named precisely so the user knows which
+    // queued edit to fix or remove, rather than a vague "batch failed".
+    const resolved = [];
+    for (const entry of entries) {
+      const matchEntry = (matched || []).find((m) => m.oldId === entry.node.id);
+      if (!matchEntry) {
+        throw new Error(
+          `[${entry.node.kind}] ${entry.field}: this node is no longer present in the live document ` +
+            "(deleted, or the match was lost). Aborting the whole batch — remove this entry and retry.",
+        );
+      }
+      if (matchEntry.newId !== matchEntry.oldId) {
+        throw new Error(
+          `[${entry.node.kind}] ${entry.field}: this node's content changed since it was claimed ` +
+            `(fingerprint ${matchEntry.oldId} -> ${matchEntry.newId}) — something else edited it. ` +
+            "Aborting the whole batch — remove this entry, release, and re-claim to edit its current state.",
+        );
+      }
+      const range = await computeFieldRange(tab, matchEntry.node, nodes, entry.field);
+      if (!range.ok) {
+        throw new Error(`[${entry.node.kind}] ${entry.field}: ${range.reason}`);
+      }
+      resolved.push({ entry, from: range.from, to: range.to, insert: entry.newValue });
     }
-    if (entry.newId !== entry.oldId) {
-      throw new Error(
-        `This node's content changed since it was claimed (fingerprint ${entry.oldId} -> ${entry.newId}), ` +
-          "meaning something else edited it in the meantime. Aborting to avoid overwriting content that " +
-          "isn't what you saw when you claimed it — release and re-claim to edit its current state.",
-      );
-    }
-    const freshNode = entry.node;
 
-    // Step 3: compute {from, to} for the field, against the CURRENT live
-    // line (never anything read earlier this session).
-    showEditResult(row, `Locating ${fieldName} text on the live line…`);
-    const range = await computeFieldRange(tab, freshNode, nodes, fieldName);
-    if (!range.ok) throw new Error(range.reason);
-
-    // Step 4: dispatch via the existing write-dispatch primitive -- a
-    // single edit; batching multiple simultaneous node edits is deferred,
-    // per the spec, to later work.
-    showEditResult(row, "Dispatching edit…");
-    const applyResp = await applyEditsOnTab(tab, [{ from: range.from, to: range.to, insert: newValue }]);
+    // Step 4: ONE dispatch, all edits as a single CM6 transaction. Sorted
+    // by `from` purely so a human reading applyEdits' own overlap-rejection
+    // error (if the ranges genuinely do overlap) sees them in document
+    // order -- applyEdits' own validation re-sorts internally regardless,
+    // so this has no effect on correctness, only on error readability.
+    resolved.sort((a, b) => a.from - b.from);
+    showBatchResult(`Dispatching ${resolved.length} edit(s) as one transaction…`);
+    const applyResp = await applyEditsOnTab(
+      tab,
+      resolved.map((r) => ({ from: r.from, to: r.to, insert: r.insert })),
+    );
     if (!applyResp.applied) {
       throw new Error(`Write failed: ${applyResp.reason || "unknown reason"}`);
     }
     const verified = Array.isArray(applyResp.verified) ? applyResp.verified : [];
-    if (!(verified.length > 0 && verified.every(Boolean))) {
+    if (!(verified.length === resolved.length && verified.every(Boolean))) {
       throw new Error(
-        "The edit was dispatched but readback verification failed — the live document may not reflect " +
-          "the requested change. Check Overleaf directly before retrying.",
+        "The batch was dispatched but readback verification failed for at least one edit — the live " +
+          "document may not fully reflect the requested changes. Check Overleaf directly before retrying.",
       );
     }
 
-    // Step 5: release the claim and refresh the displayed outline so the
-    // row reflects the newly-committed state.
-    await fetch(`${ENGINE_URL}/release`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: currentProjectId, holder_token: currentHolderToken, node_id: node.id }),
-    });
+    // Step 5: release every queued node's claim and refresh the outline.
+    for (const { entry } of resolved) {
+      await fetch(`${ENGINE_URL}/release`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: currentProjectId,
+          holder_token: currentHolderToken,
+          node_id: entry.node.id,
+        }),
+      });
+    }
 
-    showEditResult(row, "Edit applied and verified. Refreshing outline…", "ok");
+    showBatchResult(`${resolved.length} edit(s) applied and verified. Refreshing outline…`, "ok");
+    pendingBatch.clear();
     await getOutline();
   } catch (err) {
-    showEditResult(row, err.message, "error");
-    saveBtn.disabled = false;
-    input.disabled = false;
+    showBatchResult(err.message, "error");
+    applyBtn.disabled = false;
+    cancelBtn.disabled = false;
   }
 }
 
@@ -1062,4 +1204,6 @@ document.getElementById("refresh").addEventListener("click", check);
 document.getElementById("get-outline").addEventListener("click", getOutline);
 document.getElementById("check-cm6").addEventListener("click", checkCm6Access);
 document.getElementById("apply-test-edit").addEventListener("click", applyTestEdit);
+document.getElementById("batch-apply-btn").addEventListener("click", applyBatch);
+document.getElementById("batch-cancel-btn").addEventListener("click", cancelBatch);
 check();

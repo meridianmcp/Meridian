@@ -33,13 +33,27 @@
       .claim-result.ok { color: #1e7e34; }
       .claim-result.warning { color: #8a6100; }
       .claim-result.error { color: #a12622; }
-      .edit-section { display: flex; gap: 4px; margin-top: 6px; }
+      .edit-field-row { display: flex; gap: 4px; margin-top: 6px; align-items: center; }
+      .edit-field-label { font-size: 11px; color: #555; white-space: nowrap; }
       .edit-input { flex: 1; box-sizing: border-box; padding: 4px; font: 12px ui-monospace, monospace; }
       .save-edit-btn { width: auto; padding: 3px 8px; margin-top: 0; font-size: 12px; }
+      .save-edit-btn.queued { background: #e6f4ea; color: #1e7e34; }
       .edit-result { font-size: 11px; margin-top: 4px; }
       .edit-result.ok { color: #1e7e34; }
       .edit-result.warning { color: #8a6100; }
       .edit-result.error { color: #a12622; }
+      #batch-bar { padding: 8px; border-radius: 6px; background: #eef4ff; margin-top: 8px; }
+      #batch-bar-summary { font-size: 12px; margin-bottom: 6px; }
+      #batch-bar-items { font-size: 11px; margin-bottom: 6px; }
+      .batch-item-row { display: flex; justify-content: space-between; align-items: center; padding: 2px 0; }
+      .batch-item-remove { width: auto; padding: 1px 6px; margin-top: 0; font-size: 11px; }
+      #batch-bar-actions { display: flex; gap: 6px; }
+      #batch-bar-actions button { margin-top: 0; }
+      #batch-apply-btn { background: #1a73e8; color: #fff; }
+      #batch-cancel-btn { background: #f2f2f2; }
+      #batch-result { font-size: 11px; margin-top: 6px; }
+      #batch-result.ok { color: #1e7e34; }
+      #batch-result.error { color: #a12622; }
     </style>
   </head>
   <body>
@@ -49,6 +63,15 @@
     <button id="get-outline">Get structural outline</button>
     <div id="outline" hidden></div>
     <div id="nodes" hidden></div>
+    <div id="batch-bar" hidden>
+      <div id="batch-bar-summary"></div>
+      <div id="batch-bar-items"></div>
+      <div id="batch-bar-actions">
+        <button id="batch-apply-btn">Apply queued edits</button>
+        <button id="batch-cancel-btn">Cancel all</button>
+      </div>
+      <div id="batch-result" hidden></div>
+    </div>
     <button id="check-cm6">Check CM6 access</button>
     <div id="cm6-info" hidden></div>
 

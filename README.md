@@ -137,6 +137,23 @@ and tested, not a work-in-progress snapshot.
 - The extension self-reloads on its own file changes (`chrome.alarms` poll
   against the engine's `/extension-version` hash) — no more manual
   `chrome://extensions` clicks after the one-time bootstrap reload.
+- **Batched multi-node/multi-field edit UI (2026-09-18)**: "Queue edit"
+  replaces the old immediate-dispatch "Save edit" on every editable field
+  — queuing several fields, across one or many claimed nodes, accumulates
+  them; one "Apply queued edits" click dispatches every queued edit as a
+  SINGLE CM6 transaction (`applyEdits` has accepted an edit array since it
+  was written — this closes the `popup.js`-side orchestration gap, not a
+  new engine/`injected.js` capability). All-or-nothing: a fresh outline is
+  re-fetched ONCE right before dispatch, and if ANY queued entry fails to
+  re-match (deleted, or its fingerprint changed since claiming) or fails to
+  locate its field on the live line, the WHOLE batch aborts before
+  anything is dispatched — named by kind+field so the user knows which
+  queued entry to fix or remove, not a vague "batch failed." Verified via
+  a logic-replica test (9/9 checks: correct multi-edit resolution +
+  document-order sorting, and all three all-or-nothing abort paths — see
+  the meridian-build project's pinned decisions for the full log). Closes
+  the first half of the README's own former "what's next" item on this
+  exact gap.
 
 **Deliberately not built yet, not silently assumed fine:**
 - **A bare inline/display-math `equation` node (CM6 "mathenv", no
@@ -150,14 +167,12 @@ and tested, not a work-in-progress snapshot.
   reaches the server (today's malformed-edit tests were all rejected
   client-side, before dispatch — they never exercised that path at all) are
   all still open. Decision `c01875cf` has the full list.
-- **Per-write confirmation is a validation-phase artifact, not the intended
-  design.** The real UX should be a batched multi-edit confirmation (CM6's
-  `dispatch` natively takes an array of changes — one confirmation for N
-  edits) and/or routing through Overleaf's own native track-changes/Review
-  panel (real prior art exists for this exact trick — see decision
-  `28ebe1f0`) instead of a custom per-write dialog. Not implemented yet.
-- **No batched multi-node edit UI** — one node at a time, even though the
-  underlying primitive supports a batch.
+- **Routing through Overleaf's own native track-changes/Review panel**
+  (decision `28ebe1f0`'s design 2, the "meta.tc" trick documented in
+  netique/overleaf-mcp's README) instead of — or as an alternative UX to —
+  the batched-transaction confirmation above. Not investigated or
+  implemented yet; the batched-transaction half of this "what's next" item
+  is done (see above), this half is not.
 - **The new caption/label editing was NOT verified through an actual
   click-through of the popup UI in a live browser** (only through the real
   engine server + a faithful logic replica of popup.js's new functions
