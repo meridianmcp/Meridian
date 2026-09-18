@@ -56,6 +56,28 @@ and tested, not a work-in-progress snapshot.
     implementation review (the whole-doc-lease-vs-scoped-claim symmetry fix)
     and live validation (confirmed-safe write path, batched/track-changes as
     the intended real UX instead of per-write confirmation).
+  - `src/socketio09/` — original (not forked) encode/decode + transport for
+    Overleaf's real-time backend's actual wire protocol: a fork of the
+    legacy, pre-spec Socket.IO 0.9.x framing. Written from protocol facts
+    read out of Overleaf's own open-source server and cross-checked twice
+    against `github.com/overleaf/overleaf`'s real source — not copied from
+    any AGPL-licensed client (see `src/overleaf-ot-client.js`'s own header
+    for why forking one was rejected). `packet.js` is pure encode/decode;
+    `client.js` is the WebSocket transport + heartbeat/ack handling.
+  - `src/overleaf-ot-client.js` — `connectToProject`/`joinDoc`/`applyUpdate`
+    built on `socketio09/`: a direct, no-browser-tab connection to a live
+    Overleaf project's document. `applyUpdate()` deliberately waits for both
+    the ack AND the async `otUpdateApplied`/`otUpdateError` broadcast before
+    resolving (the ack alone doesn't confirm the write landed — confirmed by
+    reading the server's own callback wiring, not assumed).
+    `trackChangesOnForUser()` drives `meta.tc` for routing an edit through
+    Overleaf's native tracked-changes mode.
+  - `src/overleaf-login.js` — the ONLY place in this codebase that ever
+    touches a real Overleaf session cookie. Spawns a dedicated, isolated
+    Chrome profile via CDP, lets a human log in themselves (2FA/SSO/captcha
+    all just work, since it's a real browser window), reads the resulting
+    cookie back. Must be run directly by a human (`node src/overleaf-login.js
+    login`) — never invoked from inside an agent session.
 
 - **`extension/`** — Chrome MV3 extension, loadable unpacked. Self-reloading
   as of 2026-09-17 (see "Running it locally" below) — after the one-time
@@ -155,6 +177,27 @@ and tested, not a work-in-progress snapshot.
   the first half of the README's own former "what's next" item on this
   exact gap.
 
+**Unit-tested (103/103 passing), NOT yet live-verified:**
+- **A second, independent way to write into a live Overleaf document: a
+  direct Socket.IO 0.9.x + OT-protocol client (`src/socketio09/` +
+  `src/overleaf-ot-client.js`), talking straight to Overleaf's real-time
+  backend over WebSocket — no browser tab, no extension, no CM6 DOM
+  involved at all.** This is a different write path from everything above
+  (which all goes through the extension driving a real editor tab); the two
+  are independent, not layered. Every unit not requiring a live server
+  connection is tested and passing (packet framing, transport/heartbeat/ack
+  handling, join/apply-update flow including the ack-vs-`otUpdateApplied`
+  distinction, tracked-changes `meta.tc` wiring) using dependency-injected
+  fakes — no live network or real credentials touched during development.
+  **What's NOT yet confirmed: an actual connection to a real Overleaf
+  project.** That requires a human running `node src/overleaf-login.js
+  login` themselves (see `src/overleaf-login.js` above — an agent session
+  must never do this step) and then exercising `overleaf-ot-client.js`
+  against the resulting cookie. Until that happens, treat this path as
+  logically sound and thoroughly tested in isolation, not as proven against
+  the real service — the same honesty standard this README already applies
+  to every other capability above.
+
 **Deliberately not built yet, not silently assumed fine:**
 - **A bare inline/display-math `equation` node (CM6 "mathenv", no
   environment) still has no editable label** — it has no `label` field in
@@ -221,3 +264,9 @@ mysteriously hanging.
   copy, but concurrency/network-drop/server-desync behavior is still
   untested — treat a real document as higher-stakes than the test project
   until those gaps close.
+- **Running `node src/overleaf-login.js login`** to capture a real Overleaf
+  session cookie, and then confirming `overleaf-ot-client.js` actually
+  connects and joins a real document with it. Hard rule, not a convenience
+  choice: an agent session must never capture, handle, or transmit a real
+  account credential or session cookie itself — this step only ever runs
+  interactively, driven by a human, in a real visible browser window.
