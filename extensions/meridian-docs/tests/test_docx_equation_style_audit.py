@@ -945,6 +945,65 @@ def test_loader_output_matches_independent_recomputation_from_files(name):
     assert docs_intel.JOURNAL_STYLE_PRESETS[name] == expected
 
 
+# ---------------------------------------------------------------------------
+# _load_builtin_journal_style_presets -- fail-closed error paths (adversarial
+# review of docs-intel-journal-preset-externalization-20260918, 2026-09-18).
+# Exercised by calling the loader directly against a fake module `__file__`
+# (monkeypatched) pointed at a tmp_path sibling "journal_style_presets"
+# directory we control -- NOT by mutating the real preset files on disk,
+# so these run safely under xdist/parallel workers with no shared-state
+# cleanup risk.
+# ---------------------------------------------------------------------------
+
+def test_loader_raises_on_missing_presets_directory(tmp_path, monkeypatch):
+    """Path.glob() on a directory that doesn't exist silently yields nothing
+    rather than raising -- without an explicit is_dir() check, a deleted or
+    unpackaged journal_style_presets/ directory would leave
+    JOURNAL_STYLE_PRESETS == {} instead of failing loudly at import time,
+    defeating the loader's own fail-closed design intent."""
+    fake_module_file = tmp_path / "no_presets_dir_here" / "docs_intel.py"
+    monkeypatch.setattr(docs_intel, "__file__", str(fake_module_file))
+    with pytest.raises(ValueError, match="does not exist"):
+        docs_intel._load_builtin_journal_style_presets()
+
+
+def test_loader_raises_on_empty_presets_directory(tmp_path, monkeypatch):
+    """An existing-but-empty journal_style_presets/ directory (e.g. a
+    packaging step that created the directory but failed to include any
+    *.json files) must also fail closed, not silently resolve to zero
+    presets."""
+    (tmp_path / "journal_style_presets").mkdir()
+    fake_module_file = tmp_path / "docs_intel.py"
+    monkeypatch.setattr(docs_intel, "__file__", str(fake_module_file))
+    with pytest.raises(ValueError, match="no \\*\\.json files"):
+        docs_intel._load_builtin_journal_style_presets()
+
+
+def test_loader_raises_on_field_entry_missing_value_key(tmp_path, monkeypatch):
+    """A field entry that isn't a JSON object with a "value" key (e.g. a
+    hand-edit that dropped "value") must raise the documented ValueError
+    contract, not an undocumented bare KeyError/TypeError leaking out of a
+    dict comprehension."""
+    presets_dir = tmp_path / "journal_style_presets"
+    presets_dir.mkdir()
+    (presets_dir / "default.json").write_text(
+        json.dumps({"meta": {"journal": "default"}, "fields": {}}), encoding="utf-8"
+    )
+    (presets_dir / "broken.json").write_text(
+        json.dumps(
+            {
+                "meta": {"journal": "broken"},
+                "fields": {"citation_style": {"tier": 2}},  # no "value" key
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_module_file = tmp_path / "docs_intel.py"
+    monkeypatch.setattr(docs_intel, "__file__", str(fake_module_file))
+    with pytest.raises(ValueError, match="must be a JSON object with a 'value' key"):
+        docs_intel._load_builtin_journal_style_presets()
+
+
 def test_journal_style_presets_matches_pre_migration_snapshot():
     """THE parity check (docs-intel-journal-preset-externalization-20260918):
     tests/data/journal_style_presets_pre_migration_snapshot.json is a frozen

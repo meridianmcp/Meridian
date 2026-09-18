@@ -8996,14 +8996,34 @@ def _load_builtin_journal_style_presets() -> dict[str, dict[str, Any]]:
       stem (e.g. ``journal_style_presets/jcshm.json`` -> key ``"jcshm"``).
 
     Raises:
-      ValueError: a preset file isn't valid JSON, isn't a JSON object with
-        ``"meta"``/``"fields"`` keys, or a field's ``"value"`` fails
-        :func:`resolve_style_policy` validation (unknown style-policy key or
-        an invalid value for a known one).
+      ValueError: the ``journal_style_presets/`` directory is missing or
+        empty (see the reviewer-caught-gap comment on the directory check
+        below -- ``Path.glob()`` on a missing directory silently yields
+        nothing, which would otherwise leave :data:`JOURNAL_STYLE_PRESETS`
+        empty instead of failing loudly); a preset file isn't valid JSON,
+        isn't a JSON object with ``"meta"``/``"fields"`` keys; a field entry
+        isn't a JSON object with a ``"value"`` key; or a field's ``"value"``
+        fails :func:`resolve_style_policy` validation (unknown style-policy
+        key or an invalid value for a known one).
     """
     presets_dir = Path(__file__).parent / "journal_style_presets"
     presets: dict[str, dict[str, Any]] = {}
     provenance: dict[str, dict[str, Any]] = {}
+
+    # Reviewer-caught gap (docs-intel-journal-preset-externalization-20260918
+    # adversarial review): Path.glob() on a MISSING directory silently
+    # returns an empty iterator rather than raising -- without this check,
+    # a deleted/renamed/not-packaged journal_style_presets/ directory would
+    # make the whole built-in catalog silently empty (JOURNAL_STYLE_PRESETS
+    # == {}) instead of failing loudly, defeating this loader's own stated
+    # fail-closed intent. "default" is always expected to exist, so treat
+    # zero files found the same as a missing directory.
+    if not presets_dir.is_dir():
+        raise ValueError(
+            f"journal style preset directory {presets_dir} does not exist "
+            "(or is not a directory) -- expected one *.json file per "
+            "built-in preset (at least 'default.json')"
+        )
 
     for file_path in sorted(presets_dir.glob("*.json")):
         key = file_path.stem
@@ -9027,11 +9047,24 @@ def _load_builtin_journal_style_presets() -> dict[str, dict[str, Any]]:
                 f"journal style preset file {file_path}: 'fields' must be a JSON object"
             )
 
-        overrides = {name: entry["value"] for name, entry in fields.items()}
+        overrides = {}
+        for field_name, entry in fields.items():
+            if not isinstance(entry, dict) or "value" not in entry:
+                raise ValueError(
+                    f"journal style preset file {file_path}: field {field_name!r} "
+                    "must be a JSON object with a 'value' key"
+                )
+            overrides[field_name] = entry["value"]
         # Fail-closed: an invalid value in ANY one preset file blocks the
         # whole module from importing (see docstring above).
         presets[key] = resolve_style_policy(overrides)
         provenance[key] = {"journal": key, "meta": data["meta"], "fields": fields}
+
+    if not presets:
+        raise ValueError(
+            f"journal style preset directory {presets_dir} exists but contains "
+            "no *.json files -- expected at least 'default.json'"
+        )
 
     _JOURNAL_STYLE_PRESET_PROVENANCE.clear()
     _JOURNAL_STYLE_PRESET_PROVENANCE.update(provenance)
