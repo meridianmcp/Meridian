@@ -18,6 +18,7 @@ from unittest import mock
 
 import pytest
 
+import meridian
 from meridian import tray_main
 
 
@@ -161,7 +162,23 @@ def test_main_run_server_flag_dispatches_to_meridian_entry_and_sets_frozen_mode(
         return 0
 
     fake_entry.main = _fake_main
+    # Patch BOTH sys.modules and the real `meridian` package's own
+    # `__main__` attribute. `from . import __main__` (tray_main.main's
+    # dispatch) resolves via attribute lookup on the already-imported
+    # `meridian` package object FIRST (CPython's `_handle_fromlist`) and
+    # only falls back to sys.modules if that attribute is not yet set --
+    # so if any earlier-running test in this process (or this xdist worker)
+    # already did a real `import meridian.__main__`, patching sys.modules
+    # alone silently does nothing and this test's dispatch call falls
+    # through to the REAL entry point, which starts a real, indefinitely
+    # -running Uvicorn server inside the test process (confirmed live: this
+    # is exactly what caused CI's tray-installer test runs to hang at ~99%
+    # instead of finishing -- reproduced locally by importing
+    # meridian.__main__ for real before running this test with only the
+    # sys.modules patch). Same class of hazard the tkinter dialog tests
+    # below already guard against via `fake_tkinter.messagebox = ...`.
     monkeypatch.setitem(sys.modules, "meridian.__main__", fake_entry)
+    monkeypatch.setattr(meridian, "__main__", fake_entry, raising=False)
 
     rc = tray_main.main(["--run-server"])
     assert rc == 0
