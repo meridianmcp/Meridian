@@ -9,11 +9,14 @@
   },
   "scripts": {
     "outline": "node src/cli.js outline",
-    "test": "node --test src/"
+    "test": "node --test \"src/**/*.test.js\""
   },
   "dependencies": {
     "@unified-latex/unified-latex-types": "^1.8.4",
     "@unified-latex/unified-latex-util-parse": "^1.8.4",
-    "better-sqlite3": "^13.0.3"
+    "better-sqlite3": "^13.0.3",
+    "chrome-launcher": "^1.2.1",
+    "chrome-remote-interface": "^0.34.0",
+    "ws": "^8.21.3"
   }
 }
