@@ -101,6 +101,22 @@ function setOutline(text, cls) {
   el.className = cls || "";
 }
 
+/**
+ * Reads the FULL live document text via CM6's own `state.doc` model
+ * (MERIDIAN_LATEX_GET_FULL_TEXT -> content_script.js's
+ * getFullTextViaMainWorld -> injected.js's getFullText()) -- NOT the older
+ * MERIDIAN_LATEX_GET_TEXT/readEditorText() DOM scrape, which silently
+ * returns only whatever lines Overleaf's CM6 currently has rendered.
+ * Real bug found live, 2026-09-18: CM6 virtualizes `.cm-content`'s
+ * `.cm-line` children -- a real 405-line/69756-char manuscript had only 17
+ * lines actually in the DOM at the time, so every outline extraction this
+ * function feeds (getOutline(), saveNodeEdit()'s re-fetch) was silently
+ * scoped to whatever happened to be scrolled into view, with no error or
+ * truncation signal. This is the one and only place `getOutline()`/
+ * `saveNodeEdit()` get "the document text" from, so fixing it here fixes
+ * outline extraction for every node kind, not just the ones this pass
+ * adds editing for.
+ */
 function getEditorText() {
   return new Promise((resolve, reject) => {
     chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
@@ -108,9 +124,15 @@ function getEditorText() {
         reject(new Error("Not on an Overleaf project page."));
         return;
       }
-      chrome.tabs.sendMessage(tab.id, { type: "MERIDIAN_LATEX_GET_TEXT" }, (resp) => {
-        if (chrome.runtime.lastError || !resp || resp.text == null) {
-          reject(new Error("Could not read editor text — try reloading the Overleaf tab."));
+      chrome.tabs.sendMessage(tab.id, { type: "MERIDIAN_LATEX_GET_FULL_TEXT" }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.found || resp.text == null) {
+          reject(
+            new Error(
+              `Could not read the full editor text: ${
+                (resp && resp.reason) || "no response from content script — try reloading the Overleaf tab."
+              }`,
+            ),
+          );
           return;
         }
         resolve(resp.text);
@@ -190,12 +212,18 @@ function addReleaseButton(row, nodeId) {
 }
 
 /**
- * The editable field for each supported node kind, and how to read its
- * CURRENT value off a node object. Only `heading` (title) and `citation`
- * (key) are wired up for real editing -- see saveNodeEdit()'s module-level
- * comment for why `table`/`figure` captions and `equation` labels are not.
- * A kind with no entry here just keeps the claim-only UI (claim/release,
- * no edit box) -- see addEditSection() below.
+ * The editable field(s) for each supported node kind, and how to read a
+ * field's CURRENT value off a node object. A kind maps to an ARRAY of field
+ * descriptors -- `heading`/`citation` each have exactly one, but
+ * `table`/`figure` can have BOTH a caption and a label independently
+ * editable (a node is claimed once; either or both of its fields can then be
+ * edited under that one claim). `present(node)` gates whether the field
+ * actually exists to edit right now -- per this pass's own scope (see
+ * saveNodeEdit()'s module-level comment), INSERTING a caption/label that
+ * doesn't exist yet is a fundamentally different, riskier operation than
+ * replacing one that's already there, so a node with no caption/label simply
+ * shows no edit box for that field, same as a kind with no entry here at
+ * all keeps the claim-only UI (claim/release, no edit box).
  */
 const EDITABLE_FIELDS = {
   // outline.js's title extraction includes a leading "*" for a starred
@@ -210,38 +238,79 @@ const EDITABLE_FIELDS = {
   // into the paper's actual heading text, which is wrong output, not a
   // safety issue, but real and worth preventing at the source rather than
   // documenting as a known gotcha.
-  heading: (node) => (node.title && node.title.startsWith("*") ? node.title.slice(1) : node.title),
-  citation: (node) => node.key,
+  heading: [
+    {
+      field: "title",
+      label: "Title",
+      get: (node) => (node.title && node.title.startsWith("*") ? node.title.slice(1) : node.title),
+      present: () => true,
+    },
+  ],
+  citation: [{ field: "key", label: "Key", get: (node) => node.key, present: () => true }],
+  // table/figure: caption and label, each present only when the outline
+  // already extracted one (see outline.js's captionLine/labelLine -- both
+  // null when the field itself doesn't exist on this node).
+  table: [
+    { field: "caption", label: "Caption", get: (node) => node.caption, present: (node) => node.captionLine != null },
+    { field: "label", label: "Label", get: (node) => node.label, present: (node) => node.labelLine != null },
+  ],
+  figure: [
+    { field: "caption", label: "Caption", get: (node) => node.caption, present: (node) => node.captionLine != null },
+    { field: "label", label: "Label", get: (node) => node.label, present: (node) => node.labelLine != null },
+  ],
+  // A bare inline/display-math "mathenv" equation has no label field at all
+  // in the outline data (see outline.js) -- only the environment-shaped
+  // kinds (\begin{equation}, \begin{align}, ...) ever have one, and
+  // `present` already gates on labelLine existing, so a labelless equation
+  // node simply shows no edit box, same as any other kind with nothing to
+  // edit yet.
+  equation: [{ field: "label", label: "Label", get: (node) => node.label, present: (node) => node.labelLine != null }],
 };
 
 /**
  * Renders the "edit this node" UI for a node whose claim just succeeded (or
- * was already held by this session on popup reopen) -- a text input seeded
- * with the field's current value plus a "Save edit" button. Idempotent
- * (checked via `.edit-section`) so it's safe to call from both the
- * fresh-claim path and the already-claimed-on-reopen path. No-ops for a
- * `node.kind` not in EDITABLE_FIELDS -- that node's row just keeps showing
- * claim state with no edit control, per the scope decision above.
+ * was already held by this session on popup reopen) -- one text input per
+ * PRESENT editable field (see EDITABLE_FIELDS), each seeded with that
+ * field's current value plus its own "Save edit" button, since a claim
+ * covers the whole node but caption/label are independently saveable.
+ * Idempotent (checked via `.edit-section`) so it's safe to call from both
+ * the fresh-claim path and the already-claimed-on-reopen path. No-ops for a
+ * `node.kind` not in EDITABLE_FIELDS, or one whose fields are all absent --
+ * that node's row just keeps showing claim state with no edit control.
  */
 function addEditSection(row, node) {
-  const getField = EDITABLE_FIELDS[node.kind];
-  if (!getField) return;
+  const descriptors = (EDITABLE_FIELDS[node.kind] || []).filter((d) => d.present(node));
+  if (descriptors.length === 0) return;
   if (row.querySelector(".edit-section")) return;
 
   const section = document.createElement("div");
   section.className = "edit-section";
 
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "edit-input";
-  input.value = getField(node);
-  section.appendChild(input);
+  for (const descriptor of descriptors) {
+    const fieldRow = document.createElement("div");
+    fieldRow.className = "edit-field-row";
 
-  const saveBtn = document.createElement("button");
-  saveBtn.className = "save-edit-btn";
-  saveBtn.textContent = "Save edit";
-  saveBtn.addEventListener("click", () => saveNodeEdit(node, row, input, saveBtn));
-  section.appendChild(saveBtn);
+    if (descriptors.length > 1) {
+      const fieldLabel = document.createElement("span");
+      fieldLabel.className = "edit-field-label";
+      fieldLabel.textContent = `${descriptor.label}: `;
+      fieldRow.appendChild(fieldLabel);
+    }
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "edit-input";
+    input.value = descriptor.get(node);
+    fieldRow.appendChild(input);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "save-edit-btn";
+    saveBtn.textContent = "Save edit";
+    saveBtn.addEventListener("click", () => saveNodeEdit(node, row, input, saveBtn, descriptor.field));
+    fieldRow.appendChild(saveBtn);
+
+    section.appendChild(fieldRow);
+  }
 
   row.appendChild(section);
 }
@@ -277,13 +346,12 @@ async function claimNodeById(node, row) {
 /**
  * Renders one row per structural node with a "Claim to edit" button.
  *
- * A claimed node whose kind is in EDITABLE_FIELDS (heading, citation) also
- * gets a real edit box (see addEditSection()/saveNodeEdit()) -- the
- * paragraph/section text round-trip write-back-spec.md's section 4/5
- * originally scoped out as separate follow-on work. Other kinds
- * (table/figure/equation) still just show claim state and a Release button,
- * same as before -- see saveNodeEdit()'s comment for why those were left out
- * of this pass.
+ * A claimed node whose kind is in EDITABLE_FIELDS (heading, citation,
+ * table, figure, equation) also gets a real edit box per present field --
+ * see addEditSection()/saveNodeEdit(). A node whose kind has no entry, or
+ * whose fields are all absent (e.g. a table with neither caption nor
+ * label), still just shows claim state and a Release button with no edit
+ * control.
  */
 function renderNodes(nodes, existingClaims) {
   const container = document.getElementById("nodes");
@@ -384,29 +452,32 @@ async function getOutline() {
 // trusted -- it now exists (claim/release are live above) so this wires the
 // actual text round-trip on top of it.
 //
-// Only `heading` (title) and `citation` (key) are wired up for real
+// `heading` (title), `citation` (key), `table`/`figure` (caption and/or
+// label), and equation-like environments (label) are all wired up for real
 // editing -- see EDITABLE_FIELDS above and computeFieldRange()'s per-kind
-// comments below for why `table`/`figure` captions and `equation` labels
-// were left out of this pass rather than handled unreliably:
-//  - A caption/label can appear anywhere inside a node's `line`..`end_line`
-//    span (which can cover many lines for a table/figure), so locating "the"
-//    \caption{}/\label{} reliably needs a multi-line scan that risks
-//    matching a NESTED environment's own caption/label (e.g. a `tabular`
-//    inside a `table` float -- see engine/README.md's note on why those are
-//    now separate nodes) instead of the intended one.
-//  - A bare inline/display-math `equation` node (CM6 "mathenv", no
-//    environment) has no `label` field in the outline data at all -- adding
-//    one would mean INSERTING new `\label{...}` syntax, a fundamentally
-//    different (and riskier) operation than replacing an existing field's
-//    text, which is genuinely out of scope for this pass per the task's own
-//    framing ("editing the addressable field(s) already in the node's own
-//    outline data").
-// Both `heading` and `citation` fields, by contrast, are guaranteed to
-// already exist as plain text inside a single known line whenever the node
-// itself exists (a heading's `title` comes straight from its own
-// `\level{...}` argument; a citation's `key` from its own `\cite{...}`
-// argument) -- the two cases this pass handles well rather than everything
-// unreliably.
+// dispatch below.
+//
+// The caption/label case needed one real fix first, not just new wiring:
+// a caption/label can sit anywhere inside a node's `line`..`end_line` span
+// (which can cover many lines for a table/figure), and naively scanning
+// that whole span risks matching a NESTED environment's own caption/label
+// (e.g. a `tabular` float's own caption inside an outer `table` -- see
+// engine/README.md's note on why those are now separate nodes) instead of
+// the intended one. The fix lives engine-side: outline.js's
+// `findFirstMacroInOwnScope` stops at a nested structural boundary instead
+// of recursing through it, and each node now carries its OWN field's exact
+// source line (`captionLine`/`labelLine`) computed from that scoped search
+// -- so this file only ever reads and edits the ONE line the engine already
+// resolved unambiguously, the same safe single-line pattern heading/
+// citation editing already used.
+//
+// A bare inline/display-math `equation` node (CM6 "mathenv", no
+// environment) still has no `label` field in the outline data at all --
+// EDITABLE_FIELDS' `present` check gates on `labelLine != null`, so that
+// node kind simply shows no edit box, same as any other absent field.
+// INSERTING a caption/label that doesn't exist yet is a fundamentally
+// different (and riskier) operation than replacing one that's already
+// there, and stays out of scope for this pass.
 
 function showEditResult(row, text, cls) {
   let el = row.querySelector(".edit-result");
@@ -655,29 +726,124 @@ function locateCitationRange(lineInfo, target, siblings) {
   return { ok: true, from: lineInfo.from + seg.start, to: lineInfo.from + seg.end };
 }
 
-/**
- * Resolves `target` (a freshly re-matched node -- see saveNodeEdit) down to
- * an absolute `{from, to}` document offset for its editable field, by
- * reading the CURRENT live line via getLineInfo() and locating the field
- * within it. `nodes` is the full fresh outline array (needed to compute
- * `target`'s siblings-on-this-line for occurrence disambiguation). Returns
- * `{ok: true, from, to}` or `{ok: false, reason}`.
+/** Every node in `nodes` whose OWN `lineField` (e.g. "captionLine") equals
+ * `target`'s -- the caption/label analogue of `siblingsOnLine` above, used
+ * to disambiguate which occurrence on that line is this specific node's
+ * field when more than one node's same-named field happens to land on the
+ * identical physical source line (rare, but the same paranoia the heading/
+ * citation paths already apply). `null`-valued fields never match (both
+ * `siblingsOnLine`'s heading/citation `line` and this one exclude a node
+ * with no line for the field in question -- see EDITABLE_FIELDS' `present`
+ * gate, which already ensures `target[lineField]` itself is non-null here).
  */
-async function computeFieldRange(tab, target, nodes) {
-  if (target.line == null) {
-    return { ok: false, reason: "This node has no line number in the current outline data." };
+function siblingsOnFieldLine(nodes, target, lineField) {
+  return nodes.filter((n) => n[lineField] != null && n[lineField] === target[lineField]);
+}
+
+/** Computes `{from, to}` (line-relative) for a table/figure node's caption,
+ * or an equation-like node's label -- shared by locateCaptionRange and
+ * locateLabelRange below, parameterized by which macro/line-field/node
+ * property to use. Same occurrence-COUNT safety net as
+ * locateHeadingRange/locateCitationRange: if the number of `\macroName{`
+ * occurrences found scanning the live line doesn't match the number of
+ * outline nodes that claim that exact line for this field, abort rather
+ * than guess. Unlike the heading case (which tolerates a rendered/raw text
+ * mismatch for legitimate nested-macro reasons) this hard-aborts on a text
+ * mismatch too, same as citation -- a caption/label field found via a
+ * SCOPED search (findFirstMacroInOwnScope, engine-side) has no legitimate
+ * reason to render differently from its raw source at the specific
+ * occurrence this function locates. */
+function locateCaptionOrLabelRange(lineInfo, target, nodes, { lineField, nodeProp, macroName }) {
+  const siblings = siblingsOnFieldLine(nodes, target, lineField);
+  const idx = siblings.findIndex((n) => n.id === target.id);
+  if (idx === -1) {
+    return { ok: false, reason: "Internal error: node not found among its own field-line siblings." };
   }
-  const lineInfo = await getLineInfo(tab, target.line);
-  if (!lineInfo.found) {
+  const occurrences = findAllBraceArgs(lineInfo.text, `\\${macroName}{`);
+  if (occurrences.length !== siblings.length) {
     return {
       ok: false,
-      reason: `Could not read line ${target.line} from the live document: ${lineInfo.reason || "unknown reason"}`,
+      reason:
+        `${macroName} count mismatch on line ${target[lineField]}: the outline reports ${siblings.length} ` +
+        `node(s) with a ${macroName} there, but ${occurrences.length} "\\${macroName}{" occurrence(s) were ` +
+        `found scanning the live line text. Aborting edit for safety.`,
     };
   }
-  const siblings = siblingsOnLine(nodes, target);
-  if (target.kind === "heading") return locateHeadingRange(lineInfo, target, siblings);
-  if (target.kind === "citation") return locateCitationRange(lineInfo, target, siblings);
-  return { ok: false, reason: `Editing kind "${target.kind}" is not supported.` };
+  const occ = occurrences[idx];
+  const found = lineInfo.text.slice(occ.start, occ.end);
+  if (found !== target[nodeProp]) {
+    return {
+      ok: false,
+      reason:
+        `${macroName} text mismatch at position ${idx} on line ${target[lineField]}: expected ` +
+        `"${target[nodeProp]}", found "${found}" in the live document. Aborting edit for safety.`,
+    };
+  }
+  return { ok: true, from: lineInfo.from + occ.start, to: lineInfo.from + occ.end };
+}
+
+function locateCaptionRange(lineInfo, target, nodes) {
+  return locateCaptionOrLabelRange(lineInfo, target, nodes, {
+    lineField: "captionLine",
+    nodeProp: "caption",
+    macroName: "caption",
+  });
+}
+
+function locateLabelRange(lineInfo, target, nodes) {
+  return locateCaptionOrLabelRange(lineInfo, target, nodes, {
+    lineField: "labelLine",
+    nodeProp: "label",
+    macroName: "label",
+  });
+}
+
+/**
+ * Resolves `target` (a freshly re-matched node -- see saveNodeEdit) down to
+ * an absolute `{from, to}` document offset for ONE of its editable fields
+ * (`fieldName`, e.g. "title"/"key"/"caption"/"label"), by reading the
+ * CURRENT live line the field itself sits on (its own captionLine/labelLine
+ * for table/figure/equation, or the node's own `line` for heading/citation)
+ * via getLineInfo() and locating the field within it. `nodes` is the full
+ * fresh outline array (needed to compute `target`'s siblings for occurrence
+ * disambiguation). Returns `{ok: true, from, to}` or `{ok: false, reason}`.
+ */
+async function computeFieldRange(tab, target, nodes, fieldName) {
+  if (target.kind === "heading" || target.kind === "citation") {
+    if (target.line == null) {
+      return { ok: false, reason: "This node has no line number in the current outline data." };
+    }
+    const lineInfo = await getLineInfo(tab, target.line);
+    if (!lineInfo.found) {
+      return {
+        ok: false,
+        reason: `Could not read line ${target.line} from the live document: ${lineInfo.reason || "unknown reason"}`,
+      };
+    }
+    const siblings = siblingsOnLine(nodes, target);
+    if (target.kind === "heading") return locateHeadingRange(lineInfo, target, siblings);
+    return locateCitationRange(lineInfo, target, siblings);
+  }
+
+  if (fieldName === "caption" || fieldName === "label") {
+    const lineField = fieldName === "caption" ? "captionLine" : "labelLine";
+    const fieldLine = target[lineField];
+    if (fieldLine == null) {
+      return { ok: false, reason: `This node has no ${fieldName} in the current outline data.` };
+    }
+    const lineInfo = await getLineInfo(tab, fieldLine);
+    if (!lineInfo.found) {
+      return {
+        ok: false,
+        reason: `Could not read line ${fieldLine} from the live document: ${lineInfo.reason || "unknown reason"}`,
+      };
+    }
+    return fieldName === "caption"
+      ? locateCaptionRange(lineInfo, target, nodes)
+      : locateLabelRange(lineInfo, target, nodes);
+  }
+
+  return { ok: false, reason: `Editing field "${fieldName}" on kind "${target.kind}" is not supported.` };
 }
 
 /**
@@ -691,7 +857,7 @@ async function computeFieldRange(tab, target, nodes) {
  * applies at the CM6 layer -- this function is the layer above it that
  * re-verifies at the OUTLINE level before ever calling down into that.
  */
-async function saveNodeEdit(node, row, input, saveBtn) {
+async function saveNodeEdit(node, row, input, saveBtn, fieldName) {
   const newValue = input.value;
   if (!newValue.trim()) {
     showEditResult(row, "Type a non-empty value first.", "error");
@@ -746,8 +912,8 @@ async function saveNodeEdit(node, row, input, saveBtn) {
 
     // Step 3: compute {from, to} for the field, against the CURRENT live
     // line (never anything read earlier this session).
-    showEditResult(row, "Locating field text on the live line…");
-    const range = await computeFieldRange(tab, freshNode, nodes);
+    showEditResult(row, `Locating ${fieldName} text on the live line…`);
+    const range = await computeFieldRange(tab, freshNode, nodes, fieldName);
     if (!range.ok) throw new Error(range.reason);
 
     // Step 4: dispatch via the existing write-dispatch primitive -- a

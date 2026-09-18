@@ -91,29 +91,59 @@ and tested, not a work-in-progress snapshot.
   working against a real live Overleaf document (see decision `c01875cf`
   for the full test log — clean insert, clean revert, both malformed-batch
   rejection cases tested and confirmed non-destructive).
-- The full claim→edit→write→release flow, for **`heading` titles and
-  `citation` keys only** (see below for why those two and not the other
-  three kinds). Live-tested against the real dnabert manuscript, including
-  the hard case: disambiguating between multiple citations of the *same key*
-  repeated on one line — confirmed it edits the correct occurrence and
-  leaves siblings untouched.
-- One real bug found and fixed via that live testing, not hypothetically:
-  the heading matcher originally only recognized `\section{...}`, but PLOS's
-  own unnumbered-heading convention is `\section*{...}` — and *every single
-  heading in the real manuscript* (25/25) is starred. It failed safely every
-  time (the occurrence-count check correctly aborted rather than writing
-  anything wrong) but was completely non-functional until fixed. Now
-  star-tolerant, live-reconfirmed.
+- The full claim→edit→write→release flow, for **`heading` titles,
+  `citation` keys, and — new, 2026-09-18 — `table`/`figure` captions and
+  any environment-shaped equation's (`equation`, `align`, ...) label.**
+  Engine-side fix that made the last three safe to add: `outline.js`'s
+  caption/label extraction now stops at a nested structural boundary
+  (`findFirstMacroInOwnScope`) instead of recursing through it, so a
+  `tabular` float's own caption inside an outer `table` is never
+  misattributed to the outer node — the exact ambiguity this section used
+  to cite as the reason those three fields were left unbuilt. Each node now
+  also carries its field's own exact source line (`captionLine`/
+  `labelLine`), so the extension only ever reads and edits the ONE line the
+  engine already resolved unambiguously — the same safe single-line pattern
+  heading/citation editing already used. Live-tested against the real
+  running engine server (a real nested-tabular-inside-table document, both
+  captions/labels extracted independently and correctly) and against a
+  faithful replica of `popup.js`'s new locate functions using that real
+  engine output (correct extraction, correct post-edit text, correct
+  concurrent-edit-abort behavior) — see the 2026-09-18 pinned decision for
+  the full log and for what remains open (see below).
+- **A real, more fundamental bug found live during that same pass, in the
+  ALREADY-shipped code, not the new work**: Overleaf's CM6 editor
+  virtualizes `.cm-content`'s rendered `.cm-line` children — only lines
+  near the current scroll position actually exist in the DOM (confirmed
+  live: a real 405-line/69756-char manuscript had only 17 lines rendered).
+  `content_script.js`'s original `readEditorText()` (a `.cm-content
+  .cm-line` DOM-text-join) silently returned ONLY that virtualized subset
+  with no error or truncation signal — meaning `getOutline()`'s `/outline`
+  POST (and thus the ENTIRE claim/edit/write/release flow, for every node
+  kind including headings/citations) was silently scoped to whatever
+  happened to be scrolled into view, not the real document. Fixed by adding
+  a new `getFullText()` primitive to `injected.js` that reads CM6's actual
+  `state.doc` model (never the DOM, exactly like `applyEdits`/`getLineInfo`
+  already do on the write side) and rewiring `popup.js`'s `getEditorText()`
+  to use it. Live-confirmed: the new path returns the full 69756/405 real
+  document, matching `getDocInfo()`'s own ground truth exactly.
+- One real bug found and fixed via live testing (Phase 1), not
+  hypothetically: the heading matcher originally only recognized
+  `\section{...}`, but PLOS's own unnumbered-heading convention is
+  `\section*{...}` — and *every single heading in the real manuscript*
+  (25/25) is starred. It failed safely every time (the occurrence-count
+  check correctly aborted rather than writing anything wrong) but was
+  completely non-functional until fixed. Now star-tolerant,
+  live-reconfirmed.
 - The extension self-reloads on its own file changes (`chrome.alarms` poll
   against the engine's `/extension-version` hash) — no more manual
   `chrome://extensions` clicks after the one-time bootstrap reload.
 
 **Deliberately not built yet, not silently assumed fine:**
-- **`table`/`figure` captions and `equation` labels are not editable.**
-  Locating a caption/label safely needs a multi-line scan that risks
-  matching a *nested* environment's own caption (e.g. a `tabular` inside a
-  `table` float) instead of the intended one — narrower-but-correct (headings
-  and citations) was chosen over broader-but-unreliable for this pass.
+- **A bare inline/display-math `equation` node (CM6 "mathenv", no
+  environment) still has no editable label** — it has no `label` field in
+  the outline data at all, and INSERTING new `\label{...}` syntax is a
+  fundamentally different (and riskier) operation than replacing an
+  existing field's text, out of scope for this pass same as before.
 - **Concurrency and failure-mode testing.** Two tabs editing the same
   document simultaneously, a mid-edit network drop/reconnect, and Overleaf's
   own server-side "out of sync" recovery under a genuinely malformed op that
@@ -128,6 +158,20 @@ and tested, not a work-in-progress snapshot.
   `28ebe1f0`) instead of a custom per-write dialog. Not implemented yet.
 - **No batched multi-node edit UI** — one node at a time, even though the
   underlying primitive supports a batch.
+- **The new caption/label editing was NOT verified through an actual
+  click-through of the popup UI in a live browser** (only through the real
+  engine server + a faithful logic replica of popup.js's new functions
+  against real engine output — see above). Browser automation in this pass
+  could reach the real Overleaf tab and drive injected.js directly (proving
+  the outline/getFullText fixes genuinely live), but could not reach
+  `chrome-extension://`/`chrome://extensions` pages (a known, pre-existing
+  constraint — see `extension/background.js`'s own comment) to drive
+  `popup.html` itself, and the browser window became unresponsive
+  mid-session before a manual-style click-through could be substituted.
+  Treat this specific gap as higher-priority to close (a real click-through
+  by a human, or a future session with working GUI access) than the
+  concurrency/failure-mode items above, precisely because it's the one
+  piece this pass could not exercise end-to-end itself.
 
 ## Running it locally
 

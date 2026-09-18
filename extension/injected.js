@@ -41,6 +41,8 @@
   const APPLY_EDITS_RESPONSE_TYPE = "meridian-latex-apply-edits-result";
   const LINE_INFO_REQUEST_TYPE = "meridian-latex-get-line-info";
   const LINE_INFO_RESPONSE_TYPE = "meridian-latex-line-info-result";
+  const FULL_TEXT_REQUEST_TYPE = "meridian-latex-get-full-text";
+  const FULL_TEXT_RESPONSE_TYPE = "meridian-latex-full-text-result";
   const RESPONSE_SOURCE = "meridian-latex-injected";
 
   /**
@@ -131,6 +133,39 @@
       return {
         found: false,
         reason: `Unexpected error reading CM6 state: ${err && err.message ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * The FULL live document text, via CM6's own `state.doc` model -- never
+   * the rendered DOM. Real bug found live, 2026-09-18: Overleaf's CM6
+   * virtualizes `.cm-content`'s `.cm-line` children (only lines near the
+   * current scroll position actually exist in the DOM at any time --
+   * confirmed live: a 405-line/69756-char real document had only 17
+   * `.cm-line` elements rendered). content_script.js's original
+   * `readEditorText()` (`.cm-content .cm-line` text-join) silently returns
+   * ONLY that virtualized, scroll-position-dependent subset with no error
+   * or truncation signal -- every node past whatever happens to be
+   * scrolled into view is invisible to POST /outline, and thus to the
+   * entire claim/edit/write/release flow, regardless of node kind. `doc`
+   * here is CM6's actual document model (a rope, not the DOM), which holds
+   * the complete text independent of what's currently rendered/visible --
+   * exactly the same "trust the model, not the DOM" principle
+   * `recoverEditorView`/`applyEdits` already apply for the write side, now
+   * applied to the read side actually used for outline extraction.
+   */
+  function getFullText() {
+    try {
+      const { view, reason } = recoverEditorView();
+      if (!view) return { found: false, reason };
+
+      const doc = view.state.doc;
+      return { found: true, text: doc.sliceString(0, doc.length), length: doc.length, lines: doc.lines };
+    } catch (err) {
+      return {
+        found: false,
+        reason: `Unexpected error reading full document text: ${err && err.message ? err.message : String(err)}`,
       };
     }
   }
@@ -374,6 +409,15 @@
       const info = getLineInfo(msg.lineNumber);
       window.postMessage(
         Object.assign({ source: RESPONSE_SOURCE, type: LINE_INFO_RESPONSE_TYPE }, info),
+        window.location.origin,
+      );
+      return;
+    }
+
+    if (msg.type === FULL_TEXT_REQUEST_TYPE) {
+      const info = getFullText();
+      window.postMessage(
+        Object.assign({ source: RESPONSE_SOURCE, type: FULL_TEXT_RESPONSE_TYPE }, info),
         window.location.origin,
       );
       return;

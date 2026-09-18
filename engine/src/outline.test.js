@@ -85,6 +85,64 @@ test("a nested tabular inside a table float is now its own addressable node (doc
   assert.equal(tableKindNodes.length, 2);
 });
 
+test("a nested tabular's OWN caption/label is never attributed to the outer table float", () => {
+  const source = [
+    "\\begin{table}",
+    "\\caption{Outer float caption.}",
+    "\\label{tab:outer}",
+    "\\begin{tabular}{cc}",
+    "\\caption{Inner tabular caption.}",
+    "\\label{tab:inner}",
+    "a & b \\\\",
+    "\\end{tabular}",
+    "\\end{table}",
+  ].join("\n");
+  const nodes = outlineOf(source);
+  const tables = nodes.filter((n) => n.kind === "table");
+  assert.equal(tables.length, 2);
+  const outer = tables.find((n) => n.label === "tab:outer");
+  const inner = tables.find((n) => n.label === "tab:inner");
+  assert.ok(outer, "outer table node not found");
+  assert.ok(inner, "inner tabular node not found");
+  // The real bug this guards against: findFirstMacro's unscoped recursion
+  // would have handed the OUTER node the INNER tabular's caption/label
+  // (whichever comes first in a depth-first walk of the outer's content),
+  // since both live inside the outer table's own `content` array.
+  assert.equal(outer.caption, "Outer float caption.");
+  assert.equal(inner.caption, "Inner tabular caption.");
+  assert.notEqual(outer.caption, inner.caption);
+});
+
+test("captionLine/labelLine point at the field's OWN source line, not the environment's start line", () => {
+  const source = [
+    "\\begin{table}",       // line 1
+    "\\centering",          // line 2
+    "\\begin{tabular}{c}",  // line 3
+    "x \\\\",               // line 4
+    "\\end{tabular}",       // line 5
+    "\\caption{A caption several lines in.}", // line 6
+    "\\label{tab:deep}",    // line 7
+    "\\end{table}",         // line 8
+  ].join("\n");
+  const nodes = outlineOf(source);
+  const outer = nodes.find((n) => n.kind === "table" && n.label === "tab:deep");
+  assert.ok(outer);
+  assert.equal(outer.line, 1);
+  assert.equal(outer.captionLine, 6);
+  assert.equal(outer.labelLine, 7);
+});
+
+test("captionLine/labelLine are null when the field itself doesn't exist", () => {
+  const source = ["\\begin{figure}", "\\includegraphics{plot.png}", "\\end{figure}"].join("\n");
+  const nodes = outlineOf(source);
+  const fig = nodes.find((n) => n.kind === "figure");
+  assert.ok(fig);
+  assert.equal(fig.caption, null);
+  assert.equal(fig.captionLine, null);
+  assert.equal(fig.label, null);
+  assert.equal(fig.labelLine, null);
+});
+
 test("two untitled same-level headings collide on content fingerprint and get disambiguated, not merged", () => {
   const source = ["\\section{}", "\\section{}"].join("\n");
   const nodes = outlineOf(source);

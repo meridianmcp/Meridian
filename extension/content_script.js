@@ -68,6 +68,18 @@ const LINE_INFO_REQUEST_TYPE = "meridian-latex-get-line-info";
 const LINE_INFO_RESPONSE_TYPE = "meridian-latex-line-info-result";
 const LINE_INFO_TIMEOUT_MS = 2000;
 
+// Full-document-text read, via CM6's own state.doc model (see
+// injected.js's getFullText() for the real bug this fixes: Overleaf's CM6
+// virtualizes .cm-content's rendered lines, so the OLD readEditorText()
+// DOM-scrape below silently returned only whatever happened to be
+// scrolled into view). Same MAIN-world bridge, a fourth request/response
+// message pair. A larger timeout than the other three: sliceString(0,
+// doc.length) on a large real document is real synchronous work, unlike
+// the near-instant doc-info/line-info/apply-edits calls.
+const FULL_TEXT_REQUEST_TYPE = "meridian-latex-get-full-text";
+const FULL_TEXT_RESPONSE_TYPE = "meridian-latex-full-text-result";
+const FULL_TEXT_TIMEOUT_MS = 5000;
+
 // BUG FIXED 2026-09-17 (found by re-reading this code after a real, live
 // timeout report -- "Timed out waiting for the injected page script to
 // respond"): this used to append the <script> tag and fire
@@ -199,13 +211,26 @@ function getLineInfoViaMainWorld(lineNumber) {
   );
 }
 
+/** Relays a full-document-text request into the page's MAIN world.
+ * Resolves to `{found, text, length, lines}` on success or `{found: false,
+ * reason}` on any failure -- see injected.js's getFullText(). The
+ * CORRECT source for popup.js's real outline extraction to read from
+ * (see module-level comment above); readEditorText()/detectEditor() below
+ * stay DOM-based on purpose for the lightweight "is an editor here at
+ * all" status check, which never needed full-document correctness. */
+function getFullTextViaMainWorld() {
+  return relayToMainWorld(
+    FULL_TEXT_REQUEST_TYPE,
+    FULL_TEXT_RESPONSE_TYPE,
+    {},
+    { found: false },
+    FULL_TEXT_TIMEOUT_MS,
+  );
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "MERIDIAN_LATEX_GET_STATUS") {
     sendResponse(detectEditor());
-    return true;
-  }
-  if (message?.type === "MERIDIAN_LATEX_GET_TEXT") {
-    sendResponse({ text: readEditorText() });
     return true;
   }
   if (message?.type === "MERIDIAN_LATEX_GET_CM6_INFO") {
@@ -218,6 +243,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === "MERIDIAN_LATEX_GET_LINE_INFO") {
     getLineInfoViaMainWorld(message.lineNumber).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "MERIDIAN_LATEX_GET_FULL_TEXT") {
+    getFullTextViaMainWorld().then(sendResponse);
     return true;
   }
   return false;
