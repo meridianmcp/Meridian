@@ -284,6 +284,43 @@ def test_no_references_heading_found_produces_no_findings(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# code-review regression (docs-intel-jcshm-linter-gap-cleanup-20260918) --
+# a References/Bibliography heading that IS located but has ZERO parseable
+# entries after it (immediately followed by the next heading, or by end of
+# document) must still flag every in-text citation as
+# citation_missing_reference_entry. All four finding-generating loops were
+# originally nested under ``if reference_numbers:`` (true only when at
+# least one entry was found), so this exact case -- confirmed by direct
+# repro during review -- silently produced ZERO findings even though real
+# citations existed with no possible matching entry. This is DIFFERENT from
+# test_no_references_heading_found_produces_no_findings above (no heading
+# located AT ALL, which correctly stays silent -- "can't check against a
+# list that doesn't exist").
+# ---------------------------------------------------------------------------
+
+def test_references_heading_found_with_zero_entries_still_flags_citations(tmp_path):
+    body = (
+        _body_para("See prior work [1] and [2] for details.", "B0000001")
+        + _references_heading()
+        # NOTE: no entries at all after the heading -- end of document.
+    )
+    path = _write_docx(tmp_path, _doc(body))
+    result = docs_intel.audit_reference_consistency(path)
+    assert result["reference_count"] == 0
+    assert result["citation_count"] == 2
+    types_and_numbers = {
+        (f["type"], f["citation_number"]) for f in result["findings"]
+        if f["type"] == "citation_missing_reference_entry"
+    }
+    assert types_and_numbers == {("citation_missing_reference_entry", 1), ("citation_missing_reference_entry", 2)}
+    # No entries at all -> the gap/duplicate checks (which need a non-empty
+    # reference_numbers to compute a "highest") must not fire.
+    types = {f["type"] for f in result["findings"]}
+    assert "reference_list_number_gap" not in types
+    assert "reference_list_duplicate_number" not in types
+
+
+# ---------------------------------------------------------------------------
 # Unconditional -- not style-policy-gated
 # ---------------------------------------------------------------------------
 

@@ -198,6 +198,55 @@ def test_no_abstract_heading_found_returns_none_and_no_findings(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# code-review regression (docs-intel-jcshm-linter-gap-cleanup-20260918) --
+# _ABSTRACT_RE (the general front-matter classifier document_outline/
+# _assign_section_types use) also matches "Summary"/"Acknowledgements"/
+# "Preface"/"Foreword"/"Dedication"/"Synopsis"/"Executive Summary", not just
+# "Abstract". audit_manuscript_structure must use its OWN narrower pattern
+# (_ABSTRACT_HEADING_ONLY_RE) so a document with no literal "Abstract"
+# heading but an early "Acknowledgements" (or similar) heading is correctly
+# treated as having no locatable Abstract, rather than having that unrelated
+# section's word count checked against the Abstract's 150-250 rule.
+# ---------------------------------------------------------------------------
+
+def test_acknowledgements_heading_is_not_mistaken_for_the_abstract(tmp_path):
+    body = (
+        _heading_para(1, "Acknowledgements", "00000001")
+        + _body_para(_words(8), "00000002")
+        + _heading_para(1, "References", "00000003")
+    )
+    path = _write_docx(tmp_path, _doc(body))
+    result = docs_intel.audit_manuscript_structure(
+        path,
+        style_policy={
+            "abstract_word_count_min": 150, "abstract_word_count_max": 250,
+            "keyword_count_min": 4, "keyword_count_max": 6,
+        },
+    )
+    assert result["abstract_word_count"] is None
+    assert result["keyword_count"] is None
+    assert result["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "heading_text",
+    ["Summary", "Executive Summary", "Synopsis", "Preface", "Foreword", "Dedication"],
+)
+def test_other_abstract_re_front_matter_headings_not_mistaken_for_abstract(tmp_path, heading_text):
+    """Every OTHER text _ABSTRACT_RE also matches (see that regex's own
+    comment) must likewise be rejected by audit_manuscript_structure's
+    narrower _ABSTRACT_HEADING_ONLY_RE."""
+    body = _heading_para(1, heading_text, "00000001") + _body_para(_words(8), "00000002")
+    path = _write_docx(tmp_path, _doc(body))
+    result = docs_intel.audit_manuscript_structure(
+        path,
+        style_policy={"abstract_word_count_min": 150, "abstract_word_count_max": 250},
+    )
+    assert result["abstract_word_count"] is None
+    assert result["findings"] == []
+
+
+# ---------------------------------------------------------------------------
 # Keywords count
 # ---------------------------------------------------------------------------
 

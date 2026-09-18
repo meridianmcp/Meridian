@@ -136,6 +136,24 @@ _REFERENCES_RE = re.compile(
     re.IGNORECASE,
 )
 
+# docs-intel-jcshm-linter-gap-cleanup-20260918 -- audit_manuscript_structure
+# needs to find THE Abstract heading specifically, not any front-matter
+# heading _ABSTRACT_RE happens to also classify into the same region.
+# _ABSTRACT_RE above is deliberately broad (abstract|summary|executive
+# summary|synopsis|preface|foreword|acknowledgements?|dedication) because
+# _classify_heading_text/_assign_section_types only need to know "this is
+# front matter, not main-body text" -- lumping those seven together is
+# correct for THAT purpose. It is NOT correct for locating "the Abstract":
+# a manuscript or SI with no literal "Abstract" heading but an early
+# "Acknowledgements"/"Summary"/"Preface" heading would otherwise have THAT
+# section's word count checked against the Abstract's 150-250 rule (found
+# by direct repro during this session's own review -- see the code review
+# notes for docs-intel-jcshm-linter-gap-cleanup-20260918). A dedicated,
+# narrow pattern avoids that entirely.
+_ABSTRACT_HEADING_ONLY_RE = re.compile(
+    r"^(abstract|structured\s+abstract|graphical\s+abstract)$", re.IGNORECASE
+)
+
 # docs-intel-jcshm-linter-gap-cleanup-20260918 -- matches a "Keywords:" /
 # "Key words:" / "Keyword:" line's leading label, so its position and the
 # term list following it can be found the same text-pattern way
@@ -11682,12 +11700,20 @@ def audit_manuscript_structure(
     150-250 words, 4-6 Keywords) that this project's own manuscript was
     never automatically verified against.
 
-    Section location is TEXT-pattern based, the same discipline
-    :func:`document_outline`/:func:`_assign_section_types` already use for
-    front-matter classification (:data:`_ABSTRACT_RE`) rather than assuming
-    any particular heading STYLE name -- an "Abstract" heading is any
-    heading paragraph (:func:`_is_heading`) whose text matches
-    :data:`_ABSTRACT_RE`. The Abstract's body is every non-heading paragraph
+    Section location is TEXT-pattern based, the same general discipline
+    :func:`document_outline`/:func:`_assign_section_types` use for
+    front-matter classification, but with its OWN dedicated pattern
+    (:data:`_ABSTRACT_HEADING_ONLY_RE`) rather than the broader
+    :data:`_ABSTRACT_RE` those functions use -- an "Abstract" heading here
+    is any heading paragraph (:func:`_is_heading`) whose text matches
+    :data:`_ABSTRACT_HEADING_ONLY_RE` (deliberately narrower than
+    :data:`_ABSTRACT_RE`, which also matches "Summary"/"Preface"/
+    "Acknowledgements"/etc. for the DIFFERENT purpose of front-matter
+    region classification -- reusing it here would have this function treat
+    an early "Acknowledgements" or "Summary" heading in a document with no
+    literal "Abstract" heading as if it WERE the Abstract, checking its word
+    count against the same 150-250 rule; see :data:`_ABSTRACT_HEADING_ONLY_RE`'s
+    own comment). The Abstract's body is every non-heading paragraph
     between that heading and the next heading (any level) OR a recognised
     "Keywords" line, whichever comes first. JCSHM's own convention puts the
     Keywords line immediately after the Abstract body, inside the same
@@ -11766,7 +11792,7 @@ def audit_manuscript_structure(
     abstract_heading_idx = next(
         (
             idx for idx, (style, text, _pid) in enumerate(paragraphs)
-            if _is_heading(style) and _ABSTRACT_RE.match(text.strip())
+            if _is_heading(style) and _ABSTRACT_HEADING_ONLY_RE.match(text.strip())
         ),
         None,
     )
@@ -11919,6 +11945,18 @@ def audit_reference_consistency(
     fallback can never itself manufacture a gap/duplicate finding; only the
     cross-citation checks still meaningfully apply in that case.
 
+    A References/Bibliography heading that IS located but has ZERO
+    parseable entries after it (e.g. a heading immediately followed by the
+    next section, or by only blank paragraphs) still runs the two
+    cross-citation checks -- every in-text citation number then has no
+    matching entry by construction, which is itself flagged via
+    ``citation_missing_reference_entry`` rather than silently producing no
+    findings. Only the gap/duplicate checks are skipped in that case (they
+    are not meaningful with zero entries). A document with NO
+    References/Bibliography heading located AT ALL is the one case that
+    produces no findings whatsoever -- see the "no heading found" bullet
+    above.
+
     Args:
       docx_path:     Absolute path to the .docx file. Read-only -- this
                      function never mutates the file.
@@ -12002,20 +12040,40 @@ def audit_reference_consistency(
 
     findings: list[dict[str, Any]] = []
 
-    if reference_numbers:
-        highest = max(reference_numbers)
-        for missing in sorted(set(range(1, highest + 1)) - set(reference_numbers)):
-            findings.append({
-                "type": "reference_list_number_gap",
-                "para_id": None,
-                "missing_number": missing,
-            })
-        for dup in sorted(duplicate_numbers):
-            findings.append({
-                "type": "reference_list_duplicate_number",
-                "para_id": reference_numbers[dup],
-                "duplicate_number": dup,
-            })
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 code-review fix -- the
+    # cross-citation checks (citation_missing_reference_entry /
+    # reference_entry_never_cited) must run whenever a References/
+    # Bibliography heading was actually LOCATED (bib_start is not None),
+    # even if it turned out to contain zero parseable entries: that is
+    # itself a real defect (every in-text citation is then "missing"), not
+    # a reason to stay silent. Only the gap/duplicate checks genuinely
+    # require at least one numbered entry (``highest = max(reference_numbers)``
+    # would raise ValueError on an empty dict). Originally all four loops
+    # were nested under ``if reference_numbers:``, which -- confirmed by
+    # direct repro during this session's own review -- silently produced
+    # ZERO findings for a document with real in-text citations but an
+    # empty/heading-only reference list, exactly the "reports clean while a
+    # real defect exists" failure mode this whole cleanup exists to close.
+    # A document with NO References/Bibliography heading at all
+    # (``bib_start is None``) still deliberately produces no findings --
+    # "can't check consistency against a list that doesn't exist" -- see
+    # this function's own docstring and
+    # test_no_references_heading_found_produces_no_findings.
+    if bib_start is not None:
+        if reference_numbers:
+            highest = max(reference_numbers)
+            for missing in sorted(set(range(1, highest + 1)) - set(reference_numbers)):
+                findings.append({
+                    "type": "reference_list_number_gap",
+                    "para_id": None,
+                    "missing_number": missing,
+                })
+            for dup in sorted(duplicate_numbers):
+                findings.append({
+                    "type": "reference_list_duplicate_number",
+                    "para_id": reference_numbers[dup],
+                    "duplicate_number": dup,
+                })
         for missing_entry in sorted(cited_numbers - set(reference_numbers)):
             findings.append({
                 "type": "citation_missing_reference_entry",
