@@ -39,6 +39,8 @@
   const RESPONSE_TYPE = "meridian-latex-doc-info";
   const APPLY_EDITS_REQUEST_TYPE = "meridian-latex-apply-edits";
   const APPLY_EDITS_RESPONSE_TYPE = "meridian-latex-apply-edits-result";
+  const LINE_INFO_REQUEST_TYPE = "meridian-latex-get-line-info";
+  const LINE_INFO_RESPONSE_TYPE = "meridian-latex-line-info-result";
   const RESPONSE_SOURCE = "meridian-latex-injected";
 
   /**
@@ -248,6 +250,45 @@
   }
 
   /**
+   * Read-only lookup of one document line's exact character range + text,
+   * via CM6's own `state.doc.line(lineNumber)` (1-indexed, matching both
+   * CM6's own convention and unified-latex's `position.start.line` -- both
+   * operate on the identical "\n"-joined text this extension already reads
+   * via readEditorText()/outlineText() in content_script.js/engine, so the
+   * two numbering schemes agree with no translation needed).
+   *
+   * This exists so the real node-editing flow (popup.js) can compute a
+   * precise `{from, to}` character offset for a field inside a specific line
+   * without reconstructing the document's line-start offsets itself from
+   * `.cm-line` DOM text -- a second, independent source of truth that could
+   * drift from CM6's actual state. Same "never trust anything but the live
+   * document" principle applyEdits() below already applies at dispatch time;
+   * this is the read-side equivalent, used just before computing the edit to
+   * send there. Never dispatches, never mutates view.state -- purely a read.
+   */
+  function getLineInfo(lineNumber) {
+    try {
+      const { view, reason } = recoverEditorView();
+      if (!view) return { found: false, reason };
+
+      const doc = view.state.doc;
+      if (!Number.isInteger(lineNumber) || lineNumber < 1 || lineNumber > doc.lines) {
+        return {
+          found: false,
+          reason: `line ${lineNumber} is out of range [1, ${doc.lines}] for the live document.`,
+        };
+      }
+      const line = doc.line(lineNumber);
+      return { found: true, from: line.from, to: line.to, text: line.text };
+    } catch (err) {
+      return {
+        found: false,
+        reason: `Unexpected error reading line ${lineNumber}: ${err && err.message ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
    * The write-dispatch primitive. `edits` is an array of `{from, to, insert}`
    * (per write-back-spec.md's batched-not-per-call design). Never throws --
    * every failure path returns `{applied: false, reason}` instead, matching
@@ -324,6 +365,15 @@
       const result = applyEdits(msg.edits);
       window.postMessage(
         Object.assign({ source: RESPONSE_SOURCE, type: APPLY_EDITS_RESPONSE_TYPE }, result),
+        window.location.origin,
+      );
+      return;
+    }
+
+    if (msg.type === LINE_INFO_REQUEST_TYPE) {
+      const info = getLineInfo(msg.lineNumber);
+      window.postMessage(
+        Object.assign({ source: RESPONSE_SOURCE, type: LINE_INFO_RESPONSE_TYPE }, info),
         window.location.origin,
       );
       return;

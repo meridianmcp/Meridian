@@ -58,6 +58,16 @@ const APPLY_EDITS_REQUEST_TYPE = "meridian-latex-apply-edits";
 const APPLY_EDITS_RESPONSE_TYPE = "meridian-latex-apply-edits-result";
 const APPLY_EDITS_TIMEOUT_MS = 2000;
 
+// Read-only line-info primitive (see injected.js's getLineInfo()). Used by
+// the real node-editing flow (popup.js) to get a claimed node's live line
+// text + its exact document-offset start, so it can compute a precise
+// {from, to} for the specific field being edited before calling
+// MERIDIAN_LATEX_APPLY_EDITS above. Same MAIN-world bridge, a third
+// request/response message pair.
+const LINE_INFO_REQUEST_TYPE = "meridian-latex-get-line-info";
+const LINE_INFO_RESPONSE_TYPE = "meridian-latex-line-info-result";
+const LINE_INFO_TIMEOUT_MS = 2000;
+
 // BUG FIXED 2026-09-17 (found by re-reading this code after a real, live
 // timeout report -- "Timed out waiting for the injected page script to
 // respond"): this used to append the <script> tag and fire
@@ -175,6 +185,20 @@ function applyEditsViaMainWorld(edits) {
   );
 }
 
+/** Relays a line-info request (1-indexed `lineNumber`, matching CM6's
+ * state.doc.line(n) convention) into the page's MAIN world. Resolves to
+ * `{found, from, to, text}` on success or `{found: false, reason}` on any
+ * failure -- see injected.js's getLineInfo(). Read-only, never dispatches. */
+function getLineInfoViaMainWorld(lineNumber) {
+  return relayToMainWorld(
+    LINE_INFO_REQUEST_TYPE,
+    LINE_INFO_RESPONSE_TYPE,
+    { lineNumber },
+    { found: false },
+    LINE_INFO_TIMEOUT_MS,
+  );
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "MERIDIAN_LATEX_GET_STATUS") {
     sendResponse(detectEditor());
@@ -190,6 +214,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === "MERIDIAN_LATEX_APPLY_EDITS") {
     applyEditsViaMainWorld(message.edits).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "MERIDIAN_LATEX_GET_LINE_INFO") {
+    getLineInfoViaMainWorld(message.lineNumber).then(sendResponse);
     return true;
   }
   return false;
