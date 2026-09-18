@@ -198,7 +198,19 @@ function addReleaseButton(row, nodeId) {
  * no edit box) -- see addEditSection() below.
  */
 const EDITABLE_FIELDS = {
-  heading: (node) => node.title,
+  // outline.js's title extraction includes a leading "*" for a starred
+  // heading (e.g. \section*{Introduction} -> title "*Introduction") --
+  // confirmed live, 2026-09-17: EVERY heading in the real dnabert manuscript
+  // is starred, so this is the common case, not an edge case. The star is
+  // NOT part of the actual argument text findMacroBraceArgs locates (it sits
+  // outside the braces, between the macro name and "{"), so stripping it
+  // here is purely a display/seed-value fix -- it does not change what
+  // computeFieldRange() targets. Left un-stripped, a user who resubmits the
+  // seeded value with only a light edit would insert a literal "*" character
+  // into the paper's actual heading text, which is wrong output, not a
+  // safety issue, but real and worth preventing at the source rather than
+  // documenting as a known gotcha.
+  heading: (node) => (node.title && node.title.startsWith("*") ? node.title.slice(1) : node.title),
   citation: (node) => node.key,
 };
 
@@ -500,6 +512,50 @@ function findAllBraceArgs(text, macroPrefix) {
   return results;
 }
 
+/** Every `{...}` argument immediately following each occurrence of a macro
+ * named `macroName` on `text`, left to right -- tolerant of an optional `*`
+ * between the macro name and its argument brace (`\section{...}` AND
+ * `\section*{...}` both match a search for macroName="section"). This is a
+ * REAL, common case, not a hypothetical: found live, 2026-09-17, testing
+ * against the actual dnabert manuscript -- every single heading in that real
+ * document is starred (`\section*{}`, `\subsection*{}`, `\paragraph*{}`,
+ * PLOS's own unnumbered-heading convention), so the earlier exact-prefix
+ * version of this search (`findAllBraceArgs(text, "\\" + level + "{")`)
+ * found ZERO occurrences for every real heading in that paper and always hit
+ * the occurrence-count safety abort -- safe (never a wrong edit) but useless
+ * (never a successful one either) for the overwhelmingly common real case.
+ * Each result is `{start, end}` -- the argument's content span, exclusive of
+ * the braces themselves. A macro occurrence with no balanced closing brace on
+ * this line, or whose character immediately after the (optional) `*` isn't
+ * `{`, is skipped (not reported) rather than guessed at. */
+function findMacroBraceArgs(text, macroName) {
+  const results = [];
+  const anchor = `\\${macroName}`;
+  let searchFrom = 0;
+  while (true) {
+    const idx = text.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    let braceOpen = idx + anchor.length;
+    if (text[braceOpen] === "*") braceOpen += 1;
+    if (text[braceOpen] !== "{") {
+      // Not a real match at all (e.g. this "\section" is actually the start
+      // of "\subsectionfoo" or some other longer macro name, or a bare macro
+      // with no argument on this line) -- move past just the anchor, not the
+      // whole remaining line, so a genuine later occurrence is still found.
+      searchFrom = idx + anchor.length;
+      continue;
+    }
+    const closeIdx = matchBraceIndex(text, braceOpen);
+    if (closeIdx === -1) {
+      searchFrom = braceOpen + 1;
+      continue;
+    }
+    results.push({ start: braceOpen + 1, end: closeIdx });
+    searchFrom = closeIdx + 1;
+  }
+  return results;
+}
+
 /** Every comma-separated key segment inside every `\cite{...}` occurrence on
  * `text`, left to right, flattened into one ordered list -- mirroring
  * outline.js's own `raw.split(",").map(k => k.trim())` extraction exactly,
@@ -552,15 +608,14 @@ function locateHeadingRange(lineInfo, target, siblings) {
   if (idx === -1) {
     return { ok: false, reason: "Internal error: node not found among its own line siblings." };
   }
-  const macroPrefix = `\\${target.level}{`;
-  const occurrences = findAllBraceArgs(lineInfo.text, macroPrefix);
+  const occurrences = findMacroBraceArgs(lineInfo.text, target.level);
   if (occurrences.length !== siblings.length) {
     return {
       ok: false,
       reason:
         `Heading count mismatch on line ${target.line}: the outline reports ${siblings.length} ` +
-        `"${target.level}" heading(s) there, but ${occurrences.length} "${macroPrefix}" occurrence(s) ` +
-        `were found scanning the live line text. Aborting edit for safety.`,
+        `"${target.level}" heading(s) there, but ${occurrences.length} "\\${target.level}" (optionally ` +
+        `starred) occurrence(s) were found scanning the live line text. Aborting edit for safety.`,
     };
   }
   const occ = occurrences[idx];
