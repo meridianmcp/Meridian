@@ -268,6 +268,53 @@ const EDITABLE_FIELDS = {
 };
 
 /**
+ * Debounced (400ms) citation-key check against the engine's /zotero-lookup
+ * (see zotero.js/server.js). Debounced because this fires on every
+ * keystroke via the input's own "input" listener, not just once -- without
+ * debouncing, typing a key would fire one HTTP request per character.
+ * `statusEl._zoteroTimer` is a plain ad hoc property on the element (no
+ * framework/state layer here), matching this file's existing vanilla-DOM
+ * style throughout.
+ */
+function scheduleZoteroCheck(statusEl, key, delayMs = 400) {
+  clearTimeout(statusEl._zoteroTimer);
+  const trimmed = (key || "").trim();
+  if (!trimmed) {
+    statusEl.textContent = "";
+    statusEl.className = "zotero-status";
+    return;
+  }
+  statusEl.textContent = "Checking Zotero…";
+  statusEl.className = "zotero-status checking";
+  statusEl._zoteroTimer = setTimeout(async () => {
+    try {
+      const res = await fetch(`${ENGINE_URL}/zotero-lookup?key=${encodeURIComponent(trimmed)}`);
+      const result = await res.json();
+      renderZoteroStatus(statusEl, result);
+    } catch {
+      renderZoteroStatus(statusEl, { resolved: null });
+    }
+  }, delayMs);
+}
+
+/** Three-way render, matching lookupCitationKey's own three-way result
+ * (zotero.js): found / not found / couldn't check at all -- these are
+ * genuinely different situations and must not be collapsed into a single
+ * ok/error binary (see zotero.js's own header comment). */
+function renderZoteroStatus(statusEl, result) {
+  if (result.resolved === true) {
+    statusEl.textContent = `✓ Zotero: ${result.title || result.tag}`;
+    statusEl.className = "zotero-status ok";
+  } else if (result.resolved === false) {
+    statusEl.textContent = "⚠ Not found in Zotero";
+    statusEl.className = "zotero-status warn";
+  } else {
+    statusEl.textContent = "Zotero unavailable";
+    statusEl.className = "zotero-status unknown";
+  }
+}
+
+/**
  * Renders the "edit this node" UI for a node whose claim just succeeded (or
  * was already held by this session on popup reopen) -- one text input per
  * PRESENT editable field (see EDITABLE_FIELDS), each seeded with that
@@ -308,6 +355,19 @@ function addEditSection(row, node) {
     // recording (see toggleQueueNodeEdit/applyBatch).
     input.dataset.originalValue = descriptor.get(node);
     fieldRow.appendChild(input);
+
+    // Citation-key validation against the local Zotero library (item
+    // 6160d667 piece 2) -- purely informational, never blocks queueing or
+    // applying an edit: Zotero not running, or a key legitimately not in
+    // the library yet (e.g. a brand-new reference not added yet), are both
+    // real, non-error situations a user should be free to proceed through.
+    if (node.kind === "citation" && descriptor.field === "key") {
+      const zoteroStatus = document.createElement("span");
+      zoteroStatus.className = "zotero-status";
+      fieldRow.appendChild(zoteroStatus);
+      scheduleZoteroCheck(zoteroStatus, input.value);
+      input.addEventListener("input", () => scheduleZoteroCheck(zoteroStatus, input.value));
+    }
 
     const saveBtn = document.createElement("button");
     saveBtn.className = "save-edit-btn";

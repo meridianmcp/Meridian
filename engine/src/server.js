@@ -25,6 +25,10 @@
 //                    (for a later agent session to pull and push into
 //                    meridian-outputs itself, then mark synced)
 //   POST /provenance/mark-synced  { ids: [...] }  -> { marked: <count> }
+//   GET  /zotero-lookup?key=<citekey>  -> { resolved: true, tag, title } /
+//                    { resolved: false } / { resolved: null, reason }
+//                    (citation-key validation against the local Zotero
+//                    library's `:key:` tag convention -- see zotero.js)
 //   GET  /extension-version  -> { hash }  (mtime fingerprint of extension/,
 //                    for background.js's self-reload poll -- see below)
 //   GET  /health     ->  { ok: true }
@@ -44,6 +48,7 @@ import { matchOutlines } from "./matching.js";
 import { openStore, getProject, upsertProject } from "./store.js";
 import { claimNode, leaseWholeDocument, releaseClaims, getLiveClaims } from "./claims.js";
 import { recordEdit, listProvenance, markSynced } from "./provenance.js";
+import { lookupCitationKey } from "./zotero.js";
 
 // One shared connection for the lifetime of this process -- matches the
 // spec's "one local Node process on one machine" framing (no pooling, no
@@ -255,6 +260,25 @@ const server = createServer(async (req, res) => {
       const provenance = listProvenance(db, { project_id, unsynced_only });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ provenance }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String(err && err.message || err) }));
+    }
+    return;
+  }
+
+  if (req.method === "GET" && req.url && req.url.startsWith("/zotero-lookup")) {
+    try {
+      const url = new URL(req.url, "http://127.0.0.1");
+      const key = url.searchParams.get("key");
+      if (!key) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "missing 'key' query parameter" }));
+        return;
+      }
+      const result = await lookupCitationKey(key);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: String(err && err.message || err) }));
