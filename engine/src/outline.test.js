@@ -12,6 +12,49 @@ function outlineOf(source) {
   return outlineText(source);
 }
 
+// --- Heading title extraction (\section*, \section[short]{long}) --------
+//
+// Real, ALREADY-LIVE bug found 2026-09-18 via independent code review, then
+// confirmed against dnabert_test_dummy's actual stored outline: every one
+// of its 25 real headings (100% starred, per the earlier Phase-1 finding)
+// had a corrupted title with a spurious leading "*" ("*Abstract", not
+// "Abstract"). Every SECTION_MACROS member has ctan signature "s o m" (star
+// flag, optional short title, mandatory title), so argText() -- which
+// concatenates every arg -- folded the star flag's content into the title.
+// Worse than cosmetic: the corrupted title seeds the popup's edit input, so
+// submitting an unedited heading edit would write the stray "*" into the
+// live document.
+
+test("\\section*{...} (starred heading) extracts a clean title, no leading '*'", () => {
+  const nodes = outlineOf("\\section*{Abstract}\n");
+  const heading = nodes.find((n) => n.kind === "heading");
+  assert.equal(heading.title, "Abstract");
+});
+
+test("\\subsection*{...} and \\chapter*{...} are also clean, not just \\section*", () => {
+  const nodes = outlineOf("\\subsection*{Discussion}\n\\chapter*{Preface}\n");
+  const titles = nodes.filter((n) => n.kind === "heading").map((n) => n.title);
+  assert.deepEqual(titles, ["Discussion", "Preface"]);
+});
+
+test("\\section[Short]{Long Title} extracts the LONG title, not both concatenated", () => {
+  const nodes = outlineOf("\\section[Short]{Long Discussion Title}\n");
+  const heading = nodes.find((n) => n.kind === "heading");
+  assert.equal(heading.title, "Long Discussion Title");
+});
+
+test("a starred heading WITH a short-title optional arg combines neither into the title", () => {
+  const nodes = outlineOf("\\section*[Short]{Long Discussion Title}\n");
+  const heading = nodes.find((n) => n.kind === "heading");
+  assert.equal(heading.title, "Long Discussion Title");
+});
+
+test("an ordinary, unstarred heading with no optional arg is unaffected (no regression)", () => {
+  const nodes = outlineOf("\\section{Discussion}\n");
+  const heading = nodes.find((n) => n.kind === "heading");
+  assert.equal(heading.title, "Discussion");
+});
+
 test("splits a multi-key \\cite into one citation node per key", () => {
   const nodes = outlineOf("\\section{Intro}\nSee \\cite{alice2020,bob2021,carol2022}.\n");
   const citations = nodes.filter((n) => n.kind === "citation");
@@ -46,6 +89,59 @@ test("resolves a \\ref{} inside a caption to the referenced table's sequential n
   assert.match(tables[0].caption, /See Table~2 for more\./);
 });
 
+// Real bug found 2026-09-18 via independent code review, confirmed by
+// reproduction: collectLabels incremented the shared "table"/"figure"
+// counter for EVERY STRUCTURAL_ENVIRONMENTS match, including a nested
+// tabular/subfigure sharing the SAME kind as its enclosing float -- so
+// every real table (which always wraps a tabular, per both test papers)
+// inflated the counter by 2 instead of 1, corrupting every \ref{} number
+// after the first table/figure in the document.
+test("a table wrapping a tabular does NOT inflate the table counter -- \\ref{} numbers stay correct", () => {
+  const source = [
+    "\\begin{table}",
+    "\\begin{tabular}{lc}",
+    "a & b \\\\",
+    "\\end{tabular}",
+    "\\caption{First table}",
+    "\\label{tab:first}",
+    "\\end{table}",
+    "\\begin{table}",
+    "\\begin{tabular}{lc}",
+    "c & d \\\\",
+    "\\end{tabular}",
+    "\\caption{Second table, see Table~\\ref{tab:first} above.}",
+    "\\label{tab:second}",
+    "\\end{table}",
+  ].join("\n");
+  const nodes = outlineOf(source);
+  const outerTables = nodes.filter((n) => n.kind === "table" && n.env === "table");
+  assert.equal(outerTables.length, 2);
+  // Without the fix this resolves to "Table~2" (each table counted twice --
+  // once for `table`, once for its nested `tabular`).
+  assert.match(outerTables[1].caption, /see Table~1 above\./);
+});
+
+test("a figure wrapping a subfigure does NOT inflate the figure counter", () => {
+  const source = [
+    "\\begin{figure}",
+    "\\begin{subfigure}{0.4\\textwidth}",
+    "\\caption{Sub A}",
+    "\\label{fig:a}",
+    "\\end{subfigure}",
+    "\\caption{First figure}",
+    "\\label{fig:first}",
+    "\\end{figure}",
+    "\\begin{figure}",
+    "\\caption{Second figure, see Figure~\\ref{fig:first} above.}",
+    "\\label{fig:second}",
+    "\\end{figure}",
+  ].join("\n");
+  const nodes = outlineOf(source);
+  const outerFigures = nodes.filter((n) => n.kind === "figure" && n.env === "figure");
+  assert.equal(outerFigures.length, 2);
+  assert.match(outerFigures[1].caption, /see Figure~1 above\./);
+});
+
 test("an unresolved \\ref{} renders as a marked placeholder, never silently drops", () => {
   const source = [
     "\\begin{figure}",
@@ -56,6 +152,76 @@ test("an unresolved \\ref{} renders as a marked placeholder, never silently drop
   const figures = nodes.filter((n) => n.kind === "figure");
   assert.equal(figures.length, 1);
   assert.match(figures[0].caption, /See Figure~\[\?fig:does-not-exist\]\./);
+});
+
+// --- subfigure/subtable (subcaption/subfig packages) ----------------------
+//
+// Real bug found 2026-09-18 via independent code review, confirmed by
+// reproduction: subfigure/subtable were entirely missing from
+// STRUCTURAL_ENVIRONMENTS, so a nested `\begin{subfigure}` inside an outer
+// `\begin{figure}` was not recognized as a scope boundary -- the outer
+// float's real caption/label were silently OVERWRITTEN by the subfigure's
+// own (data loss, not a display quirk: the real outer caption/label never
+// appeared anywhere in the output). Multi-panel figures/tables are common
+// in real papers.
+
+test("a subfigure's own caption/label is never attributed to the outer figure float (data-loss regression)", () => {
+  const source = [
+    "\\begin{figure}",
+    "\\begin{subfigure}{0.4\\textwidth}",
+    "\\caption{Sub A}",
+    "\\label{fig:a}",
+    "\\end{subfigure}",
+    "\\caption{Overall figure}",
+    "\\label{fig:overall}",
+    "\\end{figure}",
+  ].join("\n");
+  const nodes = outlineOf(source);
+  const figures = nodes.filter((n) => n.kind === "figure");
+  assert.equal(figures.length, 2, "both the outer figure AND the subfigure must be their own nodes");
+  const outer = figures.find((n) => n.env === "figure");
+  const sub = figures.find((n) => n.env === "subfigure");
+  assert.ok(outer, "outer figure node not found");
+  assert.ok(sub, "subfigure node not found");
+  assert.equal(outer.caption, "Overall figure", "the outer float's REAL caption must survive");
+  assert.equal(outer.label, "fig:overall");
+  assert.equal(sub.caption, "Sub A");
+  assert.equal(sub.label, "fig:a");
+});
+
+test("a \\ref{} to the OUTER figure's label still resolves correctly with a nested subfigure present", () => {
+  const source = [
+    "\\begin{figure}",
+    "\\begin{subfigure}{0.4\\textwidth}",
+    "\\caption{Sub A}",
+    "\\label{fig:a}",
+    "\\end{subfigure}",
+    "\\caption{Overall figure, see Figure~\\ref{fig:overall} for itself.}",
+    "\\label{fig:overall}",
+    "\\end{figure}",
+  ].join("\n");
+  const nodes = outlineOf(source);
+  const outer = nodes.find((n) => n.kind === "figure" && n.env === "figure");
+  assert.match(outer.caption, /see Figure~1 for itself/);
+});
+
+test("subtable behaves the same way as subfigure (not attributed to the outer table)", () => {
+  const source = [
+    "\\begin{table}",
+    "\\begin{subtable}{0.4\\textwidth}",
+    "\\caption{Sub table}",
+    "\\label{tab:sub}",
+    "\\end{subtable}",
+    "\\caption{Overall table}",
+    "\\label{tab:overall}",
+    "\\end{table}",
+  ].join("\n");
+  const nodes = outlineOf(source);
+  const tables = nodes.filter((n) => n.kind === "table");
+  const outer = tables.find((n) => n.env === "table");
+  const sub = tables.find((n) => n.env === "subtable");
+  assert.equal(outer.caption, "Overall table");
+  assert.equal(sub.caption, "Sub table");
 });
 
 test("a citation nested inside a table/figure environment is still found, not dropped", () => {
