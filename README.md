@@ -57,11 +57,16 @@ and tested, not a work-in-progress snapshot.
     that genuinely has MCP access) pull unsynced rows and push them into
     meridian-outputs itself. See "What's real" below for what's built vs.
     what's still a manual/future step.
+  - `src/zotero.js` — citation-key validation against the LOCAL Zotero
+    desktop app's HTTP API (127.0.0.1:23119, not the Meridian tunnel).
+    `lookupCitationKey()` returns a three-way resolved/not-resolved/
+    couldn't-check result via the library's own `:key:` tag convention.
   - `src/server.js` — plain Node `http`, no framework. `POST /outline`,
     `POST /claim`, `POST /lease`, `POST /release`, `GET /claims`,
     `POST /provenance`, `GET /provenance`, `POST /provenance/mark-synced`,
-    `GET /extension-version` (for the extension's self-reload poll),
-    `GET /health`. See its own header comment for the full contract.
+    `GET /zotero-lookup`, `GET /extension-version` (for the extension's
+    self-reload poll), `GET /health`. See its own header comment for the
+    full contract.
   - `docs/write-back-spec.md` — the original write-back design doc (storage
     schema, conflict rules, HTTP contract). Still accurate for what's
     described; see the pinned Meridian decisions for what changed during
@@ -225,15 +230,28 @@ and tested, not a work-in-progress snapshot.
   trying to make the engine call meridian-outputs directly: it can't (no MCP
   client in a headless local Node process), so instead it buffers durably and
   exposes `synced_to_meridian_outputs`/`GET /provenance?unsynced_only=true`
-  for a LATER agent session — one that genuinely has meridian-outputs access
-  — to pull and push through, then mark synced. **What's NOT done: that sync
-  step itself.** No agent session has yet actually pulled a real batch of
-  provenance rows and pushed them into meridian-outputs' `register_output_paths`/
-  `annotate_outputs`; the bridge exists and is tested on the local-buffer
-  side only. The `popup.js` wiring itself also hasn't been exercised through
-  an actual live click-through (same gap this README already notes for the
-  caption/label editing UI below — `applyBatch()`'s own logic was reasoned
-  through and syntax-checked, not driven end-to-end in a real popup).
+  for a LATER agent session to pull and push through, then mark synced.
+  **Correction (2026-09-18, after actually reading the real meridian-outputs
+  tool catalog rather than assuming the item's own guess was right):**
+  `annotate_outputs`/`search_outputs`/`register_output_paths` are scoped to
+  a FILESYSTEM `outputs_dir` tree of research artifacts (CSV/JSON/NPY
+  experiment outputs, annotated and BM25-searched by path) — there is no
+  natural filesystem path for "a citation key was edited in a live Overleaf
+  document" to attach to, and forcing one in just to satisfy a tool
+  signature would produce misleading data. **The local ledger itself already
+  satisfies this item's actual stated goal** ("a durable, queryable audit
+  trail... distinct from Overleaf's own version history") on its own,
+  without needing to push anywhere. If Meridian-side visibility is ever
+  wanted later, `log_task`/a project note (generic, project-scoped, no
+  filesystem-path assumption) is the right target, not meridian-outputs —
+  but there is no real provenance data yet to sync regardless (confirmed:
+  zero rows in the live local DB, since dispatching a real edit needs the
+  same popup click-through this README already can't complete in this
+  environment — see below). The `popup.js` wiring itself also hasn't been
+  exercised through an actual live click-through (same gap this README
+  already notes for the caption/label editing UI below — `applyBatch()`'s
+  own logic was reasoned through and syntax-checked, not driven end-to-end
+  in a real popup).
   A real bug caught while building this: SQLite's `REFERENCES` clause in
   `store.js`'s schema turned out to be genuinely ENFORCED (better-sqlite3
   defaults `PRAGMA foreign_keys=ON` — confirmed live, `db.pragma("foreign_keys",
@@ -241,6 +259,62 @@ and tested, not a work-in-progress snapshot.
   of this same change assumed; `recordEdit()` calls `ensureProjectRow()`
   first (mirroring `claims.js`'s `insertClaimRow`) so provenance can still be
   recorded for a project row that doesn't exist yet, rather than throwing.
+
+**Multi-project robustness (2026-09-18) — real, live-verified:**
+- **A genuinely second, structurally different disposable test Overleaf
+  project now exists**: `ooxml-graph-paper-overleaf`
+  (`overleaf.com/project/6aadcce27d9be38465624f22`), uploaded from a real
+  paper's actual `main.tex`/`refs.bib`/figures — unstarred `\section{}`
+  headings (vs. dnabert's starred PLOS convention), `natbib`'s
+  `\citep`/`\citet` (vs. dnabert's bare `\cite`), 4 tables, 5 figures, zero
+  equations. Compiles cleanly. This is exactly the "catch what's overfit to
+  one document's shape" test the README has called for since Phase 1 — and
+  it worked immediately:
+- **Real bug found and fixed**: natbib's whole citation family
+  (`\citep`/`\citet`/`\citealp`/`\citealt`/`\citeauthor`/`\citeyear`/
+  `\citeyearpar`, plus capitalized sentence-start variants) was completely
+  invisible to the outline — 0 citation nodes extracted from a real document
+  with 15+ real citations, silently, no error. Root cause went one level
+  deeper than a simple macro-name check: `unified-latex`'s own bundled
+  macro-info database doesn't know natbib at all, so without an explicit
+  signature registration, `\citep{key}`'s `{key}` group doesn't even attach
+  to the macro node as an arg. Fixed with a custom parser registering the
+  whole family (xparse signature `"s o o m"` — the leading `s` for the
+  starred forms needed its own real investigation: TeX always lexes
+  `\citep*` as macro name "citep" plus a separate "*" token, and an earlier,
+  wrong attempt without the `s` spec let that stray "*" silently satisfy the
+  mandatory key-list argument on its own). 8 new tests. Bare `\cite`
+  unaffected (verified, not assumed).
+- **Real UX bug found and fixed**: a nested `\tabular` inside every real
+  `\table` (100% of occurrences in BOTH real test papers) produces a second,
+  caption-less outline node that `popup.js` offered a dead-end "Claim to
+  edit" button for. The outline data itself is unchanged on purpose (an
+  existing, deliberate prior decision keeps that node addressable for a
+  future cell/column-edit feature — see `outline.test.js`'s own "documented
+  behavior change" test); fixed at the actual point of confusion instead —
+  `popup.js` now shows "(no editable fields yet)" instead of a working-
+  looking button that does nothing once clicked.
+- **Citation-key validation against the local Zotero library** (`src/zotero.js`,
+  `GET /zotero-lookup`, a non-blocking status indicator in `popup.js`).
+  Confirmed live before building anything: the Meridian-hosted `zotero-mcp`
+  tunnel slot is disabled, Better BibTeX is not installed, but a real,
+  already-in-use manual tag convention exists in the actual Zotero library
+  (`<project-prefix>:key:<citekey>`, e.g. `P1:key:margulies2005454`).
+  `lookupCitationKey()` is a three-way result — resolved / not-resolved /
+  couldn't-check-at-all (Zotero not running) — deliberately not a boolean,
+  since those are different situations a user shouldn't have collapsed into
+  one. 14 unit tests; live-verified against the real local Zotero API: a
+  tagged real key resolves true with the item's title, a real-but-untagged
+  key (from the new ooxml-graph-paper project, which hasn't had the tagging
+  convention applied to it yet) correctly resolves false, not a false
+  positive or a crash.
+- A stray literal NUL byte was found in `outline.js`'s `fingerprint()`
+  function (pre-existing, not introduced this session) — makes git treat
+  the whole file as binary. NOT fixed here on purpose: naively replacing it
+  would change every fingerprint's hash input, silently invalidating every
+  currently-persisted node id across both live test projects. Flagged as
+  its own follow-up task requiring a real migration plan, not a one-line
+  edit.
 
 **Deliberately not built yet, not silently assumed fine:**
 - **A bare inline/display-math `equation` node (CM6 "mathenv", no
@@ -253,27 +327,33 @@ and tested, not a work-in-progress snapshot.
   own server-side "out of sync" recovery under a genuinely malformed op that
   reaches the server (today's malformed-edit tests were all rejected
   client-side, before dispatch — they never exercised that path at all) are
-  all still open. Decision `c01875cf` has the full list.
-- **Routing through Overleaf's own native track-changes/Review panel**
-  (decision `28ebe1f0`'s design 2, the "meta.tc" trick documented in
-  netique/overleaf-mcp's README) instead of — or as an alternative UX to —
-  the batched-transaction confirmation above. Not investigated or
-  implemented yet; the batched-transaction half of this "what's next" item
-  is done (see above), this half is not.
-- **The new caption/label editing was NOT verified through an actual
-  click-through of the popup UI in a live browser** (only through the real
-  engine server + a faithful logic replica of popup.js's new functions
-  against real engine output — see above). Browser automation in this pass
-  could reach the real Overleaf tab and drive injected.js directly (proving
-  the outline/getFullText fixes genuinely live), but could not reach
-  `chrome-extension://`/`chrome://extensions` pages (a known, pre-existing
-  constraint — see `extension/background.js`'s own comment) to drive
-  `popup.html` itself, and the browser window became unresponsive
-  mid-session before a manual-style click-through could be substituted.
-  Treat this specific gap as higher-priority to close (a real click-through
-  by a human, or a future session with working GUI access) than the
-  concurrency/failure-mode items above, precisely because it's the one
-  piece this pass could not exercise end-to-end itself.
+  all still open. Decision `c01875cf` has the full list. **Now blocked
+  specifically on a human step, not on more engine work**: the new OT client
+  (`overleaf-ot-client.js`) is the actual right tool to exercise this (two
+  independent OT-client connections, no browser tab needed at all, could
+  simulate real concurrent writers), but every path to it needs a real
+  session cookie, which only `node src/overleaf-login.js login` (human-only,
+  see above) can produce.
+- **Routing through Overleaf's own native track-changes/Review panel** —
+  superseded, not abandoned: the OT client's `meta.tc`/`trackChangesOnForUser`
+  (built this session) is the actual, more direct mechanism this item was
+  really asking for (we construct the OT update ourselves now, so `meta.tc`
+  is set directly rather than inferred/observed via the old extension-based
+  approach) — see pinned decision `3ee2b454`. What remains is exactly the
+  same live-connection verification blocker as the OT client generally.
+- **The caption/label editing (and every other UI added since) was NOT
+  verified through an actual click-through of the popup UI in a live
+  browser.** Re-confirmed independently TWICE now that this is a genuine
+  environment constraint, not something more code can fix: browser
+  automation can reach a real Overleaf tab and drive injected.js directly
+  (proving the outline/getFullText fixes genuinely live) via two DIFFERENT
+  tools tried this session (an in-app browser pane, and Claude-in-Chrome
+  driving a real, already-logged-in Chrome) — but BOTH tools mangle
+  `chrome://extensions`/`chrome-extension://` URLs identically (silently
+  prepending `https://`, producing an invalid URL Chrome simply ignores),
+  so neither can load or drive `popup.html` itself. Treat a real
+  click-through by a human, or a future session with a different automation
+  approach entirely, as the only way to close this specific gap.
 
 ## Running it locally
 
