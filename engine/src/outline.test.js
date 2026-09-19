@@ -1,10 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parse } from "@unified-latex/unified-latex-util-parse";
-import { extractOutline } from "./outline.js";
+import { outlineText } from "./outline.js";
 
+// outlineText (not a raw `parse` from unified-latex-util-parse + a separate
+// extractOutline call) so every test here goes through the SAME natbib-aware
+// parser outline.js's real callers (server.js's /outline) actually use --
+// the plain unified-latex parse() doesn't know \citep/\citet at all (see
+// outline.js's own header comment), and testing against it would silently
+// validate a parse path nothing in production ever takes.
 function outlineOf(source) {
-  return extractOutline(parse(source));
+  return outlineText(source);
 }
 
 test("splits a multi-key \\cite into one citation node per key", () => {
@@ -66,6 +71,83 @@ test("a citation nested inside a table/figure environment is still found, not dr
   assert.equal(tables.length, 1);
   assert.equal(citations.length, 1);
   assert.equal(citations[0].key, "someone2020");
+});
+
+// --- natbib author-year citation family (\citep, \citet, ...) -------------
+//
+// Real bug found 2026-09-18 via multi-project robustness testing against a
+// genuinely different real paper (ooxml-graph-paper, which uses natbib
+// throughout, unlike the original dnabert manuscript's bare \cite): every
+// \citep{}/\citet{} call was SILENTLY invisible to the outline -- 0 citation
+// nodes extracted from a document with 15+ real citations. Root cause: the
+// old code only matched macro name "cite" (`node.content === "cite"`), and
+// unified-latex's default parser doesn't know natbib's macros at all, so
+// \citep{key}'s `{key}` group wasn't even attached to the macro node as an
+// arg. It failed SILENTLY (0 results, no error, no partial/garbled output)
+// rather than safely like the earlier starred-heading bug did -- worse, not
+// better, since nothing signals anything went wrong.
+
+test("\\citep (natbib) is recognized as a citation macro, same as \\cite", () => {
+  const nodes = outlineOf("\\section{Intro}\nAs shown by \\citep{alice2020}.\n");
+  const citations = nodes.filter((n) => n.kind === "citation");
+  assert.equal(citations.length, 1);
+  assert.equal(citations[0].key, "alice2020");
+});
+
+test("\\citet (natbib) is recognized as a citation macro", () => {
+  const nodes = outlineOf("\\section{Intro}\nAlice \\citet{alice2020} showed...\n");
+  const citations = nodes.filter((n) => n.kind === "citation");
+  assert.equal(citations.length, 1);
+  assert.equal(citations[0].key, "alice2020");
+});
+
+test("a multi-key \\citep{a,b,c} splits into one citation node per key, same as \\cite", () => {
+  const nodes = outlineOf("\\section{Intro}\nSee \\citep{alice2020,bob2021,carol2022}.\n");
+  const citations = nodes.filter((n) => n.kind === "citation");
+  assert.deepEqual(citations.map((c) => c.key), ["alice2020", "bob2021", "carol2022"]);
+});
+
+test("\\citep[pre][post]{key} -- the optional pre/post note text is NOT concatenated into the key", () => {
+  // Regression for a second, related latent bug this fix also had to avoid:
+  // naively reusing argText() (which concatenates every arg) on a natbib
+  // macro would fold the optional note's text into the key list itself
+  // (e.g. "seealice2020"). lastArgText() must read only the final,
+  // mandatory arg regardless of how many optional notes precede it.
+  const nodes = outlineOf("\\section{Intro}\nSee \\citep[see][p.\\ 2]{alice2020}.\n");
+  const citations = nodes.filter((n) => n.kind === "citation");
+  assert.equal(citations.length, 1);
+  assert.equal(citations[0].key, "alice2020");
+});
+
+test("the rest of the natbib author-year family is recognized: citealp, citealt, citeauthor, citeyear, citeyearpar", () => {
+  const source = [
+    "\\section{Intro}",
+    "\\citealp{a2020} \\citealt{b2020} \\citeauthor{c2020} \\citeyear{d2020} \\citeyearpar{e2020}.",
+  ].join("\n");
+  const nodes = outlineOf(source);
+  const keys = nodes.filter((n) => n.kind === "citation").map((c) => c.key);
+  assert.deepEqual(keys, ["a2020", "b2020", "c2020", "d2020", "e2020"]);
+});
+
+test("capitalized natbib sentence-start variants (\\Citep, \\Citet, ...) are recognized too", () => {
+  const source = "\\section{Intro}\n\\Citep{a2020} \\Citet{b2020} \\Citealp{c2020} \\Citealt{d2020} \\Citeauthor{e2020}.";
+  const nodes = outlineOf(source);
+  const keys = nodes.filter((n) => n.kind === "citation").map((c) => c.key);
+  assert.deepEqual(keys, ["a2020", "b2020", "c2020", "d2020", "e2020"]);
+});
+
+test("a starred natbib variant (\\citep*{key}) still resolves to the plain key, not garbage from the star", () => {
+  const nodes = outlineOf("\\section{Intro}\nSee \\citep*{alice2020}.\n");
+  const citations = nodes.filter((n) => n.kind === "citation");
+  assert.equal(citations.length, 1);
+  assert.equal(citations[0].key, "alice2020");
+});
+
+test("bare \\cite is completely unaffected by the natbib macro registration (no regression)", () => {
+  const nodes = outlineOf("\\section{Intro}\nSee \\cite{alice2020}.\n");
+  const citations = nodes.filter((n) => n.kind === "citation");
+  assert.equal(citations.length, 1);
+  assert.equal(citations[0].key, "alice2020");
 });
 
 test("a nested tabular inside a table float is now its own addressable node (documented behavior change)", () => {
