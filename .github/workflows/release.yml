@@ -177,9 +177,14 @@ jobs:
       # 80f1d4bc — skip Docker Hub publish cleanly when creds aren't configured
       # (repo without DOCKER_USERNAME/DOCKER_TOKEN) instead of failing the run.
       # The ghcr image (docker-ghcr, via GITHUB_TOKEN) still publishes regardless.
+      # 730b7d8e — the guard only checked DOCKER_USERNAME; a repo with just ONE
+      # of the two secrets configured (confirmed live on the v0.1.8 tag run,
+      # 28740098906: "Log in to Docker Hub" failed with "Username and password
+      # required" even though this check reported has=true) still hit a real
+      # failure instead of skipping cleanly. Require BOTH secrets.
       - name: Check Docker Hub credentials
         id: dockercreds
-        run: echo "has=${{ secrets.DOCKER_USERNAME != '' }}" >> "$GITHUB_OUTPUT"
+        run: echo "has=${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
       - name: Log in to Docker Hub
         if: steps.dockercreds.outputs.has == 'true'
         uses: docker/login-action@v3
@@ -226,9 +231,24 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-      - run: |
+      # 730b7d8e — npm forbids republishing an already-published version
+      # (confirmed live: v0.1.9 tag run 28767217852 failed with real error
+      # "403 Forbidden ... You cannot publish over the previously published
+      # versions: 0.1.9"), so re-running/re-triggering a workflow on a tag
+      # whose npm version was already published failed the whole run even
+      # though nothing was actually broken. Check the registry first and
+      # skip cleanly — same tolerant "don't fail the run" pattern already
+      # used for the Docker Hub credentials check above — instead of erroring.
+      - name: Publish to npm (skip cleanly if this version is already published)
+        run: |
           TAG="${{ github.ref_name }}"
-          cd npm && npm version "$TAG" --no-git-tag-version
+          cd npm
+          npm version "$TAG" --no-git-tag-version
+          PKG_NAME=$(node -p "require('./package.json').name")
+          if npm view "${PKG_NAME}@${TAG}" version >/dev/null 2>&1; then
+            echo "${PKG_NAME}@${TAG} is already published on npm -- skipping (idempotent re-run)."
+            exit 0
+          fi
           if [[ "$TAG" == *"-"* ]]; then
             npm publish --tag pre-alpha
           else
