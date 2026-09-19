@@ -19,6 +19,25 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+/**
+ * Real bug found 2026-09-18 via independent code review: every validation
+ * check below used to be a bare truthiness check (`!project_id`), which
+ * only rejects falsy values (`""`, `null`, `undefined`, `0`) -- a JSON
+ * request body can carry a NUMBER for any of these fields (a client bug, or
+ * a project id that happens to look numeric), which is truthy and would
+ * sail past the check, then get bound into a better-sqlite3 TEXT column via
+ * SQLite's own numeric-to-TEXT affinity conversion. Not a SQL-injection risk
+ * (still a prepared-statement bind, not string concatenation), but a real
+ * correctness one: a huge numeric holder_token can silently lose precision
+ * in JSON.parse before it even reaches here, and a numeric vs. string
+ * node_id could compare inconsistently depending on which callers use the
+ * request-derived value versus a str `node_id` typed into a follow-up
+ * request. Reject anything that isn't a real, non-empty string outright.
+ */
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
 function isLive(row, nowMs) {
   if (!row || row.released_at) return false;
   const claimedMs = Date.parse(row.claimed_at);
@@ -111,7 +130,7 @@ export function identityConfidenceFor(nodeId) {
  */
 export function claimNode(db, { project_id, node_id, holder_token }) {
   try {
-    if (!project_id || !node_id || !holder_token) {
+    if (!isNonEmptyString(project_id) || !isNonEmptyString(node_id) || !isNonEmptyString(holder_token)) {
       return { claimed: false, reason: "project_id, node_id, and holder_token are all required" };
     }
     if (node_id === WHOLE_DOCUMENT_LEASE_NODE_ID) {
@@ -182,7 +201,7 @@ export function claimNode(db, { project_id, node_id, holder_token }) {
  */
 export function leaseWholeDocument(db, { project_id, holder_token }) {
   try {
-    if (!project_id || !holder_token) {
+    if (!isNonEmptyString(project_id) || !isNonEmptyString(holder_token)) {
       return { leased: false, reason: "project_id and holder_token are both required" };
     }
 
@@ -237,8 +256,11 @@ export function leaseWholeDocument(db, { project_id, holder_token }) {
  */
 export function releaseClaims(db, { project_id, holder_token, node_id }) {
   try {
-    if (!project_id || !holder_token) {
+    if (!isNonEmptyString(project_id) || !isNonEmptyString(holder_token)) {
       return { released: 0, reason: "project_id and holder_token are both required" };
+    }
+    if (node_id !== undefined && !isNonEmptyString(node_id)) {
+      return { released: 0, reason: "node_id, if provided, must be a non-empty string" };
     }
     const now = nowIso();
     const result = node_id

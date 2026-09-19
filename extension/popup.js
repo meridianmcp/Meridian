@@ -194,15 +194,23 @@ function addReleaseButton(row, nodeId) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project_id: currentProjectId, holder_token: currentHolderToken, node_id: nodeId }),
       });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`Engine returned ${res.status}: ${body}`);
+      }
       const data = await res.json();
       showClaimResult(row, `Released (${data.released} claim${data.released === 1 ? "" : "s"}).`, "ok");
       btn.remove();
       if (claimBtn) claimBtn.hidden = false;
       // A released claim can no longer be safely edited -- drop the edit
       // section rather than leave a stale input sitting under a row that no
-      // longer holds the claim it would need to write back against.
+      // longer holds the claim it would need to write back against. Also
+      // purge any already-queued edit for this node from pendingBatch
+      // itself, not just its DOM -- otherwise "Apply queued edits" could
+      // still dispatch a write against a node whose claim was just released.
       const editSection = row.querySelector(".edit-section");
       if (editSection) editSection.remove();
+      unqueueAllForNode(nodeId);
     } catch (err) {
       showClaimResult(row, `Release request failed: ${err.message}`, "error");
       btn.disabled = false;
@@ -278,6 +286,17 @@ const EDITABLE_FIELDS = {
  */
 function scheduleZoteroCheck(statusEl, key, delayMs = 400) {
   clearTimeout(statusEl._zoteroTimer);
+  // Real bug found 2026-09-18 via independent code review: clearTimeout only
+  // cancels a PENDING (not-yet-fired) timer -- it does nothing for a fetch
+  // that already started from an earlier keystroke. Without this generation
+  // counter, an older, slower lookup's response could still overwrite the
+  // display after a newer, faster one already rendered (a classic out-of-
+  // order/stale-response race, made worse by network jitter). Bump the
+  // counter on every call; a response only renders if this element's
+  // CURRENT generation still matches the one it was issued under -- i.e. no
+  // newer request has been scheduled since.
+  const generation = (statusEl._zoteroGeneration || 0) + 1;
+  statusEl._zoteroGeneration = generation;
   const trimmed = (key || "").trim();
   if (!trimmed) {
     statusEl.textContent = "";
@@ -287,13 +306,14 @@ function scheduleZoteroCheck(statusEl, key, delayMs = 400) {
   statusEl.textContent = "Checking Zotero…";
   statusEl.className = "zotero-status checking";
   statusEl._zoteroTimer = setTimeout(async () => {
+    let result;
     try {
       const res = await fetch(`${ENGINE_URL}/zotero-lookup?key=${encodeURIComponent(trimmed)}`);
-      const result = await res.json();
-      renderZoteroStatus(statusEl, result);
+      result = await res.json();
     } catch {
-      renderZoteroStatus(statusEl, { resolved: null });
+      result = { resolved: null };
     }
+    if (statusEl._zoteroGeneration === generation) renderZoteroStatus(statusEl, result);
   }, delayMs);
 }
 
@@ -388,6 +408,10 @@ async function claimNodeById(node, row) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ project_id: currentProjectId, node_id: node.id, holder_token: currentHolderToken }),
     });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Engine returned ${res.status}: ${body}`);
+    }
     const data = await res.json();
     if (!data.claimed) {
       showClaimResult(row, `Not claimed: ${data.reason || "unknown reason"}`, "error");
@@ -1023,6 +1047,30 @@ function unqueueByKey(key) {
 }
 
 /**
+ * Purge every queued field for one node (a node can have multiple queued
+ * fields -- e.g. both caption and label on a table). Used by
+ * addReleaseButton below: real bug found 2026-09-18 via independent code
+ * review -- releasing a claim used to leave any already-queued edit for
+ * that node sitting in pendingBatch untouched (only the DOM's own
+ * `.edit-section` was removed), so a later "Apply queued edits" click could
+ * still dispatch a write against a node whose claim was already released --
+ * a real correctness gap (writing to unclaimed content), not just stale UI.
+ * Does NOT call resetQueueUi per-entry (the row/input/queueBtn it would
+ * reset are about to be discarded by the release flow itself) -- just
+ * removes the pendingBatch entries and refreshes the batch bar.
+ */
+function unqueueAllForNode(nodeId) {
+  let removedAny = false;
+  for (const [key, entry] of pendingBatch) {
+    if (entry.node.id === nodeId) {
+      pendingBatch.delete(key);
+      removedAny = true;
+    }
+  }
+  if (removedAny) updateBatchBar();
+}
+
+/**
  * Per-field "Queue edit" button handler: queues the field's current input
  * value (or, if already queued, un-queues it -- a toggle, same button).
  * Does NOT touch the engine or the live document at all -- purely local
@@ -1085,10 +1133,22 @@ async function applyBatch() {
   cancelBtn.disabled = true;
   showBatchResult(`Re-fetching the live outline before writing ${entries.length} edit(s)…`);
 
+  // Real bug found 2026-09-18 via independent code review: this whole
+  // function used to read the module-level currentProjectId/
+  // currentHolderToken fresh at every fetch call inside the loop below
+  // instead of snapshotting them once here. Both are reassigned by
+  // getOutline() -- reachable via the (still-enabled during this async
+  // function) "Get structural outline" button -- so a click on it mid-batch
+  // could mix values from two different projects/sessions into the same
+  // batch's own provenance/release calls. Snapshot once; every use below
+  // refers to these, never the live globals.
+  const projectId = currentProjectId;
+  const holderToken = currentHolderToken;
+
   try {
     const tab = await getActiveOverleafTab();
     if (!tab) throw new Error("Not on an Overleaf project page.");
-    if (!currentProjectId || !currentHolderToken) {
+    if (!projectId || !holderToken) {
       throw new Error("No active claim session for this project — re-open the popup and re-claim.");
     }
 
@@ -1097,7 +1157,7 @@ async function applyBatch() {
     const res = await fetch(`${ENGINE_URL}/outline`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, project_id: currentProjectId }),
+      body: JSON.stringify({ text, project_id: projectId }),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -1167,31 +1227,54 @@ async function applyBatch() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            project_id: currentProjectId,
+            project_id: projectId,
             node_id: entry.node.id,
             kind: entry.node.kind,
             field: entry.field,
             old_value: entry.oldValue,
             new_value: entry.newValue,
-            holder_token: currentHolderToken,
+            holder_token: holderToken,
           }),
         });
       } catch (err) {
         console.warn("Provenance recording failed (edit itself already succeeded):", err);
       }
-      await fetch(`${ENGINE_URL}/release`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: currentProjectId,
-          holder_token: currentHolderToken,
-          node_id: entry.node.id,
-        }),
-      });
+      // Same reasoning as the provenance call above, and the same real bug
+      // found 2026-09-18 via independent code review: this had neither a
+      // try/catch nor a res.ok check, so a transient network failure on
+      // JUST the release step (after the actual document write already
+      // succeeded and was readback-verified above) would propagate to
+      // applyBatch()'s outer catch and get reported as "batch failed" --
+      // conflating a harmless, self-healing claim-release hiccup (the claim
+      // simply TTLs out in CLAIM_TTL_MINUTES) with an actual failed edit.
+      try {
+        const releaseRes = await fetch(`${ENGINE_URL}/release`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_id: projectId,
+            holder_token: holderToken,
+            node_id: entry.node.id,
+          }),
+        });
+        if (!releaseRes.ok) {
+          console.warn(`Release failed for ${entry.node.id} (edit itself already succeeded): HTTP ${releaseRes.status}`);
+        }
+      } catch (err) {
+        console.warn(`Release request failed for ${entry.node.id} (edit itself already succeeded):`, err);
+      }
     }
 
     showBatchResult(`${resolved.length} edit(s) applied and verified. Refreshing outline…`, "ok");
     pendingBatch.clear();
+    // Real bug found 2026-09-18 via independent code review: these were
+    // only ever re-enabled on the catch (error) path below -- a SUCCESSFUL
+    // batch left both buttons permanently disabled for the rest of the
+    // popup session (updateBatchBar, called when a later edit gets queued,
+    // manages the bar's visibility/contents but never touches these
+    // buttons' own `disabled` state). Re-enable on success too.
+    applyBtn.disabled = false;
+    cancelBtn.disabled = false;
     await getOutline();
   } catch (err) {
     showBatchResult(err.message, "error");

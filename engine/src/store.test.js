@@ -253,6 +253,30 @@ test("missing required fields never throws -- returns a structured failure inste
   });
 });
 
+// Real bug found 2026-09-18 via independent code review: these checks used
+// to be bare truthiness (`!x`), which only rejects falsy values -- a JSON
+// request body can carry a NUMBER for any of these fields (truthy, and
+// truthy sails past a `!x` check), which would then get silently coerced to
+// TEXT by SQLite's own type affinity rather than rejected outright.
+test("a non-string (e.g. a JSON number) project_id/node_id/holder_token is rejected, not silently coerced", () => {
+  const db = freshStore();
+  const r1 = claimNode(db, { project_id: 12345, node_id: "heading:abc", holder_token: "alice" });
+  assert.equal(r1.claimed, false);
+  const r2 = claimNode(db, { project_id: "p1", node_id: 12345, holder_token: "alice" });
+  assert.equal(r2.claimed, false);
+  const r3 = claimNode(db, { project_id: "p1", node_id: "heading:abc", holder_token: 12345 });
+  assert.equal(r3.claimed, false);
+  const r4 = leaseWholeDocument(db, { project_id: 12345, holder_token: "alice" });
+  assert.equal(r4.leased, false);
+  const r5 = releaseClaims(db, { project_id: 12345, holder_token: "alice" });
+  assert.equal(r5.released, 0);
+  // node_id is optional on releaseClaims, but if PROVIDED must still be a
+  // real string -- a numeric node_id must not silently release everything
+  // (which omitting node_id entirely would do) nor silently coerce.
+  const r6 = releaseClaims(db, { project_id: "p1", holder_token: "alice", node_id: 12345 });
+  assert.equal(r6.released, 0);
+});
+
 // --- Sentinel routing -------------------------------------------------
 
 test("a /claim aimed at the reserved whole-document sentinel node_id is routed to lease semantics, same response shape", () => {
