@@ -27,6 +27,18 @@ name: "meridian-latex: Test & Publish"
 # tag, which makes github.ref equal that tag ref for the dispatched run --
 # satisfying the npm-publish job's existing `startsWith(..., 'refs/tags/
 # meridian-latex-v')` condition below unchanged. No inputs needed.
+#
+# `cache-dependency-path` below points at the ROOT package-lock.json, not a
+# per-package one under extensions/meridian-latex/engine/ -- since the repo
+# root became an npm workspace (linking npm/ and this engine together),
+# `npm ci`/`npm install` anywhere in the tree resolve and write ONLY the root
+# lockfile; a per-package lockfile is no longer read or maintained by npm at
+# all and was deleted for exactly that reason (it had silently drifted out of
+# sync with package.json, and a stale cache-dependency-path pointing at it
+# meant the GitHub Actions npm-cache key never changed when real dependencies
+# did). `npm ci` with `working-directory: extensions/meridian-latex/engine`
+# still installs correctly with no lockfile in that directory -- npm detects
+# the workspace root and installs from there regardless of cwd.
 
 on:
   push:
@@ -54,7 +66,7 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: extensions/meridian-latex/engine/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm test
 

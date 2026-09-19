@@ -16,6 +16,10 @@ commands:
   outline <path.tex>   parse a .tex file and print its structural outline as JSON
   serve                start the local engine server (http://127.0.0.1:8471) --
                         this is what the Chrome extension's popup talks to
+  mcp                  start the MCP server (stdio) -- this is what an AI agent
+                        session (Claude Code, etc.) connects to; see
+                        src/mcp-server.js's header comment for exposed tools and
+                        deliberate safety scoping (no live Overleaf write path)
   login                open a dedicated browser window to capture your Overleaf
                         session (human-only -- never run this from an agent session)
   status               show whether a saved Overleaf session exists
@@ -35,6 +39,17 @@ async function main() {
     // dynamic import so that only happens when `serve` is the chosen
     // subcommand, not on every `meridian-latex` invocation.
     await import("./server.js");
+  } else if (command === "mcp") {
+    // Dynamic import for the same reason `serve` above does it (only pull in
+    // the MCP SDK/stdio machinery when `mcp` is the chosen subcommand) --
+    // but unlike server.js, mcp-server.js does NOT start listening as a pure
+    // side effect of being imported: it's also imported directly by tests
+    // (to reach its tools/handler logic without opening a real stdio
+    // transport onto the test process's own stdin/stdout), so starting it is
+    // an explicit exported call instead. See mcp-server.js's own
+    // `runStdioServer`/`isMainModule` doc comments for why.
+    const { runStdioServer } = await import("./mcp-server.js");
+    await runStdioServer();
   } else if (command === "login") {
     await login();
   } else if (command === "status") {

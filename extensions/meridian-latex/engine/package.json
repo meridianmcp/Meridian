@@ -33,6 +33,7 @@
     "test": "node --test \"src/**/*.test.js\""
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@unified-latex/unified-latex-types": "^1.8.4",
     "@unified-latex/unified-latex-util-parse": "^1.8.4",
     "better-sqlite3": "^13.0.3",
