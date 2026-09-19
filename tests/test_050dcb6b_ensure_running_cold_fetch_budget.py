@@ -54,9 +54,9 @@ def test_cold_spawn_budget_helper_matches_the_constants():
     """_cold_spawn_budget is the single source of truth both call sites share:
     cold-fetch labels get _PREFLIGHT_BUDGET_COLD_FETCH, everything else gets
     _PREFLIGHT_BUDGET_DEFAULT."""
-    for label in tc._COLD_FETCH_SLOTS:  # dc, ppt, word, docs, zotero
+    for label in tc._COLD_FETCH_SLOTS:  # dc, ppt, word, docs, zotero, outputs, debug, extract
         assert tc._cold_spawn_budget(label) == tc._PREFLIGHT_BUDGET_COLD_FETCH
-    for label in ("fs", "extract", "some-unknown-slot"):
+    for label in ("fs", "code", "some-unknown-slot"):
         assert tc._cold_spawn_budget(label) == tc._PREFLIGHT_BUDGET_DEFAULT
 
 

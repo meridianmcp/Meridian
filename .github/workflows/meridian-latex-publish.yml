@@ -1,0 +1,74 @@
+name: "meridian-latex: Test & Publish"
+
+# meridian-latex moved into extensions/meridian-latex/ from its own
+# standalone repo (git subtree, full history preserved). It publishes as
+# its own npm package (@meridianmcp/latex, a separate registry entry from
+# the main product's own @meridianmcp/mcp), so it needs its OWN tag
+# namespace -- "meridian-latex-vX.Y.Z", never the bare "vX.Y.Z" pattern
+# release.yml/npm-publish.yml already use for the main product's own
+# releases. Reusing that pattern would make a normal Meridian release tag
+# ALSO try to re-version and publish meridian-latex, which is wrong.
+#
+# `test` runs on any push/PR that touches extensions/meridian-latex/** --
+# scoped by path so unrelated Meridian commits don't waste CI time on it.
+# `npm-publish` only runs on a meridian-latex-vX.Y.Z tag, after `test`
+# passes, and reuses the same NPM_TOKEN secret already configured for
+# @meridianmcp/mcp (same npm org, meridianmcp) -- an agent session must
+# never generate, see, or handle that token itself.
+
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - 'extensions/meridian-latex/**'
+    tags:
+      - 'meridian-latex-v[0-9]+.[0-9]+.[0-9]+'
+      - 'meridian-latex-v[0-9]+.[0-9]+.[0-9]+-*'
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - 'extensions/meridian-latex/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/meridian-latex/engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: extensions/meridian-latex/engine/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  npm-publish:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/meridian-latex-v')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/meridian-latex/engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci
+      - name: Sync package.json version to the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#meridian-latex-v}"
+          npm version "$TAG" --no-git-tag-version --allow-same-version
+      - name: Publish (pre-release tags get the "next" dist-tag, not "latest")
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *"-"* ]]; then
+            npm publish --tag next
+          else
+            npm publish
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
