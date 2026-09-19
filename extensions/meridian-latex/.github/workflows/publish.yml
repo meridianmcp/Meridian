@@ -1,0 +1,68 @@
+name: Test & Publish
+
+# Adapted from the main Meridian repo's own release.yml npm-publish job
+# pattern (tag-triggered, NPM_TOKEN secret), simplified: this is a plain
+# Node package with no compiled executable, so there's just one publish
+# job, not a cross-platform binary-build matrix.
+#
+# `test` runs on every push/PR with no secrets needed at all -- useful CI
+# hygiene on its own, regardless of whether npm publishing is ever set up.
+# `npm-publish` only runs on a `vX.Y.Z` tag push, and only after `test`
+# passes; it needs an NPM_TOKEN repository secret (Settings -> Secrets and
+# variables -> Actions -> New repository secret) generated from an npm
+# "Automation" access token (npmjs.com -> Access Tokens) -- an agent
+# session must never generate, see, or handle that token itself; this
+# workflow only ever references it as `secrets.NPM_TOKEN`.
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: engine/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  npm-publish:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci
+      - name: Sync package.json version to the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          npm version "$TAG" --no-git-tag-version --allow-same-version
+      - name: Publish (pre-release tags get the "next" dist-tag, not "latest")
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *"-"* ]]; then
+            npm publish --tag next
+          else
+            npm publish
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

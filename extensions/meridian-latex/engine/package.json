@@ -1,0 +1,43 @@
+{
+  "name": "@meridianmcp/latex",
+  "version": "0.1.0",
+  "description": "Structural LaTeX editing engine for Overleaf — real parse/print AST over .tex, addressable nodes (sections, tables, equations, figures, citations), claim/write coordination, and a direct Socket.IO/OT client for no-browser-tab writes.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "meridian-latex": "src/cli.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "latex",
+    "overleaf",
+    "tex",
+    "structural-editing",
+    "citation",
+    "zotero"
+  ],
+  "author": "Adam Camerer",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "outline": "node src/cli.js outline",
+    "test": "node --test \"src/**/*.test.js\""
+  },
+  "dependencies": {
+    "@unified-latex/unified-latex-types": "^1.8.4",
+    "@unified-latex/unified-latex-util-parse": "^1.8.4",
+    "better-sqlite3": "^13.0.3",
+    "chrome-launcher": "^1.2.1",
+    "chrome-remote-interface": "^0.34.0",
+    "ws": "^8.21.3"
+  }
+}
