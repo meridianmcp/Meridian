@@ -433,11 +433,32 @@ function renderNodes(nodes, existingClaims) {
     label.textContent = `[${node.kind}] ${nodeLabel(node)}`;
     row.appendChild(label);
 
-    const claimBtn = document.createElement("button");
-    claimBtn.className = "claim-btn";
-    claimBtn.textContent = "Claim to edit";
-    claimBtn.addEventListener("click", () => claimNodeById(node, row));
-    row.appendChild(claimBtn);
+    // A node kind CAN appear in the outline with zero present editable
+    // fields today -- most commonly a `tabular` nested inside a `table`
+    // float with no caption/label of its own (the outer float has those;
+    // the inner tabular is still its own distinct, addressable AST node,
+    // kept for a future cell/column-edit operation to target -- see
+    // outline.test.js's "documented behavior change" test). Offering
+    // "Claim to edit" for it today is a dead end: addEditSection renders
+    // nothing once claimed, since EDITABLE_FIELDS has nothing present to
+    // show. Rather than let a user claim it and then wonder why nothing
+    // happened, say so up front and skip the claim button entirely --
+    // this changes only what the UI offers, never the outline data itself
+    // or the engine's own claim capability (still claimable via a direct
+    // API call, if a future feature needs to).
+    const hasEditableField = (EDITABLE_FIELDS[node.kind] || []).some((d) => d.present(node));
+    if (hasEditableField) {
+      const claimBtn = document.createElement("button");
+      claimBtn.className = "claim-btn";
+      claimBtn.textContent = "Claim to edit";
+      claimBtn.addEventListener("click", () => claimNodeById(node, row));
+      row.appendChild(claimBtn);
+    } else {
+      const note = document.createElement("span");
+      note.className = "node-no-fields";
+      note.textContent = "(no editable fields yet)";
+      row.appendChild(note);
+    }
 
     container.appendChild(row);
 
