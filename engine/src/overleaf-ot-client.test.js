@@ -225,6 +225,99 @@ test("applyUpdate(): times out if no otUpdateApplied ever arrives for this write
   await assert.rejects(() => session.applyUpdate("doc1", 5, [{ i: "x", p: 0 }]), /timed out/);
 });
 
+// --- transport "error"/"disconnect" handling -------------------------------
+//
+// Real bugs found 2026-09-18 via independent code review: OverleafProjectSession
+// never listened for either of these. "error" is worse than a missed
+// convenience -- Socket09Client documents it as part of its public event
+// contract, and Node's EventEmitter THROWS SYNCHRONOUSLY (can crash the
+// whole process) when "error" is emitted with zero listeners anywhere on
+// that emitter. "disconnect" left a pending applyUpdate() waiter to fail
+// LATE (only once its own timeout elapsed) with a misleading message,
+// instead of immediately with the real cause.
+
+test("a transport 'error' event does not crash the process (a real, live crash risk before this fix)", () => {
+  const transport = new FakeTransport();
+  const session = makeSession(transport); // event routing wired in the constructor
+  assert.doesNotThrow(() => {
+    transport.emit("error", new Error("simulated transport error"));
+  });
+});
+
+test("a transport 'error' event immediately rejects any pending applyUpdate(), not just future ones", async () => {
+  const transport = new FakeTransport();
+  transport.queueAck({ resolve: [null] });
+  const session = makeSession(transport);
+
+  const promise = session.applyUpdate("doc1", 5, [{ i: "x", p: 0 }]);
+  transport.emit("error", new Error("simulated transport error"));
+  await assert.rejects(() => promise, /transport error/);
+});
+
+test("a transport 'disconnect' event immediately rejects a pending applyUpdate() with an accurate reason, not a generic timeout", async () => {
+  const transport = new FakeTransport();
+  transport.queueAck({ resolve: [null] });
+  const session = makeSession(transport); // appliedTimeoutMs: 100 (see makeSession)
+
+  const promise = session.applyUpdate("doc1", 5, [{ i: "x", p: 0 }]);
+  const start = Date.now();
+  transport.emit("disconnect", { code: 1006, reason: "" });
+  await assert.rejects(() => promise, /connection closed while waiting for otUpdateApplied/);
+  assert.ok(Date.now() - start < 50, "must reject immediately on disconnect, not wait out the 100ms applied-timeout");
+});
+
+test("applyUpdate(): an emitWithAck() REJECTION (not just an ack-level error value) still cleans up its waiter -- no unhandled rejection later", async () => {
+  const transport = new FakeTransport();
+  transport.queueAck({ reject: new Error("ack timeout") });
+  const session = makeSession(transport); // appliedTimeoutMs: 100
+
+  let unhandled = null;
+  const onUnhandled = (err) => { unhandled = err; };
+  process.once("unhandledRejection", onUnhandled);
+  try {
+    await assert.rejects(() => session.applyUpdate("doc1", 5, [{ i: "x", p: 0 }]), /ack timeout/);
+    // Wait past appliedTimeoutMs -- before the fix, the dangling waiter's
+    // own timer fired here and rejected an abandoned promise nothing was
+    // awaiting anymore.
+    await new Promise((r) => setTimeout(r, 150));
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+  assert.equal(unhandled, null, "the dangling waiter must not reject unobserved later");
+});
+
+test("connectToProject(): a connect() failure cleans up joinProjectPromise's own timer -- no unhandled rejection later", async () => {
+  class FailingTransport extends FakeTransport {
+    async connect() {
+      throw new Error("ECONNREFUSED");
+    }
+  }
+  let unhandled = null;
+  const onUnhandled = (err) => { unhandled = err; };
+  process.once("unhandledRejection", onUnhandled);
+  try {
+    await assert.rejects(
+      () =>
+        connectToProject({
+          projectId: "proj1",
+          httpBaseUrl: "x",
+          wsBaseUrl: "x",
+          cookie: "c",
+          Socket09ClientImpl: FailingTransport,
+          appliedTimeoutMs: 100,
+        }),
+      /ECONNREFUSED/,
+    );
+    // Wait past appliedTimeoutMs -- before the fix, joinProjectPromise's own
+    // timer fired here and rejected an abandoned promise nothing was
+    // awaiting anymore.
+    await new Promise((r) => setTimeout(r, 150));
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+  assert.equal(unhandled, null, "the abandoned joinProjectPromise must not reject unobserved later");
+});
+
 test("toggle-track-changes event live-updates trackChangesState", () => {
   const transport = new FakeTransport();
   const session = makeSession(transport); // event routing is wired in the constructor itself

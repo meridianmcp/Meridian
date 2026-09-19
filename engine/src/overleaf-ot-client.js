@@ -88,20 +88,36 @@ export async function connectToProject({
   // joinProjectResponse arrives unprompted right after connect (confirmed:
   // WebsocketController auto-calls joinProject server-side) -- wait for it
   // here so a caller never has to know that detail themselves.
+  let joinProjectTimer;
+  const onJoinProjectEvent = function onEvent(e) {
+    if (e.name !== "joinProjectResponse") return;
+    clearTimeout(joinProjectTimer);
+    transport.off("event", onJoinProjectEvent);
+    resolveJoinProject(e.args[0] || {});
+  };
+  let resolveJoinProject;
   const joinProjectPromise = new Promise((resolve, reject) => {
-    const timer = setTimeout(
+    resolveJoinProject = resolve;
+    joinProjectTimer = setTimeout(
       () => reject(new OverleafOtError("connectToProject: timed out waiting for joinProjectResponse")),
       appliedTimeoutMs,
     );
-    transport.on("event", function onEvent(e) {
-      if (e.name !== "joinProjectResponse") return;
-      clearTimeout(timer);
-      transport.off("event", onEvent);
-      resolve(e.args[0] || {});
-    });
+    transport.on("event", onJoinProjectEvent);
   });
 
-  await transport.connect();
+  try {
+    await transport.connect();
+  } catch (err) {
+    // Real bug found 2026-09-18 via independent code review: without this
+    // cleanup, a connect() failure left joinProjectPromise's own timer
+    // running -- it would fire ~appliedTimeoutMs later and reject an
+    // already-abandoned promise nothing is awaiting anymore (this function
+    // has already thrown and returned control to the caller by then),
+    // surfacing as a delayed unhandled promise rejection.
+    clearTimeout(joinProjectTimer);
+    transport.off("event", onJoinProjectEvent);
+    throw err;
+  }
   const joinProjectResponse = await joinProjectPromise;
   session._applyJoinProjectResponse(joinProjectResponse);
   return session;
@@ -144,6 +160,35 @@ export class OverleafProjectSession {
       if (e.name === "otUpdateApplied" || e.name === "otUpdateError") {
         this._resolveAppliedWaiters(e.name, e.args);
       }
+    });
+
+    // Real bugs found 2026-09-18 via independent code review:
+    // (1) Socket09Client documents "error" as part of its public event
+    //     contract (a raw WebSocket error, a malformed server "error"
+    //     packet, an unrecognized packet) but nothing here ever listened
+    //     for it -- Node's EventEmitter throws SYNCHRONOUSLY (can crash the
+    //     whole process) when "error" is emitted with zero listeners. This
+    //     was a real, live crash risk on exactly the first real transport
+    //     error Adam's own live verification was likely to hit.
+    // (2) This session never listened for the transport's "disconnect"
+    //     event either, so a genuine connection drop mid-write left any
+    //     pending applyUpdate() waiter to fail LATE (only once its own
+    //     appliedTimeoutMs elapsed) with a misleading "timed out waiting
+    //     for otUpdateApplied" message, instead of an immediate, accurate
+    //     one naming the real cause.
+    // Both fixed the same way: reject every pending waiter across every
+    // doc immediately with a clear, accurate reason (there's no single doc
+    // a transport-level failure is scoped to, unlike otUpdateError).
+    this.transport.on("error", (err) => {
+      this._lastTransportError = err;
+      this._rejectAllAppliedWaiters(new OverleafOtError(`transport error: ${err.message}`, { cause: err }));
+    });
+    this.transport.on("disconnect", ({ code, reason }) => {
+      this._rejectAllAppliedWaiters(
+        new OverleafOtError(
+          `connection closed while waiting for otUpdateApplied (code ${code}${reason ? `, reason: ${reason}` : ""})`,
+        ),
+      );
     });
   }
 
@@ -209,7 +254,24 @@ export class OverleafProjectSession {
 
     const appliedPromise = this._waitForApplied(docId, version + 1);
 
-    const [ackError] = await this.transport.emitWithAck("applyOtUpdate", [docId, update]);
+    // Real bug found 2026-09-18 via independent code review: _cancelAppliedWait
+    // was only ever called when the ack ITSELF resolved with a truthy error
+    // value -- not when emitWithAck's own promise REJECTS (ack timeout, or
+    // the socket closing before any ack arrives -- see emitWithAck's own
+    // doc comment). In that case control left this function via the `await`
+    // below without ever reaching the `if (ackError)` check, leaving the
+    // otUpdateApplied waiter registered above dangling -- its own timer
+    // would fire ~appliedTimeoutMs later and reject an abandoned promise
+    // nothing is awaiting anymore, the exact unhandled-rejection class of
+    // bug _cancelAppliedWait's OWN timer-clearing was already built to
+    // prevent, just reached via a different, previously-uncovered path.
+    let ackError;
+    try {
+      [ackError] = await this.transport.emitWithAck("applyOtUpdate", [docId, update]);
+    } catch (err) {
+      this._cancelAppliedWait(docId, appliedPromise.waiterId);
+      throw err;
+    }
     if (ackError) {
       this._cancelAppliedWait(docId, appliedPromise.waiterId);
       throw new OverleafOtError(`applyOtUpdate rejected for ${docId}: ${JSON.stringify(ackError)}`, {
@@ -307,6 +369,18 @@ export class OverleafProjectSession {
         waiter.reject(new OverleafOtError(`otUpdateError for ${docId}: ${errorReason}`, { cause: payload }));
       }
     }
+  }
+
+  /** Rejects EVERY pending applyUpdate() waiter across every doc -- used on
+   * a transport-level "error" or "disconnect" (see _attachEventRouting),
+   * where there's no single doc the failure is scoped to, unlike
+   * otUpdateError which names one. Each waiter's own `reject` wrapper
+   * already clears its own timer (see _waitForApplied). */
+  _rejectAllAppliedWaiters(err) {
+    for (const waiters of this._appliedWaiters.values()) {
+      for (const waiter of waiters) waiter.reject(err);
+    }
+    this._appliedWaiters.clear();
   }
 
   close() {
