@@ -215,8 +215,21 @@ _PREFLIGHT_BUDGET_COLD_FETCH: "tuple[int, float]" = (4, 5.0)
 # them (previously they were never wired at all — see 12afe021), they need this same
 # larger budget or their first spawn would spuriously fail the standard-budget
 # preflight health check on a cold cache, exactly like docs/zotero did pre-105e56b9.
+# extract-serena — the Serena slot (`uvx --from serena-agent serena start-mcp-server`)
+# is a different SHAPE of cold-start than a network/venv fetch (its uvx resolve is
+# usually already cached), but its language-server initialization is its own
+# comparably expensive cold-start cost: live-measured at 12.958s just to complete
+# LS init on this repo, on top of the process spawn itself, well past the
+# standard-budget's ~23s ceiling once you add real spawn overhead. Confirmed live: the
+# "extract" slot was stuck in a deterministic infinite respawn loop — every single
+# spawn missed the standard preflight window, and even after eventually starting,
+# the FIRST real request (still racing LS init) tripped the separate request-timeout
+# watchdog, which force-kills the proxy and restarts the whole cold-start from zero,
+# so it could never succeed no matter how many times it was retried. Moving it to the
+# cold-fetch tier gives the preflight probe the same ~55s ceiling already proven for
+# dc/ppt/docs/zotero/outputs/debug above, instead of a bespoke third tier.
 _COLD_FETCH_SLOTS: "frozenset[str]" = frozenset(
-    {"dc", "ppt", "word", "docs", "zotero", "outputs", "debug"}
+    {"dc", "ppt", "word", "docs", "zotero", "outputs", "debug", "extract"}
 )
 
 
