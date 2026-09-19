@@ -17,8 +17,16 @@ Fix: ``_fetch_slot_tools`` now accepts an explicit ``budget=`` override and its
 retry loop is budget-exhaustion-bound instead of attempt-count-bound (the old
 ``range(4)`` cap silently defeated any budget bigger than ~13.5s). list_plugins
 and get_plugin_details pass a much larger, cold-fetch-slot-aware budget
-(``_slot_tools_fetch_budget``) for the cold-fetch family only; fs/code/extract
-(never cold) keep the original flat 4.0s budget so the common case stays fast.
+(``_slot_tools_fetch_budget``) for the cold-fetch family only; fs/code (never
+cold) keep the original flat 4.0s budget so the common case stays fast.
+
+extract-serena -- "extract" moved from the always-fast family into the
+cold-fetch family (``tunnel_client._COLD_FETCH_SLOTS``): live-measured on the
+real Meridian repo, Serena's language-server initialization alone takes
+12.958s, well past the flat 4.0s budget this file used to assert for it.
+``_slot_tools_fetch_budget`` (routes/tunnel.py) imports ``_COLD_FETCH_SLOTS``
+directly from ``tunnel_client``, so this is the same single source of truth
+as the client's own preflight-readiness fix -- not a separate change.
 
 Unit-level with mocks only — no real socket/network/tunnel touched.
 """
@@ -39,8 +47,8 @@ from meridian.routes import tunnel as tn
 
 _TENANT = {"id": "tenant-5a8a2d2e", "plan": "pro"}
 
-_COLD_FETCH_LABELS = ("dc", "ppt", "word", "docs", "zotero", "outputs", "debug")
-_FAST_LABELS = ("fs", "code", "extract")
+_COLD_FETCH_LABELS = ("dc", "ppt", "word", "docs", "zotero", "outputs", "debug", "extract")
+_FAST_LABELS = ("fs", "code")
 
 
 @pytest.fixture(autouse=True)
