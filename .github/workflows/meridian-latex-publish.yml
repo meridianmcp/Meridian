@@ -15,6 +15,18 @@ name: "meridian-latex: Test & Publish"
 # passes, and reuses the same NPM_TOKEN secret already configured for
 # @meridianmcp/mcp (same npm org, meridianmcp) -- an agent session must
 # never generate, see, or handle that token itself.
+#
+# workflow_dispatch exists for exactly one caller: meridian-latex-release-sync.yml.
+# That workflow creates+pushes a meridian-latex-vX.Y.Z tag using the default
+# GITHUB_TOKEN -- and GitHub does NOT fire push-triggered workflow runs from
+# GITHUB_TOKEN-authored pushes (the same anti-recursion rule deploy.yml's
+# auto-promote/merge-to-main jobs and docs.yml's dispatch already document and
+# work around). workflow_dispatch IS exempt from that suppression, so
+# meridian-latex-release-sync.yml dispatches this workflow explicitly
+# (`gh workflow run ... --ref meridian-latex-vX.Y.Z`) right after pushing the
+# tag, which makes github.ref equal that tag ref for the dispatched run --
+# satisfying the npm-publish job's existing `startsWith(..., 'refs/tags/
+# meridian-latex-v')` condition below unchanged. No inputs needed.
 
 on:
   push:
@@ -28,6 +40,7 @@ on:
     branches: [dev, main]
     paths:
       - 'extensions/meridian-latex/**'
+  workflow_dispatch: {}
 
 jobs:
   test:

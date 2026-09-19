@@ -1,6 +1,7 @@
 {
   "private": true,
   "type": "module",
+  "workspaces": ["npm", "extensions/meridian-latex/engine"],
   "scripts": {
     "build": "node build.mjs",
     "test": "vitest run",
