@@ -23,6 +23,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { launch as launchChrome } from "chrome-launcher";
 import CDP from "chrome-remote-interface";
 
@@ -190,7 +191,21 @@ export function status(cookieFile = COOKIE_FILE) {
 }
 
 // Allow `node src/overleaf-login.js [login|status|logout]` directly.
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`) {
+//
+// Real, live bug found 2026-09-19 -- Adam ran this on Windows and got
+// silent zero output. Root cause: this used to hand-build the comparison
+// string as `file://${argv[1] with backslashes replaced}`, producing
+// "file://C:/Users/..." (two slashes before the drive letter) -- but
+// Node's real import.meta.url for an absolute Windows path is
+// "file:///C:/Users/..." (THREE slashes: the file: scheme's empty host,
+// then the path itself starting with "/C:/..."). The two never matched, so
+// this guard was permanently false on Windows -- login() (and status/
+// logout) were simply never invoked from the CLI, on this platform, ever.
+// pathToFileURL() is Node's own documented, cross-platform-correct way to
+// build this comparison (this is the recommended ESM replacement for
+// CommonJS's `require.main === module`) -- verified live against this
+// exact machine before shipping, not assumed from documentation alone.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const command = process.argv[2] || "login";
   if (command === "login") {
     login()
