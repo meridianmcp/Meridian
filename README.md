@@ -316,6 +316,90 @@ and tested, not a work-in-progress snapshot.
   its own follow-up task requiring a real migration plan, not a one-line
   edit.
 
+**Independent multi-agent code review (2026-09-18) — 20 more real bugs found and fixed:**
+Rather than stop after the natbib/tables fixes above, a background review
+workflow (5 dimensions covering outline.js, matching.js, claims.js/store.js,
+the extension, server.js, and the whole OT-client stack, with every
+candidate finding adversarially re-verified by a separate agent before
+being trusted) went looking for more of the same "overfit to one document/
+scenario" class of bug. 24 of 26 candidates were confirmed real; 20 are
+fixed here (the other 4 are documented below, not silently dropped):
+
+- **Heading titles were corrupted for EVERY starred heading, already live**:
+  confirmed against dnabert_test_dummy's actual stored outline that all 25
+  of its real headings carried a leading `*` ("*Abstract", not "Abstract")
+  -- the same argText-vs-lastArgText bug already fixed for citations, just
+  never applied to headings. Worse than cosmetic: the corrupted title seeds
+  the popup's edit input, so submitting an unedited heading edit would
+  write the stray `*` into the live document.
+- **`subfigure`/`subtable` (the subcaption/subfig packages) silently
+  overwrote the outer figure/table's real caption+label** -- actual data
+  loss, not a display quirk. Added to `STRUCTURAL_ENVIRONMENTS`.
+- **Every table/figure number was inflated** by `collectLabels` counting a
+  nested tabular/subfigure as a second increment of the same counter --
+  corrupting every `\ref{}` to a table/figure past the first.
+- **Type-confusion in claims.js**: bare truthiness checks (`!x`) let a JSON
+  number sail past validation and get silently coerced to SQLite TEXT.
+- **6 fixes in popup.js's claim/release/batch-apply flow**: a released
+  claim's already-queued edit wasn't purged (could still be dispatched); the
+  batch apply/cancel buttons stayed permanently disabled after any
+  SUCCESSFUL batch (not just on error); three missing `res.ok` checks
+  masked real HTTP errors as generic failures; a transient network hiccup
+  on the release step (after a write already succeeded) was reported as a
+  failed edit; and the Zotero status indicator had a stale-response race
+  (an older, slower lookup could overwrite a newer, faster one's result).
+- **A real, live crash risk in the OT client**: `Socket09Client` documents
+  `"error"` as part of its public event contract, but nothing ever listened
+  for it -- Node's `EventEmitter` throws SYNCHRONOUSLY (can crash the whole
+  process) when `"error"` is emitted with zero listeners anywhere on that
+  emitter. Fixed alongside a missing `"disconnect"` listener (a dropped
+  connection used to fail a pending write LATE with a misleading timeout
+  instead of immediately with the real cause), two more dangling-waiter/
+  timer-leak paths (matching the exact class of bug found and fixed in
+  `overleaf-ot-client.js` earlier the same day), and an unbounded-growth
+  `Map` that never pruned empty entries.
+- **CORS accepted ANY installed browser extension**, not just this repo's
+  own -- fixed by pinning the extension's id (`manifest.json` now declares
+  a `"key"`, a public key safe to commit) instead of only checking the
+  `chrome-extension://` scheme. **Requires re-loading the extension unpacked
+  once** -- see "Running it locally" below.
+- A body-size guard reset the TCP connection instead of sending its
+  intended "body too large" error.
+
+**Found, deliberately NOT fixed, with reasoning (not silently skipped):**
+- `store.js`'s `upsertProject`/`ensureProjectRow`/`getProject` don't wrap
+  themselves in try/catch, unlike claims.js/provenance.js's own documented
+  convention. Traced every real call site: each one is already inside a
+  caller's own try/catch (server.js's route handlers, claims.js's own
+  wrapped functions), so this is a real consistency gap, not a live crash
+  risk today -- left as a defense-in-depth item rather than forcing an
+  unclear "what does upsertProject even return on failure" design decision
+  under review-pass time pressure.
+- `matching.js`'s `isAlignable` has no content discriminator at all for
+  citations/equations, so two same-kind nodes that are BOTH reordered and
+  retitled in the same edit could theoretically be cross-matched by the LCS
+  fallback. Traced where a `matched` pair's specific old/new ids are
+  actually consumed: `applyBatch()` already aborts the whole batch on ANY
+  `oldId !== newId`, regardless of whether that mismatch came from a
+  legitimate retitle or a cross-match -- the existing fail-safe already
+  neutralizes the one way this could cause a wrong write. A real algorithmic
+  imprecision, not a live risk under the current consumer.
+- A narrow popup.js race (closing the popup within milliseconds of clicking
+  "Claim to edit" can orphan a claim past the pagehide beacon) -- real but
+  low-likelihood and expensive to fix properly given Chrome's popup
+  lifecycle; the claim still self-heals via its 30-minute TTL regardless.
+- Every `server.js` catch block returns the raw internal error message
+  verbatim, which could leak filesystem paths to a caller. For a
+  single-user, localhost-only, now CORS-pinned dev tool where Adam himself
+  reads these errors to debug, this is closer to a useful feature than a
+  vulnerability -- not fixed, to avoid trading away real debugging value
+  for a security property this specific deployment doesn't need.
+
+20 new unit tests were added across this whole review-and-fix pass (135 ->
+155 passing engine-wide, plus extension-side fixes verified via
+`node --check` and manual trace, since popup.js has no Node-side test
+harness).
+
 **Deliberately not built yet, not silently assumed fine:**
 - **A bare inline/display-math `equation` node (CM6 "mathenv", no
   environment) still has no editable label** — it has no `label` field in
