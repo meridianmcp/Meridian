@@ -205,7 +205,16 @@ export function status(cookieFile = COOKIE_FILE) {
 // build this comparison (this is the recommended ESM replacement for
 // CommonJS's `require.main === module`) -- verified live against this
 // exact machine before shipping, not assumed from documentation alone.
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+//
+// A second real bug caught immediately after fixing the first, while
+// verifying this module still imports cleanly from index.js (the new
+// package "main"): pathToFileURL(process.argv[1]) THROWS if argv[1] is
+// undefined (e.g. `node -e "import(...)"`, or any context with no real
+// script path) -- a real regression versus the old, wrong-but-non-throwing
+// `argv[1]?.replace(...)`. Guarded so importing this module (rather than
+// running it as the entry point) can never crash regardless of how the
+// importing process itself was invoked.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const command = process.argv[2] || "login";
   if (command === "login") {
     login()
