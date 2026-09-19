@@ -14,13 +14,15 @@ each part is for" below.
 ## Install
 
 ```bash
-npx meridian-latex outline paper.tex
+npx @meridianmcp/latex outline paper.tex
 ```
 
-or install it globally / as a project dependency:
+or install it globally (this also gives you the shorter `meridian-latex`
+command directly, matching the CLI reference below) / as a project
+dependency:
 
 ```bash
-npm install -g meridian-latex
+npm install -g @meridianmcp/latex
 ```
 
 ## CLI
@@ -38,7 +40,7 @@ meridian-latex logout               remove the saved Overleaf session
 ## Library
 
 ```js
-import { outlineText, matchOutlines, connectToProject } from "meridian-latex";
+import { outlineText, matchOutlines, connectToProject } from "@meridianmcp/latex";
 
 const nodes = outlineText(texSource);
 // [{ id: "heading:abc123", kind: "heading", level: "section", title: "Introduction", line: 12 }, ...]
