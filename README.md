@@ -379,6 +379,17 @@ extension's own resources from a different tab for up to its full timeout
 window. Close that tab if `chrome-extension://` resource loads start
 mysteriously hanging.
 
+**2026-09-18: the extension's id is now pinned, not random.** `manifest.json`
+declares a `"key"` (a public key -- safe to commit, not the private signing
+key, which this project never generates or needs) so Chrome assigns the SAME
+id every time the extension is loaded unpacked, instead of a fresh random one
+per load. This closes a real gap `server.js`'s CORS check had (it used to
+accept any `chrome-extension://` origin, not just this one). **If you already
+had the extension loaded from before this change, remove it and re-load it
+unpacked** so Chrome picks up the new fixed id — otherwise the popup's calls
+to the local engine will get silently blocked by CORS (no error dialog, just
+requests failing).
+
 ## Manual steps only a human can do
 
 - Chrome Web Store Developer Dashboard registration (one-time $5 fee) — only

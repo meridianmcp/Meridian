@@ -90,9 +90,24 @@ function computeExtensionVersionHash() {
   return hash.digest("hex");
 }
 
+// Real bug found 2026-09-18 via independent code review: this used to only
+// check the "chrome-extension://" SCHEME prefix, not a specific extension
+// id -- Access-Control-Allow-Origin was reflected back to ANY installed
+// browser extension on this machine, not just this repo's own, meaning any
+// other (e.g. malicious/compromised) extension could read/write this
+// project's outline/claims/provenance/Zotero-lookup data via this local
+// server. Fixed by pinning the extension's id: manifest.json now declares a
+// "key" (a public key, safe to commit -- it is NOT the private signing key,
+// which this project never generates or needs, since Chrome Web Store
+// publishing uses its own signing key regardless), which makes Chrome
+// assign this SAME extension id every time it's loaded unpacked, instead
+// of a fresh random one per load. Reloading the extension after this
+// change picks up the new fixed id -- see README's "Running it locally".
+const EXTENSION_ORIGIN = "chrome-extension://ekdmjppbmdohipibjlogobkodikcffob";
+
 function withCors(req, res) {
   const origin = req.headers.origin || "";
-  if (origin.startsWith("chrome-extension://")) {
+  if (origin === EXTENSION_ORIGIN) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -102,14 +117,26 @@ function withCors(req, res) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
+    let rejected = false;
     req.on("data", (chunk) => {
+      if (rejected) return; // already given up -- stop accumulating further bytes
       data += chunk;
       if (data.length > 20_000_000) {
+        rejected = true;
+        data = ""; // release what's accumulated so far, nothing more to hold onto
+        // Real bug found 2026-09-18 via independent code review: this used
+        // to call req.destroy() right here, which tears down the
+        // underlying TCP connection immediately -- before the route
+        // handler's own catch block ever got a chance to send its intended
+        // "body too large" JSON error through the still-intact `res`. The
+        // client saw a connection reset instead of a clean error response.
+        // Just reject and let the caller respond normally.
         reject(new Error("body too large"));
-        req.destroy();
       }
     });
-    req.on("end", () => resolve(data));
+    req.on("end", () => {
+      if (!rejected) resolve(data);
+    });
     req.on("error", reject);
   });
 }
