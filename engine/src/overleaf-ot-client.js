@@ -339,10 +339,15 @@ export class OverleafProjectSession {
     if (!waiters) return;
     const waiter = waiters.find((w) => w.waiterId === waiterId);
     if (waiter) clearTimeout(waiter.timer);
-    this._appliedWaiters.set(
-      docId,
-      waiters.filter((w) => w.waiterId !== waiterId),
-    );
+    const remaining = waiters.filter((w) => w.waiterId !== waiterId);
+    // Real bug found 2026-09-18 via independent code review: this used to
+    // `.set(docId, [])` rather than deleting the key once a doc's waiter
+    // list empties -- a long session touching many distinct docs would
+    // accumulate one permanent, never-cleaned Map entry per docId ever
+    // written to, each holding a trivial but real empty array (unbounded
+    // growth over the session's lifetime).
+    if (remaining.length === 0) this._appliedWaiters.delete(docId);
+    else this._appliedWaiters.set(docId, remaining);
   }
 
   _resolveAppliedWaiters(eventName, args) {
@@ -355,7 +360,9 @@ export class OverleafProjectSession {
       const matchIndex = waiters.findIndex((w) => w.expectedVersion === version);
       if (matchIndex === -1) return; // someone else's update on this doc -- not ours, ignore
       const [waiter] = waiters.splice(matchIndex, 1);
-      this._appliedWaiters.set(docId, waiters);
+      // Same unbounded-growth fix as _cancelAppliedWait above.
+      if (waiters.length === 0) this._appliedWaiters.delete(docId);
+      else this._appliedWaiters.set(docId, waiters);
       waiter.resolve(version);
       return;
     }

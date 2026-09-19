@@ -245,6 +245,38 @@ test("Socket09Client: a disconnect event fires with the close code/reason", asyn
   assert.equal(disconnects[0].code, 1000);
 });
 
+// Real bugs found 2026-09-18 via independent code review.
+
+test("Socket09Client: this.connected is already true by the time a 'connect' listener runs (not stale false)", async () => {
+  const client = makeClient();
+  let connectedInsideListener = null;
+  client.on("connect", () => {
+    connectedInsideListener = client.connected;
+  });
+  const connectPromise = client.connect();
+  await new Promise((r) => setTimeout(r, 10));
+  const ws = FakeWebSocket.lastInstance;
+  ws.simulateOpen();
+  ws.simulateMessage("1::");
+  await connectPromise;
+  assert.equal(connectedInsideListener, true, "a 'connect' listener must see the flag already set, not stale false");
+});
+
+test("Socket09Client: a heartbeat arriving while the socket is no longer OPEN does not throw (a real, narrow timing case, not a crash)", async () => {
+  const client = makeClient();
+  const connectPromise = client.connect();
+  await new Promise((r) => setTimeout(r, 10));
+  const ws = FakeWebSocket.lastInstance;
+  ws.simulateOpen();
+  ws.simulateMessage("1::");
+  await connectPromise;
+
+  // Simulate the narrow race: the socket has moved past OPEN (about to
+  // close) but a heartbeat frame is still delivered on this same tick.
+  ws.readyState = FakeWebSocket.CLOSED;
+  assert.doesNotThrow(() => ws.simulateMessage("2::"));
+});
+
 test("Socket09Client.connect(): rejects if the socket closes before the server's connect packet ever arrives", async () => {
   const client = makeClient();
   const connectPromise = client.connect();

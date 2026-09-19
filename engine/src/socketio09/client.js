@@ -174,12 +174,18 @@ export class Socket09Client extends EventEmitter {
       ws.on("message", (raw) => {
         const text = typeof raw === "string" ? raw : raw.toString("utf8");
         for (const packet of decodePayload(text)) {
-          this._handlePacket(packet);
+          // Real bug found 2026-09-18 via independent code review: this
+          // used to call _handlePacket() (which emits "connect" for a
+          // connect packet) BEFORE setting this.connected = true, so a
+          // listener checking `client.connected` synchronously inside its
+          // own "connect" handler would see stale `false`. Set the flag
+          // first so it's already correct by the time any listener runs.
           if (!settled && packet.type === "connect") {
             settled = true;
             this.connected = true;
-            resolve();
           }
+          this._handlePacket(packet);
+          if (packet.type === "connect") resolve();
         }
       });
 
@@ -200,7 +206,22 @@ export class Socket09Client extends EventEmitter {
   _handlePacket(packet) {
     switch (packet.type) {
       case "heartbeat":
-        this._send(encodePacket({ type: "heartbeat" }));
+        // Real bug found 2026-09-18 via independent code review: _send()
+        // throws if the socket isn't OPEN, and this call sat unguarded
+        // directly inside the raw WebSocket's own synchronous "message"
+        // handler chain, with no try/catch anywhere between here and `ws`
+        // itself. A heartbeat arriving in the brief window while the
+        // connection is already closing (a real, if narrow, timing case --
+        // not a client bug to react to) could throw an uncaught exception
+        // out of that chain. A failed heartbeat reply on a dying connection
+        // isn't actionable -- the close/disconnect handling already covers
+        // the connection genuinely going away -- so this is swallowed, not
+        // rethrown or emitted as "error".
+        try {
+          this._send(encodePacket({ type: "heartbeat" }));
+        } catch {
+          // socket already closing/closed -- nothing to do, see above.
+        }
         break;
       case "connect":
         this.emit("connect");

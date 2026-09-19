@@ -318,6 +318,31 @@ test("connectToProject(): a connect() failure cleans up joinProjectPromise's own
   assert.equal(unhandled, null, "the abandoned joinProjectPromise must not reject unobserved later");
 });
 
+// Real bug found 2026-09-18 via independent code review: _appliedWaiters
+// used to .set(docId, []) instead of deleting the key once a doc's waiter
+// list emptied -- a long session touching many distinct docs would
+// accumulate one permanent Map entry per docId ever written to.
+test("_appliedWaiters does not accumulate empty entries after a resolved write (no unbounded growth)", async () => {
+  const transport = new FakeTransport();
+  transport.queueAck({ resolve: [null] });
+  const session = makeSession(transport);
+
+  const promise = session.applyUpdate("doc1", 5, [{ i: "x", p: 0 }]);
+  transport.pushEvent("otUpdateApplied", [{ v: 6, doc: "doc1" }]);
+  await promise;
+
+  assert.equal(session._appliedWaiters.has("doc1"), false, "the Map entry must be deleted, not left as an empty array");
+});
+
+test("_appliedWaiters does not accumulate empty entries after a cancelled wait (ack-level error)", async () => {
+  const transport = new FakeTransport();
+  transport.queueAck({ resolve: ["Op too old"] });
+  const session = makeSession(transport);
+
+  await assert.rejects(() => session.applyUpdate("doc1", 5, [{ i: "x", p: 0 }]), OverleafOtError);
+  assert.equal(session._appliedWaiters.has("doc1"), false);
+});
+
 test("toggle-track-changes event live-updates trackChangesState", () => {
   const transport = new FakeTransport();
   const session = makeSession(transport); // event routing is wired in the constructor itself
