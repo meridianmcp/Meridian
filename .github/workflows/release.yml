@@ -229,7 +229,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # '22', not '20': @meridianmcp/mcp now bundles the meridian-latex
+          # engine in as a real subpath (npm/scripts/bundle-latex.mjs, run
+          # automatically as this package's own prepack step), which
+          # depends on better-sqlite3@13 -- its own package.json requires
+          # node >=22 (confirmed directly). Node 20 only warned
+          # (EBADENGINE) rather than failing, so this was easy to miss.
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
       # 730b7d8e — npm forbids republishing an already-published version
       # (confirmed live: v0.1.9 tag run 28767217852 failed with real error

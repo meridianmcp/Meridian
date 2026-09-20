@@ -2,17 +2,35 @@
   "name": "@meridianmcp/mcp",
   "mcpName": "io.github.ajc3xc/meridian",
   "version": "0.1.0-pre-alpha",
-  "description": "Persistent memory, task coordination, and HITL queue for AI coding sessions. MCP server for Claude Code, Cursor, Windsurf, Codex CLI.",
-  "keywords": ["mcp", "claude", "cursor", "windsurf", "ai", "session", "coordination", "hitl"],
+  "description": "Persistent memory, task coordination, and HITL queue for AI coding sessions. MCP server for Claude Code, Cursor, Windsurf, Codex CLI. Also ships the meridian-latex structural LaTeX/Overleaf engine as a subpath (see latex/) and CLI (meridian-latex).",
+  "keywords": ["mcp", "claude", "cursor", "windsurf", "ai", "session", "coordination", "hitl", "latex", "overleaf"],
   "homepage": "https://usemeridian.us",
   "repository": {
     "type": "git",
     "url": "https://github.com/meridianmcp/Meridian.git"
   },
   "license": "MSL-1.0",
+  "type": "module",
   "bin": {
-    "meridian-mcp": "./bin/meridian-mcp.js"
+    "meridian-mcp": "./bin/meridian-mcp.cjs",
+    "meridian-latex": "./latex/cli.js"
   },
-  "engines": { "node": ">=18" },
-  "files": ["bin/", "README.md"]
+  "exports": {
+    "./latex": "./latex/index.js"
+  },
+  "engines": { "node": ">=22" },
+  "files": ["bin/", "latex/", "README.md"],
+  "scripts": {
+    "prepack": "node scripts/bundle-latex.mjs",
+    "test": "node scripts/bundle-latex.mjs && node scripts/smoke-test-bundle.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@unified-latex/unified-latex-types": "^1.8.4",
+    "@unified-latex/unified-latex-util-parse": "^1.8.4",
+    "better-sqlite3": "^13.0.3",
+    "chrome-launcher": "^1.2.1",
+    "chrome-remote-interface": "^0.34.0",
+    "ws": "^8.21.3"
+  }
 }
