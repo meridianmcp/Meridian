@@ -644,6 +644,7 @@ No auth required.
 | `POST` | `/admin/shutdown` | Gracefully stop the server process |
 | `GET` | `/admin/snapshot` | Download the current DB as a SQLite snapshot file |
 | `GET` | `/admin/stats` | d1cb1100 — launch/user stats for the admin Users widget: free-tier count |
+| `POST` | `/admin/tenants/{tenant_id}/reset-provisioning` | Reset a tenant back to a de-novo, never-provisioned state -- admin/ops |
 | `GET` | `/admin/waitlist` | Admin waitlist management page — shows signups, tenant stats, approve/delete buttons |
 | `DELETE` | `/admin/waitlist/{entry_id}` | Delete a waitlist entry by id. Admin only |
 
