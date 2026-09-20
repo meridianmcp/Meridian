@@ -101,8 +101,22 @@ jobs:
           TAG="${GITHUB_REF_NAME#meridian-latex-v}"
           npm version "$TAG" --no-git-tag-version --allow-same-version
       - name: Publish (pre-release tags get the "next" dist-tag, not "latest")
+        # Real bug found live (2026-09-19, the package's actual first publish
+        # attempt): this used to check the RAW tag ref (${GITHUB_REF_NAME},
+        # e.g. "meridian-latex-v0.1.0") for a hyphen -- but the
+        # "meridian-latex-v" prefix ITSELF contains hyphens, so this matched
+        # on every single tag, prerelease or not, and every publish tried to
+        # use the "next" dist-tag. npm's registry rejects a non-"latest"
+        # dist-tag on a package's very first-ever publish (404 Not Found on
+        # the PUT) -- which is exactly why this was never caught before: it
+        # had never been exercised against a real first publish until now.
+        # Fixed by stripping the "meridian-latex-v" prefix FIRST (same as the
+        # sync step above) and checking the remaining semver-shaped string
+        # for a hyphen -- the actual, correct prerelease indicator (e.g.
+        # "0.1.0-beta.1" vs "0.1.0").
         run: |
-          if [[ "${GITHUB_REF_NAME}" == *"-"* ]]; then
+          TAG="${GITHUB_REF_NAME#meridian-latex-v}"
+          if [[ "${TAG}" == *"-"* ]]; then
             npm publish --tag next
           else
             npm publish
