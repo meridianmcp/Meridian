@@ -1,4 +1,5 @@
 {
+  "name": "@meridianmcp/dashboard-workspace-root",
   "private": true,
   "type": "module",
   "workspaces": ["npm", "extensions/meridian-latex/engine"],
