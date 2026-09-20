@@ -1271,7 +1271,22 @@ async def _create_neon_pool_project(
                 "autoscaling_limit_min_cu": 0.25,
                 "autoscaling_limit_max_cu": autoscaling_limit_max_cu,
             },
-            "quota": quota,
+            # Real bug, live in production until 2026-09-20: `quota` was a
+            # direct sibling of `default_endpoint_settings` here, but Neon's
+            # actual Create Project schema nests it under `project.settings.
+            # quota` (confirmed against the Neon-authored MCP server's own
+            # create_project tool schema, which mirrors the real API and
+            # marks nested objects `additionalProperties: false`). Sending
+            # an unrecognized top-level `quota` key made Neon reject the
+            # WHOLE request with 400 Bad Request -- every new-pool-project
+            # creation failed outright, which only bit once the one
+            # existing (manually console-created) pool project filled up
+            # and the app needed to create a second one for the first time.
+            # New signups landed with no tenant DB at all (see _deps.py's
+            # "tenant database not provisioned" 503).
+            "settings": {
+                "quota": quota,
+            },
         }
     }
 
