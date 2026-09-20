@@ -16,7 +16,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "keywords": [
     "latex",
@@ -30,7 +30,7 @@
   "license": "SEE LICENSE IN LICENSE",
   "scripts": {
     "outline": "node src/cli.js outline",
-    "test": "node --test \"src/**/*.test.js\""
+    "test": "node --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
