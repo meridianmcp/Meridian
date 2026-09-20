@@ -11656,11 +11656,41 @@ async def delete_tenant_records(
     db: aiosqlite.Connection,
     tenant_id: str,
 ) -> None:
-    """Remove all records for a tenant from the main DB. Irreversible."""
+    """Remove all records for a tenant from the main (control-plane) DB.
+    Irreversible. Does NOT touch the tenant's own per-tenant project data --
+    that lives in its own Neon database, dropped separately via
+    ``_drop_tenant_neon_database`` (see routes/export.py's delete_account).
+
+    Real bug found 2026-09-20 while investigating this GDPR-required flow at
+    the user's request: this used to delete only user_sessions/api_tokens/
+    workspace_members before the tenants row itself. In production (Postgres)
+    both oauth_tokens and tenant_environments have a NO ACTION foreign key
+    to tenants(id) -- confirmed directly against the live schema -- so
+    deleting a tenant with ANY row in either table (i.e. anyone who ever
+    logged in via OAuth, the primary hosted-tier auth method) would fail
+    outright with an unhandled IntegrityError, never reaching the `tenants`
+    row at all. This went undetected because the one account manually
+    spot-checked for this investigation happened to be a long-dormant test
+    account with zero rows in either table -- exactly the kind of account
+    that makes broken cleanup logic look like it works.
+    Also now cleans up oauth_codes/oauth_refresh_tokens/device_codes/
+    registered_hostnames/provision_queue -- no hard FK on these (so their
+    absence never caused a crash), but leaving them behind after a
+    GDPR-motivated account deletion is exactly the kind of leftover PII this
+    endpoint exists to prevent. Order doesn't matter beyond "before tenants"
+    -- none of these reference each other, only tenants(id).
+    """
     for stmt, params in [
         ("DELETE FROM user_sessions WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM api_tokens WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM workspace_members WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM oauth_tokens WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM tenant_environments WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM oauth_codes WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM oauth_refresh_tokens WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM device_codes WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM registered_hostnames WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM provision_queue WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM tenants WHERE id = ?", (tenant_id,)),
     ]:
         await db.execute(stmt, params)
