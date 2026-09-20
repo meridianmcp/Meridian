@@ -1788,6 +1788,74 @@ async def _drop_tenant_neon_database(tenant: dict[str, Any]) -> None:
         pass
 
 
+async def reset_tenant_provisioning(db: Any, tenant_id: str) -> dict[str, Any]:
+    """Reset a tenant back to a de-novo, never-provisioned state -- WITHOUT
+    deleting the tenant itself. The tenant keeps its id/email/plan/
+    stripe_customer_id and can log back in immediately; the next project
+    creation attempt re-provisions a fresh Neon database exactly like a
+    brand-new signup would.
+
+    Admin/ops tool (see routes/control_plane.py's ``/admin/tenants/{id}/
+    reset-provisioning``), not customer self-service -- for re-testing
+    onboarding/provisioning against the same email without a full delete
+    (which cannot be undone) and re-signup cycle each time.
+
+    Distinct from ``delete_account`` (routes/export.py): that permanently
+    removes the tenant row and is irreversible; this only tears down and
+    re-blanks the PROVISIONING-related state, reusing the exact same
+    tenant-scoped ``_drop_tenant_neon_database`` the real delete flow uses
+    (never the whole shared pool project -- see run_churn_cleanup's own
+    2026-09-20 fix for why that distinction matters).
+
+    Returns a summary dict so a caller can verify what actually happened,
+    rather than silently trusting best-effort Neon API calls.
+    """
+    from . import db as db_module  # noqa: PLC0415
+
+    tenant = await db_module.get_tenant_by_id(db, tenant_id)
+    if tenant is None:
+        raise ValueError(f"tenant {tenant_id!r} not found")
+
+    had_neon_project = bool(tenant.get("neon_project_id"))
+    neon_project_id = tenant.get("neon_project_id")
+
+    if had_neon_project:
+        await _drop_tenant_neon_database(tenant)
+        try:
+            await db_module.decrement_pool_project_count(db, neon_project_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+    await db.execute(
+        "UPDATE tenants SET neon_project_id=NULL, pool_project_id=NULL, neon_db_url=NULL WHERE id=?",
+        (tenant_id,),
+    )
+    async with db.execute(
+        "SELECT COUNT(*) AS n FROM user_sessions WHERE tenant_id=?", (tenant_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    sessions_cleared = (row["n"] if isinstance(row, dict) else row[0]) if row else 0
+    await db.execute("DELETE FROM user_sessions WHERE tenant_id=?", (tenant_id,))
+
+    async with db.execute(
+        "SELECT COUNT(*) AS n FROM api_tokens WHERE tenant_id=?", (tenant_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    tokens_cleared = (row["n"] if isinstance(row, dict) else row[0]) if row else 0
+    await db.execute("DELETE FROM api_tokens WHERE tenant_id=?", (tenant_id,))
+
+    await db.commit()
+
+    return {
+        "tenant_id": tenant_id,
+        "email": tenant.get("email"),
+        "had_neon_project": had_neon_project,
+        "dropped_neon_project_id": neon_project_id if had_neon_project else None,
+        "sessions_cleared": sessions_cleared,
+        "api_tokens_cleared": tokens_cleared,
+    }
+
+
 async def send_account_deleted_email(email: str) -> None:
     """Send account deletion confirmation via Resend. Silently skips in dev."""
     api_key = _cfg("RESEND_API_KEY")
@@ -2318,6 +2386,8 @@ async def run_churn_cleanup(db: Any) -> None:
     import httpx
     from datetime import datetime, timedelta, timezone
 
+    from . import db as db_module  # noqa: PLC0415
+
     now = datetime.now(tz=timezone.utc)
     api_key = _cfg("RESEND_API_KEY")
     from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
@@ -2347,21 +2417,30 @@ async def run_churn_cleanup(db: Any) -> None:
         days_since = (now - cancelled_at).days
 
         if days_since >= 28:
-            # Delete Neon project and mark tenant fully inactive
+            # Drop this tenant's customer database and mark it fully inactive.
+            #
+            # Real bug found 2026-09-20 (never triggered in production --
+            # this function is defined but never actually called from
+            # anywhere, no scheduler/startup hook wires it up): this used to
+            # DELETE THE WHOLE NEON PROJECT (`DELETE /projects/{neon_id}`).
+            # Under the pool architecture, `neon_project_id` identifies a
+            # SHARED pool project housing up to _MAX_CUSTOMERS_PER_PROJECT
+            # (8) different tenants' own databases -- deleting the whole
+            # project on one tenant's churn would have destroyed every OTHER
+            # tenant sharing that pool. Fixed to reuse the same tenant-scoped
+            # `_drop_tenant_neon_database` the real, live `delete_account`
+            # endpoint already uses correctly (drops only this tenant's own
+            # `cust_<email>_<id>` database within the shared project), plus
+            # the matching pool-slot decrement that was also missing here.
             neon_id = tenant.get("neon_project_id")
             if neon_id:
+                await _drop_tenant_neon_database(tenant)
                 try:
-                    neon_key = _cfg("NEON_API_KEY")
-                    if neon_key:
-                        async with httpx.AsyncClient(timeout=15) as http:
-                            await http.delete(
-                                f"https://console.neon.tech/api/v2/projects/{neon_id}",
-                                headers={"Authorization": f"Bearer {neon_key}"},
-                            )
+                    await db_module.decrement_pool_project_count(db, neon_id)
                 except Exception:  # noqa: BLE001
                     pass
             await db.execute(
-                "UPDATE tenants SET neon_project_id=NULL, neon_db_url=NULL WHERE id=?",
+                "UPDATE tenants SET neon_project_id=NULL, neon_db_url=NULL, pool_project_id=NULL WHERE id=?",
                 (tenant["id"],),
             )
             await db.commit()

@@ -11326,6 +11326,63 @@ async def test_g210_is_internal_backfill_and_churn_cleanup_skip():
 
 
 @pytest.mark.asyncio
+async def test_churn_cleanup_drops_only_the_tenants_own_database(monkeypatch):
+    """Real bug found 2026-09-20 (never triggered in production -- this
+    function is dead code, never wired to any scheduler/startup hook):
+    run_churn_cleanup used to DELETE THE WHOLE NEON PROJECT on a churned
+    tenant's day-28 cleanup. Under the pool architecture a Neon project is
+    SHARED by up to 8 different tenants' own databases -- deleting it would
+    have destroyed every other tenant sharing that pool alongside the one
+    that actually churned. This asserts the fix: cleanup now calls the same
+    tenant-scoped _drop_tenant_neon_database the real, live delete_account
+    endpoint already uses correctly, and decrements the pool's customer
+    count -- never a whole-project delete.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from meridian import hosted as hosted_module
+
+    db = await db_module.init_db(":memory:")
+    try:
+        old_iso = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat().replace("+00:00", "Z")
+        await db.execute(
+            "INSERT INTO tenants (id, email, neon_project_id, pool_project_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("t-churned", "churned@example.com", "shared-pool-proj", "pool-row-1", old_iso),
+        )
+        await db.commit()
+
+        dropped = []
+
+        async def _fake_drop(tenant):
+            dropped.append(tenant["id"])
+
+        decremented = []
+
+        async def _fake_decrement(_db, neon_project_id):
+            decremented.append(neon_project_id)
+
+        monkeypatch.setattr(hosted_module, "_drop_tenant_neon_database", _fake_drop)
+        monkeypatch.setattr(db_module, "decrement_pool_project_count", _fake_decrement)
+
+        await hosted_module.run_churn_cleanup(db)
+
+        assert dropped == ["t-churned"], "must drop via the tenant-scoped helper, not a raw project DELETE"
+        assert decremented == ["shared-pool-proj"], "pool slot must be freed"
+
+        async with db.execute(
+            "SELECT neon_project_id, pool_project_id FROM tenants WHERE id='t-churned'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["neon_project_id"] is None
+        assert row["pool_project_id"] is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_start_session_returns_continuation_for_fresh_repeat():
     """G8.34 — re-calling start_session for the same session_name within the
     idle window returns a continuation block, not a brand-new registration."""

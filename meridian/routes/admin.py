@@ -257,6 +257,60 @@ async def admin_restart(request: Request) -> Response:
     return JSONResponse({"ok": True})
 
 
+@router.post("/admin/tenants/{tenant_id}/reset-provisioning")
+async def admin_reset_tenant_provisioning(tenant_id: str, request: Request) -> Response:
+    """Reset a tenant back to a de-novo, never-provisioned state -- admin/ops
+    tool for re-testing signup/provisioning against the same account without
+    a full (irreversible) account deletion + re-signup cycle each time.
+
+    Drops the tenant's own customer database (never the whole shared pool
+    project -- see hosted.reset_tenant_provisioning's docstring), clears its
+    Neon provisioning fields, and force-logs-out every existing session/API
+    token for that tenant. The tenant row itself, its email, plan, and
+    Stripe subscription are all left untouched -- this is NOT delete_account
+    (routes/export.py), which is permanent.
+
+    Requires an explicit ``{"confirm": true}`` body, matching admin_restart's
+    own confirmation pattern above.
+    """
+    from ..hosted import get_current_tenant, is_admin_db, check_admin_password, reset_tenant_provisioning  # noqa: PLC0415
+
+    if _is_demo_request(request):
+        return JSONResponse(
+            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
+            status_code=403,
+        )
+    try:
+        caller = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if not await is_admin_db(caller.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    if not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not (isinstance(body, dict) and body.get("confirm") is True):
+        return JSONResponse(
+            {
+                "warning": "This will drop the tenant's Neon database (if any) and "
+                           "log out every active session. The tenant account itself "
+                           "is kept. Confirm?",
+                "requires_confirm": True,
+            }
+        )
+
+    db = request.app.state.db
+    try:
+        result = await reset_tenant_provisioning(db, tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse({"reset": True, **result})
+
+
 @router.get("/admin/snapshot")
 async def download_snapshot(request: Request) -> Response:
     """Download the current DB as a SQLite snapshot file."""
