@@ -8426,8 +8426,27 @@ def _validate_omml_structure(omml_raw: str) -> ET.Element:
             missing = [child for child in required if child not in children]
             if missing:
                 raise ValueError(f"OMML <m:{name}> is missing required child element(s): {', '.join(missing)}")
-        if name in {"num", "den"} and element.find(_qm("e")) is None:
-            raise ValueError(f"OMML <m:{name}> must contain <m:e>")
+        if name in {"num", "den"} and len(element) == 0:
+            # 2026-09-22 — was `element.find(_qm("e")) is None`, which
+            # rejected real, valid OOXML math wherever a fraction's
+            # numerator/denominator holds its content directly (runs,
+            # `m:sSup`, etc.) rather than wrapped in an `m:e` element.
+            # Per the actual OOXML math schema, `m:num`/`m:den` (unlike
+            # `m:sSup`/`m:sSub`/`m:rad`/`m:func`/`m:d`/`m:acc`, which DO
+            # require an `m:e` base argument) are themselves argument
+            # containers — they do not need an additional `m:e` wrapper.
+            # Real-world equations (Word's own equation editor, LaTeX/
+            # MathType converters — anything not authored by this
+            # project's own `insert_equation` writer, which happens to
+            # always emit the `m:e`-wrapped shape) commonly place content
+            # directly inside `m:num`/`m:den`; the old check flagged all
+            # of it as malformed. What genuinely IS malformed is a
+            # numerator/denominator with NO content at all (`<m:num/>`),
+            # which this still catches — same "zero children" scope the
+            # `<m:oMath>`-body-empty check above already uses, for the
+            # same reason (a run with empty/whitespace text is a
+            # different, narrower case, deliberately left untouched here).
+            raise ValueError(f"OMML <m:{name}> is empty -- a fraction's {name} must contain at least one child element")
     flat = _omml_flatten_text_local(omml_raw).casefold()
     names = {el.tag.rsplit("}", 1)[-1] for el in root.iter() if "}" in el.tag}
     for marker, structural_names in _OMML_FALLBACK_MARKERS.items():
