@@ -264,7 +264,15 @@ def check_file(path: Path, index: dict[str, ModuleInfo]) -> list[Finding]:
     return findings
 
 
-def main() -> int:
+def run_check() -> tuple[list[Path], list[Finding]]:
+    """Walk the whole first-party source tree once and return every file
+    considered plus every orphaned-reference finding.
+
+    Factored out of `main()` (CI-PERF-4) so callers that need both the raw
+    finding list (e.g. a test asserting the repo is clean) and `main()`'s
+    printed/exit-code behavior (e.g. a test asserting its CLI output) can
+    share a single full-tree AST walk instead of each triggering their own.
+    """
     files = [p for p in iter_source_files() if p.name != SELF_NAME]
     index = build_module_index(files + [Path(__file__).resolve()])
 
@@ -273,6 +281,11 @@ def main() -> int:
         findings.extend(check_file(path, index))
 
     findings.sort(key=lambda f: (str(f.path), f.line_no, f.reference))
+    return files, findings
+
+
+def main() -> int:
+    files, findings = run_check()
     for f in findings:
         rel = f.path.relative_to(ROOT).as_posix()
         print(f"[{f.kind}] {rel}:{f.line_no} {f.reference} -- {f.reason}")
