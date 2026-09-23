@@ -40,6 +40,12 @@ from . import capability_availability as capability_availability_module
 from . import capability_contract as capability_contract_module
 from . import continuation_gate as continuation_gate_module
 from . import db as db_module
+# SECURITY (1e9527a2) — gates the raw-absolute-path leak in
+# regenerate_handoff_correction's new_handoff_path field below. _deps.py is a
+# leaf module (no imports back into handoff.py / server.py), so this is safe
+# from server.py's own "shared helpers live in _deps.py to avoid circular
+# imports" pattern.
+from ._deps import _hosted_mode
 from . import dependency_graph as _dependency_graph  # 83a7586d (fan-out/fan-in frontier)
 from . import docx_integrity_gate as docx_integrity_gate_module
 from .db import ai_log as ai_log_module
@@ -1237,7 +1243,17 @@ async def regenerate_handoff_correction(
         "regenerated": True,
         "already_regenerated": False,
         "new_handoff_id": new_handoff_id,
-        "new_handoff_path": path,
+        # SECURITY (1e9527a2) — ``path`` is an absolute SERVER filesystem path
+        # (str(out_path.resolve()), rooted at the process-global output_dir,
+        # e.g. /app/data/... on the Fly.io hosted tier). On hosted Meridian the
+        # caller and server are different trust boundaries (one process serves
+        # many tenants), so this must never reach the client verbatim — same
+        # leak class, same fix, as start_session's handoff_path (server.py).
+        # Self-hosted is unaffected: there the caller IS the server. The
+        # handoffs DB row (new_handoff_id, fetched via new_handoff_content
+        # above) remains the canonical, Postgres-backed source of truth either
+        # way — this only changes what's echoed back over the wire.
+        "new_handoff_path": (None if _hosted_mode() else path),
         "new_handoff_content": content,
         "new_token": new_token,
         "new_body_hash": new_body_hash,
