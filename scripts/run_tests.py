@@ -1410,26 +1410,40 @@ def main(argv: list[str] | None = None) -> int:
             owner_session=os.environ.get("MERIDIAN_SESSION_ID") or None,
         )
         tracker.mark_collecting()
-        collected, code = collect_count(pytest_args)
-        if code:
-            tracker.mark_terminal(STATE_CRASHED, exit_code=code, error="collection preflight failed")
-            return code
-        if collected is None:
-            print("Could not determine collected test count; refusing to guess scheduling.", file=sys.stderr)
-            tracker.mark_terminal(STATE_CRASHED, exit_code=2, error="could not determine collected test count")
-            return 2
+        # CI-PERF-1 -- when --serial already forces serial scheduling,
+        # build_run_args never looks at the real collected count (it's
+        # called with effective_count=0, which always selects "-p
+        # no:xdist"), so spending an entire extra pytest subprocess here
+        # just to *count* tests is pure overhead with no effect on
+        # scheduling. Skip the collect-only preflight entirely in that
+        # case; collected stays None, matching TestRunRecord.collected_count's
+        # existing Optional default.
+        if ns.serial:
+            collected = None
+            effective_count = 0
+            mode = "serial (forced)"
+        else:
+            collected, code = collect_count(pytest_args)
+            if code:
+                tracker.mark_terminal(STATE_CRASHED, exit_code=code, error="collection preflight failed")
+                return code
+            if collected is None:
+                print("Could not determine collected test count; refusing to guess scheduling.", file=sys.stderr)
+                tracker.mark_terminal(STATE_CRASHED, exit_code=2, error="could not determine collected test count")
+                return 2
+            effective_count = collected
+            mode = "serial" if collected <= serial_threshold else f"auto/worksteal (max {max_workers})"
         tracker.record.collected_count = collected
-        effective_count = 0 if ns.serial else collected
         run_args = build_run_args(
             pytest_args,
             effective_count,
             serial_threshold=serial_threshold,
             max_workers=max_workers,
         )
-        mode = "serial (forced)" if ns.serial else (
-            "serial" if collected <= serial_threshold else f"auto/worksteal (max {max_workers})"
-        )
-        print(f"Meridian test policy: {collected} tests -> {mode}", flush=True)
+        if collected is None:
+            print(f"Meridian test policy: {mode} (collection preflight skipped)", flush=True)
+        else:
+            print(f"Meridian test policy: {collected} tests -> {mode}", flush=True)
 
         wall_timeout = float(
             os.environ.get("MERIDIAN_TEST_WALL_TIMEOUT_SECONDS", DEFAULT_WALL_TIMEOUT_SECONDS)
