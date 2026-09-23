@@ -448,9 +448,23 @@ def _run_hook(
 
 @_needs_bash
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_hook_fails_open_when_server_unreachable(tool):
-    """MERIDIAN_URL on an unbound port -- connection refused, hook exits 0."""
+def test_hook_fails_open_when_server_unreachable():
+    """MERIDIAN_URL on an unbound port -- connection refused, hook exits 0.
+
+    CI-PERF-5: this was parametrized over tool=["Grep", "Glob"], spawning the
+    real bash subprocess twice. The hook's Grep|Glob case-statement gate (see
+    code_intel_guard.sh) runs BEFORE this unreachable-server check, so once a
+    tool value passes the gate the rest of the path is identical for Grep and
+    Glob -- the tool name only ever resurfaces verbatim in an interpolated
+    log message, never in a branch condition. Varying it here can't catch a
+    gate-matching bug either: an incorrectly-gated tool would ALSO exit 0 (as
+    unmatched passthrough), making the two outcomes indistinguishable. Real
+    per-tool coverage (does the gate recognize both "Grep" and "Glob") lives
+    in test_hook_blocks_grep_glob_when_code_intel_enabled and
+    test_hook_stderr_names_the_tool_that_was_blocked, which keep the axis
+    because the block path is the only one where a gate-matching bug would
+    actually surface (exit 2 vs exit 0)."""
+    tool = "Grep"
     payload = json.dumps({"tool_name": tool, "tool_input": {}})
     r = _run_hook(payload, meridian_url=_free_url())
     assert r.returncode == 0, f"{tool}: must fail open when server is unreachable"
@@ -462,9 +476,14 @@ def test_hook_fails_open_when_server_unreachable(tool):
 
 @_needs_bash
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_hook_fails_open_when_code_intel_disabled(tool):
-    """code_intel_enabled=0 -- no index, hook exits 0 (nothing to redirect to)."""
+def test_hook_fails_open_when_code_intel_disabled():
+    """code_intel_enabled=0 -- no index, hook exits 0 (nothing to redirect to).
+
+    CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_hook_fails_open_when_server_unreachable's docstring for why it can't
+    catch a gate-matching bug here) -- was spawning the real bash subprocess
+    twice for an identical code path."""
+    tool = "Glob"
     url, stub = _start_stub_server(code_intel_enabled=0)
     try:
         payload = json.dumps({"tool_name": tool, "tool_input": {}})
@@ -559,12 +578,15 @@ def test_hook_fails_open_on_unparseable(payload):
 
 @_needs_bash
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_hook_fails_open_when_slot_readiness_unreachable_but_settings_ok(tool):
+def test_hook_fails_open_when_slot_readiness_unreachable_but_settings_ok():
     """settings reports code_intel_enabled=1, but /slot-readiness errors
     (HTTP 500 -> curl -sf fails -> empty slot_resp). Before 883ce543 this fell
     through the `if [ -n "$slot_resp" ]` guard straight to the block path --
-    the opposite of the documented fail-open policy."""
+    the opposite of the documented fail-open policy.
+
+    CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_hook_fails_open_when_server_unreachable's docstring)."""
+    tool = "Grep"
     url, handle, tmpfile = _start_custom_slot_stub(
         code_intel_enabled=1, slot_status=500, slot_body="internal error"
     )
@@ -581,12 +603,15 @@ def test_hook_fails_open_when_slot_readiness_unreachable_but_settings_ok(tool):
 
 @_needs_bash
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_hook_fails_open_when_slot_readiness_body_unparseable(tool):
+def test_hook_fails_open_when_slot_readiness_body_unparseable():
     """settings reports code_intel_enabled=1, /slot-readiness returns HTTP 200
     but a body with no extractable ready/has_tunnel fields (neither jq nor the
     regex fallback can populate them). Before 883ce543 this also fell through
-    to block instead of failing open."""
+    to block instead of failing open.
+
+    CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_hook_fails_open_when_server_unreachable's docstring)."""
+    tool = "Glob"
     url, handle, tmpfile = _start_custom_slot_stub(
         code_intel_enabled=1, slot_status=200, slot_body="not json at all"
     )
@@ -603,12 +628,15 @@ def test_hook_fails_open_when_slot_readiness_body_unparseable(tool):
 
 @_needs_bash
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_hook_fails_open_when_slot_readiness_json_missing_fields(tool):
+def test_hook_fails_open_when_slot_readiness_json_missing_fields():
     """/slot-readiness returns valid JSON (200) but omits ready/has_tunnel
     entirely -- jq's `.ready | tostring` yields "null" (not true/false) and
     the regex finds no match either way, so both stay unconfirmed. Must fail
-    open, never block on an unconfirmed value."""
+    open, never block on an unconfirmed value.
+
+    CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_hook_fails_open_when_server_unreachable's docstring)."""
+    tool = "Grep"
     url, handle, tmpfile = _start_custom_slot_stub(
         code_intel_enabled=1, slot_status=200, slot_body="{}"
     )
@@ -767,8 +795,14 @@ def _run_ps1_hook(payload: str, *, meridian_url: str) -> subprocess.CompletedPro
 
 @_needs_powershell
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_ps1_hook_fails_open_when_code_intel_disabled(tool):
+def test_ps1_hook_fails_open_when_code_intel_disabled():
+    """CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis -- the PS1
+    hook's `$tool -ne 'Grep' -and $tool -ne 'Glob'` gate runs before this
+    check, so once a value passes the gate the rest of the path (and this
+    fail-open outcome) is identical for Grep and Glob; the only place a
+    gate-matching bug could actually surface is the block path, where
+    test_ps1_hook_blocks_when_validated_ready_and_tunnel keeps both values."""
+    tool = "Glob"
     url, srv, _t = _start_plain_stub(code_intel_enabled=0)
     try:
         payload = json.dumps({"tool_name": tool, "tool_input": {}})
@@ -780,8 +814,10 @@ def test_ps1_hook_fails_open_when_code_intel_disabled(tool):
 
 @_needs_powershell
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_ps1_hook_fails_open_when_server_unreachable(tool):
+def test_ps1_hook_fails_open_when_server_unreachable():
+    """CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_ps1_hook_fails_open_when_code_intel_disabled's docstring)."""
+    tool = "Grep"
     payload = json.dumps({"tool_name": tool, "tool_input": {}})
     r = _run_ps1_hook(payload, meridian_url=_free_url())
     assert r.returncode == 0, f"{tool}: ps1 hook must fail open when server is unreachable"
@@ -789,11 +825,14 @@ def test_ps1_hook_fails_open_when_server_unreachable(tool):
 
 @_needs_powershell
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_ps1_hook_fails_open_when_slot_readiness_unreachable(tool):
+def test_ps1_hook_fails_open_when_slot_readiness_unreachable():
     """883ce543 (PS1 side): code_intel_enabled=1 but /slot-readiness errors
     (HTTP 500 -> Invoke-RestMethod throws, caught -> $slotResp stays $null).
-    Must fail open, not fall through to block."""
+    Must fail open, not fall through to block.
+
+    CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_ps1_hook_fails_open_when_code_intel_disabled's docstring)."""
+    tool = "Glob"
     url, srv, _t = _start_plain_stub(code_intel_enabled=1, slot_status=500, slot_body="err")
     try:
         payload = json.dumps({"tool_name": tool, "tool_input": {}})
@@ -808,11 +847,14 @@ def test_ps1_hook_fails_open_when_slot_readiness_unreachable(tool):
 
 @_needs_powershell
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_ps1_hook_fails_open_when_slot_readiness_malformed(tool):
+def test_ps1_hook_fails_open_when_slot_readiness_malformed():
     """883ce543 (PS1 side): code_intel_enabled=1, /slot-readiness returns 200
     with a non-JSON body (Invoke-RestMethod throws parsing it, caught). Must
-    fail open, not fall through to block."""
+    fail open, not fall through to block.
+
+    CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_ps1_hook_fails_open_when_code_intel_disabled's docstring)."""
+    tool = "Grep"
     url, srv, _t = _start_plain_stub(
         code_intel_enabled=1, slot_status=200, slot_body="not json at all"
     )
@@ -829,11 +871,14 @@ def test_ps1_hook_fails_open_when_slot_readiness_malformed(tool):
 
 @_needs_powershell
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_ps1_hook_fails_open_when_slot_readiness_missing_fields(tool):
+def test_ps1_hook_fails_open_when_slot_readiness_missing_fields():
     """883ce543 (PS1 side): valid JSON (200) but missing ready/has_tunnel
     entirely -- $slotResp.ready and $slotResp.has_tunnel resolve to $null,
-    which is neither -eq $true nor -eq $false. Must fail open."""
+    which is neither -eq $true nor -eq $false. Must fail open.
+
+    CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_ps1_hook_fails_open_when_code_intel_disabled's docstring)."""
+    tool = "Glob"
     url, srv, _t = _start_plain_stub(code_intel_enabled=1, slot_status=200, slot_body="{}")
     try:
         payload = json.dumps({"tool_name": tool, "tool_input": {}})
@@ -848,8 +893,10 @@ def test_ps1_hook_fails_open_when_slot_readiness_missing_fields(tool):
 
 @_needs_powershell
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_ps1_hook_fails_open_when_ready_false(tool):
+def test_ps1_hook_fails_open_when_ready_false():
+    """CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_ps1_hook_fails_open_when_code_intel_disabled's docstring)."""
+    tool = "Grep"
     url, srv, _t = _start_plain_stub(
         code_intel_enabled=1,
         slot_body=json.dumps({"ready": False, "has_tunnel": True}),
@@ -865,8 +912,10 @@ def test_ps1_hook_fails_open_when_ready_false(tool):
 
 @_needs_powershell
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
-def test_ps1_hook_fails_open_when_has_tunnel_false(tool):
+def test_ps1_hook_fails_open_when_has_tunnel_false():
+    """CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis (see
+    test_ps1_hook_fails_open_when_code_intel_disabled's docstring)."""
+    tool = "Glob"
     url, srv, _t = _start_plain_stub(
         code_intel_enabled=1,
         slot_body=json.dumps({"ready": True, "has_tunnel": False}),
@@ -906,7 +955,6 @@ def test_ps1_hook_blocks_when_validated_ready_and_tunnel(tool):
 
 @_needs_powershell
 @pytest.mark.subprocess_isolated
-@pytest.mark.parametrize("tool", ["Grep", "Glob"])
 @pytest.mark.parametrize(
     "slot_body",
     [
@@ -916,7 +964,7 @@ def test_ps1_hook_blocks_when_validated_ready_and_tunnel(tool):
         json.dumps({"ready": 1, "has_tunnel": 1}),
     ],
 )
-def test_ps1_hook_fails_open_on_non_boolean_ready_or_tunnel(tool, slot_body):
+def test_ps1_hook_fails_open_on_non_boolean_ready_or_tunnel(slot_body):
     """Verifier-found gap (post-883ce543 fix): PowerShell's -eq coerces its
     RHS to the LHS's type, so a non-boolean truthy JSON value like ready=1
     (int) or ready="true" (string) made "$slotReady -eq $true" coerce
@@ -924,7 +972,16 @@ def test_ps1_hook_fails_open_on_non_boolean_ready_or_tunnel(tool, slot_body):
     should fail open -- diverging from code_intel_guard.sh, whose jq/regex
     path only ever matches the literal strings "true"/"false". Must fail
     open (exit 0) for every one of these malformed-but-truthy shapes,
-    identically to the .sh hook."""
+    identically to the .sh hook.
+
+    CI-PERF-5: dropped the redundant tool=["Grep", "Glob"] axis that was
+    cross-multiplying with slot_body (2x4 = 8 real PowerShell subprocess
+    spawns -> 4). Both axes independently vary orthogonal, non-interacting
+    inputs (the coercion bug lives in the ready/has_tunnel comparison, not in
+    which of Grep/Glob was passed) -- see
+    test_ps1_hook_fails_open_when_code_intel_disabled's docstring for why the
+    tool value alone can't add coverage here."""
+    tool = "Grep"
     url, srv, _t = _start_plain_stub(code_intel_enabled=1, slot_body=slot_body)
     try:
         payload = json.dumps({"tool_name": tool, "tool_input": {}})
