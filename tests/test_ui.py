@@ -589,6 +589,33 @@ def test_dashboard_open_in_claude_not_dominant(client):
     )
 
 
+def test_vtab_strip_scrolls_instead_of_clipping(client):
+    """52218bb7 — the vtab rail's ancestor (.tab-body) is `overflow: hidden`.
+
+    Without the strip handling its own vertical overflow, a project with more
+    vtabs than fit in the rail's height gets those extra icons silently
+    CLIPPED by the ancestor instead of made reachable via scroll. The strip
+    must own its overflow (scroll), not rely on the ancestor to clip it.
+    """
+    import re
+
+    css = client.get("/static/dashboard.css").text
+    m = re.search(r'\.vtab-strip\s*\{([^}]+)\}', css)
+    assert m, ".vtab-strip CSS rule not found"
+    rule = m.group(1)
+    assert re.search(r'overflow-y\s*:\s*(auto|scroll)', rule), (
+        "Bug: .vtab-strip has no overflow-y: auto/scroll — extra vtab icons "
+        "beyond the rail's height are clipped by the .tab-body ancestor's "
+        "overflow: hidden instead of being scrollable."
+    )
+    # The strip is only 44px wide — horizontal scroll would be a broken glitch,
+    # not a fix, so it must be explicitly suppressed rather than left auto.
+    assert re.search(r'overflow-x\s*:\s*hidden', rule), (
+        ".vtab-strip should suppress horizontal overflow (it is a fixed-width "
+        "icon rail, not something that should scroll sideways)."
+    )
+
+
 def test_dashboard_live_tab_has_progress_bar(client, js):
     """LIVE tab shows a sprint progress bar ([████░░] done/total).
 
