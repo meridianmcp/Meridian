@@ -8393,7 +8393,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // node_modules/preact/dist/preact.module.js
+  // ../repository/node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -8652,7 +8652,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // node_modules/preact/hooks/dist/hooks.module.js
+  // ../repository/node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8793,7 +8793,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // ../repository/node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -9646,7 +9646,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // node_modules/zustand/esm/vanilla.mjs
+  // ../repository/node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
@@ -11206,7 +11206,7 @@ Existing folders: ${existing.join(", ")}` : "";
     const folder = (next || "").trim();
     toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
   }
-  async function _makeSubproject(t3) {
+  async function _makeSubproject(t3, anchor) {
     const candidates = eligibleParents(state.projects, t3.id);
     if (!candidates.length) {
       if (state.projects.some((p3) => p3.parent_project_id === t3.id)) {
@@ -11216,35 +11216,65 @@ Existing folders: ${existing.join(", ")}` : "";
       }
       return;
     }
-    const lines = candidates.map((p3, i3) => `${i3 + 1}. ${p3.name}`).join("\n");
-    const raw = window.prompt(
-      `Make "${t3.project.name}" a subproject of which project?
-
-${lines}
-
-Enter a number (or leave blank to cancel):`,
-      ""
-    );
-    if (raw === null) return;
-    const idx = parseInt(raw.trim(), 10) - 1;
-    if (Number.isNaN(idx) || idx < 0 || idx >= candidates.length) {
-      if (raw.trim() !== "") toast("Invalid selection", true);
-      return;
+    document.querySelectorAll(".subproject-parent-picker").forEach((d3) => d3.remove());
+    const sel = document.createElement("select");
+    sel.className = "subproject-parent-picker";
+    sel.style.cssText = "position:fixed;z-index:1002;background:var(--surface-2);color:var(--text);font-size:11px;font-family:var(--font-mono);border:1px solid var(--border);border-radius:4px;padding:4px 6px;cursor:pointer;outline:none;box-shadow:0 4px 12px rgba(0,0,0,0.4)";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = `Make "${t3.project.name}" a subproject of\u2026`;
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    sel.appendChild(placeholder);
+    candidates.forEach((p3) => {
+      const opt = document.createElement("option");
+      opt.value = p3.id;
+      opt.textContent = p3.name || "";
+      sel.appendChild(opt);
+    });
+    const rect = anchor && typeof anchor.getBoundingClientRect === "function" ? anchor.getBoundingClientRect() : { left: 0, bottom: 0, width: 200 };
+    sel.style.left = rect.left + "px";
+    sel.style.top = rect.bottom + 4 + "px";
+    sel.style.minWidth = Math.max(rect.width, 200) + "px";
+    document.body.appendChild(sel);
+    sel.focus({ preventScroll: true });
+    if (typeof sel.showPicker === "function") {
+      try {
+        sel.showPicker();
+      } catch (_2) {
+        sel.click();
+      }
+    } else {
+      sel.click();
     }
-    const parent = candidates[idx];
-    try {
-      await api(`/projects/${t3.id}/parent`, {
-        method: "POST",
-        body: JSON.stringify({ parent_project_id: parent.id })
-      });
-      t3.project = { ...t3.project, parent_project_id: parent.id };
-      const proj = state.projects.find((p3) => p3.id === t3.id);
-      if (proj) proj.parent_project_id = parent.id;
-      await loadProjects();
-      toast(`"${t3.project.name}" is now a subproject of "${parent.name}"`);
-    } catch (e3) {
-      toast("Could not set parent: " + e3.message, true);
-    }
+    let pickerRemoved = false;
+    const removeSel = () => {
+      if (pickerRemoved) return;
+      pickerRemoved = true;
+      try {
+        sel.remove();
+      } catch (_2) {
+      }
+    };
+    sel.onblur = () => removeSel();
+    sel.onchange = async () => {
+      const parent = candidates.find((p3) => p3.id === sel.value);
+      removeSel();
+      if (!parent) return;
+      try {
+        await api(`/projects/${t3.id}/parent`, {
+          method: "POST",
+          body: JSON.stringify({ parent_project_id: parent.id })
+        });
+        t3.project = { ...t3.project, parent_project_id: parent.id };
+        const proj = state.projects.find((p3) => p3.id === t3.id);
+        if (proj) proj.parent_project_id = parent.id;
+        await loadProjects();
+        toast(`"${t3.project.name}" is now a subproject of "${parent.name}"`);
+      } catch (e3) {
+        toast("Could not set parent: " + e3.message, true);
+      }
+    };
   }
   async function _detachSubproject(t3) {
     try {
@@ -11438,7 +11468,7 @@ Enter a number (or leave blank to cancel):`,
     if (t3.project && t3.project.parent_project_id) {
       menuItem("\u2934 Detach from parent", () => _detachSubproject(t3));
     } else {
-      menuItem("\u{1F517} Make subproject of\u2026", () => _makeSubproject(t3));
+      menuItem("\u{1F517} Make subproject of\u2026", () => _makeSubproject(t3, anchor));
     }
     menuItem("\u2B07 Download DB", () => window.open("/admin/snapshot", "_blank"));
     menuItem("\u{1F5D1} Delete project\u2026", () => _deleteProject(t3));
