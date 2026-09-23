@@ -315,3 +315,65 @@ def test_activity_not_recorded_for_skip_tools(client):
     tool_names = [e["tool_name"] for e in result["activity"]]
     assert "get_session_log" not in tool_names
     assert "get_session_activity" not in tool_names
+
+
+# ---------------------------------------------------------------------------
+# b0ed079a — connection_events and session_activity must not be blind to a
+# tool-level exception raised during tools/call.
+# ---------------------------------------------------------------------------
+
+
+def test_tool_exception_recorded_in_session_activity_and_connection_events(
+    client, monkeypatch,
+):
+    """A tool call that raises is still turned into the same JSON-RPC error as
+    before (behavior unchanged), but the failure is now durably recorded:
+    once in session_activity (via _handle_mcp_request's except-block, mirroring
+    the existing executor-session activity heartbeat) and once in
+    connection_events (via a distinct auth_result/response_status), instead of
+    leaving zero trace in either.
+    """
+    pid, headers = _setup_authed_project(client, "exc-trace-test")
+    r2 = _mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "exc-sess", "role": "executor"
+    }, headers)
+    sid = json.loads(r2.json()["result"]["content"][0]["text"]).get("session_id")
+    assert sid
+
+    async def _boom(*_a, **_kw):
+        raise RuntimeError("synthetic failure for regression test")
+
+    # log_task's own handler calls db_module.log_task with no surrounding
+    # try/except, so this raises uncaught all the way up through
+    # _dispatch_mcp_tool into _handle_mcp_request's tools/call except-block —
+    # a realistic stand-in for any genuine tool-level exception.
+    monkeypatch.setattr(db_module, "log_task", _boom)
+
+    resp = _mcp_call(client, "log_task", {
+        "session_id": sid, "project_id": pid, "description": "trigger failure",
+    }, headers)
+
+    # Unchanged behavior: still a 200 HTTP response carrying a JSON-RPC error,
+    # never a raw 500 or an unhandled traceback.
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "error" in body
+    assert "synthetic failure" in body["error"]["message"]
+
+    # session_activity: the failed call is now visible.
+    activity_resp = _mcp_call(client, "get_session_activity", {"session_id": sid}, headers)
+    activity = _result(activity_resp)
+    matches = [e for e in activity["activity"] if e["tool_name"] == "log_task"]
+    assert matches, f"expected a log_task session_activity entry, got: {activity['activity']}"
+    assert "RuntimeError" in matches[0]["summary"]
+    assert "synthetic failure" in matches[0]["summary"]
+
+    # connection_events: distinguishable from a normal success.
+    async def _fetch_connection_log():
+        return await db_module.get_connection_log(client.app.state.db, tenant_id=None, limit=50)
+
+    conn_rows = asyncio.run(_fetch_connection_log())
+    tool_error_rows = [r for r in conn_rows if r.get("auth_result") == "tool_error"]
+    assert tool_error_rows, f"expected a tool_error connection_events row, got: {conn_rows}"
+    assert tool_error_rows[0]["method"] == "tools/call"
+    assert tool_error_rows[0]["response_status"] == 500
