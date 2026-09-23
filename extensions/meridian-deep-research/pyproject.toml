@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+# da8fbeec / packaging-plan (2026-09-23) -- the distribution name must NOT be
+# "open-deep-research"/"open_deep_research": that exact hyphenated name is the
+# real upstream PyPI package (langchain-ai/open_deep_research, pinned below)
+# and reusing it recreates the uvx `--from <path> <entry-point>` name-collision
+# bug extensions/meridian-docs/pyproject.toml already documents and works
+# around (6ee033c0) -- `uvx --from <local-path> <name>` can still attempt a
+# PyPI registry lookup when the distribution name matches the trailing
+# command argument. "meridian-deep-research-mcp" removes the ambiguity at the
+# source, same fix as meridian-docs-mcp.
+name = "meridian-deep-research-mcp"
+description = "Thin MCP stdio server wrapping langchain-ai/open_deep_research's compiled LangGraph agent as Meridian's deep-research capability -- configured Anthropic-only (Claude models + Anthropic native web_search), no OpenAI/Tavily keys required."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Adam Camerer" }]
+keywords = ["mcp", "deep-research", "langgraph", "anthropic", "agents"]
+version = "0.1.0"
+dependencies = [
+    # 106caa76 -- mcp pinned below the v2 major across every sibling
+    # extension: an isolated `uvx --from <path>` child can resolve mcp==2.0.0,
+    # which removed the `mcp.server.fastmcp` import this server uses,
+    # crashing on startup. See tests/test_tunnel_extension_dependencies.py in
+    # the parent repo for the regression coverage this mirrors.
+    "mcp>=1.27,<2",
+    # da8fbeec -- exact pin, not a floor. open_deep_research (langchain-ai,
+    # MIT) is the real upstream research agent we wrap, not something we
+    # re-implement. Exact-pinned (rather than >=) because upstream has had no
+    # substantive release in over a year (last real README update
+    # 2025-08-14, last PyPI release 0.0.16 was 2025-07-16) and its own
+    # Configuration surface (search_api/model fields -- see server.py) is
+    # exactly what this wrapper depends on; a silent upstream minor bump
+    # could change field names or defaults under us with no warning.
+    # Deliberately does NOT re-declare open_deep_research's own ~30
+    # transitive deps (langgraph, langchain-openai/anthropic/community,
+    # azure-*/boto3/google-cloud-* optional-provider SDKs, pandas,
+    # ipykernel, ...) -- its own pyproject.toml declares all of them and pip
+    # resolves them transitively on install.
+    "open-deep-research==0.0.16",
+]
+
+[project.scripts]
+# Entry-point is "meridian-deep-research-mcp" (matches the distribution name)
+# for the same uvx name-collision reason documented above.
+meridian-deep-research-mcp = "meridian_deep_research.server:main"
+
+[project.urls]
+Homepage = "https://usemeridian.us"
+Source = "https://github.com/meridianmcp/meridian"
+
+[tool.hatch.build.targets.wheel]
+packages = ["meridian_deep_research"]
