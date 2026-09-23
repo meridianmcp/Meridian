@@ -1,0 +1,60 @@
+# Pinned dependency versions for artifact reproduction.
+#
+# This is NOT a full transitive-dependency lockfile (e.g. a pip-compile or
+# uv-lock output) -- see "Why not a full freeze" below for why. It pins
+# exactly the versions this package's own run harness actually recorded
+# using the reported paper's results, and nothing beyond that with
+# fabricated precision.
+#
+# == The three version-sensitive dependencies, pinned to recorded evidence ==
+#
+# These three are the ones a real run manifest from an execution against
+# this artifact's controlled corpus actually recorded (see this paper's own
+# Artifact Availability section, and any run-manifest.json under this
+# repository's results/ tree, e.g.
+# results/meridian-outputs-ablations/controlled/baseline-runs-secretcomplete-20260919/
+# */*/run-manifest.json), pinned here to those exact recorded values:
+duckdb==1.5.4
+tantivy==0.26.0
+xxhash==3.8.1
+# Python 3.12.13 was the interpreter version recorded alongside them
+# (Windows-11-10.0.26200-SP0). requirements-lock.txt cannot pin an
+# interpreter version; use pyenv/uv/pixi's own python pin for that (see
+# pyproject.toml's requires-python = ">=3.11,<3.13").
+
+# == Remaining declared dependencies: floor-pinned only, by design ==
+#
+# mcp, watchdog, pyarrow, psutil, and pypdf are all declared as real,
+# non-optional dependencies in pyproject.toml, but the run harness that
+# produced this paper's numbers never recorded their exact resolved
+# versions (only duckdb/tantivy/xxhash are instrumented for that). Per
+# pyproject.toml's own dependency comments, each of pyarrow/psutil/xxhash
+# already has a documented lazy-import-and-degrade fallback path in
+# outputs_local.py if the dependency is ever missing at runtime -- meaning
+# their exact version affects PERFORMANCE (a fast path taken or not), not
+# the CORRECTNESS of any number reported in this paper. Pinning them here
+# to an unverified exact version would manufacture false precision this
+# project's own evidentiary standard does not accept elsewhere; the
+# version floors already declared in pyproject.toml (mcp>=1.27,<2,
+# watchdog>=4.0, pyarrow>=14.0, psutil>=5.9, pypdf>=4.0) are the actual,
+# honestly-supportable constraint for these five.
+mcp>=1.27,<2
+watchdog>=4.0
+pyarrow>=14.0
+psutil>=5.9
+pypdf>=4.0
+
+# == Why not a full freeze (`pip freeze` / `uv pip compile`) ==
+#
+# A full freeze was attempted from this package's own committed .venv
+# (2026-09-19) and DELIBERATELY discarded: that venv had already drifted
+# from what actually produced the paper's results (duckdb 1.5.5 in the
+# venv vs. 1.5.4 recorded in the real run manifest; xxhash 4.0.0 vs. 3.8.1)
+# -- an ordinary consequence of a long-lived local dev venv picking up
+# routine upstream patch releases over time, not a bug, but exactly the
+# kind of silent drift this file exists to prevent from being mistaken for
+# ground truth. Freezing that venv's current state and presenting it as
+# "the versions used for this paper" would have been a fabricated-precision
+# claim of the same kind this project has caught and corrected elsewhere
+# (see the paper's own disclosed corrections throughout its evaluation
+# sections). This file pins only what real evidence backs.
