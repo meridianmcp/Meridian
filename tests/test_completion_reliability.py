@@ -148,6 +148,14 @@ async def test_wave_run_bookkeeping_hang_does_not_block_completion(db, monkeypat
 
     from meridian.db import wave_runs as wave_runs_module
 
+    # CI-PERF-3A: _ADVISORY_PHASE_TIMEOUT_S is already a monkeypatchable
+    # module constant (meridian/db/sprint_items.py) — shrink it so this test
+    # doesn't actually wait out the real 5s advisory bound. complete_sprint_
+    # item's own asyncio.wait_for cancels the hang at this (now tiny) timeout
+    # regardless of how long the mock below would otherwise sleep, so the
+    # mechanism under test (fail-open on a hung advisory phase) is exercised
+    # identically, just fast.
+    monkeypatch.setattr(sprint_items_module, "_ADVISORY_PHASE_TIMEOUT_S", 0.05)
     _timeout_s = sprint_items_module._ADVISORY_PHASE_TIMEOUT_S
     _hang_s = _timeout_s + 3.0  # comfortably longer than the bound
 
