@@ -126,7 +126,17 @@ html, body {
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column; align-items: center;
   padding-top: 6px; gap: 2px; z-index: 20; position: relative;
+  /* 52218bb7 — the strip's ancestor (.tab-body) is `overflow: hidden`. Without
+     its own overflow handling, a rail with more vtabs than fit vertically gets
+     silently CLIPPED by that ancestor instead of scrolling. Scope overflow to
+     the strip itself so extra icons stay reachable via scroll. */
+  overflow-y: auto; overflow-x: hidden;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
 }
+.vtab-strip::-webkit-scrollbar { width: 6px; }
+.vtab-strip::-webkit-scrollbar-track { background: transparent; }
+.vtab-strip::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.vtab-strip::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 .vtab-btn {
   width: 36px; height: 36px; border-radius: 6px;
   background: transparent; border: none; cursor: pointer;
