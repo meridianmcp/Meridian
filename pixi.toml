@@ -207,9 +207,23 @@ Pillow = ">=10.0"
 model2vec = ">=0.3"
 psutil = ">=5.9"
 
+# da8fbeec -- extensions/meridian-deep-research wraps langchain-ai/
+# open_deep_research (exact-pinned open-deep-research==0.0.16 in that
+# package's own pyproject.toml) as Meridian's deep-research MCP tool. OPT-IN
+# feature, mirroring the (as yet unmerged-to-dev) meridian-docs-mcp
+# [feature.docs.pypi-dependencies] editable-path pattern -- NOT
+# meridian-outputs' default-env mirroring above. open_deep_research pulls in
+# ~30 transitive dependencies (LangGraph, langchain-openai/-anthropic/
+# -community, the optional Azure/AWS/GCP provider SDKs, pandas, ipykernel,
+# ...); nobody running a plain `pixi run` should pay that install cost by
+# default just to get the rest of Meridian working.
+[feature.deep_research.pypi-dependencies]
+meridian-deep-research-mcp = { path = "extensions/meridian-deep-research", editable = true }
+
 [environments]
 dev = { features = ["dev"], solve-group = "default" }
 semantic = { features = ["semantic"], solve-group = "default" }
+deep_research = { features = ["deep_research"], solve-group = "default" }
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
