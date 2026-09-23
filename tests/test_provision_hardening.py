@@ -126,6 +126,114 @@ def test_provision_with_retry_exhausts_and_enqueues(monkeypatch):
 # /health/deep
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 8b6c19d3 — on-demand provisioning from POST /projects
+# ---------------------------------------------------------------------------
+
+def test_create_project_provisions_on_demand_for_unprovisioned_tenant(monkeypatch, tmp_path):
+    """A tenant with no neon_project_id (e.g. an accepted workspace member whose
+    OAuth-login background provisioning never ran) must self-heal on the one
+    action that actually needs their own DB, instead of hard-failing with
+    'tenant database not provisioned'."""
+    monkeypatch.setenv("MERIDIAN_SESSION_SECRET", "test-secret")
+    with _hosted_client(monkeypatch, tmp_path) as c:
+        from meridian.hosted import _make_session_cookie
+        from meridian import hosted as hosted_module
+        db = c.app.state.db
+        t = asyncio.run(db_module.upsert_tenant(db, "member@example.com"))
+        assert t.get("neon_project_id") is None
+        s = asyncio.run(
+            db_module.create_user_session(db, t["id"], "2099-01-01 00:00:00")
+        )
+        c.cookies.set("meridian_session", _make_session_cookie(s["id"]))
+
+        calls = {"n": 0}
+
+        async def fake_provision(tenant_id, d):
+            calls["n"] += 1
+            from meridian.tenant_crypto import encrypt_tenant_db_url
+            await db_module.update_tenant(
+                d, tenant_id,
+                neon_project_id="proj_fake",
+                neon_db_url=encrypt_tenant_db_url(tenant_id, "postgres://fake/db"),
+            )
+            return await db_module.get_tenant_by_id(d, tenant_id)
+
+        async def fake_init_pg_db(url):
+            # Stand in for a real Neon connection -- reuse the in-memory auth DB
+            # as the tenant's "own" DB so the request can complete end-to-end.
+            return db
+
+        monkeypatch.setattr(hosted_module, "provision_neon_db", fake_provision)
+        import meridian.pg_adapter as pg_adapter_module
+        monkeypatch.setattr(pg_adapter_module, "init_pg_db", fake_init_pg_db)
+
+        r = c.post("/projects", json={"name": "my-first-project"})
+        assert r.status_code == 201, r.text
+        assert calls["n"] == 1
+
+        tenant_after = asyncio.run(db_module.get_tenant_by_id(db, t["id"]))
+        assert tenant_after["neon_project_id"] == "proj_fake"
+
+
+def test_create_project_admin_tenant_skips_on_demand_provisioning(monkeypatch, tmp_path):
+    """Admin tenants use MERIDIAN_AUTH_DB directly and are never auto-provisioned
+    (mirrors provision_neon_db's own admin short-circuit) — the new on-demand
+    call must not even attempt it."""
+    monkeypatch.setenv("MERIDIAN_SESSION_SECRET", "test-secret")
+    with _hosted_client(monkeypatch, tmp_path) as c:
+        from meridian.hosted import _make_session_cookie
+        from meridian import hosted as hosted_module
+        db = c.app.state.db
+        t = asyncio.run(db_module.upsert_tenant(db, "admin@example.com"))
+        asyncio.run(db_module.update_tenant(db, t["id"], plan="admin"))
+        s = asyncio.run(
+            db_module.create_user_session(db, t["id"], "2099-01-01 00:00:00")
+        )
+        c.cookies.set("meridian_session", _make_session_cookie(s["id"]))
+
+        calls = {"n": 0}
+
+        async def fake_provision(tenant_id, d):
+            calls["n"] += 1
+            return {"ok": True}
+
+        monkeypatch.setattr(hosted_module, "provision_neon_db", fake_provision)
+
+        r = c.post("/projects", json={"name": "admin-project"})
+        assert r.status_code == 201, r.text
+        assert calls["n"] == 0
+
+
+def test_create_project_surfaces_503_when_on_demand_provisioning_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("MERIDIAN_SESSION_SECRET", "test-secret")
+    with _hosted_client(monkeypatch, tmp_path) as c:
+        from meridian.hosted import _make_session_cookie
+        from meridian import hosted as hosted_module
+        db = c.app.state.db
+        t = asyncio.run(db_module.upsert_tenant(db, "unlucky@example.com"))
+        s = asyncio.run(
+            db_module.create_user_session(db, t["id"], "2099-01-01 00:00:00")
+        )
+        c.cookies.set("meridian_session", _make_session_cookie(s["id"]))
+
+        async def always_fail(tenant_id, d):
+            raise RuntimeError("neon down")
+
+        async def fake_sleep(s):
+            return None
+
+        monkeypatch.setattr(hosted_module, "provision_neon_db", always_fail)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        r = c.post("/projects", json={"name": "doomed-project"})
+        assert r.status_code == 503, r.text
+        assert "retry" in r.json()["detail"].lower()
+
+        projects = asyncio.run(db_module.list_projects(db))
+        assert not any(p["name"] == "doomed-project" for p in projects)
+
+
 def test_health_deep_endpoint(monkeypatch, tmp_path):
     with _hosted_client(monkeypatch, tmp_path) as c:
         r = c.get("/health/deep")

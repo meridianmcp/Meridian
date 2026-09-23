@@ -128,12 +128,38 @@ async def create_project(
     body: ProjectCreate, request: Request
 ) -> dict[str, Any]:
     """Create a new project. 409 if the name is already in use."""
+    tenant = await _get_tenant_from_request(request)
+    # 8b6c19d3 — c3e91df4 (below) already anticipates an invited workspace
+    # member creating their own project later, but nothing actually provisions
+    # a Neon DB for that path: OAuth-login background provisioning only fires
+    # for tenants with no accepted workspace membership anywhere, so a member
+    # who never got a DB (or whose background attempt silently failed) hits
+    # "tenant database not provisioned" from _db() below with no way to
+    # recover. Provision on demand, right here, before the first _db() call —
+    # project creation is the one action a tenant takes that requires their
+    # own DB to exist, so it's the right place to self-heal a missing one
+    # instead of hard-failing. provision_with_retry is idempotent (an
+    # already-provisioned tenant returns immediately).
+    if (
+        tenant
+        and _hosted_mode()
+        and tenant.get("plan") != "admin"
+        and not tenant.get("neon_project_id")
+    ):
+        from .. import hosted as hosted_module  # noqa: PLC0415
+        try:
+            await hosted_module.provision_with_retry(tenant["id"], request.app.state.db)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=503,
+                detail="tenant database is provisioning — please retry in a moment",
+            ) from exc
+        tenant = await _get_tenant_from_request(request, force_refresh=True)
     existing = await db_module.get_project_by_name(await _db(request), body.name)
     if existing is not None:
         raise HTTPException(
             status_code=409, detail=f"project '{body.name}' already exists"
         )
-    tenant = await _get_tenant_from_request(request)
     if tenant and tenant.get("plan") == "free":
         existing_projects = await db_module.list_projects(await _db(request))
         if len(existing_projects) >= 1:
