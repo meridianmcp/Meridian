@@ -689,6 +689,30 @@ def client(tmp_path, monkeypatch, request):
         monkeypatch.setattr(db_module, "init_db", _init_db_from_template)
 
     monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    # CI-PERF-6 — default the document-structure store to a throwaway
+    # in-memory SQLite DB instead of the tier-resolved on-disk sidecar
+    # (``{tmp_path}/doc_structure.db``). The lifespan (server.py) opens the
+    # doc store UNCONDITIONALLY on every startup via
+    # ``doc_store.open_doc_store_for(..., override_url=os.environ.get(
+    # "MERIDIAN_DOC_STORE_URL"))`` — with no override, that's a real on-disk
+    # SQLite file per test (open + schema create + WAL/journal + fsync), which
+    # profiling (tests/PERF_test_core_durations.md) identified as the single
+    # dominant per-test cost across the ~390 test_core.py tests using this
+    # fixture (~90% of client-fixture wall time). Safe to default to
+    # ":memory:" here: ``close_all_doc_stores()`` runs unconditionally on
+    # lifespan shutdown (i.e. every time this fixture's
+    # ``with TestClient(...)`` block below exits) and clears the module-level
+    # ``_doc_store_cache`` keyed by resolved target, so the NEXT test's
+    # ``open_doc_store_for(override_url=":memory:")`` call always opens a
+    # genuinely fresh in-memory connection rather than reusing a prior test's
+    # cached one — no cross-test data leakage despite every test sharing the
+    # literal ":memory:" cache key.
+    # Only set when unset so a test that already configured its own
+    # MERIDIAN_DOC_STORE_URL (e.g. a real on-disk sidecar via its own
+    # monkeypatch, to exercise the persistent/file-backed path) is respected
+    # rather than clobbered.
+    if not os.environ.get("MERIDIAN_DOC_STORE_URL"):
+        monkeypatch.setenv("MERIDIAN_DOC_STORE_URL", ":memory:")
     # v2.2 — also block MERIDIAN_DEMO_DB_URL so the lifespan doesn't try to
     # connect to Neon and seed demo data during tests (would hang on every
     # client fixture if a .env file with a real demo URL is present).
