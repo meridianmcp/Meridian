@@ -18,6 +18,11 @@ import "./dashboard-notes";
 import "./dashboard-documents";
 import "./dashboard-files";
 import "./dashboard-rewind";
+// afcbd8a2 — PWA install-prompt affordance (beforeinstallprompt handling).
+// b03be6a6 already shipped the manifest/SW/icons; this module adds the actual
+// installable button so ChromeOS (and any other beforeinstallprompt-capable
+// browser) has a discoverable way to install the dashboard.
+import "./dashboard-pwa-install";
 // e553fa7a — workspace Blog tab editor/card builders (edit-in-place for drafts).
 import {
   blogEditorFormHtml,
