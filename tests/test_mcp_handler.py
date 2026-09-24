@@ -171,9 +171,18 @@ async def test_refresh_tool_manifest_with_tenant_forces_tunnel_rebuild(db, monke
 
 @pytest.mark.asyncio
 async def test_refresh_tool_manifest_bounded_on_slow_tunnel(db, monkeypatch):
-    """A wedged tunnel refresh must not hang the tool call — bounded to 5s,
-    degrading to the last-known (possibly empty) snapshot."""
+    """A wedged tunnel refresh must not hang the tool call — bounded by
+    ``_TUNNEL_MANIFEST_REFRESH_TIMEOUT_S``, degrading to the last-known
+    (possibly empty) snapshot.
+
+    CI-PERF-3B: this constant (a former hardcoded 5.0s literal) is
+    monkeypatched down to a fraction of a second so the test exercises the
+    real timeout/degrade code path without actually waiting out a
+    production-sized timeout — the assertion on ``elapsed`` proves the
+    monkeypatch was genuinely read, not just set.
+    """
     tenant = {"id": "t-refresh-slow", "plan": "pro"}
+    monkeypatch.setattr(mh, "_TUNNEL_MANIFEST_REFRESH_TIMEOUT_S", 0.05)
 
     async def hangs_forever(tid, reserved_names=frozenset()):
         await asyncio.sleep(30)
@@ -186,7 +195,7 @@ async def test_refresh_tool_manifest_bounded_on_slow_tunnel(db, monkeypatch):
     result = await mh._dispatch_mcp_tool("refresh_tool_manifest", {}, db, "/tmp", tenant=tenant)
     elapsed = _time.monotonic() - start
 
-    assert elapsed < 8.0, f"refresh_tool_manifest took {elapsed:.1f}s — outer timeout did not bound it"
+    assert elapsed < 1.0, f"refresh_tool_manifest took {elapsed:.1f}s — monkeypatched timeout did not bound it"
     assert result["list_changed_refired"] is False
     assert "tunnel" in result  # degraded snapshot, not a missing key
 

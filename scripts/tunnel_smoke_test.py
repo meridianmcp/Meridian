@@ -229,6 +229,14 @@ STARTUP_CONFIRM_RE = re.compile(r"meridian tunnel: serving")
 STARTUP_SETTLE_WINDOW_S = 8.0
 STARTUP_HARD_TIMEOUT_S = 90.0
 
+# CI-PERF-3B — the remaining inline process-lifecycle timeout literals,
+# extracted into named constants alongside the block above (pure refactor,
+# same values) so tests can monkeypatch them instead of waiting out a real
+# process kill/shutdown.
+PROCESS_KILL_WAIT_TIMEOUT_S = 5.0  # _terminate_proc_tree_async: taskkill + proc.wait() bound
+GRACEFUL_SHUTDOWN_TIMEOUT_S = 15.0  # TunnelBoot.stop(): wait for graceful signal-handler exit
+READER_TASK_JOIN_TIMEOUT_S = 5.0  # TunnelBoot.stop(): bound on joining the log-reader task
+
 # "passes once" != "fixed" (edge case #3 in the design note).
 CONSECUTIVE_PASSES_REQUIRED = 2
 DEFAULT_MAX_CYCLES = 5
@@ -716,7 +724,7 @@ async def _terminate_proc_tree_async(proc: "asyncio.subprocess.Process | None") 
             # target) and must not hang this function forever. TimeoutError
             # is an Exception subclass so it's caught by the clause below,
             # same as a spawn failure.
-            await asyncio.wait_for(kill_proc.wait(), timeout=5.0)
+            await asyncio.wait_for(kill_proc.wait(), timeout=PROCESS_KILL_WAIT_TIMEOUT_S)
         except Exception:  # noqa: BLE001 — fall back to terminate below
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
@@ -724,7 +732,7 @@ async def _terminate_proc_tree_async(proc: "asyncio.subprocess.Process | None") 
         with contextlib.suppress(ProcessLookupError):
             proc.terminate()
     try:
-        await asyncio.wait_for(proc.wait(), timeout=5.0)
+        await asyncio.wait_for(proc.wait(), timeout=PROCESS_KILL_WAIT_TIMEOUT_S)
     except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
@@ -1331,12 +1339,12 @@ class TunnelSubprocess:
             # down every SlotProxy (and its whole process tree) itself when
             # given the chance -- only escalate to a hard tree-kill below if
             # it doesn't exit in time.
-            await asyncio.wait_for(self.proc.wait(), timeout=15.0)
+            await asyncio.wait_for(self.proc.wait(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT_S)
         except asyncio.TimeoutError:
             await _terminate_proc_tree_async(self.proc)
         if self._reader_task is not None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self._reader_task, timeout=5.0)
+                await asyncio.wait_for(self._reader_task, timeout=READER_TASK_JOIN_TIMEOUT_S)
         if self._log_fh:
             self._log_fh.close()
 
