@@ -234,7 +234,7 @@ def test_call_hosted_ingest_content_sibling_unaffected_regression_guard(monkeypa
     assert isinstance(sent["params"]["arguments"]["content"], str)
 
 
-def test_ingest_document_structure_server_side_accepts_fixed_client_payload_shape():
+def test_ingest_document_structure_server_side_accepts_fixed_client_payload_shape(monkeypatch):
     """End-to-end (in-process, real server dispatch): the FIXED client sends
     blocks as a real list; confirm meridian.server's ingest_document_structure
     handler round-trips it correctly (the isinstance(_blocks_raw, list) branch,
@@ -249,7 +249,7 @@ def test_ingest_document_structure_server_side_accepts_fixed_client_payload_shap
 
         import tempfile
         tmp_path = tempfile.mkdtemp()
-        os.environ["MERIDIAN_DOC_STORE_URL"] = os.path.join(tmp_path, "doc_structure.db")
+        monkeypatch.setenv("MERIDIAN_DOC_STORE_URL", os.path.join(tmp_path, "doc_structure.db"))
         doc_store._reset_doc_store_cache()
 
         db = await db_module.init_db(":memory:")
