@@ -29,12 +29,13 @@ jobs:
           name: meridian-windows
           path: dist/meridian.exe
 
-  # 4e4c3817 -- Windows-only tray/GUI installer (meridian-tray.exe). Wraps
+  # 4e4c3817 -- Windows tray/GUI installer (meridian-tray.exe). Wraps
   # LocalRunner (899936dd) to supervise the real HTTP server as a child
-  # process; see meridian/tray_main.py's own module docstring. Windows-only
-  # because the sprint item itself scopes this as a Windows tray app --
-  # Linux/macOS users keep using the existing meridian.exe / install.ps1
-  # paths unchanged.
+  # process; see meridian/tray_main.py's own module docstring. Originally
+  # Windows-only per this item's initial scope; a macOS counterpart now
+  # ships too (73257801, build-tray-mac below) via the same spec file's
+  # darwin branch. Linux still has no tray build (separate item,
+  # 52cdabaa -- a .desktop launcher, not this PyInstaller+pystray mechanism).
   build-tray:
     runs-on: windows-latest
     steps:
@@ -52,6 +53,42 @@ jobs:
         with:
           name: meridian-tray-windows
           path: dist/meridian-tray.exe
+
+  # 73257801 -- macOS tray build (meridian-tray-mac, unsigned .app). Same
+  # PyInstaller+pystray mechanism as build-tray above (meridian/tray_main.py
+  # has zero platform-specific code -- see meridian-tray.spec's own darwin
+  # branch for where platform actually matters: hiddenimports and the
+  # onedir+COLLECT+BUNDLE packaging pystray's macOS menu-bar icon needs).
+  # macos-14 mirrors build-mac-arm64's runner choice -- only Apple Silicon is
+  # realistic here (macos-13/Intel is effectively unavailable, same
+  # constraint already accepted for the slim client per decision 80f1d4bc).
+  # No UPX install step, matching build-mac-arm64's existing precedent for
+  # this runner (pixi run -e dev build-tray still passes upx=True; PyInstaller
+  # skips compression gracefully when the upx binary isn't on PATH).
+  # Ships UNSIGNED / not notarized, matching build-tray's own Windows
+  # precedent -- code signing/notarization is a deliberate, separate follow-up
+  # (see meridian-tray.spec's module docstring for the macOS Gatekeeper
+  # caveat this implies).
+  build-tray-mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.79.0
+          cache: true
+      - name: Build macOS tray app bundle
+        run: pixi run -e dev build-tray
+      - name: Zip app bundle
+        # ditto (not a plain `zip`) preserves the .app bundle's resource
+        # forks/extended attributes correctly -- Apple's own documented tool
+        # for this, matching how Finder's own "Compress" does it.
+        run: ditto -c -k --sequesterRsrc --keepParent dist/meridian-tray.app meridian-tray-mac.zip
+      - name: Upload tray artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meridian-tray-mac
+          path: meridian-tray-mac.zip
 
   build-linux:
     runs-on: ubuntu-latest
@@ -137,7 +174,7 @@ jobs:
           path: ${{ matrix.artifact }}
 
   release:
-    needs: [build-windows, build-tray, build-linux, build-mac-arm64, build-connect]
+    needs: [build-windows, build-tray, build-tray-mac, build-linux, build-mac-arm64, build-connect]
     # 80f1d4bc — run as long as we weren't cancelled, even if a build variant
     # failed, so one flaky/unbuildable platform can't SKIP the whole release.
     # With fail_on_unmatched_files:false the release ships whatever actually built.
@@ -161,6 +198,7 @@ jobs:
           files: |
             dist-artifacts/meridian-windows/meridian.exe
             dist-artifacts/meridian-tray-windows/meridian-tray.exe
+            dist-artifacts/meridian-tray-mac/meridian-tray-mac.zip
             dist-artifacts/meridian-linux/meridian-linux
             dist-artifacts/meridian-mac-arm64/meridian-mac-arm64
             dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux
