@@ -266,7 +266,7 @@ def test_show_status_dialog_reads_runner_status_without_raising(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _spec_call_kwargs(spec_path: Path, call_name: str) -> dict:
+def _spec_call_kwargs(spec_path: Path, call_name: str, occurrence: int = 1) -> dict:
     """Statically extract literal keyword arguments from a named call (e.g.
     ``Analysis(...)`` or ``EXE(...)``) inside a PyInstaller .spec file.
 
@@ -277,10 +277,22 @@ def _spec_call_kwargs(spec_path: Path, call_name: str) -> dict:
     only the literal (list/str/bool/None) keyword values out of the call we
     care about validates the spec's real, checked-in content without needing
     PyInstaller itself (or a full build) to do it.
+
+    73257801 -- the spec now has TWO ``EXE(...)`` calls (macOS's onedir
+    build inside ``if _IS_MACOS:``, Windows' onefile build inside the
+    ``else:``). ``occurrence`` (1-based) picks which match to return when a
+    call name appears more than once -- default 1 keeps every pre-existing,
+    unambiguous call site (``Analysis``/``PYZ``/``COLLECT``/``BUNDLE`` each
+    appear exactly once) working unchanged; the macOS branch is textually
+    first, so the Windows-only ``EXE(...)`` call is occurrence=2.
     """
     tree = ast.parse(spec_path.read_text(encoding="utf-8"))
+    seen = 0
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and getattr(node.func, "id", None) == call_name:
+            seen += 1
+            if seen != occurrence:
+                continue
             kwargs: dict = {}
             for kw in node.keywords:
                 if kw.arg is None:
@@ -288,8 +300,34 @@ def _spec_call_kwargs(spec_path: Path, call_name: str) -> dict:
                 try:
                     kwargs[kw.arg] = ast.literal_eval(kw.value)
                 except (ValueError, TypeError):
-                    # A non-literal value (e.g. `cipher=block_cipher`, a bare
-                    # Name reference) -- not needed by any check below.
+                    # 73257801 -- a list kwarg may contain a platform-
+                    # conditional ternary element (e.g.
+                    # `'pystray._darwin' if _IS_MACOS else 'pystray._win32'`),
+                    # which isn't a literal, so a whole-list literal_eval
+                    # fails even though every OTHER element is a plain
+                    # literal. Fall back to evaluating element-by-element,
+                    # resolving such a ternary to BOTH of its literal
+                    # branches -- a static pre-ship check just needs to know
+                    # a given literal is reachable somewhere in the list, not
+                    # which platform's branch actually picks it at build
+                    # time. A genuinely non-literal, non-list value (e.g.
+                    # `cipher=block_cipher`, a bare Name reference) is still
+                    # skipped entirely, unchanged from before.
+                    if isinstance(kw.value, ast.List):
+                        elts: list = []
+                        ok = True
+                        for elt in kw.value.elts:
+                            try:
+                                if isinstance(elt, ast.IfExp):
+                                    elts.append(ast.literal_eval(elt.body))
+                                    elts.append(ast.literal_eval(elt.orelse))
+                                else:
+                                    elts.append(ast.literal_eval(elt))
+                            except (ValueError, TypeError):
+                                ok = False
+                                break
+                        if ok:
+                            kwargs[kw.arg] = elts
                     continue
             return kwargs
     raise AssertionError(f"no {call_name}(...) call found in {spec_path}")
@@ -347,7 +385,9 @@ class TestTraySpecPreShipConsistency:
         assert "meridian/templates" in datas_sources
 
     def test_spec_exe_icon_kwarg_points_at_the_real_ico_file(self):
-        icon = _spec_call_kwargs(_TRAY_SPEC_PATH, "EXE").get("icon")
+        # occurrence=2: the Windows-only EXE() call (see 73257801) -- the
+        # macOS EXE() sets no icon at all (BUNDLE() carries it there instead).
+        icon = _spec_call_kwargs(_TRAY_SPEC_PATH, "EXE", occurrence=2).get("icon")
         assert icon == "meridian/static/meridian-tray.ico"
         assert (_REPO_ROOT / icon).is_file()
 
@@ -365,7 +405,10 @@ class TestTraySpecPreShipConsistency:
         # The module docstring promises "a single binary that is BOTH the
         # tray icon and ... the real Meridian HTTP server" -- onefile=False
         # would ship a directory instead, breaking that contract silently.
-        assert _spec_call_kwargs(_TRAY_SPEC_PATH, "EXE").get("onefile") is True
+        # This is the Windows shape specifically (occurrence=2, see
+        # 73257801) -- macOS deliberately uses onedir+BUNDLE instead, since
+        # pystray's menu-bar icon needs a real .app bundle to show at all.
+        assert _spec_call_kwargs(_TRAY_SPEC_PATH, "EXE", occurrence=2).get("onefile") is True
 
     def test_spec_hiddenimports_has_no_duplicate_entries(self):
         hidden = _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["hiddenimports"]
