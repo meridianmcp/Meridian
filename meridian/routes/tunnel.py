@@ -1361,6 +1361,44 @@ async def get_tunnel_manifest_route(request: Request) -> Response:
 # Shared proxy helper
 # ---------------------------------------------------------------------------
 
+async def _authorize_tunnel_proxy_caller(tenant_id: str, request: "Request") -> "Response | None":
+    """Verify the HTTP caller is authenticated as, and owns, ``tenant_id``.
+
+    5de3d422 — the 10 HTTP MCP proxy routes (fs/code/extract/ppt/word/dc/
+    docs/zotero/outputs/debug, each registered twice: base path +
+    ``/{rest:path}``) previously took ``tenant_id`` straight from the URL
+    path with ZERO authentication, and explicitly strip the client's
+    ``Authorization`` header before forwarding it downstream (see
+    ``_skip``/``_fwd_headers`` below) — so anyone who knew or guessed a
+    tenant_id was proxied straight into that tenant's local fs/code/docs/
+    outputs/etc. process with no check at all.
+
+    This resolves the caller's own tenant via :func:`_get_tenant_from_request`
+    (session cookie or bearer token — the same helper used by every other
+    tenant-scoped route in this module, e.g. ``/tunnel/plugins``,
+    ``/tunnel/diagnostics/{tenant_id}``) and hard-requires it match the
+    ``tenant_id`` path parameter, exactly mirroring the existing WS tunnel
+    siblings' own check (``tunnel_ws`` et al.: ``if tenant is None or
+    tenant.get("id") != tenant_id: reject``).
+
+    Self-hosted (non-hosted) mode is single-user and has no tenant concept;
+    callers here are expected to have already returned early via
+    ``_hosted_mode()`` before reaching this check, matching every other
+    tenant-gated route in this file.
+
+    Returns an error ``Response`` (401) when the caller does not own
+    ``tenant_id``, or ``None`` when verified and proxying may proceed.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None or tenant.get("id") != tenant_id:
+        return Response(
+            content='{"error":"invalid or mismatched tenant credential"}',
+            status_code=401,
+            media_type="application/json",
+        )
+    return None
+
+
 async def _do_proxy(
     tenant_id: str,
     method: str,
@@ -1532,6 +1570,10 @@ async def fs_mcp_proxy(tenant_id: str, request: Request) -> Response:
             media_type="application/json",
         )
 
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
+
     body_bytes = await request.body()
     # Forward a safe subset of request headers; strip host/auth to avoid loops
     _skip = {"host", "authorization", "cookie", "x-forwarded-for"}
@@ -1572,6 +1614,10 @@ async def fs_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> R
             media_type="application/json",
         )
 
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
+
     body_bytes = await request.body()
     _skip = {"host", "authorization", "cookie", "x-forwarded-for"}
     fwd_headers = {
@@ -1607,6 +1653,9 @@ async def _code_proxy(tenant_id: str, local_path: str, request: Request) -> Resp
             status_code=503,
             media_type="application/json",
         )
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
     body_bytes = await request.body()
     return await _do_proxy(
         tenant_id=tenant_id,
@@ -1651,6 +1700,9 @@ async def _extract_proxy(tenant_id: str, local_path: str, request: Request) -> R
             status_code=503,
             media_type="application/json",
         )
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
     body_bytes = await request.body()
     return await _do_proxy(
         tenant_id=tenant_id,
@@ -1699,6 +1751,9 @@ async def _office_proxy(
             status_code=503,
             media_type="application/json",
         )
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
     body_bytes = await request.body()
     return await _do_proxy(
         tenant_id=tenant_id,
