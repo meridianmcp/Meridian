@@ -19,9 +19,11 @@ SQL translation rules:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import re
+import uuid
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -350,11 +352,75 @@ class PostgresConnection:
     def __init__(self, pool: Any) -> None:
         self._pool = pool
         self.row_factory = None
+        # 408e5cea — set only while a begin_transaction() block is pinning a
+        # connection open across multiple statements; see commit()/
+        # rollback()/begin_transaction() below.
+        #
+        # This MUST be per-asyncio-task, not a plain instance attribute: one
+        # PostgresConnection wraps a pool shared by every concurrent request
+        # in this process (init_pg_db's pool has max_size=15, and this
+        # object is handed out once at startup — see meridian/db/__init__.py)
+        # so a plain `self._pending_txn = ...` would let two requests that
+        # both happen to call begin_transaction() around the same moment
+        # stomp on each other's pending transaction: request A's commit()/
+        # rollback() could finalize request B's write instead of its own.
+        # contextvars.ContextVar gives each asyncio Task (created via
+        # asyncio.create_task/loop.create_task, which every real request
+        # handler runs under) its own isolated value, exactly the isolation
+        # a shared connection wrapper needs here.
+        self._pending_txn_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
+            f"meridian_pg_pending_txn_{id(self)}", default=None
+        )
 
     # ------------------------------------------------------------------ API
 
     def execute(self, sql: str, params: tuple = ()) -> _ExecProxy:
         return _ExecProxy(self._do_execute(sql, params))
+
+    def begin_transaction(self) -> "_PendingPgTransaction":
+        """Open a REAL, explicit, connection-pinned Postgres transaction
+        spanning multiple statements up to the next commit()/rollback() —
+        unlike the default connection-per-statement model (see class
+        docstring), where every execute() borrows a fresh pool connection
+        that is already durably applied by the time it returns.
+
+        Used by callers that need genuine cross-statement atomicity (e.g.
+        ``record_wave_run_child_outcome``'s single write + cancellation-safe
+        commit): a write issued through the object this yields stays
+        pending — visible on that SAME connection, but not yet committed —
+        until this ``PostgresConnection``'s own ``commit()``/``rollback()``
+        is called, INCLUDING when an exception (e.g. ``asyncio.CancelledError``
+        from a caller that never gets to call commit()) unwinds straight
+        through the ``async with`` block below without either being called:
+        deliberately, that leaves the transaction (and its borrowed
+        connection) still pinned via this task's context var rather than
+        auto-rolling-back the instant the exception propagates — the exact
+        "in_flight" window record_wave_run_child_outcome's cancellation
+        contract depends on (mirrors aiosqlite's real pending-transaction
+        behavior, where a write stays visible-but-uncommitted on its own
+        connection until an explicit commit()/rollback() decides its fate).
+
+        Usage::
+
+            async with db.begin_transaction() as txn:
+                await txn.execute(sql, params)
+                await db.commit()  # or let an exception propagate — see above
+
+        Uses ``SAVEPOINT``/``RELEASE SAVEPOINT``/``ROLLBACK TO SAVEPOINT``
+        rather than bare ``BEGIN``/``COMMIT``/``ROLLBACK`` so this composes
+        correctly whether the borrowed connection already has an ambient
+        transaction open (tests/conftest.py's per-test transactional
+        isolation, which wraps the whole test in one outer transaction) or
+        not (a fresh production pool connection, autocommit=True) — the
+        savepoint owns only ITS OWN scope either way and never accidentally
+        commits/rolls back a transaction it did not itself start.
+        """
+        return _PendingPgTransaction(self)
+
+    async def _finish_pending_txn(self, *, rollback: bool) -> None:
+        pending = self._pending_txn_var.get()
+        if pending is not None:
+            await pending.finish(rollback=rollback)
 
     async def executescript(self, sql: str) -> None:
         """Run multiple semicolon-separated statements (skipping PRAGMAs).
@@ -387,17 +453,26 @@ class PostgresConnection:
                     await conn.execute(stmt)
 
     async def commit(self) -> None:
-        """No-op: psycopg3 autocommit handles this."""
+        """Finalize a pending ``begin_transaction()`` block on THIS
+        connection, if one is open (408e5cea) — otherwise a no-op, exactly
+        as before: psycopg3 autocommit means an ordinary execute() already
+        durably applied by the time it returns, so there is nothing else to
+        finalize."""
+        await self._finish_pending_txn(rollback=False)
 
     async def rollback(self) -> None:
-        """No-op: psycopg3 autocommit=True means each statement is its own
-        transaction; there is no pending transaction to roll back.
+        """Undo a pending ``begin_transaction()`` block on THIS connection,
+        if one is open (408e5cea) — otherwise a no-op, exactly as before.
 
-        Callers that need atomicity on Postgres must use compensating actions
-        instead of relying on this no-op.  The method exists only so callers
-        written for aiosqlite (which has a real rollback) don't raise
-        AttributeError when running against the Postgres backend.
+        Callers that need atomicity on Postgres without an explicit
+        ``begin_transaction()`` must use compensating actions instead of
+        relying on this no-op: psycopg3 autocommit=True means a bare
+        execute() has no pending transaction of its own to roll back.  The
+        no-op path exists so callers written for aiosqlite (which has a
+        real rollback) don't raise AttributeError when running against the
+        Postgres backend.
         """
+        await self._finish_pending_txn(rollback=True)
 
     async def close(self) -> None:
         await self._pool.close()
@@ -484,29 +559,42 @@ class PostgresConnection:
             raise
 
     async def _table_info(self, table_name: str) -> _PgCursor:
+        """PRAGMA table_info(...) emulation, real dict rows (408e5cea).
+
+        Every OTHER cursor this adapter opens passes
+        ``row_factory=_dict_row_factory`` so callers can do ``row["name"]``
+        the same way aiosqlite.Row supports it. This one didn't: it opened
+        a plain ``conn.cursor()`` (default psycopg3 tuple rows) and then
+        hand-rolled a *positional* ``tuple(...)`` from ``cur.description``,
+        so every row ``_PgCursor.fetchall()`` handed back stayed a bare
+        tuple (``_PgCursor._to_dict`` only converts ``dict`` or
+        ``hasattr(row, "keys")`` rows — a plain tuple is neither). Any
+        caller doing ``row["name"]`` against a real Postgres schema
+        introspection (as opposed to SQLite's own dict-like ``Row``) hit
+        ``TypeError: tuple indices must be integers or slices, not str``.
+
+        Also computes a REAL ``notnull`` (``information_schema.is_nullable``)
+        instead of the previous hardcoded ``0`` — a column that is actually
+        ``NOT NULL`` on Postgres (e.g. ``workspace_proposals.scope_type``,
+        added by ``_migrate_pg_proposal_project_scope``) must report
+        ``notnull == 1`` to match what the same PRAGMA reports on SQLite.
+        """
         pg_query = """
-            SELECT ordinal_position - 1 AS cid,
-                   column_name          AS name,
-                   data_type            AS type,
-                   0                    AS notnull,
-                   column_default       AS dflt_value,
-                   0                    AS pk
+            SELECT ordinal_position - 1                          AS cid,
+                   column_name                                    AS name,
+                   data_type                                       AS type,
+                   CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END AS notnull,
+                   column_default                                  AS dflt_value,
+                   0                                                AS pk
             FROM information_schema.columns
             WHERE table_name = %s
             ORDER BY ordinal_position
         """
         async with self._pool.connection() as conn:
-            async with conn.cursor() as cur:
+            async with conn.cursor(row_factory=_dict_row_factory) as cur:
                 await cur.execute(pg_query, (table_name,))
                 rows = await cur.fetchall()
-                desc = cur.description or []
-                col_names = [d.name for d in desc]
-        fake_rows = [
-            tuple(row[col_names.index(c)] if c in col_names else None
-                  for c in ("cid", "name", "type", "notnull", "dflt_value", "pk"))
-            for row in rows
-        ]
-        return _PgCursor(fake_rows, len(fake_rows))
+        return _PgCursor(rows, len(rows))
 
     # ---- sqlite_master translation ---------------------------------------
     #
@@ -617,6 +705,125 @@ class PostgresConnection:
                 sql_text = f"CREATE TABLE {table_name} ({col_sql})"
 
         return _PgCursor([{"name": table_name, "sql": sql_text}], 1)
+
+
+# ---------------------------------------------------------------------------
+# Pinned, explicit transactions (408e5cea) — see
+# PostgresConnection.begin_transaction()'s docstring for the full rationale.
+# ---------------------------------------------------------------------------
+
+
+class _PinnedExec:
+    """``execute()`` bound to ONE already-borrowed connection.
+
+    Mirrors ``PostgresConnection._do_execute`` minus the per-call
+    ``getconn()``/``putconn()`` — the caller already owns the connection for
+    the whole ``begin_transaction()`` block, so every statement here lands on
+    the SAME session (required for the writes to be visible to each other,
+    and for the eventual SAVEPOINT release/rollback to cover all of them).
+    No transient-error retry (unlike ``_execute_with_retry``): a connection
+    lost mid-explicit-transaction can't be transparently retried without
+    losing the transaction's whole point, so the error just propagates.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    async def execute(self, sql: str, params: tuple = ()) -> _PgCursor:
+        if params is None:
+            params = ()
+        pg_sql, pg_params = _pg_adapt_sql(sql, params)
+        q_upper = pg_sql.lstrip().upper()
+        async with self._conn.cursor(row_factory=_dict_row_factory) as cur:
+            await cur.execute(pg_sql, pg_params if pg_params else None)
+            if q_upper.startswith(("SELECT", "WITH")) or "RETURNING" in pg_sql.upper():
+                rows = await cur.fetchall()
+                return _PgCursor(rows, len(rows))
+            rc = cur.rowcount if cur.rowcount is not None else 0
+            return _PgCursor([], rc)
+
+
+class _PendingPgTransaction:
+    """One real, explicit Postgres transaction pinned to ONE borrowed
+    connection — see ``PostgresConnection.begin_transaction()`` for the full
+    contract this implements.
+
+    Uses ``SAVEPOINT``/``RELEASE SAVEPOINT``/``ROLLBACK TO SAVEPOINT``
+    instead of bare ``BEGIN``/``COMMIT``/``ROLLBACK`` — a plain ``BEGIN`` is
+    a harmless no-op (with a server NOTICE) when the connection already has
+    an ambient transaction open, but an unconditional bare ``COMMIT``/
+    ``ROLLBACK`` at the end would durably finalize or discard THAT ambient
+    transaction too (exactly what tests/conftest.py's per-test transactional
+    isolation must never have happen). Whether this connection is already
+    mid-transaction is checked once via ``conn.info.transaction_status``
+    (``psycopg.pq.TransactionStatus.IDLE`` means it is not) — if it is
+    genuinely idle (a fresh production pool connection, autocommit=True),
+    an explicit ``BEGIN``/final ``COMMIT``-or-``ROLLBACK`` pair is added so
+    the connection is never handed back to the pool sitting inside an open
+    transaction.
+    """
+
+    __slots__ = ("_owner", "_conn", "_savepoint", "_started_own_txn", "_done", "_token")
+
+    def __init__(self, owner: "PostgresConnection") -> None:
+        self._owner = owner
+        self._conn: Any = None
+        self._savepoint = ""
+        self._started_own_txn = False
+        self._done = False
+        self._token: Any = None
+
+    async def __aenter__(self) -> _PinnedExec:
+        import psycopg.pq  # local import — keeps SQLite-only installs psycopg-free
+
+        self._conn = await self._owner._pool.getconn()
+        self._started_own_txn = (
+            self._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        )
+        if self._started_own_txn:
+            await self._conn.execute("BEGIN")
+        self._savepoint = f"sp_rwrco_{uuid.uuid4().hex}"
+        await self._conn.execute(f"SAVEPOINT {self._savepoint}")
+        # Per-task, not per-connection-instance — see the ContextVar's own
+        # comment on PostgresConnection.__init__ for why a plain attribute
+        # would be unsafe under concurrent requests sharing this pool.
+        self._token = self._owner._pending_txn_var.set(self)
+        return _PinnedExec(self._conn)
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        # An exception (including asyncio.CancelledError from a caller that
+        # never got to call commit()/rollback()) propagating out of the
+        # block deliberately does NOT finalize anything here — the whole
+        # point is that the transaction stays open/pinned (this task's
+        # ContextVar keeps pointing at `self`) until an explicit LATER
+        # commit()/rollback() call decides its fate. See class +
+        # begin_transaction() docstrings.
+        if exc_type is None and not self._done:
+            # Exited normally without an explicit decision: the only
+            # caller of begin_transaction() today (record_wave_run_child_
+            # outcome) always calls db.commit() before falling through, so
+            # this is a defensive fallback, not a real path — fail safe by
+            # committing (the block completed with no error) rather than
+            # leaking the connection or silently discarding a clean write.
+            await self.finish(rollback=False)
+        return False
+
+    async def finish(self, *, rollback: bool) -> None:
+        if self._done:
+            return
+        self._done = True
+        if self._token is not None:
+            self._owner._pending_txn_var.reset(self._token)
+            self._token = None
+        try:
+            verb = "ROLLBACK TO SAVEPOINT" if rollback else "RELEASE SAVEPOINT"
+            await self._conn.execute(f"{verb} {self._savepoint}")
+            if self._started_own_txn:
+                await self._conn.execute("ROLLBACK" if rollback else "COMMIT")
+        finally:
+            await self._owner._pool.putconn(self._conn)
 
 
 # ---------------------------------------------------------------------------
