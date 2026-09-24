@@ -256,6 +256,21 @@ _slot_health: dict[str, dict[str, bool]] = {}
 # will simply report unhealthy again, re-arming the timer).
 _slot_unhealthy_since: dict[str, dict[str, float]] = {}
 
+# 43fcdf9f — wall-clock ``time.time()`` at which the server last RECEIVED a real
+# ``plugin_status`` report for a slot: tenant_id → {slot: epoch_seconds}. Neither
+# ``_slot_health`` nor ``_slot_unhealthy_since`` carries this: the former is just
+# a bare bool, and the latter is only ever stamped on an unhealthy transition
+# (monotonic, not wall-clock). Confirmed live: ``get_tunnel_diagnostics`` reported
+# "extract: healthy" at the exact moment real find_symbol/search_code calls were
+# failing with Cloudflare 502/504s, because "healthy" here has only ever meant
+# "the last plugin_status this process received said so" (or "never received one
+# at all" — ``_slot_health`` defaults absent to healthy) — never a live,
+# request-level check. This map is what lets ``build_tunnel_diagnostics`` report
+# an honest age/basis alongside that flag instead of a bare, undated "healthy"
+# a caller can mistake for "verified just now". Cleared alongside ``_slot_health``
+# in ``_clear_slot_health`` so the two never drift out of sync.
+_slot_health_reported_at: dict[str, dict[str, float]] = {}
+
 
 def _slot_unhealthy_ttl() -> float:
     """Seconds a slot stays suppressed before an optimistic re-probe (16e02240).
@@ -530,6 +545,10 @@ def _record_slot_health(
         return
     was_unhealthy = not _slot_is_healthy(tenant_id, slot)
     _slot_health.setdefault(tenant_id, {})[slot] = bool(healthy)
+    # 43fcdf9f — stamp wall-clock receipt time on EVERY report (healthy or not)
+    # so a diagnostics read can report how stale this flag actually is instead
+    # of a bare, undated bool.
+    _slot_health_reported_at.setdefault(tenant_id, {})[slot] = time.time()
     if healthy:
         _slot_status_detail.get(tenant_id, {}).pop(slot, None)
         # 16e02240 — clear the suppression timestamp so a future unhealthy report
@@ -601,6 +620,7 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
     if slot is None:
         _slot_health.pop(tenant_id, None)
         _slot_status_detail.pop(tenant_id, None)
+        _slot_health_reported_at.pop(tenant_id, None)  # 43fcdf9f
         _clear_slot_unhealthy_since(tenant_id)  # 16e02240
         _tools_list_changed_pending.discard(tenant_id)  # 54ddd609
         return
@@ -610,6 +630,11 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
         if not slots:
             _slot_health.pop(tenant_id, None)
     _clear_slot_unhealthy_since(tenant_id, slot)  # 16e02240
+    _reported = _slot_health_reported_at.get(tenant_id)  # 43fcdf9f
+    if _reported is not None:
+        _reported.pop(slot, None)
+        if not _reported:
+            _slot_health_reported_at.pop(tenant_id, None)
     _det = _slot_status_detail.get(tenant_id)
     if _det is not None:
         _det.pop(slot, None)
@@ -2592,6 +2617,25 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
             healthy_flag=healthy_flag,
             detail=detail,
         )
+        # 43fcdf9f — honesty contract: ``healthy_reported``/``state`` above are
+        # (and always have been) a CACHED last-known-state flag, never a live,
+        # request-level probe — confirmed live reporting "extract: healthy"
+        # at the exact moment real requests through that slot were failing
+        # with Cloudflare 502/504s. A genuine end-to-end probe on every
+        # diagnostics call would be expensive/slow, so instead of silently
+        # continuing to imply "healthy" means "verified just now", surface
+        # exactly how this flag was derived and how stale it is:
+        #   - health_basis: "client_reported" once ANY plugin_status message
+        #     has been received for this slot, else "default_assumed" — the
+        #     pre-existing "absent ⇒ healthy" default above, made explicit
+        #     instead of silently indistinguishable from a real report.
+        #   - health_reported_at / health_age_seconds: wall-clock receipt
+        #     time of that last report and its age — None/None when the
+        #     basis is "default_assumed" (there is nothing to date).
+        # None of this changes ``state``/``healthy_reported`` themselves —
+        # existing callers keyed on those keep their exact current behavior.
+        reported_at = _slot_health_reported_at.get(tid, {}).get(slot)
+        health_basis = "client_reported" if reported_at is not None else "default_assumed"
         slots[slot] = _diag_redact({
             # Persisted-in-dashboard state — NEVER reported as "active" here,
             # only as what is saved.
@@ -2606,6 +2650,11 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
             # as last reported by a plugin_status message — None if never reported.
             "external_child_state": (detail or {}).get("state"),
             "healthy_reported": healthy_flag,
+            "health_basis": health_basis,
+            "health_reported_at": reported_at,
+            "health_age_seconds": (
+                None if reported_at is None else max(0.0, generated_at - reported_at)
+            ),
             "retry_count": (detail or {}).get("retry_count"),
             "quarantine_reason": (detail or {}).get("quarantine_reason"),
             "last_error": (detail or {}).get("detail") or (detail or {}).get("reason"),
