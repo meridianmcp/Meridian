@@ -26,6 +26,24 @@ from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
 from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
 
+# CI-PERF-3B — named, overridable timeout constants (extracted from inline
+# literals scattered across the dispatch functions below) so tests can
+# monkeypatch a specific budget instead of waiting out a real timeout. Pure
+# refactor: values are unchanged from the literals they replace. Grouped here
+# rather than re-declared at each (often deeply-nested, multi-hundred-line)
+# dispatch function, since "near the call site" for these particular sites
+# would just mean "before a giant function" — this keeps them easy to find
+# and override as a set. Two more timeout constants (``_RECENT_COMMITS_TTL``,
+# ``_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S``) predate this block and stay
+# defined next to their single use below, unchanged.
+_GITHUB_TOOL_HTTP_TIMEOUT_S = 15.0  # _dispatch_github_tool's httpx client timeout
+_TUNNEL_TOOLS_LIST_TIMEOUT_S = 5.0  # tools/list's outer bound on the tunnel-tools fetch
+_GIT_DIFF_SUBPROCESS_TIMEOUT_S = 5.0  # `git diff --name-only` (staged + unstaged) in _unclaimed_file_warnings
+_GITHUB_COMMITS_FETCH_TIMEOUT_S = 8.0  # GitHub REST commits fetch in _fetch_recent_commits_uncached
+_GIT_LOG_SUBPROCESS_TIMEOUT_S = 5  # local `git log` fallback in _fetch_recent_commits_uncached
+_GENERATE_HANDOFF_TIMEOUT_S = 180.0  # outer wait_for around generate_handoff's core call (65c8b426)
+_TUNNEL_MANIFEST_REFRESH_TIMEOUT_S = 5.0  # refresh_tunnel_manifest bound (matches _TUNNEL_TOOLS_LIST_TIMEOUT_S)
+
 
 def _json_default(o: Any) -> Any:
     """JSON fallback for MCP tool results. On Postgres the timestamp columns
@@ -416,7 +434,7 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
     if not repo:
         return {"error": f"No GitHub repo connected for project {project_id} — use POST /projects/{project_id}/github/connect"}
     gh_headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github+json"}
-    async with _httpx.AsyncClient(timeout=15.0) as http:
+    async with _httpx.AsyncClient(timeout=_GITHUB_TOOL_HTTP_TIMEOUT_S) as http:
         if name == "read_file":
             path = args.get("path", "")
             ref = args.get("ref") or branch
@@ -1238,7 +1256,7 @@ async def _handle_mcp_request(
                     try:
                         tunnel_tools = await _asyncio.wait_for(
                             _tunnel_mod.list_tunnel_tools(tenant["id"], reserved),
-                            timeout=5.0,
+                            timeout=_TUNNEL_TOOLS_LIST_TIMEOUT_S,
                         )
                     except _asyncio.TimeoutError:
                         tunnel_tools = []
@@ -2753,14 +2771,14 @@ async def _unclaimed_file_warnings(
             "git", "diff", "--name-only", "HEAD",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_GIT_DIFF_SUBPROCESS_TIMEOUT_S)
         unstaged = set(stdout.decode().splitlines()) if stdout else set()
 
         proc2 = await asyncio.create_subprocess_exec(
             "git", "diff", "--name-only", "--cached",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5.0)
+        stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=_GIT_DIFF_SUBPROCESS_TIMEOUT_S)
         staged = set(stdout2.decode().splitlines()) if stdout2 else set()
 
         modified = {p for p in (unstaged | staged) if p}
@@ -2824,7 +2842,7 @@ async def _fetch_recent_commits_uncached(
                     "Authorization": f"token {pat}",
                     "Accept": "application/vnd.github+json",
                 }
-                async with _httpx.AsyncClient(timeout=8.0) as http:
+                async with _httpx.AsyncClient(timeout=_GITHUB_COMMITS_FETCH_TIMEOUT_S) as http:
                     r = await http.get(
                         f"https://api.github.com/repos/{repo}/commits",
                         headers=gh_headers,
@@ -2841,7 +2859,7 @@ async def _fetch_recent_commits_uncached(
     try:
         result = _sp.run(
             ["git", "log", "--oneline", "-20"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=_GIT_LOG_SUBPROCESS_TIMEOUT_S,
         )
         for line in result.stdout.splitlines():
             line = line.strip()
@@ -3324,7 +3342,7 @@ async def _handle_task_tools(
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
                 # Haiku calls that caused the live timeout; the higher ceiling is a
                 # backstop for DB-heavy projects.
-                timeout=180.0,
+                timeout=_GENERATE_HANDOFF_TIMEOUT_S,
             )
         except handoff_module_local.HandoffEvidenceRequired as exc:
             # 8a883f60 — strict_evidence=True and at least one best-effort
@@ -5708,7 +5726,7 @@ async def _handle_plugin_tools(
             try:
                 import asyncio as _asyncio  # noqa: PLC0415
                 manifest["tunnel"] = await _asyncio.wait_for(
-                    _tunnel_mod.refresh_tunnel_manifest(_tid), timeout=5.0,
+                    _tunnel_mod.refresh_tunnel_manifest(_tid), timeout=_TUNNEL_MANIFEST_REFRESH_TIMEOUT_S,
                 )
                 manifest["list_changed_refired"] = True
             except _asyncio.TimeoutError:
