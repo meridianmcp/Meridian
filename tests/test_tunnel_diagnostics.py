@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -41,7 +42,7 @@ def _clean_diag_state(monkeypatch):
             tn._tunnel_outputs_sockets, tn._tunnel_debug_sockets,
             tn._tunnel_tool_routes, tn._slot_health, tn._slot_status_detail,
             tn._slot_unhealthy_since, tn._tools_list_changed_pending,
-            tn._tenant_owner_instance,
+            tn._tenant_owner_instance, tn._slot_health_reported_at,
         ):
             d.clear()
         redis_bridge.reset_redis_client_cache()
@@ -372,6 +373,72 @@ def test_build_diagnostics_healthy_slot_when_socket_live_and_no_bad_report():
     assert fs["process_active"] is True
     assert fs["state"] == "healthy"
     assert fs["remediation"] == "No action needed."
+
+
+def test_build_diagnostics_never_reported_slot_is_default_assumed_not_verified():
+    """43fcdf9f — a slot that has NEVER sent a plugin_status report still labels
+    'healthy' (pre-existing "absent -> assumed healthy" default, unchanged),
+    but the honesty fields must say plainly that this was never confirmed by
+    a real report — the exact gap that let a caller mistake "no news" for
+    "actively verified fine"."""
+    tenant = dict(_TENANT, tunnel_plugins=json.dumps({"filesystem": {"enabled": True}}))
+    tn._tunnel_sockets[_TENANT["id"]] = object()  # live socket, but no plugin_status ever
+    result = tn.build_tunnel_diagnostics(tenant)
+    fs = result["slots"]["fs"]
+    assert fs["state"] == "healthy"  # unchanged existing behavior
+    assert fs["health_basis"] == "default_assumed"
+    assert fs["health_reported_at"] is None
+    assert fs["health_age_seconds"] is None
+
+
+def test_build_diagnostics_reported_healthy_slot_shows_fresh_age():
+    """A slot with a REAL, just-received healthy plugin_status report is
+    distinguishable from the default-assumed case above: health_basis flips to
+    'client_reported' and health_age_seconds is small (just recorded)."""
+    tid = _TENANT["id"]
+    tenant = dict(_TENANT, tunnel_plugins=json.dumps({"filesystem": {"enabled": True}}))
+    tn._tunnel_sockets[tid] = object()
+    tn._record_slot_health(tid, "fs", True)
+    result = tn.build_tunnel_diagnostics(tenant)
+    fs = result["slots"]["fs"]
+    assert fs["state"] == "healthy"
+    assert fs["health_basis"] == "client_reported"
+    assert fs["health_reported_at"] is not None
+    assert 0.0 <= fs["health_age_seconds"] < 5.0
+
+
+def test_build_diagnostics_stale_healthy_report_surfaces_large_age_not_silently_fresh():
+    """The core regression this item fixes: a slot last confirmed healthy a LONG
+    time ago (e.g. before a Cloudflare-edge failure started, with no follow-up
+    report) must still say 'healthy' (unchanged label contract) but expose a
+    large health_age_seconds — never read identically to a report received a
+    second ago. This is what would have caught "extract: healthy" being
+    trusted at the exact moment real requests were failing with 502/504s."""
+    tid = _TENANT["id"]
+    tenant = dict(_TENANT, tunnel_plugins=json.dumps({"filesystem": {"enabled": True}}))
+    tn._tunnel_sockets[tid] = object()
+    tn._record_slot_health(tid, "fs", True)
+    # Backdate the receipt timestamp to simulate a report from hours ago with
+    # nothing more recent (e.g. the slot's failures never triggered a fresh
+    # client-side plugin_status message).
+    tn._slot_health_reported_at[tid]["fs"] = time.time() - 6000.0  # ~100 minutes
+    result = tn.build_tunnel_diagnostics(tenant)
+    fs = result["slots"]["fs"]
+    assert fs["state"] == "healthy"  # label contract unchanged
+    assert fs["health_basis"] == "client_reported"
+    assert fs["health_age_seconds"] >= 5999.0
+
+
+def test_clear_slot_health_drops_reported_at_timestamp_single_slot():
+    tid = "diag-clear-one"
+    tn._record_slot_health(tid, "fs", True)
+    tn._record_slot_health(tid, "code", True)
+    assert "fs" in tn._slot_health_reported_at.get(tid, {})
+    tn._clear_slot_health(tid, "fs")
+    assert "fs" not in tn._slot_health_reported_at.get(tid, {})
+    assert "code" in tn._slot_health_reported_at.get(tid, {})
+    tn._clear_slot_health(tid)
+    assert tid not in tn._slot_health_reported_at
 
 
 def test_build_diagnostics_degraded_slot_surfaces_last_error_and_remediation():
