@@ -1533,7 +1533,37 @@ async def _handle_mcp_request(
                         pass
             return _server._jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result, default=_json_default)}]})
         except Exception as exc:
-            return _server._jsonrpc_err(req_id, -32603, str(exc))
+            # b0ed079a — a tool-level exception here was previously converted
+            # straight into a JSON-RPC error with zero durable trace: neither
+            # session_activity nor connection_events recorded that anything
+            # went wrong, leaving silent failures with no way to debug them
+            # after the fact. Record it into session_activity (mirroring the
+            # exact _EXECUTOR_SESSIONS/_ACTIVITY_SKIP_TOOLS gating the
+            # success-path activity heartbeat in _dispatch_mcp_tool already
+            # uses, so a failed call is observable via
+            # get_session_log/get_session_activity exactly where a successful
+            # one already would be) and tag the returned error so
+            # _remote_mcp_inner can record it distinctly in connection_events
+            # too (see _jsonrpc_err's docstring). Best-effort throughout —
+            # a logging failure must never mask or replace the original
+            # exception being returned to the caller below; the response
+            # shape and message are unchanged from before this fix.
+            try:
+                _exc_sid = args.get("session_id") if isinstance(args, dict) else None
+                if (
+                    _exc_sid
+                    and _exc_sid in _EXECUTOR_SESSIONS
+                    and name not in _ACTIVITY_SKIP_TOOLS
+                ):
+                    await db_module.record_session_activity(
+                        db, _exc_sid, name,
+                        f"EXCEPTION {type(exc).__name__}: {exc}"[:200],
+                    )
+            except Exception:  # noqa: BLE001 — never mask the real error below
+                pass
+            return _server._jsonrpc_err(
+                req_id, -32603, str(exc), data={"tool_exception": True},
+            )
 
     return _server._jsonrpc_err(req_id, -32601, f"method not found: {method}")
 
@@ -2864,6 +2894,15 @@ _PLANNER_REFRESH_TRIGGERS = frozenset({
 _EXECUTOR_SESSIONS: set[str] = set()
 _PLANNER_SESSIONS: set[str] = set()
 _SESSION_REFRESH_STATE: dict[str, dict] = {}
+
+# 8c147109 / b0ed079a — tool names that must never generate a session_activity
+# entry (observer/polling tools, not signal). Shared by the success-path
+# activity heartbeat in _dispatch_mcp_tool and the tool-exception recording
+# path in _handle_mcp_request's tools/call except-block, so the two "which
+# tool calls are signal, not polling noise" gates can never drift apart.
+_ACTIVITY_SKIP_TOOLS: frozenset[str] = frozenset({
+    "heartbeat", "get_session_log", "get_session_activity", "update_session_seen",
+})
 
 
 def _session_role_hint(session_id: "str | None") -> "str | None":
@@ -7198,10 +7237,9 @@ async def _dispatch_mcp_tool(
             # signs of life via get_session_log even before the executor calls
             # log_task(). Only fires for executor sessions; never for the observer
             # tools (get_session_log/get_session_activity/heartbeat) themselves.
-            _ACTIVITY_SKIP_TOOLS = frozenset({
-                "heartbeat", "get_session_log", "get_session_activity",
-                "update_session_seen",
-            })
+            # b0ed079a — _ACTIVITY_SKIP_TOOLS now lives at module level (shared
+            # with the tool-exception recording path below); see its definition
+            # next to _EXECUTOR_SESSIONS above.
             try:
                 _act_sid = args.get("session_id")
                 if (

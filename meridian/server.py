@@ -7444,8 +7444,21 @@ def _jsonrpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
-def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+def _jsonrpc_err(
+    req_id: Any, code: int, message: str, data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a JSON-RPC 2.0 error response.
+
+    ``data`` (b0ed079a, optional) — an extra machine-readable error payload
+    per the JSON-RPC 2.0 spec's optional ``error.data`` member. Used to flag
+    a genuine tool-level exception (as opposed to a routine validation
+    error) so ``_remote_mcp_inner`` can record it distinctly in
+    connection_events instead of logging it identically to a success.
+    """
+    err: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": req_id, "error": err}
 
 
 # ---------------------------------------------------------------------------
@@ -8368,19 +8381,34 @@ async def _remote_mcp_inner(
         _t_prev = _t_now
         _mcp_profile_log(getattr(request.state, "request_id", "unknown"), _prof_stages)
 
-    # b12cc29f — log every successful /mcp dispatch. tools/list captures tool count.
+    # b12cc29f — log every /mcp dispatch. tools/list captures tool count.
     _tools_ret2: "int | None" = None
     if _req_method == "tools/list":
         _r = result.get("result") or {}
         _tools_ret2 = len(_r.get("tools", []))
+    # b0ed079a — a tool-level exception raised during tools/call is caught by
+    # _handle_mcp_request and turned into a JSON-RPC error (never raised past
+    # this point — response shape/behavior for the caller is unchanged), but
+    # this connection-event log previously recorded that identically to a
+    # genuine success: auth_result="success", response_status=200, with zero
+    # trace that anything actually failed. _jsonrpc_err tags that specific
+    # case via error.data.tool_exception (see its docstring); surface it here
+    # as a distinct auth_result/response_status so connection_events is no
+    # longer blind to it. Every other error path (unknown tool, out-of-scope
+    # project, etc.) is unaffected — those never set tool_exception.
+    _tool_exc = False
+    if isinstance(result, dict):
+        _err_obj = result.get("error")
+        if isinstance(_err_obj, dict) and isinstance(_err_obj.get("data"), dict):
+            _tool_exc = bool(_err_obj["data"].get("tool_exception"))
     await _log_connection_event(
         _conn_db,
         tenant_id=_conn_tenant_id,
         method=_req_method,
-        auth_result="success",
+        auth_result=("tool_error" if _tool_exc else "success"),
         tools_returned=_tools_ret2,
         client_user_agent=_conn_ua,
-        response_status=200,
+        response_status=(500 if _tool_exc else 200),
     )
     return JSONResponse(result)
 

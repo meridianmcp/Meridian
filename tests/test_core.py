@@ -9058,8 +9058,94 @@ async def test_get_tasks_includes_human_id(db):
     assert t["session_name"] == "test-session"
 
 
-def test_git_status_endpoint_returns_shape(client):
-    """GET /admin/git-status returns ok and behind fields; warning present when ok=True."""
+def test_git_status_endpoint_returns_shape(client, monkeypatch):
+    """GET /admin/git-status returns ok/behind/warning shape.
+
+    CI-PERF-2: fast unit test — mocks the 5 ``git`` subprocess calls (and the
+    ``git fetch origin`` network call among them) that ``admin.git_status``
+    makes, so this test never touches the network or spawns a real process.
+    Covers both success shapes (behind==0 -> warning None; behind>0 -> warning
+    a string) plus the exception fallback shape. See
+    ``test_git_status_endpoint_returns_shape_real_subprocess`` below for the
+    real-subprocess/network integration counterpart.
+    """
+    import subprocess as sp
+
+    def _fake_run(cmd, **kwargs):
+        assert cmd[0] == "git"
+        if cmd[1] == "fetch":
+            return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1:4] == ["rev-list", "--left-right", "--count"]:
+            return sp.CompletedProcess(cmd, 0, stdout="0\t2\n", stderr="")
+        if cmd[1:3] == ["rev-parse", "--abbrev-ref"]:
+            return sp.CompletedProcess(cmd, 0, stdout="dev\n", stderr="")
+        if cmd[-1] == "HEAD":
+            return sp.CompletedProcess(cmd, 0, stdout="abc1234\n", stderr="")
+        if cmd[-1] == "@{upstream}":
+            return sp.CompletedProcess(cmd, 0, stdout="def5678\n", stderr="")
+        raise AssertionError(f"unexpected git invocation in mocked test: {cmd}")
+
+    monkeypatch.setattr(sp, "run", _fake_run)
+    r = client.get("/admin/git-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {
+        "ok": True,
+        "branch": "dev",
+        "ahead": 0,
+        "behind": 2,
+        "local_hash": "abc1234",
+        "remote_hash": "def5678",
+        "up_to_date": False,
+        "warning": "2 commit(s) behind origin/dev",
+    }
+
+
+def test_git_status_endpoint_returns_shape_up_to_date_no_warning(client, monkeypatch):
+    """Same success path, but behind==0 -> warning must be None (not absent)."""
+    import subprocess as sp
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[1:4] == ["rev-list", "--left-right", "--count"]:
+            return sp.CompletedProcess(cmd, 0, stdout="0\t0\n", stderr="")
+        return sp.CompletedProcess(cmd, 0, stdout="deadbee\n", stderr="")
+
+    monkeypatch.setattr(sp, "run", _fake_run)
+    r = client.get("/admin/git-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["behind"] == 0
+    assert body["up_to_date"] is True
+    assert body["warning"] is None
+
+
+def test_git_status_endpoint_returns_shape_on_subprocess_error(client, monkeypatch):
+    """Any exception (e.g. git not installed / not a repo) -> ok=False shape,
+    never a 500 -- the endpoint's own try/except contract."""
+    import subprocess as sp
+
+    def _fake_run(cmd, **kwargs):
+        raise FileNotFoundError("git executable not found")
+
+    monkeypatch.setattr(sp, "run", _fake_run)
+    r = client.get("/admin/git-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["behind"] == 0
+    assert body["ahead"] == 0
+    assert isinstance(body["error"], str) and body["error"]
+
+
+@pytest.mark.subprocess_isolated
+def test_git_status_endpoint_returns_shape_real_subprocess(client):
+    """CI-PERF-2 integration counterpart: exercises the real ``git`` subprocess
+    calls (including a real ``git fetch origin`` network round-trip) against
+    this checkout. Marked subprocess_isolated (existing repo convention — see
+    pytest.ini) since it spawns real OS subprocesses and does real network
+    I/O, so it runs serially outside the main -n auto sweep instead of being
+    mocked like the fast unit tests above."""
     r = client.get("/admin/git-status")
     assert r.status_code == 200
     body = r.json()

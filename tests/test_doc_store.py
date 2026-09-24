@@ -939,3 +939,97 @@ def test_docx_chain_missing_source_returns_none(tmp_path):
         store = await _open_store(tmp_path)
         assert await store.get_structure("proj", "never-ingested.docx") is None
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# CI-PERF-6 — the shared ``client`` fixture's MERIDIAN_DOC_STORE_URL=":memory:"
+# default (tests/conftest.py). Opening + schema-initializing a real on-disk
+# sidecar (``{tmp_path}/doc_structure.db``) on EVERY ``client``-fixture test's
+# lifespan startup was profiled as the dominant per-test cost across the
+# suite's ~390 ``client``-fixture tests in test_core.py.
+# ---------------------------------------------------------------------------
+
+def test_client_fixture_defaults_doc_store_to_memory(client, tmp_path):
+    """The shared ``client`` fixture defaults ``MERIDIAN_DOC_STORE_URL`` to
+    ``":memory:"`` so the lifespan's unconditional ``open_doc_store_for`` call
+    (server.py) never touches disk. Asserts both the env var AND the actual
+    absence of the on-disk sidecar file, so a regression that quietly
+    reintroduces the on-disk default (even with the env var still reading
+    correctly at some other point) is still caught."""
+    assert os.environ.get("MERIDIAN_DOC_STORE_URL") == ":memory:"
+    assert os.environ.get("MERIDIAN_DATA_DIR") == str(tmp_path)
+    sidecar = tmp_path / "doc_structure.db"
+    assert not sidecar.exists(), (
+        "doc store fell back to the on-disk sidecar despite the ':memory:' "
+        "override — exactly the dominant per-test cost CI-PERF-6 removes"
+    )
+    # The lifespan actually opened a live store, not None.
+    assert client.app.state.doc_store is not None
+
+
+@pytest.fixture
+def _preset_doc_store_url(monkeypatch, tmp_path):
+    """A caller-owned MERIDIAN_DOC_STORE_URL, set before ``client`` runs.
+
+    Listed ahead of ``client`` in a test's parameter list so pytest
+    instantiates it first (same-scope fixtures with no dependency between
+    them are instantiated in the left-to-right order they appear in the
+    test's parameter list) — this lets the test below observe the ``client``
+    fixture's own opt-out check running against an already-populated env
+    var, exactly as a real caller doing the same thing would.
+    """
+    sidecar = str(tmp_path / "preset_sidecar.db")
+    monkeypatch.setenv("MERIDIAN_DOC_STORE_URL", sidecar)
+    return sidecar
+
+
+def test_client_fixture_respects_preexisting_doc_store_url_override(
+    _preset_doc_store_url, client
+):
+    """CI-PERF-6 opt-out — a caller that already configured
+    ``MERIDIAN_DOC_STORE_URL`` before requesting ``client`` keeps that value;
+    the shared fixture's ``":memory:"`` default only applies when the var is
+    UNSET, so a test that deliberately exercises the persistent/file-backed
+    sidecar path is never silently switched to in-memory underneath it."""
+    assert os.environ.get("MERIDIAN_DOC_STORE_URL") == _preset_doc_store_url
+    assert os.environ.get("MERIDIAN_DOC_STORE_URL") != ":memory:"
+    assert client.app.state.doc_store is not None
+
+
+def test_memory_doc_store_is_fresh_after_close_all_doc_stores(tmp_path):
+    """CI-PERF-6 correctness guard — every ``client``-fixture test now
+    resolves the SAME literal ``":memory:"`` target, so
+    ``doc_store._doc_store_cache`` would hand every test the SAME cached
+    connection (leaking every prior test's documents into every later one)
+    unless something clears that cache between tests. ``close_all_doc_stores``
+    is exactly that something: it already runs unconditionally on every
+    FastAPI lifespan shutdown (server.py), i.e. at the end of every
+    ``client``-fixture test. This exercises the underlying mechanism the
+    ``client`` fixture's ':memory:' default now depends on for correctness,
+    independent of pytest's test execution order: open a ':memory:' store,
+    write to it, close-all (mirrors lifespan shutdown), reopen the SAME
+    ':memory:' target, and confirm the reopened store is empty rather than
+    handing back the first store's cached connection/data."""
+    async def _run():
+        store1 = await doc_store.open_doc_store_for(
+            plan=None, hosted=False, data_dir=str(tmp_path),
+            tenant_pg_url=None, override_url=":memory:",
+        )
+        elements = doc_store.elements_from_docx_outline(document_outline(_synthetic_docx()))
+        await store1.put_document("leak-proj", "docx", elements, source="leak-check.docx")
+        assert await store1.get_structure("leak-proj", "leak-check.docx") is not None
+
+        await doc_store.close_all_doc_stores()
+
+        store2 = await doc_store.open_doc_store_for(
+            plan=None, hosted=False, data_dir=str(tmp_path),
+            tenant_pg_url=None, override_url=":memory:",
+        )
+        try:
+            assert store2 is not store1
+            assert await store2.get_structure("leak-proj", "leak-check.docx") is None
+        finally:
+            await doc_store.close_all_doc_stores()
+
+    asyncio.run(_run())
+    asyncio.run(_run())

@@ -378,6 +378,12 @@ def test_call_tunnel_tool_bounds_cold_cache_discovery_to_outer_timeout(monkeypat
     promptly (miss/None) instead of hanging on a slow/wedged fetch."""
     import time as _time
 
+    # CI-PERF-3A: _TOOL_DISCOVERY_TIMEOUT is already a monkeypatchable module
+    # constant (routes/tunnel.py) — shrink it so this test doesn't actually
+    # wait out the real 5s bound; the mechanism under test (a hard outer
+    # wait_for) is timeout-magnitude independent.
+    monkeypatch.setattr(tn, "_TOOL_DISCOVERY_TIMEOUT", 0.05)
+
     tenant = "t-cold-cache-hang"
     tn._tunnel_sockets[tenant] = object()
     # No pre-seeded route — forces the cold-cache discovery branch.
@@ -394,7 +400,7 @@ def test_call_tunnel_tool_bounds_cold_cache_discovery_to_outer_timeout(monkeypat
     elapsed = _time.monotonic() - start
 
     # Bounded well under the 30s hang — proves the outer wait_for fired.
-    assert elapsed < tn._TOOL_DISCOVERY_TIMEOUT + 5.0, (
+    assert elapsed < tn._TOOL_DISCOVERY_TIMEOUT + 1.0, (
         f"call_tunnel_tool took {elapsed:.1f}s — outer discovery timeout did not bound it"
     )
     # No route was discovered (the hung fetch's result is discarded, not
@@ -692,6 +698,11 @@ def test_fetch_slot_tools_bounds_wall_clock_even_if_every_attempt_times_out(monk
     safety net alongside the outer asyncio.wait_for(5.0) in handler.py's
     tools/list branch — it must hold even if that outer cancellation never
     reaches this coroutine."""
+    # CI-PERF-3A: _SLOT_TOOLS_FETCH_BUDGET is already a monkeypatchable module
+    # constant (routes/tunnel.py) — shrink it so this test doesn't actually
+    # wait out the real 4s default budget; the mechanism under test (a
+    # wall-clock-bound retry loop) is timeout-magnitude independent.
+    monkeypatch.setattr(tn, "_SLOT_TOOLS_FETCH_BUDGET", 0.05)
     tn._tunnel_code_sockets["t-slow-slot"] = object()
 
     async def hangs(tenant_id, method, path, query, headers, body, sockets, pending, label):

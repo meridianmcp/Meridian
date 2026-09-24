@@ -2803,11 +2803,19 @@ function _moveProjectToFolder(t: any) {
 
 
 // 0fed6a42 — kebab-menu action: make a project a one-level-deep subproject of
-// another. Presents a numbered picker of *eligible* parents (eligibleParents
-// enforces the same guards as the server: not self, parent must be top-level, a
+// another. Presents a picker of *eligible* parents (eligibleParents enforces
+// the same guards as the server: not self, parent must be top-level, a
 // project that already has children can't be moved). Persists via the
 // POST /projects/{id}/parent REST route, then re-renders the (now nested) list.
-async function _makeSubproject(t: any) {
+//
+// a40ec229 — the picker is a real inline <select> dropdown (same pattern as
+// the "decision-cat-dropdown" inline picker elsewhere in this file) rather
+// than a window.prompt() numbered list: it opens anchored under the
+// triggering kebab button, offers exactly the same eligibleParents candidates
+// as options, and performs the exact same action on selection. Choosing
+// nothing (blur without picking) is the same as the old "leave blank to
+// cancel" behavior.
+async function _makeSubproject(t: any, anchor?: any) {
 
   const candidates = eligibleParents(state.projects as HierProject[], t.id);
 
@@ -2821,32 +2829,78 @@ async function _makeSubproject(t: any) {
     return;
   }
 
-  const lines = candidates.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
-  const raw = window.prompt(
-    `Make "${t.project.name}" a subproject of which project?\n\n${lines}\n\nEnter a number (or leave blank to cancel):`,
-    '',
-  );
-  if (raw === null) return; // cancelled
-  const idx = parseInt(raw.trim(), 10) - 1;
-  if (Number.isNaN(idx) || idx < 0 || idx >= candidates.length) {
-    if (raw.trim() !== '') toast('Invalid selection', true);
-    return;
-  }
-  const parent = candidates[idx];
+  // Remove any existing inline picker before opening a new one.
+  document.querySelectorAll('.subproject-parent-picker').forEach(d => d.remove());
 
-  try {
-    await api(`/projects/${t.id}/parent`, {
-      method: 'POST', body: JSON.stringify({ parent_project_id: parent.id }),
-    });
-    // Reflect the change on the local row + reload so the nested render applies.
-    t.project = { ...t.project, parent_project_id: parent.id };
-    const proj = state.projects.find((p: any) => p.id === t.id);
-    if (proj) proj.parent_project_id = parent.id;
-    await loadProjects();
-    toast(`"${t.project.name}" is now a subproject of "${parent.name}"`);
-  } catch (e: any) {
-    toast('Could not set parent: ' + e.message, true);
+  const sel = document.createElement('select');
+  sel.className = 'subproject-parent-picker';
+  sel.style.cssText = 'position:fixed;z-index:1002;background:var(--surface-2);color:var(--text);font-size:11px;font-family:var(--font-mono);border:1px solid var(--border);border-radius:4px;padding:4px 6px;cursor:pointer;outline:none;box-shadow:0 4px 12px rgba(0,0,0,0.4)';
+
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = `Make "${t.project.name}" a subproject of…`;
+  placeholder.disabled = true;
+  placeholder.selected = true;
+  sel.appendChild(placeholder);
+
+  candidates.forEach((p) => {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.name || '';
+    sel.appendChild(opt);
+  });
+
+  const rect = (anchor && typeof anchor.getBoundingClientRect === 'function'
+    ? anchor.getBoundingClientRect()
+    : { left: 0, bottom: 0, width: 200 }) as DOMRect;
+  sel.style.left = rect.left + 'px';
+  sel.style.top = (rect.bottom + 4) + 'px';
+  sel.style.minWidth = Math.max(rect.width, 200) + 'px';
+
+  document.body.appendChild(sel);
+  sel.focus({ preventScroll: true });
+  if (typeof sel.showPicker === 'function') {
+    try { sel.showPicker(); }
+    catch (_) { sel.click(); }
+  } else {
+    sel.click();
   }
+  // Idempotency-flag-guarded, not just isConnected-checked: removing a
+  // currently-FOCUSED element synchronously fires its `blur` handler as part
+  // of that same removal (before the node is actually detached), so
+  // onchange's removeSel() call reenters via onblur's removeSel() call while
+  // the outer .remove() is still in flight — an isConnected check alone still
+  // reads true at that point, so the reentrant call throws NotFoundError.
+  // Unguarded, that exception aborted the whole onchange handler before it
+  // ever reached the api() call below. The flag makes any later call a no-op
+  // regardless of call order; the try/catch is defense in depth.
+  let pickerRemoved = false;
+  const removeSel = () => {
+    if (pickerRemoved) return;
+    pickerRemoved = true;
+    try { sel.remove(); } catch (_) { /* already being removed re-entrantly */ }
+  };
+  sel.onblur = () => removeSel();
+
+  sel.onchange = async () => {
+    const parent = candidates.find(p => p.id === sel.value);
+    removeSel();
+    if (!parent) return; // placeholder somehow re-selected — treat as cancel
+
+    try {
+      await api(`/projects/${t.id}/parent`, {
+        method: 'POST', body: JSON.stringify({ parent_project_id: parent.id }),
+      });
+      // Reflect the change on the local row + reload so the nested render applies.
+      t.project = { ...t.project, parent_project_id: parent.id };
+      const proj = state.projects.find((p: any) => p.id === t.id);
+      if (proj) proj.parent_project_id = parent.id;
+      await loadProjects();
+      toast(`"${t.project.name}" is now a subproject of "${parent.name}"`);
+    } catch (e: any) {
+      toast('Could not set parent: ' + e.message, true);
+    }
+  };
 
 }
 
@@ -3223,7 +3277,7 @@ function _openTabMenu(t: any, anchor: any) {
   if (t.project && t.project.parent_project_id) {
     menuItem('\u2934 Detach from parent', () => _detachSubproject(t));
   } else {
-    menuItem('\ud83d\udd17 Make subproject of\u2026', () => _makeSubproject(t));
+    menuItem('\ud83d\udd17 Make subproject of\u2026', () => _makeSubproject(t, anchor));
   }
 
   menuItem('\u2b07 Download DB', () => window.open('/admin/snapshot', '_blank'));
