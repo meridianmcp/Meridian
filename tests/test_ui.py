@@ -1132,3 +1132,24 @@ def test_pwa_dashboard_head_wires_manifest_and_sw(soup, html):
     assert "navigator.serviceWorker.register('/sw.js'" in html, (
         "dashboard must register /sw.js"
     )
+
+
+def test_pwa_install_prompt_wired(js):
+    """afcbd8a2 — beforeinstallprompt is captured (not left to the browser's own
+    mini-infobar) and replayed from a real user-gesture click, with the button
+    removed again on click or on appinstalled.
+
+    b03be6a6 shipped the installability requirements (manifest/SW/icons); this
+    covers the actual install AFFORDANCE, which was the remaining gap.
+    """
+    assert "beforeinstallprompt" in js, "beforeinstallprompt listener missing"
+    assert "event.preventDefault()" in js, (
+        "must preventDefault() beforeinstallprompt to suppress the browser's own UI"
+    )
+    assert "appinstalled" in js, "appinstalled listener missing (button must be hidden after install)"
+    assert "pwa-install-button" in js, "install button id/class missing"
+    assert "promptEvent.prompt()" in js, "captured event's prompt() must be replayed on click"
+
+    # Never shown when already running as an installed app.
+    assert "display-mode: standalone" in js, "standalone display-mode check missing"
+    assert "navigator.standalone" in js, "legacy iOS standalone check missing"
