@@ -38,6 +38,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -163,6 +164,87 @@ def is_secret_path(path: str) -> bool:
     This function is tested exhaustively in the package test suite.
     """
     return _SECRET_PATTERN_RE.match(os.path.basename(path)) is not None
+
+
+def has_secret_content(text: str) -> bool:
+    """Return True if ``text`` itself contains secret-shaped material, using
+    ``detect-secrets`` (Yelp/IBM, Apache 2.0)'s real regex+entropy+keyword
+    plugin engine -- a genuinely different, complementary signal from
+    :func:`is_secret_path`'s basename-only check.
+
+    Added 2026-09-24 after a paper evaluation comparing ``is_secret_path()``
+    against Gitleaks (a real, independently-developed content scanner) found
+    the expected, structural asymmetry: ``is_secret_path()`` cannot detect a
+    secret embedded in an ordinary-looking output file (e.g. a stray API key
+    pasted into a log or notes file), and a pure content scanner cannot
+    detect a secret-shaped FILENAME with placeholder content. Neither gap is
+    a defect in either approach; each mechanism answers a different
+    question. This closes the content-detection half for callers who opt in.
+
+    Optional and lazy by design, mirroring every other optional-dependency
+    pattern in this module (:func:`_xxh3_file`, :func:`_blake3_file`,
+    :func:`npy_metadata`): if ``detect-secrets`` isn't installed, this
+    degrades to ``False`` (never raises, never blocks indexing) rather than
+    making it a hard dependency of the whole package. Callers control
+    whether this runs at all via ``content_secret_mode`` on
+    :meth:`OutputsFtsIndex.rebuild` (default ``"off"`` -- zero behavior
+    change, zero performance cost, for every existing caller).
+
+    Deliberately conservative in the opposite direction from
+    ``is_secret_path()``: this reads real file content that has already
+    been loaded for fingerprinting (no extra I/O), but a false positive
+    here silently excludes a legitimate output file from the index, so
+    ``detect-secrets``'s own default plugin set and allowlist/entropy
+    heuristics (tuned against SecretBench, a real labeled-secrets
+    benchmark -- see the paper's own citation of Basak et al.) are used
+    unmodified rather than a custom, unverified ruleset.
+    """
+    if not text or not text.strip():
+        return False
+    if not verify_search_dependencies()["detect_secrets"]["available"]:
+        return False
+    try:
+        from detect_secrets.core.scan import scan_file  # noqa: PLC0415 -- optional, lazy
+        from detect_secrets.settings import default_settings  # noqa: PLC0415
+    except ImportError:
+        return False
+    # scan_file(), not the adhoc per-line scan_line(): live-verified (2026-09-24)
+    # that scan_line() skips filters scan_file() applies and produces a
+    # catastrophic false-positive rate on ordinary prose -- its "Base64 High
+    # Entropy String" plugin flagged nearly every short lowercase English
+    # word ("this", "is", "with", "file", ...) in a plain benign sentence.
+    # scan_file() against a real (if temporary) file applies the full,
+    # properly-calibrated filter set and correctly returned zero findings
+    # for the same benign content while still catching every real secret
+    # type tested (AWS key, GitHub token, Stripe key, PEM private key).
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8",
+        ) as f:
+            f.write(text)
+            tmp_path = f.name
+        with default_settings():
+            for _ in scan_file(tmp_path):
+                return True
+        return False
+    except Exception:
+        # Never let a scanning bug in an optional dependency break indexing
+        # (the same posture _xxh3_file/_blake3_file already take on their
+        # own optional deps) -- treat an unexpected failure as "clean"
+        # rather than crashing rebuild(), and log it so it isn't silent.
+        _log.warning(
+            "meridian_outputs: has_secret_content() scan failed unexpectedly, "
+            "treating content as clean rather than blocking indexing",
+            exc_info=True,
+        )
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 
@@ -1963,15 +2045,29 @@ def _light_row(row: OutputRow) -> OutputRow:
 
 def build_output_rows(
     outputs_dir: str, *, hasher: Callable[[str], str | None] = _xxh3_file,
-    exclude_patterns: tuple[str, ...] = (),
+    exclude_patterns: tuple[str, ...] = (), content_secret_mode: str = "off",
 ) -> list[OutputRow]:
     """Walk ``outputs_dir`` with secret-file exclusion (and the optional
-    user ``exclude_patterns`` list, fd4dd661) and build OutputRows."""
+    user ``exclude_patterns`` list, fd4dd661) and build OutputRows.
+
+    ``content_secret_mode``: same opt-in content-based secret exclusion as
+    :meth:`OutputsFtsIndex.rebuild`'s own parameter of the same name
+    (default ``"off"``) -- kept consistent here even though this legacy,
+    non-parallel path has no production caller (see :meth:`rebuild`'s own
+    docstring for the full account), since it remains public API.
+    """
     paths = _iter_safe_output_files(outputs_dir, exclude_patterns=exclude_patterns)
     classifications = classify_canonical_archival(paths, hasher=hasher)
     rows: list[OutputRow] = []
     for path in paths:
         fp = file_fingerprint(path)
+        content = _content_for_fts(path, fp)
+        if content_secret_mode == "scan" and has_secret_content(content):
+            _log.debug(
+                "outputs_local: skipping file with secret-shaped content %r "
+                "(content_secret_mode=\"scan\")", path,
+            )
+            continue
         try:
             st = os.stat(path)
             size: int | None = st.st_size
@@ -1981,7 +2077,7 @@ def build_output_rows(
         cls = classifications.get(path)
         rows.append(OutputRow(
             path=path,
-            content=_content_for_fts(path, fp),
+            content=content,
             mtime=mtime,
             sha256=hasher(path),
             size=size,
@@ -2842,6 +2938,14 @@ def verify_search_dependencies(force: bool = False) -> dict[str, dict[str, Any]]
             "`pip install xxhash>=3.4`) -- until then, content hashing "
             "falls back to slower SHA-256 (functionally equivalent, no "
             "data loss, no behavior change beyond speed)",
+        ),
+        "detect_secrets": _probe_optional_dependency(
+            "detect_secrets",
+            "install the declared dependency (`pixi install`, or "
+            "`pip install detect-secrets>=1.5`) -- until then, "
+            "content_secret_mode=\"scan\" degrades to a no-op (identical "
+            "to \"off\"): basename-based secret exclusion (is_secret_path) "
+            "is unaffected either way",
         ),
     }
     for name, info in result.items():
@@ -5037,8 +5141,28 @@ class OutputsFtsIndex:
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
         staleness_mode: str = "fast", staleness_sample_rate: float = 0.1,
+        content_secret_mode: str = "off",
     ) -> int:
         """Incrementally rebuild the table + FTS index.  Returns row count.
+
+        ``content_secret_mode`` (2026-09-24, optional, default ``"off"``): the
+        content-based complement to the always-on, basename-only
+        :func:`is_secret_path` filter. ``"off"`` (default) is a strict no-op
+        -- zero behavior change, zero performance cost, for every existing
+        caller. ``"scan"`` additionally runs :func:`has_secret_content` on
+        each stale file's already-extracted text content (no extra I/O) and
+        excludes it from the index, with the same "never discovered" contract
+        :func:`is_secret_path` already has, if secret-shaped content is
+        found. Requires the optional ``detect-secrets`` dependency
+        (``pip install meridian-outputs[secrets]``); degrades to a no-op
+        (identical to ``"off"``) if it isn't installed, never raises. Added
+        after a paper evaluation comparing ``is_secret_path()`` against a
+        real content scanner (Gitleaks) found the expected, structural
+        asymmetry: a basename filter cannot catch a secret embedded in an
+        ordinary-looking file, and a content scanner alone cannot catch a
+        secret-shaped filename with placeholder content. The two mechanisms
+        are complementary, not substitutable -- see
+        :func:`has_secret_content`'s own docstring for the fuller account.
 
         Performance design (two-phase):
 
@@ -5877,6 +6001,7 @@ class OutputsFtsIndex:
                 self._apply_precomputed(
                     all_paths, path_set, removed_paths, stale, stale_sigs,
                     precomputed, classifications, deadline,
+                    content_secret_mode=content_secret_mode,
                 )
             )
             self.last_rebuild_metrics["apply_precomputed_seconds"] = round(
@@ -6449,6 +6574,7 @@ class OutputsFtsIndex:
         precomputed: dict[str, "_FileAnalysis"],
         classifications: dict[str, ArchivalClassification],
         deadline: float | None,
+        content_secret_mode: str = "off",
     ) -> tuple[int, bool, list[str], list[OutputRow]]:
         """Apply pre-computed per-file analysis to the in-memory cache.
 
@@ -6508,6 +6634,31 @@ class OutputsFtsIndex:
             fp = analysis.fingerprint
             mtime = analysis.mtime
             size = analysis.size
+            content = (
+                analysis.content
+                if analysis.content is not None
+                else _content_for_fts(p, fp)
+            )
+            if content_secret_mode == "scan" and has_secret_content(content):
+                # Same contract as is_secret_path exclusion: this file never
+                # gets a NEW row, and its manifest entry is still recorded
+                # (so a later rebuild() doesn't keep re-scanning its content
+                # every call believing it's still unseen). Unlike a file
+                # that was ALWAYS excluded, this one is in `stale` -- it may
+                # have had a previously-persisted row from before its
+                # content became secret-shaped (e.g. a credential pasted
+                # into a previously-clean notes file); that stale row must
+                # be deleted, not left indexed forever.
+                self._manifest[p] = stale_sigs.get(p, (mtime, size))
+                if p in self._row_cache or self._pending_hash_upgrade:
+                    self._row_cache.pop(p, None)
+                    paths_to_delete.append(p)
+                    changed = True
+                _log.debug(
+                    "outputs_local: skipping file with secret-shaped content %r "
+                    "(content_secret_mode=\"scan\")", p,
+                )
+                continue
             # During a hash-algorithm upgrade the cache is intentionally left
             # empty, even though DuckDB still contains legacy rows; those
             # rows must be replaced rather than treated as brand-new inserts.
@@ -6515,11 +6666,7 @@ class OutputsFtsIndex:
             cls = classifications.get(p)
             row = OutputRow(
                 path=p,
-                content=(
-                    analysis.content
-                    if analysis.content is not None
-                    else _content_for_fts(p, fp)
-                ),
+                content=content,
                 mtime=mtime,
                 sha256=analysis.sha256,
                 size=size,
@@ -7145,6 +7292,7 @@ class OutputsFtsIndex:
         stale_sigs: dict[str, tuple[float | None, int | None]],
         precomputed: dict[str, "_FileAnalysis"],
         classifications: dict[str, ArchivalClassification],
+        content_secret_mode: str = "off",
     ) -> tuple[list[OutputRow], list[str]]:
         """Build+cache :class:`OutputRow` objects for a small, EXPLICIT path
         set. This is the row-construction slice of :meth:`_apply_precomputed`
@@ -7164,14 +7312,29 @@ class OutputsFtsIndex:
             if analysis is None:
                 continue
             fp = analysis.fingerprint
+            content = (
+                analysis.content if analysis.content is not None
+                else _content_for_fts(p, fp)
+            )
+            if content_secret_mode == "scan" and has_secret_content(content):
+                # Same contract as _apply_precomputed's own guard (mirror it
+                # exactly, not shared code -- see that method's own comment
+                # for the full rationale): never gets a new row, and if it
+                # previously had one, that stale row is deleted too.
+                self._manifest[p] = stale_sigs.get(p, (analysis.mtime, analysis.size))
+                if p in self._row_cache or self._pending_hash_upgrade:
+                    self._row_cache.pop(p, None)
+                    paths_to_delete.append(p)
+                _log.debug(
+                    "outputs_local: skipping file with secret-shaped content %r "
+                    "(content_secret_mode=\"scan\")", p,
+                )
+                continue
             had_existing = p in self._row_cache or self._pending_hash_upgrade
             cls = classifications.get(p)
             row = OutputRow(
                 path=p,
-                content=(
-                    analysis.content if analysis.content is not None
-                    else _content_for_fts(p, fp)
-                ),
+                content=content,
                 mtime=analysis.mtime,
                 sha256=analysis.sha256,
                 size=analysis.size,
@@ -7229,10 +7392,18 @@ class OutputsFtsIndex:
             if not self._fts_built:
                 self._fts_pending = True
 
-    def index_paths(self, paths: list[str]) -> dict[str, Any]:
+    def index_paths(
+        self, paths: list[str], *, content_secret_mode: str = "off",
+    ) -> dict[str, Any]:
         """Synchronously analyse + persist a small, EXPLICIT set of paths,
         bypassing the ambient resumable walk (Phase 0) and its
         deadline/backlog-throttle machinery entirely.
+
+        ``content_secret_mode``: same opt-in content-based secret exclusion
+        as :meth:`rebuild`'s own parameter of the same name (default
+        ``"off"``, see that docstring for the full account) -- this entry
+        point can persist a row without ever going through ``rebuild()``,
+        so it needs the same guard to be airtight, not just a convenience.
 
         Cost is bounded by ``len(paths)``, not by ``outputs_dir``'s total
         size -- safe to call synchronously from a fast, latency-sensitive
@@ -7302,6 +7473,7 @@ class OutputsFtsIndex:
             self._ensure_schema(con)
             new_rows, paths_to_delete = self._build_rows_for_paths(
                 list(precomputed), stale_sigs, precomputed, classifications,
+                content_secret_mode=content_secret_mode,
             )
             if new_rows:
                 try:
@@ -8140,8 +8312,14 @@ def search_outputs(
     subtree: str | None = None,
     staleness_mode: str = "fast",
     staleness_sample_rate: float = 0.1,
+    content_secret_mode: str = "off",
 ) -> dict[str, Any]:
     """BM25 search over a local outputs tree.
+
+    ``content_secret_mode`` (2026-09-24, optional, default ``"off"``):
+    opt-in content-based secret exclusion, passed straight through to
+    :meth:`OutputsFtsIndex.rebuild` -- see that method's own docstring for
+    the full account. ``"off"`` is a strict no-op.
 
     ``staleness_mode`` (item 89612890, optional, default ``"fast"``): the
     documented default is stat-based (mtime+size) staleness, which cannot
@@ -8240,6 +8418,7 @@ def search_outputs(
         max_seconds=max_seconds,
         staleness_mode=staleness_mode,
         staleness_sample_rate=staleness_sample_rate,
+        content_secret_mode=content_secret_mode,
     )
     # b1789c0d -- expose cumulative row count from the DB (which may be
     # larger than total_indexed on a partial rebuild that resumes prior work)
