@@ -111,6 +111,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import re
 from typing import Any
 
 from meridian import db as db_module
@@ -501,6 +502,73 @@ async def preview_proposal_promotion(
 # ---------------------------------------------------------------------------
 
 
+# b0ae9fc6 — the naive `kw in combined_text` substring scan below used to be
+# both negation-blind ("do NOT delete X" still matched on "delete") and
+# scope-blind (a keyword sitting in a quoted example or a code comment still
+# counted as a proposed action). The two helpers below are a deliberately
+# small, regex-based fix -- not full NLP -- matching this module's own
+# "narrow, documented heuristic" contract from the module docstring.
+
+# Words/phrases that, when they immediately govern a keyword match, mean the
+# proposal is describing what it will NOT do rather than proposing the
+# destructive action itself.
+_NEGATION_MARKERS: tuple[str, ...] = (
+    "not", "never", "won't", "wont", "don't", "dont", "doesn't", "doesnt",
+    "shouldn't", "shouldnt", "isn't", "isnt", "cannot", "can't", "cant",
+    "without", "avoid", "no longer", "instead of",
+)
+# How far back (characters) before a keyword match to look for a governing
+# negation marker -- bounded so a negation from an earlier, unrelated clause
+# doesn't suppress a real destructive statement later in the same sentence.
+_NEGATION_LOOKBACK_CHARS = 40
+# Clause boundaries that stop the negation lookback from crossing into a
+# prior, unrelated sentence/clause.
+_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;\n]")
+
+
+def _strip_quoted_and_comment_spans(text: str) -> str:
+    """Remove fenced code blocks, quoted spans, and line-comment tails
+    before keyword matching, so a keyword appearing only in a quoted
+    example or a code comment -- incidental text, not an actual proposed
+    action -- doesn't count (scope-blindness fix)."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r'"[^"\n]*"', " ", text)
+    text = re.sub(r"'[^'\n]*'", " ", text)
+    text = re.sub(r"`[^`\n]*`", " ", text)
+    text = re.sub(r"(#|//).*", " ", text)
+    return text
+
+
+def _keyword_match_is_negated(text: str, match_start: int) -> bool:
+    """True if a negation marker governs the keyword found at
+    ``match_start`` -- i.e. it appears within a short preceding window, on
+    the same clause (bounded by sentence-ending punctuation so a negation in
+    a PRIOR sentence doesn't suppress this one)."""
+    window_start = max(0, match_start - _NEGATION_LOOKBACK_CHARS)
+    preceding = text[window_start:match_start]
+    boundary_positions = [m.end() for m in _CLAUSE_BOUNDARY_RE.finditer(preceding)]
+    if boundary_positions:
+        preceding = preceding[boundary_positions[-1]:]
+    return any(marker in preceding for marker in _NEGATION_MARKERS)
+
+
+def _text_proposes_destructive_action(text: str) -> bool:
+    """Negation- and scope-aware version of the old bare substring scan:
+    a keyword only counts when it isn't inside a quoted/comment span AND
+    isn't immediately governed by a negation marker."""
+    scoped_text = _strip_quoted_and_comment_spans(text)
+    for kw in db_module._HITL_DESTRUCTIVE_KEYWORDS:
+        search_from = 0
+        while True:
+            idx = scoped_text.find(kw, search_from)
+            if idx == -1:
+                break
+            if not _keyword_match_is_negated(scoped_text, idx):
+                return True
+            search_from = idx + len(kw)
+    return False
+
+
 def _classify_deviation(
     proposal_title: str, proposal_body: str, resources: list[str],
 ) -> str | None:
@@ -515,7 +583,7 @@ def _classify_deviation(
         if any(kw in r for kw in _SECURITY_RESOURCE_KEYWORDS):
             return "tenant_security_boundary"
     combined_text = f"{proposal_title} {proposal_body}".lower()
-    if any(kw in combined_text for kw in db_module._HITL_DESTRUCTIVE_KEYWORDS):
+    if _text_proposes_destructive_action(combined_text):
         return "destructive_behavior"
     return None
 

@@ -202,6 +202,70 @@ async def test_sqlite_master_index_query_bound_param_placeholder():
 
 
 # ---------------------------------------------------------------------------
+# type='index' AND tbl_name=X (408e5cea) -- "list every index on this table",
+# a genuinely different shape from the by-NAME lookups above. Confirmed real
+# via CI: tests/test_d2539453_lint_finding.py::test_migration_creates_table_and_indexes
+# uses this exact shape and returned an empty set on Postgres before this.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sqlite_master_indexes_for_table_returns_all_matching_indexes():
+    db, pool = _pg([
+        (
+            "pg_indexes",
+            [
+                {"indexname": "idx_lint_findings_project"},
+                {"indexname": "idx_lint_findings_document"},
+                {"indexname": "idx_lint_findings_audit_run"},
+            ],
+        ),
+    ])
+
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='lint_findings'"
+    ) as cur:
+        rows = await cur.fetchall()
+
+    names = {row["name"] for row in rows}
+    assert names == {
+        "idx_lint_findings_project",
+        "idx_lint_findings_document",
+        "idx_lint_findings_audit_run",
+    }
+    # Query-aware: the real table name was bound, not inlined/fabricated.
+    assert pool.calls[-1][1] == ("lint_findings",)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_master_indexes_for_table_bound_param_placeholder():
+    db, pool = _pg([
+        ("pg_indexes", [{"indexname": "idx_foo_bar"}]),
+    ])
+
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
+        ("foo",),
+    ) as cur:
+        rows = await cur.fetchall()
+
+    assert {row["name"] for row in rows} == {"idx_foo_bar"}
+    assert pool.calls[-1][1] == ("foo",)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_master_indexes_for_table_none_found_returns_empty():
+    db, _pool = _pg([])  # no configured pg_indexes match -> empty result
+
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='nonexistent_table'"
+    ) as cur:
+        rows = await cur.fetchall()
+
+    assert rows == []
+
+
+# ---------------------------------------------------------------------------
 # type='table' -- another real sqlite_master consumer (356d6ac8's
 # file_patch_counters migration guard, tests/test_356d6ac8_file_patch_counters.py::
 # test_migration_creates_table) must ALSO get a correct, query-aware answer,

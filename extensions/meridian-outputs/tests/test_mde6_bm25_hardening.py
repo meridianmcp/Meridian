@@ -77,9 +77,15 @@ class TestVerifySearchDependencies:
     def test_real_environment_reports_tantivy_and_xxhash_available(self) -> None:
         """This repo declares both as real dependencies (pixi.toml,
         pyproject.toml, item 52cbe5d8) -- in a correctly provisioned
-        pixi environment both must verify as importable."""
+        pixi environment both must verify as importable.
+
+        2026-09-24 -- the registry also carries "detect_secrets" now (a
+        genuine optional extra backing has_secret_content(), same class as
+        blake3: never installed in the standard pixi env, so its own
+        "available" is NOT asserted here, only that the key exists in the
+        registry's shape)."""
         result = OL.verify_search_dependencies(force=True)
-        assert set(result) == {"tantivy", "xxhash"}
+        assert set(result) == {"tantivy", "xxhash", "detect_secrets"}
         assert result["tantivy"]["available"] is True
         assert result["tantivy"]["version"] is not None
 

@@ -824,19 +824,26 @@ async def test_terminate_proc_tree_async_bounds_stalled_taskkill(monkeypatch):
     interference, or an unkillable target process) must not hang
     _terminate_proc_tree_async forever. The very next await in the same
     function (``proc.wait()``) is already wrapped in
-    ``asyncio.wait_for(..., timeout=5.0)``; the taskkill wait must be bounded
-    the same way so a stall there still reaches the ``proc.terminate()``
-    fallback instead of blocking every caller (StdioMcpClient.close(),
-    TunnelSubprocess.stop()) indefinitely.
+    ``asyncio.wait_for(..., timeout=PROCESS_KILL_WAIT_TIMEOUT_S)``; the
+    taskkill wait must be bounded the same way so a stall there still reaches
+    the ``proc.terminate()`` fallback instead of blocking every caller
+    (StdioMcpClient.close(), TunnelSubprocess.stop()) indefinitely.
 
     Reproduced by making the spawned taskkill helper process's own ``wait()``
     never resolve, then bounding the whole call with an outer watchdog that
-    is longer than the function's internal 5s timeout but far shorter than
+    is longer than the function's internal timeout but far shorter than
     "forever" -- before the fix this outer watchdog is what fires (proving
     the function itself has no bound); after the fix the function returns on
     its own well within the outer watchdog.
+
+    CI-PERF-3B: ``PROCESS_KILL_WAIT_TIMEOUT_S`` is monkeypatched down to a
+    fraction of a second here (was a hardcoded 5.0s literal) so this test
+    proves the same real code path -- internal bound fires, taskkill wait is
+    abandoned, ``proc.terminate()`` fallback runs -- without actually waiting
+    out the production-sized timeout.
     """
     monkeypatch.setattr(tst.sys, "platform", "win32")
+    monkeypatch.setattr(tst, "PROCESS_KILL_WAIT_TIMEOUT_S", 0.05)
 
     class _HangingKillProc:
         def __init__(self):
@@ -862,7 +869,11 @@ async def test_terminate_proc_tree_async_bounds_stalled_taskkill(monkeypatch):
             return 0
 
     target = _FakeTargetProc()
-    await asyncio.wait_for(tst._terminate_proc_tree_async(target), timeout=8.0)
+    # Outer watchdog is now far shorter than the old fixed 8.0s -- if the
+    # monkeypatched constant were NOT actually being read by the function
+    # (e.g. the literal had been left hardcoded), this would still fire at
+    # the old 5s internal bound and time out here well before 2.0s.
+    await asyncio.wait_for(tst._terminate_proc_tree_async(target), timeout=2.0)
     assert target.terminate_called is True
 
 

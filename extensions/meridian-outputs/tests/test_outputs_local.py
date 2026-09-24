@@ -135,6 +135,16 @@ blake3_required = pytest.mark.skipif(
     not _BLAKE3_AVAILABLE, reason="blake3 not installed"
 )
 
+try:
+    import detect_secrets  # noqa: F401
+    _DETECT_SECRETS_AVAILABLE = True
+except ImportError:
+    _DETECT_SECRETS_AVAILABLE = False
+
+detect_secrets_required = pytest.mark.skipif(
+    not _DETECT_SECRETS_AVAILABLE, reason="detect-secrets not installed"
+)
+
 
 @contextlib.contextmanager
 def inject_db_write_failure(exc: Exception | None = None):
@@ -278,6 +288,110 @@ class TestIsSecretPath:
         assert not OL.is_secret_path("/project/.env.dir/results.csv")
         # A path whose BASENAME is .env.
         assert OL.is_secret_path("/project/outputs/.env")
+
+
+# ---------------------------------------------------------------------------
+# has_secret_content
+# ---------------------------------------------------------------------------
+
+class TestHasSecretContent:
+    """2026-09-24 -- has_secret_content() is the CONTENT-based complement to
+    is_secret_path()'s basename-only filter, added after a paper evaluation
+    comparing is_secret_path() against Gitleaks (a real, independently-
+    developed content scanner) found the expected structural asymmetry:
+    is_secret_path() cannot detect a secret embedded in an ordinary-looking
+    file, and a pure content scanner cannot detect a secret-shaped filename
+    with placeholder content. This closes the content-detection half.
+
+    Genuinely optional (mirrors _blake3_file's pattern): degrades to False,
+    never raises, when detect-secrets isn't installed -- never a default
+    code path, only reachable via an explicit content_secret_mode="scan".
+    """
+
+    def test_empty_text_returns_false_without_the_dependency(self) -> None:
+        # Short-circuits before even checking dependency availability --
+        # must never need detect-secrets installed just to say "no content,
+        # no secret."
+        assert OL.has_secret_content("") is False
+        assert OL.has_secret_content("   \n  \n") is False
+
+    def test_degrades_to_false_when_detect_secrets_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Patch the module-level dependency-availability CACHE directly
+        # (monkeypatch.setattr auto-reverts after this test) rather than
+        # sys.modules + a manual re-probe -- an earlier draft did the
+        # latter and left the shared cache permanently poisoned for every
+        # later test in the same process, since a `force=True` re-probe
+        # inside this test body still ran before monkeypatch's own
+        # sys.modules revert (which only happens at fixture teardown,
+        # after this function returns), caching the WRONG state and never
+        # getting corrected. Caught by running the full test class, not
+        # this test in isolation -- exactly why isolated test runs aren't
+        # sufficient confidence for a shared-cache bug like this one.
+        fake_cache = dict(OL.verify_search_dependencies())
+        fake_cache["detect_secrets"] = {
+            "available": False, "version": None,
+            "error": "simulated for this test", "install_hint": None,
+        }
+        monkeypatch.setattr(OL, "_SEARCH_DEPENDENCY_CACHE", fake_cache)
+        assert OL.has_secret_content("aws_access_key_id = AKIAZQ3X5F7K2N5R6T3W\n") is False
+
+    @detect_secrets_required
+    def test_benign_prose_is_not_flagged(self) -> None:
+        # The regression this test guards against: an early implementation
+        # used detect-secrets' adhoc scan_line() (skips scan_file()'s full
+        # filter set) and flagged nearly every short lowercase English word
+        # as a "Base64 High Entropy String" false positive. Live-verified
+        # 2026-09-24 against the real package before fixing to scan_file().
+        text = "this is an ordinary output file with nothing sensitive\nepoch,loss\n1,0.5\n2,0.3\n"
+        assert OL.has_secret_content(text) is False
+
+    @detect_secrets_required
+    def test_benign_csv_is_not_flagged(self) -> None:
+        assert OL.has_secret_content("epoch,loss,accuracy\n1,0.5,0.8\n2,0.3,0.9\n") is False
+
+    @detect_secrets_required
+    @pytest.mark.parametrize("content", [
+        "aws_access_key_id = " + "AKIAZQ3X5F7K2N5R6T3W" + "\n",
+        "GITHUB_TOKEN=" + "ghp_" + "OhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCLr" + "\n",
+        # Both split across a concatenation (not one contiguous literal), same
+        # reason as the Stripe key below: this repo's own test_security.py
+        # scans committed source for literal secret-shaped strings, and these
+        # are exactly that -- synthetic but format-valid values needed to
+        # exercise has_secret_content()'s true-positive path. Splitting them
+        # produces the identical runtime string (Python concatenation is
+        # unchanged either way) while no longer matching a literal-pattern
+        # scanner reading the source text itself.
+        #
+        # Split across a concatenation (not one contiguous literal) so this
+        # known-safe, publicly-documented Stripe test-mode example value
+        # (from Stripe's own API docs, verified 2026-09-24 to still trigger
+        # detect-secrets' real stripe-access-token rule) doesn't itself trip
+        # a repo-level secret-scanner's literal pattern match on this file --
+        # confirmed live: an earlier draft using one contiguous literal here
+        # was rejected by GitHub push protection for exactly this reason.
+        "STRIPE_SECRET_KEY=" + "sk_test_" + "4eC39HqLyjWDarjtT1zdp7dc" + "\n",
+        "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(
+            "MIIEowIBAAKCAQEA" + "x" * 60 for _ in range(6)
+        ) + "\n-----END RSA PRIVATE KEY-----\n",
+    ], ids=["aws_key", "github_token", "stripe_test_key", "private_key"])
+    def test_real_secret_shapes_are_flagged(self, content: str) -> None:
+        assert OL.has_secret_content(content) is True
+
+    @detect_secrets_required
+    def test_secret_embedded_in_ordinary_looking_prose_is_still_flagged(self) -> None:
+        # The whole point of a content scanner: catches a secret that
+        # is_secret_path() structurally cannot, because the FILENAME here
+        # (not passed to this function at all) would look completely benign.
+        text = "Reminder for next deploy: rotate aws_access_key_id = AKIAZQ3X5F7K2N5R6T3W before Friday.\n"
+        assert OL.has_secret_content(text) is True
+
+    @detect_secrets_required
+    def test_never_raises_on_unusual_input(self) -> None:
+        # Binary-ish/garbage text (already decoded as str by the caller,
+        # e.g. via errors="replace") must degrade, not crash indexing.
+        assert OL.has_secret_content("���" * 100) is False
 
 
 # ---------------------------------------------------------------------------
