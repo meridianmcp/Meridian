@@ -607,41 +607,78 @@ class PostgresConnection:
     # WHERE clause into the equivalent real Postgres catalog query
     # (``information_schema.tables`` / ``pg_indexes``) instead of returning a
     # fixed fake row. Only the query *shapes* this codebase actually issues
-    # are recognised (see 246eccb6 investigation notes): a bare
-    # ``type = 'table'|'index' AND name = <literal-or-?>`` predicate,
-    # optionally selecting ``name`` or ``sql``. An unrecognised shape (e.g. a
-    # bulk "list every table" query, only ever used against a real SQLite
-    # connection directly, never through this adapter) logs a warning and
-    # returns an EMPTY result -- a truthful "nothing matched" -- rather than
-    # fabricating a row that would silently lie to the caller.
+    # are recognised (see 246eccb6 investigation notes, extended by
+    # 408e5cea): a bare ``type = 'table'|'index' AND name = <literal-or-?>``
+    # predicate, optionally selecting ``name`` or ``sql``; and (408e5cea)
+    # ``type = 'index' AND tbl_name = <literal-or-?>`` -- "list every index
+    # belonging to this table" (migration tests asserting a SET of indexes
+    # were created, as opposed to the by-name shape's "does this ONE index
+    # exist"). An unrecognised shape (e.g. a bulk "list every table" query,
+    # only ever used against a real SQLite connection directly, never through
+    # this adapter) logs a warning and returns an EMPTY result -- a truthful
+    # "nothing matched" -- rather than fabricating a row that would silently
+    # lie to the caller.
     _SQLITE_MASTER_RE = re.compile(
         r"SELECT\s+(?P<col>\w+)\s+FROM\s+sqlite_master\s+WHERE\s+"
         r"type\s*=\s*'(?P<objtype>table|index)'\s+AND\s+name\s*=\s*"
         r"(?:'(?P<name_lit>[^']*)'|\?)",
         re.IGNORECASE,
     )
+    _SQLITE_MASTER_BY_TABLE_RE = re.compile(
+        r"SELECT\s+(?P<col>\w+)\s+FROM\s+sqlite_master\s+WHERE\s+"
+        r"type\s*=\s*'index'\s+AND\s+tbl_name\s*=\s*"
+        r"(?:'(?P<name_lit>[^']*)'|\?)",
+        re.IGNORECASE,
+    )
 
     async def _sqlite_master(self, stripped_sql: str, params: tuple) -> _PgCursor:
         m = self._SQLITE_MASTER_RE.search(stripped_sql)
-        if not m:
-            logger.warning(
-                "PostgresConnection: unrecognized sqlite_master query shape; "
-                "returning an empty result instead of a fabricated row: %r",
-                stripped_sql,
-            )
-            return _PgCursor([], 0)
+        if m:
+            name = m.group("name_lit")
+            if name is None:
+                # Bound as a positional ``?`` placeholder rather than inlined.
+                if not params:
+                    return _PgCursor([], 0)
+                name = params[0]
 
-        name = m.group("name_lit")
-        if name is None:
-            # Bound as a positional ``?`` placeholder rather than inlined.
-            if not params:
-                return _PgCursor([], 0)
-            name = params[0]
+            if m.group("objtype").lower() == "index":
+                return await self._sqlite_master_index(name)
+            want_sql = m.group("col").lower() == "sql"
+            return await self._sqlite_master_table(name, want_sql)
 
-        if m.group("objtype").lower() == "index":
-            return await self._sqlite_master_index(name)
-        want_sql = m.group("col").lower() == "sql"
-        return await self._sqlite_master_table(name, want_sql)
+        m = self._SQLITE_MASTER_BY_TABLE_RE.search(stripped_sql)
+        if m:
+            table_name = m.group("name_lit")
+            if table_name is None:
+                if not params:
+                    return _PgCursor([], 0)
+                table_name = params[0]
+            return await self._sqlite_master_indexes_for_table(table_name)
+
+        logger.warning(
+            "PostgresConnection: unrecognized sqlite_master query shape; "
+            "returning an empty result instead of a fabricated row: %r",
+            stripped_sql,
+        )
+        return _PgCursor([], 0)
+
+    async def _sqlite_master_indexes_for_table(self, table_name: str) -> _PgCursor:
+        """Real ``pg_indexes`` lookup for every index belonging to a table.
+
+        The direct Postgres analog of sqlite_master's
+        ``type='index' AND tbl_name=X`` shape -- "what indexes exist on
+        table X", as opposed to ``_sqlite_master_index``'s "does this ONE
+        named index exist".
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=_dict_row_factory) as cur:
+                await cur.execute(
+                    "SELECT indexname FROM pg_indexes WHERE tablename = %s",
+                    (table_name,),
+                )
+                rows = await cur.fetchall()
+        result = [{"name": row["indexname"]} for row in rows]
+        return _PgCursor(result, len(result))
 
     async def _sqlite_master_index(self, index_name: str) -> _PgCursor:
         """Real ``pg_indexes`` lookup for a single index by name.
