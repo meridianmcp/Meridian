@@ -197,6 +197,72 @@ def test_install_windows_ps1_route_serves_script(client):
 
 
 # ---------------------------------------------------------------------------
+# cf8a90ec -- install-windows.ps1 -Tray installs meridian-tray.exe, the built
+# and tested Windows tray/GUI binary that was never reachable through any
+# documented install path before this.
+# ---------------------------------------------------------------------------
+
+def test_install_windows_ps1_exposes_tray_switch():
+    src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+    assert "[switch]$Tray" in src
+    assert "if ($Tray) {" in src
+
+
+def test_install_windows_ps1_tray_downloads_meridian_tray_exe():
+    src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+    tray_idx = src.index("if ($Tray) {")
+    # The tray branch must return (exit 0) before falling through to the
+    # meridian.exe / uv path below -- otherwise -Tray would install both.
+    exit_idx = src.index("exit 0", tray_idx)
+    tray_block = src[tray_idx:exit_idx]
+    assert "releases/latest/download/meridian-tray.exe" in tray_block
+    assert 'Join-Path $env:USERPROFILE ".local\\bin"' in tray_block
+    assert 'Join-Path $binDir "meridian-tray.exe"' in tray_block
+    # Same download hardening as every other installer path in this repo.
+    assert "maxAttempts" in tray_block and "for ($attempt" in tray_block
+    assert ".Length -gt 0" in tray_block
+    assert "Write-Error" in tray_block and "exit 1" in tray_block
+
+
+def test_install_windows_ps1_tray_branch_precedes_uv_path():
+    """The -Tray branch must exit before the uv/meridian.exe logic below it --
+    confirms -Tray and the default path are mutually exclusive, not both-run."""
+    src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+    tray_idx = src.index("if ($Tray) {")
+    # The real invocation (not just a comment mentioning the same phrase --
+    # the -Tray branch's own preamble comment explains it does NOT use uv,
+    # which contains this same substring earlier in the file).
+    uv_idx = src.index("& uv tool install meridian-server")
+    assert tray_idx < uv_idx
+    exit_idx = src.index("exit 0", tray_idx)
+    assert exit_idx < uv_idx, "-Tray branch must exit before reaching the uv/meridian.exe path"
+
+
+def test_install_windows_ps1_default_behavior_unchanged_without_tray():
+    """Behavior-preserving: everything below the -Tray branch (the pre-existing
+    uv-then-binary-fallback flow for meridian.exe) is untouched."""
+    src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+    assert "uv tool install meridian-server" in src
+    assert "releases/latest/download/meridian.exe" in src
+    assert 'Join-Path $binDir "meridian.exe"' in src
+
+
+def test_install_windows_ps1_route_serves_tray_switch(client):
+    r = client.get("/install-windows.ps1")
+    assert r.status_code == 200
+    assert "[switch]$Tray" in r.text
+    assert "meridian-tray.exe" in r.text
+
+
+def test_install_ps1_points_to_tray_option():
+    """Discoverability only (no functional change to install.ps1 itself): a
+    hosted-tunnel-client user who actually wants the self-hosted tray/GUI app
+    is pointed at the right script rather than left to find it on their own."""
+    src = _src()
+    assert "install-windows.ps1 -Tray" in src
+
+
+# ---------------------------------------------------------------------------
 # hooks_install.ps1 — thin backward-compat shim to install.ps1 -Component hooks
 # (a1ba9aa8). The RFC 8628 device-flow auth that used to live standalone here
 # (e9f18530) now lives inline in install.ps1's -Component hooks path; this file
