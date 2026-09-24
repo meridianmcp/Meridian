@@ -7,7 +7,11 @@ name = "meridian-outputs"
 description = "Standalone local MCP server for outputs indexing (CSV/JSON/NPY) — wave-1 stopgap extracted from Meridian. Runs fully locally against a real outputs_dir, no hosted call."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-license = { text = "MIT" }
+license = { text = "MSL-1.0" }  # Meridian Source License 1.0 -- see LICENSE. NOT MIT (was a leftover
+                                 # wave-1-extraction placeholder never corrected; MSL-1.0's own Sec.
+                                 # 2(d)/(f) already permit academic/research use and unmodified-copy
+                                 # evaluation distribution -- see LICENSE for the full text this
+                                 # declaration must match).
 authors = [{ name = "Adam Camerer" }]
 keywords = ["mcp", "outputs", "indexer", "fts", "duckdb", "csv", "json", "npy"]
 version = "0.1.0"
