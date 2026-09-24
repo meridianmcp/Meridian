@@ -8,18 +8,40 @@ hazard this module explicitly guards against), the health probe, and the
 icon or tkinter window -- those need an actual display/Windows session, not
 a CI test runner; the dialog functions are exercised only for their
 LocalRunner-facing logic (via monkeypatched tkinter), never a real GUI loop.
+
+507e55de -- also carries the tray/GUI installer's PRE-SHIP VALIDATION
+CHECKLIST (see ``TestTraySpecPreShipConsistency`` below and the standalone
+subprocess regression test at the bottom of this file). Those are a
+deliberately different kind of test from the unit tests above: instead of
+mocking tray_main.py's collaborators, they check the REAL, as-shipped
+``meridian-tray.spec`` / ``meridian/static/meridian-tray.ico`` files on disk
+for the specific properties a broken pre-ship build has historically failed
+on (see the spec file's own comments: a missing ``meridian/static`` datas
+entry 500'd the bundled server, a missing ``meridian/templates`` entry
+500'd `GET /`). A drift here -- e.g. tray_main.py growing a new third-party
+import that the spec's ``hiddenimports`` doesn't know about -- fails a fast
+pytest run instead of surfacing as a broken exe after a real PyInstaller
+build.
 """
 from __future__ import annotations
 
+import ast
 import io
 import os
+import subprocess
 import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
 import meridian
 from meridian import tray_main
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TRAY_SPEC_PATH = _REPO_ROOT / "meridian-tray.spec"
+_TRAY_MAIN_PATH = _REPO_ROOT / "meridian" / "tray_main.py"
+_ICO_PATH = _REPO_ROOT / "meridian" / "static" / "meridian-tray.ico"
 
 
 # ---------------------------------------------------------------------------
@@ -232,3 +254,186 @@ def test_show_status_dialog_reads_runner_status_without_raising(monkeypatch):
     title, message = fake_messagebox.showinfo.call_args[0][:2]
     assert "running" in message
     assert "1234" in message
+
+
+# ---------------------------------------------------------------------------
+# Pre-ship validation checklist (507e55de) -- real-artifact consistency
+# checks between meridian-tray.spec, meridian/static/meridian-tray.ico, and
+# tray_main.py itself. These read the ACTUAL files on disk (never mocks),
+# so they catch the class of bug a unit test mocking LocalRunner/pystray/PIL
+# cannot: a PyInstaller build succeeding but shipping a broken exe because
+# the spec drifted from what the module actually needs at runtime.
+# ---------------------------------------------------------------------------
+
+
+def _spec_call_kwargs(spec_path: Path, call_name: str) -> dict:
+    """Statically extract literal keyword arguments from a named call (e.g.
+    ``Analysis(...)`` or ``EXE(...)``) inside a PyInstaller .spec file.
+
+    .spec files are real Python but reference names (``Analysis``, ``EXE``,
+    ``PYZ``, and the pipeline variables they're chained through) that only
+    exist inside PyInstaller's own exec environment -- they cannot be safely
+    ``exec``'d here just to validate their shape. Parsing the AST and pulling
+    only the literal (list/str/bool/None) keyword values out of the call we
+    care about validates the spec's real, checked-in content without needing
+    PyInstaller itself (or a full build) to do it.
+    """
+    tree = ast.parse(spec_path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == call_name:
+            kwargs: dict = {}
+            for kw in node.keywords:
+                if kw.arg is None:
+                    continue
+                try:
+                    kwargs[kw.arg] = ast.literal_eval(kw.value)
+                except (ValueError, TypeError):
+                    # A non-literal value (e.g. `cipher=block_cipher`, a bare
+                    # Name reference) -- not needed by any check below.
+                    continue
+            return kwargs
+    raise AssertionError(f"no {call_name}(...) call found in {spec_path}")
+
+
+def _tray_main_top_level_imports() -> set[str]:
+    """Top-level module names tray_main.py imports anywhere in its source
+    (module scope or inside a function, e.g. the lazily-imported ``pystray``/
+    ``PIL`` inside ``_run_tray``) -- excludes relative imports (``from .
+    local_runner import ...``, ``from . import __main__``), which are
+    covered by their own explicit hiddenimports checks below instead.
+    """
+    tree = ast.parse(_TRAY_MAIN_PATH.read_text(encoding="utf-8"))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.level == 0:
+                modules.add(node.module.split(".")[0])
+    return modules
+
+
+class TestTraySpecPreShipConsistency:
+    """Cross-checks between the real, committed meridian-tray.spec,
+    meridian/static/meridian-tray.ico, and tray_main.py."""
+
+    def test_ico_asset_exists_and_has_valid_ico_magic(self):
+        assert _ICO_PATH.is_file(), f"missing tray icon asset: {_ICO_PATH}"
+        header = _ICO_PATH.read_bytes()[:4]
+        # ICO file format header: reserved(2)=0x0000, type(2)=0x0001.
+        assert header == b"\x00\x00\x01\x00", (
+            f"{_ICO_PATH} does not have a valid .ico header (got {header!r})"
+        )
+
+    def test_spec_datas_paths_all_exist_relative_to_repo_root(self):
+        datas = _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["datas"]
+        assert datas, "meridian-tray.spec Analysis(datas=...) is empty"
+        for src, _dest in datas:
+            path = _REPO_ROOT / src
+            assert path.exists(), (
+                f"meridian-tray.spec datas=... references {src!r}, which "
+                f"does not exist at {path}"
+            )
+
+    def test_spec_bundles_the_real_static_and_templates_directories(self):
+        # Regression check for the two documented live-build failures in the
+        # spec file's own comments: a missing 'meridian/static' entry 500'd
+        # the bundled server's StaticFiles mount, and a missing
+        # 'meridian/templates' entry 500'd `GET /` (Jinja2Templates).
+        datas_sources = {src for src, _dest in _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["datas"]}
+        assert "meridian/static/meridian-tray.ico" in datas_sources
+        assert "meridian/static" in datas_sources
+        assert "meridian/templates" in datas_sources
+
+    def test_spec_exe_icon_kwarg_points_at_the_real_ico_file(self):
+        icon = _spec_call_kwargs(_TRAY_SPEC_PATH, "EXE").get("icon")
+        assert icon == "meridian/static/meridian-tray.ico"
+        assert (_REPO_ROOT / icon).is_file()
+
+    def test_spec_exe_is_a_windowed_gui_app_not_a_console_tool(self):
+        exe_kwargs = _spec_call_kwargs(_TRAY_SPEC_PATH, "EXE")
+        assert exe_kwargs.get("console") is False, (
+            "meridian-tray.exe is a tray/GUI app -- console=True would pop "
+            "a terminal window behind the tray icon on every launch"
+        )
+
+    def test_spec_exe_name_matches_the_documented_binary_name(self):
+        assert _spec_call_kwargs(_TRAY_SPEC_PATH, "EXE").get("name") == "meridian-tray"
+
+    def test_spec_exe_is_a_single_onefile_binary(self):
+        # The module docstring promises "a single binary that is BOTH the
+        # tray icon and ... the real Meridian HTTP server" -- onefile=False
+        # would ship a directory instead, breaking that contract silently.
+        assert _spec_call_kwargs(_TRAY_SPEC_PATH, "EXE").get("onefile") is True
+
+    def test_spec_hiddenimports_has_no_duplicate_entries(self):
+        hidden = _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["hiddenimports"]
+        assert len(hidden) == len(set(hidden)), (
+            f"duplicate entries in meridian-tray.spec hiddenimports: {hidden}"
+        )
+
+    @pytest.mark.parametrize(
+        "required_entry",
+        [
+            "meridian.tray_main",  # PyInstaller's own Analysis(['meridian/tray_main.py']) entry
+            "meridian.__main__",  # main()'s `from . import __main__` (--run-server dispatch)
+            "meridian.server",  # the real HTTP server --run-server ultimately serves
+            "meridian.local_runner",  # module-level `from .local_runner import (...)`
+            "pystray._win32",  # _run_tray()'s lazily-imported `import pystray`
+            "PIL",  # _run_tray()'s lazily-imported `from PIL import Image`
+            "PIL.Image",
+        ],
+    )
+    def test_spec_hiddenimports_covers_tray_mains_real_dependencies(self, required_entry):
+        hidden = _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["hiddenimports"]
+        assert required_entry in hidden, (
+            f"meridian-tray.spec hiddenimports is missing {required_entry!r}, "
+            "which tray_main.py needs at runtime (directly, or via "
+            "local_runner/server/--run-server dispatch)"
+        )
+
+    def test_spec_hiddenimports_covers_every_third_party_import_tray_main_uses(self):
+        """Statically derives tray_main.py's own third-party imports (stdlib
+        modules and the relative `meridian` package excluded) and asserts
+        each has a matching hiddenimports entry -- so this test itself
+        breaks, rather than silently drifting, the next time tray_main.py
+        grows a new third-party import the spec hasn't been updated for.
+        """
+        third_party = _tray_main_top_level_imports() - set(sys.stdlib_module_names) - {"meridian"}
+        assert third_party, "sanity check: expected at least pystray/PIL here"
+        hidden = _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["hiddenimports"]
+        for module in sorted(third_party):
+            assert any(entry == module or entry.startswith(module + ".") for entry in hidden), (
+                f"tray_main.py imports {module!r} but meridian-tray.spec's "
+                f"hiddenimports does not declare it (or any submodule of it): {hidden}"
+            )
+
+
+@pytest.mark.subprocess_isolated
+def test_running_tray_main_as_a_direct_script_does_not_hit_relative_import_error():
+    """Regression check for the exact frozen-crash class tray_main.py's own
+    module docstring documents: PyInstaller's Analysis(['meridian/tray_main.py'])
+    runs this file as __main__ with __package__ unset, which historically
+    crashed the frozen exe with "attempted relative import with no known
+    parent package" before the module's top-of-file __package__ fixup was
+    added. A real PyInstaller build isn't available in a plain pytest run,
+    but invoking the script directly (not via `python -m`, which would
+    already set __package__ correctly and mask the bug) reproduces the same
+    "no parent package" starting condition the frozen exe hits, over a real
+    subprocess -- not a mock.
+    """
+    result = subprocess.run(
+        [sys.executable, str(_TRAY_MAIN_PATH), "--help"],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"direct-script invocation failed (rc={result.returncode}):\n{result.stderr}"
+    )
+    assert "attempted relative import" not in result.stderr
+    assert "--run-server" not in result.stdout, (
+        "the internal --run-server flag must stay hidden from --help output"
+    )
