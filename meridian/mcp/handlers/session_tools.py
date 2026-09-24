@@ -856,10 +856,32 @@ async def handle_set_agent_instructions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: set_agent_instructions."""
+    """MCP tool: set_agent_instructions.
+
+    acc7e504 -- this is the write path for the field ``start_session``/
+    ``checkpoint`` echo verbatim into every future session's agent_instructions.
+    ``pkg_install_guard.check_agent_instructions`` was built specifically to
+    scan this content for prompt-injection-shaped patterns (invisible unicode,
+    "ignore previous instructions", fake system-prompt delimiters, etc. -- see
+    its module docstring) but was never actually wired to either write path
+    (this tool, or routes/projects.py's PATCH /agent-instructions) -- it only
+    ran in its own unit tests. Best-effort and non-blocking, matching that
+    module's fail-open design: a finding is surfaced as ``content_warnings`` on
+    the response so the caller (dashboard, API client) can flag it, never
+    silently swallowed and never a hard rejection of the write.
+    """
+    from meridian.pkg_install_guard import check_agent_instructions  # noqa: PLC0415
+
     validate_input_size(args.get("instructions"), "agent_instructions", 100_000)
     instructions = (args.get("instructions") or "").strip() or None
-    return await db_module.set_agent_instructions(db, args["project_id"], instructions)
+    result = await db_module.set_agent_instructions(db, args["project_id"], instructions)
+    findings = check_agent_instructions(instructions)
+    if findings:
+        result["content_warnings"] = [
+            {"kind": f.kind, "description": f.description, "location": f.location}
+            for f in findings
+        ]
+    return result
 
 
 async def handle_set_executor_config(
