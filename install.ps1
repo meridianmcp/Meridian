@@ -30,6 +30,10 @@
 #              When piped through `iex` (no -File), pass it after the script, e.g.
 #                  & ([scriptblock]::Create((irm https://usemeridian.us/install.ps1))) -Component hooks
 #              or run the saved file directly: powershell -File install.ps1 -Component binary
+#   cf8a90ec -- this script installs meridian-connect.exe, the slim HOSTED tunnel
+#              client. For a self-hosted Windows tray/GUI app wrapping the full
+#              local server (meridian-tray.exe), use install-windows.ps1 -Tray
+#              instead -- see scripts/install-windows.ps1.
 param(
     [ValidateSet('binary', 'hooks', 'both', 'custom')]
     [string]$Component = 'both',
