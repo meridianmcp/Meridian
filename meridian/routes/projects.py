@@ -601,8 +601,18 @@ async def get_agent_instructions(project_id: str, request: Request) -> dict[str,
 async def patch_agent_instructions(
     project_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    """Set or clear agent_instructions. Pass null to reset to server defaults."""
+    """Set or clear agent_instructions. Pass null to reset to server defaults.
+
+    acc7e504 -- mirrors the same best-effort content scan wired into the
+    set_agent_instructions MCP tool (mcp/handlers/session_tools.py): both are
+    write paths for a field start_session/checkpoint echo verbatim into every
+    future session, and pkg_install_guard.check_agent_instructions was built
+    for exactly this content but previously ran only in its own unit tests.
+    Non-blocking -- a finding surfaces as ``content_warnings``, the write is
+    never rejected on this heuristic alone.
+    """
     from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # noqa: PLC0415
+    from ..pkg_install_guard import check_agent_instructions  # noqa: PLC0415
     instructions = body.get("agent_instructions")
     if instructions is None:
         instructions = DEFAULT_AGENT_INSTRUCTIONS
@@ -611,6 +621,12 @@ async def patch_agent_instructions(
     result = await db_module.set_agent_instructions(
         await _db(request), project_id, instructions
     )
+    findings = check_agent_instructions(instructions)
+    if findings:
+        result["content_warnings"] = [
+            {"kind": f.kind, "description": f.description, "location": f.location}
+            for f in findings
+        ]
     return result
 
 
