@@ -3331,7 +3331,50 @@ async def _update_roadmap_version_history(
 
 @app.websocket("/ws/{project_id}")
 async def ws_project(ws: WebSocket, project_id: str) -> None:
-    """Push task-log events to dashboard clients for one project."""
+    """Push task-log events to dashboard clients for one project.
+
+    4bea8629 — SECURITY FIX: this route previously had NO auth check at
+    all. ``db_module.subscribe_tasks``/``_TASK_LISTENERS`` is a process-wide
+    in-process pub/sub keyed ONLY by ``project_id`` (not per-tenant), so on
+    hosted Meridian — one process serving many tenants — anyone who knew or
+    guessed a ``project_id`` could open this socket and stream that
+    project's live task-log events, regardless of which tenant actually
+    owns it. Fix: in hosted mode, resolve the caller's own tenant via
+    ``_get_tenant_from_request`` (session cookie or bearer token — a
+    ``WebSocket`` is a Starlette ``HTTPConnection`` just like ``Request``,
+    exposing the same ``.cookies``/``.headers``/``.state``/``.app``) and
+    confirm that tenant's OWN database actually has a project with this id
+    (``_open_tenant_db_by_id`` + ``db_module.get_project``) — mirroring the
+    tenant-ownership check ``_authorize_tunnel_proxy_caller`` already uses
+    for the tunnel HTTP/WS proxy routes (5de3d422). Rejects with
+    ``code=4401``, the same close code this codebase already uses for an
+    auth-rejected WebSocket (see ``routes/tunnel.py``'s ``tunnel_ws`` et
+    al.). Self-hosted (single-user) mode has no tenant concept, so this is
+    a no-op there, matching every other ``_hosted_mode()``-gated check.
+
+    The socket is accepted unconditionally first (before either branch) so
+    a rejection can send a real close frame with a reason instead of
+    failing the handshake outright — same convention ``tunnel_ws`` uses.
+    ``WebSocketBroadcaster.serve`` no longer accepts the socket itself; it
+    assumes an already-accepted connection (see its docstring).
+    """
+    await ws.accept()
+
+    if _hosted_mode():
+        tenant = await _get_tenant_from_request(ws)  # type: ignore[arg-type]
+        if tenant is None:
+            await ws.close(code=4401, reason="authentication required")
+            return
+        try:
+            tenant_db = await _open_tenant_db_by_id(ws, tenant["id"])  # type: ignore[arg-type]
+        except HTTPException:
+            await ws.close(code=4401, reason="invalid tenant")
+            return
+        owned_project = await db_module.get_project(tenant_db, project_id)
+        if owned_project is None:
+            await ws.close(code=4401, reason="project not found for this tenant")
+            return
+
     broadcaster: dashboard_module.WebSocketBroadcaster = (
         ws.app.state.ws_broadcaster
     )

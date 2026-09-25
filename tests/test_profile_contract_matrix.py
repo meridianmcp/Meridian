@@ -660,7 +660,9 @@ def test_tunnel_status_profile_binding_matches_independent_workspace_resolution(
             client.app.state.db, "workspace", "singleton", fields={"auto_worktrees": 0},
         ))
 
-        route_binding = client.get(f"/tunnel/status/{tenant_id}").json()["profile_binding"]
+        # 4bea8629 — /tunnel/status/{tenant_id} now requires the caller be
+        # the named tenant in hosted mode; pass the owner's own credential.
+        route_binding = client.get(f"/tunnel/status/{tenant_id}", headers=hdr).json()["profile_binding"]
         independent = asyncio.run(db_module.get_workspace_effective_profile(client.app.state.db))
 
         assert route_binding["generation_key"] == independent["generation_key"]
@@ -814,7 +816,8 @@ def test_fresh_tenant_tunnel_routes_degrade_gracefully_with_zero_profile_config(
         hdr = {"Authorization": f"Bearer {raw_token}"}
         tenant_id = client.get("/me", headers=hdr).json()["tenant_id"]
 
-        status = client.get(f"/tunnel/status/{tenant_id}")
+        # 4bea8629 — auth now required in hosted mode; use the owner's own credential.
+        status = client.get(f"/tunnel/status/{tenant_id}", headers=hdr)
         assert status.status_code == 200
         status_binding = status.json()["profile_binding"]
         assert status_binding["executable"] is True

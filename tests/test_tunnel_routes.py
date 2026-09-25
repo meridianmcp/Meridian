@@ -400,7 +400,9 @@ def test_tunnel_status_reports_config_generation_and_drain_safety(monkeypatch, t
         me = client.get("/me", headers=hdr)
         tenant_id = me.json()["tenant_id"]
 
-        status = client.get(f"/tunnel/status/{tenant_id}")
+        # 4bea8629 — /tunnel/status/{tenant_id} now requires the caller be
+        # the named tenant in hosted mode; pass the owner's own credential.
+        status = client.get(f"/tunnel/status/{tenant_id}", headers=hdr)
         assert status.status_code == 200
         body = status.json()
         assert body["safe_to_restart"] is True
@@ -469,7 +471,8 @@ def test_tunnel_status_includes_profile_binding(monkeypatch, tmp_path):
         me = client.get("/me", headers=hdr)
         tenant_id = me.json()["tenant_id"]
 
-        status = client.get(f"/tunnel/status/{tenant_id}")
+        # 4bea8629 — auth now required in hosted mode; use the owner's own credential.
+        status = client.get(f"/tunnel/status/{tenant_id}", headers=hdr)
         assert status.status_code == 200
         binding = status.json()["profile_binding"]
         assert binding is not None
@@ -483,14 +486,15 @@ def test_tunnel_status_profile_binding_reflects_configured_workspace_layer(monke
         me = client.get("/me", headers=hdr)
         tenant_id = me.json()["tenant_id"]
 
-        before = client.get(f"/tunnel/status/{tenant_id}").json()["profile_binding"]
+        # 4bea8629 — auth now required in hosted mode; use the owner's own credential.
+        before = client.get(f"/tunnel/status/{tenant_id}", headers=hdr).json()["profile_binding"]
 
         from meridian import db as db_module
         _run(db_module.set_profile_layer(
             client.app.state.db, "workspace", "singleton", fields={"auto_worktrees": 0},
         ))
 
-        after = client.get(f"/tunnel/status/{tenant_id}").json()["profile_binding"]
+        after = client.get(f"/tunnel/status/{tenant_id}", headers=hdr).json()["profile_binding"]
         assert before["generation_key"] != after["generation_key"]
 
 

@@ -1916,7 +1916,9 @@ async def debug_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -
 
 
 # ---------------------------------------------------------------------------
-# GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
+# GET /tunnel/status/{tenant_id}  — lightweight status check
+# 4bea8629: hosted mode now hard-requires the caller be the named tenant
+# (see tunnel_status's own docstring below) — this used to be unauthenticated.
 # ---------------------------------------------------------------------------
 
 async def _build_tunnel_profile_binding(db: Any) -> "dict[str, Any] | None":
@@ -1957,7 +1959,28 @@ async def tunnel_status(tenant_id: str, request: Request = None) -> dict:  # typ
     default), so this stays a non-breaking change for both calling styles.
     ``profile_binding`` degrades to ``None`` (see below) when ``request`` is
     ``None``, exactly like every other best-effort field in this response.
+
+    4bea8629 — SECURITY FIX: this route previously had NO auth at all
+    (see the "no auth required" note that used to head this section),
+    unlike its documentary-tenant_id siblings ``/tunnel/diagnostics/{tenant_id}``
+    and ``/tunnel/launch-matrix/{tenant_id}`` (which resolve the REAL caller
+    via ``_get_tenant_from_request`` and treat the path's ``tenant_id`` as
+    informational only). Anyone who knew or guessed a ``tenant_id`` could
+    fetch this response — live per-slot health, config generation, and
+    in-flight request counts for that tenant. Fix: in hosted mode, resolve
+    the caller's own tenant the same way, and hard-require it match the
+    path's ``tenant_id`` (mirroring ``tunnel_ws``'s own WS-side check and
+    the tunnel HTTP/WS proxy routes' 5de3d422 fix). A direct, non-HTTP call
+    (``request is None`` — see above) is unaffected, same as the
+    ``profile_binding`` degrade. ``/tunnel/openai/diagnostics/{tenant_id}``
+    is intentionally unauthenticated per its own docstring and is NOT
+    touched by this fix.
     """
+    if request is not None and _hosted_mode():
+        caller = await _get_tenant_from_request(request)
+        if caller is None or caller.get("id") != tenant_id:
+            return _json_response({"error": "authentication required"}, status_code=401)
+
     return {
         "tenant_id": tenant_id,
         "active": tenant_id in _tunnel_sockets,
