@@ -17,9 +17,21 @@ both sources uniformly.
 Pure parsing (:func:`parse_arxiv_atom`, :func:`parse_openalex_works`) is separated from the
 network calls (:func:`arxiv_search`, :func:`openalex_search`) so both can be unit-tested
 deterministically without hitting the network.
+
+9dc630de adds two more sources. Crossref (keyless) is the DOI registry itself: weaker than
+OpenAlex/Semantic Scholar for topical discovery (its relevance ranking is metadata matching),
+but authoritative for DOI resolution and venue metadata -- journal name, ISSN, publisher,
+work type -- which is what matters when targeting a specific journal. CORE aggregates
+open-access full text; unlike every other source here it needs an API key (an
+unauthenticated probe got HTTP 429 on its very first request), so :func:`core_search` fails
+closed with an explicit error when ``CORE_API_KEY`` is unset rather than degrading to a
+different source.
 """
 from __future__ import annotations
 
+import asyncio
+import os
+import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -38,6 +50,13 @@ _PUBMED_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 _PUBMED_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 _NCBI_TOOL = "Meridian"
 _NCBI_EMAIL = "research@usemeridian.us"
+# 9dc630de — Crossref REST (keyless; a mailto puts requests in the polite pool) and CORE v3
+# (key required). CORE's bare path 301-redirects to the trailing-slash form.
+_CROSSREF_API = "https://api.crossref.org/works"
+_CORE_API = "https://api.core.ac.uk/v3/search/works/"
+_CONTACT_EMAIL = "research@usemeridian.us"
+_RETRY_DELAYS = (0.5, 1.5)  # waits [s] before attempt 2 and attempt 3; no wait before 1
+_MARKUP_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def parse_arxiv_atom(xml_text: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -559,4 +578,294 @@ async def pubmed_search(
             results = parse_pubmed_articles(efetch_resp.text, n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
         return {"error": f"pubmed search failed: {exc}", "query": q}
+    return {"query": q, "count": len(results), "results": results}
+
+
+# ---------------------------------------------------------------------------
+# 9dc630de — Crossref + CORE
+# ---------------------------------------------------------------------------
+
+async def _fetch_with_backoff(
+    http: Any, url: str, params: dict[str, str], headers: dict[str, str]
+) -> Any:
+    """HTTP GET with backoff on 429/503; max 3 attempts.
+
+    Same contract as the helpers in github_search.py/social_search.py (each research
+    module keeps its own copy): no delay before the first attempt, and any non-429/503
+    HTTP error propagates immediately so the caller degrades it without retrying.
+    """
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
+        try:
+            resp = await http.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            return resp
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (429, 503):
+                last_exc = exc
+                continue
+            raise
+    raise last_exc
+
+
+_BLOCK_TAG_RE = re.compile(r"</?(?:jats:)?(?:p|title|sec|list|list-item|br)\b[^>]*>", re.IGNORECASE)
+_JATS_TITLE_RE = re.compile(r"<(?:jats:)?title\b[^>]*>.*?</(?:jats:)?title>", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_markup(text: Any, *, drop_titles: bool = False) -> str:
+    """Remove JATS/HTML markup and collapse whitespace; non-strings degrade to ``""``.
+
+    Crossref titles carry inline tags (``<scp>DNA</scp>``, ``H<sub>2</sub>O``) that must
+    vanish without inserting spaces, while abstracts carry block tags (``<jats:p>``)
+    that must become paragraph breaks. ``drop_titles`` removes an abstract's own
+    ``<jats:title>Abstract</jats:title>`` heading.
+    """
+    if not isinstance(text, str):
+        return ""
+    if drop_titles:
+        text = _JATS_TITLE_RE.sub(" ", text)
+    text = _BLOCK_TAG_RE.sub(" ", text)
+    text = _MARKUP_TAG_RE.sub("", text)
+    return " ".join(text.split())
+
+
+def _crossref_date(item: dict[str, Any], *keys: str) -> str:
+    """First usable ``date-parts`` among ``keys`` as ``YYYY[-MM[-DD]]``, else ``""``.
+
+    Crossref pads unknown components with ``null`` (e.g. ``[[2021, null]]``) and some
+    records carry an empty ``[[null]]``; both stop at the last known component.
+    """
+    for key in keys:
+        block = item.get(key)
+        if not isinstance(block, dict):
+            continue
+        parts = block.get("date-parts")
+        if not (isinstance(parts, list) and parts and isinstance(parts[0], list)):
+            continue
+        fields: list[str] = []
+        for i, part in enumerate(parts[0][:3]):
+            if isinstance(part, bool):
+                break
+            try:
+                value = int(part)
+            except (TypeError, ValueError):
+                break
+            fields.append(str(value) if i == 0 else f"{value:02d}")
+        if fields:
+            return "-".join(fields)
+    return ""
+
+
+def parse_crossref_works(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Parse a Crossref ``/works`` JSON payload into normalized paper dicts.
+
+    Never raises — a malformed or empty payload degrades to ``[]``. Each result:
+    ``{doi, title, authors, summary, published, updated, url, pdf_url, venue, issn,
+    publisher, type, citation_count}``. ``venue`` is the first ``container-title``
+    (journal or proceedings name); ``pdf_url`` is only set when Crossref lists a link
+    whose content type is ``application/pdf``. Accepts the full response
+    (``{"message": {"items": [...]}}``), the ``message`` object, or a bare item list.
+    """
+    items: Any = None
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        items = message.get("items") if isinstance(message, dict) else payload.get("items")
+    elif isinstance(payload, (list, tuple)):
+        items = payload
+    if not isinstance(items, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        titles = item.get("title")
+        title = _strip_markup(titles[0] if isinstance(titles, list) and titles else titles)
+        authors: list[str] = []
+        for author in item.get("author") or []:
+            if not isinstance(author, dict):
+                continue
+            given = str(author.get("given") or "").strip()
+            family = str(author.get("family") or "").strip()
+            name = " ".join(p for p in (given, family) if p) or str(author.get("name") or "").strip()
+            if name:
+                authors.append(name)
+        containers = item.get("container-title")
+        venue = _strip_markup(
+            containers[0] if isinstance(containers, list) and containers else containers
+        )
+        raw_issn = item.get("ISSN")
+        issn = (
+            [str(x).strip() for x in raw_issn if str(x).strip()]
+            if isinstance(raw_issn, list)
+            else []
+        )
+        doi = str(item.get("DOI") or "").strip()
+        pdf_url = ""
+        for link in item.get("link") or []:
+            if (
+                isinstance(link, dict)
+                and str(link.get("content-type") or "").lower() == "application/pdf"
+            ):
+                pdf_url = str(link.get("URL") or "").strip()
+                if pdf_url:
+                    break
+        citation_count = item.get("is-referenced-by-count")
+        out.append({
+            "doi": doi,
+            "title": title,
+            "authors": authors,
+            "summary": _strip_markup(item.get("abstract"), drop_titles=True),
+            "published": _crossref_date(
+                item, "published", "issued", "published-print", "published-online"
+            ),
+            "updated": _crossref_date(item, "deposited"),
+            "url": str(item.get("URL") or "").strip() or (f"https://doi.org/{doi}" if doi else ""),
+            "pdf_url": pdf_url,
+            "venue": venue,
+            "issn": issn,
+            "publisher": str(item.get("publisher") or "").strip(),
+            "type": str(item.get("type") or "").strip(),
+            "citation_count": (
+                citation_count
+                if isinstance(citation_count, int) and not isinstance(citation_count, bool)
+                else 0
+            ),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def crossref_search(
+    query: str, limit: int = 10, sort_by: str = "relevance"
+) -> dict[str, Any]:
+    """Search Crossref (keyless) and return ``{query, count, results:[...]}``.
+
+    Rows share the ``title/authors/summary/published/updated/url/pdf_url`` base shape
+    with the other sources and add ``doi``, ``venue``, ``issn``, ``publisher``, ``type``
+    and ``citation_count``. ``sort_by='date'`` sorts by publication date, newest first.
+    Retries 429/503 with backoff; never raises — degrades to ``{error, query}``.
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"error": "query is required"}
+    n = max(1, min(int(limit or 10), 50))
+    params = {"query": q, "rows": str(n), "mailto": _CONTACT_EMAIL}
+    if str(sort_by).lower() in ("date", "recent", "newest"):
+        params["sort"] = "published"
+        params["order"] = "desc"
+    headers = {"User-Agent": f"Meridian/paper_search (research routing; mailto:{_CONTACT_EMAIL})"}
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    try:
+        async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
+            resp = await _fetch_with_backoff(http, _CROSSREF_API, params, headers)
+            results = parse_crossref_works(resp.json(), n)
+    except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
+        return {"error": f"crossref search failed: {exc}", "query": q}
+    return {"query": q, "count": len(results), "results": results}
+
+
+def parse_core_works(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Parse a CORE v3 ``/search/works`` JSON payload into normalized paper dicts.
+
+    Never raises — a malformed or empty payload degrades to ``[]``. Each result:
+    ``{core_id, title, authors, summary, published, updated, url, pdf_url, doi, venue,
+    publisher, has_full_text}``. CORE's ``fullText`` field can be an entire paper, so it
+    is deliberately NOT copied into the result; ``has_full_text`` says whether one
+    exists and ``pdf_url`` (CORE's ``downloadUrl``) is where to fetch it.
+    """
+    works = payload.get("results") if isinstance(payload, dict) else payload
+    if not isinstance(works, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for work in works:
+        if not isinstance(work, dict):
+            continue
+        core_id = str(work.get("id") or "").strip()
+        authors = [
+            " ".join(str(a.get("name") or "").split())
+            for a in (work.get("authors") or [])
+            if isinstance(a, dict) and str(a.get("name") or "").strip()
+        ]
+        published = str(work.get("publishedDate") or "").strip()[:10]
+        if not published and work.get("yearPublished"):
+            published = str(work.get("yearPublished")).strip()
+        display_url = ""
+        for link in work.get("links") or []:
+            if isinstance(link, dict) and link.get("type") == "display":
+                display_url = str(link.get("url") or "").strip()
+                if display_url:
+                    break
+        venue = ""
+        for journal in work.get("journals") or []:
+            if isinstance(journal, dict) and str(journal.get("title") or "").strip():
+                venue = " ".join(str(journal["title"]).split())
+                break
+        full_text = work.get("fullText")
+        out.append({
+            "core_id": core_id,
+            "title": " ".join(str(work.get("title") or "").split()),
+            "authors": authors,
+            "summary": " ".join(str(work.get("abstract") or "").split()),
+            "published": published,
+            "updated": str(work.get("updatedDate") or "").strip()[:10],
+            "url": display_url or (f"https://core.ac.uk/works/{core_id}" if core_id else ""),
+            "pdf_url": str(work.get("downloadUrl") or "").strip(),
+            "doi": str(work.get("doi") or "").strip(),
+            "venue": venue,
+            "publisher": str(work.get("publisher") or "").strip(),
+            "has_full_text": isinstance(full_text, str) and bool(full_text.strip()),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def core_search(
+    query: str, limit: int = 10, sort_by: str = "relevance", api_key: str | None = None
+) -> dict[str, Any]:
+    """Search CORE's open-access corpus and return ``{query, count, results:[...]}``.
+
+    Needs an API key (free registration): ``api_key`` if given, else the
+    ``CORE_API_KEY`` environment variable. With no key it returns an explicit error
+    WITHOUT making a request — never a silent fallback to another source. The key is
+    sent only as an ``Authorization: Bearer`` header (never a query parameter, which
+    would leak it into exception messages) and is redacted from any error text.
+    ``sort_by`` is accepted for API-shape consistency but not applied: CORE's date-sort
+    parameter could not be verified without a key, so results are always by relevance.
+    Retries 429/503 with backoff; never raises — degrades to ``{error, query}``.
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"error": "query is required"}
+    key = (api_key if api_key is not None else os.environ.get("CORE_API_KEY", "")).strip()
+    if not key:
+        return {
+            "error": (
+                "CORE requires an API key: set CORE_API_KEY (free registration at "
+                "https://core.ac.uk/services/api). Unauthenticated requests are rate-"
+                "limited to failure (HTTP 429)."
+            ),
+            "query": q,
+        }
+    n = max(1, min(int(limit or 10), 50))
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "User-Agent": f"Meridian/paper_search (research routing; mailto:{_CONTACT_EMAIL})",
+    }
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    try:
+        async with _httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http:
+            resp = await _fetch_with_backoff(http, _CORE_API, {"q": q, "limit": str(n)}, headers)
+            results = parse_core_works(resp.json(), n)
+    except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (401, 403):
+            message = f"CORE rejected the API key (HTTP {status}) -- check CORE_API_KEY"
+        else:
+            message = f"core search failed: {exc}"
+        return {"error": message.replace(key, "***"), "query": q}
     return {"query": q, "count": len(results), "results": results}

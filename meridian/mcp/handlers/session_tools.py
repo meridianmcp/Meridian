@@ -1025,6 +1025,20 @@ async def handle_planning_search(
     )
 
 
+# paper_search 'source' -> function name in meridian.paper_search. Names, not
+# function objects, so the lookup happens at call time and tests can monkeypatch
+# the module attribute. The tool's inputSchema enum (mcp_tools.py) must list
+# exactly these keys; tests/test_crossref_core_paper_search.py enforces that.
+_PAPER_SEARCH_SOURCES: dict[str, str] = {
+    "arxiv": "arxiv_search",
+    "openalex": "openalex_search",
+    "semantic_scholar": "semantic_scholar_search",
+    "pubmed": "pubmed_search",
+    "crossref": "crossref_search",
+    "core": "core_search",
+}
+
+
 async def handle_paper_search(
     args: dict[str, Any],
     db: Any,
@@ -1036,14 +1050,27 @@ async def handle_paper_search(
 
     811881c6 — real callable arXiv search so the research-routing protocol's
     "use the paper-search MCP first" finally points at a tool that exists (it was
-    instruction-only before). Keyless external lookup; degrades to {error}, never
-    raises. No project scope needed — it's an external search.
-    f65f6111 — 'source' routes between two keyless sources: arxiv (default) and
-    openalex. Both return the same {query, count, results} shape.
+    instruction-only before). External lookup; degrades to {error}, never raises.
+    No project scope needed — it's an external search.
+    f65f6111 — 'source' routes between sources, all returning the same
+    {query, count, results} shape.
+    9dc630de — routes every source in _PAPER_SEARCH_SOURCES. Before this, any
+    source other than 'openalex' (including 'semantic_scholar' and 'pubmed',
+    which already existed in paper_search.py) silently returned arXiv results;
+    an unknown source is now an explicit error.
     """
-    from meridian.paper_search import arxiv_search, openalex_search  # noqa: PLC0415
+    import meridian.paper_search as paper_search  # noqa: PLC0415
     source = str(args.get("source", "arxiv") or "arxiv").strip().lower()
-    search = openalex_search if source == "openalex" else arxiv_search
+    fn_name = _PAPER_SEARCH_SOURCES.get(source)
+    if fn_name is None:
+        return {
+            "error": (
+                f"unknown paper_search source {source!r}; expected one of: "
+                + ", ".join(_PAPER_SEARCH_SOURCES)
+            ),
+            "query": args.get("query", ""),
+        }
+    search = getattr(paper_search, fn_name)
     return await search(
         args.get("query", ""),
         limit=args.get("limit", 10),

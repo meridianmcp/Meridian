@@ -160,9 +160,13 @@ def test_paper_search_registered_and_read_only():
     props = entry["inputSchema"]["properties"]
     assert "query" in props
     assert entry["inputSchema"]["required"] == ["query"]
-    # f65f6111 — the 'source' param routes between the two keyless sources
+    # f65f6111 — the 'source' param routes between sources. 9dc630de widened it
+    # from arxiv/openalex to every source the handler dispatches (the exact
+    # enum<->dispatch match is enforced in test_crossref_core_paper_search.py).
     assert "source" in props, "paper_search must expose a 'source' param"
-    assert set(props["source"]["enum"]) == {"arxiv", "openalex"}
+    assert set(props["source"]["enum"]) == {
+        "arxiv", "openalex", "semantic_scholar", "pubmed", "crossref", "core",
+    }
 
 
 def test_research_protocol_names_the_real_tool():
