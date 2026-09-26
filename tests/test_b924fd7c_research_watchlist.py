@@ -464,7 +464,7 @@ def test_tools_registered_with_correct_schema_and_classification():
     props = save_entry["inputSchema"]["properties"]
     assert set(save_entry["inputSchema"]["required"]) == {"source_type", "query"}
     assert set(props["source_type"]["enum"]) == {
-        "arxiv", "openalex", "semantic_scholar", "pubmed",
+        "arxiv", "openalex", "semantic_scholar", "pubmed", "crossref", "core",
         "github_code", "github_repo", "hn",
     }
 
@@ -538,11 +538,17 @@ def test_research_protocol_names_watchlist_and_all_three_search_tools():
     assert "paper-search" in DEFAULT_AGENT_INSTRUCTIONS
 
 
-def test_paper_search_source_enum_unchanged():
-    """Regression guard: this item must NOT widen paper_search's own locked
-    'source' enum (tests/test_paper_search.py) — new sources are reached only
-    via run_watchlist_query calling the underlying functions directly."""
+def test_every_paper_search_source_is_a_watchlist_source():
+    """b924fd7c originally pinned paper_search's enum to arxiv/openalex as a
+    scope guard for this item, leaving semantic_scholar/pubmed reachable only
+    via watchlists. 9dc630de widened paper_search deliberately (its handler had
+    been silently routing those sources to arXiv); the invariant worth keeping
+    from this module's side is that a watchlist can re-run any paper_search
+    source."""
     from meridian import mcp_tools
 
-    entry = next(t for t in mcp_tools._MCP_TOOLS_LIST if t["name"] == "paper_search")
-    assert set(entry["inputSchema"]["properties"]["source"]["enum"]) == {"arxiv", "openalex"}
+    def _enum(tool: str, prop: str) -> set:
+        entry = next(t for t in mcp_tools._MCP_TOOLS_LIST if t["name"] == tool)
+        return set(entry["inputSchema"]["properties"][prop]["enum"])
+
+    assert _enum("paper_search", "source") <= _enum("save_watchlist_query", "source_type")

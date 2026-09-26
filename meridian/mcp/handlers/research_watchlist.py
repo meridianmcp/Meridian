@@ -73,6 +73,8 @@ _SOURCE_IDENTITY_FIELD: dict[str, str] = {
     "openalex": "openalex_id",
     "semantic_scholar": "s2_id",
     "pubmed": "pmid",
+    "crossref": "doi",
+    "core": "core_id",
     "github_code": "sha",
     "github_repo": "repo",
     "hn": "hn_id",
@@ -81,8 +83,8 @@ _SOURCE_IDENTITY_FIELD: dict[str, str] = {
 # source_type -> save_finding's closed source_type vocabulary (web|arxiv|code|
 # conversation, meridian/db/__init__.py:_FINDING_SOURCE_TYPES). Anything not
 # listed here falls back to "web" (save_finding's own default), which is
-# correct for openalex/semantic_scholar/pubmed/hn — none of those are "arxiv"
-# or "code" in the sense save_finding means.
+# correct for openalex/semantic_scholar/pubmed/crossref/core/hn — none of those
+# are "arxiv" or "code" in the sense save_finding means.
 _SAVE_FINDING_SOURCE_TYPE: dict[str, str] = {
     "arxiv": "arxiv",
     "github_code": "code",
@@ -110,6 +112,10 @@ def _resolve_search_fn(source_type: str) -> Any:
         from meridian.paper_search import semantic_scholar_search as fn  # noqa: PLC0415
     elif source_type == "pubmed":
         from meridian.paper_search import pubmed_search as fn  # noqa: PLC0415
+    elif source_type == "crossref":
+        from meridian.paper_search import crossref_search as fn  # noqa: PLC0415
+    elif source_type == "core":
+        from meridian.paper_search import core_search as fn  # noqa: PLC0415
     elif source_type == "github_code":
         from meridian.github_search import github_code_search as fn  # noqa: PLC0415
     elif source_type == "github_repo":

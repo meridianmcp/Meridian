@@ -3402,18 +3402,25 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "limit": {"type": "integer", "description": "Max results per type fed to synthesis (default 10)."}},
          "required": ["query"]}},
     {"name": "paper_search", "description":
-        "Search academic papers — a REAL external lookup (keyless). Per the "
-        "research-routing protocol, use this FIRST for academic/paper questions (cite "
-        "the paper itself, not a secondary write-up), then capture_research_finding to "
-        "save what you cite. Two keyless sources via the 'source' param: 'arxiv' "
-        "(default; preprints, physics/CS/math) and 'openalex' (published journal/"
-        "conference works across every discipline). Both return the same shape: {query, "
-        "count, results:[{title, authors, summary, published, url, pdf_url, ...}]} — "
-        "arxiv rows carry arxiv_id, openalex rows carry openalex_id + doi.",
+        "Search academic papers — a REAL external lookup. Per the research-routing "
+        "protocol, use this FIRST for academic/paper questions (cite the paper itself, "
+        "not a secondary write-up), then capture_research_finding to save what you cite. "
+        "Sources via the 'source' param: 'arxiv' (default; preprints, physics/CS/math), "
+        "'openalex' (broadest journal/conference coverage across every discipline), "
+        "'semantic_scholar' (citation counts + TL;DRs), 'pubmed' (biomedical/"
+        "agricultural), 'crossref' (the DOI registry: best for DOI resolution and venue "
+        "metadata — journal name, ISSN, publisher — weaker for topical discovery), and "
+        "'core' (open-access full-text aggregator; needs CORE_API_KEY on the server and "
+        "returns an explicit error without it). All keyless except 'core'. Every source "
+        "returns the same base shape: {query, count, results:[{title, authors, summary, "
+        "published, url, pdf_url, ...}]} plus a per-source id — arxiv_id, openalex_id "
+        "(+doi), s2_id (+doi, citation_count, tldr), pmid (+doi), doi (crossref: +venue, "
+        "issn, publisher, type, citation_count), or core_id (+doi, venue, has_full_text). "
+        "An unknown source returns {error}.",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "Search terms (matches title / abstract / authors)."},
          "limit": {"type": "integer", "description": "Max papers to return (default 10, max 50)."},
-         "source": {"type": "string", "enum": ["arxiv", "openalex"], "description": "Which keyless source to search (default 'arxiv'). 'openalex' covers published cross-discipline works."},
+         "source": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "crossref", "core"], "description": "Which source to search (default 'arxiv'). 'openalex' for broad published-work discovery; 'crossref' for DOI/venue metadata; 'core' needs CORE_API_KEY."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recent first)."}},
          "required": ["query"]}},
     {"name": "social_search", "description":
@@ -3652,14 +3659,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "save_watchlist_query", "description":
         "b924fd7c — save a recurring research query so it can be re-run and "
         "diffed over time via run_watchlist_query. Persisted as a project note "
-        "(no separate table); the returned watchlist_id addresses it. Sources "
-        "beyond paper_search's own 'arxiv'/'openalex' are reachable here by "
-        "calling the underlying search function directly: 'semantic_scholar' "
-        "and 'pubmed' (meridian.paper_search), 'github_code'/'github_repo' "
-        "(meridian.github_search), and 'hn' (meridian.social_search).",
+        "(no separate table); the returned watchlist_id addresses it. Every "
+        "paper_search source ('arxiv', 'openalex', 'semantic_scholar', 'pubmed', "
+        "'crossref', 'core' — core needs CORE_API_KEY) is available, plus "
+        "'github_code'/'github_repo' (meridian.github_search) and 'hn' "
+        "(meridian.social_search).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "source_type": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "github_code", "github_repo", "hn"], "description": "Which keyless source this watchlist re-runs against."},
+         "source_type": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "crossref", "core", "github_code", "github_repo", "hn"], "description": "Which source this watchlist re-runs against."},
          "query": {"type": "string", "description": "The search terms to re-run each time."},
          "limit": {"type": "integer", "description": "Max results per run (default 10, max 50)."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order for each run (default relevance)."},
@@ -3671,13 +3678,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "query, source_type, limit, and sort_by.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "source_type": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "github_code", "github_repo", "hn"], "description": "Optional filter."}},
+         "source_type": {"type": "string", "enum": ["arxiv", "openalex", "semantic_scholar", "pubmed", "crossref", "core", "github_code", "github_repo", "hn"], "description": "Optional filter."}},
          "required": []}},
     {"name": "run_watchlist_query", "description":
         "b924fd7c — re-run a saved watchlist query and diff its results against "
         "everything already captured for it. Every newly-seen result (matched "
-        "by a per-source stable id — arxiv_id/openalex_id/s2_id/pmid/sha/repo/"
-        "hn_id, falling back to url) is auto-captured via the same durable "
+        "by a per-source stable id — arxiv_id/openalex_id/s2_id/pmid/doi/core_id/"
+        "sha/repo/hn_id, falling back to url) is auto-captured via the same durable "
         "path as capture_research_finding/save_finding, tagged so the NEXT run "
         "recognizes it as already-seen. Returns {new_count, already_seen_count, "
         "new_results, captured, total_results}. Never raises — an unresolvable "
