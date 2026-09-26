@@ -45,5 +45,42 @@ you're pushing before you run it (e.g. `git log` on
 
 The standalone repo path above (`C:\Users\13144\Documents\meridian-latex`)
 is machine-local — it only works on the machine where that checkout lives.
-If/when the standalone repo is ever pushed to a real git remote (GitHub,
-etc.), swap the local path for that remote URL in both commands above.
+
+**Update (2026-09-25): the standalone repo now has a real remote** —
+`https://github.com/meridianmcp/meridian-latex.git`, branch `master`. The
+local path still works fine on this machine and is faster for the fast-lane
+use case described above; swap in the remote URL instead if you're running
+these commands from a different machine, or if the local checkout ever
+moves/is removed.
+
+## Known divergence (2026-09-25) — read before running `pull`
+
+The two copies have drifted independently since roughly commit `119b38d`
+("publish as @meridianmcp/latex") and are **not** a simple ahead/behind
+pair — both sides grew real, non-overlapping feature work:
+
+- **This monorepo's `extensions/meridian-latex/`** gained its own MCP
+  server (`d9fb0358`) and was repackaged to ship as a subpath of
+  `@meridianmcp/mcp` instead of a separate package (`afb9bc5c`). Neither
+  commit exists in the standalone repo's history (checked: `git log --all
+  --grep` on the standalone repo turns up nothing for either).
+- **The standalone repo's `master`** independently grew write-path
+  robustness (snapshot+reconcile), the real-time OT write primitive,
+  doc-tree path resolution, docparse ports, and — as of a 2026-09-25
+  session — its *own* MCP server (ported from a stale copy of this
+  monorepo's `mcp-server.js`, then extended to 15 tools) plus claim-aware
+  writes wired into `applyFieldEdit`/`cli.js write`. None of that exists in
+  this monorepo's copy.
+
+Net effect: **two different `mcp-server.js` implementations now exist**,
+with different tool counts and no common recent ancestor for either to
+diff cleanly against. Running `git subtree pull` here right now would not
+be a clean fast-forward — it would need a real three-way merge with manual
+conflict resolution on `mcp-server.js` specifically, deciding which tool
+set is authoritative (or unioning them).
+
+**Do not run `pull` or `push` here without first deciding which
+`mcp-server.js` is canonical.** That reconciliation is tracked as ongoing
+work in the standalone repo (see its own commit history from 2026-09-25
+onward); once it lands there, `pull` becomes safe again and this note
+should come out.
