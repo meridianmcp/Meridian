@@ -1904,7 +1904,9 @@ async def _check_stored_evidence(
                 if rid_lower.startswith("inferred:"):
                     rid = rid[len("inferred:"):]
                 if rid.startswith("file:"):
-                    path = rid[len("file:"):]
+                    # 4e2bce48 — real file, so a legacy "file:<path>:<symbol>"
+                    # declaration still matches the files actually modified.
+                    path = _resource_file_of(rid) or rid[len("file:"):]
                     declared_paths.append(path)
                 elif rid.startswith("symbol:"):
                     # symbol:<path>::<symbol> — extract the path part.
@@ -3543,6 +3545,22 @@ async def classify_stale_claim(
     return {"item_id": item_id, "classification": classification, "reasons": reasons, "signals": signals}
 
 
+async def _release_file_resource(db: Any, body: str, session_id: str) -> bool:
+    """4e2bce48 — release a ``file:`` resource's lock under the SAME real-file
+    identity claim time locks (:func:`_resource_file_of`), shared by every
+    release/transfer/stale-reset path so they can't drift from the claim side
+    again. A legacy ``file:<path>:<symbol>`` lock taken before the claim-side fix
+    sits under the literal ``<path>:<symbol>`` key, so that key is released too.
+    Returns True if either lock was released."""
+    from meridian.db import release_file  # noqa: PLC0415 — same lazy import as the callers
+    raw_path = body[len("file:"):]
+    path = _resource_file_of(body) or raw_path
+    released = await release_file(db, path, session_id)
+    if raw_path != path and await release_file(db, raw_path, session_id):
+        released = True
+    return bool(released)
+
+
 async def _reset_stale_claim(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3607,8 +3625,7 @@ async def _reset_stale_claim(
                 body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
                 try:
                     if body.startswith("file:"):
-                        path = body[len("file:"):]
-                        if await release_file(db, path, prior_actor):
+                        if await _release_file_resource(db, body, prior_actor):
                             released.append(rid)
                     elif body.startswith("symbol:"):
                         path, _, sym = body[len("symbol:"):].partition("::")
@@ -3984,8 +4001,7 @@ async def release_sprint_item_claim(
                 body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
                 try:
                     if body.startswith("file:"):
-                        path = body[len("file:"):]
-                        if await release_file(db, path, prior_actor):
+                        if await _release_file_resource(db, body, prior_actor):
                             released.append(rid)
                     elif body.startswith("symbol:"):
                         path, _, sym = body[len("symbol:"):].partition("::")
@@ -4133,8 +4149,10 @@ async def transfer_sprint_item_claim(
             body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
             try:
                 if body.startswith("file:"):
-                    path = body[len("file:"):]
-                    _rel = await release_file(db, path, from_session_id)
+                    # 4e2bce48 — move the REAL file's lock (and clear any
+                    # pre-fix "<path>:<symbol>" lock) instead of the raw suffix.
+                    path = _resource_file_of(body) or body[len("file:"):]
+                    _rel = await _release_file_resource(db, body, from_session_id)
                     if to_session_id:
                         _claim_res = await claim_file(db, path, to_session_id, item_id=item_id)
                         if _claim_res.get("claimed"):
