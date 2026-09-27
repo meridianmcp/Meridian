@@ -2795,7 +2795,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "milestone_type": {"type": "string", "enum": ["task", "milestone", "human"],
                             "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."},
          "touches_resources": {"type": "array", "items": {"type": "string"},
-                               "description": "Typed resource identifiers this item touches, for parallel conflict detection: 'file:path.py', 'db:migrations', 'mcp_tool:name', 'route:METHOD:/path', 'pypi:publish', 'github:tag'. Used by get_parallelizable_groups to cluster non-overlapping items. SYMBOL-LEVEL: append ':symbol_name' to a file id — 'file:path.py:function_name' — so two items editing DIFFERENT symbols in the SAME file are treated as non-overlapping and co-batched in parallel (line ranges resolve via real AST/tree-sitter parsing). Prefer symbol-level ids when two items touch the same file but different functions/classes."},
+                               "description": "Typed resource identifiers this item touches, for parallel conflict detection: 'file:path.py', 'db:migrations', 'mcp_tool:name', 'route:METHOD:/path', 'pypi:publish', 'github:tag'. Used by get_parallelizable_groups to cluster non-overlapping items. SYMBOL-LEVEL: use 'symbol:path.py::function_name' (double colon) so two items editing DIFFERENT symbols in the SAME file are treated as non-overlapping and co-batched in parallel (line ranges resolve via real AST/tree-sitter parsing when claim_sprint_item gets the file's content in resource_contents). A single-colon 'file:path.py:function_name' suffix is treated as the WHOLE file (it locks and conflicts like 'file:path.py') and does not co-batch. Prefer symbol-level ids when two items touch the same file but different functions/classes."},
          "force": {"type": "boolean",
                    "description": "Override the duplicate guard AND the codebase drift check (7e212375) and add the item even if its title matches an existing open item or looks already-shipped. Default false."},
          "deferred_until": {"type": "string",
@@ -2850,7 +2850,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                      "description": {"type": "string", "description": "Optional notes / detail for the item."},
                      "group": {"type": "string", "description": "Optional objective group name."},
                      "version": {"type": "string", "description": "Optional sprint-version bucket; defaults to empty string."},
-                     "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Optional typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:) for parallel conflict detection. For SYMBOL-LEVEL granularity append ':symbol_name' to a file id ('file:path.py:func') so items editing different symbols in the same file co-batch in parallel."},
+                     "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Optional typed resource identifiers (file:/symbol:/db:/mcp_tool:/route:/pypi:/github:) for parallel conflict detection. For SYMBOL-LEVEL granularity use 'symbol:path.py::func' (double colon) so items editing different symbols in the same file co-batch in parallel; a single-colon 'file:path.py:func' suffix is treated as the whole file."},
                      "force": {"type": "boolean", "description": "strict mode only — override the duplicate-title guard for this item (same meaning as add_sprint_item's own force). Ignored in legacy (non-strict) mode, which never applies the guard at all."},
                      "correlation_key": {"type": "string", "description": "strict mode only — an arbitrary caller-chosen id echoed back on this item's result for reconciliation. Ignored in legacy mode."},
                  },
@@ -2883,7 +2883,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "human_id": {"type": "string", "description": "Reassign to a person (assignee); empty string clears it."},
          "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."},
          "touches_resources": {"type": "array", "items": {"type": "string"},
-                               "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged. SYMBOL-LEVEL: append ':symbol_name' to a file id ('file:path.py:func') so items editing different symbols in the same file are non-overlapping and co-batch in parallel."},
+                               "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged. SYMBOL-LEVEL: use 'symbol:path.py::func' (double colon) so items editing different symbols in the same file are non-overlapping and co-batch in parallel; a single-colon 'file:path.py:func' suffix is treated as the whole file."},
          "required_notes": {"type": "boolean", "description": "Quality gate (5823db0b): when true, complete_sprint_item is blocked until the item has evidence (existing notes, a linked task, or a notes= argument on completion)."},
          "deferred_until": {"type": "string", "description": "dec69708 — ISO timestamp before which the item CANNOT be claimed (enforced deferral). Pass an empty string to CLEAR the deferral and make the item claimable now. Omit to leave unchanged."},
          "track": {"type": "string", "description": "dec69708 — named lane (e.g. 'paper'). Pass an empty string to clear; omit to leave unchanged."},
@@ -3026,7 +3026,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "status) and releases any file/symbol resource locks the claim held. Returns a "
         "structured {blocked: true, error: ...} dict (NOT_IN_PROGRESS / NOT_CLAIM_OWNER / "
         "RACE_LOST) rather than raising when it can't proceed; on success returns "
-        "{item_id, prior_actor, prior_claimed_at, released_resources, item}.",
+        "{item_id, prior_actor, prior_claimed_at, released_resources, item}, plus "
+        "kept_for_sibling_items when a lock was deliberately kept because another "
+        "in_progress item held by the same session still declares that file/symbol.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string", "description": "The in_progress sprint item to release."},
@@ -3046,13 +3048,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "given and the item declares touches_resources, each declared file:/symbol: lock "
         "is released under session_id and re-acquired under to_session_id via the same "
         "claim_file/claim_symbol machinery claim_sprint_item itself uses (a symbol: "
-        "resource is released but not auto-reclaimed — re-acquiring a real AST-resolved "
-        "range needs the file's current content, which this call doesn't have; the "
-        "receiving session should claim_file(symbol=..., content=...) itself for those). "
+        "resource's real AST-range claim is released but not auto-reclaimed — that needs "
+        "the file's current content, which this call doesn't have; the receiving session "
+        "should claim_file(symbol=..., content=...) itself for those — while a whole-file "
+        "lock the claim took for it moves like a file: lock). When to_session_id is the "
+        "session already holding the locks, only the actor changes and no lock moves. "
         "Returns a structured {blocked: true, error: ...} dict (NOT_IN_PROGRESS / "
         "NOT_CLAIM_OWNER / SAME_ACTOR / RACE_LOST) rather than raising when it can't "
         "proceed; on success returns {item_id, prior_actor, prior_claimed_at, new_actor, "
-        "transferred_resources, released_only_resources, item}.",
+        "transferred_resources, released_only_resources, item}, plus "
+        "kept_for_sibling_items for locks left with the current session because another "
+        "of its in_progress items still needs them (never moved out from under it).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string", "description": "The in_progress sprint item to transfer."},

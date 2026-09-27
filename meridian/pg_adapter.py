@@ -5469,6 +5469,30 @@ async def _migrate_pg_docx_derivatives(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_lock_session_id(conn: PostgresConnection) -> None:
+    """c0ddd5b3 -- Postgres mirror of
+    db.migrations._migrate_sprint_item_lock_session_id: the session that
+    actually holds a claim's touches_resources locks, kept separate from the
+    attribution-only ``actor`` column. Nullable, no default -- legacy rows read
+    NULL and release falls back to ``actor``. ADD COLUMN IF NOT EXISTS so
+    re-running is a no-op."""
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS lock_session_id TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_coarse_lock_files(conn: PostgresConnection) -> None:
+    """Postgres mirror of db.migrations._migrate_sprint_item_coarse_lock_files:
+    JSON list of the whole-file locks a claim owns on behalf of its
+    ``symbol:`` declarations. Nullable, no default, no index. ADD COLUMN IF NOT
+    EXISTS so re-running is a no-op. If this (or lock_session_id's) migration
+    is skipped by _run_pg_migrations, sprint_items._sprint_items_has_column
+    keeps every status transition working without it."""
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS coarse_lock_files TEXT"
+    )
+
+
 async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     """7c96d41b — Postgres mirror of the paper_contract schema: the
     first-class versioned editorial-intent document for Meridian's
@@ -5759,4 +5783,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_remote_tasks,
     _migrate_pg_repo_identity,
     _migrate_pg_docx_derivatives,
+    _migrate_pg_sprint_item_lock_session_id,
+    _migrate_pg_sprint_item_coarse_lock_files,
 )

@@ -1988,13 +1988,19 @@ async def _sprint_item_resource_claim_gate(
 
     for resource in declared:
         if resource.startswith("file:"):
-            file_path = resource[len("file:"):]
+            # 4e2bce48 — lock the REAL file, resolved through the same canonical
+            # helper the scheduler and _claim_batch_resource (6b3b2c0e) use. The
+            # raw suffix turned a legacy "file:<path>:<symbol>" declaration into
+            # a lock on the nonexistent path "<path>:<symbol>", leaving <path>
+            # itself unprotected for the whole claim.
+            file_path = db_module._resource_file_of(resource) or resource[len("file:"):]
+            legacy_shorthand = file_path != resource[len("file:"):]
             pre_held = await _session_holds_file_lock(db, file_path, session_id)
             result = await db_module.claim_file(
                 db, file_path, session_id, mode="write", item_id=item_id,
             )
             if result.get("claimed"):
-                lock_scope.append({
+                acquired_entry: dict[str, Any] = {
                     "resource": resource, "scope": "file", "file_path": file_path,
                     "acquired": True, "newly_acquired": not pre_held,
                     # 0d0cada7 — claim_granularity/lease_expiry alongside
@@ -2003,23 +2009,29 @@ async def _sprint_item_resource_claim_gate(
                     # of which branch produced it.
                     "claim_granularity": "file",
                     "lease_expiry": result.get("expires_at"),
-                })
+                }
+                if legacy_shorthand:
+                    acquired_entry["resolved_from_legacy_shorthand"] = True
+                lock_scope.append(acquired_entry)
                 if not pre_held:
                     acquired_this_call.append({"kind": "file", "file_path": file_path})
                 continue
-            return await _blocked(
-                {
-                    "resource": resource, "scope": "file", "file_path": file_path,
-                    "acquired": False,
-                    "wait_reason": result.get("reason") or "locked",
-                    "claim_granularity": "file",
-                    "lease_expiry": result.get("expires_at"),
-                    "retry_after": db_module._seconds_until(result.get("expires_at")),
-                    "conflict": {
-                        "reason": result.get("reason") or "locked",
-                        "holder_session_id": result.get("holder_session_id"),
-                    },
+            blocked_entry: dict[str, Any] = {
+                "resource": resource, "scope": "file", "file_path": file_path,
+                "acquired": False,
+                "wait_reason": result.get("reason") or "locked",
+                "claim_granularity": "file",
+                "lease_expiry": result.get("expires_at"),
+                "retry_after": db_module._seconds_until(result.get("expires_at")),
+                "conflict": {
+                    "reason": result.get("reason") or "locked",
+                    "holder_session_id": result.get("holder_session_id"),
                 },
+            }
+            if legacy_shorthand:
+                blocked_entry["resolved_from_legacy_shorthand"] = True
+            return await _blocked(
+                blocked_entry,
                 f"Cannot claim sprint item: resource {resource!r} is locked by "
                 f"another live session ({result.get('holder_session_id')}).",
             )
@@ -2376,22 +2388,29 @@ def _check_file_only_resources_warning(
         if len(candidates) >= 5:
             break
 
+    # 4e2bce48 — recommend ONLY the canonical symbol:<path>::<symbol> form. The
+    # single-colon file:<path>:<symbol> shorthand resolves to the WHOLE file for
+    # both conflict grouping (_resource_file_of, 2a176d6d) and locking, so it
+    # never co-batches; advertising it as the co-batching form was wrong.
     affected = ", ".join(f"``{e}``" for e in file_only)
     if candidates:
         examples = " or ".join(
-            f"``{e}:{c}``" for e, c in zip(file_only[:2], candidates[:2])
+            f"``symbol:{e[len('file:'):]}::{c}``"
+            for e, c in zip(file_only[:2], candidates[:2])
         )
         hint = (
             f"SYMBOL_SCOPE_HINT: {affected} declared at file level. "
             f"Prefer symbol-scoped ids when items touch different functions in the "
             f"same file — e.g. {examples}. "
             f"This allows co-batching in the same parallel wave. "
-            f"(Non-fatal: item filed as-is. Use file:path.py:symbol_name format.)"
+            f"(Non-fatal: item filed as-is. Use the symbol:path.py::symbol_name "
+            f"format; a file:path.py:symbol_name suffix is treated as the whole "
+            f"file and does not co-batch.)"
         )
     else:
         hint = (
             f"SYMBOL_SCOPE_HINT: {affected} declared at file level. "
-            f"Prefer symbol-scoped ids (file:path.py:symbol_name or symbol:path::Name) "
+            f"Prefer symbol-scoped ids (symbol:path.py::symbol_name) "
             f"when two items touch different functions in the same file — "
             f"this allows them to co-batch in the same parallel wave. "
             f"(Non-fatal: item filed as-is.)"
@@ -2465,11 +2484,13 @@ def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
     symbols: list[str] = []
     for entry in _parse_touches_files(item.get("touches_resources")):
         if entry.startswith("file:"):
-            files.append(entry[len("file:"):])
+            # 4e2bce48 — the real file, not a "<path>:<symbol>" pseudo-path.
+            files.append(db_module._resource_file_of(entry) or entry[len("file:"):])
         elif entry.startswith("symbol:"):
             symbols.append(entry[len("symbol:"):])
         elif entry.startswith("inferred:file:"):
-            files.append(entry[len("inferred:file:"):])
+            tail = entry[len("inferred:file:"):]
+            files.append(db_module._resource_file_of("file:" + tail) or tail)
     if files or symbols:
         ctx: dict[str, Any] = {"source": "touches_resources"}
         if files:
@@ -2537,9 +2558,13 @@ async def _code_notes_for_item_resources(
     file_paths: list[str] = []
     for entry in _parse_touches_files(item.get("touches_resources")):
         if entry.startswith("file:"):
-            file_paths.append(entry[len("file:"):])
+            # 4e2bce48 — look notes up under the real file; a "<path>:<symbol>"
+            # pseudo-path never matches a code-anchored note, so the warning
+            # silently never surfaced at claim time.
+            file_paths.append(db_module._resource_file_of(entry) or entry[len("file:"):])
         elif entry.startswith("inferred:file:"):
-            file_paths.append(entry[len("inferred:file:"):])
+            tail = entry[len("inferred:file:"):]
+            file_paths.append(db_module._resource_file_of("file:" + tail) or tail)
     # Also extract symbol paths so the file portion can be included.
     for entry in _parse_touches_files(item.get("touches_resources")):
         if entry.startswith("symbol:"):
@@ -5177,7 +5202,23 @@ async def _handle_file_claims(
         }
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
-        return {"released": released, "file_path": args["file_path"]}
+        release_result: dict[str, Any] = {"released": released, "file_path": args["file_path"]}
+        if not released:
+            # 4e2bce48 — executors often release by the declared string (e.g.
+            # "pkg/mod.py:helper" from "file:pkg/mod.py:helper"), but claim time
+            # locks the real file, so fall back to it instead of leaking the lock.
+            raw = args["file_path"]
+            raw = raw[len("file:"):] if raw.startswith("file:") else raw
+            real = db_module._resource_file_of("file:" + raw)
+            if real and real != args["file_path"] and await db_module.release_file(
+                db, real, args["session_id"],
+            ):
+                release_result.update({
+                    "released": True,
+                    "released_file_path": real,
+                    "resolved_from_legacy_shorthand": True,
+                })
+        return release_result
     if name == "find_orphaned_docx_staged_files":
         # 6507e83a — maintenance diagnostic: staged-DOCX temp files left
         # behind by a process that crashed between STAGE and PROMOTE inside

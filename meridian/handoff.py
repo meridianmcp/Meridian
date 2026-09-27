@@ -5951,7 +5951,9 @@ def build_declared_symbol_targets(item: dict[str, Any]) -> list[dict[str, Any]]:
                 # No ``::`` scope — treat the whole tail as the qualified_name.
                 symbols.append((body, None))
         elif s.startswith("file:"):
-            fp = s[len("file:"):].strip()
+            # 4e2bce48 — real file, not a "<path>:<symbol>" pseudo-path.
+            from meridian.db import _resource_file_of  # noqa: PLC0415
+            fp = (_resource_file_of(s.strip()) or s[len("file:"):]).strip()
             if fp:
                 files.append(fp)
     if not symbols:

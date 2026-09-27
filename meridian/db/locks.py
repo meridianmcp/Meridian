@@ -234,14 +234,31 @@ async def _amend_sprint_item_resources_for_session(
             parse_touches_resources,
             serialize_touches_resources,
         )
+        from meridian.db.sprint_items import _sprint_items_has_column  # noqa: PLC0415
+        # c0ddd5b3 — "this session's item" means the item whose locks are held
+        # under this session: its lock_session_id when recorded, else its actor
+        # (legacy rows) — the same rule every release path uses
+        # (sprint_items._claim_lock_owner). Matching actor alone missed every
+        # claim made with an explicit actor (a human name, an orchestrator id):
+        # the pivot lock was never declared on the item, so releasing the item
+        # left it held under this session for its whole TTL.
+        if await _sprint_items_has_column(db, "lock_session_id"):
+            owner_sql = (
+                "(lock_session_id = ? OR "
+                "((lock_session_id IS NULL OR lock_session_id = '') AND actor = ?))"
+            )
+            owner_params: tuple[Any, ...] = (session_id, session_id)
+        else:  # skipped migration: every row is a legacy row
+            owner_sql = "actor = ?"
+            owner_params = (session_id,)
         if item_id:
             # c027922d — explicit item context: look up THAT row directly,
             # scoped to this session and still in_progress. No ORDER BY /
             # LIMIT guessing across sibling in_progress items.
             async with db.execute(
                 "SELECT id, touches_resources, wave FROM sprint_items "
-                "WHERE id = ? AND actor = ? AND status = 'in_progress'",
-                (item_id, session_id),
+                f"WHERE id = ? AND {owner_sql} AND status = 'in_progress'",
+                (item_id, *owner_params),
             ) as cur:
                 row = await cur.fetchone()
         else:
@@ -251,9 +268,9 @@ async def _amend_sprint_item_resources_for_session(
             # concurrently in_progress item.
             async with db.execute(
                 "SELECT id, touches_resources, wave FROM sprint_items "
-                "WHERE actor = ? AND status = 'in_progress' "
+                f"WHERE {owner_sql} AND status = 'in_progress' "
                 "ORDER BY claimed_at DESC LIMIT 1",
-                (session_id,),
+                owner_params,
             ) as cur:
                 row = await cur.fetchone()
         item = _row_to_dict(row)
@@ -280,6 +297,17 @@ async def _amend_sprint_item_resources_for_session(
                 existing_canonical.add(body)
         if canonical in existing_canonical:
             return None  # already declared — no amendment needed
+        # 4e2bce48 — a legacy "file:<path>:<symbol>" declaration already covers a
+        # whole-file claim on <path> (that is exactly what it locks), so compare
+        # real-file identities among file: declarations. symbol: declarations
+        # stay string-compared: a whole-file claim IS broader than one symbol.
+        if canonical.startswith("file:"):
+            from meridian.db import _resource_file_of  # noqa: PLC0415
+            declared_files = {
+                _resource_file_of(c) for c in existing_canonical if c.startswith("file:")
+            }
+            if _resource_file_of(canonical) in declared_files:
+                return None
         # Resource is new: append it (grow, don't replace).
         amended = existing + [canonical]
         new_json = serialize_touches_resources(amended)
@@ -324,6 +352,7 @@ async def claim_file(
     ttl_hours: int = _FILE_LOCK_TTL_HOURS,
     mode: str = "write",
     item_id: str | None = None,
+    amend_sprint_item: bool = True,
 ) -> dict[str, Any]:
     """Claim a file path for a session, auto-releasing expired locks first.
 
@@ -349,6 +378,11 @@ async def claim_file(
     item) so a session holding 2+ concurrently in_progress items never has a
     claim misattributed to the wrong one. Omitted, the pre-existing
     single-candidate heuristic is used unchanged.
+
+    ``amend_sprint_item=False`` skips that amendment entirely: for a lock the
+    coordination layer takes on an item's behalf from what the item already
+    declares (``transfer_sprint_item_claim`` re-acquiring a moved claim's locks
+    under the receiving session), which is not a mid-execution pivot.
     """
     normalized = _normalize_file_path(file_path)
     if not normalized:
@@ -463,8 +497,11 @@ async def claim_file(
     # 2593a5fe — amend the active sprint item's touches_resources if this file
     # was not in the original declaration (mid-execution pivot detection).
     # Best-effort: errors never block the claim. Use "file:<path>" as resource id.
-    _resource_hint = await _amend_sprint_item_resources_for_session(
-        db, session_id, f"file:{normalized}", item_id=item_id
+    _resource_hint = (
+        await _amend_sprint_item_resources_for_session(
+            db, session_id, f"file:{normalized}", item_id=item_id
+        )
+        if amend_sprint_item else None
     )
     result: dict[str, Any] = {
         "claimed": True,
