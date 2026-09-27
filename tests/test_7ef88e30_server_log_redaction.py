@@ -591,3 +591,44 @@ def test_redact_log_row_copies_and_redacts_only_text_fields():
     }
     # Rows without the text fields pass through.
     assert redact_log_row({"id": "x"}) == {"id": "x"}
+
+
+# ---------------------------------------------------------------------------
+# write time, every call site: _MeridianDBLogHandler redacts before storage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_db_log_handler_redacts_before_storing(db):
+    """Any WARNING+ record, not only [mcp_auth], reaches server_logs redacted:
+    the stored row itself never holds the token secret or the full IP."""
+    import asyncio
+
+    from meridian.server import _MeridianDBLogHandler
+
+    token, secret = _new_token()
+    handler = _MeridianDBLogHandler(db)
+    try:
+        raise RuntimeError(f"upstream rejected Authorization: Bearer {token}")
+    except RuntimeError:
+        import sys
+        exc_info = sys.exc_info()
+    record = logging.LogRecord(
+        name="meridian.some_future_call_site", level=logging.ERROR,
+        pathname="", lineno=0,
+        msg="client %s sent key %s",
+        args=("203.0.113.77", token), exc_info=exc_info,
+    )
+    handler.emit(record)
+    for _ in range(50):  # emit() schedules a fire-and-forget write task
+        rows = await db_module.get_server_logs(db, limit=10, module_filter="some_future_call_site")
+        if rows:
+            break
+        await asyncio.sleep(0.02)
+    assert rows, "handler did not persist the record"
+    stored = json.dumps(rows)
+    assert secret[:12] not in stored
+    assert "203.0.113.77" not in stored
+    assert "203.0.113.0/24" in stored
+    assert rows[0]["level"] == "EXCEPTION"
+    assert "RuntimeError" in (rows[0]["exc_text"] or "")

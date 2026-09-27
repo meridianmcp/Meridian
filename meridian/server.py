@@ -370,6 +370,18 @@ class _MeridianDBLogHandler(logging.Handler):
                 except Exception:  # noqa: BLE001
                     pass
 
+            # 7ef88e30 — server_logs is process-global and readable by every
+            # authenticated caller (get_server_logs / search_server_logs), so
+            # mask credentials and client IPs before they reach the table.  The
+            # readers redact too; this keeps raw secrets out of storage for any
+            # current or future log call site, not only [mcp_auth].
+            try:
+                from .log_redaction import redact_log_text as _redact  # noqa: PLC0415
+                msg = _redact(msg)
+                exc_text = _redact(exc_text)
+            except Exception:  # noqa: BLE001 — redaction failure must not drop the record
+                pass
+
             db = self._db
 
             async def _async_write() -> None:
