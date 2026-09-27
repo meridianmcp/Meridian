@@ -150,7 +150,15 @@ shopt -u nocasematch
 
 if [ "$is_worktree" = "1" ] && [ "$inside_project_dir" != "1" ]; then
     # Scratch space a worktree session legitimately writes outside its checkout.
-    for d in "${TEMP:-}" "${TMP:-}" "${TMPDIR:-}" "/tmp" "${HOME:+$HOME/.claude/plans}" "${USERPROFILE:+$USERPROFILE/.claude/plans}" "${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/plans}"; do
+    # 55d48d69 fix round 1 regression (found while verifying this same fix round):
+    # this used to exempt ANY path under the bare OS temp dir, not just Claude
+    # Code's own '<temp>/claude/...' tree (scratchpad, logs, other per-session
+    # state) -- so any unrelated file that merely happened to live under $TEMP
+    # (e.g. a pytest tmp_path fixture, an extracted archive, another tool's
+    # scratch file) silently bypassed the worktree boundary block entirely.
+    # Scoped to '<temp>/claude' to match the session scratchpad's real shape
+    # (see the harness environment block: "<TEMP>\claude\<project>\<session>\scratchpad").
+    for d in "${TEMP:+$TEMP/claude}" "${TMP:+$TMP/claude}" "${TMPDIR:+$TMPDIR/claude}" "/tmp/claude" "${HOME:+$HOME/.claude/plans}" "${USERPROFILE:+$USERPROFILE/.claude/plans}" "${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/plans}"; do
         [ -n "$d" ] && is_under "$norm_file" "$d" && exit 0
     done
     # The file is outside this session's worktree. Block it.

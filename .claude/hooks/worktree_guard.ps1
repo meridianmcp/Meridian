@@ -130,9 +130,17 @@ $insideProjectDir = $normFile.StartsWith($prefix, [System.StringComparison]::Ord
 
 if ($isWorktreeSession -and -not $insideProjectDir) {
     # Scratch space a worktree session legitimately writes outside its checkout.
+    # 55d48d69 fix round 1 regression (found while verifying this same fix round):
+    # this used to exempt ANY path under the bare OS temp dir, not just Claude
+    # Code's own '<temp>/claude/...' tree (scratchpad, logs, other per-session
+    # state) -- so any unrelated file that merely happened to live under %TEMP%
+    # (e.g. a pytest tmp_path fixture, an extracted archive, another tool's
+    # scratch file) silently bypassed the worktree boundary block entirely.
+    # Scoped to '<temp>/claude' to match the session scratchpad's real shape
+    # (see the harness environment block: "<TEMP>\claude\<project>\<session>\scratchpad").
     $scratch = $false
-    foreach ($d in @($env:TEMP, $env:TMP, $env:TMPDIR)) { if ($d -and (Test-Under $normFile $d)) { $scratch = $true } }
-    if ((Norm $normFile).StartsWith('/tmp/', [System.StringComparison]::Ordinal)) { $scratch = $true }
+    foreach ($d in @($env:TEMP, $env:TMP, $env:TMPDIR)) { if ($d -and (Test-Under $normFile ((Norm $d) + '/claude'))) { $scratch = $true } }
+    if ((Norm $normFile).StartsWith('/tmp/claude/', [System.StringComparison]::Ordinal)) { $scratch = $true }
     foreach ($h in @($env:USERPROFILE, $env:HOME)) {
         if ($h -and (Test-Under $normFile ((Norm $h) + '/.claude/plans'))) { $scratch = $true }
     }

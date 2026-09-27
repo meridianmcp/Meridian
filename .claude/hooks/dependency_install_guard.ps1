@@ -241,14 +241,21 @@ function Split-Words([string]$Seg) {
 # Drop wrappers in front of the real command: VAR=x, env/sudo/command, pixi run,
 # uv run, poetry run, conda run [-n NAME|-p PATH].
 function Strip-Wrappers($W) {
+    # 55d48d69 fix round 1 regression (found while verifying this same fix round):
+    # PowerShell variable names are case-INSENSITIVE, so a local $w/$lw here was the
+    # SAME variable as the $W parameter -- the first loop iteration's "$w = ...$W[$i]"
+    # silently clobbered $W itself (a List[string]) with a scalar string, after which
+    # $W.Count returned PowerShell's synthetic scalar Count (1) and $W[0] indexed into
+    # that string's characters. Every call silently truncated to a 1-character result,
+    # so no dependency-install command was ever correctly parsed. Renamed to $cw/$lcw.
     $i = 0
     while ($i -lt $W.Count) {
-        $w = [string]$W[$i]
-        $lw = $w.ToLowerInvariant()
-        if ($w -match '^[A-Za-z_][A-Za-z0-9_]*=') { $i++; continue }
-        if ($lw -in @('env', 'sudo', 'command', 'exec', 'nohup', 'time')) { $i++; continue }
-        if ($lw -in @('pixi', 'uv', 'poetry', 'hatch', 'pdm') -and $i + 1 -lt $W.Count -and ([string]$W[$i + 1]).ToLowerInvariant() -eq 'run') { $i += 2; continue }
-        if ($lw -eq 'conda' -and $i + 1 -lt $W.Count -and ([string]$W[$i + 1]).ToLowerInvariant() -eq 'run') {
+        $cw = [string]$W[$i]
+        $lcw = $cw.ToLowerInvariant()
+        if ($cw -match '^[A-Za-z_][A-Za-z0-9_]*=') { $i++; continue }
+        if ($lcw -in @('env', 'sudo', 'command', 'exec', 'nohup', 'time')) { $i++; continue }
+        if ($lcw -in @('pixi', 'uv', 'poetry', 'hatch', 'pdm') -and $i + 1 -lt $W.Count -and ([string]$W[$i + 1]).ToLowerInvariant() -eq 'run') { $i += 2; continue }
+        if ($lcw -eq 'conda' -and $i + 1 -lt $W.Count -and ([string]$W[$i + 1]).ToLowerInvariant() -eq 'run') {
             $i += 2
             while ($i -lt $W.Count -and ([string]$W[$i]).StartsWith('-')) {
                 if (([string]$W[$i]) -in @('-n', '--name', '-p', '--prefix') ) { $i += 2 } else { $i++ }
