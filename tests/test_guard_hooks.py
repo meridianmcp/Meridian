@@ -1031,7 +1031,9 @@ def test_bad_stdin_allows(shim, label, guard_root):
 def test_unreadable_state_file_is_treated_as_empty(shim, guard_root):
     """A state path that cannot be read (here: a directory) behaves like an empty
     state -- no crash, no spurious block: an allowed call stays allowed and a
-    code-search call gets exactly the core's (empty-state) decision."""
+    code-search call gets the core's (empty-state) decision, failed open because
+    the state cannot be saved either (fix round 1: without saved state the breaker
+    and the receipt escape cannot work, so an escapable deny becomes an inject)."""
     if shim == "ps1" and POWERSHELL is None:
         pytest.skip("PowerShell unavailable")
     if shim == "sh" and BASH is None:
@@ -1047,7 +1049,8 @@ def test_unreadable_state_file_is_treated_as_empty(shim, guard_root):
         assert r.returncode == 0
         out = r.stdout.decode("utf-8", "replace")
         got = json.loads(out) if out.strip() else None
-        assert got == gc.render_output("PreToolUse", mat["ref"]), (name, out)
+        want = gc.fail_open_result(mat["ref"]) if isinstance(mat["ref"].get("state"), dict) else mat["ref"]
+        assert got == gc.render_output("PreToolUse", want), (name, out)
         assert mat["state_path"].is_dir(), "the unreadable state path is left alone"
 
 

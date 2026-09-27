@@ -47,6 +47,15 @@
 #
 # Tolerant JSON extraction (no jq dependency), mirrors secret_guard.sh /
 # worktree_guard.sh. Fails OPEN on any parse error.
+# 55d48d69 fix round 1 (mirrors dependency_install_guard.ps1): statements and words
+# are read the way a shell reads them -- quotes respected (a commit message or echo
+# text mentioning "pip install" is not an install) and removed from words (pip
+# install -e ".[dev]"), redirections dropped (2>/dev/null is not a package) --
+# relative directory specs with a path separator are local installs, wrappers
+# (VAR=x, env, sudo, pixi/uv/poetry/conda run, full-path python -m pip, uv pip) are
+# unwrapped, and '|' / newlines split statements too. The owner kill switch
+# (MERIDIAN_GUARD=off|advisory, guard.off / guard.advisory,
+# MERIDIAN_GUARD_DISABLE=dependency_install_guard) covers this hook.
 # NOT hooks.sh (the token-rotation installer).
 set -uo pipefail
 
@@ -58,8 +67,41 @@ tool="$(printf '%s' "$payload" | grep -oE '"tool_name"[[:space:]]*:[[:space:]]*"
 # 55d48d69: the PowerShell tool runs the same install commands (pip/npm/...).
 case "$tool" in Bash|PowerShell) ;; *) exit 0 ;; esac
 
-cmd="$(printf '%s' "$payload" | grep -oE '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/^"command"[[:space:]]*:[[:space:]]*"//; s/"$//')"
+# the command string, JSON escapes for quotes / backslashes / newlines undone
+cmd="$(printf '%s' "$payload" | grep -oE '"command"[[:space:]]*:[[:space:]]*"([^"\\]|\\.)*"' | head -1 \
+    | sed -E 's/^"command"[[:space:]]*:[[:space:]]*"//; s/"$//')"
 [ -z "$cmd" ] && exit 0
+cmd="${cmd//\\n/$'\n'}"; cmd="${cmd//\\t/ }"; cmd="${cmd//\\\"/\"}"; cmd="${cmd//\\\\/\\}"
+
+# --- owner kill switch (same inputs as the Meridian guard's G0) ------------------
+# Sets GUARD_MODE (off|advisory|enforce) -- bash builtins only, no subshell.
+guard_mode() {
+    local raw="${MERIDIAN_GUARD:-}" dm="${MERIDIAN_GUARD_DEFAULT_MODE:-}" dis tok gd
+    raw="${raw//[[:space:]]/}"; dm="${dm//[[:space:]]/}"
+    shopt -s nocasematch
+    GUARD_MODE=enforce
+    if [[ $raw == off ]]; then GUARD_MODE=off; shopt -u nocasematch; return; fi
+    if [ -n "$raw" ] && [[ $raw != enforce ]]; then GUARD_MODE=advisory; fi
+    if [ -z "$raw" ] && [[ $dm == advisory ]]; then GUARD_MODE=advisory; fi
+    dis="${MERIDIAN_GUARD_DISABLE:-}"; dis="${dis//[,;]/ }"
+    for tok in $dis; do
+        if [[ $tok == "$1" ]]; then GUARD_MODE=off; shopt -u nocasematch; return; fi
+    done
+    shopt -u nocasematch
+    gd=''
+    if [ -n "${LOCALAPPDATA:-}" ]; then gd="$LOCALAPPDATA/meridian/guard"
+    elif [ -n "${USERPROFILE:-}" ]; then gd="$USERPROFILE/AppData/Local/meridian/guard"
+    elif [ -n "${HOME:-}" ]; then gd="${XDG_STATE_HOME:-$HOME/.local/state}/meridian/guard"
+    fi
+    if [ -n "$gd" ]; then
+        if [ -f "$gd/guard.off" ]; then GUARD_MODE=off; elif [ -f "$gd/guard.advisory" ]; then GUARD_MODE=advisory; fi
+    fi
+}
+guard_mode dependency_install_guard
+[ "$GUARD_MODE" = "off" ] && exit 0
+cmd_cwd="$(printf '%s' "$payload" | grep -oE '"cwd"[[:space:]]*:[[:space:]]*"([^"\\]|\\.)*"' | head -1 | sed -E 's/^"cwd"[[:space:]]*:[[:space:]]*"//; s/"$//')"
+cmd_cwd="${cmd_cwd//\\\\/\\}"
+[ -z "$cmd_cwd" ] && cmd_cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." >/dev/null 2>&1 && pwd)"
@@ -139,9 +181,111 @@ is_flag() {
 
 is_local_path() {
     case "$1" in
-        .|./*|../*|/*|~*|[A-Za-z]:*) return 0 ;;
-        *) return 1 ;;
+        .*|/*|~*|[A-Za-z]:*|file:*) return 0 ;;   # '.', './x', '../x', '.[dev]', absolute
+        *://*|[A-Za-z]*+*) return 1 ;;              # URL / VCS spec: remote
+        @*) return 1 ;;
+        */*|*\\*)
+            # pip/pixi/conda/poetry/pipx: a spec with a path separator is a directory;
+            # npm: 'user/repo' is a GitHub shorthand, so only an existing path is local.
+            [ "$manager" != "npm" ] && return 0
+            [ -e "$cmd_cwd/$1" ] && return 0
+            return 1 ;;
     esac
+    return 1
+}
+
+# Statements of a shell command, one per line: split on ; newline && || | outside quotes.
+split_statements() {
+    local s="$1" out="" q="" c i n
+    n=${#s}
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        c="${s:$i:1}"
+        if [ -n "$q" ]; then
+            if [ "$c" = "$q" ]; then q=""
+            elif [ "$c" = "\\" ] && [ "$q" = '"' ] && [ $((i + 1)) -lt "$n" ]; then out="$out$c"; i=$((i + 1)); c="${s:$i:1}"
+            fi
+            [ "$c" = $'\n' ] && c=" "
+            out="$out$c"; i=$((i + 1)); continue
+        fi
+        case "$c" in
+            "'"|'"') q="$c"; out="$out$c" ;;
+            "\\") out="$out$c${s:$((i + 1)):1}"; i=$((i + 1)) ;;
+            ";"|$'\n'|$'\r'|"|") out="$out"$'\n'; [ "$c" = "|" ] && [ "${s:$((i + 1)):1}" = "|" ] && i=$((i + 1)) ;;
+            "&") if [ "${s:$((i + 1)):1}" = "&" ]; then out="$out"$'\n'; i=$((i + 1)); else out="$out$c"; fi ;;
+            *) out="$out$c" ;;
+        esac
+        i=$((i + 1))
+    done
+    printf '%s\n' "$out"
+}
+
+# Words of one statement on stdout, one per line: whitespace outside quotes,
+# quotes removed, redirections dropped, wrappers (VAR=x env sudo pixi/uv/poetry/
+# conda run, python -m, uv pip) removed and the verb normalized.
+statement_words() {
+    local s="$1" w="" have=0 q="" c i n
+    local -a W=()
+    n=${#s}
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        c="${s:$i:1}"
+        if [ -n "$q" ]; then
+            if [ "$c" = "$q" ]; then q=""; else w="$w$c"; fi
+            i=$((i + 1)); continue
+        fi
+        case "$c" in
+            "'"|'"') q="$c"; have=1 ;;
+            " "|$'\t') if [ "$have" = 1 ]; then W+=("$w"); w=""; have=0; fi ;;
+            *) w="$w$c"; have=1 ;;
+        esac
+        i=$((i + 1))
+    done
+    [ "$have" = 1 ] && W+=("$w")
+    local -a O=()
+    local skip=0 x redir_only_re='^([0-9]*|&)(>>?|<)$' redir_re='^([0-9]*|&)(>>?|<)' 
+    for x in "${W[@]}"; do
+        if [ "$skip" = 1 ]; then skip=0; continue; fi
+        if [[ $x =~ $redir_only_re ]]; then skip=1; continue; fi
+        if [[ $x =~ $redir_re ]]; then continue; fi
+        O+=("$x")
+    done
+    local k=0 lw nw
+    nw=${#O[@]}
+    while [ "$k" -lt "$nw" ]; do
+        lw="$(printf '%s' "${O[$k]}" | tr '[:upper:]' '[:lower:]')"
+        case "${O[$k]}" in [A-Za-z_]*=*) k=$((k + 1)); continue ;; esac
+        case "$lw" in
+            env|sudo|command|exec|nohup|time) k=$((k + 1)); continue ;;
+            pixi|uv|poetry|hatch|pdm)
+                if [ $((k + 1)) -lt "$nw" ] && [ "$(printf '%s' "${O[$((k + 1))]}" | tr '[:upper:]' '[:lower:]')" = "run" ]; then k=$((k + 2)); continue; fi ;;
+            conda)
+                if [ $((k + 1)) -lt "$nw" ] && [ "$(printf '%s' "${O[$((k + 1))]}" | tr '[:upper:]' '[:lower:]')" = "run" ]; then
+                    k=$((k + 2))
+                    while [ "$k" -lt "$nw" ]; do
+                        case "${O[$k]}" in
+                            -n|--name|-p|--prefix) k=$((k + 2)) ;;
+                            -*) k=$((k + 1)) ;;
+                            *) break ;;
+                        esac
+                    done
+                    continue
+                fi ;;
+        esac
+        break
+    done
+    [ "$k" -ge "$nw" ] && return 0
+    local v0
+    v0="$(printf '%s' "${O[$k]}" | tr '\\' '/' | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/\.exe$//')"
+    case "$v0" in
+        python|python3|py)
+            if [ $((k + 2)) -lt "$nw" ] && [ "${O[$((k + 1))]}" = "-m" ]; then k=$((k + 2)); v0="$(printf '%s' "${O[$k]}" | tr '[:upper:]' '[:lower:]')"; fi ;;
+        uv)
+            if [ $((k + 1)) -lt "$nw" ] && [ "$(printf '%s' "${O[$((k + 1))]}" | tr '[:upper:]' '[:lower:]')" = "pip" ]; then k=$((k + 1)); v0=pip; fi ;;
+    esac
+    printf '%s\n' "$v0"
+    k=$((k + 1))
+    while [ "$k" -lt "$nw" ]; do printf '%s\n' "${O[$k]}"; k=$((k + 1)); done
 }
 
 flagged=""
@@ -358,12 +502,13 @@ check_pipx_segment() {
     fi
 }
 
-# Split on &&, ||, ; into segments so each sub-command is inspected independently.
-segments="$(printf '%s' "$cmd" | sed -E 's/&&|\|\||;/\n/g')"
+# Split into statements (quote-aware) so each sub-command is inspected independently,
+# then re-assemble each one from its unquoted, unwrapped words.
+segments="$(split_statements "$cmd")"
 
 while IFS= read -r seg; do
     [ -n "$flagged" ] && break
-    seg_trim="$(printf '%s' "$seg" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    seg_trim="$(statement_words "$seg" | tr '\n' ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     [ -z "$seg_trim" ] && continue
 
     if printf '%s' "$seg_trim" | grep -qE '^((python3?|py)[[:space:]]+-m[[:space:]]+)?pip3?[[:space:]]+install([[:space:]]|$)'; then
@@ -413,6 +558,12 @@ $segments
 EOF
 
 if [ -n "$flagged" ]; then
+    if [ "$GUARD_MODE" = "advisory" ]; then
+        _m="Meridian dependency-install guard (31a4a9c8): $manager install of unverified package '$flagged' -- verify it on the official registry (or request_hitl) and add it to .claude/hooks/verified_packages.txt."
+        _m=${_m//\\/\\\\}; _m=${_m//\"/\\\"}
+        printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"[advisory, not blocked] %s"}}' "$_m"
+        exit 0
+    fi
     echo "Meridian dependency-install guard (31a4a9c8): BLOCKED $manager install of unverified package '$flagged'. Per the May 2026 CISA/NSA/Five Eyes supply-chain advisory on malicious AI-agent package installs, an unknown package must be verified BEFORE install. Do ONE of: (1) look '$flagged' up on the official registry (PyPI: https://pypi.org/pypi/$flagged/json or https://www.npmjs.com/package/$flagged) to confirm it is the real, actively-maintained project -- not a typosquat -- then append the exact name to .claude/hooks/verified_packages.txt and retry; or (2) call request_hitl(project_id, question) for explicit human confirmation, then add it to the allowlist once approved. Packages already declared in pyproject.toml/package.json/pixi.toml are pre-approved and never blocked." >&2
     exit 2
 fi

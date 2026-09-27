@@ -11,44 +11,78 @@
 # does NOT contain '.claude/worktrees/' the session is in the main tree -- fail open
 # (no restriction: the main-tree session owns the main tree).
 #
+# 55d48d69 fix round 1: a worktree session may still write its own scratch files:
+# the OS temp dirs (TEMP/TMP/TMPDIR, /tmp -- the session scratchpad lives there) and
+# Claude Code's plan files (~/.claude/plans). Only other checkouts (the main tree, a
+# sibling worktree, any other path) stay blocked. The owner kill switch
+# (MERIDIAN_GUARD=off|advisory, guard.off / guard.advisory, MERIDIAN_GUARD_DISABLE=
+# worktree_guard) covers this hook too.
+#
 # Mirrors the structural pattern of hitl_guard.ps1 (PreToolUse, exit 2 to block,
 # tolerant JSON parsing, fail open on any parse error).
 # NOT hooks.ps1 (the token-rotation installer).
 #
-# 71f597b7 (decision 9ce6420e) -- git-common-dir lockfile extension.
+# 71f597b7 (decision 9ce6420e) -- same-file lock, revised in 55d48d69 fix round 1.
 #
-# The worktree-boundary check above only stops a session from editing a file
-# OUTSIDE its own claimed worktree. It does nothing about two LIVE sessions that
-# each stay within their own worktree (or the main tree) but happen to be editing
-# the SAME repo-relative file at the same time -- e.g. two sessions in sibling
-# worktrees of one clone both touching meridian/server.py, or a main-tree session
-# and a worktree session both touching it. claim_file/claim_symbol (meridian/db/
-# locks.py) track that in the DB but have zero enforcement power over a local
-# disk write, and there is no reliable bridge between Claude Code's own hook-
-# supplied session_id and Meridian's independently-minted DB session_id (see
-# decision 9ce6420e, option 2). So this section adds a purely LOCAL, best-effort
-# lock keyed by repo-relative path, stored as a small JSON file under this
-# clone's shared `git rev-parse --git-common-dir` -- every worktree of one clone
-# (main tree included) resolves to the SAME common dir, so the lock is visible
-# to every session sharing this checkout, with zero network calls and zero
-# session-identity bridging (Claude Code's own per-CLI session_id is used purely
-# as a local lock-owner token, never sent anywhere).
+# The lock records which session last edited a repo-relative file, as a small JSON
+# file under THIS CHECKOUT's own git dir (`git rev-parse --git-dir`: the main tree's
+# .git, or .git/worktrees/<name> for a linked worktree). It is WARN-ONLY: when
+# another session edited the same file in the same working tree within the last 15
+# minutes, the edit is allowed and the model gets an additionalContext warning to
+# coordinate (two sessions must never share one working tree -- AGENTS.md).
 #
-# This is advisory-hard (a live foreign lock exit-2 blocks, matching this hook's
-# own worktree-boundary fail-mode), not a distributed/atomic guarantee: the
-# check-then-write below has a small race window on a genuinely simultaneous
-# first touch, which is judged acceptable for a local, single-machine, no-
-# network guard whose job is to catch the common "another live session already
-# owns this file" case, not to replace a real consensus protocol.
-#
-# Staleness: a lock older than 2 hours (by file mtime) is treated as abandoned
-# and silently reclaimed. 2 hours mirrors meridian/db/locks.py's own
-# _FILE_LOCK_TTL_HOURS -- the same threshold Meridian's server-side file claims
-# already use to decide a claim is dead, chosen here for consistency rather than
-# reinvented. This hook has no network access to ask "is that session still
-# alive" against anything external, so an mtime heuristic is the most it can do
-# on its own -- documented here rather than left implicit.
+# Why not the old design (git-common-dir key, 2 h TTL, exit 2): the common dir is
+# shared by every worktree of the clone, so parallel worktree agents editing their
+# OWN copies of one file blocked each other; nothing released a lock when a session
+# ended, so a new session -- or the same human after /clear -- was locked out of a
+# file for 2 h after the last edit; and the only escape was /hooks or
+# disableAllHooks. A hook cannot tell a live session from a finished one (no
+# network, no reliable session-to-process mapping; a process lookup costs ~1.5 s in
+# Windows PowerShell), so it cannot hard-block safely: it warns instead, keyed per
+# working tree, with a 15 minute window refreshed by every edit.
 $ErrorActionPreference = 'SilentlyContinue'
+
+# --- owner kill switch (same inputs as the Meridian guard's G0) ------------------
+function Get-GuardMode([string]$HookName) {
+    $raw = ([string]$env:MERIDIAN_GUARD).Trim().ToLowerInvariant()
+    if ($raw -eq 'off') { return 'off' }
+    $mode = if ($raw -eq '' -or $raw -eq 'enforce') { 'enforce' } else { 'advisory' }
+    if ($raw -eq '' -and ([string]$env:MERIDIAN_GUARD_DEFAULT_MODE).Trim().ToLowerInvariant() -eq 'advisory') { $mode = 'advisory' }
+    foreach ($tok in ([string]$env:MERIDIAN_GUARD_DISABLE -split '[\s,;]+')) {
+        if ($tok.Trim().ToLowerInvariant() -eq $HookName) { return 'off' }
+    }
+    $gd = $null
+    if ($env:LOCALAPPDATA) { $gd = [System.IO.Path]::Combine($env:LOCALAPPDATA, 'meridian', 'guard') }
+    elseif ($env:USERPROFILE) { $gd = [System.IO.Path]::Combine($env:USERPROFILE, 'AppData', 'Local', 'meridian', 'guard') }
+    elseif ($env:HOME) {
+        $st = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { [System.IO.Path]::Combine($env:HOME, '.local', 'state') }
+        $gd = [System.IO.Path]::Combine($st, 'meridian', 'guard')
+    }
+    if ($gd) {
+        if ([System.IO.File]::Exists([System.IO.Path]::Combine($gd, 'guard.off'))) { return 'off' }
+        if ([System.IO.File]::Exists([System.IO.Path]::Combine($gd, 'guard.advisory'))) { return 'advisory' }
+    }
+    return $mode
+}
+
+function Write-Context([string]$Message) {
+    $o = @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; additionalContext = $Message } }
+    [Console]::Out.Write(($o | ConvertTo-Json -Compress -Depth 4))
+}
+
+function Stop-Call([string]$Message) {
+    if ($script:GuardMode -eq 'advisory') { Write-Context ('[advisory, not blocked] ' + $Message); exit 0 }
+    [Console]::Error.WriteLine($Message)
+    exit 2
+}
+
+function Norm([string]$p) { return (($p -replace '\\', '/') -replace '/+', '/').TrimEnd('/') }
+
+function Test-Under([string]$File, [string]$Dir) {
+    if (-not $Dir) { return $false }
+    $d = (Norm $Dir) + '/'
+    return ((Norm $File) + '/').StartsWith($d, [System.StringComparison]::OrdinalIgnoreCase)
+}
 
 try { $payload = [Console]::In.ReadToEnd() } catch { exit 0 }
 if (-not $payload) { exit 0 }
@@ -57,6 +91,9 @@ if (-not $obj) { exit 0 }
 
 $tool = [string]$obj.tool_name
 if ($tool -notin @('Edit', 'Write', 'MultiEdit', 'NotebookEdit')) { exit 0 }
+
+$script:GuardMode = Get-GuardMode 'worktree_guard'
+if ($script:GuardMode -eq 'off') { exit 0 }
 
 # CLAUDE_PROJECT_DIR is set by Claude Code to the session's project root.
 # Fail open if the env var is absent (unknown execution context).
@@ -92,10 +129,18 @@ $prefix = $normProject.TrimEnd('/') + '/'
 $insideProjectDir = $normFile.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
 
 if ($isWorktreeSession -and -not $insideProjectDir) {
+    # Scratch space a worktree session legitimately writes outside its checkout.
+    $scratch = $false
+    foreach ($d in @($env:TEMP, $env:TMP, $env:TMPDIR)) { if ($d -and (Test-Under $normFile $d)) { $scratch = $true } }
+    if ((Norm $normFile).StartsWith('/tmp/', [System.StringComparison]::Ordinal)) { $scratch = $true }
+    foreach ($h in @($env:USERPROFILE, $env:HOME)) {
+        if ($h -and (Test-Under $normFile ((Norm $h) + '/.claude/plans'))) { $scratch = $true }
+    }
+    if ($env:CLAUDE_CONFIG_DIR -and (Test-Under $normFile ((Norm $env:CLAUDE_CONFIG_DIR) + '/plans'))) { $scratch = $true }
+    if ($scratch) { exit 0 }
     # The file is outside this session's worktree. Block it.
     # exit 2 blocks the tool call; stderr is fed back to Claude as the reason.
-    [Console]::Error.WriteLine("Meridian worktree guard (a3984d96): ${tool} target '$filePath' is OUTSIDE this session's worktree ('$projectDir'). Edit only files under your own worktree. If you need to affect the main tree or a different worktree, coordinate via request_hitl or complete this session first.")
-    exit 2
+    Stop-Call "Meridian worktree guard (a3984d96): ${tool} target '$filePath' is OUTSIDE this session's worktree ('$projectDir'). Edit only files under your own worktree (the temp dir / session scratchpad and ~/.claude/plans are fine). If you need to affect the main tree or a different worktree, coordinate via request_hitl or complete this session first."
 }
 
 if (-not $insideProjectDir) {
@@ -112,88 +157,53 @@ $relPath = $normFile.Substring($prefix.Length)
 if (-not $relPath) { exit 0 }
 
 # ---------------------------------------------------------------------------
-# 71f597b7 -- git-common-dir lockfile check.
+# 71f597b7 -- per-checkout same-file lock (warn-only, see header).
 # ---------------------------------------------------------------------------
 $sessionId = [string]$obj.session_id
-if (-not $sessionId) { exit 0 }  # no attributable local owner -- fail open on locking only
+if (-not $sessionId) { exit 0 }  # no attributable local owner -- nothing to record
 
-$gitCommonDirRaw = $null
-try { $gitCommonDirRaw = (& git -C $projectDir rev-parse --git-common-dir 2>$null) } catch { $gitCommonDirRaw = $null }
-if (($LASTEXITCODE -and $LASTEXITCODE -ne 0) -or -not $gitCommonDirRaw) { exit 0 }
-$gitCommonDirRaw = [string]$gitCommonDirRaw
+$gitDirRaw = $null
+try { $gitDirRaw = (& git -C $projectDir rev-parse --git-dir 2>$null) } catch { $gitDirRaw = $null }
+if (($LASTEXITCODE -and $LASTEXITCODE -ne 0) -or -not $gitDirRaw) { exit 0 }
+$gitDirRaw = [string]$gitDirRaw
 
-if ([System.IO.Path]::IsPathRooted($gitCommonDirRaw)) {
-    $gitCommonDirCandidate = $gitCommonDirRaw
+if ([System.IO.Path]::IsPathRooted($gitDirRaw)) {
+    $gitDirCandidate = $gitDirRaw
 } else {
-    $gitCommonDirCandidate = Join-Path $projectDir $gitCommonDirRaw
+    $gitDirCandidate = [System.IO.Path]::Combine($projectDir, $gitDirRaw)
 }
-$gitCommonDir = $null
-try { $gitCommonDir = (Resolve-Path -LiteralPath $gitCommonDirCandidate -ErrorAction Stop).ProviderPath } catch { exit 0 }
-if (-not $gitCommonDir) { exit 0 }
+$gitDir = $null
+try { $gitDir = [System.IO.Path]::GetFullPath($gitDirCandidate) } catch { exit 0 }
+if (-not $gitDir -or -not [System.IO.Directory]::Exists($gitDir)) { exit 0 }
 
-$lockRoot = Join-Path $gitCommonDir 'meridian-locks'
-try { New-Item -ItemType Directory -Force -Path $lockRoot -ErrorAction Stop | Out-Null } catch { exit 0 }
+$lockRoot = [System.IO.Path]::Combine($gitDir, 'meridian-locks')
+$lockFile = [System.IO.Path]::Combine($lockRoot, ($relPath -replace '/', [System.IO.Path]::DirectorySeparatorChar) + '.lock')
+try { [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($lockFile)) } catch { exit 0 }
 
-$lockRelPath = ($relPath -replace '/', [System.IO.Path]::DirectorySeparatorChar) + '.lock'
-$lockFile = Join-Path $lockRoot $lockRelPath
-$lockFileDir = Split-Path -Parent $lockFile
-try { New-Item -ItemType Directory -Force -Path $lockFileDir -ErrorAction Stop | Out-Null } catch { exit 0 }
-
-$staleThresholdHours = 2  # mirrors meridian/db/locks.py _FILE_LOCK_TTL_HOURS
+$windowMinutes = 15
 $nowUtc = [DateTime]::UtcNow
 $lockJson = "{`"session_id`":`"$sessionId`",`"path`":`"$relPath`",`"tool`":`"$tool`",`"locked_at`":`"$($nowUtc.ToString('o'))`"}"
 
-$acquired = $false
-try {
-    $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockJson)
-        $fs.Write($bytes, 0, $bytes.Length)
-    } finally { $fs.Close() }
-    $acquired = $true
-} catch [System.IO.IOException] {
-    $acquired = $false
-} catch {
-    exit 0  # unexpected I/O problem with lock bookkeeping -- never trap real work over it
-}
-
-if ($acquired) { exit 0 }
-
-# Lock file already existed -- inspect its owner.
 $existingOwner = $null
-try {
-    $existingRaw = Get-Content -LiteralPath $lockFile -Raw -ErrorAction Stop
-    $existingObj = $existingRaw | ConvertFrom-Json -ErrorAction Stop
-    $existingOwner = [string]$existingObj.session_id
-} catch { $existingOwner = $null }
-
-if ($existingOwner -and $existingOwner -eq $sessionId) {
-    # Same session re-editing (or continuing to edit) its own file -- refresh
-    # the lock's timestamp (extends its staleness TTL) and allow.
-    # WriteAllBytes (not WriteAllText -- [System.Text.Encoding]::UTF8's
-    # preamble adds a BOM that WriteAllText honors and GetBytes doesn't,
-    # which would silently corrupt the JSON on every refresh while leaving
-    # the initial CreateNew-path write above BOM-free) to match the encoding
-    # used when the lock was first created.
-    try { [System.IO.File]::WriteAllBytes($lockFile, [System.Text.Encoding]::UTF8.GetBytes($lockJson)) } catch { }
-    exit 0
+$ageMinutes = $null
+if ([System.IO.File]::Exists($lockFile)) {
+    try {
+        $existingObj = [System.IO.File]::ReadAllText($lockFile) | ConvertFrom-Json
+        $existingOwner = [string]$existingObj.session_id
+    } catch { $existingOwner = $null }
+    try { $ageMinutes = ($nowUtc - [System.IO.File]::GetLastWriteTimeUtc($lockFile)).TotalMinutes } catch { $ageMinutes = $null }
 }
 
-# Different (or unattributable) owner -- check staleness via file mtime before
-# treating this as a real, live collision.
-$isStale = $false
-try {
-    $mtime = (Get-Item -LiteralPath $lockFile -ErrorAction Stop).LastWriteTimeUtc
-    if (([DateTime]::UtcNow - $mtime).TotalHours -ge $staleThresholdHours) { $isStale = $true }
-} catch { $isStale = $true }  # can't stat it -- treat as unusable rather than trap forever
+# Record this session as the file's latest editor. WriteAllBytes (not WriteAllText --
+# [System.Text.Encoding]::UTF8's preamble would add a BOM) keeps the JSON BOM-free.
+try { [System.IO.File]::WriteAllBytes($lockFile, [System.Text.Encoding]::UTF8.GetBytes($lockJson)) } catch { }
 
-if ($isStale) {
-    try { [System.IO.File]::WriteAllBytes($lockFile, [System.Text.Encoding]::UTF8.GetBytes($lockJson)) } catch { exit 0 }
-    exit 0
+if ($existingOwner -and $existingOwner -ne $sessionId -and $null -ne $ageMinutes -and $ageMinutes -lt $windowMinutes) {
+    $mins = [Math]::Max(0, [int][Math]::Floor($ageMinutes))
+    Write-Context ("Meridian worktree lock guard (71f597b7), warning only -- the edit is allowed: '$relPath' in this " +
+        "working tree ('$projectDir') was edited $mins minute(s) ago by another session ($existingOwner). " +
+        "Two sessions must not edit one working tree at the same time (AGENTS.md: one worktree per session). " +
+        "If that session is still running, stop and coordinate (claim_file / request_hitl) before editing further; " +
+        "if it has ended (or it was you before /clear), carry on.")
 }
-
-# A live lock is held by a DIFFERENT session. Block it, matching this hook's
-# own worktree-boundary fail-mode (hard exit-2 block naming the other owner).
-$ownerDisplay = if ($existingOwner) { $existingOwner } else { '(unknown session)' }
-[Console]::Error.WriteLine("Meridian worktree lock guard (71f597b7): ${tool} target '$filePath' (repo-relative '$relPath') is locked by another live session ($ownerDisplay) sharing this checkout's git-common-dir. Coordinate via request_hitl, wait for that session to finish, or -- only if you are certain it is dead -- remove the stale lock at '$lockFile' (locks self-expire after $staleThresholdHours hours of inactivity).")
-exit 2
+exit 0

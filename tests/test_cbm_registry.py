@@ -159,6 +159,11 @@ def test_env_dirs():
     assert reg.guard_dir({"HOME": "/home/u", "XDG_STATE_HOME": "/st"}) == "/st/meridian/guard"
     assert reg.guard_dir({}) is None
     assert reg.guard_dir(None) is None
+    # guard-integ round 2: MERIDIAN_GUARD_DIR overrides everything else, including
+    # when LOCALAPPDATA is also set -- this is the single resolver guard_core uses
+    # for PreToolUse/PostToolUse, so this is what makes it agree with session_brief.
+    assert reg.guard_dir({"LOCALAPPDATA": "C:\\U\\AppData\\Local", "MERIDIAN_GUARD_DIR": "D:\\reloc"}) == "D:/reloc"
+    assert reg.guard_dir({"meridian_guard_dir": "D:\\reloc"}) == "D:/reloc", "env keys are case-insensitive"
     assert reg.default_cache_dir({"USERPROFILE": "C:\\U"}) == "C:/U/.cache/codebase-memory-mcp"
     assert reg.default_cache_dir({"USERPROFILE": "C:\\U", "cbm_cache_dir": "D:\\cbm"}) == "D:/cbm", "env keys are case-insensitive"
     assert reg.default_cache_dir({}) is None
@@ -610,10 +615,66 @@ def test_resolver_against_built_snapshot_end_to_end(cache, tmp_path):
     (root / ".git").mkdir(parents=True)
     (root / "pkg").mkdir()
     slug_name = reg.slug(reg.norm_path(str(root)))
-    make_db(cache, slug_name, root, indexed_at=_iso(NOW - 3600), nodes=3)
+    make_db(cache, slug_name, root, indexed_at=_iso(NOW - 3600), nodes=30)  # 3 would be "partial" next to 900
     make_db(cache, "dup", root, indexed_at=_iso(NOW - 60), nodes=900)
     snap = reg.build_snapshot(str(cache), env=_env(tmp_path), now=NOW)
     res = reg.resolve(str(root / "pkg"), snap, RealFS(), {})
     assert res["mode"] == "own" and res["winner"]["name"] == slug_name and res["shadowed"] == ["dup"]
     fr = reg.freshness(res["winner"], RealFS(), NOW)
     assert fr["present"] is True
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (55d48d69): partial indexes and code-only coverage
+# ---------------------------------------------------------------------------
+
+
+def test_read_db_row_covers_only_dirs_holding_code(cache, repo):
+    """results/ (json, npz) and paper/ (png, pdf, log) are hashed but hold no code:
+    they must not be covered, or G1/G3 deny data-only searches (verification finding 6)."""
+    db = make_db(cache, "cov", repo, rel_paths=(
+        "a.py", "results/metrics_summary.json", "results/test_predictions.npz", "paper/fig1.png",
+        "paper/main.pdf", "paper/build.log", "src\\model.py", ".github/workflows/ci.yml", "docs/x.md",
+    ))
+    info = reg.read_db_row(str(db))
+    assert info["covered_dirs"] == ["", "src"]
+    assert info["files"] == 9
+
+
+def test_mark_partial_fewer_nodes_than_files_and_dwarfed():
+    rows = [
+        {"name": "slug", "root_key": "c:/r", "nodes": 90, "files": 1146},     # the live 2026-09-27 broken build
+        {"name": "whole", "root_key": "c:/r", "nodes": 126821, "files": 4908},
+        {"name": "tiny", "root_key": "c:/r", "nodes": 700, "files": None},     # < 1000 and 100x smaller
+        {"name": "small-ok", "root_key": "c:/r", "nodes": 5000, "files": None},  # dwarfed but not tiny
+        {"name": "alone", "root_key": "c:/other", "nodes": 3, "files": 3},
+        {"name": "nofiles", "root_key": "c:/other2", "nodes": 0, "files": 0},
+    ]
+    reg.mark_partial(rows)
+    assert {r["name"]: r["partial"] for r in rows} == {
+        "slug": True, "whole": False, "tiny": True, "small-ok": False, "alone": False, "nofiles": False}
+
+
+def test_pick_never_lets_a_partial_index_win_unless_pinned_or_alone():
+    slug = dict(_row("C-R", "C:/R", NOW - 60, nodes=90, slug_match=True), partial=True, files=1146)
+    whole = _row("meridian-repo", "C:/R", NOW - 55 * 86400, nodes=126821, slug_match=False)
+    w, why, shadowed = reg.pick([slug, whole])
+    assert w["name"] == "meridian-repo" and shadowed == ["C-R"]
+    assert reg.pick([slug, whole], pin_name="C-R")[0]["name"] == "C-R", "an explicit pin still wins"
+    assert reg.pick([slug])[0]["name"] == "C-R", "a lone partial index is still the (advisory-only) winner"
+
+
+def test_build_snapshot_demotes_unfinished_slug_index(cache, tmp_path):
+    root = tmp_path / "Proj"
+    (root / ".git").mkdir(parents=True)
+    (root / "pkg").mkdir()
+    slug_name = reg.slug(reg.norm_path(str(root)))
+    many = tuple(f"pkg/m{i}.py" for i in range(40))
+    make_db(cache, slug_name, root, indexed_at=_iso(NOW - 600), nodes=2, rel_paths=many)
+    make_db(cache, "whole", root, indexed_at=_iso(NOW - 40 * 86400), nodes=900, rel_paths=many)
+    snap = reg.build_snapshot(str(cache), env=_env(tmp_path), now=NOW)
+    by = {r["name"]: r for r in snap["rows"]}
+    assert by[slug_name]["partial"] is True and by[slug_name]["files"] == 40
+    assert by["whole"]["partial"] is False
+    res = reg.resolve(str(root / "pkg"), snap, RealFS(), {})
+    assert res["winner"]["name"] == "whole" and res["shadowed"] == [slug_name]

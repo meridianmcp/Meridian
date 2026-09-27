@@ -23,10 +23,26 @@
 # network error - it must never trap the executor.
 #
 # This is NOT hooks.sh (the token-rotation installer).
+# 55d48d69 fix round 1 (mirrors test_tamper_guard.ps1): the default non-blocking mode
+# no longer contacts Meridian (its stderr note never reaches the model); block mode
+# uses a 1 s connect timeout. The owner kill switch (MERIDIAN_GUARD=off, guard.off,
+# MERIDIAN_GUARD_DISABLE=test_tamper_guard) covers this hook too.
 set -uo pipefail
 
 PROJECT_ID="5787cc92-ba7d-4788-b17c-28ab7938b839"
 MERIDIAN_URL="${MERIDIAN_URL:-http://localhost:7878}"
+
+_off=0
+[ "$(printf '%s' "${MERIDIAN_GUARD:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" = "off" ] && _off=1
+for _tok in $(printf '%s' "${MERIDIAN_GUARD_DISABLE:-}" | tr ',;' '  ' | tr '[:upper:]' '[:lower:]'); do
+  [ "$_tok" = "test_tamper_guard" ] && _off=1
+done
+if [ -n "${LOCALAPPDATA:-}" ]; then _gd="$LOCALAPPDATA/meridian/guard"
+elif [ -n "${USERPROFILE:-}" ]; then _gd="$USERPROFILE/AppData/Local/meridian/guard"
+else _gd="${XDG_STATE_HOME:-${HOME:-/nonexistent}/.local/state}/meridian/guard"
+fi
+[ -f "$_gd/guard.off" ] && _off=1
+[ "$_off" = 1 ] && exit 0
 
 payload="$(cat 2>/dev/null || true)"
 [ -z "$payload" ] && exit 0
@@ -60,10 +76,12 @@ esac
 # Exemption: if the in-progress sprint item explicitly calls for test/coverage work,
 # stay silent. Best-effort; any failure leaves exempt=0 (we still flag - safe).
 exempt=0
-url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/test_coverage_expected"
-resp="$(curl -sf --max-time 3 "$url" 2>/dev/null || true)"
-if printf '%s' "$resp" | grep -Eq '"test_coverage_expected"[[:space:]]*:[[:space:]]*true'; then
-  exempt=1
+if [ "${MERIDIAN_TEST_TAMPER_BLOCK:-}" = "1" ]; then
+  url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/test_coverage_expected"
+  resp="$(curl -sf --connect-timeout 1 --max-time 3 "$url" 2>/dev/null || true)"
+  if printf '%s' "$resp" | grep -Eq '"test_coverage_expected"[[:space:]]*:[[:space:]]*true'; then
+    exempt=1
+  fi
 fi
 [ "$exempt" -eq 1 ] && exit 0
 

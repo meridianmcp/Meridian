@@ -31,8 +31,40 @@
 # Best-effort command parsing, not a full shell grammar -- a speed bump for the
 # common case, not a sandbox. Fails OPEN on parse ambiguity outside the specific
 # "unknown package name" match, which fails CLOSED by design.
+# 55d48d69 fix round 1: the command is split into statements and words the way a
+# shell reads it -- quotes respected (a commit message or echo text mentioning
+# "pip install" is not an install), quotes removed from words (pip install -e
+# ".[dev]"), redirections dropped (2>/dev/null is not a package) -- and relative
+# directory specs with a path separator (pip install -e extensions/meridian-docs)
+# are local installs. Wrapped invocations are unwrapped: VAR=x / env / sudo
+# prefixes, pixi run / uv run / poetry run / conda run, a full-path python -m pip,
+# uv pip install, and single '|' pipelines and newlines split statements too. The
+# owner kill switch (MERIDIAN_GUARD=off|advisory, guard.off / guard.advisory,
+# MERIDIAN_GUARD_DISABLE=dependency_install_guard) covers this hook.
 # NOT hooks.ps1 (the token-rotation installer).
 $ErrorActionPreference = 'SilentlyContinue'
+
+function Get-GuardMode([string]$HookName) {
+    $raw = ([string]$env:MERIDIAN_GUARD).Trim().ToLowerInvariant()
+    if ($raw -eq 'off') { return 'off' }
+    $mode = if ($raw -eq '' -or $raw -eq 'enforce') { 'enforce' } else { 'advisory' }
+    if ($raw -eq '' -and ([string]$env:MERIDIAN_GUARD_DEFAULT_MODE).Trim().ToLowerInvariant() -eq 'advisory') { $mode = 'advisory' }
+    foreach ($tok in ([string]$env:MERIDIAN_GUARD_DISABLE -split '[\s,;]+')) {
+        if ($tok.Trim().ToLowerInvariant() -eq $HookName) { return 'off' }
+    }
+    $gd = $null
+    if ($env:LOCALAPPDATA) { $gd = [System.IO.Path]::Combine($env:LOCALAPPDATA, 'meridian', 'guard') }
+    elseif ($env:USERPROFILE) { $gd = [System.IO.Path]::Combine($env:USERPROFILE, 'AppData', 'Local', 'meridian', 'guard') }
+    elseif ($env:HOME) {
+        $st = if ($env:XDG_STATE_HOME) { $env:XDG_STATE_HOME } else { [System.IO.Path]::Combine($env:HOME, '.local', 'state') }
+        $gd = [System.IO.Path]::Combine($st, 'meridian', 'guard')
+    }
+    if ($gd) {
+        if ([System.IO.File]::Exists([System.IO.Path]::Combine($gd, 'guard.off'))) { return 'off' }
+        if ([System.IO.File]::Exists([System.IO.Path]::Combine($gd, 'guard.advisory'))) { return 'advisory' }
+    }
+    return $mode
+}
 
 try { $raw = [Console]::In.ReadToEnd() } catch { exit 0 }
 if (-not $raw) { exit 0 }
@@ -48,6 +80,10 @@ if ($tool -ne 'Bash' -and $tool -ne 'PowerShell') { exit 0 }
 $cmd = $null
 if ($payload.tool_input) { $cmd = [string]$payload.tool_input.command }
 if (-not $cmd) { exit 0 }
+
+$GuardMode = Get-GuardMode 'dependency_install_guard'
+if ($GuardMode -eq 'off') { exit 0 }
+$CmdCwd = if ($payload.cwd) { [string]$payload.cwd } elseif ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 
 $ScriptDir = $PSScriptRoot
 $RepoRoot = Split-Path (Split-Path $ScriptDir -Parent) -Parent
@@ -125,10 +161,112 @@ function Test-IsFlag {
 
 function Test-IsLocalPath {
     param([string]$Tok)
-    if ($Tok -eq '.') { return $true }
-    if ($Tok.StartsWith('./') -or $Tok.StartsWith('../') -or $Tok.StartsWith('/') -or $Tok.StartsWith('~')) { return $true }
+    # '.', './x', '../x', '.[dev]' and absolute / home-relative paths
+    if ($Tok.StartsWith('.') -or $Tok.StartsWith('/') -or $Tok.StartsWith('~')) { return $true }
     if ($Tok -match '^[A-Za-z]:') { return $true }
+    if ($Tok -match '^file:') { return $true }
+    # a URL / VCS spec is a remote install, never local
+    if ($Tok -match '://' -or $Tok -match '^[A-Za-z]+\+') { return $false }
+    if ($Tok.StartsWith('@')) { return $false }
+    if ($Tok.Contains('/') -or $Tok.Contains('\')) {
+        # pip/pixi/conda/poetry/pipx: a spec with a path separator is a directory.
+        # npm: 'user/repo' is a GitHub shorthand, so only a path that exists is local.
+        if ($script:Manager -ne 'npm') { return $true }
+        try {
+            $full = [System.IO.Path]::Combine($script:CmdCwd, $Tok)
+            return ([System.IO.Directory]::Exists($full) -or [System.IO.File]::Exists($full))
+        } catch { return $false }
+    }
     return $false
+}
+
+# Statements of a shell command: split on ; newline && || | outside quotes.
+function Split-Statements([string]$Cmd) {
+    $out = New-Object System.Collections.Generic.List[string]
+    $sb = [System.Text.StringBuilder]::new()
+    $q = [char]0
+    $n = $Cmd.Length
+    $i = 0
+    while ($i -lt $n) {
+        $c = $Cmd[$i]
+        if ($q -ne [char]0) {
+            if ($c -eq $q) { $q = [char]0 }
+            elseif ($c -eq [char]92 -and $q -eq [char]34 -and $i + 1 -lt $n) { [void]$sb.Append($c); $i++; $c = $Cmd[$i] }
+            [void]$sb.Append($c); $i++; continue
+        }
+        if ($c -eq [char]39 -or $c -eq [char]34) { $q = $c; [void]$sb.Append($c); $i++; continue }
+        if ($c -eq [char]92 -and $i + 1 -lt $n) { [void]$sb.Append($c).Append($Cmd[$i + 1]); $i += 2; continue }
+        $isSep = ($c -eq ';' -or $c -eq "`n" -or $c -eq "`r" -or $c -eq '|' -or ($c -eq '&' -and $i + 1 -lt $n -and $Cmd[$i + 1] -eq '&'))
+        if ($isSep) {
+            $out.Add($sb.ToString()); [void]$sb.Clear()
+            if ($i + 1 -lt $n -and ($c -eq '&' -or $c -eq '|') -and $Cmd[$i + 1] -eq $c) { $i++ }
+            $i++; continue
+        }
+        [void]$sb.Append($c); $i++
+    }
+    $out.Add($sb.ToString())
+    return , $out
+}
+
+# Words of one statement: whitespace outside quotes, quotes removed, redirections dropped.
+function Split-Words([string]$Seg) {
+    $words = New-Object System.Collections.Generic.List[string]
+    $sb = [System.Text.StringBuilder]::new()
+    $have = $false
+    $q = [char]0
+    foreach ($c in $Seg.ToCharArray()) {
+        if ($q -ne [char]0) {
+            if ($c -eq $q) { $q = [char]0 } else { [void]$sb.Append($c) }
+            continue
+        }
+        if ($c -eq [char]39 -or $c -eq [char]34) { $q = $c; $have = $true; continue }
+        if ([char]::IsWhiteSpace($c)) {
+            if ($have) { $words.Add($sb.ToString()); [void]$sb.Clear(); $have = $false }
+            continue
+        }
+        [void]$sb.Append($c); $have = $true
+    }
+    if ($have) { $words.Add($sb.ToString()) }
+    $out = New-Object System.Collections.Generic.List[string]
+    $skip = $false
+    foreach ($w in $words) {
+        if ($skip) { $skip = $false; continue }
+        if ($w -match '^(\d*|&)(>>?|<)$') { $skip = $true; continue }   # '>' 'log.txt'
+        if ($w -match '^(\d*|&)(>>?|<)') { continue }                   # '2>/dev/null', '>log'
+        $out.Add($w)
+    }
+    return , $out
+}
+
+# Drop wrappers in front of the real command: VAR=x, env/sudo/command, pixi run,
+# uv run, poetry run, conda run [-n NAME|-p PATH].
+function Strip-Wrappers($W) {
+    $i = 0
+    while ($i -lt $W.Count) {
+        $w = [string]$W[$i]
+        $lw = $w.ToLowerInvariant()
+        if ($w -match '^[A-Za-z_][A-Za-z0-9_]*=') { $i++; continue }
+        if ($lw -in @('env', 'sudo', 'command', 'exec', 'nohup', 'time')) { $i++; continue }
+        if ($lw -in @('pixi', 'uv', 'poetry', 'hatch', 'pdm') -and $i + 1 -lt $W.Count -and ([string]$W[$i + 1]).ToLowerInvariant() -eq 'run') { $i += 2; continue }
+        if ($lw -eq 'conda' -and $i + 1 -lt $W.Count -and ([string]$W[$i + 1]).ToLowerInvariant() -eq 'run') {
+            $i += 2
+            while ($i -lt $W.Count -and ([string]$W[$i]).StartsWith('-')) {
+                if (([string]$W[$i]) -in @('-n', '--name', '-p', '--prefix') ) { $i += 2 } else { $i++ }
+            }
+            continue
+        }
+        break
+    }
+    $o = New-Object System.Collections.Generic.List[string]
+    for ($k = $i; $k -lt $W.Count; $k++) { $o.Add([string]$W[$k]) }
+    return , $o
+}
+
+function Get-VerbName([string]$w) {
+    $b = ($w -replace '\\', '/') -replace '.*/', ''
+    $b = $b.ToLowerInvariant()
+    if ($b.EndsWith('.exe')) { $b = $b.Substring(0, $b.Length - 4) }
+    return $b
 }
 
 $PipValueFlags = @('-r', '--requirement', '-c', '--constraint', '-i', '--index-url', '--extra-index-url',
@@ -316,12 +454,23 @@ function Check-PipxSegment {
     }
 }
 
-# Split on &&, ||, ; into segments so each sub-command is inspected independently.
-$segments = [regex]::Split($cmd, '&&|\|\||;')
-
-foreach ($seg in $segments) {
+# Split into statements (quote-aware) so each sub-command is inspected independently,
+# then re-assemble each one from its unquoted, unwrapped words.
+foreach ($seg in (Split-Statements $cmd)) {
     if ($Flagged) { break }
-    $segTrim = $seg.Trim()
+    $W = Strip-Wrappers (Split-Words $seg)
+    if ($W.Count -eq 0) { continue }
+    # full-path / py-launcher 'python -m pip' and 'uv pip' normalize to plain 'pip'
+    $v0 = Get-VerbName ([string]$W[0])
+    if ($v0 -in @('python', 'python3', 'py') -and $W.Count -ge 3 -and [string]$W[1] -eq '-m') {
+        $W = [System.Collections.Generic.List[string]]($W.GetRange(2, $W.Count - 2))
+    } elseif ($v0 -eq 'uv' -and $W.Count -ge 2 -and ([string]$W[1]).ToLowerInvariant() -eq 'pip') {
+        $W = [System.Collections.Generic.List[string]]($W.GetRange(1, $W.Count - 1))
+    } else {
+        $W[0] = $v0
+    }
+    if ($W.Count -gt 0) { $W[0] = Get-VerbName ([string]$W[0]) }
+    $segTrim = ($W -join ' ')
     if (-not $segTrim) { continue }
 
     if ($segTrim -match '^((python3?|py)\s+-m\s+)?pip3?\s+install(\s|$)') {
@@ -366,7 +515,7 @@ foreach ($seg in $segments) {
 }
 
 if ($Flagged) {
-    [Console]::Error.WriteLine(
+    $blockMsg = (
         "Meridian dependency-install guard (31a4a9c8): BLOCKED $Manager install of unverified package '$Flagged'. " +
         "Per the May 2026 CISA/NSA/Five Eyes supply-chain advisory on malicious AI-agent package installs, an " +
         "unknown package must be verified BEFORE install. Do ONE of: (1) look '$Flagged' up on the official " +
@@ -376,6 +525,12 @@ if ($Flagged) {
         "explicit human confirmation, then add it to the allowlist once approved. Packages already declared in " +
         "pyproject.toml/package.json/pixi.toml are pre-approved and never blocked."
     )
+    if ($GuardMode -eq 'advisory') {
+        $o = @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; additionalContext = ('[advisory, not blocked] ' + $blockMsg) } }
+        [Console]::Out.Write(($o | ConvertTo-Json -Compress -Depth 4))
+        exit 0
+    }
+    [Console]::Error.WriteLine($blockMsg)
     exit 2
 }
 

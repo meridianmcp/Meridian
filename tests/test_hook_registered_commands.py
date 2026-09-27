@@ -260,6 +260,10 @@ CASES: dict[str, list[tuple[str, dict[str, Any], dict[str, str], int, Any, str |
     "secret_guard": [
         ("blocks_read_of_env_file", _pre("Read", {"file_path": _ENV_FILE}), {}, 2, _empty, "secret guard"),
         ("allows_read_of_readme", _pre("Read", {"file_path": str(REPO / "README.md")}), {}, 0, _empty, None),
+        # 55d48d69 fix round 1: source files named *secret* / *_token.* are not credentials
+        ("allows_read_of_secret_redaction_source", _pre("Read", {"file_path": str(REPO / "meridian" / "secret_redaction.py")}),
+         {}, 0, _empty, None),
+        ("allows_shell_prologue", _pre("Bash", {"command": "set -euo pipefail; pixi run test"}), {}, 0, _empty, None),
     ],
     "dependency_install_guard": [
         ("blocks_undeclared_pip_install",
@@ -289,11 +293,15 @@ CASES: dict[str, list[tuple[str, dict[str, Any], dict[str, str], int, Any, str |
     "sprint_guard": [
         ("stop_hook_active_allows", {"session_id": "registered-cmd-test", "hook_event_name": "Stop",
                                      "stop_hook_active": True}, {}, 0, _empty, None),
+        # 55d48d69 fix round 1: only a session that claimed a sprint item is held back
         ("blocks_stop_with_pending_items", {"session_id": "registered-cmd-test", "hook_event_name": "Stop",
-                                            "stop_hook_active": False}, {"_PENDING": "2"}, 2, _empty,
-         "2 sprint item(s) still pending"),
+                                            "stop_hook_active": False},
+         {"_PENDING": "2", "_CLAIMED_TRANSCRIPT": "1"}, 2, _empty, "2 sprint item(s) still pending"),
+        ("non_executor_session_stops_freely", {"session_id": "registered-cmd-test", "hook_event_name": "Stop",
+                                               "stop_hook_active": False}, {"_PENDING": "2"}, 0, _empty, None),
         ("allows_stop_with_nothing_pending", {"session_id": "registered-cmd-test", "hook_event_name": "Stop",
-                                              "stop_hook_active": False}, {"_PENDING": "0"}, 0, _empty, None),
+                                              "stop_hook_active": False},
+         {"_PENDING": "0", "_CLAIMED_TRANSCRIPT": "1"}, 0, _empty, None),
     ],
     "post_compact_refresh": [
         ("compact_injects_reminder", {"session_id": "registered-cmd-test", "hook_event_name": "SessionStart",
@@ -400,6 +408,12 @@ def test_settings_is_what_the_installer_generates():
 def test_registered_command_executes(entry, payload, extra, expected_rc, check, needle, tmp_path, stub_url):
     extra = dict(extra)
     _Stub.pending_count = int(extra.pop("_PENDING", "0"))
+    if extra.pop("_CLAIMED_TRANSCRIPT", None) and payload is not None:
+        tp = tmp_path / "transcript.jsonl"
+        tp.write_text(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "mcp__meridian__claim_sprint_item", "input": {}}]}}) + "\n",
+            encoding="utf-8")
+        payload = dict(payload, transcript_path=str(tp))
     if payload is None:  # G6 memory write, rooted in this test's own home dir
         payload = _pre("Write", {"file_path": str(tmp_path / "home" / ".claude" / "projects" / "p" / "memory" / "a.md"),
                                  "content": "x"})

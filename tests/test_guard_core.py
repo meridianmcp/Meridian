@@ -18,7 +18,9 @@ from __future__ import annotations
 import copy
 import io
 import json
+import os
 import re
+import stat
 from pathlib import Path
 
 import pytest
@@ -275,7 +277,8 @@ def test_g13_and_g14_on_one_call_join_texts():
     r = _eval(_post("mcp__meridian__start_session", {"project_id": "p"}, "no_confirmation " + "x" * 70000), event="PostToolUse")
     assert r["rule_id"] == "G14"
     assert "no_confirmation" in r["reason"] and "chars" in r["reason"]
-    assert r["state"]["research_receipts"], "start_session is also a research health receipt"
+    # fix round 1: start_session no longer arms G11 (only paper_search/github_search do)
+    assert "state" not in r, "start_session is not a research receipt"
 
 
 def test_g14_scan_is_bounded_to_256k():
@@ -284,6 +287,7 @@ def test_g14_scan_is_bounded_to_256k():
     assert r["rule_id"] == "G14"
     assert "no_confirmation" not in r["reason"], "directives past the scan bound are not reported"
     assert "chars" in r["reason"], "but the oversize notice still fires"
+    assert f"more than {gc.QUARANTINE_SCAN_CHARS} chars" in r["reason"], "past the scan bound the size is a lower bound"
 
 
 def test_g13_degraded_plus_g14_both_reported():
@@ -411,6 +415,36 @@ def test_guard_mode_sentinels_and_missing_guard_dir():
     fs2 = DictFS({"files": {"C:/x/meridian/guard/guard.off": ""}})
     assert gc.guard_mode({"LOCALAPPDATA": "C:\\x", "MERIDIAN_GUARD": "advisory"}, fs2) == "off"
     assert gc.guard_mode({}, fs2) == "enforce", "no LOCALAPPDATA/home: no sentinel lookup"
+
+
+def test_guard_mode_sentinel_as_a_directory_is_not_a_kill_switch():
+    """guard-integ round 2 (verification, not a fix): a guard.off/guard.advisory
+    sentinel created as a DIRECTORY (e.g. an accidental ``mkdir``) must NOT flip
+    the kill switch -- this is the existing, deliberate design already pinned by
+    tests/fixtures/guard_cases.json's G0_sentinel_dir_is_not_a_file ('the sentinel
+    must be a FILE'): a bare directory is a far lower bar to create by accident,
+    or via an ordinary tool call the guard does not treat as owner-privileged,
+    than deliberately dropping a file. Kept enforced by design, not a bug."""
+    off_dir = DictFS({"dirs": ["C:/x/meridian/guard/guard.off"]})
+    assert gc.guard_mode({"LOCALAPPDATA": "C:\\x", "MERIDIAN_GUARD": "enforce"}, off_dir) == "enforce"
+    advisory_dir = DictFS({"dirs": ["C:/x/meridian/guard/guard.advisory"]})
+    assert gc.guard_mode({"LOCALAPPDATA": "C:\\x"}, advisory_dir) == "enforce"
+
+
+def test_guard_dir_honors_meridian_guard_dir_override_for_pre_and_post_tool_use():
+    """guard-integ round 2: MERIDIAN_GUARD_DIR was honored by session_brief and the
+    installer but not by cbm_registry.guard_dir -- the resolver guard_core itself
+    uses for the PreToolUse/PostToolUse path (guard_mode, run_hook's state/snapshot/
+    audit locations). Fixed at the shared resolver so every caller agrees."""
+    from meridian import cbm_registry as reg
+
+    env = {"LOCALAPPDATA": "C:\\x", "MERIDIAN_GUARD_DIR": "D:\\relocated\\guard"}
+    assert reg.guard_dir(env) == "D:/relocated/guard"
+    fs = DictFS({"files": {"D:/relocated/guard/guard.off": ""}})
+    assert gc.guard_mode(env, fs) == "off", "the PreToolUse/PostToolUse shim now honours the relocation too"
+    # the default (un-relocated) location is NOT consulted once the override is set
+    fs_default_only = DictFS({"files": {"C:/x/meridian/guard/guard.off": ""}})
+    assert gc.guard_mode(env, fs_default_only) == "enforce"
 
 
 def test_disabled_rules_parsing():
@@ -750,6 +784,123 @@ def test_run_hook_unwritable_guard_dir_still_answers(tmp_path):
     (tmp_path / "lad").write_text("a file where the dir should be", encoding="utf-8")
     out = gc.run_hook("PreToolUse", json.dumps(_case("D4_write_automem")["payload"]), env=env, fs=_fs(), now=NOW)
     assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def _decision(out: str) -> str:
+    if not out:
+        return "allow"
+    hso = json.loads(out)["hookSpecificOutput"]
+    return hso.get("permissionDecision") or ("inject" if "additionalContext" in hso else "allow")
+
+
+def test_run_hook_unsavable_state_fails_open_for_escapable_rules(tmp_path):
+    """Fix round 1: a state dir that cannot be written used to deny every Grep forever
+    (no breaker, no receipt escape). Escapable denies now become injects; hard rules stay."""
+    env = _runner_env(tmp_path)
+    gdir = tmp_path / "lad" / "meridian" / "guard"
+    gdir.mkdir(parents=True)
+    (gdir / "snapshot.json").write_text(json.dumps(DOC["snapshots"]["indexed"]), encoding="utf-8")
+    (gdir / "state").write_text("a file where the state dir should be", encoding="utf-8")
+    outs = [gc.run_hook("PreToolUse", json.dumps(D1), env=env, fs=_fs(), now=NOW + i) for i in range(4)]
+    assert [_decision(o) for o in outs] == ["inject"] * 4
+    assert "could not be saved" in json.loads(outs[0])["hookSpecificOutput"]["additionalContext"]
+    hard = gc.run_hook("PreToolUse", json.dumps(_case("D4_write_automem")["payload"]), env=env, fs=_fs(), now=NOW)
+    assert _decision(hard) == "deny", "G6 never depends on state"
+
+
+def test_run_hook_corrupt_state_file_fails_open_to_fresh_state(tmp_path):
+    """guard-integ round 2: a state file that exists but is not valid JSON (disk
+    corruption, a killed write, ...) must decide exactly like a first-ever call for
+    that session -- not crash, not silently allow everything, and not get stuck.
+    ``_read_json_file`` already fails open to None on OSError/ValueError; this pins
+    that the whole run_hook path behaves correctly on top of it, including that the
+    corrupt file is overwritten with valid state afterward (self-healing)."""
+    env = _runner_env(tmp_path)
+    gdir = tmp_path / "lad" / "meridian" / "guard"
+    (gdir / "state").mkdir(parents=True)
+    (gdir / "snapshot.json").write_text(json.dumps(DOC["snapshots"]["indexed"]), encoding="utf-8")
+    sid = "corrupt-state"
+    state_file = gdir / "state" / f"{sid}.json"
+    state_file.write_text("{not valid json at all!!", encoding="utf-8")
+    payload = dict(D1, session_id=sid)
+    out = gc.run_hook("PreToolUse", json.dumps(payload), env=env, fs=_fs(), now=NOW)
+    assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny", (
+        "a corrupt read must decide like a fresh session (denies=0), not fail closed or crash"
+    )
+    healed = json.loads(state_file.read_text(encoding="utf-8"))
+    assert healed["denies"] == 1, "the corrupt file self-heals to valid state on the next write"
+
+
+def test_run_hook_unwritable_state_dir_still_trips_the_breaker_in_memory(tmp_path):
+    """guard-integ round 2: once 3 denies are ALREADY recorded (readable) and the
+    state directory then becomes unwritable (permissions, disk full, another
+    process holding it), the breaker must still trip for THIS call using the
+    successfully-read in-memory counters -- never fall back to a hard deny just
+    because persistence failed. Distinct from the write-failure fallback pinned by
+    test_run_hook_unsavable_state_fails_open_for_escapable_rules (which covers a
+    session that never had savable state at all): here the read succeeds and the
+    natural breaker message must be the one returned, not the generic
+    '[guard state could not be saved]' note."""
+    env = _runner_env(tmp_path)
+    gdir = tmp_path / "lad" / "meridian" / "guard"
+    state_dir = gdir / "state"
+    state_dir.mkdir(parents=True)
+    (gdir / "snapshot.json").write_text(json.dumps(DOC["snapshots"]["indexed"]), encoding="utf-8")
+    sid = "tripped-breaker"
+    state_file = state_dir / f"{sid}.json"
+    state_file.write_text(json.dumps({"v": 1, "denies": 3}), encoding="utf-8")
+    os.chmod(state_file, stat.S_IREAD)
+    try:
+        payload = dict(D1, session_id=sid)
+        out = gc.run_hook("PreToolUse", json.dumps(payload), env=env, fs=_fs(), now=NOW)
+        hso = json.loads(out)["hookSpecificOutput"]
+        assert "additionalContext" in hso, "the breaker converts the would-be deny to an inject"
+        assert "breaker: 3 guard denies this session" in hso["additionalContext"]
+        assert "could not be saved" not in hso["additionalContext"], (
+            "this is the natural breaker trip (read succeeded), not the state-fail fallback"
+        )
+    finally:
+        os.chmod(state_file, stat.S_IWRITE | stat.S_IREAD)
+    # the read-only file is left with its original content: the write really did fail
+    assert json.loads(state_file.read_text(encoding="utf-8"))["denies"] == 3
+
+
+def test_run_hook_concurrent_denies_respect_the_breaker(tmp_path):
+    """Fix round 1: parallel PreToolUse hooks raced on the state file (8 denies before the
+    breaker). Under the per-session lock exactly 3 of 6 concurrent calls deny."""
+    import threading
+
+    env = _runner_env(tmp_path)
+    gdir = tmp_path / "lad" / "meridian" / "guard"
+    gdir.mkdir(parents=True)
+    (gdir / "snapshot.json").write_text(json.dumps(DOC["snapshots"]["indexed"]), encoding="utf-8")
+    payload = json.dumps(dict(D1, session_id="par"))
+    outs: list[str] = []
+    lock = threading.Lock()
+    start = threading.Barrier(6)
+
+    def one() -> None:
+        start.wait()
+        o = gc.run_hook("PreToolUse", payload, env=env, fs=_fs(), now=NOW)
+        with lock:
+            outs.append(o)
+
+    threads = [threading.Thread(target=one) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    decisions = sorted(_decision(o) for o in outs)
+    assert decisions == ["deny"] * 3 + ["inject"] * 3, decisions
+    assert json.loads((gdir / "state" / "par.json").read_text(encoding="utf-8"))["denies"] == 3
+
+
+def test_shell_caps_are_word_and_char_bounded():
+    assert gc.analyze_shell("echo " + "w " * 199, "bash", REPO, lambda s, c: s, None)["too_big"] is False
+    assert gc.analyze_shell("echo " + "w " * 200, "bash", REPO, lambda s, c: s, None)["too_big"] is True
+    assert gc.analyze_shell("echo '" + "q" * 8190 + "'", "bash", REPO, lambda s, c: s, None)["too_big"] is True
+    inner = "bash -c \"echo " + "w " * 250 + "\""
+    assert gc.analyze_shell(inner, "bash", REPO, lambda s, c: s, None)["too_big"] is True
 
 
 def test_main_reads_stdin_and_always_returns_zero(monkeypatch, tmp_path, capsys):
