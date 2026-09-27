@@ -28,6 +28,7 @@ What this file pins down:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import os
 import re
@@ -92,7 +93,7 @@ EXPECTED_PUBLIC = {
 EXPECTED_SELF_AUTHENTICATED = {
     ("POST", "/webhooks/stripe"), ("POST", "/webhooks/github-marketplace"),
     ("POST", "/projects/{project_id}/events"),
-    ("POST", "/mcp"), ("POST", "/mcp/openai"),
+    ("POST", "/mcp"), ("POST", "/mcp/openai"), ("GET", "/mcp/sse"), ("POST", "/mcp/sse"),
     ("POST", "/hooks/session-start"), ("POST", "/hooks/stop"),
     ("GET", "/dashboard"), ("GET", "/admin"), ("GET", "/activate"), ("POST", "/activate"),
     ("GET", "/oauth/authorize"), ("GET", "/checkout"), ("GET", "/billing/portal"),
@@ -317,8 +318,8 @@ def test_named_leak_routes_are_gated():
         ("GET", "/projects/{project_id}/notes"), ("GET", "/projects/{project_id}/sprint-items"),
         ("GET", "/projects/{project_id}/settings"), ("PATCH", "/projects/{project_id}/settings"),
         ("POST", "/tunnel/plugins/install"), ("POST", "/admin/shutdown"),
-        ("POST", "/admin/restart"), ("GET", "/waitlist"), ("GET", "/mcp/sse"),
-        ("POST", "/mcp/sse"), ("POST", "/tasks/enqueue"), ("GET", "/admin/snapshot"),
+        ("POST", "/admin/restart"), ("GET", "/waitlist"),
+        ("POST", "/tasks/enqueue"), ("GET", "/admin/snapshot"),
     ]:
         assert key in _GATED_KEYS, key
 
@@ -627,36 +628,363 @@ def test_hooks_contract_for_anonymous_and_bogus_bearer(hosted):
         assert r.status_code == 401, path
 
 
-def test_sse_session_is_bound_to_its_tenant(hosted, own_db_tenant, monkeypatch):
+# ---------------------------------------------------------------------------
+# 7. /mcp/sse: same auth and MCP context as POST /mcp (fix round 1)
+# ---------------------------------------------------------------------------
+# The GET stream is infinite, which the sync TestClient cannot consume, so
+# sessions are opened by calling the GET handler directly with a real ASGI
+# request (the session is registered before the first frame) and every message
+# POST then goes through the full HTTP stack (gate, middleware, route).
+
+def _sse_get_request(app, headers: dict[str, str]):
+    from starlette.requests import Request
+    raw = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()]
+    return Request({
+        "type": "http", "http_version": "1.1", "method": "GET", "scheme": "http",
+        "path": "/mcp/sse", "raw_path": b"/mcp/sse", "root_path": "", "query_string": b"",
+        "headers": raw, "server": ("testserver", 80), "client": ("testclient", 50000),
+        "app": app,
+    })
+
+
+@contextlib.contextmanager
+def _sse_session(hosted, headers: dict[str, str]):
     c, server_module, _op = hosted
-    tenant_a, conn_a, _proj = own_db_tenant
-    tenant_b = _seed_tenant(c, f"b-{uuid.uuid4().hex[:8]}@example.com", plan="pro")
-    conn_b = asyncio.run(db_module.init_db(":memory:"))
-    _deps._tenant_db_cache[tenant_b["id"]] = conn_b
-    seen = []
-
-    async def _capture(body, db, data_dir, **_kw):
-        seen.append(db)
-        return {"jsonrpc": "2.0", "id": body.get("id"), "result": {}}
-
-    monkeypatch.setattr(server_module, "_handle_mcp_request", _capture)
-    sid = str(uuid.uuid4())
-    server_module._SSE_SESSIONS[sid] = {"db": conn_a, "data_dir": ".", "tenant_id": tenant_a["id"]}
+    before = set(server_module._SSE_SESSIONS)
+    resp = asyncio.run(server_module.mcp_sse_get(_sse_get_request(c.app, headers)))
+    assert resp.status_code == 200, getattr(resp, "body", b"")[:200]
+    assert resp.media_type == "text/event-stream"
+    new = set(server_module._SSE_SESSIONS) - before
+    assert len(new) == 1
+    sid = new.pop()
     try:
-        rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-        # Tenant B presenting tenant A's session id gets its OWN db, never A's.
-        r = c.post(f"/mcp/sse?session_id={sid}", json=rpc, headers=_bearer_header(c, tenant_b["id"]))
-        assert r.status_code == 200
-        assert seen[-1] is conn_b
-        # Tenant A reuses its own session.
-        r = c.post(f"/mcp/sse?session_id={sid}", json=rpc, headers=_bearer_header(c, tenant_a["id"]))
-        assert r.status_code == 200
-        assert seen[-1] is conn_a
-        # Anonymous: refused outright.
-        r = c.post(f"/mcp/sse?session_id={sid}", json=rpc)
-        assert r.status_code == 401
-        assert len(seen) == 2
+        yield sid
     finally:
         server_module._SSE_SESSIONS.pop(sid, None)
+
+
+def _rpc_call(name: str, args: dict, rpc_id: int = 1) -> dict:
+    return {"jsonrpc": "2.0", "id": rpc_id, "method": "tools/call",
+            "params": {"name": name, "arguments": args}}
+
+
+def _note_titles(conn, project_id: str) -> set[str]:
+    return {n["title"] for n in asyncio.run(db_module.get_project_notes(conn, project_id))}
+
+
+def _add_member(c, workspace_tenant_id: str, email: str, role: str,
+                project_id: "str | None" = None) -> dict:
+    row = asyncio.run(db_module.create_workspace_invite(
+        c.app.state.db, workspace_tenant_id, email, role,
+        f"invite-{uuid.uuid4().hex}", project_id=project_id,
+    ))
+    return asyncio.run(db_module.accept_workspace_invite(c.app.state.db, row["id"]))
+
+
+@pytest.fixture
+def invited_member(hosted, own_db_tenant):
+    """A second tenant who is an ACCEPTED member of own_db_tenant's workspace;
+    the role (and optional project scope) is set per test via ``make``."""
+    c = hosted[0]
+    victim, _victim_conn, _victim_proj = own_db_tenant
+    member_tenant = _seed_tenant(c, f"member-{uuid.uuid4().hex[:8]}@example.com", plan="pro")
+    member_conn = asyncio.run(db_module.init_db(":memory:"))
+    _deps._tenant_db_cache[member_tenant["id"]] = member_conn
+    rows: list[dict] = []
+
+    def make(role: str, project_id: "str | None" = None) -> dict:
+        m = _add_member(c, victim["id"], member_tenant["email"], role, project_id)
+        rows.append(m)
+        return m
+
+    try:
+        yield member_tenant, member_conn, make
+    finally:
+        for m in rows:
+            asyncio.run(db_module.delete_workspace_member(c.app.state.db, m["id"], victim["id"]))
+        _deps._tenant_db_cache.pop(member_tenant["id"], None)
+        asyncio.run(member_conn.close())
+
+
+def _denied(resp_json: dict, needle: str) -> bool:
+    return "error" in resp_json and needle in resp_json["error"].get("message", "")
+
+
+def test_sse_viewer_cannot_write_to_invited_workspace(hosted, own_db_tenant, invited_member):
+    """Finding 1: a 'viewer' used to write to the owner's DB over /mcp/sse."""
+    c = hosted[0]
+    victim, victim_conn, victim_proj = own_db_tenant
+    viewer, _vconn, make = invited_member
+    make("viewer")
+    headers = {**_bearer_header(c, viewer["id"]), "X-Workspace-Tenant-Id": victim["id"]}
+    write = _rpc_call("add_note", {"project_id": victim_proj["id"], "title": "viewer-wrote-this",
+                                   "body": "x"})
+
+    # Parity reference: POST /mcp refuses the viewer.
+    r = c.post("/mcp", json=write, headers=headers)
+    assert _denied(r.json(), "is read-only"), r.text[:300]
+    # POST /mcp/sse carrying the credential: same refusal.
+    r = c.post("/mcp/sse", json=write, headers=headers)
+    assert r.status_code == 200
+    assert _denied(r.json(), "workspace role 'viewer' is read-only"), r.text[:300]
+    # Session opened by the viewer, credential-less message POST: same refusal.
+    with _sse_session(hosted, headers) as sid:
+        r = c.post(f"/mcp/sse?session_id={sid}", json=write)
+        assert _denied(r.json(), "workspace role 'viewer' is read-only"), r.text[:300]
+        # Reads still reach the invited workspace.
+        r = c.post(f"/mcp/sse?session_id={sid}", json=_rpc_call("list_projects", {}))
+        assert "tenant-own-proj" in r.text, r.text[:300]
+    assert "viewer-wrote-this" not in _note_titles(victim_conn, victim_proj["id"])
+
+
+def test_sse_member_role_can_still_write_to_invited_workspace(hosted, own_db_tenant,
+                                                             invited_member):
+    c = hosted[0]
+    victim, victim_conn, victim_proj = own_db_tenant
+    member, _mconn, make = invited_member
+    make("member")
+    headers = {**_bearer_header(c, member["id"]), "X-Workspace-Tenant-Id": victim["id"]}
+    with _sse_session(hosted, headers) as sid:
+        r = c.post(f"/mcp/sse?session_id={sid}", json=_rpc_call(
+            "add_note", {"project_id": victim_proj["id"], "title": "member-note", "body": "x"}))
+        assert "error" not in r.json(), r.text[:300]
+    assert "member-note" in _note_titles(victim_conn, victim_proj["id"])
+
+
+def test_sse_readonly_token_cannot_write(hosted, own_db_tenant):
+    """Finding 1: a read-only API token used to write over /mcp/sse."""
+    c = hosted[0]
+    tenant, conn, proj = own_db_tenant
+    raw, _row = asyncio.run(db_module.create_api_token(
+        c.app.state.db, tenant["id"], label="ro", token_type="readonly"))
+    headers = {"Authorization": f"Bearer {raw}"}
+    write = _rpc_call("add_note", {"project_id": proj["id"], "title": "readonly-wrote-this",
+                                   "body": "x"})
+    r = c.post("/mcp", json=write, headers=headers)
+    assert _denied(r.json(), "not allowed for read-only tokens"), r.text[:300]
+    r = c.post("/mcp/sse", json=write, headers=headers)
+    assert _denied(r.json(), "not allowed for read-only tokens"), r.text[:300]
+    with _sse_session(hosted, headers) as sid:
+        r = c.post(f"/mcp/sse?session_id={sid}", json=write)
+        assert _denied(r.json(), "not allowed for read-only tokens"), r.text[:300]
+        r = c.post(f"/mcp/sse?session_id={sid}", json=[write, _rpc_call("list_projects", {}, 2)])
+        batch = r.json()
+        assert _denied(batch[0], "not allowed for read-only tokens")
+        assert "tenant-own-proj" in str(batch[1])
+    assert "readonly-wrote-this" not in _note_titles(conn, proj["id"])
+
+
+def test_sse_project_scoped_member_is_limited_to_their_project(hosted, own_db_tenant,
+                                                              invited_member):
+    """Finding 1 (scope): /mcp/sse also dropped scoped_project_ids."""
+    c = hosted[0]
+    victim, victim_conn, victim_proj = own_db_tenant
+    other = asyncio.run(db_module.create_project(victim_conn, "victim-other-proj"))
+    member, _mconn, make = invited_member
+    make("member", project_id=victim_proj["id"])
+    headers = {**_bearer_header(c, member["id"]), "X-Workspace-Tenant-Id": victim["id"]}
+    out_of_scope = _rpc_call("add_note", {"project_id": other["id"], "title": "scope-escape",
+                                          "body": "x"})
+    r = c.post("/mcp/sse", json=out_of_scope, headers=headers)
+    assert _denied(r.json(), "outside your access scope"), r.text[:300]
+    with _sse_session(hosted, headers) as sid:
+        r = c.post(f"/mcp/sse?session_id={sid}", json=out_of_scope)
+        assert _denied(r.json(), "outside your access scope"), r.text[:300]
+        r = c.post(f"/mcp/sse?session_id={sid}", json=_rpc_call(
+            "add_note", {"project_id": victim_proj["id"], "title": "in-scope", "body": "x"}))
+        assert "error" not in r.json(), r.text[:300]
+    assert "scope-escape" not in _note_titles(victim_conn, other["id"])
+
+
+def test_sse_session_post_without_credential_uses_the_session(hosted, own_db_tenant):
+    """Finding 4: the HTTP+SSE flow where only the GET carries the token."""
+    c = hosted[0]
+    tenant, _conn, _proj = own_db_tenant
+    with _sse_session(hosted, _bearer_header(c, tenant["id"])) as sid:
+        r = c.post(f"/mcp/sse?session_id={sid}", json=_rpc_call("list_projects", {}))
+        assert r.status_code == 200
+        assert "tenant-own-proj" in r.text and "operator-secret" not in r.text
+        r = c.post(f"/mcp/sse?session_id={sid}", json={"jsonrpc": "2.0", "id": 3,
+                                                        "method": "tools/list"})
+        assert "start_session" in r.text
+
+
+def test_sse_session_from_cookie_login(hosted, own_db_tenant):
+    c = hosted[0]
+    tenant, _conn, _proj = own_db_tenant
+    cookie = _cookie_header(c, tenant["id"])
+    rpc = _rpc_call("list_projects", {})
+    # A session cookie alone (no session id) authenticates a message POST.
+    assert "tenant-own-proj" in c.post("/mcp/sse", json=rpc, headers=cookie).text
+    with _sse_session(hosted, cookie) as sid:
+        r = c.post(f"/mcp/sse?session_id={sid}", json=rpc)
+        assert "tenant-own-proj" in r.text, r.text[:300]
+        # An ambient stale/forged cookie never overrides a live session id.
+        r = c.post(f"/mcp/sse?session_id={sid}", json=rpc,
+                   headers={"Cookie": "meridian_session=forged.value"})
+        assert "tenant-own-proj" in r.text, r.text[:300]
+
+
+def test_sse_session_dies_when_its_token_is_revoked(hosted, own_db_tenant):
+    c, server_module, _op = hosted
+    tenant, _conn, _proj = own_db_tenant
+    raw, row = asyncio.run(db_module.create_api_token(c.app.state.db, tenant["id"], label="rv"))
+    with _sse_session(hosted, {"Authorization": f"Bearer {raw}"}) as sid:
+        rpc = _rpc_call("list_projects", {})
+        assert c.post(f"/mcp/sse?session_id={sid}", json=rpc).status_code == 200
+        asyncio.run(db_module.delete_api_token(c.app.state.db, tenant["id"], row["id"]))
+        r = c.post(f"/mcp/sse?session_id={sid}", json=rpc)
+        assert r.status_code == 401
+        assert "tenant-own-proj" not in r.text
+        assert sid not in server_module._SSE_SESSIONS
+
+
+def test_sse_session_dies_when_membership_is_removed(hosted, own_db_tenant, invited_member):
+    c, server_module, _op = hosted
+    victim, _vconn, _vproj = own_db_tenant
+    member_tenant, _mconn, make = invited_member
+    member = make("member")
+    headers = {**_bearer_header(c, member_tenant["id"]), "X-Workspace-Tenant-Id": victim["id"]}
+    with _sse_session(hosted, headers) as sid:
+        rpc = _rpc_call("list_projects", {})
+        assert "tenant-own-proj" in c.post(f"/mcp/sse?session_id={sid}", json=rpc).text
+        asyncio.run(db_module.delete_workspace_member(c.app.state.db, member["id"], victim["id"]))
+        r = c.post(f"/mcp/sse?session_id={sid}", json=rpc)
+        assert r.status_code == 401
+        assert sid not in server_module._SSE_SESSIONS
+
+
+def test_sse_session_is_bound_to_its_tenant(hosted, own_db_tenant):
+    """A POST carrying its OWN credential is judged by it alone: another
+    tenant presenting this session id reaches its own DB, never the session's;
+    a bogus credential is refused even with a live session id."""
+    c = hosted[0]
+    tenant_a, _conn_a, _proj = own_db_tenant
+    tenant_b = _seed_tenant(c, f"b-{uuid.uuid4().hex[:8]}@example.com", plan="pro")
+    conn_b = asyncio.run(db_module.init_db(":memory:"))
+    asyncio.run(db_module.create_project(conn_b, "tenant-b-proj"))
+    _deps._tenant_db_cache[tenant_b["id"]] = conn_b
+    rpc = _rpc_call("list_projects", {})
+    try:
+        with _sse_session(hosted, _bearer_header(c, tenant_a["id"])) as sid:
+            r = c.post(f"/mcp/sse?session_id={sid}", json=rpc,
+                       headers=_bearer_header(c, tenant_b["id"]))
+            assert "tenant-b-proj" in r.text and "tenant-own-proj" not in r.text
+            r = c.post(f"/mcp/sse?session_id={sid}", json=rpc,
+                       headers={"Authorization": "Bearer sk_meridian_bogus"})
+            assert r.status_code == 401
+            assert 'error="invalid_token"' in r.headers["www-authenticate"]
+            assert "tenant-own-proj" not in r.text
+    finally:
         _deps._tenant_db_cache.pop(tenant_b["id"], None)
         asyncio.run(conn_b.close())
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/mcp/sse"), ("POST", "/mcp/sse"),
+    ("POST", "/mcp/sse?session_id=00000000-0000-4000-8000-000000000000"),
+])
+def test_sse_anonymous_gets_mcp_discovery_401(hosted, method, path):
+    """Finding 4: the 401 carries the same OAuth discovery challenge as /mcp,
+    readable cross-origin, and no 'invalid_token' when nothing was presented."""
+    c = hosted[0]
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"} if method == "POST" else None
+    r = c.request(method, path, json=body)
+    assert r.status_code == 401, r.text[:200]
+    assert r.json() == _GATE_401
+    www = r.headers["www-authenticate"]
+    assert www.startswith("Bearer ")
+    assert 'resource_metadata="http://testserver/.well-known/oauth-protected-resource"' in www
+    assert "invalid_token" not in www
+    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "www-authenticate" in r.headers.get("access-control-expose-headers", "").lower()
+
+
+def test_sse_get_with_bogus_bearer_is_invalid_token(hosted):
+    r = hosted[0].get("/mcp/sse", headers={"Authorization": "Bearer sk_meridian_bogus"})
+    assert r.status_code == 401
+    assert 'error="invalid_token"' in r.headers["www-authenticate"]
+
+
+def test_sse_self_hosted_is_unchanged(hosted, monkeypatch):
+    c, _server, _op = hosted
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    r = c.post("/mcp/sse", json=_rpc_call("list_projects", {}))
+    assert r.status_code == 200
+    assert "operator-secret-proj" in r.text
+
+
+def test_sse_demo_cookie_reaches_only_the_demo_db(hosted, monkeypatch):
+    c = hosted[0]
+    demo = asyncio.run(db_module.init_db(":memory:"))
+    try:
+        asyncio.run(db_module.create_project(demo, "demo-proj"))
+        monkeypatch.setattr(c.app.state, "demo_db", demo, raising=False)
+        r = c.post("/mcp/sse", json=_rpc_call("list_projects", {}),
+                   headers={"Cookie": "meridian_demo=1"})
+        assert r.status_code == 200
+        assert "demo-proj" in r.text and "operator-secret" not in r.text
+    finally:
+        asyncio.run(demo.close())
+
+
+# ---------------------------------------------------------------------------
+# 8. Deploy smoke check and dashboard poll (fix round 1)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _smoke_preview_mcp_step() -> str:
+    import yaml
+    path = os.path.join(_REPO_ROOT, ".github", "workflows", "deploy.yml")
+    with open(path, encoding="utf-8") as fh:
+        wf = yaml.safe_load(fh)
+    steps = wf["jobs"]["smoke-preview"]["steps"]
+    matches = [s["run"] for s in steps if "MCP" in s.get("name", "")]
+    assert len(matches) == 1, [s.get("name") for s in steps]
+    return matches[0]
+
+
+def test_deploy_smoke_does_not_depend_on_anonymous_mcp():
+    """Finding 2: the preview smoke step used to require an ANONYMOUS
+    POST /mcp/sse to list tools, which now (correctly) 401s and would block
+    every normal promote to prod. It must check the public tool doc instead
+    and assert that anonymous MCP is refused."""
+    run = _smoke_preview_mcp_step()
+    assert "/mcp/tools-doc" in run
+    anon_posts = [ln for ln in run.splitlines() if "-X POST" in ln and "Authorization" not in ln]
+    assert anon_posts, "the step must probe anonymous MCP"
+    for line in anon_posts:
+        # Every anonymous POST is a status-code probe, never a tools check.
+        assert "%{http_code}" in line, line
+    assert '"401"' in run
+
+
+def test_deploy_smoke_checks_hold_against_the_hosted_app(hosted):
+    """Replay the smoke step's anonymous checks in-process (hosted mode)."""
+    c = hosted[0]
+    r = c.get("/mcp/tools-doc")
+    assert r.status_code == 200 and "start_session" in r.text
+    rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    assert c.post("/mcp/sse", json=rpc).status_code == 401
+    assert c.post("/mcp", json=rpc).status_code == 401
+
+
+def test_dashboard_polls_server_git_status_only_when_self_hosted():
+    """Finding 3: the 60s /admin/git-status poll ran in hosted and demo mode,
+    where the route is operator-only (403) and api() turns a demo 403 into the
+    'Read-only demo' toast on every page load and every minute."""
+    static = os.path.join(_REPO_ROOT, "meridian", "static")
+    with open(os.path.join(static, "dashboard.ts"), encoding="utf-8") as fh:
+        ts = fh.read()
+    with open(os.path.join(static, "dashboard.bundle.js"), encoding="utf-8") as fh:
+        bundle = fh.read()
+    guard = re.compile(
+        r"if \(!isHostedMode\(\) && !isDemoMode\(\)\) \{\s*_checkGitStatus\(\);\s*"
+        r"setInterval\(_checkGitStatus, (?:60000|6e4)\);\s*\}"
+    )
+    assert guard.search(ts), "dashboard.ts: git-status poll must be self-hosted only"
+    assert guard.search(bundle), "dashboard.bundle.js is stale: rebuild with node build.mjs"
+    for text in (ts, bundle):
+        assert len(re.findall(r"_checkGitStatus\(\);", text)) == 1

@@ -13317,9 +13317,19 @@ async function restoreTabs() {
 
   }
 
-  _checkGitStatus();
+  // ece2ac0a — /admin/git-status reports the SERVER's git checkout, so it is
+  // operator-only in hosted mode (403 for tenants and the demo cookie, where
+  // api() turns a 403 into the "read-only demo" toast). Hosted tenants cannot
+  // act on the server's git state anyway, so only a local self-hosted
+  // dashboard polls it -- the same gate checkGitStatus() already applies.
 
-  setInterval(_checkGitStatus, 60000);
+  if (!isHostedMode() && !isDemoMode()) {
+
+    _checkGitStatus();
+
+    setInterval(_checkGitStatus, 60000);
+
+  }
 
   const workspaceEntry = document.getElementById('workspace-entry');
 

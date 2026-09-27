@@ -405,6 +405,12 @@ async def _get_tenant_from_request(request: Request, *, force_refresh: bool = Fa
 
     import hashlib as _hashlib
 
+    # ece2ac0a — which credential resolved the tenant, as ("cookie",
+    # user_session_id) or ("bearer", token_sha256), so a caller that outlives
+    # this request (an /mcp/sse session) can re-check that SAME credential
+    # later through _tenant_for_credential below. Never the raw token.
+    request.state._tenant_credential = None
+
     if not _hosted_mode():
         request.state._tenant = None
         return None
@@ -413,7 +419,6 @@ async def _get_tenant_from_request(request: Request, *, force_refresh: bool = Fa
         return None
 
     from .hosted import _SESSION_COOKIE, _read_session_cookie
-    from . import db as db_module
 
     auth_db = request.app.state.db
 
@@ -421,22 +426,58 @@ async def _get_tenant_from_request(request: Request, *, force_refresh: bool = Fa
     if cookie_val:
         session_id = _read_session_cookie(cookie_val)
         if session_id:
-            session = await db_module.get_user_session(auth_db, session_id)
-            if session:
-                tenant = await db_module.get_tenant_by_id(auth_db, session["tenant_id"])
+            credential = ("cookie", session_id)
+            tenant = await _tenant_for_credential(auth_db, credential)
+            if tenant is not _NO_SUCH_CREDENTIAL:
                 request.state._tenant = tenant
+                request.state._tenant_credential = credential
                 return tenant
 
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        token_hash = _hashlib.sha256(token.encode()).hexdigest()
-        tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
+        credential = ("bearer", _hashlib.sha256(token.encode()).hexdigest())
+        tenant = await _tenant_for_credential(auth_db, credential)
+        if tenant is _NO_SUCH_CREDENTIAL:
+            tenant = None
         request.state._tenant = tenant
+        request.state._tenant_credential = credential if tenant else None
         return tenant
 
     request.state._tenant = None
     return None
+
+
+# Returned by _tenant_for_credential when a session cookie names no live
+# session, so _get_tenant_from_request can fall through to the Bearer token
+# exactly as it always has (a live session whose tenant row is gone still
+# resolves to None WITHOUT falling through).
+_NO_SUCH_CREDENTIAL: Any = object()
+
+
+async def _tenant_for_credential(auth_db: Any, credential: "tuple[str, str]") -> Any:
+    """ece2ac0a — resolve one credential reference to its tenant row.
+
+    ``("cookie", user_session_id)`` -> the live session's tenant (None if the
+    tenant row is gone); ``("bearer", token_sha256)`` -> the API token's tenant,
+    carrying ``_token_type``. Returns ``_NO_SUCH_CREDENTIAL`` when the session
+    or token no longer exists (expired, revoked, signed out).
+
+    Shared by _get_tenant_from_request and the /mcp/sse session re-check so the
+    two can never disagree about what a credential means.
+    """
+    from . import db as db_module
+
+    kind, ref = credential
+    if kind == "cookie":
+        session = await db_module.get_user_session(auth_db, ref)
+        if not session:
+            return _NO_SUCH_CREDENTIAL
+        return await db_module.get_tenant_by_id(auth_db, session["tenant_id"])
+    if kind == "bearer":
+        tenant = await db_module.get_tenant_from_token_hash(auth_db, ref)
+        return _NO_SUCH_CREDENTIAL if tenant is None else tenant
+    return _NO_SUCH_CREDENTIAL
 
 
 async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None":

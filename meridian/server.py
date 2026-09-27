@@ -7848,7 +7848,10 @@ from .mcp.handler import (  # noqa: E402
 # the POST URL. Client POSTs JSON-RPC to POST /mcp/sse?session_id=<uuid> and
 # reads the JSON response directly from the HTTP response body.
 
-_SSE_SESSIONS: dict[str, dict[str, Any]] = {}  # session_id → {db, queue}
+# session_id → the MCP context built by _mcp_sse_request_context (db, data_dir,
+# tenant, token_type, enforce_role, scoped_project_ids, workspace_tenant_id,
+# tenant_id, credential). Lives only while the GET stream that created it is open.
+_SSE_SESSIONS: dict[str, dict[str, Any]] = {}
 
 @app.get("/mcp")
 async def _mcp_get(request: Request):
@@ -7932,14 +7935,158 @@ async def _with_sse_heartbeat(upstream, interval: float = 30.0):
             nxt.cancel()
 
 
-async def _sse_caller_tenant_id(request: Request) -> "str | None":
-    """ece2ac0a — the tenant id an /mcp/sse session is bound to: the caller's
-    resolved hosted tenant, or None (self-hosted single user, or demo cookie).
-    Memoized per request by _get_tenant_from_request."""
-    if not _hosted_mode():
+# ---------------------------------------------------------------------------
+# ece2ac0a — /mcp/sse authentication and per-call MCP context
+# ---------------------------------------------------------------------------
+# /mcp/sse must hand _handle_mcp_request exactly the context POST /mcp does:
+# the caller's tenant, the API token's read-only flag, the workspace role when
+# the caller acts in a workspace they were INVITED to (X-Workspace-Tenant-Id),
+# and that membership's project scope. Before this, /mcp/sse passed none of
+# them, so a 'viewer' member could write to the owner's DB and a read-only
+# token could write, both of which POST /mcp refuses. (_role_enforcement_
+# middleware skips every /mcp* path because MCP is gated per tool, which is
+# only true when this context actually reaches the dispatcher.)
+#
+# Auth model (HTTP+SSE transport): the GET that opens the stream must carry a
+# credential. The session it opens remembers WHICH credential that was (a
+# token hash or a user-session id, never the raw token). A message POST that
+# carries its own Authorization header is judged by that credential alone,
+# exactly like POST /mcp. A POST without one may use a live session's endpoint URL
+# (an unguessable uuid4, delivered only on the authenticated stream and valid
+# only while that stream is open); every such POST re-checks the session's
+# credential and re-resolves the workspace role, so a revoked token, a signed-
+# out session or a removed membership stops working mid-stream.
+
+_SSE_WWW_AUTH_EXPOSE = {"Access-Control-Expose-Headers": "WWW-Authenticate"}
+
+
+class _McpSseUnauthenticated(Exception):
+    """No usable credential for an /mcp/sse request (hosted mode)."""
+
+    def __init__(self, credential_presented: bool) -> None:
+        super().__init__("authentication required")
+        self.credential_presented = credential_presented
+
+
+def _mcp_sse_presents_credential(request: Request) -> bool:
+    """True when the request deliberately carries its OWN credential (an
+    Authorization header) rather than relying on an SSE session id. A session
+    cookie is ambient (a browser attaches it on its own, possibly stale or for
+    another account), so it never overrides a live session id; without a
+    session id, _mcp_sse_request_context still accepts it."""
+    return bool(request.headers.get("authorization", "").strip())
+
+
+def _mcp_sse_unauthorized(request: Request, *, credential_presented: bool) -> Response:
+    """401 for /mcp/sse. Same discovery header as POST /mcp (resource_metadata
+    + device endpoint) so OAuth-capable SSE clients can find the auth server;
+    ``error="invalid_token"`` only when a credential was actually presented
+    (RFC 6750 §3.1). CORS headers ride along so a browser-extension client can
+    read the status and the challenge."""
+    base = str(request.base_url).rstrip("/")
+    challenge = 'Bearer realm="MCP"'
+    if credential_presented:
+        challenge += ', error="invalid_token"'
+    challenge += (
+        f', resource_metadata="{base}/.well-known/oauth-protected-resource"'
+        f', device_authorization_endpoint="{base}/oauth/device"'
+    )
+    return JSONResponse(
+        {"detail": "authentication required"},
+        status_code=401,
+        headers={**_SSE_CORS_HEADERS, **_SSE_WWW_AUTH_EXPOSE, "WWW-Authenticate": challenge},
+    )
+
+
+def _split_token_type(caller: "dict[str, Any]") -> "tuple[dict[str, Any], str]":
+    """Return (tenant without the private ``_token_type`` field, token_type).
+    Copies: the tenant dict is memoized on request.state and must not mutate."""
+    token_type = caller.get("_token_type") or "readwrite"
+    return {k: v for k, v in caller.items() if k != "_token_type"}, token_type
+
+
+async def _mcp_sse_request_context(request: Request) -> "dict[str, Any]":
+    """MCP context for an /mcp/sse request judged by its OWN credential.
+
+    Mirrors POST /mcp: tenant, token_type, enforce_role and scoped_project_ids
+    come from the same helpers. Raises _McpSseUnauthenticated in hosted mode
+    when no credential resolves a tenant. The demo cookie and self-hosted mode
+    keep their existing behavior (demo DB / the local single-user DB, no
+    tenant). Role/scope lookups are NOT wrapped in a catch-all: a failure there
+    must not silently grant owner rights on an invited workspace.
+    """
+    ctx: "dict[str, Any]" = {
+        "tenant": None, "token_type": "readwrite", "enforce_role": None,
+        "scoped_project_ids": None, "workspace_tenant_id": None, "credential": None,
+    }
+    if _hosted_mode() and not request.cookies.get(_DEMO_CONTEXT_COOKIE):
+        caller = await _get_tenant_from_request(request)
+        if caller is None or not caller.get("id"):
+            raise _McpSseUnauthenticated(_mcp_sse_presents_credential(request))
+        ctx["tenant"], ctx["token_type"] = _split_token_type(caller)
+        ctx["credential"] = getattr(request.state, "_tenant_credential", None)
+        if request.headers.get("x-workspace-tenant-id", "").strip():
+            enf = await _enforcement_context(request)
+            if enf is not None:
+                ctx["workspace_tenant_id"], ctx["enforce_role"] = enf[1], enf[2]
+            from ._deps import _scoped_project_ids_for_request as _scoped_fn  # noqa: PLC0415
+            ctx["scoped_project_ids"] = await _scoped_fn(request)
+    ctx["db"] = await _db(request)
+    ctx["data_dir"] = _data_dir(request)
+    ctx["tenant_id"] = (ctx["tenant"] or {}).get("id")
+    return ctx
+
+
+async def _mcp_sse_session_context(
+    request: Request, sess: "dict[str, Any]",
+) -> "dict[str, Any] | None":
+    """MCP context for a credential-less POST that names a live SSE session.
+
+    Re-checks the credential the session was opened with and re-resolves the
+    workspace role/scope, returning None (caller answers 401 and drops the
+    session) when the credential is gone or no longer maps to the session's
+    tenant, or the invited-workspace membership was removed. Sessions opened
+    without a tenant (self-hosted, demo cookie) have nothing to re-check.
+    """
+    if sess.get("tenant_id") is None:
+        return sess
+    credential = sess.get("credential")
+    if not _hosted_mode() or credential is None:
         return None
-    tenant = await _get_tenant_from_request(request)
-    return (tenant or {}).get("id")
+    from ._deps import _NO_SUCH_CREDENTIAL, _tenant_for_credential  # noqa: PLC0415
+    auth_db = request.app.state.db
+    caller = await _tenant_for_credential(auth_db, credential)
+    if caller is _NO_SUCH_CREDENTIAL or not caller or caller.get("id") != sess["tenant_id"]:
+        return None
+    ctx = dict(sess)
+    ctx["tenant"], ctx["token_type"] = _split_token_type(caller)
+    ws_tid = sess.get("workspace_tenant_id")
+    if ws_tid:
+        email = caller.get("email", "")
+        resolved = await db_module.resolve_member_role(auth_db, ws_tid, email)
+        if resolved is None:
+            return None
+        ctx["enforce_role"] = resolved[0]
+        ctx["scoped_project_ids"] = await db_module.get_scoped_project_ids_for_member(
+            auth_db, ws_tid, email,
+        )
+    return ctx
+
+
+async def _dispatch_mcp_sse(body: Any, ctx: "dict[str, Any]") -> Any:
+    """Run one JSON-RPC message (or a batch) with the full caller context."""
+    from .mcp_profiles import get_tool_allowlist  # noqa: PLC0415
+
+    kwargs = {
+        "tenant": ctx.get("tenant"),
+        "token_type": ctx.get("token_type") or "readwrite",
+        "enforce_role": ctx.get("enforce_role"),
+        "scoped_project_ids": ctx.get("scoped_project_ids"),
+        "allowed_tool_names": get_tool_allowlist(None),
+    }
+    if isinstance(body, list):
+        return [await _handle_mcp_request(item, ctx["db"], ctx["data_dir"], **kwargs) for item in body]
+    return await _handle_mcp_request(body, ctx["db"], ctx["data_dir"], **kwargs)
 
 
 @app.options("/mcp/sse")
@@ -7949,7 +8096,7 @@ async def mcp_sse_options(request: Request) -> Response:
 
 
 @app.get("/mcp/sse")
-async def mcp_sse_get(request: Request) -> StreamingResponse:
+async def mcp_sse_get(request: Request) -> Response:
     """MCP SSE transport GET — opens event stream for dnakov/claude-mcp.
 
     Sends ``event: endpoint`` with POST URL, then a keepalive ``: ping`` every
@@ -7957,31 +8104,32 @@ async def mcp_sse_get(request: Request) -> StreamingResponse:
     drop the idle connection. Uses the same _db() resolver (Bearer / cookie)
     so both local and hosted-tier clients work.
 
-    ece2ac0a — hosted callers must authenticate (_db() now 401s anonymous
-    hosted requests; the docstring used to say "no strict auth required", and
-    the whole read/write MCP toolset was reachable anonymously). Each SSE
-    session is also bound to the tenant that opened it, so a leaked or guessed
-    ``session_id`` cannot be reused by a different caller.
+    ece2ac0a — hosted callers must authenticate (401 with the same OAuth
+    discovery challenge as POST /mcp). The session stores the full MCP context
+    (tenant, token type, workspace role and scope) plus a reference to the
+    credential that opened it; see the section comment above for how message
+    POSTs use it.
     """
     import uuid as _uuid
     import anyio as _anyio
 
-    db = await _db(request)
-    data_dir = _data_dir(request)
-    owner_tid = await _sse_caller_tenant_id(request)
+    try:
+        ctx = await _mcp_sse_request_context(request)
+    except _McpSseUnauthenticated as exc:
+        return _mcp_sse_unauthorized(request, credential_presented=exc.credential_presented)
+    owner_tid = ctx["tenant_id"]
 
     # Reuse session_id on reconnect if client sends one, it's valid, and it
-    # belongs to this same caller.
+    # belongs to this same caller; the context is replaced with this request's.
     requested_sid = request.query_params.get("session_id")
     existing = _SSE_SESSIONS.get(requested_sid) if requested_sid else None
     if existing is not None and existing.get("tenant_id") == owner_tid:
         session_id = requested_sid
-        existing["db"] = db
+        existing.clear()
+        existing.update(ctx)
     else:
         session_id = str(_uuid.uuid4())
-        _SSE_SESSIONS[session_id] = {
-            "db": db, "data_dir": data_dir, "tenant_id": owner_tid,
-        }
+        _SSE_SESSIONS[session_id] = ctx
 
     endpoint_path = f"/mcp/sse?session_id={session_id}"
 
@@ -8014,29 +8162,35 @@ async def mcp_sse_post(request: Request) -> Any:
 
     Client POSTs a JSON-RPC 2.0 message; response is returned as JSON in the
     HTTP response body (extension reads it directly, not via the SSE stream).
+
+    ece2ac0a — a POST carrying its own Authorization header is judged by it
+    alone (a different tenant's session_id is ignored, never handed over). A
+    POST without one may use a live session opened by an authenticated GET; its
+    credential and workspace role are re-checked on every message. Anything
+    else is a 401. Both paths dispatch with the full context POST /mcp uses
+    (read-only tokens, workspace roles, project scope).
     """
     from fastapi.responses import JSONResponse as _JSONResp
 
     session_id = request.query_params.get("session_id", "")
-    sess = _SSE_SESSIONS.get(session_id)
-    if sess is not None and sess.get("tenant_id") != await _sse_caller_tenant_id(request):
-        # ece2ac0a — someone else's session_id: never hand over that session's
-        # DB. Resolve the caller's own DB instead (401 if unauthenticated).
-        sess = None
-    db = sess["db"] if sess else await _db(request)
-    data_dir = sess["data_dir"] if sess else _data_dir(request)
+    sess = _SSE_SESSIONS.get(session_id) if session_id else None
+    try:
+        if sess is not None and not _mcp_sse_presents_credential(request):
+            ctx = await _mcp_sse_session_context(request, sess)
+            if ctx is None:
+                _SSE_SESSIONS.pop(session_id, None)
+                return _mcp_sse_unauthorized(request, credential_presented=False)
+        else:
+            ctx = await _mcp_sse_request_context(request)
+    except _McpSseUnauthenticated as exc:
+        return _mcp_sse_unauthorized(request, credential_presented=exc.credential_presented)
 
     try:
         body = await request.json()
     except Exception:
         return _JSONResp(_jsonrpc_err(None, -32700, "parse error"), status_code=400, headers=_SSE_CORS_HEADERS)
 
-    if isinstance(body, list):
-        results = [await _handle_mcp_request(item, db, data_dir) for item in body]
-        return _JSONResp(results, headers=_SSE_CORS_HEADERS)
-
-    result = await _handle_mcp_request(body, db, data_dir)
-    return _JSONResp(result, headers=_SSE_CORS_HEADERS)
+    return _JSONResp(await _dispatch_mcp_sse(body, ctx), headers=_SSE_CORS_HEADERS)
 
 
 @app.post("/feedback", status_code=201)

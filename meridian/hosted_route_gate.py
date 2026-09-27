@@ -43,9 +43,9 @@ The two allowlists
 ``HOSTED_SELF_AUTHENTICATED_ROUTES``
     Routes that enforce their OWN credential and must keep their exact current
     response to a credential-less request: webhook signatures (Stripe, GitHub
-    Marketplace, project ``X-Meridian-Token``), the OAuth-aware ``/mcp``
-    endpoints (their 401 carries the ``resource_metadata`` discovery header the
-    claude.ai connector needs), hook routes (``registration_token`` in the body;
+    Marketplace, project ``X-Meridian-Token``), the OAuth-aware ``/mcp`` and
+    ``/mcp/sse`` endpoints (their 401 carries the ``resource_metadata``
+    discovery header MCP clients need), hook routes (``registration_token`` in the body;
     contractually never 401), and pages that redirect to the login page rather
     than returning 401 (``/dashboard``, ``/oauth/authorize``, ...). Every entry
     was reviewed to confirm the handler itself refuses anonymous callers;
@@ -183,6 +183,12 @@ HOSTED_SELF_AUTHENTICATED_ROUTES: frozenset[RouteKey] = frozenset({
     # --- MCP endpoints: OAuth-aware 401 with resource_metadata ---------------
     ("POST", "/mcp"),
     ("POST", "/mcp/openai"),
+    # /mcp/sse (ece2ac0a): the GET needs a credential; a message POST needs a
+    # credential OR a live session id opened by that authenticated GET (the
+    # HTTP+SSE transport's endpoint-URL capability). Both answer 401 with the
+    # same OAuth discovery challenge as POST /mcp -- see server.mcp_sse_*.
+    ("GET", "/mcp/sse"),
+    ("POST", "/mcp/sse"),
     # --- Hook routes: Bearer OR body registration_token; never 401 anon ------
     ("POST", "/hooks/session-start"),
     ("POST", "/hooks/stop"),
