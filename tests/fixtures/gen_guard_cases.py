@@ -46,15 +46,16 @@ SLUG_M = "C-Users-13144-Documents-Meridian-repository"
 SLUG_D = "C-Users-13144-Documents-dnabert-error-correction"
 THESIS_W = "C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator"
 
-MERIDIAN_COVER = ["", ".agents", ".github", "android", "dxt", "extensions", "hooks", "k6", "meridian", "npm", "packages", "tests", "workspace"]
+MERIDIAN_COVER = ["", ".agents", ".github", "android", "dxt", "extensions", "hooks", "k6", "meridian", "meridian/db",
+                   "npm", "packages", "tests", "workspace"]
 
 
-def row(name, root, indexed_at, nodes, slug_match, covered):
+def row(name, root, indexed_at, nodes, slug_match, covered, files=None, partial=False):
     db = f"{CACHE}/{name}.db"
     return {
         "name": name, "root": root, "root_key": root.lower(), "indexed_at": indexed_at,
-        "indexed_epoch": ep(indexed_at), "nodes": nodes, "slug_match": slug_match,
-        "covered_dirs": covered, "db": db, "wal": db + "-wal", "sig": [1, 1, 0, 1],
+        "indexed_epoch": ep(indexed_at), "nodes": nodes, "files": files, "partial": partial,
+        "slug_match": slug_match, "covered_dirs": covered, "db": db, "wal": db + "-wal", "sig": [1, 1, 0, 1],
     }
 
 
@@ -73,6 +74,23 @@ ROWS = [
 ]
 SERVERS = {"user": ["codebase-memory-mcp"], "projects": {REPO.lower(): ["codebase-memory"]}}
 
+# 2026-09-27 live state: the slug index of the Meridian repo is an unfinished build
+# (90 nodes, 2 File nodes, 1146 hashed files, next to a .db.corrupt). The builder
+# marks it partial; pick() must never let it beat a whole index.
+PARTIAL_M = row(SLUG_M, REPO, "2026-09-26T18:55:35Z", 90, True, MERIDIAN_COVER, files=1146, partial=True)
+FRESH_REPO_DUP = row("meridian-repo", REPO, "2026-09-26T12:00:00Z", 126821, False,
+                     ["", ".agents", ".codex", ".github", "meridian", "tests", "extensions"], files=4908)
+# The builder now counts a top-level dir as covered only when it holds code files:
+# dnabert's results/ (json, npz) and paper/ (png, pdf, log, md) are not.
+DNABERT_CODE_COVER = row(SLUG_D, "C:/Users/13144/Documents/dnabert-error-correction", "2026-09-26T18:59:48Z", 65573, True,
+                         ["", "reference", "scripts", "src", "tests"], files=408)
+# covered_dirs now records every ANCESTOR of a code file's directory, not just its
+# top-level segment: src/ has code directly (train.py) AND a nested code dir
+# (src/models), but src/checkpoints/ is a pure-data dir (.pt files) that must stay
+# ALLOWED even though its top-level ancestor src/ is otherwise code-covered.
+DNABERT_NESTED_DATA_COVER = row(SLUG_D, "C:/Users/13144/Documents/dnabert-error-correction", "2026-09-26T18:59:48Z", 65573, True,
+                                ["", "reference", "scripts", "src", "src/models", "tests"], files=412)
+
 
 def snap(rows, pins=None, automem=None):
     return {"schema": "meridian-guard-snapshot/1", "built_at": NOW - 3600, "cache_dir": CACHE,
@@ -86,6 +104,11 @@ SNAPSHOTS = {
     "automem_dir": snap(ROWS, automem=["D:/claude-memory"]),
     "pinned_canonical_root": snap(ROWS, pins={REPO.lower(): SLUG_M}),
     "pinned_worktree_root": snap(ROWS, pins={WT_EPH.lower(): SLUG_M}),
+    "partial_slug_live": snap([PARTIAL_M] + [r for r in ROWS if r["name"] not in (SLUG_M, "meridian-main")]),
+    "partial_slug_fresh_dup": snap([PARTIAL_M, FRESH_REPO_DUP] + [r for r in ROWS if r["root"] != REPO]),
+    "all_partial": snap([PARTIAL_M] + [r for r in ROWS if r["root"] != REPO]),
+    "dnabert_code_coverage": snap([DNABERT_CODE_COVER] + [r for r in ROWS if r["name"] != SLUG_D]),
+    "dnabert_nested_data_coverage": snap([DNABERT_NESTED_DATA_COVER] + [r for r in ROWS if r["name"] != SLUG_D]),
     "missing": None,
     "corrupt_string": "this is not a snapshot",
     "wrong_schema": {"schema": "something-else/9", "rows": ROWS},
@@ -106,7 +129,7 @@ FS = {
         REPO + "/meridian/db", REPO + "/meridian/mcp/handlers", REPO + "/tests", REPO + "/docs", REPO + "/scripts",
         REPO + "/node_modules/pkg", REPO + "/.codex/worktrees/x", REPO + "/data", REPO + "/logs",
         REPO + "/.github/workflows", WT_EPH + "/meridian", LEFTOVER + "/meridian", WT_XREF + "/meridian",
-        DNABERT + "/.git", DNABERT + "/paper", LATEX + "/.git", ROUND3 + "/sub", THESIS + "/.git", THESIS + "/helpers",
+        DNABERT + "/.git", DNABERT + "/paper", DNABERT + "/results", LATEX + "/.git", ROUND3 + "/sub", THESIS + "/.git", THESIS + "/helpers",
         MEM, SCRATCH, GUARD + "/state", HOME + "/.claude/hooks",
     ],
     "files": {
@@ -527,9 +550,32 @@ G7_DENY = [
     ("python_unknown_verb", "Bash", "python scripts/x.py ~/.claude/projects/foo/memory/MEMORY.md"),
     ("pwsh_wrapped", "Bash", "powershell -Command \"Add-Content -Path ~/.claude/projects/foo/memory/a.md -Value x\""),
     ("param_colon_form", "PowerShell", "Out-File -FilePath:$env:USERPROFILE\\.claude\\projects\\foo\\memory\\x.md -InputObject y"),
+    # fix round 1: a write DESTINATION in memory, or a read verb in its writing mode
+    ("sed_inplace_suffix", "Bash", "sed -i.bak 's/a/b/' ~/.claude/projects/foo/memory/MEMORY.md"),
+    ("find_delete", "Bash", "find ~/.claude/projects/foo/memory -name '*.md' -delete"),
+    ("cd_find_exec_rm", "Bash", "cd ~/.claude/projects/foo/memory && find . -name '*.md' -exec rm {} +"),
+    ("gawk_inplace", "Bash", "gawk -i inplace '{print}' ~/.claude/projects/foo/memory/MEMORY.md"),
+    ("cp_into", "Bash", f"cp {SCRATCH}/x.md ~/.claude/projects/foo/memory/x.md"),
+    ("cp_target_dir_into", "Bash", "cp -t ~/.claude/projects/foo/memory a.md b.md"),
+    ("copy_item_named_dest_into", "PowerShell", "Copy-Item -Path a.md -Destination $env:USERPROFILE\\.claude\\projects\\foo\\memory\\a.md"),
+    ("mv_out_removes_source", "Bash", "mv ~/.claude/projects/foo/memory/a.md /tmp/a.md"),
+    ("rsync_remove_source", "Bash", "rsync --remove-source-files ~/.claude/projects/foo/memory/a.md /tmp/"),
 ]
 for key, tool, cmd in G7_DENY:
     add(f"G7_deny_{key}", PRE, pre(tool, {"command": cmd}), "deny", "G7")
+# Over the analysis cap (8192 chars / 200 words) a command is not tokenized:
+# G7/G9 fall back to "does the raw text name that dir", G3 allows.
+BIG_WORDS = "echo " + "w " * 250
+add("G7_too_big_names_memory_denied", PRE, pre("Bash", {"command": BIG_WORDS + "> ~/.claude/projects/foo/memory/x.md"}),
+    "deny", "G7", contains=["too large"])
+add("G7_too_big_chars_heredoc_into_memory", PRE,
+    pre("Bash", {"command": "cat > ~/.claude/projects/foo/memory/x.md <<'EOF'\n" + "y" * 9000 + "\nEOF"}), "deny", "G7",
+    contains=["too large"])
+add("G7_too_big_without_memory_allowed", PRE, pre("Bash", {"command": BIG_WORDS + "| grep memory_notes"}), "allow", None)
+add("G9_too_big_names_guard_denied", PRE, pre("Bash", {"command": BIG_WORDS + "> \"$LOCALAPPDATA/meridian/guard/guard.off\""}),
+    "deny", "G9", contains=["too large"])
+add("G3_too_big_search_allowed", PRE, pre("Bash", {"command": "grep -rn arxiv_search . " + "--include=x " * 210}), "allow", None,
+    note="documented residual: a command over the analysis cap is not searched for G3")
 add("G7_deny_dc_start_process", PRE, pre("mcp__dc__start_process", {"command": "Set-Content C:/Users/13144/.claude/projects/foo/memory/a.md x"}), "deny", "G7")
 G7_ALLOW = [
     ("cat", "Bash", "cat ~/.claude/projects/foo/memory/MEMORY.md"),
@@ -542,6 +588,16 @@ G7_ALLOW = [
     ("repo_memory_named_file", "Bash", "cat src.md > docs/memory.md"),
     ("repo_memory_import", "Bash", "python -m meridian.memory_import --dry-run"),
     ("cp_from_memory_to_elsewhere_by_read", "Bash", "cat ~/.claude/projects/foo/memory/MEMORY.md > /tmp/mem_copy.md"),
+    # fix round 1: the six reads / copies-out the verification run saw denied
+    ("sed_n", "Bash", "sed -n '1,40p' ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md"),
+    ("find_mtime", "Bash", "find ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory -name '*.md' -mtime -7"),
+    ("awk_head", "Bash", "awk 'NR<=20' ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md"),
+    ("diff_backup", "Bash", f"diff ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md {SCRATCH}/memory_backup.md"),
+    ("cp_out_to_scratchpad", "Bash", f"cp ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md {SCRATCH}/mem_snapshot.md"),
+    ("copy_item_out", "PowerShell", f"Copy-Item C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md {SCRATCH}/mem_snapshot2.md"),
+    ("copy_item_named_dest_out", "PowerShell", f"Copy-Item -Destination {SCRATCH}/m.md -Path ~/.claude/projects/foo/memory/MEMORY.md"),
+    ("cd_find_list", "Bash", "cd ~/.claude/projects/foo/memory && find . -name '*.md'"),
+    ("head_tail", "Bash", "head -5 ~/.claude/projects/foo/memory/MEMORY.md && tail -5 ~/.claude/projects/foo/memory/MEMORY.md"),
 ]
 for key, tool, cmd in G7_ALLOW:
     add(f"G7_allow_{key}", PRE, pre(tool, {"command": cmd}), "allow", None)
@@ -604,10 +660,41 @@ add("G11_latest_receipt_failed_escape", PRE, pre("WebSearch", {"query": "prior a
 add("G11_docs_query_allowed", PRE, pre("WebSearch", {"query": "fastapi lifespan event docs"}), "allow", None, state=R_OK_5)
 add("G11_blob_url_allowed", PRE, pre("WebFetch", {"url": "https://github.com/DeusData/codebase-memory-mcp/blob/main/src/cli/hook_augment.c", "prompt": "x"}),
     "allow", None, state=R_OK_5)
-add("G11_arxiv_fetch_denied", PRE, pre("WebFetch", {"url": "https://arxiv.org/abs/2401.01234", "prompt": "summarize"}), "deny", "G11", state=R_OK_5)
+add("G11_arxiv_abs_allowed", PRE, pre("WebFetch", {"url": "https://arxiv.org/abs/2401.01234", "prompt": "summarize"}), "allow", None,
+    state=R_OK_5, note="one specific paper: paper_search cannot return its full text")
+add("G11_arxiv_list_denied", PRE, pre("WebFetch", {"url": "https://arxiv.org/list/cs.LG/recent", "prompt": "x"}), "deny", "G11", state=R_OK_5)
 add("G11_export_arxiv_subdomain", PRE, pre("WebFetch", {"url": "https://export.arxiv.org/api/query?search_query=x", "prompt": "x"}), "deny", "G11", state=R_OK_5)
-add("G11_doi_fetch_denied", PRE, pre("WebFetch", {"url": "https://doi.org/10.1145/1234", "prompt": "x"}), "deny", "G11", state=R_OK_5)
-add("G11_pubmed_fetch_denied", PRE, pre("WebFetch", {"url": "https://pubmed.ncbi.nlm.nih.gov/12345/", "prompt": "x"}), "deny", "G11", state=R_OK_5)
+add("G11_doi_fetch_allowed", PRE, pre("WebFetch", {"url": "https://doi.org/10.1145/1234", "prompt": "x"}), "allow", None, state=R_OK_5)
+add("G11_pubmed_record_allowed", PRE, pre("WebFetch", {"url": "https://pubmed.ncbi.nlm.nih.gov/12345/", "prompt": "x"}), "allow", None, state=R_OK_5)
+add("G11_pubmed_search_denied", PRE, pre("WebFetch", {"url": "https://pubmed.ncbi.nlm.nih.gov/?term=dnabert", "prompt": "x"}), "deny", "G11", state=R_OK_5)
+# fix round 1: the verification run's docs / status / specific-paper fetches (all were denied)
+G11_ALLOW_URLS = [
+    ("openalex_docs", "https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication"),
+    ("openalex_help", "https://help.openalex.org/hc/en-us"),
+    ("openalex_blog", "https://blog.openalex.org/"),
+    ("arxiv_info_manual", "https://info.arxiv.org/help/api/user-manual.html"),
+    ("arxiv_status", "https://status.arxiv.org/"),
+    ("s2_api_docs", "https://api.semanticscholar.org/api-docs/"),
+    ("s2_product_api", "https://www.semanticscholar.org/product/api"),
+    ("doi_handbook", "https://www.doi.org/the-identifier/resources/handbook"),
+    ("arxiv_html_full_text", "https://arxiv.org/html/2306.15006v2"),
+    ("doi_bibliography_check", "https://doi.org/10.1093/bioinformatics/btab083"),
+    ("openalex_single_work", "https://api.openalex.org/works/W2741809807"),
+    ("github_issue_search", "https://github.com/search?q=repo%3Aanthropics%2Fclaude-code+powershell+hook&type=issues"),
+]
+for key, url in G11_ALLOW_URLS:
+    add(f"G11_allow_{key}", PRE, pre("WebFetch", {"url": url, "prompt": "x"}), "allow", None, state=R_OK_5)
+add("G11_openalex_works_search_denied", PRE, pre("WebFetch", {"url": "https://api.openalex.org/works?search=dnabert&per-page=1", "prompt": "x"}),
+    "deny", "G11", state=R_OK_5)
+add("G11_s2_paper_search_api_denied", PRE, pre("WebFetch", {"url": "https://api.semanticscholar.org/graph/v1/paper/search?query=dnabert", "prompt": "x"}),
+    "deny", "G11", state=R_OK_5)
+add("G11_github_api_repo_search_denied", PRE, pre("WebFetch", {"url": "https://api.github.com/search/repositories?q=mcp", "prompt": "x"}),
+    "deny", "G11", state=R_OK_5)
+add("G11_github_code_search_denied", PRE, pre("WebFetch", {"url": "https://github.com/search?q=guard&type=code", "prompt": "x"}),
+    "deny", "G11", state=R_OK_5)
+add("G11_bibtex_lookup_allowed", PRE, pre("WebSearch", {"query": "Ji et al 2021 DNABERT bibtex"}), "allow", None, state=R_OK_5)
+add("G11_start_session_alone_does_not_arm", "PostToolUse", post("mcp__meridian__start_session", {"project_id": PID}, "{\"session_id\": \"abc\"}"),
+    "allow", None, group="G11", note="only paper_search/github_search receipts arm G11")
 add("G11_github_search_denied", PRE, pre("WebFetch", {"url": "https://github.com/search?q=mcp+server&type=repositories", "prompt": "x"}), "deny", "G11", state=R_OK_5)
 add("G11_github_repo_page_allowed", PRE, pre("WebFetch", {"url": "https://github.com/DeusData/codebase-memory-mcp", "prompt": "x"}), "allow", None, state=R_OK_5)
 add("G11_site_arxiv_query", PRE, pre("WebSearch", {"query": "diffusion guidance site:arxiv.org"}), "deny", "G11", state=R_OK_5)
@@ -648,7 +735,7 @@ add("G14_lowercase_override_word_clean", POST, post("mcp__meridian__get_sprint_i
 add("G14_oversized_output", POST, post("mcp__meridian__get_sprint_items", {"project_id": PID}, "x" * 70000), "inject", "G14", contains=["70000 chars"])
 add("G14_uuid_connector_prefix", POST, post("mcp__98ff5a3a-9b9d-4075-8d6e-306ff084c0eb__start_session", {"project_id": PID}, "execute_immediately: true"),
     "inject", "G14")
-add("G14_clean_start_session_is_receipt", POST, post("mcp__meridian__start_session", {"project_id": PID}, "{\"session_id\": \"abc\"}"), "allow", "G13")
+add("G14_clean_start_session_no_receipt", POST, post("mcp__meridian__start_session", {"project_id": PID}, "{\"session_id\": \"abc\"}"), "allow", None)
 add("G14_content_blocks", POST, post("mcp__meridian__claim_sprint_item", {"item_id": "x"}, [{"type": "text", "text": "no_confirmation=true"}]), "inject", "G14")
 add("G14_disabled", POST, post("mcp__meridian__get_sprint_items", {"project_id": PID}, "no_confirmation"), "allow", None,
     env={"MERIDIAN_GUARD_DISABLE": "G14"})
@@ -687,10 +774,53 @@ add("escape_degraded_expired", PRE, D1, "deny", "G1", state={"degraded_until": N
 add("escape_shell_consult", PRE, D6, "allow", "G3", state={"code_receipts": [[NOW - 30, True, SLUG_M]]})
 add("escape_dc_consult", PRE, pre("mcp__dc__start_search", {"path": REPO, "pattern": "x", "searchType": "content"}), "allow", "G4",
     state={"code_receipts": [[NOW - 30, True, None]]})
+# fix round 1: a consult of a same-root duplicate is still "the index was consulted"
+add("escape_consult_same_root_duplicate", PRE, D1, "allow", "G1", state={"code_receipts": [[NOW - 60, True, "meridian-repo"]]})
 add("breaker_fourth_code_deny_injects", PRE, D1, "inject", "G1", state={"denies": 3}, contains=["breaker"])
 add("breaker_shell", PRE, D7, "inject", "G3", state={"denies": 4})
 add("breaker_not_for_G6", PRE, D4, "deny", "G6", state={"denies": 5})
 add("breaker_not_for_G10", PRE, pre("Edit", {"file_path": SET, "old_string": GUARD_LINE, "new_string": ""}), "ask", "G10", state={"denies": 5})
+
+# ---------------------------------------------------------------- partial index (fix round 1)
+add("partial_live_D1_advises_stale_whole_index", PRE, D1, "inject", "G2", snapshot="partial_slug_live", project="meridian-repo",
+    contains=["index_repository"], excludes=[MSG_PROJ_M],
+    note="live 2026-09-27: the 90-node slug index must not win; the whole (stale) index is named, no deny")
+add("partial_fresh_dup_D1_denies_toward_whole_index", PRE, D1, "deny", "G1", snapshot="partial_slug_fresh_dup", project="meridian-repo",
+    contains=["project='meridian-repo'", f"Do NOT use project={SLUG_M}"], excludes=[MSG_PROJ_M])
+add("partial_fresh_dup_G5_whole_index_allowed", PRE, pre("mcp__codebase-memory__search_code", {"project": "meridian-repo", "pattern": "def arxiv_search", "mode": "files"}),
+    "allow", None, snapshot="partial_slug_fresh_dup")
+add("partial_fresh_dup_G5_partial_index_denied", PRE, pre("mcp__codebase-memory__search_code", {"project": SLUG_M, "pattern": "x"}),
+    "deny", "G5", snapshot="partial_slug_fresh_dup", project="meridian-repo", contains=["incomplete", "Retry with project='meridian-repo'"])
+add("partial_live_G5_whole_index_allowed", PRE, pre("mcp__codebase-memory__search_code", {"project": "meridian-repo", "pattern": "def arxiv_search", "mode": "files"}),
+    "allow", None, snapshot="partial_slug_live")
+add("partial_all_partial_advises", PRE, D1, "inject", "G2", snapshot="all_partial", project=SLUG_M, contains=["incomplete", "index_repository"])
+add("partial_all_partial_G5_allowed", PRE, pre("mcp__codebase-memory__search_code", {"project": SLUG_M, "pattern": "x"}), "allow", None,
+    snapshot="all_partial")
+add("partial_subagent_brief_names_whole_index", "SubagentStart", {"session_id": "s", "hook_event_name": "SubagentStart", "cwd": REPO_BS},
+    "inject", "G16", snapshot="partial_slug_fresh_dup", contains=["project='meridian-repo'", f"(not {SLUG_M})"], group="G16")
+add("partial_session_brief_flags_incomplete", "SessionStart", {"session_id": "s", "hook_event_name": "SessionStart", "source": "startup", "cwd": REPO_BS},
+    "inject", "G15", snapshot="all_partial", contains=["INCOMPLETE"], group="G15")
+# data-only directories: covered_dirs now lists only dirs holding code files
+add("coverage_results_dir_not_denied", PRE, pre("Grep", {"pattern": "accuracy", "path": DNABERT + "/results"}), "inject", "G2",
+    snapshot="dnabert_code_coverage", project=SLUG_D, group="G2")
+add("coverage_paper_tex_glob_not_denied", PRE, pre("Grep", {"pattern": "\\\\cite\\{", "path": DNABERT + "/paper", "glob": "*.tex"}), "inject", "G2",
+    snapshot="dnabert_code_coverage", project=SLUG_D, group="G2")
+add("coverage_bash_grep_results_not_denied", PRE, pre("Bash", {"command": "grep -rn 'val_f1' results/"}, cwd=DNABERT), "inject", "G2",
+    snapshot="dnabert_code_coverage", project=SLUG_D, group="G2")
+add("coverage_src_still_denied", PRE, pre("Grep", {"pattern": "zotero", "path": DNABERT + "/src"}), "deny", "G1",
+    snapshot="dnabert_code_coverage", project=SLUG_D, group="G1", fs_overlay={"dirs": [DNABERT + "/src"]})
+# covered_dirs now records every ancestor of a code file's directory (not just its
+# top-level segment), so a G1/G3 check against the SPECIFIC target directory finds
+# a data-only dir nested under an otherwise code-covered top-level dir and allows it.
+add("coverage_nested_data_subdir_not_denied", PRE, pre("Grep", {"pattern": "loss", "path": DNABERT + "/src/checkpoints"}), "inject", "G2",
+    snapshot="dnabert_nested_data_coverage", project=SLUG_D, group="G2",
+    fs_overlay={"dirs": [DNABERT + "/src/checkpoints"]},
+    contains=["'src/checkpoints' is not in that index"],
+    note="src/ has code directly (train.py); src/checkpoints/ nested under it is pure data (.pt) and must be allowed")
+add("coverage_nested_code_subdir_still_denied", PRE, pre("Grep", {"pattern": "zotero", "path": DNABERT + "/src/models"}), "deny", "G1",
+    snapshot="dnabert_nested_data_coverage", project=SLUG_D, group="G1",
+    fs_overlay={"dirs": [DNABERT + "/src/models"]},
+    note="src/models/ itself holds code, so the specific-directory check still denies there")
 
 # ---------------------------------------------------------------- malformed / fail-open
 add("malformed_payload_array", PRE, ["not", "an", "object"], "allow", None)

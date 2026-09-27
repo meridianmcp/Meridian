@@ -78,6 +78,27 @@ STALE_DAYS = 7
 STALE_SECONDS = STALE_DAYS * 86400
 SQLITE_TIMEOUT_S = 0.05
 MAX_COVERED_DIRS = 2000
+# Upper bound on file_hashes rows scanned for covered_dirs (a 9k-file index is ~10 ms).
+MAX_COVERAGE_ROWS = 200000
+# An index is PARTIAL (unfinished or broken build, e.g. 90 nodes / 2 File nodes for
+# 1146 hashed files next to a *.db.corrupt) when it has fewer graph nodes than hashed
+# files -- every healthy index on the owner's machine has >= 1 File node per hashed
+# file plus symbol nodes -- or when it is tiny (< PARTIAL_TINY_NODES) and a
+# same-root sibling is more than PARTIAL_SIBLING_RATIO times larger. pick() never
+# lets a partial index beat a whole one, and the guard only advises (never
+# denies) for a partial winner.
+PARTIAL_SIBLING_RATIO = 100
+PARTIAL_TINY_NODES = 1000
+# Extensions that make a top-level directory count as COVERED code (G1/G3 deny only
+# inside covered dirs). guard_core.CODE_EXTS is this same set.
+CODE_EXTS = frozenset({
+    "py", "pyi", "pyx", "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "go", "rs",
+    "java", "kt", "kts", "scala", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "cs", "fs",
+    "rb", "php", "swift", "m", "mm", "sh", "bash", "zsh", "ps1", "psm1", "psd1", "sql",
+    "vue", "svelte", "lua", "r", "jl", "dart", "ex", "exs", "erl", "hrl", "hs", "ml",
+    "mli", "clj", "cljs", "groovy", "pl", "pm", "css", "scss", "sass", "less", "html",
+    "htm", "tex", "ipynb", "proto", "tf", "nim", "zig", "sol",
+})
 _MAX_WALK = 128
 # Default MCP tool prefix when no local codebase-memory server is detected.
 DEFAULT_SERVER_PREFIX = "mcp__codebase-memory-mcp__"
@@ -280,10 +301,17 @@ def upper_env(env: dict[str, Any] | None) -> dict[str, str]:
 def guard_dir(env: dict[str, Any] | None) -> str | None:
     """The guard's state directory: ``%LOCALAPPDATA%/meridian/guard``.
 
+    ``MERIDIAN_GUARD_DIR`` overrides everything else when set (tests,
+    relocation) -- this is the single resolver ``guard_core`` uses for both
+    PreToolUse/PostToolUse and the briefs, so honouring it here is what keeps
+    every caller (not just ``session_brief``'s own wrapper) consistent.
     Without LOCALAPPDATA: ``<home>/AppData/Local/meridian/guard`` for a Windows
     home, else ``${XDG_STATE_HOME:-<home>/.local/state}/meridian/guard``.
     """
     e = upper_env(env)
+    override = norm_path(e.get("MERIDIAN_GUARD_DIR"), None, msys=True) if e.get("MERIDIAN_GUARD_DIR") else None
+    if override:
+        return override
     lad = norm_path(e.get("LOCALAPPDATA"), None, msys=True) if e.get("LOCALAPPDATA") else None
     if lad:
         return lad.rstrip("/") + "/meridian/guard"
@@ -532,7 +560,9 @@ def pick(cands: list[dict[str, Any]], *, pin_name: str | None = None) -> tuple[d
     """Break a same-root tie. Returns ``(winner, why, shadowed_names)``.
 
     Order: explicit pin > slug-name match > newest indexed_at > most nodes >
-    lexically smallest name (deterministic).
+    lexically smallest name (deterministic). A ``partial`` row (unfinished or
+    broken build, see :func:`mark_partial`) only wins when it is pinned or every
+    candidate is partial.
     """
     winner = None
     why = ""
@@ -541,13 +571,14 @@ def pick(cands: list[dict[str, Any]], *, pin_name: str | None = None) -> tuple[d
             if c["name"] == pin_name or c["name"].lower() == pin_name.lower():
                 winner, why = c, "pin"
                 break
+    pool = [c for c in cands if c.get("partial") is not True] or cands
     if winner is None:
-        slugged = sorted((c for c in cands if c.get("slug_match")), key=lambda c: c["name"])
+        slugged = sorted((c for c in pool if c.get("slug_match")), key=lambda c: c["name"])
         if slugged:
             winner, why = slugged[0], "slug-name match"
     if winner is None:
         ordered = sorted(
-            cands,
+            pool,
             key=lambda c: (-float(c.get("indexed_epoch") or 0), -int(c.get("nodes") or 0), c["name"]),
         )
         winner = ordered[0]
@@ -736,21 +767,46 @@ def read_db_row(db_path: str, *, timeout: float = SQLITE_TIMEOUT_S) -> dict[str,
         _name, indexed_at, root = chosen
         seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='nodes'").fetchone()
         covered: list[str] | None
+        files: int | None
         try:
-            cur = conn.execute(
-                "SELECT DISTINCT CASE WHEN instr(p, '/') > 0 THEN substr(p, 1, instr(p, '/') - 1) ELSE '' END "
-                "FROM (SELECT replace(rel_path, char(92), '/') AS p FROM file_hashes) LIMIT ?",
-                (MAX_COVERED_DIRS,),
-            )
-            covered = sorted({str(r[0]) for r in cur.fetchall() if r[0] is not None})
+            # A directory is covered only when it holds at least one CODE file, at
+            # ANY depth -- not just its top-level ancestor: data/output dirs
+            # (results/ of json+npz, paper/ of png/pdf/log) are hashed by the
+            # indexer but hold nothing search_code can answer better than Grep, so
+            # G1/G3 must not deny there, even when they nest under a covered
+            # top-level dir (e.g. src/data/ inside an otherwise code-covered src/).
+            # Every ANCESTOR of a code file's directory is recorded (including the
+            # repo root as "" and the immediate parent), so a G1/G3 check against
+            # the SPECIFIC target directory (not just its top segment) finds a hit
+            # exactly when the index has code at or under that directory.
+            cur = conn.execute("SELECT rel_path FROM file_hashes LIMIT ?", (MAX_COVERAGE_ROWS,))
+            dirs: set[str] = set()
+            files = 0
+            for (rp,) in cur:
+                files += 1
+                if not isinstance(rp, str) or len(dirs) >= MAX_COVERED_DIRS:
+                    continue
+                p = rp.replace("\\", "/")
+                base = p.rsplit("/", 1)[-1]
+                ext = base.rsplit(".", 1)[-1].lower() if "." in base.lstrip(".") else ""
+                if ext in CODE_EXTS:
+                    parent = p.rsplit("/", 1)[0] if "/" in p else ""
+                    segs = parent.split("/") if parent else []
+                    for depth in range(len(segs) + 1):
+                        dirs.add("/".join(segs[:depth]))
+                        if len(dirs) >= MAX_COVERED_DIRS:
+                            break
+            covered = sorted(dirs)
         except sqlite3.Error:
             covered = None
+            files = None
         return {
             "name": stem,
             "indexed_at": indexed_at if isinstance(indexed_at, str) else None,
             "root_path": root if isinstance(root, str) else None,
             "nodes": int(seq[0]) if seq and isinstance(seq[0], int) else 0,
             "covered_dirs": covered,
+            "files": files,
         }
     finally:
         conn.close()
@@ -764,6 +820,7 @@ def _row_from_read(db_path: str, info: dict[str, Any], sig: list[int]) -> dict[s
     if not db:
         return None
     covered = info.get("covered_dirs")
+    files = info.get("files")
     return {
         "name": info["name"],
         "root": root,
@@ -771,12 +828,27 @@ def _row_from_read(db_path: str, info: dict[str, Any], sig: list[int]) -> dict[s
         "indexed_at": info.get("indexed_at"),
         "indexed_epoch": parse_indexed_at(info.get("indexed_at")),
         "nodes": int(info.get("nodes") or 0),
+        "files": int(files) if isinstance(files, int) and not isinstance(files, bool) else None,
         "slug_match": info["name"] == slug(root),
         "covered_dirs": covered if isinstance(covered, list) else None,
         "db": db,
         "wal": db + "-wal",
         "sig": sig,
     }
+
+
+def mark_partial(rows: list[dict[str, Any]]) -> None:
+    """Set ``row['partial']`` on every row in place (see PARTIAL_SIBLING_RATIO)."""
+    biggest: dict[str, int] = {}
+    for r in rows:
+        k = r.get("root_key") or ""
+        biggest[k] = max(biggest.get(k, 0), int(r.get("nodes") or 0))
+    for r in rows:
+        nodes = int(r.get("nodes") or 0)
+        files = r.get("files")
+        few = isinstance(files, int) and not isinstance(files, bool) and files > 0 and nodes < files
+        dwarfed = nodes < PARTIAL_TINY_NODES and nodes * PARTIAL_SIBLING_RATIO < biggest.get(r.get("root_key") or "", 0)
+        r["partial"] = bool(few or dwarfed)
 
 
 def _mcp_server_names(mcp_servers: Any) -> list[str]:
@@ -935,6 +1007,7 @@ def build_snapshot(
             stats["dropped_missing_root"] += 1
             continue
         rows.append(row)
+    mark_partial(rows)
     home = home_dir(e)
     roots = sorted({r["root"] for r in rows})
     extra = [p for p in project_dirs if p]

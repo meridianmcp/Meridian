@@ -43,6 +43,8 @@
      "indexed_at": "2026-09-26T18:55:35Z",
      "indexed_epoch": 1790448935,
      "nodes": 30660,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -54,6 +56,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -75,6 +78,8 @@
      "indexed_at": "2026-08-03T18:02:37Z",
      "indexed_epoch": 1785780157,
      "nodes": 126821,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -109,6 +114,8 @@
      "indexed_at": "2026-09-04T12:00:00Z",
      "indexed_epoch": 1788523200,
      "nodes": 25457,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -134,6 +141,8 @@
      "indexed_at": "2026-09-02T16:00:45Z",
      "indexed_epoch": 1788364845,
      "nodes": 6584,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -159,6 +168,8 @@
      "indexed_at": "2026-09-26T17:22:25Z",
      "indexed_epoch": 1790443345,
      "nodes": 30399,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -170,6 +181,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -191,6 +203,8 @@
      "indexed_at": "2026-09-26T18:59:48Z",
      "indexed_epoch": 1790449188,
      "nodes": 65573,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -217,6 +231,8 @@
      "indexed_at": "2026-08-24T10:00:00Z",
      "indexed_epoch": 1787565600,
      "nodes": 4682,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -238,6 +254,8 @@
      "indexed_at": "2026-09-25T00:20:26Z",
      "indexed_epoch": 1790295626,
      "nodes": 492,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -259,6 +277,8 @@
      "indexed_at": "2026-08-19T17:11:50Z",
      "indexed_epoch": 1787159510,
      "nodes": 2394,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -282,6 +302,8 @@
      "indexed_at": "2026-08-06T13:18:41Z",
      "indexed_epoch": 1786022321,
      "nodes": 3592,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -326,6 +348,8 @@
      "indexed_at": "2026-08-03T18:02:37Z",
      "indexed_epoch": 1785780157,
      "nodes": 126821,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -360,6 +384,8 @@
      "indexed_at": "2026-09-04T12:00:00Z",
      "indexed_epoch": 1788523200,
      "nodes": 25457,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -385,6 +411,8 @@
      "indexed_at": "2026-09-02T16:00:45Z",
      "indexed_epoch": 1788364845,
      "nodes": 6584,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -410,6 +438,8 @@
      "indexed_at": "2026-09-26T17:22:25Z",
      "indexed_epoch": 1790443345,
      "nodes": 30399,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -421,6 +451,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -442,6 +473,8 @@
      "indexed_at": "2026-09-26T18:59:48Z",
      "indexed_epoch": 1790449188,
      "nodes": 65573,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -468,6 +501,8 @@
      "indexed_at": "2026-08-24T10:00:00Z",
      "indexed_epoch": 1787565600,
      "nodes": 4682,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -489,6 +524,8 @@
      "indexed_at": "2026-09-25T00:20:26Z",
      "indexed_epoch": 1790295626,
      "nodes": 492,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -510,6 +547,8 @@
      "indexed_at": "2026-08-19T17:11:50Z",
      "indexed_epoch": 1787159510,
      "nodes": 2394,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -533,6 +572,8 @@
      "indexed_at": "2026-08-06T13:18:41Z",
      "indexed_epoch": 1786022321,
      "nodes": 3592,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -577,6 +618,8 @@
      "indexed_at": "2026-09-26T18:55:35Z",
      "indexed_epoch": 1790448935,
      "nodes": 30660,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -588,6 +631,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -609,6 +653,8 @@
      "indexed_at": "2026-08-03T18:02:37Z",
      "indexed_epoch": 1785780157,
      "nodes": 126821,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -643,6 +689,8 @@
      "indexed_at": "2026-09-04T12:00:00Z",
      "indexed_epoch": 1788523200,
      "nodes": 25457,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -668,6 +716,8 @@
      "indexed_at": "2026-09-02T16:00:45Z",
      "indexed_epoch": 1788364845,
      "nodes": 6584,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -693,6 +743,8 @@
      "indexed_at": "2026-09-26T17:22:25Z",
      "indexed_epoch": 1790443345,
      "nodes": 30399,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -704,6 +756,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -725,6 +778,8 @@
      "indexed_at": "2026-09-26T18:59:48Z",
      "indexed_epoch": 1790449188,
      "nodes": 65573,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -751,6 +806,8 @@
      "indexed_at": "2026-08-24T10:00:00Z",
      "indexed_epoch": 1787565600,
      "nodes": 4682,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -772,6 +829,8 @@
      "indexed_at": "2026-09-25T00:20:26Z",
      "indexed_epoch": 1790295626,
      "nodes": 492,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -793,6 +852,8 @@
      "indexed_at": "2026-08-19T17:11:50Z",
      "indexed_epoch": 1787159510,
      "nodes": 2394,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -816,6 +877,8 @@
      "indexed_at": "2026-08-06T13:18:41Z",
      "indexed_epoch": 1786022321,
      "nodes": 3592,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -862,6 +925,8 @@
      "indexed_at": "2026-09-26T18:55:35Z",
      "indexed_epoch": 1790448935,
      "nodes": 30660,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -873,6 +938,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -894,6 +960,8 @@
      "indexed_at": "2026-08-03T18:02:37Z",
      "indexed_epoch": 1785780157,
      "nodes": 126821,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -928,6 +996,8 @@
      "indexed_at": "2026-09-04T12:00:00Z",
      "indexed_epoch": 1788523200,
      "nodes": 25457,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -953,6 +1023,8 @@
      "indexed_at": "2026-09-02T16:00:45Z",
      "indexed_epoch": 1788364845,
      "nodes": 6584,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -978,6 +1050,8 @@
      "indexed_at": "2026-09-26T17:22:25Z",
      "indexed_epoch": 1790443345,
      "nodes": 30399,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -989,6 +1063,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -1010,6 +1085,8 @@
      "indexed_at": "2026-09-26T18:59:48Z",
      "indexed_epoch": 1790449188,
      "nodes": 65573,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1036,6 +1113,8 @@
      "indexed_at": "2026-08-24T10:00:00Z",
      "indexed_epoch": 1787565600,
      "nodes": 4682,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1057,6 +1136,8 @@
      "indexed_at": "2026-09-25T00:20:26Z",
      "indexed_epoch": 1790295626,
      "nodes": 492,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1078,6 +1159,8 @@
      "indexed_at": "2026-08-19T17:11:50Z",
      "indexed_epoch": 1787159510,
      "nodes": 2394,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1101,6 +1184,8 @@
      "indexed_at": "2026-08-06T13:18:41Z",
      "indexed_epoch": 1786022321,
      "nodes": 3592,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1147,6 +1232,8 @@
      "indexed_at": "2026-09-26T18:55:35Z",
      "indexed_epoch": 1790448935,
      "nodes": 30660,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1158,6 +1245,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -1179,6 +1267,8 @@
      "indexed_at": "2026-08-03T18:02:37Z",
      "indexed_epoch": 1785780157,
      "nodes": 126821,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1213,6 +1303,8 @@
      "indexed_at": "2026-09-04T12:00:00Z",
      "indexed_epoch": 1788523200,
      "nodes": 25457,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1238,6 +1330,8 @@
      "indexed_at": "2026-09-02T16:00:45Z",
      "indexed_epoch": 1788364845,
      "nodes": 6584,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1263,6 +1357,8 @@
      "indexed_at": "2026-09-26T17:22:25Z",
      "indexed_epoch": 1790443345,
      "nodes": 30399,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1274,6 +1370,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -1295,6 +1392,8 @@
      "indexed_at": "2026-09-26T18:59:48Z",
      "indexed_epoch": 1790449188,
      "nodes": 65573,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1321,6 +1420,8 @@
      "indexed_at": "2026-08-24T10:00:00Z",
      "indexed_epoch": 1787565600,
      "nodes": 4682,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1342,6 +1443,8 @@
      "indexed_at": "2026-09-25T00:20:26Z",
      "indexed_epoch": 1790295626,
      "nodes": 492,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1363,6 +1466,8 @@
      "indexed_at": "2026-08-19T17:11:50Z",
      "indexed_epoch": 1787159510,
      "nodes": 2394,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1386,6 +1491,8 @@
      "indexed_at": "2026-08-06T13:18:41Z",
      "indexed_epoch": 1786022321,
      "nodes": 3592,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1432,6 +1539,8 @@
      "indexed_at": "2026-09-26T18:55:35Z",
      "indexed_epoch": 1790448935,
      "nodes": 30660,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1443,6 +1552,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -1464,6 +1574,8 @@
      "indexed_at": "2026-08-03T18:02:37Z",
      "indexed_epoch": 1785780157,
      "nodes": 126821,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1498,6 +1610,8 @@
      "indexed_at": "2026-09-04T12:00:00Z",
      "indexed_epoch": 1788523200,
      "nodes": 25457,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1523,6 +1637,8 @@
      "indexed_at": "2026-09-02T16:00:45Z",
      "indexed_epoch": 1788364845,
      "nodes": 6584,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1548,6 +1664,8 @@
      "indexed_at": "2026-09-26T17:22:25Z",
      "indexed_epoch": 1790443345,
      "nodes": 30399,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1559,6 +1677,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -1580,6 +1699,8 @@
      "indexed_at": "2026-09-26T18:59:48Z",
      "indexed_epoch": 1790449188,
      "nodes": 65573,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1606,6 +1727,8 @@
      "indexed_at": "2026-08-24T10:00:00Z",
      "indexed_epoch": 1787565600,
      "nodes": 4682,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1627,6 +1750,8 @@
      "indexed_at": "2026-09-25T00:20:26Z",
      "indexed_epoch": 1790295626,
      "nodes": 492,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1648,6 +1773,8 @@
      "indexed_at": "2026-08-19T17:11:50Z",
      "indexed_epoch": 1787159510,
      "nodes": 2394,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1671,6 +1798,8 @@
      "indexed_at": "2026-08-06T13:18:41Z",
      "indexed_epoch": 1786022321,
      "nodes": 3592,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1705,10 +1834,10 @@
    },
    "automem_dirs": []
   },
-  "missing": null,
-  "corrupt_string": "this is not a snapshot",
-  "wrong_schema": {
-   "schema": "something-else/9",
+  "partial_slug_live": {
+   "schema": "meridian-guard-snapshot/1",
+   "built_at": 1790449200,
+   "cache_dir": "C:/Users/13144/.cache/codebase-memory-mcp",
    "rows": [
     {
      "name": "C-Users-13144-Documents-Meridian-repository",
@@ -1716,7 +1845,9 @@
      "root_key": "c:/users/13144/documents/meridian/repository",
      "indexed_at": "2026-09-26T18:55:35Z",
      "indexed_epoch": 1790448935,
-     "nodes": 30660,
+     "nodes": 90,
+     "files": 1146,
+     "partial": true,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1728,6 +1859,7 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -1749,6 +1881,824 @@
      "indexed_at": "2026-08-03T18:02:37Z",
      "indexed_epoch": 1785780157,
      "nodes": 126821,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".codex",
+      ".github",
+      "android",
+      "docs",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "npm",
+      "packages",
+      "scripts",
+      "tests"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-repo.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-repo.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-build",
+     "root": "C:/Users/13144/Documents/Meridian/repository/meridian",
+     "root_key": "c:/users/13144/documents/meridian/repository/meridian",
+     "indexed_at": "2026-09-02T16:00:45Z",
+     "indexed_epoch": 1788364845,
+     "nodes": 6584,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "db",
+      "integrations",
+      "mcp",
+      "routes",
+      "templates"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-dev-crossref-core",
+     "root": "C:/Users/13144/Documents/Meridian/worktrees/crossref-core-paper-search",
+     "root_key": "c:/users/13144/documents/meridian/worktrees/crossref-core-paper-search",
+     "indexed_at": "2026-09-26T17:22:25Z",
+     "indexed_epoch": 1790443345,
+     "nodes": 30399,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-09-26T18:59:48Z",
+     "indexed_epoch": 1790449188,
+     "nodes": 65573,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "paper",
+      "reference",
+      "results",
+      "scripts",
+      "src",
+      "tests"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-08-24T10:00:00Z",
+     "indexed_epoch": 1787565600,
+     "nodes": 4682,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "src"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-round3_interview",
+     "root": "C:/Users/13144/Documents/round3_interview",
+     "root_key": "c:/users/13144/documents/round3_interview",
+     "indexed_at": "2026-09-25T00:20:26Z",
+     "indexed_epoch": 1790295626,
+     "nodes": 492,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "sub"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-19T17:11:50Z",
+     "indexed_epoch": 1787159510,
+     "nodes": 2394,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "test"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "Camerer_MS_Graduation_2026",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-06T13:18:41Z",
+     "indexed_epoch": 1786022321,
+     "nodes": 3592,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "scripts",
+      "test",
+      "tools"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    }
+   ],
+   "pins": {},
+   "servers": {
+    "user": [
+     "codebase-memory-mcp"
+    ],
+    "projects": {
+     "c:/users/13144/documents/meridian/repository": [
+      "codebase-memory"
+     ]
+    }
+   },
+   "automem_dirs": []
+  },
+  "partial_slug_fresh_dup": {
+   "schema": "meridian-guard-snapshot/1",
+   "built_at": 1790449200,
+   "cache_dir": "C:/Users/13144/.cache/codebase-memory-mcp",
+   "rows": [
+    {
+     "name": "C-Users-13144-Documents-Meridian-repository",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-09-26T18:55:35Z",
+     "indexed_epoch": 1790448935,
+     "nodes": 90,
+     "files": 1146,
+     "partial": true,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-repo",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-09-26T12:00:00Z",
+     "indexed_epoch": 1790424000,
+     "nodes": 126821,
+     "files": 4908,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".codex",
+      ".github",
+      "meridian",
+      "tests",
+      "extensions"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-repo.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-repo.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-build",
+     "root": "C:/Users/13144/Documents/Meridian/repository/meridian",
+     "root_key": "c:/users/13144/documents/meridian/repository/meridian",
+     "indexed_at": "2026-09-02T16:00:45Z",
+     "indexed_epoch": 1788364845,
+     "nodes": 6584,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "db",
+      "integrations",
+      "mcp",
+      "routes",
+      "templates"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-dev-crossref-core",
+     "root": "C:/Users/13144/Documents/Meridian/worktrees/crossref-core-paper-search",
+     "root_key": "c:/users/13144/documents/meridian/worktrees/crossref-core-paper-search",
+     "indexed_at": "2026-09-26T17:22:25Z",
+     "indexed_epoch": 1790443345,
+     "nodes": 30399,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-09-26T18:59:48Z",
+     "indexed_epoch": 1790449188,
+     "nodes": 65573,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "paper",
+      "reference",
+      "results",
+      "scripts",
+      "src",
+      "tests"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-08-24T10:00:00Z",
+     "indexed_epoch": 1787565600,
+     "nodes": 4682,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "src"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-round3_interview",
+     "root": "C:/Users/13144/Documents/round3_interview",
+     "root_key": "c:/users/13144/documents/round3_interview",
+     "indexed_at": "2026-09-25T00:20:26Z",
+     "indexed_epoch": 1790295626,
+     "nodes": 492,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "sub"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-19T17:11:50Z",
+     "indexed_epoch": 1787159510,
+     "nodes": 2394,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "test"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "Camerer_MS_Graduation_2026",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-06T13:18:41Z",
+     "indexed_epoch": 1786022321,
+     "nodes": 3592,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "scripts",
+      "test",
+      "tools"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    }
+   ],
+   "pins": {},
+   "servers": {
+    "user": [
+     "codebase-memory-mcp"
+    ],
+    "projects": {
+     "c:/users/13144/documents/meridian/repository": [
+      "codebase-memory"
+     ]
+    }
+   },
+   "automem_dirs": []
+  },
+  "all_partial": {
+   "schema": "meridian-guard-snapshot/1",
+   "built_at": 1790449200,
+   "cache_dir": "C:/Users/13144/.cache/codebase-memory-mcp",
+   "rows": [
+    {
+     "name": "C-Users-13144-Documents-Meridian-repository",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-09-26T18:55:35Z",
+     "indexed_epoch": 1790448935,
+     "nodes": 90,
+     "files": 1146,
+     "partial": true,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-build",
+     "root": "C:/Users/13144/Documents/Meridian/repository/meridian",
+     "root_key": "c:/users/13144/documents/meridian/repository/meridian",
+     "indexed_at": "2026-09-02T16:00:45Z",
+     "indexed_epoch": 1788364845,
+     "nodes": 6584,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "db",
+      "integrations",
+      "mcp",
+      "routes",
+      "templates"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-dev-crossref-core",
+     "root": "C:/Users/13144/Documents/Meridian/worktrees/crossref-core-paper-search",
+     "root_key": "c:/users/13144/documents/meridian/worktrees/crossref-core-paper-search",
+     "indexed_at": "2026-09-26T17:22:25Z",
+     "indexed_epoch": 1790443345,
+     "nodes": 30399,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-09-26T18:59:48Z",
+     "indexed_epoch": 1790449188,
+     "nodes": 65573,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "paper",
+      "reference",
+      "results",
+      "scripts",
+      "src",
+      "tests"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-08-24T10:00:00Z",
+     "indexed_epoch": 1787565600,
+     "nodes": 4682,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "src"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-round3_interview",
+     "root": "C:/Users/13144/Documents/round3_interview",
+     "root_key": "c:/users/13144/documents/round3_interview",
+     "indexed_at": "2026-09-25T00:20:26Z",
+     "indexed_epoch": 1790295626,
+     "nodes": 492,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "sub"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-19T17:11:50Z",
+     "indexed_epoch": 1787159510,
+     "nodes": 2394,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "test"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "Camerer_MS_Graduation_2026",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-06T13:18:41Z",
+     "indexed_epoch": 1786022321,
+     "nodes": 3592,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "scripts",
+      "test",
+      "tools"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    }
+   ],
+   "pins": {},
+   "servers": {
+    "user": [
+     "codebase-memory-mcp"
+    ],
+    "projects": {
+     "c:/users/13144/documents/meridian/repository": [
+      "codebase-memory"
+     ]
+    }
+   },
+   "automem_dirs": []
+  },
+  "dnabert_code_coverage": {
+   "schema": "meridian-guard-snapshot/1",
+   "built_at": 1790449200,
+   "cache_dir": "C:/Users/13144/.cache/codebase-memory-mcp",
+   "rows": [
+    {
+     "name": "C-Users-13144-Documents-dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-09-26T18:59:48Z",
+     "indexed_epoch": 1790449188,
+     "nodes": 65573,
+     "files": 408,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "reference",
+      "scripts",
+      "src",
+      "tests"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-Meridian-repository",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-09-26T18:55:35Z",
+     "indexed_epoch": 1790448935,
+     "nodes": 30660,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-repo",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-08-03T18:02:37Z",
+     "indexed_epoch": 1785780157,
+     "nodes": 126821,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1783,6 +2733,8 @@
      "indexed_at": "2026-09-04T12:00:00Z",
      "indexed_epoch": 1788523200,
      "nodes": 25457,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1808,6 +2760,8 @@
      "indexed_at": "2026-09-02T16:00:45Z",
      "indexed_epoch": 1788364845,
      "nodes": 6584,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1833,6 +2787,8 @@
      "indexed_at": "2026-09-26T17:22:25Z",
      "indexed_epoch": 1790443345,
      "nodes": 30399,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1844,6 +2800,588 @@
       "hooks",
       "k6",
       "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-08-24T10:00:00Z",
+     "indexed_epoch": 1787565600,
+     "nodes": 4682,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "src"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-round3_interview",
+     "root": "C:/Users/13144/Documents/round3_interview",
+     "root_key": "c:/users/13144/documents/round3_interview",
+     "indexed_at": "2026-09-25T00:20:26Z",
+     "indexed_epoch": 1790295626,
+     "nodes": 492,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "sub"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-19T17:11:50Z",
+     "indexed_epoch": 1787159510,
+     "nodes": 2394,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "test"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "Camerer_MS_Graduation_2026",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-06T13:18:41Z",
+     "indexed_epoch": 1786022321,
+     "nodes": 3592,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "scripts",
+      "test",
+      "tools"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    }
+   ],
+   "pins": {},
+   "servers": {
+    "user": [
+     "codebase-memory-mcp"
+    ],
+    "projects": {
+     "c:/users/13144/documents/meridian/repository": [
+      "codebase-memory"
+     ]
+    }
+   },
+   "automem_dirs": []
+  },
+  "dnabert_nested_data_coverage": {
+   "schema": "meridian-guard-snapshot/1",
+   "built_at": 1790449200,
+   "cache_dir": "C:/Users/13144/.cache/codebase-memory-mcp",
+   "rows": [
+    {
+     "name": "C-Users-13144-Documents-dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-09-26T18:59:48Z",
+     "indexed_epoch": 1790449188,
+     "nodes": 65573,
+     "files": 412,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "reference",
+      "scripts",
+      "src",
+      "src/models",
+      "tests"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-Meridian-repository",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-09-26T18:55:35Z",
+     "indexed_epoch": 1790448935,
+     "nodes": 30660,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-repo",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-08-03T18:02:37Z",
+     "indexed_epoch": 1785780157,
+     "nodes": 126821,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".codex",
+      ".github",
+      "android",
+      "docs",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "npm",
+      "packages",
+      "scripts",
+      "tests"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-repo.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-repo.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-main",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-09-04T12:00:00Z",
+     "indexed_epoch": 1788523200,
+     "nodes": 25457,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".github",
+      "meridian",
+      "tests",
+      "scripts",
+      "extensions"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-main.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-main.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-build",
+     "root": "C:/Users/13144/Documents/Meridian/repository/meridian",
+     "root_key": "c:/users/13144/documents/meridian/repository/meridian",
+     "indexed_at": "2026-09-02T16:00:45Z",
+     "indexed_epoch": 1788364845,
+     "nodes": 6584,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "db",
+      "integrations",
+      "mcp",
+      "routes",
+      "templates"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-dev-crossref-core",
+     "root": "C:/Users/13144/Documents/Meridian/worktrees/crossref-core-paper-search",
+     "root_key": "c:/users/13144/documents/meridian/worktrees/crossref-core-paper-search",
+     "indexed_at": "2026-09-26T17:22:25Z",
+     "indexed_epoch": 1790443345,
+     "nodes": 30399,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-dev-crossref-core.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "dnabert-error-correction",
+     "root": "C:/Users/13144/Documents/dnabert-error-correction",
+     "root_key": "c:/users/13144/documents/dnabert-error-correction",
+     "indexed_at": "2026-08-24T10:00:00Z",
+     "indexed_epoch": 1787565600,
+     "nodes": 4682,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "src"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/dnabert-error-correction.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-round3_interview",
+     "root": "C:/Users/13144/Documents/round3_interview",
+     "root_key": "c:/users/13144/documents/round3_interview",
+     "indexed_at": "2026-09-25T00:20:26Z",
+     "indexed_epoch": 1790295626,
+     "nodes": 492,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      "sub"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-round3_interview.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-19T17:11:50Z",
+     "indexed_epoch": 1787159510,
+     "nodes": 2394,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "test"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Masters_Thesis-CURRENT_PROJECT_CODE-width_baseline_generator.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "Camerer_MS_Graduation_2026",
+     "root": "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE",
+     "root_key": "c:/users/13144/documents/masters_thesis/current_project_code",
+     "indexed_at": "2026-08-06T13:18:41Z",
+     "indexed_epoch": 1786022321,
+     "nodes": 3592,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "helpers",
+      "cracktools",
+      "scripts",
+      "test",
+      "tools"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/Camerer_MS_Graduation_2026.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    }
+   ],
+   "pins": {},
+   "servers": {
+    "user": [
+     "codebase-memory-mcp"
+    ],
+    "projects": {
+     "c:/users/13144/documents/meridian/repository": [
+      "codebase-memory"
+     ]
+    }
+   },
+   "automem_dirs": []
+  },
+  "missing": null,
+  "corrupt_string": "this is not a snapshot",
+  "wrong_schema": {
+   "schema": "something-else/9",
+   "rows": [
+    {
+     "name": "C-Users-13144-Documents-Meridian-repository",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-09-26T18:55:35Z",
+     "indexed_epoch": 1790448935,
+     "nodes": 30660,
+     "files": null,
+     "partial": false,
+     "slug_match": true,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
+      "npm",
+      "packages",
+      "tests",
+      "workspace"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/C-Users-13144-Documents-Meridian-repository.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-repo",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-08-03T18:02:37Z",
+     "indexed_epoch": 1785780157,
+     "nodes": 126821,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".codex",
+      ".github",
+      "android",
+      "docs",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "npm",
+      "packages",
+      "scripts",
+      "tests"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-repo.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-repo.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-main",
+     "root": "C:/Users/13144/Documents/Meridian/repository",
+     "root_key": "c:/users/13144/documents/meridian/repository",
+     "indexed_at": "2026-09-04T12:00:00Z",
+     "indexed_epoch": 1788523200,
+     "nodes": 25457,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".github",
+      "meridian",
+      "tests",
+      "scripts",
+      "extensions"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-main.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-main.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-build",
+     "root": "C:/Users/13144/Documents/Meridian/repository/meridian",
+     "root_key": "c:/users/13144/documents/meridian/repository/meridian",
+     "indexed_at": "2026-09-02T16:00:45Z",
+     "indexed_epoch": 1788364845,
+     "nodes": 6584,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      "db",
+      "integrations",
+      "mcp",
+      "routes",
+      "templates"
+     ],
+     "db": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db",
+     "wal": "C:/Users/13144/.cache/codebase-memory-mcp/meridian-build.db-wal",
+     "sig": [
+      1,
+      1,
+      0,
+      1
+     ]
+    },
+    {
+     "name": "meridian-dev-crossref-core",
+     "root": "C:/Users/13144/Documents/Meridian/worktrees/crossref-core-paper-search",
+     "root_key": "c:/users/13144/documents/meridian/worktrees/crossref-core-paper-search",
+     "indexed_at": "2026-09-26T17:22:25Z",
+     "indexed_epoch": 1790443345,
+     "nodes": 30399,
+     "files": null,
+     "partial": false,
+     "slug_match": false,
+     "covered_dirs": [
+      "",
+      ".agents",
+      ".github",
+      "android",
+      "dxt",
+      "extensions",
+      "hooks",
+      "k6",
+      "meridian",
+      "meridian/db",
       "npm",
       "packages",
       "tests",
@@ -1865,6 +3403,8 @@
      "indexed_at": "2026-09-26T18:59:48Z",
      "indexed_epoch": 1790449188,
      "nodes": 65573,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1891,6 +3431,8 @@
      "indexed_at": "2026-08-24T10:00:00Z",
      "indexed_epoch": 1787565600,
      "nodes": 4682,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1912,6 +3454,8 @@
      "indexed_at": "2026-09-25T00:20:26Z",
      "indexed_epoch": 1790295626,
      "nodes": 492,
+     "files": null,
+     "partial": false,
      "slug_match": true,
      "covered_dirs": [
       "",
@@ -1933,6 +3477,8 @@
      "indexed_at": "2026-08-19T17:11:50Z",
      "indexed_epoch": 1787159510,
      "nodes": 2394,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -1956,6 +3502,8 @@
      "indexed_at": "2026-08-06T13:18:41Z",
      "indexed_epoch": 1786022321,
      "nodes": 3592,
+     "files": null,
+     "partial": false,
      "slug_match": false,
      "covered_dirs": [
       "",
@@ -2010,6 +3558,7 @@
     "C:/Users/13144/Documents/Meridian/worktrees/crossref-core-paper-search/meridian",
     "C:/Users/13144/Documents/dnabert-error-correction/.git",
     "C:/Users/13144/Documents/dnabert-error-correction/paper",
+    "C:/Users/13144/Documents/dnabert-error-correction/results",
     "C:/Users/13144/Documents/meridian-latex/.git",
     "C:/Users/13144/Documents/round3_interview/sub",
     "C:/Users/13144/Documents/Masters_Thesis/CURRENT_PROJECT_CODE/.git",
@@ -8162,6 +9711,296 @@
    "expected_rule": "G7"
   },
   {
+   "name": "G7_deny_sed_inplace_suffix",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "sed -i.bak 's/a/b/' ~/.claude/projects/foo/memory/MEMORY.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_deny_find_delete",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "find ~/.claude/projects/foo/memory -name '*.md' -delete"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_deny_cd_find_exec_rm",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "cd ~/.claude/projects/foo/memory && find . -name '*.md' -exec rm {} +"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_deny_gawk_inplace",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "gawk -i inplace '{print}' ~/.claude/projects/foo/memory/MEMORY.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_deny_cp_into",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "cp C:/Users/13144/AppData/Local/Temp/claude/C--Users-13144-Documents-Meridian-repository/dd6978a9-46e6-438b-8fad-4dea3335489f/scratchpad/x.md ~/.claude/projects/foo/memory/x.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_deny_cp_target_dir_into",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "cp -t ~/.claude/projects/foo/memory a.md b.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_deny_copy_item_named_dest_into",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "PowerShell",
+    "tool_input": {
+     "command": "Copy-Item -Path a.md -Destination $env:USERPROFILE\\.claude\\projects\\foo\\memory\\a.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_deny_mv_out_removes_source",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "mv ~/.claude/projects/foo/memory/a.md /tmp/a.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_deny_rsync_remove_source",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "rsync --remove-source-files ~/.claude/projects/foo/memory/a.md /tmp/"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7"
+  },
+  {
+   "name": "G7_too_big_names_memory_denied",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "echo w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w > ~/.claude/projects/foo/memory/x.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7",
+   "expected_reason_contains": [
+    "too large"
+   ]
+  },
+  {
+   "name": "G7_too_big_chars_heredoc_into_memory",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "cat > ~/.claude/projects/foo/memory/x.md <<'EOF'\nyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\nEOF"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G7",
+   "expected_reason_contains": [
+    "too large"
+   ]
+  },
+  {
+   "name": "G7_too_big_without_memory_allowed",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "echo w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w | grep memory_notes"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G9_too_big_names_guard_denied",
+   "group": "G9",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "echo w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w > \"$LOCALAPPDATA/meridian/guard/guard.off\""
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G9",
+   "expected_reason_contains": [
+    "too large"
+   ]
+  },
+  {
+   "name": "G3_too_big_search_allowed",
+   "group": "G3",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "grep -rn arxiv_search . --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x --include=x "
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "note": "documented residual: a command over the analysis cap is not searched for G3"
+  },
+  {
    "name": "G7_deny_dc_start_process",
    "group": "G7",
    "source": "rule",
@@ -8372,6 +10211,186 @@
     "tool_name": "Bash",
     "tool_input": {
      "command": "cat ~/.claude/projects/foo/memory/MEMORY.md > /tmp/mem_copy.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_sed_n",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "sed -n '1,40p' ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_find_mtime",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "find ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory -name '*.md' -mtime -7"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_awk_head",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "awk 'NR<=20' ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_diff_backup",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "diff ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md C:/Users/13144/AppData/Local/Temp/claude/C--Users-13144-Documents-Meridian-repository/dd6978a9-46e6-438b-8fad-4dea3335489f/scratchpad/memory_backup.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_cp_out_to_scratchpad",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "cp ~/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md C:/Users/13144/AppData/Local/Temp/claude/C--Users-13144-Documents-Meridian-repository/dd6978a9-46e6-438b-8fad-4dea3335489f/scratchpad/mem_snapshot.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_copy_item_out",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "PowerShell",
+    "tool_input": {
+     "command": "Copy-Item C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/MEMORY.md C:/Users/13144/AppData/Local/Temp/claude/C--Users-13144-Documents-Meridian-repository/dd6978a9-46e6-438b-8fad-4dea3335489f/scratchpad/mem_snapshot2.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_copy_item_named_dest_out",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "PowerShell",
+    "tool_input": {
+     "command": "Copy-Item -Destination C:/Users/13144/AppData/Local/Temp/claude/C--Users-13144-Documents-Meridian-repository/dd6978a9-46e6-438b-8fad-4dea3335489f/scratchpad/m.md -Path ~/.claude/projects/foo/memory/MEMORY.md"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_cd_find_list",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "cd ~/.claude/projects/foo/memory && find . -name '*.md'"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G7_allow_head_tail",
+   "group": "G7",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "head -5 ~/.claude/projects/foo/memory/MEMORY.md && tail -5 ~/.claude/projects/foo/memory/MEMORY.md"
     },
     "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
    },
@@ -9342,7 +11361,7 @@
    }
   },
   {
-   "name": "G11_arxiv_fetch_denied",
+   "name": "G11_arxiv_abs_allowed",
    "group": "G11",
    "source": "rule",
    "event": "PreToolUse",
@@ -9353,6 +11372,36 @@
     "tool_input": {
      "url": "https://arxiv.org/abs/2401.01234",
      "prompt": "summarize"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   },
+   "note": "one specific paper: paper_search cannot return its full text"
+  },
+  {
+   "name": "G11_arxiv_list_denied",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://arxiv.org/list/cs.LG/recent",
+     "prompt": "x"
     },
     "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
    },
@@ -9400,7 +11449,7 @@
    }
   },
   {
-   "name": "G11_doi_fetch_denied",
+   "name": "G11_doi_fetch_allowed",
    "group": "G11",
    "source": "rule",
    "event": "PreToolUse",
@@ -9410,6 +11459,64 @@
     "tool_name": "WebFetch",
     "tool_input": {
      "url": "https://doi.org/10.1145/1234",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_pubmed_record_allowed",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://pubmed.ncbi.nlm.nih.gov/12345/",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_pubmed_search_denied",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://pubmed.ncbi.nlm.nih.gov/?term=dnabert",
      "prompt": "x"
     },
     "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
@@ -9429,7 +11536,7 @@
    }
   },
   {
-   "name": "G11_pubmed_fetch_denied",
+   "name": "G11_allow_openalex_docs",
    "group": "G11",
    "source": "rule",
    "event": "PreToolUse",
@@ -9438,7 +11545,355 @@
     "hook_event_name": "PreToolUse",
     "tool_name": "WebFetch",
     "tool_input": {
-     "url": "https://pubmed.ncbi.nlm.nih.gov/12345/",
+     "url": "https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_openalex_help",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://help.openalex.org/hc/en-us",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_openalex_blog",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://blog.openalex.org/",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_arxiv_info_manual",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://info.arxiv.org/help/api/user-manual.html",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_arxiv_status",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://status.arxiv.org/",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_s2_api_docs",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://api.semanticscholar.org/api-docs/",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_s2_product_api",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://www.semanticscholar.org/product/api",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_doi_handbook",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://www.doi.org/the-identifier/resources/handbook",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_arxiv_html_full_text",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://arxiv.org/html/2306.15006v2",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_doi_bibliography_check",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://doi.org/10.1093/bioinformatics/btab083",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_openalex_single_work",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://api.openalex.org/works/W2741809807",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allow_github_issue_search",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://github.com/search?q=repo%3Aanthropics%2Fclaude-code+powershell+hook&type=issues",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_openalex_works_search_denied",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://api.openalex.org/works?search=dnabert&per-page=1",
      "prompt": "x"
     },
     "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
@@ -9456,6 +11911,143 @@
      ]
     ]
    }
+  },
+  {
+   "name": "G11_s2_paper_search_api_denied",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://api.semanticscholar.org/graph/v1/paper/search?query=dnabert",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G11",
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_github_api_repo_search_denied",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://api.github.com/search/repositories?q=mcp",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G11",
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_github_code_search_denied",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebFetch",
+    "tool_input": {
+     "url": "https://github.com/search?q=guard&type=code",
+     "prompt": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G11",
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_bibtex_lookup_allowed",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebSearch",
+    "tool_input": {
+     "query": "Ji et al 2021 DNABERT bibtex"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_start_session_alone_does_not_arm",
+   "group": "G11",
+   "source": "rule",
+   "event": "PostToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PostToolUse",
+    "tool_name": "mcp__meridian__start_session",
+    "tool_input": {
+     "project_id": "5787cc92-ba7d-4788-b17c-28ab7938b839"
+    },
+    "tool_response": "{\"session_id\": \"abc\"}",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "note": "only paper_search/github_search receipts arm G11"
   },
   {
    "name": "G11_github_search_denied",
@@ -10129,7 +12721,7 @@
    "expected_rule": "G14"
   },
   {
-   "name": "G14_clean_start_session_is_receipt",
+   "name": "G14_clean_start_session_no_receipt",
    "group": "G14",
    "source": "rule",
    "event": "PostToolUse",
@@ -10147,7 +12739,7 @@
    "fs_key": "machine_2026_09_26",
    "env": {},
    "expected_decision": "allow",
-   "expected_rule": "G13"
+   "expected_rule": null
   },
   {
    "name": "G14_content_blocks",
@@ -10693,6 +13285,37 @@
    }
   },
   {
+   "name": "escape_consult_same_root_duplicate",
+   "group": "escape",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": "G1",
+   "state": {
+    "code_receipts": [
+     [
+      1790452740,
+      true,
+      "meridian-repo"
+     ]
+    ]
+   }
+  },
+  {
    "name": "breaker_fourth_code_deny_injects",
    "group": "breaker",
    "source": "rule",
@@ -10791,6 +13414,376 @@
    "state": {
     "denies": 5
    }
+  },
+  {
+   "name": "partial_live_D1_advises_stale_whole_index",
+   "group": "partial",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "partial_slug_live",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G2",
+   "expected_project": "meridian-repo",
+   "expected_reason_contains": [
+    "index_repository"
+   ],
+   "expected_reason_excludes": [
+    "project='C-Users-13144-Documents-Meridian-repository'"
+   ],
+   "note": "live 2026-09-27: the 90-node slug index must not win; the whole (stale) index is named, no deny"
+  },
+  {
+   "name": "partial_fresh_dup_D1_denies_toward_whole_index",
+   "group": "partial",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "partial_slug_fresh_dup",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G1",
+   "expected_project": "meridian-repo",
+   "expected_reason_contains": [
+    "project='meridian-repo'",
+    "Do NOT use project=C-Users-13144-Documents-Meridian-repository"
+   ],
+   "expected_reason_excludes": [
+    "project='C-Users-13144-Documents-Meridian-repository'"
+   ]
+  },
+  {
+   "name": "partial_fresh_dup_G5_whole_index_allowed",
+   "group": "partial",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "mcp__codebase-memory__search_code",
+    "tool_input": {
+     "project": "meridian-repo",
+     "pattern": "def arxiv_search",
+     "mode": "files"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "partial_slug_fresh_dup",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "partial_fresh_dup_G5_partial_index_denied",
+   "group": "partial",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "mcp__codebase-memory__search_code",
+    "tool_input": {
+     "project": "C-Users-13144-Documents-Meridian-repository",
+     "pattern": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "partial_slug_fresh_dup",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G5",
+   "expected_project": "meridian-repo",
+   "expected_reason_contains": [
+    "incomplete",
+    "Retry with project='meridian-repo'"
+   ]
+  },
+  {
+   "name": "partial_live_G5_whole_index_allowed",
+   "group": "partial",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "mcp__codebase-memory__search_code",
+    "tool_input": {
+     "project": "meridian-repo",
+     "pattern": "def arxiv_search",
+     "mode": "files"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "partial_slug_live",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "partial_all_partial_advises",
+   "group": "partial",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "all_partial",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G2",
+   "expected_project": "C-Users-13144-Documents-Meridian-repository",
+   "expected_reason_contains": [
+    "incomplete",
+    "index_repository"
+   ]
+  },
+  {
+   "name": "partial_all_partial_G5_allowed",
+   "group": "partial",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "mcp__codebase-memory__search_code",
+    "tool_input": {
+     "project": "C-Users-13144-Documents-Meridian-repository",
+     "pattern": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "all_partial",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "partial_subagent_brief_names_whole_index",
+   "group": "G16",
+   "source": "rule",
+   "event": "SubagentStart",
+   "payload": {
+    "session_id": "s",
+    "hook_event_name": "SubagentStart",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "partial_slug_fresh_dup",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G16",
+   "expected_reason_contains": [
+    "project='meridian-repo'",
+    "(not C-Users-13144-Documents-Meridian-repository)"
+   ]
+  },
+  {
+   "name": "partial_session_brief_flags_incomplete",
+   "group": "G15",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "s",
+    "hook_event_name": "SessionStart",
+    "source": "startup",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "all_partial",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G15",
+   "expected_reason_contains": [
+    "INCOMPLETE"
+   ]
+  },
+  {
+   "name": "coverage_results_dir_not_denied",
+   "group": "G2",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "accuracy",
+     "path": "C:/Users/13144/Documents/dnabert-error-correction/results"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "dnabert_code_coverage",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G2",
+   "expected_project": "C-Users-13144-Documents-dnabert-error-correction"
+  },
+  {
+   "name": "coverage_paper_tex_glob_not_denied",
+   "group": "G2",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "\\\\cite\\{",
+     "path": "C:/Users/13144/Documents/dnabert-error-correction/paper",
+     "glob": "*.tex"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "dnabert_code_coverage",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G2",
+   "expected_project": "C-Users-13144-Documents-dnabert-error-correction"
+  },
+  {
+   "name": "coverage_bash_grep_results_not_denied",
+   "group": "G2",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "grep -rn 'val_f1' results/"
+    },
+    "cwd": "C:/Users/13144/Documents/dnabert-error-correction"
+   },
+   "snapshot_key": "dnabert_code_coverage",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G2",
+   "expected_project": "C-Users-13144-Documents-dnabert-error-correction"
+  },
+  {
+   "name": "coverage_src_still_denied",
+   "group": "G1",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "zotero",
+     "path": "C:/Users/13144/Documents/dnabert-error-correction/src"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "dnabert_code_coverage",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G1",
+   "fs_overlay": {
+    "dirs": [
+     "C:/Users/13144/Documents/dnabert-error-correction/src"
+    ]
+   },
+   "expected_project": "C-Users-13144-Documents-dnabert-error-correction"
+  },
+  {
+   "name": "coverage_nested_data_subdir_not_denied",
+   "group": "G2",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "loss",
+     "path": "C:/Users/13144/Documents/dnabert-error-correction/src/checkpoints"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "dnabert_nested_data_coverage",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G2",
+   "fs_overlay": {
+    "dirs": [
+     "C:/Users/13144/Documents/dnabert-error-correction/src/checkpoints"
+    ]
+   },
+   "expected_project": "C-Users-13144-Documents-dnabert-error-correction",
+   "expected_reason_contains": [
+    "'src/checkpoints' is not in that index"
+   ],
+   "note": "src/ has code directly (train.py); src/checkpoints/ nested under it is pure data (.pt) and must be allowed"
+  },
+  {
+   "name": "coverage_nested_code_subdir_still_denied",
+   "group": "G1",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "zotero",
+     "path": "C:/Users/13144/Documents/dnabert-error-correction/src/models"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "dnabert_nested_data_coverage",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G1",
+   "fs_overlay": {
+    "dirs": [
+     "C:/Users/13144/Documents/dnabert-error-correction/src/models"
+    ]
+   },
+   "expected_project": "C-Users-13144-Documents-dnabert-error-correction",
+   "note": "src/models/ itself holds code, so the specific-directory check still denies there"
   },
   {
    "name": "malformed_payload_array",
