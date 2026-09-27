@@ -370,6 +370,18 @@ class _MeridianDBLogHandler(logging.Handler):
                 except Exception:  # noqa: BLE001
                     pass
 
+            # 7ef88e30 — server_logs is process-global and readable by every
+            # authenticated caller (get_server_logs / search_server_logs), so
+            # mask credentials and client IPs before they reach the table.  The
+            # readers redact too; this keeps raw secrets out of storage for any
+            # current or future log call site, not only [mcp_auth].
+            try:
+                from .log_redaction import redact_log_text as _redact  # noqa: PLC0415
+                msg = _redact(msg)
+                exc_text = _redact(exc_text)
+            except Exception:  # noqa: BLE001 — redaction failure must not drop the record
+                pass
+
             db = self._db
 
             async def _async_write() -> None:
@@ -8277,32 +8289,24 @@ async def _remote_mcp_inner(
 
     if tenant is None:
         import logging as _logging
-        _raw_auth = request.headers.get("authorization", "")
-        # 1b4dc353 — diagnostic enrichment. This warning previously logged only
-        # a truncated raw Authorization header + UA, which wasn't enough to
-        # fingerprint a recurring external caller (e.g. a scheduled bot hitting
-        # /mcp with NO Authorization header at all — raw=(none) — on a
-        # cadence). Add the source IP (same `request.client.host` pattern
-        # already used for signup rate-limiting and session tracking in
-        # hosted.py) plus the full non-sensitive header set, so the next
-        # occurrence carries enough to identify the caller. Authorization and
-        # Cookie are excluded from the header dump (Authorization is already
-        # covered, truncated, by raw= above) and the dump is capped to bound
-        # log size against a hostile oversized-header request.
-        _client_ip = (request.client.host if request.client else None) or "unknown"
-        _diag_headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in ("authorization", "cookie")
-        }
-        _diag_headers_repr = repr(_diag_headers)
-        if len(_diag_headers_repr) > 1000:
-            _diag_headers_repr = _diag_headers_repr[:1000] + "...(truncated)"
+        from . import log_redaction as _lr  # noqa: PLC0415
+        # 1b4dc353 — diagnostic enrichment so a recurring unauthenticated
+        # caller (e.g. a scheduled bot hitting /mcp with no Authorization at
+        # all — auth=(none) — on a cadence) can be fingerprinted from logs.
+        # 7ef88e30 — this row lands in the process-global server_logs buffer
+        # that get_server_logs/search_server_logs serve to ANY tenant. It used
+        # to log Authorization[:60] (~ the whole "Bearer sk_meridian_..." token),
+        # the client IP and x-forwarded-for/cf-connecting-ip/signature headers.
+        # Now: a non-reversible token fingerprint (scheme, public prefix,
+        # length, sha256[:10]), /24 or /48-anonymized IPs (direct peer + first
+        # forwarded client), and header NAMES plus a small value allowlist.
         _logging.getLogger("meridian.mcp_auth").warning(
-            "[mcp_auth] unrecognised token raw=%r ua=%r ip=%s headers=%s",
-            (_raw_auth[:60] if _raw_auth else "(none)"),
-            request.headers.get("user-agent", "")[:60],
-            _client_ip,
-            _diag_headers_repr,
+            "[mcp_auth] unrecognised token auth=%s ua=%r ip=%s fwd=%s headers=%s",
+            _lr.fingerprint_authorization(request.headers.get("authorization")),
+            _lr.redact_log_text(request.headers.get("user-agent", "")[:60]),
+            _lr.anonymize_ip(request.client.host if request.client else None),
+            _lr.anonymize_ip(_lr.first_forwarded_client_ip(request.headers)),
+            _lr.summarize_headers_for_log(request.headers.items()),
         )
         # b12cc29f — log auth failure (no token or invalid token).
         _auth_fail_result = "no_token" if not _bearer_hash else "invalid_token"
