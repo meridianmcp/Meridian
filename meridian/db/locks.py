@@ -352,6 +352,7 @@ async def claim_file(
     ttl_hours: int = _FILE_LOCK_TTL_HOURS,
     mode: str = "write",
     item_id: str | None = None,
+    amend_sprint_item: bool = True,
 ) -> dict[str, Any]:
     """Claim a file path for a session, auto-releasing expired locks first.
 
@@ -377,6 +378,11 @@ async def claim_file(
     item) so a session holding 2+ concurrently in_progress items never has a
     claim misattributed to the wrong one. Omitted, the pre-existing
     single-candidate heuristic is used unchanged.
+
+    ``amend_sprint_item=False`` skips that amendment entirely: for a lock the
+    coordination layer takes on an item's behalf from what the item already
+    declares (``transfer_sprint_item_claim`` re-acquiring a moved claim's locks
+    under the receiving session), which is not a mid-execution pivot.
     """
     normalized = _normalize_file_path(file_path)
     if not normalized:
@@ -491,8 +497,11 @@ async def claim_file(
     # 2593a5fe — amend the active sprint item's touches_resources if this file
     # was not in the original declaration (mid-execution pivot detection).
     # Best-effort: errors never block the claim. Use "file:<path>" as resource id.
-    _resource_hint = await _amend_sprint_item_resources_for_session(
-        db, session_id, f"file:{normalized}", item_id=item_id
+    _resource_hint = (
+        await _amend_sprint_item_resources_for_session(
+            db, session_id, f"file:{normalized}", item_id=item_id
+        )
+        if amend_sprint_item else None
     )
     result: dict[str, Any] = {
         "claimed": True,
