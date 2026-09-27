@@ -42,7 +42,8 @@ if ($null -eq $payload) { exit 0 }
 
 $tool = [string]$payload.tool_name
 if (-not $tool) { exit 0 }
-if ($tool -ne 'Bash') { exit 0 }
+# 55d48d69: the PowerShell tool runs the same install commands (pip/npm/...).
+if ($tool -ne 'Bash' -and $tool -ne 'PowerShell') { exit 0 }
 
 $cmd = $null
 if ($payload.tool_input) { $cmd = [string]$payload.tool_input.command }

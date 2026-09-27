@@ -55,7 +55,8 @@ payload="$(cat 2>/dev/null || true)"
 
 tool="$(printf '%s' "$payload" | grep -oE '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')"
 [ -z "$tool" ] && exit 0
-[ "$tool" != "Bash" ] && exit 0
+# 55d48d69: the PowerShell tool runs the same install commands (pip/npm/...).
+case "$tool" in Bash|PowerShell) ;; *) exit 0 ;; esac
 
 cmd="$(printf '%s' "$payload" | grep -oE '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/^"command"[[:space:]]*:[[:space:]]*"//; s/"$//')"
 [ -z "$cmd" ] && exit 0

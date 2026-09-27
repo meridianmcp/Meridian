@@ -31,9 +31,10 @@ if (-not $raw) { exit 0 }
 try { $payload = $raw | ConvertFrom-Json } catch { exit 0 }
 if ($null -eq $payload) { exit 0 }
 
-# Only intercept Bash tool calls.
+# Only intercept shell tool calls (55d48d69: Bash and PowerShell run the same
+# install commands).
 $tool = [string]$payload.tool_name
-if ($tool -ne 'Bash') { exit 0 }
+if ($tool -ne 'Bash' -and $tool -ne 'PowerShell') { exit 0 }
 
 # Extract the command string.
 $cmd = ''

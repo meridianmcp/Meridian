@@ -22,7 +22,8 @@ payload="$(cat 2>/dev/null || true)"
 
 # Extract tool_name; fail open if absent.
 tool="$(printf '%s' "$payload" | grep -oE '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' || true)"
-[ "$tool" != "Bash" ] && exit 0
+# 55d48d69: the PowerShell tool runs the same install commands (pip/npm/...).
+case "$tool" in Bash|PowerShell) ;; *) exit 0 ;; esac
 
 # Extract the command string (tolerant extraction -- no jq dependency).
 cmd="$(printf '%s' "$payload" | grep -oE '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' || true)"

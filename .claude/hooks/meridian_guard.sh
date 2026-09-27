@@ -6,7 +6,9 @@
 # the Python core, the ps1 shim and this shim to the same decisions.
 #
 #   G0  kill switch   MERIDIAN_GUARD=off|advisory|enforce, MERIDIAN_GUARD_DISABLE,
-#                     $LOCALAPPDATA/meridian/guard/guard.off | guard.advisory (owner-created)
+#                     $LOCALAPPDATA/meridian/guard/guard.off | guard.advisory (owner-created);
+#                     installer inputs MERIDIAN_GUARD_DEFAULT_MODE=advisory (lowest
+#                     precedence) and MERIDIAN_GUARD_SCOPE=user (G0, G6-G8 only)
 #   G1  Grep in a fresh own codebase-memory index          G6  auto-memory write (tool)
 #   G2  stale/canonical/ancestor index, code Glob (inject)  G7  auto-memory write (shell)
 #   G3  first-stage recursive shell search                  G8  Serena memory write

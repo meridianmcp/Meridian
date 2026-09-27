@@ -157,6 +157,18 @@ def evaluate_readtool_nudge(
     (there is no ``allow`` key): a hook surfaces ``message`` as a hint and lets
     the call proceed, so it can't wedge a legitimate read. Fail-open: no active
     index, an unknown/None tool, or an already-structural tool → ``nudge=False``.
+
+    Claude Code (55d48d69): the Meridian guard (``meridian/guard_core.py`` and
+    the ``.claude/hooks/meridian_guard.*`` shims) is the production PreToolUse
+    enforcement of this rule and does not call this function. Its G2 rule is
+    the advisory form of the Grep/Glob nudge (for stale or uncovered indexes
+    and code-extension Globs), and G1 denies a recursive Grep inside a fresh
+    index; both name the exact codebase-memory project, which this generic
+    ``search_graph`` suggestion cannot. The ``read`` branch stays deliberately
+    unwired there: the guard never matches Read, because reading a located
+    file is correct (and required before an Edit), Read is the most frequent
+    tool call, and every PreToolUse match costs a PowerShell start on
+    Windows. This function remains the vendor-neutral core for other shims.
     """
     name = (tool_name or "").strip().lower()
     suggest = _NUDGE_TOOLS.get(name)

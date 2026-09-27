@@ -269,6 +269,29 @@ add("G0_sentinel_off_beats_env_enforce", PRE, D1, "allow", "G0", env={"MERIDIAN_
 add("G0_sentinel_both_off_wins", PRE, D1, "allow", "G0", fs_overlay={"files": {GUARD + "/guard.off": "", GUARD + "/guard.advisory": ""}})
 add("G0_sentinel_dir_is_not_a_file", PRE, D1, "deny", "G1", fs_overlay={"dirs": [GUARD + "/guard.off"]},
     note="the sentinel must be a FILE")
+# Installer inputs (hooks install-guard): --mode advisory prefixes MERIDIAN_GUARD_DEFAULT_MODE,
+# --scope user sets MERIDIAN_GUARD_SCOPE. Both travel as env vars on the hook command.
+DEFAULT_ADVISORY = {"MERIDIAN_GUARD_DEFAULT_MODE": "advisory"}
+USER_SCOPE = {"MERIDIAN_GUARD_SCOPE": "user"}
+add("G0_installer_default_advisory", PRE, D1, "inject", "G1", env=DEFAULT_ADVISORY, contains=[MSG_PROJ_M],
+    note="install-guard --mode advisory: the installed default turns deny into inject")
+add("G0_installer_default_advisory_hard_rule", PRE, D4, "inject", "G6", env={"MERIDIAN_GUARD_DEFAULT_MODE": " Advisory "})
+add("G0_env_enforce_beats_installer_default", PRE, D1, "deny", "G1", env=dict(DEFAULT_ADVISORY, MERIDIAN_GUARD="enforce"),
+    note="the installed default is the LOWEST-precedence mode input: an explicit MERIDIAN_GUARD wins")
+add("G0_installer_default_enforce_is_noop", PRE, D1, "deny", "G1", env={"MERIDIAN_GUARD_DEFAULT_MODE": "enforce"})
+add("G0_installer_default_unknown_is_noop", PRE, D1, "deny", "G1", env={"MERIDIAN_GUARD_DEFAULT_MODE": "off"},
+    note="only 'advisory' is an installer default; the installer can never switch the guard off")
+add("G0_sentinel_off_beats_installer_default", PRE, D1, "allow", "G0", env=DEFAULT_ADVISORY,
+    fs_overlay={"files": {GUARD + "/guard.off": ""}})
+add("G0_user_scope_skips_code_rules", PRE, D1, "allow", None, env=USER_SCOPE,
+    note="install-guard --scope user evaluates only G0, G6-G8 and the brief")
+add("G0_user_scope_skips_shell_search", PRE, D6, "allow", None, env=USER_SCOPE)
+add("G0_user_scope_keeps_G6", PRE, D4, "deny", "G6", env=USER_SCOPE)
+add("G0_user_scope_keeps_G8", PRE, pre("mcp__serena__write_memory", {"memory_file_name": "notes", "content": "x"}), "deny", "G8",
+    env={"MERIDIAN_GUARD_SCOPE": " USER "})
+add("G0_user_scope_skips_G9", PRE, pre("Write", {"file_path": GUARD + "/guard.off", "content": ""}), "allow", None, env=USER_SCOPE)
+add("G0_user_scope_advisory", PRE, D4, "inject", "G6", env=dict(USER_SCOPE, **DEFAULT_ADVISORY))
+add("G0_project_scope_value_is_full", PRE, D1, "deny", "G1", env={"MERIDIAN_GUARD_SCOPE": "project"})
 
 # ---------------------------------------------------------------- G1
 add("G1_no_path_uses_cwd", PRE, pre("Grep", {"pattern": "arxiv_search"}), "deny", "G1", project=SLUG_M)

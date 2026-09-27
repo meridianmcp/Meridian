@@ -2542,6 +2542,8 @@ function prune_receipts(    i, n, TS, OK, PJ, start) {
 function env_mode(    raw) {
     raw = tolower(pystrip(env_get("MERIDIAN_GUARD")))
     if (raw == "off") return "off"
+    # install-guard --mode advisory: lowest precedence (MERIDIAN_GUARD unset/empty only).
+    if (raw == "" && tolower(pystrip(env_get("MERIDIAN_GUARD_DEFAULT_MODE"))) == "advisory") return "advisory"
     return (raw == "" || raw == "enforce") ? "enforce" : "advisory"
 }
 
@@ -2556,6 +2558,11 @@ function sentinel_mode(    gd, P) {
 }
 
 function disabled_rules(DIS,    v, T, n, i, t) {
+    # install-guard --scope user: only G0, G6-G8 and the briefs are evaluated.
+    if (tolower(pystrip(env_get("MERIDIAN_GUARD_SCOPE"))) == "user") {
+        n = split("G1 G2 G3 G4 G5 G9 G10 G11 G12 G13 G14", T, " ")
+        for (i = 1; i <= n; i++) DIS[T[i]] = 1
+    }
     v = env_get("MERIDIAN_GUARD_DISABLE")
     if (v == "") return
     n = split(v, T, /[\011-\015\034-\040,;]+/)

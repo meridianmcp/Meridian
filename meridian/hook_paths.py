@@ -33,6 +33,12 @@ hook-writer, the hooks route, diagnostics) ONE canonical, testable way to:
 4. Validate a stored ``executor_config.repo_path`` before trusting it as a
    generated-hook write target (:func:`resolve_repo_root_for_handoff`),
    used by ``handoff._write_sprint_guard_hooks``.
+5. Diagnose Meridian guard entries (55d48d69): which component a
+   ``meridian_guard*`` command is, its installed scope and default mode, and
+   whether its runtime (PowerShell, bash + awk, or the brief's Python)
+   resolves on this machine (:func:`diagnose_guard_command`,
+   :func:`summarize_guard`). The guard fails open when its runtime is
+   missing, so a session never sees such a broken install; this does.
 
 Missing OPTIONAL hooks are a silent, structured no-op -- never surfaced as
 a blocking or confusing failure. Missing REQUIRED project hooks still
@@ -45,9 +51,11 @@ risk.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 # WSL /mnt/<drive>/... mount convention -> native Windows drive path.
 _WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])(?:/(.*))?$")
@@ -258,6 +266,9 @@ def diagnose_configured_hooks(
     settings_path: Path,
     *,
     repo_root: Path | None,
+    guard_dir: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Read ``settings_path`` (a ``.claude/settings.json``) and return a
     structured diagnostic per configured hook command -- required project
@@ -265,6 +276,10 @@ def diagnose_configured_hooks(
     absolute paths. Never raises: an unreadable/malformed settings file
     yields an empty list rather than propagating the parse error, since a
     diagnostics helper must never itself become a source of failure.
+
+    A Meridian guard entry (55d48d69) also gets a ``guard`` key -- see
+    :func:`diagnose_guard_command`. ``guard_dir``, ``env`` and ``which`` feed
+    only that check.
     """
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -275,5 +290,187 @@ def diagnose_configured_hooks(
     for event, command in parse_hook_commands(settings):
         diag = resolve_configured_hook_command(command, repo_root)
         diag["event"] = event
+        if GUARD_MARKER in command:
+            diag["guard"] = diagnose_guard_command(
+                command, repo_root, guard_dir=guard_dir, env=env, which=which
+            )
         results.append(diag)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Meridian guard entries (55d48d69)
+# ---------------------------------------------------------------------------
+#
+# ``python -m meridian hooks install-guard`` (meridian/hook_settings_merge.py)
+# owns every hook entry whose command contains ``meridian_guard``. Project
+# scope uses the ``$CLAUDE_PROJECT_DIR`` form handled above. User scope runs a
+# ``meridian_guard_defer`` check first, so the FIRST quoted script in the
+# command is the defer check, not the guard shim; the shim is the last one.
+# The guard fails open when its runtime is missing (a missing interpreter is a
+# non-2 exit, which never blocks), so a broken install is silent in a session:
+# this is where it becomes visible.
+
+GUARD_MARKER = "meridian_guard"
+GUARD_DEFER_STEM = "meridian_guard_defer"
+# Shim stem -> component name.
+GUARD_COMPONENTS: dict[str, str] = {
+    "meridian_guard": "pre",
+    "meridian_guard_post": "post",
+    "meridian_guard_brief": "brief",
+}
+_ALL_SCRIPTS_RE = re.compile(r'"([^"]+\.(?:ps1|sh))"')
+# The installer's env-var prefixes (hook_settings_merge.build_command), in
+# both the PowerShell ($env:X='v') and the bash (X=v) spelling.
+_GUARD_USER_SCOPE_RE = re.compile(r"MERIDIAN_GUARD_SCOPE\s*=\s*'?user\b", re.IGNORECASE)
+_GUARD_DEFAULT_ADVISORY_RE = re.compile(r"MERIDIAN_GUARD_DEFAULT_MODE\s*=\s*'?advisory\b", re.IGNORECASE)
+
+
+def _script_stem(token: str) -> str:
+    name = normalize_wsl_path(token).rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[0]
+
+
+def guard_script_token(command: str) -> str | None:
+    """The quoted guard SHIM path in a hook command (the last quoted script
+    whose stem is a guard component), or ``None``."""
+    for token in reversed(_ALL_SCRIPTS_RE.findall(command or "")):
+        if _script_stem(token) in GUARD_COMPONENTS:
+            return token
+    return None
+
+
+def _resolve_token(token: str, repo_root: Path | None) -> Path | None:
+    if is_project_relative_command(token):
+        if repo_root is None:
+            return None
+        rel = token
+        for tok in PROJECT_DIR_TOKENS:
+            rel = rel.replace(tok, "")
+        rel_norm = normalize_wsl_path(rel).lstrip("/")
+        return (repo_root / rel_norm) if rel_norm else repo_root
+    normalized = normalize_wsl_path(token)
+    return Path(normalized) if normalized else None
+
+
+def _guard_python(
+    repo_root: Path | None,
+    guard_dir: str | Path | None,
+    env: Mapping[str, str],
+    which: Callable[[str], str | None],
+) -> tuple[str | None, str]:
+    """The Python the brief shim would start, in its documented order
+    (meridian_guard_brief.ps1 header): ``MERIDIAN_GUARD_PYTHON`` (authoritative,
+    no fall-through), ``runtime.python`` in ``<guard dir>/config.json``, the
+    repo's pixi env, then the ``py`` launcher (``python3`` off Windows).
+    Returns ``(path_or_None, source)``."""
+    explicit = (env.get("MERIDIAN_GUARD_PYTHON") or "").strip()
+    if explicit:
+        return (explicit if Path(explicit).is_file() else None), "MERIDIAN_GUARD_PYTHON"
+    if guard_dir:
+        try:
+            cfg = json.loads((Path(guard_dir) / "config.json").read_text(encoding="utf-8"))
+            recorded = str(((cfg or {}).get("runtime") or {}).get("python") or "").strip()
+        except (OSError, ValueError, AttributeError):
+            recorded = ""
+        if recorded and Path(recorded).is_file():
+            return recorded, "config.json"
+    if repo_root is not None:
+        for rel in (".pixi/envs/default/python.exe", ".pixi/envs/default/bin/python"):
+            candidate = repo_root / rel
+            if candidate.is_file():
+                return str(candidate), "pixi"
+    for launcher in ("py", "python3"):
+        found = which(launcher)
+        if found:
+            return found, launcher
+    return None, "unresolved"
+
+
+def diagnose_guard_command(
+    command: str,
+    repo_root: Path | None,
+    *,
+    guard_dir: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> dict[str, Any]:
+    """Diagnose one Meridian guard hook command: which component it is,
+    its installed scope and default mode (from the installer's env-var
+    prefixes), and whether its runtime resolves on this machine.
+
+    ``runtime_missing`` lists what is absent: ``script``, ``powershell``
+    (a .ps1 shim with neither powershell nor pwsh on PATH), ``bash``,
+    ``awk`` / ``meridian_guard.awk`` (the sh PreToolUse/PostToolUse engine),
+    ``python`` (the brief). ``env`` and ``which`` default to the current
+    process; they describe THIS process, which may differ from the Claude
+    Code session that actually runs the hook. Never raises.
+    """
+    env_map: Mapping[str, str] = os.environ if env is None else env
+    which_fn = which or shutil.which
+    token = guard_script_token(command)
+    stem = _script_stem(token) if token else None
+    component = GUARD_COMPONENTS.get(stem or "", "unknown")
+    out: dict[str, Any] = {
+        "component": component,
+        "script_token": token,
+        "script_path": None,
+        "scope": "user" if _GUARD_USER_SCOPE_RE.search(command or "") else "project",
+        "installed_mode": "advisory" if _GUARD_DEFAULT_ADVISORY_RE.search(command or "") else "enforce",
+        "interpreter": None,
+        "runtime_ok": False,
+        "runtime_missing": [],
+    }
+    try:
+        missing: list[str] = []
+        path = _resolve_token(token, repo_root) if token else None
+        out["script_path"] = str(path) if path is not None else None
+        if path is None or not path.is_file():
+            missing.append("script")
+        ext = (token or "").rsplit(".", 1)[-1].lower() if token else ""
+        if ext == "ps1":
+            out["interpreter"] = which_fn("powershell") or which_fn("pwsh")
+            if not out["interpreter"]:
+                missing.append("powershell")
+        elif ext == "sh":
+            out["interpreter"] = which_fn("bash")
+            if not out["interpreter"]:
+                missing.append("bash")
+            if component in ("pre", "post"):
+                if not which_fn("awk"):
+                    missing.append("awk")
+                if path is not None and not (path.parent / "meridian_guard.awk").is_file():
+                    missing.append("meridian_guard.awk")
+        if component == "brief":
+            py, source = _guard_python(repo_root, guard_dir, env_map, which_fn)
+            out["python"] = py
+            out["python_source"] = source
+            if not py:
+                missing.append("python")
+        out["runtime_missing"] = missing
+        out["runtime_ok"] = not missing and component != "unknown"
+    except Exception as exc:  # noqa: BLE001 - diagnostics never raise
+        out["runtime_missing"] = [f"error: {type(exc).__name__}"]
+        out["runtime_ok"] = False
+    return out
+
+
+def summarize_guard(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Roll the per-entry ``guard`` diagnostics up into one status:
+    ``registered`` (any guard entry), ``components`` (sorted), ``complete``
+    (pre, post and brief all registered), ``runtime_ok`` (every registered
+    guard entry resolves) and ``problems`` (one line per broken entry)."""
+    entries = [d for d in diagnostics if isinstance(d.get("guard"), dict)]
+    components = sorted({d["guard"]["component"] for d in entries})
+    problems = [
+        f"{d.get('event')}: {d['guard']['component']} missing {', '.join(d['guard']['runtime_missing'])}"
+        for d in entries
+        if not d["guard"].get("runtime_ok")
+    ]
+    return {
+        "registered": bool(entries),
+        "components": components,
+        "complete": {"pre", "post", "brief"}.issubset(components),
+        "runtime_ok": bool(entries) and not problems,
+        "problems": problems,
+    }

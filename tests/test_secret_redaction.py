@@ -736,8 +736,11 @@ def test_settings_wires_secret_guard_as_pretooluse():
     )
     assert entry is not None, "PreToolUse must include a secret_guard hook entry"
     matcher = entry.get("matcher", "")
-    assert "Read" in matcher, "secret_guard matcher must include Read"
-    assert "Bash" in matcher, "secret_guard matcher must include Bash"
+    tools = matcher.split("|")
+    assert "Read" in tools, "secret_guard matcher must include Read"
+    assert "Bash" in tools, "secret_guard matcher must include Bash"
+    # 55d48d69: the PowerShell tool reads files and env vars too.
+    assert "PowerShell" in tools, "secret_guard matcher must include PowerShell"
 
 
 def test_settings_does_not_disturb_existing_hooks():

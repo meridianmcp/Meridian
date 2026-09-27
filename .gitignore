@@ -309,3 +309,6 @@ extensions/claude-mcp/
  
 # Ephemeral scheduled-task lock file - runtime state, not source 
 .claude/scheduled_tasks.lock
+
+# Codex CLI worktrees/config -- keep out of code-intel indexes
+.codex/

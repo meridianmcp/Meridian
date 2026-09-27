@@ -5,7 +5,9 @@
 # (meridian_guard.sh + meridian_guard.awk) and the Python core to the same decisions.
 #
 #   G0  kill switch   MERIDIAN_GUARD=off|advisory|enforce, MERIDIAN_GUARD_DISABLE,
-#                     %LOCALAPPDATA%\meridian\guard\guard.off | guard.advisory (owner-created)
+#                     %LOCALAPPDATA%\meridian\guard\guard.off | guard.advisory (owner-created);
+#                     installer inputs MERIDIAN_GUARD_DEFAULT_MODE=advisory (lowest
+#                     precedence) and MERIDIAN_GUARD_SCOPE=user (G0, G6-G8 only)
 #   G1  Grep code search in a FRESH own codebase-memory index      -> deny
 #   G2  stale / canonical / ancestor / uncovered index, code Glob  -> inject (rate limited)
 #   G3  first-stage recursive shell search (grep -r, rg, git grep, Select-String -Recurse,
@@ -30,7 +32,7 @@
 #
 # -Batch <dir> is a test entry point (tests/test_guard_hooks.py): it evaluates
 # every <dir>/<case>/ (payload.json, env.json, mode) in one process so the
-# 378-case parity fixture does not pay PowerShell start-up per case.
+# parity fixture (hundreds of cases) does not pay PowerShell start-up per case.
 param(
     [string]$Mode = 'pre',
     [string]$Batch = ''
@@ -2508,6 +2510,9 @@ function GuardMode($envmap) {
     $raw = if ($rawv) { PyLower (PyStrip $rawv) } else { '' }
     if ($raw -ceq 'off') { return 'off' }
     $envMode = if ($raw -ceq '' -or $raw -ceq 'enforce') { 'enforce' } else { 'advisory' }
+    # install-guard --mode advisory: lowest precedence (MERIDIAN_GUARD unset/empty only).
+    $dmv = EnvGet $envmap 'MERIDIAN_GUARD_DEFAULT_MODE'
+    if ($raw -ceq '' -and $dmv -and (PyLower (PyStrip $dmv)) -ceq 'advisory') { $envMode = 'advisory' }
     $gd = GuardDir $envmap
     if ($gd) {
         if ((FsKind ($gd + '/guard.off')) -ceq 'file') { return 'off' }
@@ -2518,6 +2523,11 @@ function GuardMode($envmap) {
 
 function DisabledRules($envmap) {
     $out = NewDict
+    # install-guard --scope user: only G0, G6-G8 and the briefs are evaluated.
+    $scv = EnvGet $envmap 'MERIDIAN_GUARD_SCOPE'
+    if ($scv -and (PyLower (PyStrip $scv)) -ceq 'user') {
+        foreach ($rid in @('G1', 'G2', 'G3', 'G4', 'G5', 'G9', 'G10', 'G11', 'G12', 'G13', 'G14')) { $out[$rid] = $true }
+    }
     $v = EnvGet $envmap 'MERIDIAN_GUARD_DISABLE'
     if (-not $v) { return $out }
     foreach ($tok in $script:RX_SPLIT_DISABLE.Split($v)) {

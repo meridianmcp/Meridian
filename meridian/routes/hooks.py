@@ -1,6 +1,7 @@
 """Hooks, connections, and script-serving routes."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,9 @@ from pydantic import BaseModel
 
 from .._deps import _db, _hosted_mode
 from .. import db as db_module
+from .. import guard_core as guard_core_module
 from .. import hook_paths as hook_paths_module
+from .. import session_brief as session_brief_module
 from ..session_brief import build_server_section
 
 router = APIRouter()
@@ -172,6 +175,16 @@ async def get_hooks_diagnostics() -> dict[str, Any]:
     ``settings_found: false`` with an empty ``hooks`` list rather than a
     404/500, since a diagnostics endpoint must never itself become a source
     of failure for a session that polls it during orientation.
+
+    55d48d69 -- ``guard`` reports the Meridian guard: whether it is
+    registered, whether every registered shim's runtime resolves, the
+    effective mode (``off`` / ``advisory`` / ``enforce``, from
+    ``MERIDIAN_GUARD`` and the owner's sentinel files) and the disabled
+    rules. ``status`` folds that into one word: ``not_installed``, ``off``,
+    ``runtime_missing``, ``advisory`` or ``enforce``. The guard fails open
+    when its runtime is missing, so this is where a broken install shows up.
+    Mode and runtime are computed from THIS server process's environment,
+    which can differ from the Claude Code session that runs the hooks.
     """
     repo_root = hook_paths_module.resolve_active_repo_root(cwd=str(Path.cwd()))
     settings_path = (repo_root / ".claude" / "settings.json") if repo_root else None
@@ -182,9 +195,10 @@ async def get_hooks_diagnostics() -> dict[str, Any]:
             "repo_root": str(repo_root) if repo_root else None,
             "hooks": [],
             "missing_required_count": 0,
+            "guard": _guard_status([]),
         }
     diagnostics = hook_paths_module.diagnose_configured_hooks(
-        settings_path, repo_root=repo_root
+        settings_path, repo_root=repo_root, guard_dir=_guard_state_dir()
     )
     missing_required = [
         d for d in diagnostics
@@ -196,7 +210,40 @@ async def get_hooks_diagnostics() -> dict[str, Any]:
         "repo_root": str(repo_root),
         "hooks": diagnostics,
         "missing_required_count": len(missing_required),
+        "guard": _guard_status(diagnostics),
     }
+
+
+def _guard_state_dir() -> str | None:
+    """The guard dir the brief shim reads ``config.json`` from (fail-soft)."""
+    try:
+        return session_brief_module.guard_dir(dict(os.environ))
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        return None
+
+
+def _guard_status(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize the Meridian guard for /hooks/diagnostics. Never raises."""
+    summary = hook_paths_module.summarize_guard(diagnostics)
+    try:
+        env = dict(os.environ)
+        summary["mode"] = guard_core_module.guard_mode(env)
+        summary["disabled_rules"] = sorted(
+            guard_core_module.disabled_rules(env), key=lambda r: int(r[1:])
+        )
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        summary["mode"] = None
+        summary["disabled_rules"] = []
+    if not summary["registered"]:
+        status = "not_installed"
+    elif summary["mode"] == "off":
+        status = "off"
+    elif not summary["runtime_ok"]:
+        status = "runtime_missing"
+    else:
+        status = summary["mode"] or "unknown"
+    summary["status"] = status
+    return summary
 
 
 # ---------------------------------------------------------------------------

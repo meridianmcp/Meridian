@@ -56,6 +56,13 @@ deny/ask becomes an inject with the same text; an unset/empty/``enforce``
 value => enforce; an UNRECOGNIZED value => advisory (a typo never blocks).
 ``MERIDIAN_GUARD_DISABLE`` (e.g. ``G3,G11``) skips individual rules.
 
+Installer inputs (``python -m meridian hooks install-guard``), passed as
+environment variables on the hook command: ``MERIDIAN_GUARD_DEFAULT_MODE=
+advisory`` (``--mode advisory``) is the lowest-precedence mode input -- it
+applies only while ``MERIDIAN_GUARD`` is unset or empty, and a sentinel still
+wins; ``MERIDIAN_GUARD_SCOPE=user`` (``--scope user``) evaluates only G0,
+G6-G8 and the briefs (``USER_SCOPE_RULES``).
+
 State (per Claude Code session, the shim stores it at
 ``<guard dir>/state/<session_id>.json``)::
 
@@ -110,6 +117,13 @@ RULES: dict[str, str] = {
 DECISIONS = ("allow", "deny", "ask", "inject")
 EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "SubagentStart")
 ESCAPABLE = frozenset({"G1", "G3", "G4", "G5", "G11"})
+
+# Installer contract (meridian/hook_settings_merge.py): ``hooks install-guard``
+# passes mode and scope as environment variables on the hook command.
+DEFAULT_MODE_ENV = "MERIDIAN_GUARD_DEFAULT_MODE"
+SCOPE_ENV = "MERIDIAN_GUARD_SCOPE"
+# ``--scope user`` evaluates only the kill switch, G6-G8 and the briefs.
+USER_SCOPE_RULES = frozenset({"G0", "G6", "G7", "G8", "G15", "G16"})
 
 BREAKER_LIMIT = 3
 CONSULT_WINDOW_S = 600
@@ -2149,12 +2163,20 @@ def build_brief(ctx: _Ctx, kind: str, mode: str = "enforce") -> str:
 
 
 def guard_mode(env: dict[str, Any] | None, fs: Any = None) -> str:
-    """Effective mode: ``off`` | ``advisory`` | ``enforce`` (most permissive wins)."""
+    """Effective mode: ``off`` | ``advisory`` | ``enforce`` (most permissive wins).
+
+    ``MERIDIAN_GUARD_DEFAULT_MODE=advisory`` is what ``hooks install-guard
+    --mode advisory`` prefixes to the hook command. It is the LOWEST-precedence
+    input: it applies only while ``MERIDIAN_GUARD`` is unset or empty, and a
+    sentinel file still wins over it (same rule as ``session_brief``).
+    """
     e = reg.upper_env(env)
     raw = e.get("MERIDIAN_GUARD", "").strip().lower()
     if raw == "off":
         return "off"
     env_mode = "enforce" if raw in ("", "enforce") else "advisory"
+    if raw == "" and e.get(DEFAULT_MODE_ENV, "").strip().lower() == "advisory":
+        env_mode = "advisory"
     gdir = reg.guard_dir(e)
     probe = fs if fs is not None else RealFS()
     if gdir:
@@ -2166,13 +2188,17 @@ def guard_mode(env: dict[str, Any] | None, fs: Any = None) -> str:
 
 
 def disabled_rules(env: dict[str, Any] | None) -> set[str]:
-    """Rule ids named in ``MERIDIAN_GUARD_DISABLE`` (``G3``, ``g11``, ``G3-shell-...``)."""
+    """Rule ids named in ``MERIDIAN_GUARD_DISABLE`` (``G3``, ``g11``, ``G3-shell-...``),
+    plus every rule outside ``USER_SCOPE_RULES`` when ``MERIDIAN_GUARD_SCOPE=user``
+    (the user-scope install registers only G6-G8 and the brief)."""
     e = reg.upper_env(env)
     out: set[str] = set()
     for tok in re.split(r"[\s,;]+", e.get("MERIDIAN_GUARD_DISABLE", "")):
         m = re.match(r"^[Gg](\d{1,2})(?:-|$)", tok.strip())
         if m:
             out.add("G" + str(int(m.group(1))))
+    if e.get(SCOPE_ENV, "").strip().lower() == "user":
+        out.update(r for r in RULES if r not in USER_SCOPE_RULES)
     return out
 
 

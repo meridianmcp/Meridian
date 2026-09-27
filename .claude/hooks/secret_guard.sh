@@ -7,7 +7,7 @@
 # MERIDIAN_ENCRYPTION_KEY, admin password, DB connection strings) via Read/Bash/Grep
 # calls -- fully unredacted, no existing guard caught it.
 #
-# This hook fires on Read, Bash, Grep, and Glob tool calls and BLOCKS (exit 2,
+# This hook fires on Read, Bash, PowerShell, Grep, and Glob tool calls and BLOCKS (exit 2,
 # fail-closed) when the target file path matches a known-sensitive filename
 # pattern (.env, *.pem, *.key, id_rsa*, secrets.*, etc.).
 #
@@ -19,7 +19,8 @@
 #
 # Bash commands: we inspect the command string for common env-dump patterns
 # (cat .env, printenv, env) and flag those. Coverage is best-effort; Read/Grep/Glob
-# are authoritative.
+# are authoritative. PowerShell tool commands (55d48d69) get their own
+# statement-anchored list (is_sensitive_ps_cmd), mirroring secret_guard.ps1.
 #
 # Tolerant JSON extraction (no jq dependency) via grep + sed, same pattern as
 # hitl_guard.sh and worktree_guard.sh. Fails OPEN on any parse error.
@@ -34,9 +35,9 @@ payload="$(cat 2>/dev/null || true)"
 tool="$(printf '%s' "$payload" | grep -oE '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')"
 [ -z "$tool" ] && exit 0
 
-# Only intercept file-reading tools and Bash.
+# Only intercept file-reading tools and the shell tools (Bash, PowerShell).
 case "$tool" in
-    Read|Bash|Grep|Glob) ;;
+    Read|Bash|PowerShell|Grep|Glob) ;;
     *) exit 0 ;;
 esac
 
@@ -94,6 +95,21 @@ is_sensitive_bash_cmd() {
     return 1
 }
 
+# PowerShell tool commands. The bash checks above are not reused: 'set' and
+# 'export' style patterns would match every Set-Location / Set-Content. Mirrors
+# secret_guard.ps1 $PsDumpPatterns (statement-anchored, case-insensitive). The
+# command here is still JSON-escaped (no jq), so 'Env:\' arrives as 'Env:\\'.
+is_sensitive_ps_cmd() {
+    local cmd="$1"
+    [ -z "$cmd" ] && return 1
+    printf '%s' "$cmd" | grep -qiE '\bprintenv\b' && return 0
+    printf '%s' "$cmd" | grep -qiE '(^|[;|&(=])[[:space:]]*(cat|gc|type|Get-Content)[[:space:]][^;|&]*\.env\b' && return 0
+    printf '%s' "$cmd" | grep -qiE '(^|[;|&(=])[[:space:]]*(cat|gc|type|Get-Content)[[:space:]][^;|&]*(\.key\b|\.pem\b|id_rsa\b|passwd\b)' && return 0
+    printf '%s' "$cmd" | grep -qiE '(^|[;|&(=])[[:space:]]*(gci|ls|dir|Get-ChildItem|gi|Get-Item)[[:space:]]+(-Path[[:space:]]+)?env:(\\\\)?[[:space:]]*($|[;|&)])' && return 0
+    printf '%s' "$cmd" | grep -qiE '\[(System\.)?Environment\]::GetEnvironmentVariables\([[:space:]]*\)' && return 0
+    return 1
+}
+
 # --- Read ---
 if [ "$tool" = "Read" ]; then
     file_path="$(printf '%s' "$payload" | grep -oE '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')"
@@ -120,6 +136,16 @@ if [ "$tool" = "Bash" ]; then
         # Truncate for display
         display_cmd="$(printf '%s' "$cmd" | head -c 80)"
         echo "Meridian secret guard (14491654): BLOCKED Bash command that appears to dump environment variables or read credential files: '${display_cmd}...'. Use only the specific env var you need (e.g. echo \$SOME_SAFE_VAR) rather than printing all environment variables or cat-ing credential files." >&2
+        exit 2
+    fi
+fi
+
+# --- PowerShell ---
+if [ "$tool" = "PowerShell" ]; then
+    cmd="$(printf '%s' "$payload" | grep -oE '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')"
+    if [ -n "$cmd" ] && is_sensitive_ps_cmd "$cmd"; then
+        display_cmd="$(printf '%s' "$cmd" | head -c 80)"
+        echo "Meridian secret guard (14491654): BLOCKED PowerShell command that appears to dump environment variables or read credential files: '${display_cmd}...'. Read only the specific env var you need (e.g. \$env:SOME_SAFE_VAR) rather than listing the env: drive or reading credential files." >&2
         exit 2
     fi
 fi

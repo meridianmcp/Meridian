@@ -3068,6 +3068,325 @@
    "note": "the sentinel must be a FILE"
   },
   {
+   "name": "G0_installer_default_advisory",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_DEFAULT_MODE": "advisory"
+   },
+   "expected_decision": "inject",
+   "expected_rule": "G1",
+   "expected_reason_contains": [
+    "project='C-Users-13144-Documents-Meridian-repository'"
+   ],
+   "note": "install-guard --mode advisory: the installed default turns deny into inject"
+  },
+  {
+   "name": "G0_installer_default_advisory_hard_rule",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Write",
+    "tool_input": {
+     "file_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/project_meridian_latex_fc5d9911.md",
+     "content": "# LaTeX engine\n"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_DEFAULT_MODE": " Advisory "
+   },
+   "expected_decision": "inject",
+   "expected_rule": "G6"
+  },
+  {
+   "name": "G0_env_enforce_beats_installer_default",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_DEFAULT_MODE": "advisory",
+    "MERIDIAN_GUARD": "enforce"
+   },
+   "expected_decision": "deny",
+   "expected_rule": "G1",
+   "note": "the installed default is the LOWEST-precedence mode input: an explicit MERIDIAN_GUARD wins"
+  },
+  {
+   "name": "G0_installer_default_enforce_is_noop",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_DEFAULT_MODE": "enforce"
+   },
+   "expected_decision": "deny",
+   "expected_rule": "G1"
+  },
+  {
+   "name": "G0_installer_default_unknown_is_noop",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_DEFAULT_MODE": "off"
+   },
+   "expected_decision": "deny",
+   "expected_rule": "G1",
+   "note": "only 'advisory' is an installer default; the installer can never switch the guard off"
+  },
+  {
+   "name": "G0_sentinel_off_beats_installer_default",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_DEFAULT_MODE": "advisory"
+   },
+   "expected_decision": "allow",
+   "expected_rule": "G0",
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/AppData/Local/meridian/guard/guard.off": ""
+    }
+   }
+  },
+  {
+   "name": "G0_user_scope_skips_code_rules",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_SCOPE": "user"
+   },
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "note": "install-guard --scope user evaluates only G0, G6-G8 and the brief"
+  },
+  {
+   "name": "G0_user_scope_skips_shell_search",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "cd C:/Users/13144/Documents/Meridian/repository && grep -rn 'def arxiv_search' meridian/"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_SCOPE": "user"
+   },
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G0_user_scope_keeps_G6",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Write",
+    "tool_input": {
+     "file_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/project_meridian_latex_fc5d9911.md",
+     "content": "# LaTeX engine\n"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_SCOPE": "user"
+   },
+   "expected_decision": "deny",
+   "expected_rule": "G6"
+  },
+  {
+   "name": "G0_user_scope_keeps_G8",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "mcp__serena__write_memory",
+    "tool_input": {
+     "memory_file_name": "notes",
+     "content": "x"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_SCOPE": " USER "
+   },
+   "expected_decision": "deny",
+   "expected_rule": "G8"
+  },
+  {
+   "name": "G0_user_scope_skips_G9",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Write",
+    "tool_input": {
+     "file_path": "C:/Users/13144/AppData/Local/meridian/guard/guard.off",
+     "content": ""
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_SCOPE": "user"
+   },
+   "expected_decision": "allow",
+   "expected_rule": null
+  },
+  {
+   "name": "G0_user_scope_advisory",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Write",
+    "tool_input": {
+     "file_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/memory/project_meridian_latex_fc5d9911.md",
+     "content": "# LaTeX engine\n"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_SCOPE": "user",
+    "MERIDIAN_GUARD_DEFAULT_MODE": "advisory"
+   },
+   "expected_decision": "inject",
+   "expected_rule": "G6"
+  },
+  {
+   "name": "G0_project_scope_value_is_full",
+   "group": "G0",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Grep",
+    "tool_input": {
+     "pattern": "def arxiv_search|def openalex_search|def semantic_scholar_search|def pubmed_search",
+     "path": "C:/Users/13144/Documents/Meridian/repository",
+     "output_mode": "files_with_matches"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_SCOPE": "project"
+   },
+   "expected_decision": "deny",
+   "expected_rule": "G1"
+  },
+  {
    "name": "G1_no_path_uses_cwd",
    "group": "G1",
    "source": "rule",
