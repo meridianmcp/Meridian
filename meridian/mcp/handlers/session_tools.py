@@ -643,9 +643,18 @@ async def handle_get_server_logs(
     f0a48685 — returns recent application-level WARNING/ERROR/EXCEPTION log
     records from the server_logs ring-buffer.  Unlike get_connection_log (which
     is scoped per-tenant by /mcp request metadata), server_logs are process-global
-    and not scoped by tenant_id.  Any authenticated caller can read the full log
-    — this is intentional, since server errors are not tenant-private data and the
-    most common use case is incident diagnosis from a hosted-only session.
+    and not scoped by tenant_id: any authenticated caller (every hosted tenant)
+    can read the whole buffer, because the most common use case is incident
+    diagnosis from a hosted-only session.
+
+    7ef88e30 — process-global does NOT mean raw.  Auth-failure rows can carry
+    credential and client-IP material (the pre-7ef88e30 ``[mcp_auth]`` warning
+    logged ~full bearer tokens, client IPs and x-forwarded-for/signature
+    headers), and those rows persist in the ring-buffer and the DuckDB FTS
+    sidecar.  Every returned row's ``message``/``exc_text`` is therefore passed
+    through :func:`meridian.log_redaction.redact_log_text` (token fingerprints,
+    /24-/48 IPs, known secret shapes masked) at read time; stored rows are not
+    mutated.
 
     b241a437 — positional seeking: when ``seek_to`` is provided and the
     checkpoint index is warm, we derive a tight ``since=`` hint from the index
@@ -688,6 +697,10 @@ async def handle_get_server_logs(
         except Exception:  # noqa: BLE001
             pass
 
+    # 7ef88e30: redact credential/IP material just before returning.
+    from meridian.log_redaction import redact_log_row  # noqa: PLC0415
+    _entries = [redact_log_row(e) for e in _entries]
+
     return {
         "count": len(_entries),
         "since": _since,
@@ -715,6 +728,11 @@ async def handle_search_server_logs(
     FTS work is synchronous (DuckDB has its own thread safety model).  We avoid
     asyncio.run_in_executor because the index is tiny (max 2000 rows) and the
     BM25 search is sub-millisecond.
+
+    7ef88e30 — same visibility and redaction contract as get_server_logs: the
+    DuckDB sidecar indexes the raw stored text, so every hit's
+    ``message``/``exc_text`` is redacted via
+    :func:`meridian.log_redaction.redact_log_text` just before returning.
     """
     _query = (args.get("query") or "").strip()
     if not _query:
@@ -757,6 +775,10 @@ async def handle_search_server_logs(
         _slc.build_checkpoint(_all_rows)
     except Exception:  # noqa: BLE001
         pass
+
+    # 7ef88e30: redact credential/IP material just before returning.
+    from meridian.log_redaction import redact_log_row  # noqa: PLC0415
+    _result["hits"] = [redact_log_row(h) for h in (_result.get("hits") or [])]
 
     return _result
 

@@ -691,11 +691,12 @@ def test_remote_mcp_invalid_token_returns_401(client):
 
 
 def test_remote_mcp_unauth_warning_logs_ip_and_headers(client, caplog):
-    """1b4dc353 — the '[mcp_auth] unrecognised token' warning must carry the
-    source IP and a non-sensitive header dump so a recurring unidentified
-    caller (no Authorization header at all) can be fingerprinted from logs
-    alone next time it fires. Authorization/Cookie must never appear in the
-    header dump (they're either redacted or already covered by raw=)."""
+    """1b4dc353 + 7ef88e30 — the '[mcp_auth] unrecognised token' warning must
+    still fingerprint a recurring unidentified caller (no Authorization header
+    at all -> auth=(none)), but it lands in the process-global server_logs
+    buffer every tenant can read, so it may only carry ANONYMIZED network info
+    (/24) and header NAMES plus a small value allowlist (UA etc.) — never full
+    IPs, cookie/IP-carrier header values, or arbitrary header values."""
     import logging
 
     with caplog.at_level(logging.WARNING, logger="meridian.mcp_auth"):
@@ -706,16 +707,31 @@ def test_remote_mcp_unauth_warning_logs_ip_and_headers(client, caplog):
                 "User-Agent": "python-httpx/0.28.1",
                 "X-Diagnostic-Marker": "probe-1b4dc353",
                 "Cookie": "session=should-not-appear",
+                "X-Forwarded-For": "198.51.100.23, 10.1.2.3",
             },
         )
     assert r.status_code == 401
-    assert "[mcp_auth] unrecognised token" in caplog.text
-    assert "raw=" in caplog.text and "(none)" in caplog.text
-    assert "ip=" in caplog.text
-    # The redacted extra header must show up (proves "full headers" made it
-    # into the log), but Cookie's value must never leak.
-    assert "probe-1b4dc353" in caplog.text
-    assert "should-not-appear" not in caplog.text
+    msgs = [
+        rec.getMessage() for rec in caplog.records
+        if rec.name == "meridian.mcp_auth" and "unrecognised token" in rec.getMessage()
+    ]
+    assert len(msgs) == 1, msgs
+    text = msgs[0]
+    assert "[mcp_auth] unrecognised token" in text
+    assert "auth=(none)" in text
+    assert "ip=" in text
+    # Forwarded client network is logged, anonymized to /24 — never the full IP.
+    assert "fwd=198.51.100.0/24" in text
+    assert "198.51.100.23" not in text
+    assert "10.1.2.3" not in text
+    # UA value is kept; the extra header is listed by NAME only.
+    assert "python-httpx/0.28.1" in text
+    assert "x-diagnostic-marker" in text
+    assert "probe-1b4dc353" not in text
+    # Cookie is dropped entirely (name and value).
+    assert "should-not-appear" not in text
+    assert "cookie" not in text.lower()
+    assert "x-forwarded-for" not in text.lower()
 
 
 def test_hooks_invalid_bearer_returns_401_in_hosted_mode(monkeypatch, tmp_path):
