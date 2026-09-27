@@ -3860,10 +3860,17 @@ class _SiblingLockNeeds:
 
     __slots__ = (
         "lock_owner", "files", "symbols", "releasers", "kept", "handoffs", "legacy_keys",
+        "lookup_failed",
     )
 
     def __init__(self, lock_owner: str) -> None:
         self.lock_owner = lock_owner
+        # True when the sibling query itself failed, so the empty sets below
+        # mean "unknown", not "no sibling needs anything". The primary release
+        # path still treats that as "no siblings" (the documented best-effort
+        # pre-fd1eda7c behavior); the hand-off RE-decision must not, since
+        # there it would free a lock a live sibling may still hold.
+        self.lookup_failed = False
         # real file path -> ids of sibling items still needing a lock on it
         self.files: dict[str, list[str]] = {}
         # (real file path, symbol) -> ids of sibling items declaring that symbol
@@ -3991,7 +3998,10 @@ async def _sibling_lock_needs(
     RELEASER of the file (see :class:`_SiblingLockNeeds`).
 
     Best-effort: a lookup failure yields "no siblings", i.e. exactly the
-    pre-fd1eda7c release behavior, never a blocked release.
+    pre-fd1eda7c release behavior, never a blocked release — but flagged with
+    :attr:`_SiblingLockNeeds.lookup_failed`, so a caller that would otherwise
+    FREE a lock on the strength of an empty answer (the hand-off re-decision,
+    :func:`_hand_off_file_lock`) can tell "nothing needs it" from "unknown".
     """
     needs = _SiblingLockNeeds(lock_owner)
     if not lock_owner:
@@ -4047,7 +4057,13 @@ async def _sibling_lock_needs(
                 needs._add(needs.files, path, sibling_id)
                 needs._add_releaser(path, sibling_id)
     except Exception:  # noqa: BLE001 — sibling detection must never block a release
-        return _SiblingLockNeeds(lock_owner)
+        _log.warning(
+            "sibling lock lookup failed for session %s; treating the answer as "
+            "unknown", lock_owner, exc_info=True,
+        )
+        failed = _SiblingLockNeeds(lock_owner)
+        failed.lookup_failed = True
+        return failed
     return needs
 
 
@@ -4242,7 +4258,13 @@ async def _hand_off_file_lock(
     it, that item frees it when it leaves; only symbol-scoped items need it →
     hand it to them and repeat. Returns ``"handed_off"``, ``"kept"`` or
     ``"released"``. Bounded; exhausting it keeps the lock (TTL-bound) rather
-    than risk freeing one a live sibling holds."""
+    than risk freeing one a live sibling holds.
+
+    A FAILED live-set lookup (:attr:`_SiblingLockNeeds.lookup_failed`) is never
+    read as "nothing needs it": the lookup is retried within the same bound,
+    and exhausting it keeps the lock. Freeing on an empty answer that only
+    means "unknown" would hand the file to another session while a
+    same-session item still declares it."""
     from meridian.db import release_file  # noqa: PLC0415
     key = (path or "").strip()
     pending = list(targets)
@@ -4254,6 +4276,9 @@ async def _hand_off_file_lock(
         if took_it:
             return "handed_off"
         needs = await _sibling_lock_needs(db, None, lock_owner)
+        if needs.lookup_failed:
+            pending = []
+            continue
         if not needs.file_holders(key):
             await release_file(db, key, lock_owner)
             for legacy in legacy_keys:

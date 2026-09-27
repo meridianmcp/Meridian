@@ -28,6 +28,13 @@ sleeps.
 F2. ``_coarse_lock_paths`` only guarded ``json.loads``: a value parsing to a
 non-list made release/transfer raise after the item was already pending (lock
 stranded, no audit row), and a JSON string was iterated character by character.
+
+F3. When no hand-off target can take a kept lock, the hand-off decides again
+from the live set. That lookup swallowed its own errors and answered "no
+siblings", which the re-decision read as "nothing needs the file" and freed a
+lock a same-session item still declared (on release, and when a transfer
+settles the receiver's lock). A failed lookup is now "unknown": retried, then
+the lock is kept (TTL-bound).
 """
 from __future__ import annotations
 
@@ -419,3 +426,107 @@ async def test_malformed_coarse_lock_files_never_breaks_release_or_transfer(db, 
     warnings = [r.getMessage() for r in caplog.records if "coarse_lock_files" in r.getMessage()]
     assert warnings, "a malformed ownership record must be logged"
     assert not any("pkg/" in message for message in warnings), "the stored value was logged"
+
+
+# ---------------------------------------------------------------------------
+# F3 — a FAILED live-set lookup during the hand-off re-decision
+# ---------------------------------------------------------------------------
+
+def _fail_sibling_lookups(monkeypatch, db, *, times: int | None) -> dict:
+    """Make the next ``times`` sibling-lock lookups (the ``in_progress`` scan
+    over ``touches_resources``; ``None`` = every one) raise, as a transient DB
+    error would. Returns the arming state: set ``state["on"]`` to start."""
+    state = {"on": False, "left": times, "fired": 0}
+    real_execute = db.execute
+
+    def _execute(sql, *args, **kwargs):
+        if (
+            state["on"] and "status = 'in_progress'" in sql
+            and "touches_resources" in sql and "FROM sprint_items" in sql
+        ):
+            state["fired"] += 1
+            if state["left"] is not None:
+                state["left"] -= 1
+                if state["left"] <= 0:
+                    state["on"] = False
+            raise RuntimeError("injected transient DB error on the sibling lookup")
+        return real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", _execute)
+    return state
+
+
+@pytest.mark.parametrize("failures", [1, None], ids=["transient", "persistent"])
+async def test_failed_lookup_in_the_hand_off_re_decision_keeps_a_lock_a_sibling_declares(
+    db, monkeypatch, failures,
+):
+    """Same session: A=file:X, B=symbol:X::f (claimed after A, not an owner),
+    C=file:X (stays in_progress). A's release keeps X and queues the hand-off
+    to B; B leaves inside that window, so the compare-and-swap to B fails and
+    the decision is made again from the live set — whose lookup then FAILS.
+    An unknown answer must not read as "nothing needs X": C still declares it.
+    """
+    pid = (await db_module.create_project(db, "handoff-lookup-fails"))["id"]
+    sess = await _session(db, pid)
+    a = await _item(db, pid, "Refactor the config parser", [f"file:{X}"])
+    b = await _item(db, pid, "Add retry telemetry to uploads", [f"symbol:{X}::f"])
+    c = await _item(db, pid, "Tighten the cache eviction policy", [f"file:{X}"])
+    for item_id in (a, b, c):
+        await _claim(db, pid, item_id, sess)
+
+    injected = _fail_sibling_lookups(monkeypatch, db, times=failures)
+    original = sprint_items_module._apply_file_lock_handoffs
+    state: dict = {}
+
+    async def _b_leaves_then_lookup_fails(db_, siblings):
+        if siblings.handoffs and "b" not in state:
+            state["b"] = await _release_db(db, pid, b, sess)
+            injected["on"] = True
+        return await original(db_, siblings)
+
+    monkeypatch.setattr(sprint_items_module, "_apply_file_lock_handoffs", _b_leaves_then_lookup_fails)
+    released_a = await _release_db(db, pid, a, sess)
+    injected["on"] = False
+    monkeypatch.setattr(sprint_items_module, "_apply_file_lock_handoffs", original)
+
+    assert "b" in state, "the hand-off window was never reached"
+    assert injected["fired"] >= 1, "no sibling lookup failure was injected"
+    assert [await _status(db, i) for i in (a, b, c)] == ["pending", "pending", "in_progress"]
+    assert await _holder(db, X) == sess, "X freed while C (file:X, same session) is in_progress"
+    assert f"file:{X}" not in released_a["released_resources"]
+    assert [k["file_path"] for k in released_a["kept_for_sibling_items"]] == [X]
+    blocked = await _other_session_can_claim(db, pid, X)
+    assert blocked.get("status") != "in_progress", blocked
+
+    # C is a releaser of X: its own release still frees it.
+    await _release_db(db, pid, c, sess)
+    assert await _holder(db, X) is None
+
+
+async def test_failed_lookup_while_securing_a_transferred_lock_keeps_a_lock_a_sibling_declares(
+    db, monkeypatch,
+):
+    """The transfer-side exposure (_secure_receiver_file_lock): the item the
+    receiver's whole-file lock on X was re-acquired for already left
+    in_progress under the receiver, so the lock is settled like any leaver's —
+    and the live-set lookup fails. Another receiver item still declares
+    file:X, so X must stay the receiver's."""
+    pid = (await db_module.create_project(db, "secure-lookup-fails"))["id"]
+    receiver = await _session(db, pid, "receiver")
+    c = await _item(db, pid, "Harden the upload path", [f"file:{X}"])
+    t = await _item(db, pid, "Add retry telemetry to uploads", [f"file:{X}"])
+    await _claim(db, pid, c, receiver)
+    assert await _holder(db, X) == receiver
+    assert await _status(db, t) == "pending"
+
+    injected = _fail_sibling_lookups(monkeypatch, db, times=None)
+    injected["on"] = True
+    await sprint_items_module._secure_receiver_file_lock(
+        db, t, receiver, X, take_ownership=False,
+    )
+    injected["on"] = False
+
+    assert injected["fired"] >= 1, "no sibling lookup failure was injected"
+    assert await _holder(db, X) == receiver, "X freed while C (file:X, receiver) is in_progress"
+    await _release_db(db, pid, c, receiver)
+    assert await _holder(db, X) is None
