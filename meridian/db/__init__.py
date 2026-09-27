@@ -1165,6 +1165,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_repo_identity(db)
     # W1-K -- derivative-document (DOCX) provenance tracking.
     await _migrate_docx_derivatives(db)
+    # c0ddd5b3 -- sprint_items.lock_session_id: live lock-owning session,
+    # distinct from the attribution-only actor column.
+    await _migrate_sprint_item_lock_session_id(db)
     return db
 
 

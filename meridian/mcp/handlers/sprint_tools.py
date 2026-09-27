@@ -1099,8 +1099,23 @@ async def handle_claim_sprint_item(
         # 5823db0b — actor attribution: record who claimed the item (explicit
         # actor arg, else the claiming session id).
         _claim_actor = args.get("actor") or args.get("session_id")
+        # c0ddd5b3 — the gate above acquired every lock under session_id, which
+        # an explicit actor (a human name, an orchestrator id) need not match.
+        # Record that session as the claim's lock owner so release / stale-
+        # reset / transfer free the locks under the identity that holds them,
+        # instead of under actor (freeing nothing and leaking every lock for
+        # its full TTL). Only when the gate actually holds something.
+        _lock_owner_session = (
+            args.get("session_id")
+            if any(
+                e.get("acquired")
+                for e in (_resource_lock_gate.get("lock_scope") or [])
+            )
+            else None
+        )
         item = await db_module.claim_sprint_item(
-            db, args["project_id"], args["item_id"], actor=_claim_actor
+            db, args["project_id"], args["item_id"], actor=_claim_actor,
+            lock_session_id=_lock_owner_session,
         )
     except ValueError:
         # 18c488b6 — the status transition never landed for THIS session (lost
@@ -1447,8 +1462,9 @@ async def handle_release_sprint_item_claim(
     function's docstring for the full contract.
 
     ``session_id`` (required) is the calling session's own identity — only
-    the session recorded as the item's current ``actor`` may release its own
-    claim; pass ``force=true`` to release a different live session's claim
+    the session recorded as the item's current ``actor`` (or, c0ddd5b3, its
+    ``lock_session_id``: the session that claimed it and holds its locks) may
+    release its own claim; pass ``force=true`` to release a different live session's claim
     anyway (audited either way). ``reason`` (optional) is recorded in the
     audit trail only, never written to the item's own ``notes``.
     """

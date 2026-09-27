@@ -1346,6 +1346,36 @@ async def get_sprint_item(
     return _row_to_dict(row)
 
 
+# c0ddd5b3 — sentinel for _transition_status(lock_session_id=...): "leave the
+# column as it is", distinct from an explicit None ("write NULL").
+_LOCK_SESSION_UNCHANGED: Any = object()
+
+
+def _claim_lock_owner(item: dict[str, Any], fallback: str | None = None) -> str | None:
+    """c0ddd5b3 — the session a claim's touches_resources locks are held under.
+
+    ``lock_session_id`` (recorded by the MCP claim path, which acquires every
+    lock under the caller's session_id) when present; otherwise ``fallback``
+    (the caller's pre-c0ddd5b3 release identity) — so legacy rows, and claims
+    made by paths that never record it, release exactly as they always did.
+    ``actor`` is attribution and may be a human name or an orchestrator id
+    that holds no lock at all, which is why it can't be the release key."""
+    return (item.get("lock_session_id") or "").strip() or fallback
+
+
+def _claim_owner_identities(item: dict[str, Any]) -> set[str]:
+    """c0ddd5b3 — identities that own an ``in_progress`` claim for the
+    release/transfer ownership check: the attribution ``actor`` and the
+    lock-holding ``lock_session_id``. Empty when neither is recorded (an
+    unattributed claim, which anyone could always release)."""
+    return {
+        v for v in (
+            (item.get("actor") or "").strip(),
+            (item.get("lock_session_id") or "").strip(),
+        ) if v
+    }
+
+
 async def _transition_status(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1357,6 +1387,7 @@ async def _transition_status(
     pushed_to: str | None = None,
     actor: str | None = None,
     claimed_at_now: bool = False,
+    lock_session_id: "str | None | object" = _LOCK_SESSION_UNCHANGED,
 ) -> dict[str, Any] | None:
     """Atomic chokepoint for ALL sprint-item status transitions.
 
@@ -1380,6 +1411,13 @@ async def _transition_status(
     non-terminal statuses clear it. ``task_id``, ``notes``, ``pushed_to``,
     ``actor`` are optional extra fields. ``claimed_at_now`` sets
     ``claimed_at = datetime('now')`` (used by claim_sprint_item).
+
+    c0ddd5b3 — ``lock_session_id`` is the session that holds the claim's
+    touches_resources locks (live ownership, distinct from the attribution-only
+    ``actor``). Any transition to a status other than ``in_progress`` ends the
+    claim, so it is always cleared then — whatever this call is passed. For an
+    ``in_progress`` target it is written only when explicitly passed (``None``
+    writes NULL); the default leaves the column untouched.
 
     Side effects on success: cache invalidation via
     :func:`_invalidate_sprint_items_cache` and live event via
@@ -1418,6 +1456,11 @@ async def _transition_status(
     if actor is not None:
         fields.append("actor = ?")
         values.append(actor)
+    if to_status != "in_progress":
+        fields.append("lock_session_id = NULL")
+    elif lock_session_id is not _LOCK_SESSION_UNCHANGED:
+        fields.append("lock_session_id = ?")
+        values.append(lock_session_id)
     values.append(item_id)
     values.append(project_id)
     where = "WHERE id = ? AND project_id = ?"
@@ -2330,7 +2373,14 @@ async def complete_sprint_item(
         # only when the disagreement isn't explained by staleness/force.
         _claim_owner = (item.get("actor") or "").strip()
         _completing_actor = (actor or "").strip()
-        if _claim_owner and _completing_actor and _claim_owner != _completing_actor:
+        # c0ddd5b3 — the session holding the claim's locks (lock_session_id)
+        # owns the claim too: a claim made with an explicit actor (a human
+        # name, an orchestrator id) must stay completable by the session that
+        # actually made it.
+        if (
+            _claim_owner and _completing_actor
+            and _completing_actor not in _claim_owner_identities(item)
+        ):
             _claim_is_stale = False
             _claimed_at_dt = _parse_deferral_ts(item.get("claimed_at"))
             if _claimed_at_dt is not None:
@@ -2843,12 +2893,22 @@ async def claim_sprint_item(
     project_id: str,
     item_id: str,
     actor: str | None = None,
+    *,
+    lock_session_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Claim a sprint item: set status='in_progress' and claimed_at=now().
 
     Rejects (raises ValueError) if already in_progress, done, failed, or skipped.
     Returns None if the item doesn't exist. ``actor`` (5823db0b) records which
     executor claimed the item.
+
+    c0ddd5b3 — ``lock_session_id`` records the session that holds this claim's
+    touches_resources locks (the MCP claim path acquires them under its
+    session_id before calling here), written in the same atomic UPDATE as the
+    status flip. It is live ownership, kept apart from ``actor`` because the
+    two legitimately differ (a human name, an orchestrator id); every release
+    path keys on it. Omitted, it is written as NULL, so a claim never inherits
+    a previous claim's owner and releases fall back to ``actor`` as before.
 
     dec69708 — ENFORCED deferral: if the item's ``deferred_until`` is in the
     future, the claim is REFUSED and a structured blocked dict is returned
@@ -3170,6 +3230,8 @@ async def claim_sprint_item(
         from_statuses=sorted(claimable),
         actor=actor,
         claimed_at_now=True,
+        # c0ddd5b3 — always written (NULL when omitted); see docstring.
+        lock_session_id=(lock_session_id or "").strip() or None,
     )
     if result is None:
         # The pre-check passed but a concurrent transition committed first
@@ -3441,6 +3503,15 @@ async def classify_stale_claim(
         "age_hours": round(age_hours, 2) if age_hours is not None else None,
         "age_stale": age_stale,
     }
+    # c0ddd5b3 — judge liveness by the session that actually made the claim
+    # and holds its locks when that is recorded. ``actor`` is attribution and
+    # may be a human name / orchestrator id with no session row, which would
+    # otherwise leave a genuinely-abandoned claim unverifiable (and its locks
+    # held) until its TTL. Legacy rows keep using ``actor``, unchanged.
+    _lock_session = (item.get("lock_session_id") or "").strip()
+    if _lock_session:
+        signals["lock_session_id"] = _lock_session
+        actor = _lock_session
 
     if not actor:
         signals.update({"session_found": None, "worktree_live": None, "recent_evidence": None})
@@ -3561,6 +3632,41 @@ async def _release_file_resource(db: Any, body: str, session_id: str) -> bool:
     return bool(released)
 
 
+async def _release_claim_resources(
+    db: Any, item: dict[str, Any], lock_owner: str,
+) -> list[str]:
+    """Release every declared touches_resources lock of ``item`` held under
+    ``lock_owner``; returns the resource ids whose lock was actually released.
+
+    Shared by :func:`release_sprint_item_claim` and :func:`_reset_stale_claim`
+    (c0ddd5b3 — one loop, so the two can't drift on WHICH session they release
+    under). Best-effort: one bad resource id never blocks the others, and a
+    failure to import/iterate never propagates to the caller's transition."""
+    released: list[str] = []
+    try:
+        from meridian.db import release_file, release_resource, release_symbol  # noqa: PLC0415
+        for rid in parse_touches_resources(item.get("touches_resources")):
+            body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
+            try:
+                if body.startswith("file:"):
+                    if await _release_file_resource(db, body, lock_owner):
+                        released.append(rid)
+                elif body.startswith("symbol:"):
+                    path, _, sym = body[len("symbol:"):].partition("::")
+                    if sym and await release_symbol(db, lock_owner, path, sym):
+                        released.append(rid)
+                    elif not sym and await release_file(db, path, lock_owner):
+                        released.append(rid)
+                else:
+                    if await release_resource(db, body, lock_owner):
+                        released.append(rid)
+            except Exception:  # noqa: BLE001 — one bad resource id must not block the rest
+                continue
+    except Exception:  # noqa: BLE001 — lock release is best-effort, never blocks the caller
+        pass
+    return released
+
+
 async def _reset_stale_claim(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3617,35 +3723,19 @@ async def _reset_stale_claim(
     # lazy import here (called well after full package init) avoids the
     # circular-import ordering issue, same pattern _check_wrong_worktree in
     # sprint_evidence_guard.py already uses for a cross-submodule call.
+    # c0ddd5b3 — release under the session that HOLDS the locks, which is not
+    # necessarily the attribution-only actor (see _claim_lock_owner).
     released: list[str] = []
-    if prior_actor:
-        try:
-            from meridian.db import release_file, release_resource, release_symbol  # noqa: PLC0415
-            for rid in parse_touches_resources(item.get("touches_resources")):
-                body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
-                try:
-                    if body.startswith("file:"):
-                        if await _release_file_resource(db, body, prior_actor):
-                            released.append(rid)
-                    elif body.startswith("symbol:"):
-                        path, _, sym = body[len("symbol:"):].partition("::")
-                        if sym and await release_symbol(db, prior_actor, path, sym):
-                            released.append(rid)
-                        elif not sym and await release_file(db, path, prior_actor):
-                            released.append(rid)
-                    else:
-                        if await release_resource(db, body, prior_actor):
-                            released.append(rid)
-                except Exception:  # noqa: BLE001 — one bad resource id must not block the rest
-                    continue
-        except Exception:  # noqa: BLE001 — lock release is best-effort, never blocks the reset
-            pass
+    lock_owner = _claim_lock_owner(item, prior_actor)
+    if lock_owner:
+        released = await _release_claim_resources(db, item, lock_owner)
 
     from meridian.db import record_action_audit_event  # noqa: PLC0415
     detail = json.dumps({
         "item_id": item_id,
         "prior_actor": prior_actor,
         "prior_claimed_at": prior_claimed_at,
+        "prior_lock_session_id": item.get("lock_session_id"),
         "released_resources": released,
         "classification": verdict.get("classification"),
         "reasons": verdict.get("reasons"),
@@ -3906,7 +3996,10 @@ async def release_sprint_item_claim(
     as stale.
 
     Ownership is enforced: only the session recorded as the item's current
-    ``actor`` may release its own claim. A mismatch is refused
+    ``actor`` — or, c0ddd5b3, its ``lock_session_id``, the session the claim's
+    locks are held under, which differs from ``actor`` when the claim was made
+    with an explicit actor — may release its own claim. Locks are released
+    under ``lock_session_id`` when recorded, else ``actor``. A mismatch is refused
     (``NOT_CLAIM_OWNER``) unless the caller explicitly passes ``force=True`` —
     releasing someone else's live claim is unusual enough that it must be an
     explicit, audited choice, never a silent default.
@@ -3948,7 +4041,13 @@ async def release_sprint_item_claim(
         }
     prior_actor = item.get("actor")
     prior_claimed_at = item.get("claimed_at")
-    if prior_actor and prior_actor != session_id and not force:
+    prior_lock_session_id = item.get("lock_session_id")
+    # c0ddd5b3 — the session holding the claim's locks owns it just as much as
+    # the attribution actor does (they differ when claim_sprint_item was given
+    # an explicit actor), so either identity may release it without force.
+    owners = _claim_owner_identities(item)
+    not_owner = bool(owners) and session_id not in owners
+    if not_owner and not force:
         return {
             "blocked": True,
             "error": "NOT_CLAIM_OWNER",
@@ -3961,9 +4060,11 @@ async def release_sprint_item_claim(
             ),
             "item_id": item_id,
             "actor": prior_actor,
+            "lock_session_id": prior_lock_session_id,
         }
     # TOCTOU-safe: only transitions FROM in_progress, mirroring
-    # _reset_stale_claim's own race-safety contract.
+    # _reset_stale_claim's own race-safety contract. Leaving in_progress also
+    # clears lock_session_id (_transition_status).
     transitioned = await _transition_status(
         db, project_id, item_id, "pending",
         from_statuses=["in_progress"],
@@ -3990,41 +4091,25 @@ async def release_sprint_item_claim(
     await db.commit()
     _invalidate_sprint_items_cache(project_id)
 
-    # Release any file/symbol/resource locks the released claim held.
-    # Best-effort, same pattern as _reset_stale_claim: one bad resource id
-    # must never block the release of the others or of the item itself.
+    # Release any file/symbol/resource locks the released claim held — under
+    # the session that HOLDS them (c0ddd5b3), which is not necessarily the
+    # attribution actor. Best-effort, same helper as _reset_stale_claim: one
+    # bad resource id must never block the release of the others or of the
+    # item itself.
     released: list[str] = []
-    if prior_actor:
-        try:
-            from meridian.db import release_file, release_resource, release_symbol  # noqa: PLC0415
-            for rid in parse_touches_resources(item.get("touches_resources")):
-                body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
-                try:
-                    if body.startswith("file:"):
-                        if await _release_file_resource(db, body, prior_actor):
-                            released.append(rid)
-                    elif body.startswith("symbol:"):
-                        path, _, sym = body[len("symbol:"):].partition("::")
-                        if sym and await release_symbol(db, prior_actor, path, sym):
-                            released.append(rid)
-                        elif not sym and await release_file(db, path, prior_actor):
-                            released.append(rid)
-                    else:
-                        if await release_resource(db, body, prior_actor):
-                            released.append(rid)
-                except Exception:  # noqa: BLE001 — one bad resource id must not block the rest
-                    continue
-        except Exception:  # noqa: BLE001 — lock release is best-effort, never blocks the release
-            pass
+    lock_owner = _claim_lock_owner(item, prior_actor)
+    if lock_owner:
+        released = await _release_claim_resources(db, item, lock_owner)
 
     from meridian.db import record_action_audit_event  # noqa: PLC0415
     detail = json.dumps({
         "item_id": item_id,
         "prior_actor": prior_actor,
         "prior_claimed_at": prior_claimed_at,
+        "prior_lock_session_id": prior_lock_session_id,
         "released_resources": released,
         "reason": reason,
-        "forced": bool(force and prior_actor and prior_actor != session_id),
+        "forced": bool(force and not_owner),
         "released_by": session_id,
     })
     try:
@@ -4083,9 +4168,18 @@ async def transfer_sprint_item_claim(
     ``from_session_id`` but not re-acquired; the item still stays
     ``in_progress`` under ``to_actor`` throughout.
 
+    c0ddd5b3 — "released under ``from_session_id``" above means under the
+    session that actually holds the locks: the item's ``lock_session_id`` when
+    recorded (it differs from ``from_session_id`` under ``force``, and from
+    ``actor`` whenever the claim was made with an explicit actor), else
+    ``from_session_id`` as before. ``lock_session_id`` then moves to
+    ``to_session_id`` (NULL when omitted). An unchanged ``to_actor`` is only
+    refused as ``SAME_ACTOR`` when ``to_session_id`` wouldn't move the locks
+    either.
+
     Ownership is enforced exactly like :func:`release_sprint_item_claim`:
-    only the session recorded as the item's current ``actor`` may transfer
-    its own claim away, unless ``force=True`` is explicitly passed.
+    only the item's current ``actor`` or lock-holding ``lock_session_id`` may
+    transfer its own claim away, unless ``force=True`` is explicitly passed.
 
     Returns:
       * ``None`` if the item doesn't exist or belongs to a different project.
@@ -4116,7 +4210,12 @@ async def transfer_sprint_item_claim(
         }
     prior_actor = item.get("actor")
     prior_claimed_at = item.get("claimed_at")
-    if prior_actor and prior_actor != from_session_id and not force:
+    prior_lock_session_id = item.get("lock_session_id")
+    # c0ddd5b3 — actor OR the lock-holding session may transfer (see
+    # release_sprint_item_claim).
+    owners = _claim_owner_identities(item)
+    not_owner = bool(owners) and from_session_id not in owners
+    if not_owner and not force:
         return {
             "blocked": True,
             "error": "NOT_CLAIM_OWNER",
@@ -4128,8 +4227,18 @@ async def transfer_sprint_item_claim(
             ),
             "item_id": item_id,
             "actor": prior_actor,
+            "lock_session_id": prior_lock_session_id,
         }
-    if (to_actor or "").strip() == (prior_actor or "").strip():
+    # The session the claim's locks are held under right now: lock_session_id
+    # when recorded, else from_session_id (the pre-c0ddd5b3 behavior).
+    lock_owner = _claim_lock_owner(item, from_session_id)
+    new_lock_session_id = (to_session_id or "").strip() or None
+    # SAME_ACTOR only when nothing would change hands: an unchanged actor may
+    # still legitimately move the claim's locks to a different session (e.g.
+    # a human-attributed claim continued from a new session).
+    if (to_actor or "").strip() == (prior_actor or "").strip() and (
+        new_lock_session_id is None or new_lock_session_id == lock_owner
+    ):
         return {
             "blocked": True,
             "error": "SAME_ACTOR",
@@ -4140,7 +4249,9 @@ async def transfer_sprint_item_claim(
 
     # Move resource locks BEFORE flipping the item's actor column, mirroring
     # _reset_stale_claim's own best-effort (never-blocks-the-transition)
-    # contract for lock handling.
+    # contract for lock handling. c0ddd5b3 — released under lock_owner, the
+    # session that actually holds them, not from_session_id (they differ when
+    # the claim was made with an explicit actor, or under force).
     transferred: list[str] = []
     released_only: list[str] = []
     try:
@@ -4152,7 +4263,7 @@ async def transfer_sprint_item_claim(
                     # 4e2bce48 — move the REAL file's lock (and clear any
                     # pre-fix "<path>:<symbol>" lock) instead of the raw suffix.
                     path = _resource_file_of(body) or body[len("file:"):]
-                    _rel = await _release_file_resource(db, body, from_session_id)
+                    _rel = await _release_file_resource(db, body, lock_owner)
                     if to_session_id:
                         _claim_res = await claim_file(db, path, to_session_id, item_id=item_id)
                         if _claim_res.get("claimed"):
@@ -4167,10 +4278,10 @@ async def transfer_sprint_item_claim(
                         # Symbol-grain re-acquisition needs the file's current
                         # content to re-resolve the AST range (see docstring)
                         # — release only, never auto-reclaimed here.
-                        if await release_symbol(db, from_session_id, path, sym):
+                        if await release_symbol(db, lock_owner, path, sym):
                             released_only.append(rid)
                     else:
-                        _rel = await release_file(db, path, from_session_id)
+                        _rel = await release_file(db, path, lock_owner)
                         if to_session_id:
                             _claim_res = await claim_file(db, path, to_session_id, item_id=item_id)
                             if _claim_res.get("claimed"):
@@ -4189,6 +4300,10 @@ async def transfer_sprint_item_claim(
         from_statuses=["in_progress"],
         actor=to_actor,
         claimed_at_now=True,
+        # c0ddd5b3 — ownership of the (re-acquired) locks moves to
+        # to_session_id; with none given the locks were only released, so
+        # nothing is held and later releases fall back to to_actor.
+        lock_session_id=new_lock_session_id,
     )
     if updated is None:
         # Raced away from in_progress between the ownership check and this
@@ -4217,10 +4332,12 @@ async def transfer_sprint_item_claim(
         "new_actor": to_actor,
         "from_session_id": from_session_id,
         "to_session_id": to_session_id,
+        "prior_lock_session_id": prior_lock_session_id,
+        "released_under_session_id": lock_owner,
         "transferred_resources": transferred,
         "released_only_resources": released_only,
         "reason": reason,
-        "forced": bool(force and prior_actor and prior_actor != from_session_id),
+        "forced": bool(force and not_owner),
     })
     try:
         await record_action_audit_event(
