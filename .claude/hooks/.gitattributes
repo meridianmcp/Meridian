@@ -5,3 +5,12 @@
 meridian_guard*.sh text eol=lf
 meridian_guard*.awk text eol=lf
 meridian_guard*.ps1 text eol=lf
+# fix round 2 (guard-integ) -- sprint_guard.sh was checked in with CRLF (a checkout
+# with core.autocrlf=true can silently reintroduce it, since this file was never
+# covered by the pattern above): "set -uo pipefail\r" makes bash's `set` builtin
+# reject "pipefail\r" as an invalid option name, so the hook never even reached its
+# own logic. hitl_guard.sh had no CRLF but is pinned here too, for the same reason
+# meridian_guard*.sh is: a future edit on a Windows checkout must not be able to
+# reintroduce this class of bug.
+sprint_guard*.sh text eol=lf
+hitl_guard*.sh text eol=lf

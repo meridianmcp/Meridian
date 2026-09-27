@@ -125,6 +125,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send({"pending_count": _Stub.pending_count, "verification_pending_count": 0})
         elif path == f"/projects/{PROJECT_ID}/sprint/test_coverage_expected":
             self._send({"test_coverage_expected": False})
+        elif path == "/health":
+            # hitl_guard fix round 2's reachability probe: a real, reachable Meridian
+            # answers /health 2xx before the hook decides whether to block.
+            self._send({"status": "ok", "service": "meridian"})
         else:
             self._send({"detail": "not found"}, 404)
 

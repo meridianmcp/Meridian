@@ -557,8 +557,27 @@ _SG_REPO = Path(__file__).resolve().parent.parent
 _SG_HOOK_SH = _SG_REPO / ".claude" / "hooks" / "sprint_guard.sh"
 _SG_HOOK_PS1 = _SG_REPO / ".claude" / "hooks" / "sprint_guard.ps1"
 
+
+def _sg_bash() -> str | None:
+    """Git Bash, preferred over a bare ``bash`` PATH lookup.
+
+    On Windows, ``C:\\Windows\\System32\\bash.exe`` (the WSL launcher) can shadow
+    Git's own bash.exe on PATH. Under WSL, Windows-style paths (``C:\\Users\\...``,
+    as this file's transcript/payload paths are) never resolve, so the hook's own
+    ``[ -f "$tp" ]`` transcript check silently fails and every one of these tests
+    would report an unexplained "returncode 0, empty stdout/stderr" instead of
+    exercising sprint_guard.sh at all -- same fix as test_legacy_hooks_fix_round1.py's
+    ``_bash()``."""
+    for c in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"):
+        if os.name == "nt" and Path(c).exists():
+            return c
+    return shutil.which("bash")
+
+
+_SG_BASH = _sg_bash()
+
 _sg_needs_bash = pytest.mark.skipif(
-    not _SG_HOOK_SH.exists() or shutil.which("bash") is None,
+    not _SG_HOOK_SH.exists() or _SG_BASH is None,
     reason="sprint_guard.sh or bash unavailable",
 )
 
@@ -624,7 +643,7 @@ def _sg_run_sh(payload: str, *, meridian_url: str) -> subprocess.CompletedProces
     setup = f'export MERIDIAN_URL="{meridian_url}"; '
     cmd = setup + "exec bash .claude/hooks/sprint_guard.sh"
     r = subprocess.run(
-        ["bash", "-c", cmd],
+        [_SG_BASH, "-c", cmd],
         input=payload.encode("utf-8"),
         cwd=str(_SG_REPO),
         capture_output=True,
