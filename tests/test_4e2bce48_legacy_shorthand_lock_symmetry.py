@@ -171,6 +171,97 @@ async def test_release_helper_reports_nothing_released_when_nothing_was_held(db)
     assert await sprint_items_module._release_file_resource(db, SHORTHAND, sess["id"]) is False
 
 
+async def test_mcp_release_file_by_the_declared_string_releases_the_real_lock(db):
+    """Executors commonly release by the string they declared. Claim time now
+    locks the real file, so release_file must fall back to it or the lock leaks."""
+    from meridian import server as srv
+
+    pid, item = await _item(db, "4e2bce48-mcp-release", [SHORTHAND])
+    sess = await db_module.register_session(db, pid, "w1")
+    assert (await _sprint_item_resource_claim_gate(db, pid, item["id"], sess["id"]))["ok"] is True
+
+    res = await srv._dispatch_mcp_tool(
+        "release_file", {"file_path": BOGUS, "session_id": sess["id"]}, db, "/tmp",
+    )
+
+    assert res["released"] is True
+    assert res["released_file_path"] == REAL
+    assert res["resolved_from_legacy_shorthand"] is True
+    assert await _holder(db, REAL) is None
+
+
+async def test_mcp_release_file_accepts_the_full_resource_id_too(db):
+    from meridian import server as srv
+
+    pid, item = await _item(db, "4e2bce48-mcp-release-rid", [SHORTHAND])
+    sess = await db_module.register_session(db, pid, "w1")
+    assert (await _sprint_item_resource_claim_gate(db, pid, item["id"], sess["id"]))["ok"] is True
+
+    res = await srv._dispatch_mcp_tool(
+        "release_file", {"file_path": SHORTHAND, "session_id": sess["id"]}, db, "/tmp",
+    )
+
+    assert res["released"] is True
+    assert await _holder(db, REAL) is None
+
+
+async def test_mcp_release_file_plain_path_response_is_unchanged(db):
+    from meridian import server as srv
+
+    project = await db_module.create_project(db, "4e2bce48-mcp-release-plain")
+    sess = await db_module.register_session(db, project["id"], "w1")
+
+    res = await srv._dispatch_mcp_tool(
+        "release_file", {"file_path": "pkg/never_locked.py", "session_id": sess["id"]}, db, "/tmp",
+    )
+
+    assert res == {"released": False, "file_path": "pkg/never_locked.py"}
+
+
+async def test_reclaim_does_not_append_a_spurious_file_resource(db):
+    pid, item = await _item(db, "4e2bce48-amend", [SHORTHAND])
+    sess = await db_module.register_session(db, pid, "w1")
+    await db_module.claim_sprint_item(db, pid, item["id"], actor=sess["id"])
+    assert (await _sprint_item_resource_claim_gate(db, pid, item["id"], sess["id"]))["ok"] is True
+
+    # Re-claiming the real file for the same item must not grow its declaration.
+    await db_module.claim_file(db, REAL, sess["id"], item_id=item["id"])
+
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    assert db_module.parse_touches_resources(fresh["touches_resources"]) == [SHORTHAND]
+    assert not fresh.get("resources_amended")
+
+
+async def test_whole_file_claim_over_a_symbol_declaration_still_amends(db):
+    """A whole-file lock IS broader than a single symbol, so that amendment is kept."""
+    pid, item = await _item(db, "4e2bce48-amend-symbol", ["symbol:pkg/mod.py::helper"])
+    sess = await db_module.register_session(db, pid, "w1")
+    await db_module.claim_sprint_item(db, pid, item["id"], actor=sess["id"])
+
+    await db_module.claim_file(db, REAL, sess["id"], item_id=item["id"])
+
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    assert f"file:{REAL}" in db_module.parse_touches_resources(fresh["touches_resources"])
+    assert fresh.get("resources_amended")
+
+
+def test_drive_letter_path_with_a_symbol_suffix_resolves_to_the_real_file():
+    assert db_module._resource_file_of("file:C:/repo/x.py:helper") == "C:/repo/x.py"
+    assert db_module._resource_file_of("file:C:\\repo\\x.py:helper") == "C:\\repo\\x.py"
+    assert db_module._resource_file_of("file:C:/repo/x.py") == "C:/repo/x.py"
+    assert db_module._resource_file_of("file:x.py:helper") == "x.py"
+
+
+async def test_gate_locks_the_real_file_for_a_drive_letter_shorthand(db):
+    pid, item = await _item(db, "4e2bce48-drive-symbol", ["file:C:/repo/x.py:helper"])
+    sess = await db_module.register_session(db, pid, "w1")
+
+    entry = (await _sprint_item_resource_claim_gate(db, pid, item["id"], sess["id"]))["lock_scope"][0]
+
+    assert entry["file_path"] == "C:/repo/x.py"
+    assert entry["resolved_from_legacy_shorthand"] is True
+
+
 # ---------------------------------------------------------------------------
 # Same literal-path mistake in the non-lock consumers
 # ---------------------------------------------------------------------------
@@ -194,6 +285,22 @@ def test_strict_evidence_paths_resolve_the_real_file():
 def test_prospect_context_names_the_real_file():
     ctx = _prospect_code_context({"touches_resources": [SHORTHAND], "title": "x"})
     assert ctx["files"] == [REAL]
+
+
+def test_prospect_context_resolves_an_inferred_shorthand_too():
+    ctx = _prospect_code_context({"touches_resources": [f"inferred:{SHORTHAND}"], "title": "x"})
+    assert ctx["files"] == [REAL]
+
+
+async def test_code_notes_surface_for_an_inferred_shorthand(db):
+    pid, item = await _item(db, "4e2bce48-notes-inferred", [f"inferred:{SHORTHAND}"])
+    await db_module.add_project_note(
+        db, pid, "inferred note", "read this", kind="code", file_path=REAL,
+    )
+
+    notes = await _code_notes_for_item_resources(db, pid, item)
+
+    assert [entry["file_path"] for entry in notes] == [REAL]
 
 
 # ---------------------------------------------------------------------------

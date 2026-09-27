@@ -2489,7 +2489,8 @@ def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
         elif entry.startswith("symbol:"):
             symbols.append(entry[len("symbol:"):])
         elif entry.startswith("inferred:file:"):
-            files.append(entry[len("inferred:file:"):])
+            tail = entry[len("inferred:file:"):]
+            files.append(db_module._resource_file_of("file:" + tail) or tail)
     if files or symbols:
         ctx: dict[str, Any] = {"source": "touches_resources"}
         if files:
@@ -2562,7 +2563,8 @@ async def _code_notes_for_item_resources(
             # silently never surfaced at claim time.
             file_paths.append(db_module._resource_file_of(entry) or entry[len("file:"):])
         elif entry.startswith("inferred:file:"):
-            file_paths.append(entry[len("inferred:file:"):])
+            tail = entry[len("inferred:file:"):]
+            file_paths.append(db_module._resource_file_of("file:" + tail) or tail)
     # Also extract symbol paths so the file portion can be included.
     for entry in _parse_touches_files(item.get("touches_resources")):
         if entry.startswith("symbol:"):
@@ -5200,7 +5202,23 @@ async def _handle_file_claims(
         }
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
-        return {"released": released, "file_path": args["file_path"]}
+        release_result: dict[str, Any] = {"released": released, "file_path": args["file_path"]}
+        if not released:
+            # 4e2bce48 — executors often release by the declared string (e.g.
+            # "pkg/mod.py:helper" from "file:pkg/mod.py:helper"), but claim time
+            # locks the real file, so fall back to it instead of leaking the lock.
+            raw = args["file_path"]
+            raw = raw[len("file:"):] if raw.startswith("file:") else raw
+            real = db_module._resource_file_of("file:" + raw)
+            if real and real != args["file_path"] and await db_module.release_file(
+                db, real, args["session_id"],
+            ):
+                release_result.update({
+                    "released": True,
+                    "released_file_path": real,
+                    "resolved_from_legacy_shorthand": True,
+                })
+        return release_result
     if name == "find_orphaned_docx_staged_files":
         # 6507e83a — maintenance diagnostic: staged-DOCX temp files left
         # behind by a process that crashed between STAGE and PROMOTE inside

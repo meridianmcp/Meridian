@@ -8168,9 +8168,14 @@ def _resource_file_of(rid: str) -> "str | None":
     """
     if rid.startswith("file:"):
         value = rid[len("file:"):]
-        if ":" in value and not re.match(r"^[A-Za-z]:[/\\]", value):
-            value = value.split(":", 1)[0]
-        return value
+        # 4e2bce48 — exempt only the drive letter's OWN colon: the old check
+        # skipped stripping for the whole value, so "C:/repo/x.py:helper" kept
+        # its ":helper" suffix and locked a nonexistent path.
+        drive = value[:2] if re.match(r"^[A-Za-z]:[/\\]", value) else ""
+        rest = value[len(drive):]
+        if ":" in rest:
+            rest = rest.split(":", 1)[0]
+        return drive + rest
     if rid.startswith("symbol:"):
         return rid[len("symbol:"):].partition("::")[0]
     return None

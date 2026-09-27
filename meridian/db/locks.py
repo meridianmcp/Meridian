@@ -280,6 +280,17 @@ async def _amend_sprint_item_resources_for_session(
                 existing_canonical.add(body)
         if canonical in existing_canonical:
             return None  # already declared — no amendment needed
+        # 4e2bce48 — a legacy "file:<path>:<symbol>" declaration already covers a
+        # whole-file claim on <path> (that is exactly what it locks), so compare
+        # real-file identities among file: declarations. symbol: declarations
+        # stay string-compared: a whole-file claim IS broader than one symbol.
+        if canonical.startswith("file:"):
+            from meridian.db import _resource_file_of  # noqa: PLC0415
+            declared_files = {
+                _resource_file_of(c) for c in existing_canonical if c.startswith("file:")
+            }
+            if _resource_file_of(canonical) in declared_files:
+                return None
         # Resource is new: append it (grow, don't replace).
         amended = existing + [canonical]
         new_json = serialize_touches_resources(amended)
