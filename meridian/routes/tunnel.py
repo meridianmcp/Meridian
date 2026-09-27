@@ -41,7 +41,7 @@ from .. import db as db_module
 from .. import process_registry as process_registry_module
 from .. import profile_contract as profile_contract_module
 from .. import redis_bridge as _redis_bridge  # 2cf57fde — runtime diagnostics
-from .._deps import _hosted_mode, _get_tenant_from_request, _db
+from .._deps import _hosted_mode, _get_tenant_from_request, _db, _authentication_required
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
     migrate_retired_overrides, config_fingerprint,
@@ -2839,8 +2839,13 @@ async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
     ``tenant_id`` in the path is documentary only (matches the sibling
     ``/tunnel/status/{tenant_id}`` route's shape); the actual tenant is
     resolved from the request's own auth, same as ``/tunnel/plugins``.
+
+    ece2ac0a — hosted callers must be authenticated: with no tenant this used
+    to return the process-wide (untenanted) diagnostics snapshot to anyone.
     """
     tenant = await _get_tenant_from_request(request)
+    if tenant is None and _hosted_mode():
+        raise _authentication_required()
     hostname = (request.query_params.get("hostname") or "").strip() or None
     return _json_response(build_tunnel_diagnostics(tenant, hostname))
 
@@ -2856,8 +2861,14 @@ async def tunnel_launch_matrix(tenant_id: str, request: Request) -> Response:
     degrades to an empty project set (diagnostics-only response) rather than
     failing the request — matches ``get_tunnel_filesystem_roots``'s existing
     best-effort convention for this same tenant/project join.
+
+    ece2ac0a — hosted callers must be authenticated. The ``_db`` call below is
+    wrapped in a broad ``except`` (best-effort project listing), so it cannot
+    be relied on to refuse an anonymous caller; refuse explicitly first.
     """
     tenant = await _get_tenant_from_request(request)
+    if tenant is None and _hosted_mode():
+        raise _authentication_required()
     hostname = (request.query_params.get("hostname") or "").strip() or None
     try:
         db = await _db(request)
@@ -3033,10 +3044,23 @@ async def install_plugin(request: Request) -> Response:
     Validates that the command starts with uvx or npx to prevent arbitrary
     execution. Returns {"ok": bool, "output": str}.
 
-    In hosted mode the server and user machine are different — this endpoint
-    still runs but installs on the server (not the user's machine). The
-    dashboard shows a copy-to-clipboard fallback for hosted users.
+    ece2ac0a — refused outright in hosted mode. It used to "still run" there,
+    unauthenticated: ``npx -y <pkg> --help`` / ``uvx <pkg> --help`` download
+    AND execute the named package's code, so anyone could run arbitrary code
+    on the hosted server. A hosted user's plugins run on their own machine via
+    the tunnel, so there is nothing legitimate to install server-side; the
+    dashboard already shows a copy-to-clipboard fallback for hosted users.
     """
+    if _hosted_mode():
+        return _json_response(
+            {
+                "ok": False,
+                "error": "Plugin install runs on the machine hosting Meridian and is "
+                         "disabled on hosted Meridian. Run the command on your own "
+                         "machine instead.",
+            },
+            status_code=403,
+        )
     import asyncio
     import sys
     try:
