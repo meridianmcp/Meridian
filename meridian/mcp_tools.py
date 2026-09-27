@@ -3026,7 +3026,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "status) and releases any file/symbol resource locks the claim held. Returns a "
         "structured {blocked: true, error: ...} dict (NOT_IN_PROGRESS / NOT_CLAIM_OWNER / "
         "RACE_LOST) rather than raising when it can't proceed; on success returns "
-        "{item_id, prior_actor, prior_claimed_at, released_resources, item}.",
+        "{item_id, prior_actor, prior_claimed_at, released_resources, item}, plus "
+        "kept_for_sibling_items when a lock was deliberately kept because another "
+        "in_progress item held by the same session still declares that file/symbol.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string", "description": "The in_progress sprint item to release."},
@@ -3052,7 +3054,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Returns a structured {blocked: true, error: ...} dict (NOT_IN_PROGRESS / "
         "NOT_CLAIM_OWNER / SAME_ACTOR / RACE_LOST) rather than raising when it can't "
         "proceed; on success returns {item_id, prior_actor, prior_claimed_at, new_actor, "
-        "transferred_resources, released_only_resources, item}.",
+        "transferred_resources, released_only_resources, item}, plus "
+        "kept_for_sibling_items for locks left with the current session because another "
+        "of its in_progress items still needs them (never moved out from under it).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string", "description": "The in_progress sprint item to transfer."},

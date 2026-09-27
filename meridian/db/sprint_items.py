@@ -3616,46 +3616,266 @@ async def classify_stale_claim(
     return {"item_id": item_id, "classification": classification, "reasons": reasons, "signals": signals}
 
 
-async def _release_file_resource(db: Any, body: str, session_id: str) -> bool:
+class _SiblingLockNeeds:
+    """fd1eda7c — what the OTHER ``in_progress`` items held under one
+    lock-owning session still need, so releasing one item's claim can't free a
+    lock a same-session sibling is still working under.
+
+    ``file_locks`` holds ONE row per path (and ``file_symbol_claims`` one row
+    per (session, path, symbol)), with no sprint-item attribution. Two items
+    claimed by the same session that resolve to the same real file therefore
+    share a single lock row; releasing by path for one of them used to free it
+    for both. This is the item attribution those tables lack, derived from the
+    items' own declarations instead of a schema change: the declarations are
+    already the source of truth for what each claim locked, and any column on
+    the lock rows would have to be kept in sync on every claim/refresh path.
+
+    Built once per release call by :func:`_sibling_lock_needs`; the release
+    helpers consult it and record every lock they deliberately kept in
+    :attr:`kept`, which the callers surface as ``kept_for_sibling_items``.
+    """
+
+    __slots__ = ("lock_owner", "files", "symbols", "kept")
+
+    def __init__(self, lock_owner: str) -> None:
+        self.lock_owner = lock_owner
+        # real file path -> ids of sibling items still needing a lock on it
+        self.files: dict[str, list[str]] = {}
+        # (real file path, symbol) -> ids of sibling items declaring that symbol
+        self.symbols: dict[tuple[str, str], list[str]] = {}
+        self.kept: list[dict[str, Any]] = []
+
+    def _add(self, bucket: dict[Any, list[str]], key: Any, item_id: str) -> None:
+        ids = bucket.setdefault(key, [])
+        if item_id not in ids:
+            ids.append(item_id)
+
+    def file_holders(self, path: str) -> list[str]:
+        """Sibling item ids that still need a whole-file lock on ``path``."""
+        return list(self.files.get((path or "").strip()) or [])
+
+    def symbol_holders(self, path: str, symbol: str) -> list[str]:
+        """Sibling item ids that declare exactly ``symbol`` on ``path``."""
+        return list(self.symbols.get(((path or "").strip(), (symbol or "").strip())) or [])
+
+    def record_kept(
+        self, rid: str, path: str, holders: list[str], symbol: str | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "resource": rid, "file_path": path, "scope": "symbol" if symbol else "file",
+            "held_under_session_id": self.lock_owner,
+            "sibling_item_ids": holders,
+        }
+        if symbol:
+            entry["symbol"] = symbol
+        self.kept.append(entry)
+
+    def keep_file(self, rid: str, path: str) -> bool:
+        """Record and return True when a sibling still needs ``path`` locked."""
+        holders = self.file_holders(path)
+        if holders:
+            self.record_kept(rid, path, holders)
+        return bool(holders)
+
+    def keep_symbol(self, rid: str, path: str, symbol: str) -> bool:
+        """Record and return True when a sibling declares the same symbol."""
+        holders = self.symbol_holders(path, symbol)
+        if holders:
+            self.record_kept(rid, path, holders, symbol)
+        return bool(holders)
+
+
+async def _sibling_lock_needs(
+    db: Any, item: dict[str, Any], lock_owner: str,
+) -> _SiblingLockNeeds:
+    """fd1eda7c — collect what every OTHER ``in_progress`` item in ``item``'s
+    project whose locks are held under ``lock_owner`` still needs.
+
+    "Held under" uses the same rule as :func:`_claim_lock_owner`: the sibling's
+    ``lock_session_id`` when recorded, else its ``actor`` (legacy rows) — so a
+    sibling whose locks live under a DIFFERENT session is never counted even if
+    it shares an attribution actor with ``lock_owner``.
+
+    A sibling needs a whole-file lock on a file when it declares:
+      * ``file:<path>`` or the legacy ``file:<path>:<symbol>`` shorthand
+        (both resolve through :func:`_resource_file_of`, like the claim gate);
+      * ``symbol:<path>`` with no ``::`` scope (locked as the whole file);
+      * ``symbol:<path>::<symbol>`` — because the claim gate widens a symbol to
+        a whole-file lock whenever no source was supplied or it couldn't be
+        resolved (``claim_granularity="coarse"``), and nothing on the item row
+        says which happened, so the file lock is kept conservatively. It is
+        only ever kept by the session that is still working that file.
+    A ``symbol:<path>::<symbol>`` declaration also protects that exact symbol
+    claim (``file_symbol_claims`` has one row per session/path/symbol, so two
+    same-session items declaring the SAME symbol share it; different symbols
+    have separate rows and were already independent).
+
+    Best-effort: a lookup failure yields "no siblings", i.e. exactly the
+    pre-fd1eda7c release behavior, never a blocked release.
+    """
+    needs = _SiblingLockNeeds(lock_owner)
+    if not lock_owner:
+        return needs
+    try:
+        async with db.execute(
+            "SELECT id, actor, lock_session_id, touches_resources FROM sprint_items "
+            "WHERE project_id = ? AND status = 'in_progress' AND id != ? "
+            "AND (lock_session_id = ? OR actor = ?)",
+            (item.get("project_id"), item.get("id"), lock_owner, lock_owner),
+        ) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            sibling = _row_to_dict(row) or {}
+            sibling_id = sibling.get("id")
+            if not sibling_id or _claim_lock_owner(sibling, sibling.get("actor")) != lock_owner:
+                continue
+            for rid in parse_touches_resources(sibling.get("touches_resources")):
+                body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
+                if body.startswith("file:"):
+                    path = (_resource_file_of(body) or body[len("file:"):]).strip()
+                    if path:
+                        needs._add(needs.files, path, sibling_id)
+                elif body.startswith("symbol:"):
+                    path, _, sym = body[len("symbol:"):].partition("::")
+                    path, sym = path.strip(), sym.strip()
+                    if not path:
+                        continue
+                    needs._add(needs.files, path, sibling_id)
+                    if sym:
+                        needs._add(needs.symbols, (path, sym), sibling_id)
+    except Exception:  # noqa: BLE001 — sibling detection must never block a release
+        return _SiblingLockNeeds(lock_owner)
+    return needs
+
+
+async def _release_real_file_lock(
+    db: Any,
+    path: str,
+    session_id: str,
+    *,
+    rid: str,
+    legacy_key: str | None = None,
+    siblings: _SiblingLockNeeds | None = None,
+) -> bool:
+    """Release ``session_id``'s whole-file lock on the real file ``path`` (and
+    the pre-4e2bce48 ``legacy_key`` lock when given) — unless ``siblings`` says
+    another same-session ``in_progress`` item still needs it (fd1eda7c), in
+    which case nothing is touched, the keep is recorded on ``siblings.kept``
+    and False is returned. Returns True if any lock was released."""
+    from meridian.db import release_file  # noqa: PLC0415 — same lazy import as the callers
+    if siblings is not None and siblings.keep_file(rid, path):
+        return False
+    released = await release_file(db, path, session_id)
+    if legacy_key and legacy_key != path and await release_file(db, legacy_key, session_id):
+        released = True
+    return bool(released)
+
+
+async def _release_file_resource(
+    db: Any,
+    body: str,
+    session_id: str,
+    *,
+    siblings: _SiblingLockNeeds | None = None,
+    rid: str | None = None,
+) -> bool:
     """4e2bce48 — release a ``file:`` resource's lock under the SAME real-file
     identity claim time locks (:func:`_resource_file_of`), shared by every
     release/transfer/stale-reset path so they can't drift from the claim side
     again. A legacy ``file:<path>:<symbol>`` lock taken before the claim-side fix
     sits under the literal ``<path>:<symbol>`` key, so that key is released too.
-    Returns True if either lock was released."""
-    from meridian.db import release_file  # noqa: PLC0415 — same lazy import as the callers
+    Returns True if either lock was released.
+
+    fd1eda7c — with ``siblings`` (see :func:`_sibling_lock_needs`), the lock is
+    KEPT when another ``in_progress`` item held under the same session still
+    declares a resource on that real file; the keep is recorded on
+    ``siblings.kept`` under ``rid`` (default ``body``) for the caller to report.
+    """
     raw_path = body[len("file:"):]
     path = _resource_file_of(body) or raw_path
-    released = await release_file(db, path, session_id)
-    if raw_path != path and await release_file(db, raw_path, session_id):
-        released = True
-    return bool(released)
+    return await _release_real_file_lock(
+        db, path, session_id, rid=rid or body, legacy_key=raw_path, siblings=siblings,
+    )
+
+
+async def _session_holds_whole_file_lock(db: Any, path: str, session_id: str) -> bool:
+    from meridian.db.locks import _normalize_file_path  # noqa: PLC0415
+    async with db.execute(
+        "SELECT 1 FROM file_locks WHERE file_path = ? AND session_id = ?",
+        (_normalize_file_path(path), session_id),
+    ) as cur:
+        return (await cur.fetchone()) is not None
+
+
+async def _release_symbol_resource(
+    db: Any,
+    rid: str,
+    path: str,
+    symbol: str,
+    session_id: str,
+    siblings: _SiblingLockNeeds,
+) -> bool:
+    """fd1eda7c — release what a ``symbol:<path>::<symbol>`` declaration can
+    hold under ``session_id``; returns True if anything was released.
+
+    That is the symbol claim itself (one ``file_symbol_claims`` row per
+    session/path/symbol — kept when a sibling declares the same symbol) AND the
+    session's whole-file lock on ``path`` when it holds one: the claim gate
+    widens a symbol to a whole-file lock whenever it can't resolve a real range
+    (``claim_granularity="coarse"``), and a file lock kept for this item as a
+    sibling of an already-released ``file:`` item sits there too. Releasing only
+    the symbol row left either kind held until its TTL. The file lock is kept
+    (and reported) while any sibling still declares something on ``path``;
+    that same check makes ``release_file``'s release of every symbol claim the
+    session holds on ``path`` safe, since no sibling needs one.
+    """
+    from meridian.db import release_file, release_symbol  # noqa: PLC0415
+    if siblings.keep_symbol(rid, path, symbol):
+        # A sibling declaring the same symbol also needs the file (see
+        # _sibling_lock_needs), so nothing on this path may be released.
+        return False
+    released = bool(await release_symbol(db, session_id, path, symbol))
+    if await _session_holds_whole_file_lock(db, path, session_id):
+        if not siblings.keep_file(rid, path) and await release_file(db, path, session_id):
+            released = True
+    return released
 
 
 async def _release_claim_resources(
     db: Any, item: dict[str, Any], lock_owner: str,
-) -> list[str]:
+) -> tuple[list[str], list[dict[str, Any]]]:
     """Release every declared touches_resources lock of ``item`` held under
-    ``lock_owner``; returns the resource ids whose lock was actually released.
+    ``lock_owner``. Returns ``(released, kept_for_sibling_items)``: the resource
+    ids whose lock was actually released, and (fd1eda7c) the locks deliberately
+    kept because another ``in_progress`` item held under the same session still
+    needs them (see :func:`_sibling_lock_needs`).
 
     Shared by :func:`release_sprint_item_claim` and :func:`_reset_stale_claim`
     (c0ddd5b3 — one loop, so the two can't drift on WHICH session they release
     under). Best-effort: one bad resource id never blocks the others, and a
     failure to import/iterate never propagates to the caller's transition."""
     released: list[str] = []
+    siblings = await _sibling_lock_needs(db, item, lock_owner)
     try:
-        from meridian.db import release_file, release_resource, release_symbol  # noqa: PLC0415
+        from meridian.db import release_resource  # noqa: PLC0415
         for rid in parse_touches_resources(item.get("touches_resources")):
             body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
             try:
                 if body.startswith("file:"):
-                    if await _release_file_resource(db, body, lock_owner):
+                    if await _release_file_resource(
+                        db, body, lock_owner, siblings=siblings, rid=rid,
+                    ):
                         released.append(rid)
                 elif body.startswith("symbol:"):
                     path, _, sym = body[len("symbol:"):].partition("::")
-                    if sym and await release_symbol(db, lock_owner, path, sym):
-                        released.append(rid)
-                    elif not sym and await release_file(db, path, lock_owner):
+                    if sym:
+                        if await _release_symbol_resource(
+                            db, rid, path, sym, lock_owner, siblings,
+                        ):
+                            released.append(rid)
+                    elif await _release_real_file_lock(
+                        db, path, lock_owner, rid=rid, siblings=siblings,
+                    ):
                         released.append(rid)
                 else:
                     if await release_resource(db, body, lock_owner):
@@ -3664,7 +3884,7 @@ async def _release_claim_resources(
                 continue
     except Exception:  # noqa: BLE001 — lock release is best-effort, never blocks the caller
         pass
-    return released
+    return released, siblings.kept
 
 
 async def _reset_stale_claim(
@@ -3725,10 +3945,13 @@ async def _reset_stale_claim(
     # sprint_evidence_guard.py already uses for a cross-submodule call.
     # c0ddd5b3 — release under the session that HOLDS the locks, which is not
     # necessarily the attribution-only actor (see _claim_lock_owner).
+    # fd1eda7c — a lock another in_progress item of the same session still
+    # needs is kept, and reported, instead of being freed out from under it.
     released: list[str] = []
+    kept_for_siblings: list[dict[str, Any]] = []
     lock_owner = _claim_lock_owner(item, prior_actor)
     if lock_owner:
-        released = await _release_claim_resources(db, item, lock_owner)
+        released, kept_for_siblings = await _release_claim_resources(db, item, lock_owner)
 
     from meridian.db import record_action_audit_event  # noqa: PLC0415
     detail = json.dumps({
@@ -3737,6 +3960,7 @@ async def _reset_stale_claim(
         "prior_claimed_at": prior_claimed_at,
         "prior_lock_session_id": item.get("lock_session_id"),
         "released_resources": released,
+        "kept_for_sibling_items": kept_for_siblings,
         "classification": verdict.get("classification"),
         "reasons": verdict.get("reasons"),
         "signals": verdict.get("signals"),
@@ -3750,7 +3974,7 @@ async def _reset_stale_claim(
         pass
 
     updated = await get_sprint_item(db, item_id)
-    return {
+    result: dict[str, Any] = {
         "item_id": item_id,
         "prior_actor": prior_actor,
         "prior_claimed_at": prior_claimed_at,
@@ -3759,6 +3983,9 @@ async def _reset_stale_claim(
         "reasons": verdict.get("reasons"),
         "item": updated,
     }
+    if kept_for_siblings:
+        result["kept_for_sibling_items"] = kept_for_siblings
+    return result
 
 
 async def reconcile_stale_claims(
@@ -4017,6 +4244,12 @@ async def release_sprint_item_claim(
         ``touches_resources`` entries whose file/symbol lock was released
         under the prior owner (best-effort; a release failure for one
         resource never blocks the others or the overall release).
+        fd1eda7c — plus ``kept_for_sibling_items`` (only when non-empty):
+        locks deliberately NOT released because another ``in_progress`` item
+        held under the same session still declares a resource on that file
+        (or that exact symbol) — ``[{"resource", "file_path", "scope",
+        "symbol"?, "held_under_session_id", "sibling_item_ids"}]``. They are
+        released when the last such sibling's claim ends.
 
     f007e59e note: like :func:`_reset_stale_claim`, this clears **both**
     ``claimed_at`` and ``actor`` (not just ``status``) so a released item
@@ -4096,10 +4329,13 @@ async def release_sprint_item_claim(
     # attribution actor. Best-effort, same helper as _reset_stale_claim: one
     # bad resource id must never block the release of the others or of the
     # item itself.
+    # fd1eda7c — a lock another in_progress item of the same session still
+    # needs is kept and reported as kept_for_sibling_items, not freed.
     released: list[str] = []
+    kept_for_siblings: list[dict[str, Any]] = []
     lock_owner = _claim_lock_owner(item, prior_actor)
     if lock_owner:
-        released = await _release_claim_resources(db, item, lock_owner)
+        released, kept_for_siblings = await _release_claim_resources(db, item, lock_owner)
 
     from meridian.db import record_action_audit_event  # noqa: PLC0415
     detail = json.dumps({
@@ -4108,6 +4344,7 @@ async def release_sprint_item_claim(
         "prior_claimed_at": prior_claimed_at,
         "prior_lock_session_id": prior_lock_session_id,
         "released_resources": released,
+        "kept_for_sibling_items": kept_for_siblings,
         "reason": reason,
         "forced": bool(force and not_owner),
         "released_by": session_id,
@@ -4121,13 +4358,16 @@ async def release_sprint_item_claim(
         pass
 
     updated = await get_sprint_item(db, item_id)
-    return {
+    result: dict[str, Any] = {
         "item_id": item_id,
         "prior_actor": prior_actor,
         "prior_claimed_at": prior_claimed_at,
         "released_resources": released,
         "item": updated,
     }
+    if kept_for_siblings:
+        result["kept_for_sibling_items"] = kept_for_siblings
+    return result
 
 
 async def transfer_sprint_item_claim(
@@ -4188,7 +4428,14 @@ async def transfer_sprint_item_claim(
         already owns the claim — nothing to transfer), or ``RACE_LOST``.
       * On success: ``{"item_id", "prior_actor", "prior_claimed_at",
         "new_actor", "transferred_resources", "released_only_resources",
-        "item"}``.
+        "item"}``, plus ``kept_for_sibling_items`` (fd1eda7c, only when
+        non-empty, same shape as :func:`release_sprint_item_claim`'s): a lock
+        another ``in_progress`` item held under the same session still needs
+        is never moved to ``to_session_id`` — the transfer must not steal it
+        from that sibling — so it stays put and the receiving session has to
+        claim it once the sibling lets go. (When ``to_session_id`` IS that
+        session, the lock is already where it belongs and counts as
+        transferred.)
     """
     if not (to_actor or "").strip():
         raise ValueError("to_actor is required")
@@ -4252,10 +4499,33 @@ async def transfer_sprint_item_claim(
     # contract for lock handling. c0ddd5b3 — released under lock_owner, the
     # session that actually holds them, not from_session_id (they differ when
     # the claim was made with an explicit actor, or under force).
+    #
+    # fd1eda7c — a lock another in_progress item held under lock_owner still
+    # needs is NOT moved: the transfer must not steal it from that sibling.
+    # It stays with lock_owner and is reported as kept_for_sibling_items
+    # (the receiving session has to claim that file itself once the sibling
+    # lets go). When the receiving session IS lock_owner the lock is already
+    # where it needs to be, so that counts as transferred.
     transferred: list[str] = []
     released_only: list[str] = []
+    siblings = await _sibling_lock_needs(db, item, lock_owner)
+    _receiver_is_lock_owner = new_lock_session_id == lock_owner
+
+    def _left_for_siblings(rid: str, path: str, symbol: str | None = None) -> bool:
+        """True when this resource's lock must stay under lock_owner."""
+        holders = (
+            siblings.symbol_holders(path, symbol) if symbol else siblings.file_holders(path)
+        )
+        if not holders:
+            return False
+        if _receiver_is_lock_owner:
+            transferred.append(rid)  # already held by the receiving session
+        else:
+            siblings.record_kept(rid, path, holders, symbol)
+        return True
+
     try:
-        from meridian.db import release_file, release_symbol, claim_file  # noqa: PLC0415
+        from meridian.db import release_file, claim_file  # noqa: PLC0415
         for rid in parse_touches_resources(item.get("touches_resources")):
             body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
             try:
@@ -4263,6 +4533,8 @@ async def transfer_sprint_item_claim(
                     # 4e2bce48 — move the REAL file's lock (and clear any
                     # pre-fix "<path>:<symbol>" lock) instead of the raw suffix.
                     path = _resource_file_of(body) or body[len("file:"):]
+                    if _left_for_siblings(rid, path):
+                        continue
                     _rel = await _release_file_resource(db, body, lock_owner)
                     if to_session_id:
                         _claim_res = await claim_file(db, path, to_session_id, item_id=item_id)
@@ -4277,10 +4549,19 @@ async def transfer_sprint_item_claim(
                     if sym:
                         # Symbol-grain re-acquisition needs the file's current
                         # content to re-resolve the AST range (see docstring)
-                        # — release only, never auto-reclaimed here.
-                        if await release_symbol(db, lock_owner, path, sym):
+                        # — release only, never auto-reclaimed here. fd1eda7c —
+                        # that includes a coarse whole-file lock the symbol was
+                        # widened to (previously left with lock_owner, where it
+                        # blocked the receiving session from the file).
+                        if _left_for_siblings(rid, path, sym):
+                            continue
+                        if await _release_symbol_resource(
+                            db, rid, path, sym, lock_owner, siblings,
+                        ):
                             released_only.append(rid)
                     else:
+                        if _left_for_siblings(rid, path):
+                            continue
                         _rel = await release_file(db, path, lock_owner)
                         if to_session_id:
                             _claim_res = await claim_file(db, path, to_session_id, item_id=item_id)
@@ -4294,6 +4575,7 @@ async def transfer_sprint_item_claim(
                 continue
     except Exception:  # noqa: BLE001 — lock migration is best-effort, never blocks the transfer
         pass
+    kept_for_siblings = siblings.kept
 
     updated = await _transition_status(
         db, project_id, item_id, "in_progress",
@@ -4336,6 +4618,7 @@ async def transfer_sprint_item_claim(
         "released_under_session_id": lock_owner,
         "transferred_resources": transferred,
         "released_only_resources": released_only,
+        "kept_for_sibling_items": kept_for_siblings,
         "reason": reason,
         "forced": bool(force and not_owner),
     })
@@ -4347,7 +4630,7 @@ async def transfer_sprint_item_claim(
     except Exception:  # noqa: BLE001 — an audit-log hiccup must not undo an already-committed transfer
         pass
 
-    return {
+    result: dict[str, Any] = {
         "item_id": item_id,
         "prior_actor": prior_actor,
         "prior_claimed_at": prior_claimed_at,
@@ -4356,6 +4639,9 @@ async def transfer_sprint_item_claim(
         "released_only_resources": released_only,
         "item": updated,
     }
+    if kept_for_siblings:
+        result["kept_for_sibling_items"] = kept_for_siblings
+    return result
 
 
 async def fail_sprint_item(
