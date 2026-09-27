@@ -13,6 +13,13 @@ anything a user added by hand -- is preserved exactly: same position, same
 keys, same values. Only the file's whitespace is re-rendered, using the
 file's own detected indentation, newline style, BOM and trailing-newline so
 an unrelated entry round-trips byte-for-byte in the common case.
+
+One deliberate exception (default on, ``--no-repair-launchers`` opts out):
+the ``command`` string of a ``"shell": "powershell"`` entry that uses a
+launcher form that cannot work under Claude Code's ``-Command`` invocation
+(bare ``$CLAUDE_PROJECT_DIR``; ``& "x.ps1"`` without exit-code propagation)
+is rewritten to the working form -- see ``PS_EXIT_SUFFIX``. Nothing else in
+such an entry changes, and every rewrite is listed in the plan.
 ``autoMemoryEnabled`` is never written (item 81f403aa owns that switch, and
 only after an owner-approved memory import).
 
@@ -379,6 +386,113 @@ def _sh_quote(path: str) -> str:
     return f'"{escaped}"'
 
 
+# ---------------------------------------------------------------------------
+# PowerShell launcher (every "shell": "powershell" entry this module writes)
+# ---------------------------------------------------------------------------
+#
+# How Claude Code runs a ``"shell": "powershell"`` hook (verified against the
+# 2.1.281 binary and ~96k transcript hook-error records, 2026-09-27):
+#
+#     <pwsh.exe | powershell.exe> -NoProfile -NonInteractive
+#         -ExecutionPolicy Bypass -Command <command string>
+#
+# with ``CLAUDE_PROJECT_DIR`` set in the child's ENVIRONMENT, cwd = the
+# project root and the JSON payload on stdin. On this machine (no pwsh) that
+# is Windows PowerShell 5.1. Two consequences:
+#
+# 1. ``$CLAUDE_PROJECT_DIR`` inside the command is a PowerShell *variable*,
+#    never set, so ``& "$CLAUDE_PROJECT_DIR\.claude\hooks\x.ps1"`` collapses
+#    to ``& "\.claude\hooks\x.ps1"`` -> "is not recognized", exit 1, a
+#    NON-blocking error: the hook never ran. (2.1.281 rewrites
+#    ``${CLAUDE_PROJECT_DIR}`` to ``${env:CLAUDE_PROJECT_DIR}`` for
+#    powershell hooks and warns about the bare form; older builds did not.)
+#    ``$env:CLAUDE_PROJECT_DIR`` reads the environment variable directly and
+#    works on every build.
+# 2. Under ``-Command`` a script's ``exit 2`` does NOT become the process exit
+#    code: ``& script`` leaves ``$LASTEXITCODE=2`` and ``$?=False`` and the
+#    process exits 1, which Claude Code treats as a non-blocking error. The
+#    suffix below restores ``-File`` semantics:
+#
+#    * explicit ``exit N`` in the script -> ``$?`` False, ``$LASTEXITCODE`` N
+#      -> exit N (2 stays 2, so blocking legacy hooks block);
+#    * the script falls off its end -> ``$?`` True -> exit 0, even when the
+#      last NATIVE command it ran returned 2 (a bare ``; exit $LASTEXITCODE``
+#      would turn that into a block);
+#    * a parse error, a missing script, or a failure with no exit code ->
+#      ``$?`` False, ``$LASTEXITCODE`` empty -> exit 1 (visible, non-blocking);
+#    * a terminating error (``throw``) aborts the whole command line -> exit 1.
+#
+#    A script crash therefore never becomes a block (exit 2).
+PS_PROJECT_DIR = "$env:CLAUDE_PROJECT_DIR"
+PS_EXIT_SUFFIX = "; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
+
+# Spellings that do NOT read the environment under PowerShell (-Command).
+_PS_BARE_PROJECT_DIR_RE = re.compile(r"\$\{CLAUDE_PROJECT_DIR\}|\$CLAUDE_PROJECT_DIR\b")
+# The single-script launcher shape ``& "<...>.ps1"`` (optionally ``;``-terminated).
+_PS_SIMPLE_LAUNCH_RE = re.compile(r'^\s*&\s*"(?P<path>[^"]+\.ps1)"\s*;?\s*$', re.IGNORECASE)
+
+
+def ps_launch(quoted_target: str) -> str:
+    """``& <quoted_target>`` plus the exit-code suffix (see PS_EXIT_SUFFIX)."""
+    return f"& {quoted_target}{PS_EXIT_SUFFIX}"
+
+
+def ps_project_script(relative: str) -> str:
+    """Double-quoted PowerShell path under the active project, read from the
+    ENVIRONMENT (``$env:CLAUDE_PROJECT_DIR``). ``relative`` uses backslashes,
+    e.g. ``.claude\\hooks\\secret_guard.ps1``; spaces in the project path are
+    safe because the whole path is one double-quoted string."""
+    return f'"{PS_PROJECT_DIR}\\{relative}"'
+
+
+def repair_powershell_command(command: str) -> str:
+    """Return the working launcher form for one ``"shell": "powershell"``
+    command, or ``command`` unchanged when there is nothing to repair.
+
+    * ``$CLAUDE_PROJECT_DIR`` / ``${CLAUDE_PROJECT_DIR}`` -> ``$env:CLAUDE_PROJECT_DIR``;
+    * a single-script ``& "<...>.ps1"`` launcher gets PS_EXIT_SUFFIX so an
+      ``exit 2`` in the script still blocks.
+
+    Idempotent: a repaired command is returned unchanged."""
+    fixed = _PS_BARE_PROJECT_DIR_RE.sub(lambda _m: PS_PROJECT_DIR, command)
+    m = _PS_SIMPLE_LAUNCH_RE.match(fixed)
+    if m:
+        fixed = ps_launch(f'"{m.group("path")}"')
+    return fixed
+
+
+def repair_powershell_launchers(
+    data: dict[str, Any], *, include_owned: bool = False
+) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+    """Return ``(copy_of_data, [(old, new), ...])`` with every broken
+    ``"shell": "powershell"`` launcher repaired (see repair_powershell_command).
+    Only the ``command`` value of a repaired hook changes; every other key,
+    value and position is kept. Owned (meridian_guard) entries are skipped
+    unless ``include_owned`` -- :func:`merge_owned` regenerates those."""
+    new = json.loads(json.dumps(data))
+    repaired: list[tuple[str, str]] = []
+    hooks = new.get("hooks")
+    if not isinstance(hooks, dict):
+        return new, repaired
+    for groups in hooks.values():
+        for group in groups or []:
+            if not isinstance(group, dict):
+                continue
+            for hook in group.get("hooks") or []:
+                if not isinstance(hook, dict) or hook.get("shell") != "powershell":
+                    continue
+                if is_owned_hook(hook) and not include_owned:
+                    continue
+                command = hook.get("command")
+                if not isinstance(command, str):
+                    continue
+                fixed = repair_powershell_command(command)
+                if fixed != command:
+                    hook["command"] = fixed
+                    repaired.append((command, fixed))
+    return new, repaired
+
+
 def build_command(
     shim: str,
     *,
@@ -389,10 +503,14 @@ def build_command(
 ) -> str:
     """Render the ``command`` string for one hook entry.
 
-    Project scope reuses the repo's established ``$CLAUDE_PROJECT_DIR`` form
-    (test_e5eec33b forbids personal absolute paths in tracked settings).
-    User scope uses absolute paths into ``~/.claude/hooks`` (per-machine
-    settings, same as the global cbm hooks) and runs the dedupe check first.
+    Project scope resolves the shim from the active project root
+    (test_e5eec33b forbids personal absolute paths in tracked settings):
+    ``$env:CLAUDE_PROJECT_DIR`` under PowerShell -- the bare
+    ``$CLAUDE_PROJECT_DIR`` is an unset PowerShell variable there -- and
+    ``$CLAUDE_PROJECT_DIR`` under bash. User scope uses absolute paths into
+    ``~/.claude/hooks`` (per-machine settings, same as the global cbm hooks)
+    and runs the dedupe check first. Every PowerShell form ends with
+    PS_EXIT_SUFFIX so a script's exit code survives ``-Command``.
     """
     if scope not in SCOPES:
         raise GuardInstallError(f"unknown scope {scope!r}")
@@ -404,13 +522,14 @@ def build_command(
     if shell == "powershell":
         mode_prefix = f"$env:{DEFAULT_MODE_ENV}='advisory'; " if mode == "advisory" else ""
         if scope == "project":
-            return f'{mode_prefix}& "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\{shim}.{ext}"'
+            target = ps_project_script(f".claude\\hooks\\{shim}.{ext}")
+            return f"{mode_prefix}{ps_launch(target)}"
         assert user_hooks_dir is not None
         defer = _ps_quote(str(user_hooks_dir / f"{DEFER_BASENAME}.{ext}"))
         target = _ps_quote(str(user_hooks_dir / f"{shim}.{ext}"))
         return (
             f"if (& {defer}) {{ exit 0 }}; $env:{SCOPE_ENV}='user'; "
-            f"{mode_prefix}& {target}"
+            f"{mode_prefix}{ps_launch(target)}"
         )
     mode_prefix = f"{DEFAULT_MODE_ENV}=advisory " if mode == "advisory" else ""
     if scope == "project":
@@ -850,6 +969,26 @@ def _config_op(
     return FileOp(kind="write", path=path, content=content, note="per-machine guard config")
 
 
+def _repair_step(
+    plan: GuardPlan, path: Path, data: dict[str, Any], enabled: bool
+) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+    """Apply :func:`repair_powershell_launchers` to ``data`` (when enabled)
+    and record each repaired command in ``plan.messages``."""
+    if not enabled:
+        return data, []
+    new, repaired = repair_powershell_launchers(data)
+    if not repaired:
+        return data, []
+    for old, fixed in repaired:
+        plan.messages.append(f"launcher repaired in {path}: {old}  ->  {fixed}")
+    return new, repaired
+
+
+def _repair_reason(repaired: list[tuple[str, str]]) -> str:
+    n = len(repaired)
+    return f"repair {n} PowerShell hook launcher" + ("" if n == 1 else "s")
+
+
 def plan_install(
     repo: Path | str,
     *,
@@ -861,9 +1000,19 @@ def plan_install(
     shim_source: Path | None = None,
     env: Mapping[str, str] | None = None,
     now: _dt.datetime | None = None,
+    repair_launchers: bool = True,
 ) -> GuardPlan:
     """Compute (but do not perform) an install. Raises GuardInstallError on
-    malformed settings, a missing repo, or missing/non-ASCII shims."""
+    malformed settings, a missing repo, or missing/non-ASCII shims.
+
+    ``repair_launchers`` (default on; CLI ``--no-repair-launchers``) also
+    rewrites every OTHER ``"shell": "powershell"`` entry in the settings files
+    this install touches into the working launcher form (see PS_EXIT_SUFFIX):
+    the bare ``$CLAUDE_PROJECT_DIR`` form never ran at all, and a plain
+    ``& "x.ps1"`` turns the script's ``exit 2`` into a non-blocking 1. Each
+    repaired command is listed in the plan (``--dry-run`` shows old -> new);
+    no other key of those entries changes. Note: this makes a previously dead
+    legacy hook LIVE, including its blocking (exit 2) paths."""
     env = os.environ if env is None else env
     shell = shell or default_shell()
     if scope not in SCOPES:
@@ -918,22 +1067,29 @@ def plan_install(
         desired = desired_entries(scope="project", mode=mode, shell=shell)
         doc = load_settings(settings_path)
         new_data, changed = merge_owned(doc.data, desired)
-        if changed:
+        reasons = ["register meridian_guard entries"] if changed else []
+        new_data, repaired = _repair_step(plan, settings_path, new_data, repair_launchers)
+        if repaired:
+            reasons.append(_repair_reason(repaired))
+        if reasons:
             plan.settings_changes.append(
-                SettingsChange(settings_path, doc, new_data, "register meridian_guard entries")
+                SettingsChange(settings_path, doc, new_data, "; ".join(reasons))
             )
         local_doc = load_settings(local_path)
         local_new, removed = remove_owned(local_doc.data)
+        local_reasons = []
         if removed:
+            local_reasons.append(
+                f"remove {removed} duplicate meridian_guard entr"
+                + ("y" if removed == 1 else "ies")
+                + " (registered once, in settings.json)"
+            )
+        local_new, local_repaired = _repair_step(plan, local_path, local_new, repair_launchers)
+        if local_repaired:
+            local_reasons.append(_repair_reason(local_repaired))
+        if local_reasons:
             plan.settings_changes.append(
-                SettingsChange(
-                    local_path,
-                    local_doc,
-                    local_new,
-                    f"remove {removed} duplicate meridian_guard entr"
-                    + ("y" if removed == 1 else "ies")
-                    + " (registered once, in settings.json)",
-                )
+                SettingsChange(local_path, local_doc, local_new, "; ".join(local_reasons))
             )
 
         if copied:
@@ -1009,11 +1165,13 @@ def plan_install(
         desired = desired_entries(scope="user", mode=mode, shell=shell, user_hooks_dir=user_hooks)
         doc = load_settings(settings_path)
         new_data, changed = merge_owned(doc.data, desired)
-        if changed:
+        reasons = ["register user-scope meridian_guard entries (G6-G8, G15/G16)"] if changed else []
+        new_data, repaired = _repair_step(plan, settings_path, new_data, repair_launchers)
+        if repaired:
+            reasons.append(_repair_reason(repaired))
+        if reasons:
             plan.settings_changes.append(
-                SettingsChange(
-                    settings_path, doc, new_data, "register user-scope meridian_guard entries (G6-G8, G15/G16)"
-                )
+                SettingsChange(settings_path, doc, new_data, "; ".join(reasons))
             )
         if has_project_scope_guard(repo_path):
             plan.messages.append(
@@ -1206,6 +1364,9 @@ def build_parser() -> argparse.ArgumentParser:
     ig.add_argument("--dry-run", action="store_true", help="Print the diff and planned file operations; write nothing.")
     ig.add_argument("--uninstall", action="store_true", help="Remove everything install-guard added.")
     ig.add_argument("--shim-dir", default=None, help=f"Directory holding the guard shims (else ${SHIM_DIR_ENV} / packaged / checkout).")
+    ig.add_argument("--no-repair-launchers", action="store_true",
+                    help="Do not rewrite other (non-guard) PowerShell hook entries into the working "
+                         "$env:CLAUDE_PROJECT_DIR + exit-code launcher form.")
     return parser
 
 
@@ -1223,6 +1384,7 @@ def cli_main(argv: list[str] | None = None, *, stdout=None, stderr=None) -> int:
                 mode=args.mode,
                 shell=args.shell,
                 shim_source=Path(args.shim_dir) if args.shim_dir else None,
+                repair_launchers=not args.no_repair_launchers,
             )
     except GuardInstallError as exc:
         print(f"error: {exc}", file=stderr)

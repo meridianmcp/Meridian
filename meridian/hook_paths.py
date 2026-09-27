@@ -60,9 +60,18 @@ from typing import Any, Callable, Mapping
 # WSL /mnt/<drive>/... mount convention -> native Windows drive path.
 _WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])(?:/(.*))?$")
 
-# Token(s) Claude Code substitutes with the active project's absolute root
-# before invoking a hook "command" string.
-PROJECT_DIR_TOKENS: tuple[str, ...] = ("$CLAUDE_PROJECT_DIR", "${CLAUDE_PROJECT_DIR}")
+# Spellings of the active project's absolute root inside a hook "command"
+# string. Claude Code exports CLAUDE_PROJECT_DIR into the hook's ENVIRONMENT;
+# bash expands ``$CLAUDE_PROJECT_DIR``, while a ``"shell": "powershell"`` hook
+# must read ``$env:CLAUDE_PROJECT_DIR`` (the bare form is an unset PowerShell
+# variable there -- see hook_settings_merge.PS_EXIT_SUFFIX). Longest first so
+# stripping a token never leaves a fragment of another.
+PROJECT_DIR_TOKENS: tuple[str, ...] = (
+    "${env:CLAUDE_PROJECT_DIR}",
+    "$env:CLAUDE_PROJECT_DIR",
+    "${CLAUDE_PROJECT_DIR}",
+    "$CLAUDE_PROJECT_DIR",
+)
 
 # Script path embedded in a hook "command" string, e.g.
 # '& "$CLAUDE_PROJECT_DIR\.claude\hooks\secret_guard.ps1"' or a bare
@@ -304,7 +313,8 @@ def diagnose_configured_hooks(
 #
 # ``python -m meridian hooks install-guard`` (meridian/hook_settings_merge.py)
 # owns every hook entry whose command contains ``meridian_guard``. Project
-# scope uses the ``$CLAUDE_PROJECT_DIR`` form handled above. User scope runs a
+# scope uses the project-dir token forms handled above (``$env:`` under
+# PowerShell, ``$CLAUDE_PROJECT_DIR`` under bash). User scope runs a
 # ``meridian_guard_defer`` check first, so the FIRST quoted script in the
 # command is the defer check, not the guard shim; the shim is the last one.
 # The guard fails open when its runtime is missing (a missing interpreter is a

@@ -216,7 +216,13 @@ def test_explicit_timeouts(scope, shell, tmp_path):
 
 def test_project_command_is_the_repo_house_form():
     cmd = hsm.build_command("meridian_guard", scope="project", mode="enforce", shell="powershell")
-    assert cmd == '& "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard.ps1"'
+    # $env: (the bare $CLAUDE_PROJECT_DIR is an unset PowerShell variable under
+    # Claude Code's -Command invocation) + the exit-code suffix.
+    assert cmd == (
+        '& "$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard.ps1"'
+        "; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
+    )
+    assert cmd.endswith(hsm.PS_EXIT_SUFFIX)
     # hook_paths classifies it as a REQUIRED project hook and extracts the script.
     assert hook_paths.is_project_relative_command(cmd)
     assert hook_paths.extract_script_path_token(cmd).endswith("meridian_guard.ps1")
@@ -240,7 +246,7 @@ def test_user_scope_command_defers_then_runs_shim(tmp_path):
     assert ps.startswith("if (& ")
     assert "meridian_guard_defer.ps1" in ps and "{ exit 0 }" in ps
     assert "$env:MERIDIAN_GUARD_SCOPE='user'" in ps
-    assert ps.rstrip().endswith('meridian_guard.ps1"')
+    assert ps.endswith('meridian_guard.ps1"' + hsm.PS_EXIT_SUFFIX)
     assert "CLAUDE_PROJECT_DIR" not in ps
     sh = hsm.build_command("meridian_guard_brief", scope="user", mode="advisory", shell="bash", user_hooks_dir=hooks)
     assert "meridian_guard_defer.sh\" && exit 0; MERIDIAN_GUARD_SCOPE=user MERIDIAN_GUARD_DEFAULT_MODE=advisory bash" in sh
@@ -281,7 +287,7 @@ def test_generated_defer_scripts_are_ascii():
 
 def test_install_preserves_every_other_entry_and_registers_owned(repo, tmp_path, shim_dir, env):
     original = json.loads(REPO_STYLE_SETTINGS)
-    plan = _install(repo, tmp_path, shim_dir, env)
+    plan = _install(repo, tmp_path, shim_dir, env, repair_launchers=False)
     assert plan.changed
     hsm.apply_plan(plan)
     after = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
@@ -364,7 +370,7 @@ def test_backup_is_written_before_change(repo, tmp_path, shim_dir, env):
 
 def test_uninstall_restores_exact_bytes_and_removes_copies(repo, tmp_path, shim_dir, env):
     original = (repo / ".claude" / "settings.json").read_bytes()
-    hsm.apply_plan(_install(repo, tmp_path, shim_dir, env))
+    hsm.apply_plan(_install(repo, tmp_path, shim_dir, env, repair_launchers=False))
     plan = hsm.plan_uninstall(repo, scope="project", home=tmp_path / "home", gdir=tmp_path / "guard", env=env)
     assert plan.changed
     hsm.apply_plan(plan)
@@ -375,6 +381,127 @@ def test_uninstall_restores_exact_bytes_and_removes_copies(repo, tmp_path, shim_
     assert config["installs"] == {}
     # A second uninstall is a no-op.
     assert not hsm.plan_uninstall(repo, scope="project", home=tmp_path / "home", gdir=tmp_path / "guard", env=env).changed
+
+
+# ---------------------------------------------------------------------------
+# PowerShell launcher repair (legacy, non-owned entries)
+# ---------------------------------------------------------------------------
+
+_LEGACY_BARE = '& "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1"'
+_FIXED = '& "$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1"' + hsm.PS_EXIT_SUFFIX
+
+
+@pytest.mark.parametrize("command,expected", [
+    (_LEGACY_BARE, _FIXED),
+    ('& "${CLAUDE_PROJECT_DIR}\\.claude\\hooks\\secret_guard.ps1"', _FIXED),
+    ('& "$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1"', _FIXED),
+    ('  & "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1" ; ', _FIXED),
+    (_FIXED, _FIXED),  # idempotent
+    # absolute single-script launcher: only the exit-code suffix is added
+    ('& "C:\\Users\\me\\.claude\\hooks\\x.ps1"', '& "C:\\Users\\me\\.claude\\hooks\\x.ps1"' + hsm.PS_EXIT_SUFFIX),
+    # other shapes: only the bare variable is replaced, nothing appended
+    ("Write-Output $CLAUDE_PROJECT_DIR", "Write-Output $env:CLAUDE_PROJECT_DIR"),
+    ("Write-Output hi", "Write-Output hi"),
+])
+def test_repair_powershell_command(command, expected):
+    assert hsm.repair_powershell_command(command) == expected
+    assert hsm.repair_powershell_command(expected) == expected
+
+
+def test_repair_launchers_touches_only_powershell_commands():
+    data = {
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Read", "hooks": [
+                    {"type": "command", "shell": "powershell", "command": _LEGACY_BARE, "timeout": 7},
+                    {"type": "command", "command": 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/x.sh"'},
+                    {"type": "command", "shell": "powershell",
+                     "command": '& "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard.ps1"'},
+                ]},
+            ],
+        },
+        "permissions": {"allow": ["Bash(*)"]},
+    }
+    new, repaired = hsm.repair_powershell_launchers(data)
+    assert repaired == [(_LEGACY_BARE, _FIXED)]
+    first, bash_hook, owned = new["hooks"]["PreToolUse"][0]["hooks"]
+    assert first == {"type": "command", "shell": "powershell", "command": _FIXED, "timeout": 7}
+    assert bash_hook == data["hooks"]["PreToolUse"][0]["hooks"][1]  # bash reads the env var itself
+    assert owned == data["hooks"]["PreToolUse"][0]["hooks"][2]  # owned: merge_owned's job
+    assert new["permissions"] == data["permissions"]
+    assert data["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == _LEGACY_BARE  # input not mutated
+    _new2, owned_too = hsm.repair_powershell_launchers(data, include_owned=True)
+    assert len(owned_too) == 2
+    assert hsm.repair_powershell_launchers({"permissions": {}}) == ({"permissions": {}}, [])
+
+
+def test_install_repairs_legacy_launchers_by_default(repo, tmp_path, shim_dir, env):
+    plan = _install(repo, tmp_path, shim_dir, env)
+    (change,) = plan.settings_changes
+    assert "repair 3 PowerShell hook launchers" in change.reason
+    assert sum("launcher repaired in" in m for m in plan.messages) == 3
+    hsm.apply_plan(plan)
+    after = json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    stripped, _removed = hsm.remove_owned(after)
+    expected = json.loads(REPO_STYLE_SETTINGS)
+    for groups in expected["hooks"].values():
+        for group in groups:
+            for hook in group["hooks"]:
+                hook["command"] = hsm.repair_powershell_command(hook["command"])
+    assert stripped == expected  # only the command strings changed, nothing else
+    for groups in after["hooks"].values():
+        for group in groups:
+            for hook in group["hooks"]:
+                assert "$env:CLAUDE_PROJECT_DIR" in hook["command"]
+                assert hook["command"].endswith(hsm.PS_EXIT_SUFFIX)
+    # idempotent, and uninstall keeps the (correct) repaired legacy entries
+    assert not _install(repo, tmp_path, shim_dir, env).changed
+    hsm.apply_plan(hsm.plan_uninstall(repo, scope="project", home=tmp_path / "home", gdir=tmp_path / "guard", env=env))
+    assert json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8")) == expected
+
+
+def test_install_repairs_settings_local_json_too(repo, tmp_path, shim_dir, env):
+    local = repo / ".claude" / "settings.local.json"
+    local.write_text(json.dumps({"hooks": {"Stop": [{"matcher": "", "hooks": [
+        {"type": "command", "shell": "powershell", "command": _LEGACY_BARE}]}]}}, indent=2) + "\n", encoding="utf-8")
+    plan = _install(repo, tmp_path, shim_dir, env)
+    by_path = {ch.path: ch for ch in plan.settings_changes}
+    assert "repair 1 PowerShell hook launcher" in by_path[local].reason
+    hsm.apply_plan(plan)
+    data = json.loads(local.read_text(encoding="utf-8"))
+    assert data["hooks"]["Stop"][0]["hooks"][0]["command"] == _FIXED
+    no_repair = _install(repo, tmp_path, shim_dir, env, repair_launchers=False)
+    assert local not in {ch.path for ch in no_repair.settings_changes}
+
+
+def test_user_scope_install_repairs_user_settings(tmp_path, shim_dir, env):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    user_settings = home / ".claude" / "settings.json"
+    user_settings.write_text(json.dumps({"hooks": {"Stop": [{"matcher": "", "hooks": [
+        {"type": "command", "shell": "powershell", "command": '& "C:\\Users\\me\\.claude\\hooks\\stop.ps1"'}]}]}},
+        indent=2) + "\n", encoding="utf-8")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    plan = _install(proj, tmp_path, shim_dir, env, scope="user", home=home)
+    (change,) = plan.settings_changes
+    assert "register user-scope" in change.reason and "repair 1 PowerShell hook launcher" in change.reason
+    hsm.apply_plan(plan)
+    data = json.loads(user_settings.read_text(encoding="utf-8"))
+    assert data["hooks"]["Stop"][0]["hooks"][0]["command"].endswith(hsm.PS_EXIT_SUFFIX)
+    for _ev, _m, hook in hsm.owned_entries(data):
+        assert hook["command"].endswith(hsm.PS_EXIT_SUFFIX)
+
+
+def test_cli_dry_run_lists_launcher_repairs_and_flag_opts_out(repo, tmp_path, shim_dir, monkeypatch):
+    monkeypatch.setenv(hsm.GUARD_DIR_ENV, str(tmp_path / "guard"))
+    base = ["install-guard", "--repo", str(repo), "--dry-run", "--shell", "powershell", "--shim-dir", str(shim_dir)]
+    out = io.StringIO()
+    assert hsm.cli_main(base, stdout=out) == 0
+    assert out.getvalue().count("launcher repaired in") == 3
+    out = io.StringIO()
+    assert hsm.cli_main(base + ["--no-repair-launchers"], stdout=out) == 0
+    assert "launcher repaired in" not in out.getvalue()
 
 
 def test_uninstall_keeps_shims_modified_after_install(repo, tmp_path, shim_dir, env):
@@ -825,11 +952,11 @@ def test_cli_install_uninstall_roundtrip(repo, tmp_path, shim_dir, monkeypatch):
     before = (repo / ".claude" / "settings.json").read_bytes()
     out = io.StringIO()
     assert hsm.cli_main(["install-guard", "--repo", str(repo), "--shell", "bash", "--mode", "advisory",
-                         "--shim-dir", str(shim_dir)], stdout=out) == 0
+                         "--shim-dir", str(shim_dir), "--no-repair-launchers"], stdout=out) == 0
     assert "wrote" in out.getvalue()
     out2 = io.StringIO()
     assert hsm.cli_main(["install-guard", "--repo", str(repo), "--shell", "bash", "--mode", "advisory",
-                         "--shim-dir", str(shim_dir)], stdout=out2) == 0
+                         "--shim-dir", str(shim_dir), "--no-repair-launchers"], stdout=out2) == 0
     assert "no changes" in out2.getvalue()
     assert hsm.cli_main(["install-guard", "--repo", str(repo), "--uninstall"], stdout=io.StringIO()) == 0
     assert (repo / ".claude" / "settings.json").read_bytes() == before

@@ -7,7 +7,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\hitl_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\hitl_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
@@ -17,7 +17,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\worktree_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\worktree_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
@@ -27,7 +27,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
@@ -37,7 +37,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\dependency_install_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\dependency_install_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
@@ -47,7 +47,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\pkg_install_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\pkg_install_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
@@ -57,7 +57,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard.ps1\"",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 3
                     }
                 ]
@@ -70,7 +70,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\test_tamper_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\test_tamper_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
@@ -80,7 +80,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_post.ps1\"",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_post.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 3
                     }
                 ]
@@ -93,7 +93,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\sprint_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\sprint_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             }
@@ -105,7 +105,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
@@ -115,7 +115,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1\"",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 10
                     }
                 ]
@@ -128,7 +128,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1\"",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 10
                     }
                 ]

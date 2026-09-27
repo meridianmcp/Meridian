@@ -79,7 +79,10 @@ def test_settings_guard_registration_shape():
         (hook,) = group[0]["hooks"]
         assert hook["type"] == "command"
         assert hook["shell"] == "powershell"
-        assert hook["command"].startswith('& "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard')
+        # $env: form -- the bare $CLAUDE_PROJECT_DIR is an unset PowerShell variable
+        # under Claude Code's -Command invocation (test_hook_registered_commands.py).
+        assert hook["command"].startswith('& "$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard')
+        assert hook["command"].endswith(hsm.PS_EXIT_SUFFIX)
         assert hook["timeout"] == timeout
         assert hook_paths.is_project_relative_command(hook["command"])
     assert start[0]["matcher"] == "startup|resume|clear|compact"

@@ -1130,7 +1130,10 @@ def _entries(settings: dict, event: str) -> list[dict]:
 
 def test_settings_wires_the_brief_for_sessionstart_and_subagentstart():
     settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
-    expected_cmd = '& "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1"'
+    # $env: + exit-code suffix: the form that actually runs under Claude Code's
+    # -Command invocation (tests/test_hook_registered_commands.py).
+    expected_cmd = ('& "$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1"'
+                    "; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1")
     for event, matcher in (("SessionStart", "startup|resume|clear|compact"), ("SubagentStart", "*")):
         ours = [e for e in _entries(settings, event) if "meridian_guard_brief" in json.dumps(e)]
         assert len(ours) == 1, event
@@ -1144,12 +1147,15 @@ def test_settings_wires_the_brief_for_sessionstart_and_subagentstart():
 
 
 def test_settings_leaves_post_compact_refresh_untouched():
+    """Its own entry stays separate and unchanged except for the launcher
+    repair (bare $CLAUDE_PROJECT_DIR never resolved under PowerShell)."""
     settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
     compact = [e for e in _entries(settings, "SessionStart") if e.get("matcher") == "compact"]
     assert compact == [{
         "matcher": "compact",
         "hooks": [{
             "type": "command", "shell": "powershell",
-            "command": '& "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1"',
+            "command": ('& "$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1"'
+                        "; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"),
         }],
     }]
