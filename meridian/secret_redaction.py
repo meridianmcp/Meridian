@@ -285,11 +285,26 @@ _SENSITIVE_BASENAME_PATTERNS: tuple[str, ...] = (
     "*_token.*",
     "token",
     "token.*",
+    "meridian.toml",  # live Meridian credentials (AGENTS.md hard rules)
 )
 
 _SENSITIVE_PATTERNS_LOWER: tuple[str, ...] = tuple(
     p.lower() for p in _SENSITIVE_BASENAME_PATTERNS
 )
+
+# 55d48d69 fix round 1: a file with one of these final extensions is source,
+# script, test or notebook code -- never a credential store, whatever its name
+# says (secret_redaction.py, test_secret_redaction.py, refresh_token.py,
+# secret_guard.ps1). A template of a credential file (.env.example,
+# secrets.env.example) carries no secret either. Mirrored by
+# .claude/hooks/secret_guard.{ps1,sh}.
+_SAFE_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
+    "py", "pyi", "pyx", "ipynb", "ps1", "psm1", "psd1", "sh", "bash", "zsh", "fish", "bat", "cmd",
+    "js", "mjs", "cjs", "ts", "tsx", "jsx", "mts", "cts", "go", "rs", "java", "kt", "kts", "scala",
+    "rb", "php", "cs", "fs", "c", "h", "cc", "cpp", "cxx", "hpp", "swift", "m", "lua", "r", "jl",
+    "dart", "ex", "exs", "erl", "hs", "ml", "clj", "groovy", "pl", "pm", "sql", "vue", "svelte", "awk",
+})
+_TEMPLATE_SUFFIXES: frozenset[str] = frozenset({"example", "sample", "template", "tmpl", "dist"})
 
 
 def is_sensitive_path(path: str) -> bool:
@@ -302,7 +317,12 @@ def is_sensitive_path(path: str) -> bool:
     """
     if not path:
         return False
-    base_lower = os.path.basename(path).lower()
+    base_lower = os.path.basename(path.replace("\\", "/")).lower()
+    dot = base_lower.rfind(".")
+    if dot > 0:
+        ext = base_lower[dot + 1:]
+        if ext in _SAFE_SOURCE_EXTENSIONS or ext in _TEMPLATE_SUFFIXES:
+            return False
     for pattern in _SENSITIVE_PATTERNS_LOWER:
         if fnmatch.fnmatch(base_lower, pattern):
             return True

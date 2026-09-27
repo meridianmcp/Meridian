@@ -22,7 +22,7 @@
                 ]
             },
             {
-                "matcher": "Read|Bash|PowerShell|Grep|Glob",
+                "matcher": "Read|Bash|PowerShell|Grep|Glob|Write|Edit|MultiEdit",
                 "hooks": [
                     {
                         "type": "command",

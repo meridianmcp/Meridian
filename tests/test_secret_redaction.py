@@ -741,6 +741,11 @@ def test_settings_wires_secret_guard_as_pretooluse():
     assert "Bash" in tools, "secret_guard matcher must include Bash"
     # 55d48d69: the PowerShell tool reads files and env vars too.
     assert "PowerShell" in tools, "secret_guard matcher must include PowerShell"
+    # 833649f1: without this, Write/Edit/MultiEdit never reach the hook at all --
+    # a secret VALUE could be written straight into meridian.toml unchecked.
+    assert "Write" in tools, "secret_guard matcher must include Write (833649f1)"
+    assert "Edit" in tools, "secret_guard matcher must include Edit (833649f1)"
+    assert "MultiEdit" in tools, "secret_guard matcher must include MultiEdit (833649f1)"
 
 
 def test_settings_does_not_disturb_existing_hooks():
@@ -817,6 +822,24 @@ def test_hook_allows_read_of_python_file():
 
 
 @_needs_bash
+def test_hook_allows_read_of_test_secret_redaction_file():
+    """55d48d69 fix round 1 regression: a test file whose NAME contains 'secret'
+    is source/test code, never a credential store -- must stay readable."""
+    payload = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "tests/test_secret_redaction.py"}})
+    r = _run_hook(payload)
+    assert r.returncode == 0, f"Read of test_secret_redaction.py must be allowed\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_allows_read_of_oauth_route_source():
+    """A source file whose CONTENT (not name) mentions 'token' repeatedly must stay
+    readable -- only the file's own basename/pattern gates Read, never its content."""
+    payload = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "meridian/routes/oauth.py"}})
+    r = _run_hook(payload)
+    assert r.returncode == 0, f"Read of oauth.py must be allowed\nstderr: {r.stderr}"
+
+
+@_needs_bash
 def test_hook_blocks_bash_printenv():
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "printenv"}})
     r = _run_hook(payload)
@@ -852,6 +875,26 @@ def test_hook_allows_bash_pytest():
 
 
 @_needs_bash
+@pytest.mark.parametrize("cmd", [
+    "set -euo pipefail",
+    "export X=1 && echo done",
+    "env X=1 pytest -k foo",
+    "python -c \"print(os.environ['PATH'])\"",
+    "grep -r 'import.meta.env' src/",
+    "jq .key config.json",
+    "echo 'printenv is useful for debugging'",
+    "echo 'do not run printenv in CI'",
+])
+def test_hook_allows_harmless_bash_idioms(cmd):
+    """55d48d69 fix round 1 regression: common idioms that merely MENTION set/
+    export/env/printenv/os.environ/import.meta.env/jq must never block -- only a
+    bare dump statement or a reader verb naming a real credential file does."""
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}})
+    r = _run_hook(payload)
+    assert r.returncode == 0, f"Bash {cmd!r} must be allowed\nstderr: {r.stderr}"
+
+
+@_needs_bash
 def test_hook_blocks_grep_on_env_file():
     payload = json.dumps({"tool_name": "Grep", "tool_input": {"pattern": "KEY", "path": ".env"}})
     r = _run_hook(payload)
@@ -875,11 +918,14 @@ def test_hook_allows_grep_on_benign_path():
 @_needs_bash
 @pytest.mark.parametrize("tool", ["Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch"])
 def test_hook_allows_non_read_tools(tool):
-    """Tools not in Read|Bash|Grep|Glob must never be blocked by this guard."""
+    """A file_path alone (no content/new_string field, as here) never blocks:
+    NotebookEdit/WebFetch aren't handled by this guard at all, and
+    Write/Edit/MultiEdit (833649f1) only block when the new CONTENT looks like a
+    real secret value -- an empty/absent content field never matches that check."""
     payload = json.dumps({"tool_name": tool, "tool_input": {"file_path": ".env"}})
     r = _run_hook(payload)
     assert r.returncode == 0, (
-        f"{tool} must not be blocked by secret_guard (it handles Read/Bash/Grep/Glob only)\n"
+        f"{tool} with no content field must not be blocked by secret_guard\n"
         f"stderr: {r.stderr}"
     )
 
@@ -899,6 +945,130 @@ def test_hook_fails_open_on_garbage(payload):
         f"Must fail open on garbage payload {payload!r}\n"
         f"stderr: {r.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# meridian.toml protection (833649f1): live credentials per AGENTS.md.
+# Read is blocked wholesale like .env; the "project_id only" Grep convention
+# stays allowed; Write/Edit/MultiEdit are gated on CONTENT (a real secret VALUE),
+# not blocked wholesale, so ordinary keys (project_id, [default], ...) stay
+# writable -- this closes the write-side bypass where Write/Edit/MultiEdit were
+# never even routed to this hook.
+# ---------------------------------------------------------------------------
+
+@_needs_bash
+def test_hook_blocks_read_of_meridian_toml():
+    payload = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "meridian.toml"}})
+    r = _run_hook(payload)
+    assert r.returncode == 2, f"Read of meridian.toml must be blocked\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_blocks_bash_cat_meridian_toml():
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "cat meridian.toml"}})
+    r = _run_hook(payload)
+    assert r.returncode == 2, f"Bash cat meridian.toml must be blocked\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_allows_grep_project_id_on_meridian_toml():
+    payload = json.dumps({"tool_name": "Grep", "tool_input": {"pattern": "^project_id", "path": "meridian.toml"}})
+    r = _run_hook(payload)
+    assert r.returncode == 0, f"Grep of meridian.toml for project_id only must be allowed\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_blocks_grep_other_key_on_meridian_toml():
+    payload = json.dumps({"tool_name": "Grep", "tool_input": {"pattern": "BEARER_TOKEN", "path": "meridian.toml"}})
+    r = _run_hook(payload)
+    assert r.returncode == 2, f"Grep of meridian.toml for a non-project_id key must still be blocked\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_allows_write_of_ordinary_content_to_meridian_toml():
+    payload = json.dumps({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "meridian.toml",
+            "content": '[project]\nproject_id = "5787cc92-ba7d-4788-b17c-28ab7938b839"\n',
+        },
+    })
+    r = _run_hook(payload)
+    assert r.returncode == 0, f"Write of ordinary meridian.toml content must be allowed\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_blocks_write_of_secret_value_to_meridian_toml():
+    payload = json.dumps({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "meridian.toml",
+            "content": 'BEARER_TOKEN = "sk_meridian_' + "a" * 32 + '"\n',
+        },
+    })
+    r = _run_hook(payload)
+    assert r.returncode == 2, f"Write of a secret VALUE into meridian.toml must be blocked\nstderr: {r.stderr}"
+    assert "14491654" in r.stderr
+
+
+@_needs_bash
+def test_hook_blocks_edit_of_secret_value_into_meridian_toml():
+    payload = json.dumps({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "meridian.toml",
+            "old_string": "",
+            "new_string": 'stripe_key = "sk_live_' + "A" * 26 + '"',
+        },
+    })
+    r = _run_hook(payload)
+    assert r.returncode == 2, f"Edit inserting a secret VALUE into meridian.toml must be blocked\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_allows_edit_of_ordinary_content_into_meridian_toml():
+    payload = json.dumps({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "meridian.toml",
+            "old_string": "",
+            "new_string": 'default_mode = "advisory"',
+        },
+    })
+    r = _run_hook(payload)
+    assert r.returncode == 0, f"Edit adding ordinary meridian.toml content must be allowed\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_blocks_multiedit_of_secret_value_into_meridian_toml():
+    payload = json.dumps({
+        "tool_name": "MultiEdit",
+        "tool_input": {
+            "file_path": "meridian.toml",
+            "edits": [
+                {"old_string": "a", "new_string": "b"},
+                {"old_string": "", "new_string": 'AUTH_TOKEN = "abcdefghijklmnop"'},
+            ],
+        },
+    })
+    r = _run_hook(payload)
+    assert r.returncode == 2, f"MultiEdit inserting a secret VALUE into meridian.toml must be blocked\nstderr: {r.stderr}"
+
+
+@_needs_bash
+def test_hook_allows_write_of_secret_value_to_ordinary_file():
+    """The Write/Edit/MultiEdit content check is scoped to sensitive PATHS only --
+    an ordinary source file is never blocked by this guard no matter its content
+    (that is a different guard's job, if any)."""
+    payload = json.dumps({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "notes/scratch.md",
+            "content": 'BEARER_TOKEN = "sk_meridian_' + "a" * 32 + '"\n',
+        },
+    })
+    r = _run_hook(payload)
+    assert r.returncode == 0, f"Write to a non-sensitive path must never be blocked by this guard\nstderr: {r.stderr}"
 
 
 # ---------------------------------------------------------------------------
