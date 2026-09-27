@@ -1104,18 +1104,25 @@ async def handle_claim_sprint_item(
         # Record that session as the claim's lock owner so release / stale-
         # reset / transfer free the locks under the identity that holds them,
         # instead of under actor (freeing nothing and leaking every lock for
-        # its full TTL). Only when the gate actually holds something.
-        _lock_owner_session = (
-            args.get("session_id")
-            if any(
-                e.get("acquired")
-                for e in (_resource_lock_gate.get("lock_scope") or [])
-            )
-            else None
-        )
+        # its full TTL). Recorded whenever there IS a session, even if the
+        # gate locked nothing: a pivot claim_file made later for this item
+        # (mid-execution) is held under that session and amends the item by
+        # it, and must be released under it too.
+        _lock_owner_session = args.get("session_id") or None
+        # The gate reports which symbol: resources it widened to a whole-file
+        # lock it NEWLY acquired (claim_granularity="coarse"); persist those
+        # so releasing the symbol frees that lock — and never one the session
+        # already held for other work (a manual claim_file, another item).
+        _coarse_lock_files = [
+            e.get("file_path")
+            for e in (_resource_lock_gate.get("lock_scope") or [])
+            if e.get("acquired") and e.get("newly_acquired")
+            and e.get("claim_granularity") == "coarse" and e.get("file_path")
+        ]
         item = await db_module.claim_sprint_item(
             db, args["project_id"], args["item_id"], actor=_claim_actor,
             lock_session_id=_lock_owner_session,
+            coarse_lock_files=_coarse_lock_files,
         )
     except ValueError:
         # 18c488b6 — the status transition never landed for THIS session (lost

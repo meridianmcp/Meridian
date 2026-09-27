@@ -234,14 +234,31 @@ async def _amend_sprint_item_resources_for_session(
             parse_touches_resources,
             serialize_touches_resources,
         )
+        from meridian.db.sprint_items import _sprint_items_has_column  # noqa: PLC0415
+        # c0ddd5b3 — "this session's item" means the item whose locks are held
+        # under this session: its lock_session_id when recorded, else its actor
+        # (legacy rows) — the same rule every release path uses
+        # (sprint_items._claim_lock_owner). Matching actor alone missed every
+        # claim made with an explicit actor (a human name, an orchestrator id):
+        # the pivot lock was never declared on the item, so releasing the item
+        # left it held under this session for its whole TTL.
+        if await _sprint_items_has_column(db, "lock_session_id"):
+            owner_sql = (
+                "(lock_session_id = ? OR "
+                "((lock_session_id IS NULL OR lock_session_id = '') AND actor = ?))"
+            )
+            owner_params: tuple[Any, ...] = (session_id, session_id)
+        else:  # skipped migration: every row is a legacy row
+            owner_sql = "actor = ?"
+            owner_params = (session_id,)
         if item_id:
             # c027922d — explicit item context: look up THAT row directly,
             # scoped to this session and still in_progress. No ORDER BY /
             # LIMIT guessing across sibling in_progress items.
             async with db.execute(
                 "SELECT id, touches_resources, wave FROM sprint_items "
-                "WHERE id = ? AND actor = ? AND status = 'in_progress'",
-                (item_id, session_id),
+                f"WHERE id = ? AND {owner_sql} AND status = 'in_progress'",
+                (item_id, *owner_params),
             ) as cur:
                 row = await cur.fetchone()
         else:
@@ -251,9 +268,9 @@ async def _amend_sprint_item_resources_for_session(
             # concurrently in_progress item.
             async with db.execute(
                 "SELECT id, touches_resources, wave FROM sprint_items "
-                "WHERE actor = ? AND status = 'in_progress' "
+                f"WHERE {owner_sql} AND status = 'in_progress' "
                 "ORDER BY claimed_at DESC LIMIT 1",
-                (session_id,),
+                owner_params,
             ) as cur:
                 row = await cur.fetchone()
         item = _row_to_dict(row)

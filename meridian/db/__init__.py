@@ -1168,6 +1168,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     # c0ddd5b3 -- sprint_items.lock_session_id: live lock-owning session,
     # distinct from the attribution-only actor column.
     await _migrate_sprint_item_lock_session_id(db)
+    # sprint_items.coarse_lock_files: whole-file locks a claim owns on behalf
+    # of its symbol: declarations (so a symbol release frees only those).
+    await _migrate_sprint_item_coarse_lock_files(db)
     return db
 
 

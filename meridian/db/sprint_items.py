@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import time
+import weakref
 from datetime import datetime, timezone  # 0d0cada7 — lease-local scheduler diagnostics
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape  # fdaa5b55/cd038235 — same
@@ -1347,8 +1348,79 @@ async def get_sprint_item(
 
 
 # c0ddd5b3 — sentinel for _transition_status(lock_session_id=...): "leave the
-# column as it is", distinct from an explicit None ("write NULL").
+# column as it is", distinct from an explicit None ("write NULL"). Also used
+# for coarse_lock_files.
 _LOCK_SESSION_UNCHANGED: Any = object()
+
+# Claim-ownership columns added after the base schema (c0ddd5b3
+# lock_session_id, coarse_lock_files). Postgres runs its migrations through
+# pg_adapter._run_pg_migrations, which logs and CONTINUES when one fails (a 5s
+# lock_timeout behind live board queries on a canary deploy is the documented
+# case), so a tenant DB can boot without them. Every status transition writes
+# these columns, so an unconditional write would turn one skipped migration
+# into "every claim/complete/release/fail on this DB raises". Writers probe
+# first and degrade to the pre-column behavior instead.
+#
+# Only a PRESENT column is cached (per connection object): once a column
+# exists it never goes away, while a missing one is re-probed on the next call
+# so a later boot's successful migration (another machine, same DB) is picked
+# up without a restart. Keyed weakly so closed test connections don't pile up.
+_SPRINT_ITEM_COLUMNS_PRESENT: "weakref.WeakKeyDictionary[Any, set[str]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+async def _sprint_items_has_column(db: Any, column: str) -> bool:
+    """True when ``sprint_items.<column>`` exists on ``db`` (see
+    :data:`_SPRINT_ITEM_COLUMNS_PRESENT`). A probe that itself fails answers
+    True — the write then behaves exactly as it did before this guard existed,
+    rather than silently dropping ownership state on a transient error."""
+    try:
+        known = _SPRINT_ITEM_COLUMNS_PRESENT.get(db)
+    except TypeError:  # connection object that can't be weakly referenced
+        known = None
+    if known is not None and column in known:
+        return True
+    try:
+        from meridian.db.migrations import _column_exists  # noqa: PLC0415
+        present = await _column_exists(db, "sprint_items", column)
+    except Exception:  # noqa: BLE001 — fall back to the unguarded behavior
+        return True
+    if present:
+        try:
+            _SPRINT_ITEM_COLUMNS_PRESENT.setdefault(db, set()).add(column)
+        except TypeError:
+            pass
+    return bool(present)
+
+
+def _forget_sprint_item_columns(db: Any) -> None:
+    """Drop the cached column knowledge for ``db`` (tests that alter the
+    schema of an already-probed connection)."""
+    try:
+        _SPRINT_ITEM_COLUMNS_PRESENT.pop(db, None)
+    except TypeError:
+        pass
+
+
+def _coarse_lock_paths(item: dict[str, Any]) -> set[str]:
+    """Normalized real-file paths in ``item``'s ``coarse_lock_files``: the
+    whole-file locks this claim holds on behalf of a ``symbol:<path>::<sym>``
+    declaration (see :func:`claim_sprint_item`). Empty for legacy rows."""
+    from meridian.db.locks import _normalize_file_path  # noqa: PLC0415
+    raw = item.get("coarse_lock_files")
+    if not raw:
+        return set()
+    try:
+        values = json.loads(raw) if isinstance(raw, str) else list(raw)
+    except (TypeError, ValueError):
+        return set()
+    return {p for p in (_normalize_file_path(str(v)) for v in values or []) if p}
+
+
+def _serialize_coarse_lock_paths(paths: "set[str] | list[str] | None") -> str | None:
+    cleaned = sorted({p for p in (paths or []) if p})
+    return json.dumps(cleaned) if cleaned else None
 
 
 def _claim_lock_owner(item: dict[str, Any], fallback: str | None = None) -> str | None:
@@ -1388,6 +1460,7 @@ async def _transition_status(
     actor: str | None = None,
     claimed_at_now: bool = False,
     lock_session_id: "str | None | object" = _LOCK_SESSION_UNCHANGED,
+    coarse_lock_files: "str | None | object" = _LOCK_SESSION_UNCHANGED,
 ) -> dict[str, Any] | None:
     """Atomic chokepoint for ALL sprint-item status transitions.
 
@@ -1417,7 +1490,11 @@ async def _transition_status(
     ``actor``). Any transition to a status other than ``in_progress`` ends the
     claim, so it is always cleared then — whatever this call is passed. For an
     ``in_progress`` target it is written only when explicitly passed (``None``
-    writes NULL); the default leaves the column untouched.
+    writes NULL); the default leaves the column untouched. ``coarse_lock_files``
+    (a serialized JSON list, see :func:`claim_sprint_item`) follows exactly the
+    same rules. Either column is skipped when this DB doesn't have it yet
+    (:func:`_sprint_items_has_column`) — a skipped Postgres migration must
+    degrade lock bookkeeping, never block every status transition.
 
     Side effects on success: cache invalidation via
     :func:`_invalidate_sprint_items_cache` and live event via
@@ -1456,11 +1533,19 @@ async def _transition_status(
     if actor is not None:
         fields.append("actor = ?")
         values.append(actor)
-    if to_status != "in_progress":
-        fields.append("lock_session_id = NULL")
-    elif lock_session_id is not _LOCK_SESSION_UNCHANGED:
-        fields.append("lock_session_id = ?")
-        values.append(lock_session_id)
+    for _column, _value in (
+        ("lock_session_id", lock_session_id),
+        ("coarse_lock_files", coarse_lock_files),
+    ):
+        if to_status == "in_progress" and _value is _LOCK_SESSION_UNCHANGED:
+            continue
+        if not await _sprint_items_has_column(db, _column):
+            continue
+        if to_status != "in_progress":
+            fields.append(f"{_column} = NULL")
+        else:
+            fields.append(f"{_column} = ?")
+            values.append(_value)
     values.append(item_id)
     values.append(project_id)
     where = "WHERE id = ? AND project_id = ?"
@@ -2895,6 +2980,7 @@ async def claim_sprint_item(
     actor: str | None = None,
     *,
     lock_session_id: str | None = None,
+    coarse_lock_files: "list[str] | None" = None,
 ) -> dict[str, Any] | None:
     """Claim a sprint item: set status='in_progress' and claimed_at=now().
 
@@ -2909,6 +2995,14 @@ async def claim_sprint_item(
     two legitimately differ (a human name, an orchestrator id); every release
     path keys on it. Omitted, it is written as NULL, so a claim never inherits
     a previous claim's owner and releases fall back to ``actor`` as before.
+
+    ``coarse_lock_files`` — the real files whose whole-file lock the claim gate
+    NEWLY acquired as a coarse widening of a ``symbol:<path>::<sym>``
+    declaration (no source / unresolvable symbol). Stored (JSON, or NULL) in
+    the same UPDATE, so releasing the symbol resource frees a whole-file lock
+    only when the claim itself took it — never a lock the session already held
+    for other work (a manual ``claim_file``, another item's ``file:`` lock).
+    Nothing on the lock row says which item took it, hence the record here.
 
     dec69708 — ENFORCED deferral: if the item's ``deferred_until`` is in the
     future, the claim is REFUSED and a structured blocked dict is returned
@@ -3232,6 +3326,9 @@ async def claim_sprint_item(
         claimed_at_now=True,
         # c0ddd5b3 — always written (NULL when omitted); see docstring.
         lock_session_id=(lock_session_id or "").strip() or None,
+        coarse_lock_files=_serialize_coarse_lock_paths(
+            _coarse_lock_paths({"coarse_lock_files": list(coarse_lock_files or [])})
+        ),
     )
     if result is None:
         # The pre-check passed but a concurrent transition committed first
@@ -3633,9 +3730,15 @@ class _SiblingLockNeeds:
     Built once per release call by :func:`_sibling_lock_needs`; the release
     helpers consult it and record every lock they deliberately kept in
     :attr:`kept`, which the callers surface as ``kept_for_sibling_items``.
+
+    A whole-file lock kept for siblings is also HANDED OFF to them
+    (:attr:`handoffs`, persisted by :func:`_apply_file_lock_handoffs` into each
+    holder's ``coarse_lock_files``): a sibling that needs the file only through
+    a ``symbol:<path>::<sym>`` declaration would otherwise never release it,
+    since a symbol release frees a whole-file lock only when the item owns it.
     """
 
-    __slots__ = ("lock_owner", "files", "symbols", "kept")
+    __slots__ = ("lock_owner", "files", "symbols", "kept", "handoffs")
 
     def __init__(self, lock_owner: str) -> None:
         self.lock_owner = lock_owner
@@ -3644,6 +3747,14 @@ class _SiblingLockNeeds:
         # (real file path, symbol) -> ids of sibling items declaring that symbol
         self.symbols: dict[tuple[str, str], list[str]] = {}
         self.kept: list[dict[str, Any]] = []
+        # real file path -> sibling item ids that now own its whole-file lock
+        self.handoffs: dict[str, list[str]] = {}
+
+    def hand_off_file(self, path: str, holders: list[str]) -> None:
+        """Record that the whole-file lock on ``path`` now belongs to
+        ``holders`` (applied by :func:`_apply_file_lock_handoffs`)."""
+        for holder in holders:
+            self._add(self.handoffs, (path or "").strip(), holder)
 
     def _add(self, bucket: dict[Any, list[str]], key: Any, item_id: str) -> None:
         ids = bucket.setdefault(key, [])
@@ -3671,10 +3782,12 @@ class _SiblingLockNeeds:
         self.kept.append(entry)
 
     def keep_file(self, rid: str, path: str) -> bool:
-        """Record and return True when a sibling still needs ``path`` locked."""
+        """Record (and hand off) and return True when a sibling still needs
+        ``path`` locked."""
         holders = self.file_holders(path)
         if holders:
             self.record_kept(rid, path, holders)
+            self.hand_off_file(path, holders)
         return bool(holders)
 
     def keep_symbol(self, rid: str, path: str, symbol: str) -> bool:
@@ -3688,8 +3801,13 @@ class _SiblingLockNeeds:
 async def _sibling_lock_needs(
     db: Any, item: dict[str, Any], lock_owner: str,
 ) -> _SiblingLockNeeds:
-    """fd1eda7c — collect what every OTHER ``in_progress`` item in ``item``'s
-    project whose locks are held under ``lock_owner`` still needs.
+    """fd1eda7c — collect what every OTHER ``in_progress`` item whose locks are
+    held under ``lock_owner`` still needs.
+
+    Items of EVERY project count, not only ``item``'s: ``file_locks`` /
+    ``file_symbol_claims`` rows are keyed by path and session alone, so a
+    same-session item of another project that declares the same path shares
+    the very same lock row.
 
     "Held under" uses the same rule as :func:`_claim_lock_owner`: the sibling's
     ``lock_session_id`` when recorded, else its ``actor`` (legacy rows) — so a
@@ -3700,11 +3818,12 @@ async def _sibling_lock_needs(
       * ``file:<path>`` or the legacy ``file:<path>:<symbol>`` shorthand
         (both resolve through :func:`_resource_file_of`, like the claim gate);
       * ``symbol:<path>`` with no ``::`` scope (locked as the whole file);
-      * ``symbol:<path>::<symbol>`` — because the claim gate widens a symbol to
-        a whole-file lock whenever no source was supplied or it couldn't be
-        resolved (``claim_granularity="coarse"``), and nothing on the item row
-        says which happened, so the file lock is kept conservatively. It is
-        only ever kept by the session that is still working that file.
+      * ``symbol:<path>::<symbol>`` — either the claim gate widened it to a
+        whole-file lock (``claim_granularity="coarse"``) or it holds a real
+        symbol claim that ``release_file`` would soft-release along with the
+        file lock; either way the file lock is kept (and handed to it, see
+        :class:`_SiblingLockNeeds`). It is only ever kept by the session that
+        is still working that file.
     A ``symbol:<path>::<symbol>`` declaration also protects that exact symbol
     claim (``file_symbol_claims`` has one row per session/path/symbol, so two
     same-session items declaring the SAME symbol share it; different symbols
@@ -3717,12 +3836,20 @@ async def _sibling_lock_needs(
     if not lock_owner:
         return needs
     try:
-        async with db.execute(
-            "SELECT id, actor, lock_session_id, touches_resources FROM sprint_items "
-            "WHERE project_id = ? AND status = 'in_progress' AND id != ? "
-            "AND (lock_session_id = ? OR actor = ?)",
-            (item.get("project_id"), item.get("id"), lock_owner, lock_owner),
-        ) as cur:
+        if await _sprint_items_has_column(db, "lock_session_id"):
+            sql = (
+                "SELECT id, actor, lock_session_id, touches_resources FROM sprint_items "
+                "WHERE status = 'in_progress' AND id != ? "
+                "AND (lock_session_id = ? OR actor = ?)"
+            )
+            params: tuple[Any, ...] = (item.get("id"), lock_owner, lock_owner)
+        else:  # skipped migration: every row is a legacy row
+            sql = (
+                "SELECT id, actor, touches_resources FROM sprint_items "
+                "WHERE status = 'in_progress' AND id != ? AND actor = ?"
+            )
+            params = (item.get("id"), lock_owner)
+        async with db.execute(sql, params) as cur:
             rows = await cur.fetchall()
         for row in rows:
             sibling = _row_to_dict(row) or {}
@@ -3807,6 +3934,16 @@ async def _session_holds_whole_file_lock(db: Any, path: str, session_id: str) ->
         return (await cur.fetchone()) is not None
 
 
+async def _session_holds_live_symbol_claim(
+    db: Any, path: str, symbol: str, session_id: str,
+) -> bool:
+    from meridian.db import get_symbol_claims  # noqa: PLC0415
+    return any(
+        c.get("symbol_name") == symbol and c.get("session_id") == session_id
+        for c in await get_symbol_claims(db, path)
+    )
+
+
 async def _release_symbol_resource(
     db: Any,
     rid: str,
@@ -3814,31 +3951,72 @@ async def _release_symbol_resource(
     symbol: str,
     session_id: str,
     siblings: _SiblingLockNeeds,
+    *,
+    owns_file_lock: bool,
 ) -> bool:
-    """fd1eda7c — release what a ``symbol:<path>::<symbol>`` declaration can
-    hold under ``session_id``; returns True if anything was released.
+    """fd1eda7c — release what a ``symbol:<path>::<symbol>`` declaration holds
+    under ``session_id``; returns True if anything was released.
 
     That is the symbol claim itself (one ``file_symbol_claims`` row per
-    session/path/symbol — kept when a sibling declares the same symbol) AND the
-    session's whole-file lock on ``path`` when it holds one: the claim gate
-    widens a symbol to a whole-file lock whenever it can't resolve a real range
-    (``claim_granularity="coarse"``), and a file lock kept for this item as a
-    sibling of an already-released ``file:`` item sits there too. Releasing only
-    the symbol row left either kind held until its TTL. The file lock is kept
-    (and reported) while any sibling still declares something on ``path``;
-    that same check makes ``release_file``'s release of every symbol claim the
-    session holds on ``path`` safe, since no sibling needs one.
+    session/path/symbol — kept when a sibling declares the same symbol) and,
+    ONLY when ``owns_file_lock`` (``path`` is in the item's
+    ``coarse_lock_files``), the session's whole-file lock on ``path``: the claim
+    gate newly acquired it as a coarse widening of this symbol, or a released
+    sibling handed it over. A whole-file lock the session holds for any other
+    reason — a manual ``claim_file``, another item's ``file:`` resource, a
+    coarse widening onto a lock it already held — is not this item's and is
+    never touched (freeing it would also soft-release every symbol claim the
+    session holds on ``path``). An owned lock is still kept, and handed on,
+    while a sibling needs it.
     """
     from meridian.db import release_file, release_symbol  # noqa: PLC0415
     if siblings.keep_symbol(rid, path, symbol):
         # A sibling declaring the same symbol also needs the file (see
-        # _sibling_lock_needs), so nothing on this path may be released.
+        # _sibling_lock_needs), so nothing on this path may be released; an
+        # owned whole-file lock becomes that sibling's to release.
+        if owns_file_lock:
+            siblings.hand_off_file(path, siblings.symbol_holders(path, symbol))
         return False
     released = bool(await release_symbol(db, session_id, path, symbol))
-    if await _session_holds_whole_file_lock(db, path, session_id):
+    if owns_file_lock and await _session_holds_whole_file_lock(db, path, session_id):
         if not siblings.keep_file(rid, path) and await release_file(db, path, session_id):
             released = True
     return released
+
+
+async def _apply_file_lock_handoffs(db: Any, siblings: _SiblingLockNeeds) -> None:
+    """Persist :attr:`_SiblingLockNeeds.handoffs`: add each kept file to its new
+    owners' ``coarse_lock_files`` so the last of them releases it. Best-effort
+    (a failure leaves the lock to its TTL, the pre-fd1eda7c outcome)."""
+    if not siblings.handoffs:
+        return
+    try:
+        if not await _sprint_items_has_column(db, "coarse_lock_files"):
+            return
+        by_item: dict[str, set[str]] = {}
+        for path, holders in siblings.handoffs.items():
+            for holder in holders:
+                by_item.setdefault(holder, set()).add(path)
+        for holder, paths in by_item.items():
+            async with db.execute(
+                "SELECT coarse_lock_files FROM sprint_items "
+                "WHERE id = ? AND status = 'in_progress'",
+                (holder,),
+            ) as cur:
+                row = _row_to_dict(await cur.fetchone())
+            if row is None:
+                continue
+            owned = _coarse_lock_paths(row)
+            if paths <= owned:
+                continue
+            await db.execute(
+                "UPDATE sprint_items SET coarse_lock_files = ? "
+                "WHERE id = ? AND status = 'in_progress'",
+                (_serialize_coarse_lock_paths(owned | paths), holder),
+            )
+        await db.commit()
+    except Exception:  # noqa: BLE001 — bookkeeping must never block a release
+        pass
 
 
 async def _release_claim_resources(
@@ -3856,6 +4034,7 @@ async def _release_claim_resources(
     failure to import/iterate never propagates to the caller's transition."""
     released: list[str] = []
     siblings = await _sibling_lock_needs(db, item, lock_owner)
+    owned_files = _coarse_lock_paths(item)
     try:
         from meridian.db import release_resource  # noqa: PLC0415
         for rid in parse_touches_resources(item.get("touches_resources")):
@@ -3871,6 +4050,7 @@ async def _release_claim_resources(
                     if sym:
                         if await _release_symbol_resource(
                             db, rid, path, sym, lock_owner, siblings,
+                            owns_file_lock=path.strip() in owned_files,
                         ):
                             released.append(rid)
                     elif await _release_real_file_lock(
@@ -3884,6 +4064,7 @@ async def _release_claim_resources(
                 continue
     except Exception:  # noqa: BLE001 — lock release is best-effort, never blocks the caller
         pass
+    await _apply_file_lock_handoffs(db, siblings)
     return released, siblings.kept
 
 
@@ -4417,6 +4598,17 @@ async def transfer_sprint_item_claim(
     refused as ``SAME_ACTOR`` when ``to_session_id`` wouldn't move the locks
     either.
 
+    When ``to_session_id`` IS the lock-holding session (only the attribution
+    actor changes), no lock is released or re-acquired at all — the item stays
+    ``in_progress`` under the same session, so its real symbol claims and
+    whole-file locks stay exactly where they are and are reported as
+    transferred. A whole-file lock the item owns for a ``symbol:`` declaration
+    (``coarse_lock_files``: a coarse widening the claim gate newly acquired,
+    or a lock handed over by a released sibling) needs no source to
+    re-acquire, so it moves to a different ``to_session_id`` like a ``file:``
+    lock does (and stays recorded as the item's); only a real symbol-range
+    claim is release-only.
+
     Ownership is enforced exactly like :func:`release_sprint_item_claim`:
     only the item's current ``actor`` or lock-holding ``lock_session_id`` may
     transfer its own claim away, unless ``force=True`` is explicitly passed.
@@ -4432,10 +4624,9 @@ async def transfer_sprint_item_claim(
         non-empty, same shape as :func:`release_sprint_item_claim`'s): a lock
         another ``in_progress`` item held under the same session still needs
         is never moved to ``to_session_id`` — the transfer must not steal it
-        from that sibling — so it stays put and the receiving session has to
-        claim it once the sibling lets go. (When ``to_session_id`` IS that
-        session, the lock is already where it belongs and counts as
-        transferred.)
+        from that sibling — so it stays put (and becomes that sibling's to
+        release) and the receiving session has to claim it once the sibling
+        lets go.
     """
     if not (to_actor or "").strip():
         raise ValueError("to_actor is required")
@@ -4510,6 +4701,11 @@ async def transfer_sprint_item_claim(
     released_only: list[str] = []
     siblings = await _sibling_lock_needs(db, item, lock_owner)
     _receiver_is_lock_owner = new_lock_session_id == lock_owner
+    # Whole-file locks this claim owns on behalf of a symbol: declaration (see
+    # claim_sprint_item); new_owned_files is what the receiving session owns
+    # after the move.
+    owned_files = _coarse_lock_paths(item)
+    new_owned_files: set[str] = set()
 
     def _left_for_siblings(rid: str, path: str, symbol: str | None = None) -> bool:
         """True when this resource's lock must stay under lock_owner."""
@@ -4518,15 +4714,47 @@ async def transfer_sprint_item_claim(
         )
         if not holders:
             return False
-        if _receiver_is_lock_owner:
-            transferred.append(rid)  # already held by the receiving session
-        else:
-            siblings.record_kept(rid, path, holders, symbol)
+        siblings.record_kept(rid, path, holders, symbol)
+        # The lock stays with lock_owner, so it becomes the siblings' to
+        # release: a file lock always, and for a shared symbol the whole-file
+        # lock this item owned on top of it.
+        if not symbol or path.strip() in owned_files:
+            siblings.hand_off_file(path, holders)
         return True
 
     try:
-        from meridian.db import release_file, claim_file  # noqa: PLC0415
-        for rid in parse_touches_resources(item.get("touches_resources")):
+        from meridian.db import release_file, release_symbol, claim_file  # noqa: PLC0415
+        if _receiver_is_lock_owner:
+            # Only attribution changes hands: every lock the item holds already
+            # sits under the receiving session, and the item stays in_progress
+            # under it. Releasing to re-acquire would drop what can't be
+            # re-acquired here (a real symbol claim needs the file's source) and
+            # churn the rest, so nothing is touched; what the session holds
+            # counts as transferred.
+            new_owned_files = owned_files
+            for rid in parse_touches_resources(item.get("touches_resources")):
+                body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
+                try:
+                    if body.startswith("file:"):
+                        held = await _session_holds_whole_file_lock(
+                            db, _resource_file_of(body) or body[len("file:"):], lock_owner,
+                        )
+                    elif body.startswith("symbol:"):
+                        path, _, sym = body[len("symbol:"):].partition("::")
+                        held = await _session_holds_whole_file_lock(db, path, lock_owner) or (
+                            bool(sym)
+                            and await _session_holds_live_symbol_claim(db, path, sym, lock_owner)
+                        )
+                    else:
+                        held = False
+                    if held:
+                        transferred.append(rid)
+                except Exception:  # noqa: BLE001 — reporting only
+                    continue
+        for rid in (
+            [] if _receiver_is_lock_owner
+            else parse_touches_resources(item.get("touches_resources"))
+        ):
             body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
             try:
                 if body.startswith("file:"):
@@ -4547,17 +4775,34 @@ async def transfer_sprint_item_claim(
                 elif body.startswith("symbol:"):
                     path, _, sym = body[len("symbol:"):].partition("::")
                     if sym:
-                        # Symbol-grain re-acquisition needs the file's current
-                        # content to re-resolve the AST range (see docstring)
-                        # — release only, never auto-reclaimed here. fd1eda7c —
-                        # that includes a coarse whole-file lock the symbol was
-                        # widened to (previously left with lock_owner, where it
-                        # blocked the receiving session from the file).
+                        # A real symbol claim is released only: re-acquiring an
+                        # AST range needs the file's current content (see
+                        # docstring). A whole-file lock this item OWNS for the
+                        # symbol (a coarse widening, or one handed over by a
+                        # sibling) needs no source, so it moves to
+                        # to_session_id like a file: resource; one the session
+                        # holds for anything else is never touched.
                         if _left_for_siblings(rid, path, sym):
                             continue
-                        if await _release_symbol_resource(
-                            db, rid, path, sym, lock_owner, siblings,
-                        ):
+                        owns = path.strip() in owned_files
+                        _rel = bool(await release_symbol(db, lock_owner, path, sym))
+                        if owns and siblings.keep_file(rid, path):
+                            owns = False  # stays with lock_owner, handed to the siblings
+                        elif owns and await release_file(db, path, lock_owner):
+                            _rel = True
+                        if owns and to_session_id:
+                            _pre_held = await _session_holds_whole_file_lock(
+                                db, path, to_session_id,
+                            )
+                            _claim_res = await claim_file(
+                                db, path, to_session_id, item_id=item_id,
+                            )
+                            if _claim_res.get("claimed"):
+                                transferred.append(rid)
+                                if not _pre_held:
+                                    new_owned_files.add(path.strip())
+                                continue
+                        if _rel:
                             released_only.append(rid)
                     else:
                         if _left_for_siblings(rid, path):
@@ -4575,6 +4820,7 @@ async def transfer_sprint_item_claim(
                 continue
     except Exception:  # noqa: BLE001 — lock migration is best-effort, never blocks the transfer
         pass
+    await _apply_file_lock_handoffs(db, siblings)
     kept_for_siblings = siblings.kept
 
     updated = await _transition_status(
@@ -4586,6 +4832,11 @@ async def transfer_sprint_item_claim(
         # to_session_id; with none given the locks were only released, so
         # nothing is held and later releases fall back to to_actor.
         lock_session_id=new_lock_session_id,
+        # The whole-file locks the item owns for its symbol: declarations now
+        # (none once nothing is held under a session).
+        coarse_lock_files=(
+            _serialize_coarse_lock_paths(new_owned_files) if new_lock_session_id else None
+        ),
     )
     if updated is None:
         # Raced away from in_progress between the ownership check and this

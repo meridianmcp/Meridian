@@ -83,13 +83,16 @@ async def test_mcp_claim_with_explicit_actor_records_the_lock_session(db):
     assert sid in await _symbol_holders(db)
 
 
-async def test_claim_with_nothing_locked_records_no_lock_session(db):
+async def test_claim_with_nothing_locked_still_records_the_claiming_session(db):
+    """A later mid-execution claim_file for this item is held under the
+    session, so the session is the claim's lock owner even with no initial
+    locks (see tests/test_lock_ownership_review_findings.py)."""
     pid, item_id, sid = await _setup(db, "c0ddd5b3-no-resources", resources=[])
 
     result = await _mcp_claim(db, pid, item_id, sid)
 
     assert result["actor"] == "adam"
-    assert result["lock_session_id"] is None
+    assert result["lock_session_id"] == sid
 
 
 async def test_db_level_claim_without_a_lock_session_writes_null(db):

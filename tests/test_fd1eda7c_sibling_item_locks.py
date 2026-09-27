@@ -162,10 +162,12 @@ async def test_symbol_item_release_keeps_the_file_lock_of_a_file_sibling(db):
     first = await _release(db, pid, a, sess)
 
     # A's own symbol claim is released; the whole-file lock B needs is not.
+    # (That lock was never A's — A holds a real symbol claim, not a coarse
+    # widening — so it isn't even a "kept for a sibling" decision.)
     assert first["released_resources"] == [SYMBOL_HELPER]
     assert await _symbol_holders(db, "helper") == set()
     assert await _file_holder(db) == sess
-    assert _kept(first, SYMBOL_HELPER)["scope"] == "file"
+    assert "kept_for_sibling_items" not in first
 
     await _release(db, pid, b, sess)
     assert await _file_holder(db) is None
@@ -446,7 +448,10 @@ async def test_transfer_without_siblings_still_moves_the_lock(db):
     assert await _file_holder(db, "pkg/elsewhere.py") == sess
 
 
-async def test_transfer_releases_a_coarse_symbol_lock_instead_of_stranding_it(db):
+async def test_transfer_moves_a_coarse_symbol_lock_instead_of_stranding_it(db):
+    """The coarse whole-file lock the gate took for the symbol needs no source
+    to re-acquire, so it moves to the receiver (it used to stay with the
+    sender, blocking the receiver from the file)."""
     project = await db_module.create_project(db, "fd1eda7c-transfer-coarse")
     pid = project["id"]
     item = await db_module.add_sprint_item(
@@ -460,5 +465,6 @@ async def test_transfer_releases_a_coarse_symbol_lock_instead_of_stranding_it(db
         db, pid, item["id"], sess, "bob", to_session_id=receiver,
     )
 
-    assert result["released_only_resources"] == [SYMBOL_HELPER]
-    assert await _file_holder(db) is None
+    assert result["transferred_resources"] == [SYMBOL_HELPER]
+    assert result["released_only_resources"] == []
+    assert await _file_holder(db) == receiver
