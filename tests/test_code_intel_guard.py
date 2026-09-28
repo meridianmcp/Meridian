@@ -12,8 +12,9 @@ grep exclusively instead of code-intel tools. This tests the ACTUAL hook BEHAVIO
    - Fails open (exit 0) on any other tool (passthrough).
    - Fails open (exit 0) on garbage/missing stdin.
 
-2. settings.json actually registers the hook under PreToolUse with
-   matcher "Grep|Glob" -- structural wiring, not just file presence.
+2. settings.json NO LONGER registers the hook (55d48d69): the Meridian guard
+   (meridian_guard.ps1/.sh, rules G1-G4) superseded it. The script stays one
+   release, marked deprecated, and its behaviour is still tested here.
 """
 from __future__ import annotations
 
@@ -655,16 +656,23 @@ def test_hook_fails_open_when_slot_readiness_json_missing_fields():
 # Test: settings.json actually wires the guard
 # ---------------------------------------------------------------------------
 
-def test_settings_wires_grep_glob_matcher():
-    """The hook must be registered -- structural wiring, not just file presence."""
+def test_settings_no_longer_registers_code_intel_guard():
+    """55d48d69 superseded this hook with the Meridian guard (G1-G4): it is
+    de-registered (it probed localhost:7878 on every Grep/Glob and hung 4-5 s
+    when nothing listened) and the meridian_guard PreToolUse dispatcher now
+    covers Grep and Glob. The script itself stays one release, marked
+    deprecated, so the behavioural tests below still exercise it."""
     cfg = json.loads(_SETTINGS.read_text(encoding="utf-8"))
     pre = cfg.get("hooks", {}).get("PreToolUse", [])
-    entry = next(
-        (e for e in pre if e.get("matcher") == "Grep|Glob"), None
-    )
-    assert entry is not None, "PreToolUse must have a Grep|Glob matcher entry"
-    cmds = " ".join(h.get("command", "") for h in entry.get("hooks", []))
-    assert "code_intel_guard" in cmds, "the Grep|Glob matcher must run code_intel_guard"
+    assert "code_intel_guard" not in json.dumps(cfg), "code_intel_guard must not be registered"
+    guard = [e for e in pre if "meridian_guard" in json.dumps(e.get("hooks", []))]
+    assert len(guard) == 1, "exactly one meridian_guard PreToolUse dispatcher"
+    matcher = guard[0].get("matcher", "")
+    for tool in ("Grep", "Glob"):
+        assert re.fullmatch(matcher, tool), f"meridian_guard must match {tool}"
+    for ext in ("ps1", "sh"):
+        head = (_REPO / ".claude" / "hooks" / f"code_intel_guard.{ext}").read_text(encoding="utf-8")[:600]
+        assert "DEPRECATED (55d48d69)" in head, ext
 
 
 # ---------------------------------------------------------------------------

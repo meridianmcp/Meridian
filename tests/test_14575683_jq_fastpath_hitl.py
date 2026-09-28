@@ -16,10 +16,14 @@ or on Windows/Git-Bash).  These tests:
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,10 +31,49 @@ _REPO = Path(__file__).resolve().parent.parent
 _HOOK_SH = _REPO / ".claude" / "hooks" / "hitl_guard.sh"
 
 # ---------------------------------------------------------------------------
+# Reachable-Meridian stub (55d48d69 confirm pass): hitl_guard's fail-open-when-
+# unreachable fix (51f5120f) means "AskUserQuestion always blocks" is no longer
+# true unconditionally -- it blocks only when Meridian actually answers. Tests
+# asserting the BLOCK contract must run against a real, reachable stub rather
+# than whatever MERIDIAN_URL happens to be ambient, mirroring the same
+# stub-server pattern test_hook_registered_commands.py already uses.
+# ---------------------------------------------------------------------------
+
+
+class _HitlStubHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_a: Any) -> None:  # keep pytest output clean
+        pass
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path.split("?", 1)[0] == "/health":
+            body = json.dumps({"status": "ok", "service": "meridian"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+@pytest.fixture(scope="module")
+def reachable_meridian_url():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HitlStubHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
 # Helpers shared with the rest of the hook test suite
 # ---------------------------------------------------------------------------
 
-def _run_hook(payload: str) -> subprocess.CompletedProcess:
+def _run_hook(payload: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Run hitl_guard.sh with *payload* on stdin, mirroring the established pattern."""
     return subprocess.run(
         ["bash", ".claude/hooks/hitl_guard.sh"],
@@ -39,6 +82,7 @@ def _run_hook(payload: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=15,
+        env=env,
     )
 
 
@@ -140,11 +184,15 @@ def test_jq_fastpath_reads_toplevel_not_nested_decoy_allows():
 
 @_needs_bash
 @_needs_jq_linux_darwin
-def test_jq_fastpath_reads_toplevel_not_nested_decoy_blocks():
+def test_jq_fastpath_reads_toplevel_not_nested_decoy_blocks(reachable_meridian_url):
     """Mirror-image decoy: nested tool_name="Bash" before real top-level tool_name="AskUserQuestion".
 
     - jq reads the TOP-LEVEL .tool_name -> "AskUserQuestion" -> must BLOCK (exit 2).
     - A naive first-match regex would grab the nested "Bash" and incorrectly allow.
+
+    51f5120f made hitl_guard fail open when Meridian is unreachable, so this
+    block-contract test needs a real, reachable stub (see reachable_meridian_url)
+    rather than whatever MERIDIAN_URL happens to be ambient.
     """
     payload = json.dumps({
         "tool_input": {
@@ -156,7 +204,8 @@ def test_jq_fastpath_reads_toplevel_not_nested_decoy_blocks():
     assert payload.index('"Bash"') < payload.index('"AskUserQuestion"'), (
         "payload construction error: decoy must appear before real tool_name in raw string"
     )
-    r = _run_hook(payload)
+    env = dict(os.environ, MERIDIAN_URL=reachable_meridian_url)
+    r = _run_hook(payload, env=env)
     assert r.returncode == 2, (
         "jq fast path must read top-level .tool_name='AskUserQuestion' and block (exit 2); "
         "exit 0 would mean the hook incorrectly grabbed the nested 'Bash' decoy "
@@ -224,7 +273,7 @@ _needs_powershell = pytest.mark.skipif(
 )
 
 
-def _run_ps1_hook(payload: str) -> subprocess.CompletedProcess:
+def _run_ps1_hook(payload: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Run hitl_guard.ps1 with *payload* on stdin, mirroring _run_hook above."""
     ps = _powershell_exe()
     return subprocess.run(
@@ -235,15 +284,33 @@ def _run_ps1_hook(payload: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=15,
+        env=env,
     )
 
 
 @_needs_powershell
-def test_ps1_hook_blocks_native_askuserquestion():
-    """Same contract as the .sh hook's test_hook_blocks_native_askuserquestion."""
-    r = _run_ps1_hook('{"tool_name":"AskUserQuestion","tool_input":{}}')
-    assert r.returncode == 2, "exit 2 blocks the tool call"
+def test_ps1_hook_blocks_native_askuserquestion(reachable_meridian_url):
+    """Same contract as the .sh hook's test_hook_blocks_native_askuserquestion.
+
+    51f5120f made hitl_guard fail OPEN when Meridian is unreachable (so a
+    session is never left with no way to ask the human at all) -- the block
+    contract this test asserts only holds when Meridian actually answers, so
+    it must run against a real, reachable stub rather than the ambient
+    (normally unreachable in a test sandbox) MERIDIAN_URL.
+    """
+    env = dict(os.environ, MERIDIAN_URL=reachable_meridian_url)
+    r = _run_ps1_hook('{"tool_name":"AskUserQuestion","tool_input":{}}', env=env)
+    assert r.returncode == 2, f"exit 2 blocks the tool call when Meridian is reachable\nstdout: {r.stdout}\nstderr: {r.stderr}"
     assert "request_hitl" in r.stdout + r.stderr, "must redirect to request_hitl"
+
+
+@_needs_powershell
+def test_ps1_hook_fails_open_when_meridian_unreachable():
+    """The other half of 51f5120f's contract: with no reachable Meridian (the
+    ambient default in a sandboxed test run), AskUserQuestion must NOT be
+    blocked -- exit 0, so the session can still ask the human something."""
+    r = _run_ps1_hook('{"tool_name":"AskUserQuestion","tool_input":{}}')
+    assert r.returncode == 0, f"must fail open when Meridian is unreachable\nstdout: {r.stdout}\nstderr: {r.stderr}"
 
 
 @_needs_powershell
