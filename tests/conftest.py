@@ -44,6 +44,67 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Windows-only: disable stdlib platform's WMI-backed queries for this process
+# (test-runner reliability investigation, 2026-09-27)
+# ---------------------------------------------------------------------------
+#
+# CPython's ``platform.py`` (confirmed live against this repo's pinned
+# interpreter, 3.12.13/conda-forge) added a ``_wmi`` C-extension-backed
+# ``_wmi_query()`` as the "canonical source" for ``platform.win32_ver()`` and
+# ``platform.processor()`` -- see ``_win32_ver``/``processor`` in the
+# installed ``Lib/platform.py``, both trying ``_wmi_query(...)`` first and
+# only falling back (registry / ``sys.getwindowsversion()`` / env vars) on a
+# caught ``OSError``.
+#
+# pytest-xdist's worker bootstrap (``xdist/remote.py::getinfodict``, called
+# from ``WorkerInteractor.pytest_sessionstart`` the instant a worker process
+# starts) calls ``platform.platform()`` unconditionally to report the
+# worker's environment back to the controller -- there is no xdist config
+# flag to skip this. Under real, reproduced local conditions (many workers
+# starting concurrently while the host is under heavy memory pressure from an
+# unrelated process), the underlying WMI/COM call inside ``_wmi.exec_query``
+# has crashed multiple worker processes outright with
+# ``Windows fatal exception: code 0x8007000e`` (E_OUTOFMEMORY) -- a fatal
+# fault below Python's own exception handling, NOT a catchable ``OSError``,
+# so the existing try/except fallback in ``platform.py`` never gets a chance
+# to run.
+#
+# Fix: force ``platform._wmi_query`` to fail fast with the exact ``OSError``
+# CPython's own code already expects and handles gracefully (this is
+# literally what ``platform.py`` does itself when the ``_wmi`` extension
+# module is unavailable at all -- see the ``except ImportError`` branch a few
+# lines above ``_wmi_query``'s real definition). This never touches WMI/COM,
+# so it eliminates the crash risk entirely, and every caller already has a
+# tested, working non-WMI fallback path -- confirmed no test in this suite
+# asserts on the real WMI-sourced value (``test_host_memory_diagnostics.py``
+# always injects fake data sources or forces ``sys.platform`` to a non-win32
+# value; ``temp_artifacts.py``'s use of ``platform.platform()`` is only
+# checked for truthiness in tests, never an exact string). Applied at conftest
+# import time -- for BOTH the controller and every xdist worker, since each
+# worker is a fresh interpreter that re-imports this file during
+# ``_prepareconfig`` well before ``pytest_sessionstart`` fires -- so the real
+# WMI code path is never reached at all during this test suite's run, on
+# either process kind.
+if sys.platform == "win32":
+    def _disable_platform_wmi_queries() -> None:
+        try:
+            import platform as _platform_mod
+        except Exception:  # noqa: BLE001 -- must never block test collection
+            return
+
+        def _wmi_query_disabled(*_args: object, **_kwargs: object):
+            raise OSError(
+                "platform._wmi_query disabled during tests (see tests/conftest.py) "
+                "-- avoids a real WMI/COM call that has crashed xdist workers under "
+                "memory pressure with a non-catchable Windows fatal exception"
+            )
+
+        _platform_mod._wmi_query = _wmi_query_disabled
+
+    _disable_platform_wmi_queries()
+
+
+# ---------------------------------------------------------------------------
 # Backend selection helpers
 # ---------------------------------------------------------------------------
 
