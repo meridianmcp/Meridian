@@ -208,13 +208,35 @@ def _scope_log_dir(state_dir: Path, scope: str) -> Path:
 def _atomic_write_json(path: Path, payload: "dict[str, Any]") -> None:
     """Write *payload* to *path* as JSON via temp-file-then-``os.replace``,
     matching ``process_registry.ProcessLeaseBroker._save``'s exact pattern
-    so a crash mid-write can never corrupt a reader's view of the file."""
+    so a crash mid-write can never corrupt a reader's view of the file.
+
+    The directory and the final file are both best-effort permission-
+    hardened (0o700 / 0o600) after creation -- mirrors the existing
+    ``tunnel_client._write_cached_token`` precedent for state that
+    identifies a live pid a local writer shouldn't be able to tamper with
+    (2026-09-28 review finding #11). A ``chmod`` failure (e.g. an
+    unsupported filesystem, or Windows -- where this is a near no-op since
+    ``chmod`` there only toggles the read-only bit, not real ACLs) must
+    never break the write itself."""
+    dir_existed = path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not dir_existed:
+        # Only on actual creation -- an already-hardened directory doesn't
+        # need re-chmod'ing on every single write (this fires on every
+        # start()/restart(), sometimes twice in quick succession).
+        try:
+            path.parent.chmod(0o700)
+        except Exception:  # noqa: BLE001
+            pass
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".local_runner_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
         os.replace(tmp_name, path)
+        try:
+            path.chmod(0o600)
+        except Exception:  # noqa: BLE001
+            pass
     finally:
         try:
             if os.path.exists(tmp_name):
@@ -894,6 +916,10 @@ class LocalRunner:
     def _prepare_log_path(self) -> Path:
         log_dir = _scope_log_dir(self._state_dir, self.scope)
         log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            log_dir.chmod(0o700)
+        except Exception:  # noqa: BLE001 -- best-effort, mirrors _atomic_write_json
+            pass
         token = process_lifecycle.new_run_id()
         return log_dir / f"{token}.log"
 
@@ -901,6 +927,10 @@ class LocalRunner:
         self, command: "Sequence[str]", cwd: "str | None", log_path: Path
     ) -> process_lifecycle.OwnedProcessHandle:
         fh = open(log_path, "ab", buffering=0)
+        try:
+            log_path.chmod(0o600)  # best-effort; mirrors _atomic_write_json (finding #10)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             handle = self._backend.spawn(
                 list(command),

@@ -504,6 +504,35 @@ def test_stop_is_idempotent(state_dir, broker):
     assert again.child.state in (lr.ChildState.STOPPED, lr.ChildState.CRASHED)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="chmod on Windows only toggles the read-only attribute, not real POSIX mode bits",
+)
+def test_state_dir_record_and_log_are_permission_hardened(state_dir, broker):
+    """Regression test for the 2026-09-28 review (findings #10/#11): the
+    runner state dir, the RunnerRecord JSON file, the log dir, and the log
+    file itself must all be non-world-readable/writable -- previously only
+    the record file's 0600 was an INCIDENTAL side effect of
+    tempfile.mkstemp's default, and nothing else was hardened at all."""
+    runner = _make_runner("perm-scope", _sleepy_cmd(), state_dir=state_dir, broker=broker)
+    try:
+        started = runner.start()
+        assert started.child.state is lr.ChildState.RUNNING
+
+        assert (state_dir.stat().st_mode & 0o777) == 0o700
+        state_path = runner._state_path
+        assert state_path.exists()
+        assert (state_path.stat().st_mode & 0o777) == 0o600
+
+        record = runner._load_record()
+        log_path = lr.Path(record.log_path)
+        assert log_path.exists()
+        assert (log_path.stat().st_mode & 0o777) == 0o600
+        assert (log_path.parent.stat().st_mode & 0o777) == 0o700
+    finally:
+        runner.stop()
+
+
 def test_restart_replaces_the_child_and_increments_restart_count(state_dir, broker):
     with _make_runner("restart-scope", _sleepy_cmd(), state_dir=state_dir, broker=broker) as runner:
         first = runner.start()

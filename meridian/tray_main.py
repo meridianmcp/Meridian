@@ -215,29 +215,50 @@ def _run_tray() -> int:
 
     runner = _build_runner()
 
-    try:
-        runner.start()
-    except RunnerAlreadyRunningError:
-        # Already running (from a prior launch, or another tray instance) --
-        # attach to it rather than treating this as an error. See module
-        # docstring's "known limitation" note on multi-tray-icon launches.
-        pass
-    except Exception as exc:  # noqa: BLE001 -- must not silently exit with no UI at all
-        _show_error_dialog("Meridian failed to start", str(exc))
-        return 1
-
     # 4e4c3817 follow-up (owner feedback 2026-09-27): a bare tray icon gives
     # zero visible feedback on launch -- a human who just double-clicked this
     # (or hit it via Start Menu/startup) sees literally nothing happen, since
     # a new tray icon is often auto-hidden into Windows' overflow chevron.
     # Open the dashboard immediately so launching it always shows something,
-    # instead of requiring the tray icon to be found and clicked first. Runs
-    # on both the fresh-start and attach-to-existing paths above -- either
-    # way the server is confirmed healthy by the time we get here.
+    # instead of requiring the tray icon to be found and clicked first.
+    #
+    # 2026-09-28 review fix: this must NOT open unconditionally. start()'s
+    # RunnerStatus (and, on the attach-to-existing path, a fresh status()
+    # call) is checked first -- neither a COLD_START_TIMEOUT/FAILED fresh
+    # start nor an "already running" record that turns out to be unhealthy
+    # should silently open a browser tab to a dead URL with zero feedback.
+    should_open_dashboard = False
     try:
-        webbrowser.open(_dashboard_url())
-    except Exception:  # noqa: BLE001 -- a browser-open failure must never stop the tray/server
-        pass
+        status = runner.start()
+        should_open_dashboard = status.local_mcp.state in (
+            LocalMcpState.READY, LocalMcpState.NOT_CONFIGURED,
+        )
+        if not should_open_dashboard:
+            _show_error_dialog(
+                "Meridian did not become ready",
+                status.local_mcp.detail or f"local MCP state: {status.local_mcp.state.value}",
+            )
+    except RunnerAlreadyRunningError:
+        # Already running (from a prior launch, or another tray instance) --
+        # attach to it rather than treating this as an error. See module
+        # docstring's "known limitation" note on multi-tray-icon launches.
+        # "Already running" only means the prior record's pid is alive, NOT
+        # that the server is actually healthy -- check before opening.
+        try:
+            should_open_dashboard = runner.status().local_mcp.state in (
+                LocalMcpState.READY, LocalMcpState.NOT_CONFIGURED,
+            )
+        except Exception:  # noqa: BLE001 -- a broken status check must never crash the tray
+            should_open_dashboard = False
+    except Exception as exc:  # noqa: BLE001 -- must not silently exit with no UI at all
+        _show_error_dialog("Meridian failed to start", str(exc))
+        return 1
+
+    if should_open_dashboard:
+        try:
+            webbrowser.open(_dashboard_url())
+        except Exception:  # noqa: BLE001 -- a browser-open failure must never stop the tray/server
+            pass
 
     icon_path = _icon_image_path()
     try:

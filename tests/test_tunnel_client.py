@@ -6011,7 +6011,13 @@ def test_spawn_owned_with_cache_retry_windows_assigns_job(monkeypatch):
     assert handle is not None
     assert handle.job_id is not None
     kinds = [c[0] for c in fake_api.calls]
-    assert kinds == ["create_job", "set_kill_on_close", "open_process", "assign_process"]
+    # close_handle on the OpenProcess handle is expected even on success --
+    # it's only needed transiently to make the assign call, never for the
+    # job's continued lifetime (2026-09-28 handle-leak fix in
+    # process_lifecycle._assign_to_job).
+    assert kinds == [
+        "create_job", "set_kill_on_close", "open_process", "assign_process", "close_handle",
+    ]
 
 
 def test_spawn_owned_with_cache_retry_degrades_to_none_on_adopt_failure(monkeypatch):
