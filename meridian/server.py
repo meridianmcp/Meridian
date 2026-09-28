@@ -7344,6 +7344,24 @@ def _cleanup_tunnel_device_codes() -> None:
         _tunnel_device_codes.pop(k, None)
 
 
+def _sanitize_tunnel_hostname(raw: "str | None") -> str:
+    """Conservative charset for a client-supplied hostname (e37187f3).
+
+    Used to scope the tunnel-cli token label per-host — see
+    ``tunnel_connect_authorize`` — and this value also round-trips through
+    ``tunnel_connect_page``'s inline JS (interpolated into a single-quoted
+    JS string literal) before coming back here, so it's sanitized on BOTH
+    the way out and the way back in. Keeps only characters a real hostname
+    plausibly contains (alnum, dot, dash, underscore); everything else is
+    dropped rather than escaped, and the result is capped well under the
+    DB column's practical size.
+    """
+    if not raw:
+        return ""
+    import re as _re
+    return _re.sub(r"[^A-Za-z0-9._-]", "", raw)[:200]
+
+
 @app.get("/auth/tunnel-connect", response_class=HTMLResponse)
 async def tunnel_connect_page(request: Request) -> Any:
     """Device-code page for `meridian --tunnel` browser auth.
@@ -7357,6 +7375,11 @@ async def tunnel_connect_page(request: Request) -> Any:
     device_code = request.query_params.get("device_code", "").strip()
     if not device_code:
         raise HTTPException(status_code=400, detail="device_code required")
+    # e37187f3 — the connecting machine's hostname, so the token minted below
+    # can be scoped per-host instead of per-tenant (see tunnel_connect_authorize).
+    # Sanitized to a conservative charset since it round-trips through this
+    # HTML page's inline JS before being POSTed back.
+    hostname = _sanitize_tunnel_hostname(request.query_params.get("hostname", ""))
 
     tenant = None
     try:
@@ -7367,6 +7390,8 @@ async def tunnel_connect_page(request: Request) -> Any:
     if tenant is None:
         from urllib.parse import quote as _q
         next_path = f"/auth/tunnel-connect?device_code={_q(device_code, safe='')}"
+        if hostname:
+            next_path += f"&hostname={_q(hostname, safe='')}"
         return RedirectResponse(url=f"/auth/login?next={_q(next_path, safe='/')}", status_code=302)
 
     email = tenant.get("email", "")
@@ -7409,7 +7434,7 @@ async def tunnel_connect_page(request: Request) -> Any:
         const r = await fetch('/auth/tunnel-connect', {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{device_code: '{device_code}'}})
+          body: JSON.stringify({{device_code: '{device_code}', hostname: '{hostname}'}})
         }});
         if (r.ok) {{
           btn.style.display = 'none';
@@ -7455,10 +7480,21 @@ async def tunnel_connect_authorize(request: Request) -> dict[str, Any]:
     if device_code in _tunnel_device_codes:
         return {"status": "ok"}  # idempotent
 
-    # One active tunnel-cli token per tenant (overwrites any previous one).
+    # e37187f3 — one active tunnel-cli token per (tenant, host) rather than
+    # per tenant. Before this fix every machine shared the single label
+    # "tunnel-cli", so delete_api_tokens_by_label's "label is a unique slot"
+    # invariant (0e9bb6ef) meant installing on a SECOND machine deleted the
+    # FIRST machine's still-in-use token — the two machines fought over one
+    # credential. Scoping the label by hostname makes each machine's token a
+    # genuinely separate slot; an older client that doesn't send a hostname
+    # falls back to the original shared "tunnel-cli" label (unchanged,
+    # still single-machine, behavior for it — no regression, no forced
+    # upgrade).
+    hostname = _sanitize_tunnel_hostname(body.get("hostname"))
+    label = f"tunnel-cli:{hostname}" if hostname else "tunnel-cli"
     db = request.app.state.db
-    await db_module.delete_api_tokens_by_label(db, tenant["id"], "tunnel-cli")
-    raw_token, _ = await db_module.create_api_token(db, tenant["id"], label="tunnel-cli")
+    await db_module.delete_api_tokens_by_label(db, tenant["id"], label)
+    raw_token, _ = await db_module.create_api_token(db, tenant["id"], label=label)
 
     _tunnel_device_codes[device_code] = (raw_token, _tc_time.time() + _TUNNEL_DEVICE_CODE_TTL)
     return {"status": "ok"}
