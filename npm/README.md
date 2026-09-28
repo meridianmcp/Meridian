@@ -5,11 +5,16 @@
 
 # Meridian
 
-**Claude Code has no memory between sessions. Meridian fixes that.**
+**Shared, structured project state for long-running AI coding work.**
 
-Open-source MCP server for persistent AI session memory — shared task log,
+Source-available MCP server for persistent project state — shared task log,
 pinned decisions, human-in-the-loop queue, and tiered handoffs. Works with
 Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
+
+Built-in agent memory (for example Claude Code's `CLAUDE.md` files and auto memory)
+keeps notes as files for that agent. Meridian adds a shared, queryable project
+record that several sessions and different MCP clients can read and update. It
+works alongside built-in memory rather than replacing it.
 
 [![License: MSL-1.0](https://img.shields.io/badge/license-MSL--1.0-blue)](LICENSE)
 [![Tests](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml/badge.svg)](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml)
@@ -21,11 +26,11 @@ Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 
 Every AI coding session boots blind. You re-explain the architecture, re-describe
 the constraints, re-list what's been tried. When context fills up mid-task,
-everything is lost. This is context debt — and it compounds.
+detail is lost. This is context debt — and it compounds.
 
 Meridian gives your sessions shared memory. They see the same task log, the same
 pinned decisions, the same goal state. When context fills up, a new session resumes
-from a compressed handoff in seconds. No copy-paste, no re-explaining from scratch.
+from a compressed handoff. No copy-paste, no re-explaining from scratch.
 
 ---
 
@@ -145,8 +150,8 @@ Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) a
 - **Dashboard** at `http://localhost:7878` — sessions, tasks, sprint board,
   swimlane timeline, HITL queue, pinned decisions.
 - **MCP tools** — `start_session`, `log_task`, `claim_task`, `set_decision`,
-  `pin_decision`, `request_hitl`, `generate_handoff`, plus 10 more.
-- **Tiered handoffs** — L0/L1/L2 compression so a fresh session can resume in seconds.
+  `pin_decision`, `request_hitl`, `generate_handoff`, and more.
+- **Tiered handoffs** — L0/L1/L2 compression so a fresh session can pick up where the last one stopped.
 - **Webhook intake** — push events from LangGraph / Autogen / custom agents into the same dashboard.
 - **Works everywhere** — Claude Code, Claude Desktop, Cursor, Windsurf, LangGraph, custom.
 
