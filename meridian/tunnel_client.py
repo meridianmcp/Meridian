@@ -102,6 +102,24 @@ def _tunnel_connect_timeout() -> float:
 # clean 1012 exactly like a repeated real failure. Reused by all three
 # reconnect loops via _is_clean_server_close() below.
 _CLEAN_RECONNECT_CLOSE_CODES = frozenset({1012})
+# c7604ed7 — close codes the SERVER sends that mean "retrying with this same
+# credential/connection will never succeed" rather than a transient network
+# blip. Before this fix EVERY exception (including these) fell into the
+# generic backoff-and-retry branch below, so a revoked/mismatched token or a
+# tenant evicted by a second socket looped forever with no indication to the
+# user anything was actually, permanently wrong.
+#   4401 — invalid/expired/mismatched token (routes/tunnel.py's WS auth checks
+#          — tunnel_ws/_serve_tunnel_ws close with this on a bad credential).
+#   4403 — plan/entitlement rejection (e.g. "tunnel requires Pro plan").
+# Retrying either of these with the SAME token can never succeed — the server
+# has already told us why it rejected the credential.
+_AUTH_REJECTED_CLOSE_CODES = frozenset({4401, 4403})
+# 4000 — this tenant's socket was replaced by a newer connection (see
+# routes/tunnel.py's per-slot WS handlers / _serve_tunnel_ws). Usually a
+# harmless same-host restart that will reconnect and stay up; kept distinct
+# from the generic branch purely so the log message tells the user what's
+# actually happening instead of a bare "disconnected".
+_EVICTED_CLOSE_CODE = 4000
 # Crash isolation: how many times the watchdog relaunches a slot's proxy that
 # keeps exiting (e.g. ENOENT on a missing binary) before backing off to the
 # long-cooldown retry cadence below.
@@ -1840,6 +1858,66 @@ def _is_clean_server_close(exc: BaseException) -> bool:
     return code in _CLEAN_RECONNECT_CLOSE_CODES
 
 
+class TunnelAuthRejectedError(RuntimeError):
+    """Raised out of a reconnect loop when the server closes the socket with
+    an auth-rejection code (4401/4403 — see ``_AUTH_REJECTED_CLOSE_CODES``).
+
+    c7604ed7: every exception used to fall into the same generic
+    infinite-backoff retry branch, so a revoked/mismatched token looped
+    forever instead of ever surfacing. Retrying with the SAME rejected
+    credential can never succeed, so this is raised instead of swallowed.
+    It propagates through the owning ``asyncio.gather(*tasks)`` in
+    :func:`run_tunnel` (which only catches ``KeyboardInterrupt`` /
+    ``CancelledError`` around that call, deliberately NOT a bare
+    ``Exception``) so the whole tunnel process exits with a clear,
+    actionable message instead of quietly limping along on N-1 working
+    slots and one silently-dead one — every slot shares the same token, so
+    if the server rejected it, none of them can work either.
+    """
+
+
+def _close_code_of(exc: BaseException) -> "int | None":
+    """The numeric WS close code carried by *exc*, or ``None`` if *exc*
+    isn't a ``websockets`` ``ConnectionClosed`` (c7604ed7). Shared by the
+    reconnect loops' close-code branches so the auth-rejection /
+    eviction / clean-restart checks all agree on how to read the code.
+    """
+    import websockets.exceptions
+
+    if not isinstance(exc, websockets.exceptions.ConnectionClosed):
+        return None
+    rcvd = getattr(exc, "rcvd", None)
+    return rcvd.code if rcvd is not None else None
+
+
+def _invalidate_cached_token(base_url: str) -> None:
+    """Drop the cached tunnel token for *base_url* (c7604ed7).
+
+    Called when the server has just told us (via a 4401/4403 WS close) that
+    this exact token is rejected, so the NEXT ``meridian --tunnel`` run
+    doesn't read the same known-bad token back out of
+    ``~/.meridian/config.json`` and repeat the failure — it falls through to
+    the browser device-code flow instead. Best-effort: any I/O error is
+    swallowed, matching :func:`_read_cached_token`/:func:`_write_cached_token`'s
+    own fail-soft contract; worst case the user re-runs the device flow
+    manually the same way they would have anyway.
+    """
+    path = _config_path()
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entry = data.get("tunnel_token")
+        if not isinstance(entry, dict) or entry.get("base_url") != base_url:
+            return
+        data.pop("tunnel_token", None)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
 def _safe_disconnect_reason(exc: BaseException) -> str:
     """Stringify a reconnect-loop exception for a stderr print, with any
     embedded bearer token scrubbed first (ff9d2963).
@@ -2196,8 +2274,15 @@ async def _reconnect_loop_lazy(
     label: str,
     tool_prefix: str | None = None,
     known_repo_paths: "list[str] | None" = None,
+    base_url: str | None = None,
 ) -> None:
-    """Keep one lazy-spawn tunnel alive, reconnecting with exponential backoff."""
+    """Keep one lazy-spawn tunnel alive, reconnecting with exponential backoff.
+
+    c7604ed7 — *base_url* (when given) lets an auth-rejection close code
+    (4401/4403) invalidate the cached token for that server before this
+    raises :class:`TunnelAuthRejectedError`; see that class's docstring for
+    why raising (rather than retrying forever) is correct here.
+    """
     backoff = 1.0
     while True:
         try:
@@ -2210,7 +2295,35 @@ async def _reconnect_loop_lazy(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if _is_clean_server_close(exc):
+            _code = _close_code_of(exc)
+            if _code in _AUTH_REJECTED_CLOSE_CODES:
+                # c7604ed7 — retrying with this same rejected credential can
+                # never succeed; surface it instead of looping forever.
+                if base_url:
+                    _invalidate_cached_token(base_url)
+                print(
+                    f"tunnel:{label}: credential rejected by server "
+                    f"(close code {_code}); this will not succeed on retry. "
+                    f"Run `meridian --tunnel` again to re-authenticate.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise TunnelAuthRejectedError(
+                    f"{label}: server rejected credential (close code {_code})"
+                ) from exc
+            if _code == _EVICTED_CLOSE_CODE:
+                # c7604ed7 — usually a harmless same-host restart; back off
+                # normally (below) but say clearly what happened rather than
+                # a bare "disconnected".
+                print(
+                    f"tunnel:{label}: connection replaced by a newer one "
+                    f"(close code {_code}) — if that wasn't you, another "
+                    f"machine or process may be using this tenant's tunnel; "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif _is_clean_server_close(exc):
                 # 13161001 — server-initiated clean close (e.g. 1012 service
                 # restart) is not a failure signal: reset backoff the same as
                 # a successful connection instead of climbing it, mirroring
@@ -2386,8 +2499,14 @@ async def _reconnect_loop_extract_pool(
     default_repo_path: str,
     label: str = "extract",
     tool_prefix: str | None = None,
+    base_url: str | None = None,
 ) -> None:
-    """Keep the pooled code-extractor tunnel alive, reconnecting with backoff."""
+    """Keep the pooled code-extractor tunnel alive, reconnecting with backoff.
+
+    c7604ed7 — see :func:`_reconnect_loop_lazy`'s docstring: *base_url* lets
+    an auth-rejection close code invalidate the cached token before this
+    raises :class:`TunnelAuthRejectedError` instead of retrying forever.
+    """
     backoff = 1.0
     while True:
         try:
@@ -2398,7 +2517,31 @@ async def _reconnect_loop_extract_pool(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if _is_clean_server_close(exc):
+            _code = _close_code_of(exc)
+            if _code in _AUTH_REJECTED_CLOSE_CODES:
+                # c7604ed7 — see _reconnect_loop_lazy.
+                if base_url:
+                    _invalidate_cached_token(base_url)
+                print(
+                    f"tunnel:{label}: credential rejected by server "
+                    f"(close code {_code}); this will not succeed on retry. "
+                    f"Run `meridian --tunnel` again to re-authenticate.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise TunnelAuthRejectedError(
+                    f"{label}: server rejected credential (close code {_code})"
+                ) from exc
+            if _code == _EVICTED_CLOSE_CODE:
+                print(
+                    f"tunnel:{label}: connection replaced by a newer one "
+                    f"(close code {_code}) — if that wasn't you, another "
+                    f"machine or process may be using this tenant's tunnel; "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif _is_clean_server_close(exc):
                 # 13161001 — see _reconnect_loop_lazy: a clean server-initiated
                 # close (e.g. 1012 service restart) resets backoff instead of
                 # climbing it, mirroring _proc_watchdog's healthy-tick reset.
@@ -4552,7 +4695,17 @@ def _read_cached_token(base_url: str) -> str | None:
 
 
 def _write_cached_token(base_url: str, token: str) -> None:
-    """Persist *token* to ``~/.meridian/config.json`` with a 30-day expiry."""
+    """Persist *token* to ``~/.meridian/config.json`` with a 90-day expiry.
+
+    c7604ed7 — was 30 days, which meant the CLIENT would silently treat a
+    still-server-valid token as expired and force a needless re-auth (or,
+    worse, in the other direction masked nothing but was simply wrong): the
+    device token this caches actually lives 90 days server-side
+    (``routes/oauth.py``'s ``_oauth_device``/RFC 8628 token grant, ``exp":
+    int(_tm.time() + 86400 * 90)``). Aligning the two means the local cache
+    expires the token at the same time the server would actually reject it,
+    not a third of the way through its real lifetime.
+    """
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {}
@@ -4564,7 +4717,7 @@ def _write_cached_token(base_url: str, token: str) -> None:
     data["tunnel_token"] = {
         "token": token,
         "base_url": base_url,
-        "expires_at": int(time.time()) + 30 * 24 * 3600,
+        "expires_at": int(time.time()) + 90 * 24 * 3600,
     }
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -4581,12 +4734,25 @@ async def _browser_auth_flow(base_url: str) -> str:
     Returns the raw API token on success, or an empty string on failure/cancel.
     The token is never written to shell history or passed via the process list —
     it lives only in memory until the caller caches it to disk.
+
+    e37187f3 — this machine's hostname is passed through so the server mints
+    a per-host tunnel-cli token (see ``server.py``'s ``tunnel_connect_page``/
+    ``tunnel_connect_authorize``) instead of the old shared per-tenant one
+    that a second machine's install would silently revoke.
     """
     import uuid as _uuid
     import webbrowser
+    from urllib.parse import quote as _quote
 
     device_code = str(_uuid.uuid4())
+    try:
+        import socket as _socket
+        _hostname = _socket.gethostname() or ""
+    except Exception:  # noqa: BLE001
+        _hostname = ""
     connect_url = f"{base_url}/auth/tunnel-connect?device_code={device_code}"
+    if _hostname:
+        connect_url += f"&hostname={_quote(_hostname, safe='')}"
     poll_url = f"{base_url}/auth/tunnel-poll"
 
     print("", flush=True)
@@ -4624,6 +4790,25 @@ async def _browser_auth_flow(base_url: str) -> str:
     return ""
 
 
+def _local_host_id() -> str:
+    """This machine's self-reported host id for the tunnel WS ``?host=``
+    query param (e37187f3) — lets the server tell "this same machine
+    reconnected" apart from "a different machine connected", so it only
+    evicts a genuine same-host stale socket instead of any prior connection
+    for the tenant (see routes/tunnel.py's ``_register_tunnel_socket_multi_host``).
+    Reuses ``socket.gethostname()``, the same identifier the codebase already
+    sends as ``X-Meridian-Hostname`` for per-machine tunnel-plugin config
+    (8660d701). Best-effort: an empty/failed lookup just means the server
+    buckets this connection under its shared "unknown" host — the original
+    (pre-fix) mutual-eviction behavior — never a hard failure.
+    """
+    try:
+        import socket as _socket
+        return _socket.gethostname() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
     """Build the tunnel WebSocket URL with the token as a query param.
 
@@ -4636,6 +4821,10 @@ def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
     only ``websockets>=12.0``, open-ended). Any code that stringifies a
     connection exception built from this URL (e.g. reconnect-loop logging)
     MUST redact it first — see :func:`_safe_disconnect_reason`.
+
+    e37187f3 — also carries ``&host=`` (this machine's hostname) so the
+    server can register this connection per-host instead of evicting
+    whatever else is connected for this tenant.
     """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
@@ -4645,7 +4834,11 @@ def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    return f"{ws_base}/tunnel/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel/{tenant_id}?token={quote(token, safe='')}"
+    _host = _local_host_id()
+    if _host:
+        url += f"&host={quote(_host, safe='')}"
+    return url
 
 
 def _permanent_url(base_url: str, tenant_id: str) -> str:
@@ -4665,7 +4858,10 @@ def _sse_url(base_url: str, tenant_id: str) -> str:
 
 
 def _ws_code_url(base_url: str, tenant_id: str, token: str) -> str:
-    """Build the codebase-memory-mcp tunnel WebSocket URL."""
+    """Build the codebase-memory-mcp tunnel WebSocket URL.
+
+    e37187f3 — carries ``&host=``; see :func:`_ws_url`.
+    """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[len("https://"):]
@@ -4674,7 +4870,11 @@ def _ws_code_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    return f"{ws_base}/tunnel-code/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-code/{tenant_id}?token={quote(token, safe='')}"
+    _host = _local_host_id()
+    if _host:
+        url += f"&host={quote(_host, safe='')}"
+    return url
 
 
 def _permanent_code_url(base_url: str, tenant_id: str) -> str:
@@ -4683,7 +4883,10 @@ def _permanent_code_url(base_url: str, tenant_id: str) -> str:
 
 
 def _ws_extract_url(base_url: str, tenant_id: str, token: str) -> str:
-    """Build the mcp-server-code-extractor tunnel WebSocket URL."""
+    """Build the mcp-server-code-extractor tunnel WebSocket URL.
+
+    e37187f3 — carries ``&host=``; see :func:`_ws_url`.
+    """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[len("https://"):]
@@ -4692,7 +4895,11 @@ def _ws_extract_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    return f"{ws_base}/tunnel-extract/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-extract/{tenant_id}?token={quote(token, safe='')}"
+    _host = _local_host_id()
+    if _host:
+        url += f"&host={quote(_host, safe='')}"
+    return url
 
 
 def _permanent_extract_url(base_url: str, tenant_id: str) -> str:
@@ -4717,7 +4924,11 @@ def _meridian_server_url(base_url: str) -> str:
 
 
 def _ws_office_url(base_url: str, tenant_id: str, token: str, slot: str) -> str:
-    """Build the WebSocket URL for an Office tunnel slot (ppt/word)."""
+    """Build the WebSocket URL for an Office-family tunnel slot (ppt/word/
+    dc/docs/zotero/outputs/debug — all served by ``_serve_tunnel_ws``).
+
+    e37187f3 — carries ``&host=``; see :func:`_ws_url`.
+    """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[len("https://"):]
@@ -4726,7 +4937,11 @@ def _ws_office_url(base_url: str, tenant_id: str, token: str, slot: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    return f"{ws_base}/tunnel-{slot}/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-{slot}/{tenant_id}?token={quote(token, safe='')}"
+    _host = _local_host_id()
+    if _host:
+        url += f"&host={quote(_host, safe='')}"
+    return url
 
 
 def _permanent_office_url(base_url: str, tenant_id: str, slot: str) -> str:
@@ -6541,9 +6756,15 @@ async def _run_connection(
 # ---------------------------------------------------------------------------
 
 async def _reconnect_loop(
-    ws_url: str, port: int, label: str, tool_prefix: str | None = None
+    ws_url: str, port: int, label: str, tool_prefix: str | None = None,
+    base_url: str | None = None,
 ) -> None:
-    """Keep one tunnel alive, reconnecting with exponential backoff."""
+    """Keep one tunnel alive, reconnecting with exponential backoff.
+
+    c7604ed7 — see :func:`_reconnect_loop_lazy`'s docstring: *base_url* lets
+    an auth-rejection close code invalidate the cached token before this
+    raises :class:`TunnelAuthRejectedError` instead of retrying forever.
+    """
     backoff = 1.0
     while True:
         try:
@@ -6552,7 +6773,31 @@ async def _reconnect_loop(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if _is_clean_server_close(exc):
+            _code = _close_code_of(exc)
+            if _code in _AUTH_REJECTED_CLOSE_CODES:
+                # c7604ed7 — see _reconnect_loop_lazy.
+                if base_url:
+                    _invalidate_cached_token(base_url)
+                print(
+                    f"tunnel:{label}: credential rejected by server "
+                    f"(close code {_code}); this will not succeed on retry. "
+                    f"Run `meridian --tunnel` again to re-authenticate.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise TunnelAuthRejectedError(
+                    f"{label}: server rejected credential (close code {_code})"
+                ) from exc
+            if _code == _EVICTED_CLOSE_CODE:
+                print(
+                    f"tunnel:{label}: connection replaced by a newer one "
+                    f"(close code {_code}) — if that wasn't you, another "
+                    f"machine or process may be using this tenant's tunnel; "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif _is_clean_server_close(exc):
                 # 13161001 — see _reconnect_loop_lazy: a clean server-initiated
                 # close (e.g. 1012 service restart) resets backoff instead of
                 # climbing it, mirroring _proc_watchdog's healthy-tick reset.
@@ -6833,6 +7078,23 @@ def _tunnel_mcp_entries(
     (start_session, get_sprint_items, generate_handoff, …) even though the three
     tool-slot connectors are present.
 
+    5fe96405 — the three slot entries (fs/code/extract) now carry the SAME
+    ``Authorization: Bearer <token>`` header as the ``meridian`` entry above
+    when *token* is provided. Before this fix these entries had no credential
+    at all: the slot routes (``_authorize_tunnel_proxy_caller`` in
+    routes/tunnel.py) started hard-requiring a matching tenant credential
+    (4cbb1cea) and every generated slot entry 401'd immediately —
+    "invalid or mismatched tenant credential" — regardless of whether the
+    caller had a valid token, because none was ever attached. Adding the
+    header here (rather than dropping the per-slot entries in favour of the
+    tools that ``/mcp`` now aggregates) is the smaller, additive fix: it
+    mirrors the already-working ``meridian`` entry exactly, and a client that
+    still wants a direct per-slot connector (bypassing the aggregated-tools
+    routing) keeps working. See ``_authorize_tunnel_proxy_caller``'s
+    WWW-Authenticate header (same commit) for the discovery-side half of this
+    fix, kept for any OAuth-capable client that still hits a slot URL with no
+    credential at all.
+
     Collision handling and legacy-key migration happen in
     :func:`_inject_mcp_entries`, which sees the existing config; this function is
     a pure name→url map and stays trivially unit-testable.
@@ -6841,17 +7103,22 @@ def _tunnel_mcp_entries(
     # bf31787c — the main Meridian server entry MUST come first so it is the
     # first thing an agent sees in the merged mcpServers dict. The three slot
     # connectors follow.
+    _auth_headers = {"Authorization": f"Bearer {token}"} if token else None
     if token:
         entries["meridian"] = {
             "type": "http",
             "url": _meridian_server_url(base_url),
-            "headers": {"Authorization": f"Bearer {token}"},
+            "headers": _auth_headers,
         }
-    entries.update({
-        _TUNNEL_MCP_SLOT_NAMES["fs"]: {"type": "http", "url": _permanent_url(base_url, tenant_id)},
-        _TUNNEL_MCP_SLOT_NAMES["code"]: {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
-        _TUNNEL_MCP_SLOT_NAMES["extract"]: {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
-    })
+    for _slot_key, _slot_url in (
+        ("fs", _permanent_url(base_url, tenant_id)),
+        ("code", _permanent_code_url(base_url, tenant_id)),
+        ("extract", _permanent_extract_url(base_url, tenant_id)),
+    ):
+        _entry: dict[str, Any] = {"type": "http", "url": _slot_url}
+        if _auth_headers:
+            _entry["headers"] = dict(_auth_headers)
+        entries[_TUNNEL_MCP_SLOT_NAMES[_slot_key]] = _entry
     for cp in custom or []:
         name = cp.get("name")
         port = cp.get("port")
@@ -7789,6 +8056,7 @@ async def run_tunnel(
                 ws_fs, proxy_fs, "fs",
                 tool_prefix=slot_prefixes.get("fs"),
                 known_repo_paths=known_repo_paths,
+                base_url=base_url,
             )
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_fs)))
@@ -7799,13 +8067,13 @@ async def run_tunnel(
         tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_fs)))
     if proxy_code is not None:
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_lazy(ws_code, proxy_code, "code", tool_prefix=slot_prefixes.get("code"))
+            _reconnect_loop_lazy(ws_code, proxy_code, "code", tool_prefix=slot_prefixes.get("code"), base_url=base_url)
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_code)))
         tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_code)))
     if proxy_extract is not None:
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_lazy(ws_extract, proxy_extract, "extract", tool_prefix=slot_prefixes.get("extract"))
+            _reconnect_loop_lazy(ws_extract, proxy_extract, "extract", tool_prefix=slot_prefixes.get("extract"), base_url=base_url)
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_extract)))
         tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_extract)))
@@ -7818,13 +8086,14 @@ async def run_tunnel(
                 # which is the CLI repo_path unless a dashboard config overrode it).
                 ws_extract, serena_pool, serena_repo_path, "extract",
                 tool_prefix=slot_prefixes.get("extract"),
+                base_url=base_url,
             )
         ))
         tasks.append(asyncio.ensure_future(_pool_idle_reaper(serena_pool)))
     for slot, oproxy in office_proxies.items():
         ws_office = _ws_office_url(base_url, tenant_id, token, slot)
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_lazy(ws_office, oproxy, slot, tool_prefix=slot_prefixes.get(slot))
+            _reconnect_loop_lazy(ws_office, oproxy, slot, tool_prefix=slot_prefixes.get(slot), base_url=base_url)
         ))
         # 4ea1b9d5 — persistent slots keep their inner process alive; don't
         # attach the idle-killer that would reset their session after 30min.
@@ -7868,6 +8137,17 @@ async def run_tunnel(
 
     try:
         await asyncio.gather(*tasks)
+    except TunnelAuthRejectedError as exc:
+        # c7604ed7 — a reconnect loop already invalidated the cached token
+        # and printed the per-slot reason; every OTHER slot shares this same
+        # rejected credential, so there's nothing to gain from letting them
+        # keep retrying — stop the whole tunnel with a clear, actionable exit
+        # rather than limping along on partially-dead slots.
+        print(f"\ntunnel: stopping — {exc}", file=sys.stderr, flush=True)
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        return 2
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\ntunnel: shutting down", flush=True)
         return 0

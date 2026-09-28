@@ -182,6 +182,88 @@ _tunnel_outputs_sockets: dict[str, WebSocket] = {}
 # 121e6a27 — mcp-debugger slot (7-language DAP debugger via @debugmcp/mcp-debugger).
 _tunnel_debug_sockets: dict[str, WebSocket] = {}
 
+# e37187f3 — per-host coexistence bookkeeping: (tenant_id, slot_label) ->
+# {host_id: WebSocket}. Keyed by (tenant_id, slot_label) rather than bare
+# tenant_id because _serve_tunnel_ws below is ONE function shared by 7
+# different slots (ppt/word/dc/docs/zotero/outputs/debug), each with its own
+# separate `sockets` dict — the SAME host legitimately holds one live
+# connection per slot at once (e.g. both its ppt and word sockets), and
+# those must not be mistaken for each other's "same host reconnecting".
+# Purely ADDITIVE alongside the single-socket-per-tenant registries above
+# (_tunnel_sockets &c. stay the "active routing target" that every existing
+# proxy/dispatch call site already reads via plain `sockets[tenant_id]` —
+# unchanged). This lets a genuinely DIFFERENT host's still-open connection
+# survive a new connection from ANOTHER host, instead of being forcibly
+# closed the way the pre-fix code closed ANY existing socket for the tenant
+# regardless of which machine it belonged to (the two-machines-evict-each-
+# other bug). A same-host reconnect (the legitimate "local binary restarted"
+# case the original code comment described) still evicts its own prior
+# connection exactly as before. See _register_tunnel_socket_multi_host /
+# _unregister_tunnel_socket_multi_host below, used by every WS handler in
+# this module. Full multi-host REQUEST ROUTING (choosing which specific
+# connected host serves a given proxied call when 2+ are up) is explicitly
+# NOT built by this — the active-routing pointer just follows whichever
+# host connected most recently, same single-target semantics every
+# existing caller already assumes. A real per-request host selector is a
+# natural follow-up but a much bigger, separate change (it would need the
+# HTTP proxy routes themselves to carry a host selector, e.g. ?host=).
+_tunnel_sockets_by_host: dict[tuple[str, str], dict[str, WebSocket]] = {}
+
+
+def _tunnel_ws_host_id(ws: "WebSocket") -> str:
+    """The connecting client's self-reported host id (``?host=``), or a
+    shared ``"unknown"`` bucket for older clients that don't send one
+    (e37187f3). Clients sharing the "unknown" bucket keep the exact legacy
+    mutual-eviction behavior — we can't tell them apart, so we can't safely
+    let them coexist either.
+    """
+    try:
+        return (ws.query_params.get("host") or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _register_tunnel_socket_multi_host(
+    tenant_id: str, slot_label: str, host_id: str, ws: "WebSocket",
+    sockets: dict[str, WebSocket],
+) -> "WebSocket | None":
+    """Register *ws* as *tenant_id*'s active socket in *sockets* (unchanged
+    routing semantics for every existing caller), while only flagging for
+    eviction a PRIOR connection from the SAME (*slot_label*, *host_id*) —
+    a genuine same-machine reconnect on this same slot (e.g. the local
+    binary restarted). A different host's live socket — or this SAME host's
+    socket on a DIFFERENT slot — is left completely alone: registering this
+    new connection does not close it. Returns the same-slot-same-host socket
+    the caller should close (or ``None`` if there wasn't one / it's this
+    same object).
+    """
+    by_host = _tunnel_sockets_by_host.setdefault((tenant_id, slot_label), {})
+    same_host_old = by_host.get(host_id)
+    by_host[host_id] = ws
+    sockets[tenant_id] = ws
+    return same_host_old if same_host_old is not ws else None
+
+
+def _unregister_tunnel_socket_multi_host(
+    tenant_id: str, slot_label: str, host_id: str, ws: "WebSocket",
+    sockets: dict[str, WebSocket],
+) -> None:
+    """Clean up *ws* from both registries on disconnect (e37187f3).
+
+    Only clears the shared ACTIVE routing pointer (``sockets[tenant_id]``)
+    if it still points at THIS socket — a different host may since have
+    taken over as active on this slot while this connection was still open,
+    and this (now-closing) connection must not clobber that.
+    """
+    by_host = _tunnel_sockets_by_host.get((tenant_id, slot_label))
+    if by_host is not None and by_host.get(host_id) is ws:
+        by_host.pop(host_id, None)
+        if not by_host:
+            _tunnel_sockets_by_host.pop((tenant_id, slot_label), None)
+    if sockets.get(tenant_id) is ws:
+        sockets.pop(tenant_id, None)
+
+
 # 4d9ad87b — active repo per tenant, updated whenever set_active_repo is called.
 # Enables call_tunnel_tool to inject X-Meridian-Repo-Path so the SerenaDaemonPool
 # routes each tools/call to the correct per-repo daemon without a set_active_repo
@@ -766,15 +848,17 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
     _log_ws_legacy_auth("fs", tenant_id, used_query_fallback)
 
-    # Evict any stale socket for this tenant (e.g. binary restarted)
-    old_ws = _tunnel_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket (e.g. binary restarted
+    # on this machine); a different host's live connection is left running.
+    # See _register_tunnel_socket_multi_host's docstring.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "fs", host_id, ws, _tunnel_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "fs")
     _invalidate_tunnel_manifest(tenant_id)  # 4331f9cd / 49d8244d — reconnect: rebuild tool routes
     # af5b5739 — record THIS Fly instance as the socket owner so a request that
@@ -838,7 +922,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_sockets.pop(tenant_id, None)
+        # e37187f3 — only clears the active-routing pointer if it's still
+        # THIS socket; a different host may have taken over in the meantime.
+        _unregister_tunnel_socket_multi_host(tenant_id, "fs", host_id, ws, _tunnel_sockets)
         _clear_tunnel_mcp_session(tenant_id, "fs", socket=ws)
         _clear_slot_health(tenant_id, "fs")
         # af5b5739 — forget our ownership claim only if it's still ours (a newer
@@ -890,14 +976,15 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = _tunnel_code_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "code", host_id, ws, _tunnel_code_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_code_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "code")
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that misses can Fly-replay to us (no-op off Fly). af5b5739 wired
@@ -942,7 +1029,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel-code: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_code_sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, "code", host_id, ws, _tunnel_code_sockets)
         _clear_tunnel_mcp_session(tenant_id, "code", socket=ws)
         _clear_slot_health(tenant_id, "code")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
@@ -981,14 +1068,15 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = _tunnel_extract_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "extract", host_id, ws, _tunnel_extract_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_extract_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "extract")
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that misses an extract request can Fly-replay to us (no-op off
@@ -1033,7 +1121,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel-extract: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_extract_sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, "extract", host_id, ws, _tunnel_extract_sockets)
         _clear_tunnel_mcp_session(tenant_id, "extract", socket=ws)
         _clear_slot_health(tenant_id, "extract")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
@@ -1081,14 +1169,15 @@ async def _serve_tunnel_ws(
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, label, host_id, ws, sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, label)
     # 4331f9cd / 49d8244d — a (re)connect may change the slot's tool set; drop the
     # cached routes (+ manifest timestamp, atomically) so the next tools/list
@@ -1141,7 +1230,7 @@ async def _serve_tunnel_ws(
     except Exception as exc:
         _log.debug("tunnel-%s: tenant %s disconnected: %s", label, tenant_id[:8], exc)
     finally:
-        sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, label, host_id, ws, sockets)
         _clear_tunnel_mcp_session(tenant_id, label, socket=ws)
         _clear_slot_health(tenant_id, label)
         # 4331f9cd / 49d8244d — slot dropped; if no tunnel remains, drop cached
@@ -1413,13 +1502,32 @@ async def _authorize_tunnel_proxy_caller(tenant_id: str, request: "Request") -> 
 
     Returns an error ``Response`` (401) when the caller does not own
     ``tenant_id``, or ``None`` when verified and proxying may proceed.
+
+    5fe96405 — this 401 used to carry no ``WWW-Authenticate`` header at all,
+    so an OAuth-capable MCP client hitting a slot URL with no (or a stale)
+    credential had no standard way to discover where to authenticate — it
+    just saw a bare 401 with no next step. Mirrors the header shape
+    ``server.py``'s own ``/mcp`` auth-failure path already sends (same
+    ``resource_metadata`` well-known URL), so both entry points give a
+    client the same discovery hint. The primary fix for the reported 401s is
+    ``_tunnel_mcp_entries`` now attaching the bearer token directly (see its
+    docstring) — this header is the belt-and-suspenders half for a caller
+    that reaches this route without one.
     """
     tenant = await _get_tenant_from_request(request)
     if tenant is None or tenant.get("id") != tenant_id:
+        _base = str(request.base_url).rstrip("/")
         return Response(
             content='{"error":"invalid or mismatched tenant credential"}',
             status_code=401,
             media_type="application/json",
+            headers={
+                "WWW-Authenticate": (
+                    f'Bearer realm="MCP",'
+                    f' error="invalid_token",'
+                    f' resource_metadata="{_base}/.well-known/oauth-protected-resource"'
+                ),
+            },
         )
     return None
 
