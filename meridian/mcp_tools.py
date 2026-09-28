@@ -3544,6 +3544,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "type": {"type": "string", "enum": ["code", "repo"], "description": "Which keyless GitHub endpoint to search (default 'code')."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance; 'date' = most recently indexed/updated first)."}},
          "required": ["query"]}},
+    {"name": "zotero_search", "description":
+        "Search a Zotero library — sibling to paper_search/social_search/github_search, "
+        "but over YOUR OWN saved references rather than a public corpus. A public "
+        "GROUP library needs no credential; a private USER library needs a Zotero API "
+        "key (pass api_key, or set the ZOTERO_API_KEY env var server-side — Meridian "
+        "has no per-tenant bring-your-own-key storage yet, so this is config, not a "
+        "per-call secret). Returns {query, count, results:[{title, authors, summary, "
+        "published, url, zotero_key, item_type, tags, ...}]}.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "Search terms (matches title/creator/year by default, or full text — see qmode)."},
+         "library_type": {"type": "string", "enum": ["user", "group"], "description": "'user' (default; a personal library) or 'group' (a shared, possibly-public library)."},
+         "library_id": {"type": "string", "description": "The numeric Zotero userID or groupID to search. Required."},
+         "api_key": {"type": "string", "description": "Optional Zotero API key for a private library; falls back to the ZOTERO_API_KEY env var, then to no auth (fine for a public group library)."},
+         "limit": {"type": "integer", "description": "Max results to return (default 10, max 50)."},
+         "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance = Zotero's own ordering; 'date' = most recently added first)."}},
+         "required": ["query", "library_id"]}},
     {"name": "start_research_run", "description":
         "a5343387 — start a bounded, ephemeral research/scratch run: an ADJACENT "
         "primitive for disposable subagent probes that should not need a formal "
@@ -4572,7 +4588,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
-    "paper_search", "social_search", "github_search",
+    "paper_search", "social_search", "github_search", "zotero_search",
     "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "get_external_job", "list_external_jobs",
@@ -4627,7 +4643,7 @@ _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete
 # read-only set: a GitHub/paper/social search can be read-only for Meridian
 # while still operating in an external open world.
 _OPEN_WORLD_TOOLS = {
-    "paper_search", "social_search", "github_search", "run_watchlist_query",
+    "paper_search", "social_search", "github_search", "zotero_search", "run_watchlist_query",
     # R2-G — the only step of this tool that isn't a local DB read/write is
     # the actual OTLP HTTP POST to an operator-configured external endpoint.
     "export_ai_log_otel",
@@ -4928,6 +4944,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "paper_search": "research",
     "social_search": "research",
     "github_search": "research",
+    "zotero_search": "research",
     "save_watchlist_query": "research",
     "list_watchlist_queries": "research",
     "run_watchlist_query": "research",
@@ -5074,6 +5091,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "paper_search":              "planner",
     "social_search":             "planner",
     "github_search":             "planner",
+    "zotero_search":             "planner",
     "save_watchlist_query":      "planner",
     "list_watchlist_queries":    "planner",
     "run_watchlist_query":       "planner",
@@ -5353,6 +5371,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "paper_search":               "common-support",
     "social_search":              "common-support",
     "github_search":              "common-support",
+    "zotero_search":              "common-support",
     "save_watchlist_query":       "common-support",
     "list_watchlist_queries":     "common-support",
     "run_watchlist_query":        "common-support",

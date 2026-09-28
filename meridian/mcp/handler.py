@@ -4679,6 +4679,7 @@ async def _handle_session_tools(
         handle_search_synthesis,
         handle_paper_search,
         handle_social_search,
+        handle_zotero_search,
         handle_get_session_brief,
     )
     from .handlers.research_tools import (  # noqa: PLC0415
@@ -4738,6 +4739,7 @@ async def _handle_session_tools(
         "search_synthesis": handle_search_synthesis,
         "paper_search": handle_paper_search,
         "social_search": handle_social_search,
+        "zotero_search": handle_zotero_search,
         "github_search": handle_github_search,
         # a5343387 — bounded ephemeral research runs.
         "start_research_run": handle_start_research_run,
