@@ -915,11 +915,25 @@ class LocalRunner:
 
     def _prepare_log_path(self) -> Path:
         log_dir = _scope_log_dir(self._state_dir, self.scope)
+        state_dir_existed = self._state_dir.exists()
         log_dir.mkdir(parents=True, exist_ok=True)
         try:
             log_dir.chmod(0o700)
         except Exception:  # noqa: BLE001 -- best-effort, mirrors _atomic_write_json
             pass
+        if not state_dir_existed:
+            # mkdir(parents=True) above may have just created self._state_dir
+            # itself as an unhardened INTERMEDIATE directory (log_dir is
+            # state_dir/logs/scope) -- if this runs before _atomic_write_json
+            # ever saves a record (the only other place that hardens
+            # state_dir), state_dir would otherwise be left at default
+            # (world-readable) permissions forever, since _atomic_write_json
+            # only chmods on its OWN first creation and would see
+            # state_dir already existing by the time it runs.
+            try:
+                self._state_dir.chmod(0o700)
+            except Exception:  # noqa: BLE001
+                pass
         token = process_lifecycle.new_run_id()
         return log_dir / f"{token}.log"
 
