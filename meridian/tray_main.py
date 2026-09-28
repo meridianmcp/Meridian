@@ -226,6 +226,19 @@ def _run_tray() -> int:
         _show_error_dialog("Meridian failed to start", str(exc))
         return 1
 
+    # 4e4c3817 follow-up (owner feedback 2026-09-27): a bare tray icon gives
+    # zero visible feedback on launch -- a human who just double-clicked this
+    # (or hit it via Start Menu/startup) sees literally nothing happen, since
+    # a new tray icon is often auto-hidden into Windows' overflow chevron.
+    # Open the dashboard immediately so launching it always shows something,
+    # instead of requiring the tray icon to be found and clicked first. Runs
+    # on both the fresh-start and attach-to-existing paths above -- either
+    # way the server is confirmed healthy by the time we get here.
+    try:
+        webbrowser.open(_dashboard_url())
+    except Exception:  # noqa: BLE001 -- a browser-open failure must never stop the tray/server
+        pass
+
     icon_path = _icon_image_path()
     try:
         image = Image.open(icon_path)
