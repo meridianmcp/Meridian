@@ -168,13 +168,22 @@ jobs:
           echo "Demo: $STATUS"
           [ "$STATUS" = "200" ] || (echo "FAIL: /demo returned $STATUS" && exit 1)
 
-      - name: MCP tools/list responds
+      # ece2ac0a: this step used to list tools with an ANONYMOUS POST /mcp/sse,
+      # i.e. it exercised the anonymous-MCP leak. Anonymous MCP now 401s on the
+      # hosted service, so: check the tool registry through the public tool
+      # doc, and assert anonymous MCP is refused (guards the regression).
+      - name: MCP tools registered and anonymous MCP refused
         run: |
-          RESP=$(curl -s --max-time 15 -X POST https://meridian-preview.fly.dev/mcp/sse \
-            -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
-          echo "$RESP" | grep -q '"start_session"' || (echo "FAIL: MCP tools missing start_session" && exit 1)
-          echo "MCP tools OK"
+          BASE="https://meridian-preview.fly.dev"
+          RPC='{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+          curl -s --max-time 15 "$BASE/mcp/tools-doc" | grep -q 'start_session' \
+            || (echo "FAIL: /mcp/tools-doc missing start_session" && exit 1)
+          for EP in /mcp/sse /mcp; do
+            STATUS=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -X POST "$BASE$EP" -H 'Content-Type: application/json' -d "$RPC")
+            echo "anonymous POST $EP: $STATUS"
+            [ "$STATUS" = "401" ] || (echo "FAIL: anonymous POST $EP returned $STATUS, expected 401" && exit 1)
+          done
+          echo "MCP tools OK; anonymous MCP refused"
 
   # ─── 4. Merge dev → main on operator-gated promotion ──────────────────────
   merge-to-main:

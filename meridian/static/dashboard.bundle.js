@@ -17816,8 +17816,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       } catch (_2) {
       }
     }
-    _checkGitStatus();
-    setInterval(_checkGitStatus, 6e4);
+    if (!isHostedMode() && !isDemoMode()) {
+      _checkGitStatus();
+      setInterval(_checkGitStatus, 6e4);
+    }
     const workspaceEntry = document.getElementById("workspace-entry");
     if (workspaceEntry) {
       workspaceEntry.onclick = () => {

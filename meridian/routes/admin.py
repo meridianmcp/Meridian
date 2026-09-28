@@ -11,7 +11,7 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from .._deps import _db, _hosted_mode, _is_demo_request
+from .._deps import _db, _hosted_mode, _is_demo_request, _require_hosted_operator
 from .. import db as db_module
 
 router = APIRouter()
@@ -150,8 +150,12 @@ async def admin_stats_json(request: Request) -> dict[str, Any]:
 
 
 @router.get("/admin/git-status")
-async def git_status() -> dict[str, Any]:
-    """Check if local repo is behind/ahead of remote."""
+async def git_status(request: Request) -> dict[str, Any]:
+    """Check if local repo is behind/ahead of remote.
+
+    ece2ac0a — runs ``git fetch`` on the server; operator-only when hosted.
+    """
+    await _require_hosted_operator(request, require_admin_password=False)
     import subprocess as sp
     try:
         cwd = str(Path(__file__).parent.parent.parent)
@@ -191,12 +195,17 @@ async def git_status() -> dict[str, Any]:
 
 @router.post("/admin/shutdown")
 async def admin_shutdown(request: Request) -> Response:
-    """Gracefully stop the server process."""
+    """Gracefully stop the server process.
+
+    ece2ac0a — was callable by anyone on the hosted service. Hosted mode now
+    requires the operator (admin session + admin password).
+    """
     if _is_demo_request(request):
         return JSONResponse(
             {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
             status_code=403,
         )
+    await _require_hosted_operator(request)
 
     async def _delayed_shutdown() -> None:
         await asyncio.sleep(0.5)
@@ -213,12 +222,16 @@ async def admin_restart(request: Request) -> Response:
     Requires an explicit ``{"confirm": true}`` body — a restart kills every
     active session on the machine (a real hazard on shared Fly machines), so an
     unconfirmed call returns a warning instead of restarting.
+
+    ece2ac0a — hosted mode requires the operator (admin session + admin
+    password); previously anyone could restart the hosted server.
     """
     if _is_demo_request(request):
         return JSONResponse(
             {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
             status_code=403,
         )
+    await _require_hosted_operator(request)
 
     try:
         body = await request.json()
@@ -318,7 +331,11 @@ async def download_snapshot(request: Request) -> Response:
     db = await _db(request)
     db_url = os.environ.get("MERIDIAN_DB_URL")
 
-    if not db_url:
+    # ece2ac0a — the raw-file branch copies the WHOLE local SQLite file. That
+    # is the single user's own DB when self-hosted, but on the hosted service
+    # it would be the shared control-plane DB, so hosted callers always take
+    # the table-copy branch below, which reads only their own resolved DB.
+    if not db_url and not _hosted_mode():
         db_path = os.environ.get("MERIDIAN_DB", str(Path("data") / "meridian.db"))
         if db_path == ":memory:":
             raise HTTPException(400, "Cannot snapshot in-memory database")

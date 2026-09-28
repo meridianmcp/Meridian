@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .._deps import _db, _hosted_mode
+from .._deps import _hosted_mode, _require_hosted_operator, add_public_waitlist_entry
 from .. import db as db_module
 
 router = APIRouter()
@@ -38,9 +38,10 @@ async def join_waitlist(request: Request) -> dict[str, Any]:
         note_parts.append(body["note"].strip())
     note_parts.append(f"plan:{plan} source:{source}")
     note = " ".join(note_parts) if note_parts else None
-    db = await _db(request)
     try:
-        entry = await db_module.add_waitlist_entry(db, email, note)
+        # ece2ac0a — public form: write-only accessor into the control-plane
+        # DB (where /admin/waitlist reads it), never the tenant resolver _db().
+        entry = await add_public_waitlist_entry(request, email, note)
     except Exception as exc:
         if "UNIQUE" in str(exc) or "unique" in str(exc):
             raise HTTPException(status_code=409, detail="email already on waitlist")
@@ -57,7 +58,13 @@ async def join_waitlist(request: Request) -> dict[str, Any]:
 
 @router.get("/waitlist")
 async def list_waitlist(request: Request) -> list[dict[str, Any]]:
-    """GET all waitlist entries, newest first. Admin use only."""
+    """GET all waitlist entries, newest first. Admin use only.
+
+    ece2ac0a — this returned every waitlist email address to anyone. Hosted
+    mode now requires the operator (same bar as /admin/waitlist); self-hosted
+    is unchanged.
+    """
+    await _require_hosted_operator(request, require_admin_password=False)
     db = request.app.state.db
     return await db_module.get_waitlist(db)
 

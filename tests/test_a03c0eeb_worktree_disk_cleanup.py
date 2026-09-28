@@ -299,10 +299,32 @@ def test_delete_worktree_removes_from_disk_when_self_hosted(client, monkeypatch,
     assert calls[0][1] == ".claude/worktrees/disktest"
 
 
+def _hosted_admin_login(client, monkeypatch) -> None:
+    """ece2ac0a — hosted mode no longer serves anonymous callers from the
+    shared control-plane DB (``_db()`` now 401s), so a hosted-mode test must
+    authenticate. An ``admin``-plan tenant with no dedicated DB resolves to
+    that same in-memory control-plane DB, which keeps these tests hermetic.
+    """
+    import asyncio
+
+    from meridian import _deps
+    from meridian.hosted import _make_session_cookie
+
+    db = client.app.state.db
+    tenant = asyncio.run(db_module.upsert_tenant(db, "wt-hosted-admin@example.com"))
+    asyncio.run(db_module.update_tenant(db, tenant["id"], plan="admin"))
+    session = asyncio.run(
+        db_module.create_user_session(db, tenant["id"], "2099-01-01 00:00:00")
+    )
+    monkeypatch.setitem(_deps._tenant_db_cache, tenant["id"], db)
+    client.cookies.set("meridian_session", _make_session_cookie(session["id"]))
+
+
 def test_delete_worktree_skips_disk_removal_when_hosted(client, monkeypatch):
     import meridian.worktree_cleanup as wc_module
 
     monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    _hosted_admin_login(client, monkeypatch)
 
     calls = []
     monkeypatch.setattr(
@@ -375,6 +397,7 @@ def test_sweep_endpoint_reclaims_terminal_worktrees(client, monkeypatch, tmp_pat
 
 def test_sweep_endpoint_noop_when_hosted(client, monkeypatch):
     monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    _hosted_admin_login(client, monkeypatch)
     proj = client.post("/projects", json={"name": "wt-sweep-hosted-test"}).json()
     pid = proj["id"]
     r = client.post(f"/projects/{pid}/worktrees/sweep")
