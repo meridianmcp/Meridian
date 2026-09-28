@@ -132,7 +132,11 @@ def test_settings_code_intel_guard_superseded_and_companions_widened():
         (group,) = _group_for("PreToolUse", f"{name}.ps1")
         tools = group["matcher"].split("|")
         assert "Bash" in tools and "PowerShell" in tools, (name, group["matcher"])
-    assert _group_for("PreToolUse", "secret_guard.ps1")[0]["matcher"] == "Read|Bash|PowerShell|Grep|Glob"
+    # 93d1e8f9 (55d48d69 confirm pass): secret_guard's matcher was intentionally
+    # widened to include Write|Edit|MultiEdit -- without them, a real credential
+    # VALUE could be written straight into a sensitive file (e.g. meridian.toml)
+    # with zero interception, even though reading the same file was blocked.
+    assert _group_for("PreToolUse", "secret_guard.ps1")[0]["matcher"] == "Read|Bash|PowerShell|Grep|Glob|Write|Edit|MultiEdit"
 
 
 def test_settings_leaves_owner_switches_alone():

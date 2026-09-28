@@ -895,6 +895,52 @@ def test_hook_allows_harmless_bash_idioms(cmd):
 
 
 @_needs_bash
+def test_hook_blocks_powershell_get_content_of_dotenv():
+    """Baseline: a bare, unassigned Get-Content of a credential file must block
+    (this already passed before the assignment-prefix fix below)."""
+    payload = json.dumps({"tool_name": "PowerShell", "tool_input": {"command": "Get-Content ./secrets/.env.local"}})
+    r = _run_hook(payload)
+    assert r.returncode == 2, f"PowerShell Get-Content of .env.local must be blocked\nstderr: {r.stderr}"
+
+
+@_needs_bash
+@pytest.mark.parametrize("cmd", [
+    '$x = Get-Content ./secrets/.env.local',
+    '$x=Get-Content ./secrets/.env.local',
+    '$x= Get-Content ./secrets/.env.local',
+    '$x =Get-Content ./secrets/.env.local',
+    '$creds = cat .env',
+])
+def test_hook_blocks_powershell_assignment_wrapped_credential_read(cmd):
+    """55d48d69 confirm-pass finding: secret_guard.sh's is_sensitive_ps_cmd()
+    picked the reader verb as literally the first whitespace token, so
+    '$x = Get-Content ./secrets/.env.local' never matched -- '$x' isn't a
+    known reader verb, and 'Get-Content' was never inspected. secret_guard.ps1
+    was never affected: its regex already anchors a reader verb on '=' too
+    (see $PsDumpPatterns), not just on the start of a statement/pipeline
+    stage. This was a real, bash-shim-only bypass: the exact same command
+    without the '$x = ' prefix was already (and still is) blocked."""
+    payload = json.dumps({"tool_name": "PowerShell", "tool_input": {"command": cmd}})
+    r = _run_hook(payload)
+    assert r.returncode == 2, f"PowerShell {cmd!r} must be blocked\nstderr: {r.stderr}"
+
+
+@_needs_bash
+@pytest.mark.parametrize("cmd", [
+    '$x = Get-Content ./README.md',
+    '$path = "./secrets/.env.local"',
+    '$env:PATH = "C:\\tools"',
+])
+def test_hook_allows_powershell_assignment_of_non_credential_content(cmd):
+    """The assignment-prefix fix must not turn into an over-broad deny: an
+    ordinary file read, a plain string literal, or a normal env-var
+    assignment must all stay allowed."""
+    payload = json.dumps({"tool_name": "PowerShell", "tool_input": {"command": cmd}})
+    r = _run_hook(payload)
+    assert r.returncode == 0, f"PowerShell {cmd!r} must be allowed\nstderr: {r.stderr}"
+
+
+@_needs_bash
 def test_hook_blocks_grep_on_env_file():
     payload = json.dumps({"tool_name": "Grep", "tool_input": {"pattern": "KEY", "path": ".env"}})
     r = _run_hook(payload)

@@ -266,6 +266,21 @@ is_sensitive_ps_cmd() {
     local cmd="$1" st verb w first
     [ -z "$cmd" ] && return 1
     while IFS= read -r st; do
+        # 55d48d69 (confirm pass, secret_guard.sh-only gap): a leading simple
+        # variable assignment ('$x = Get-Content ...', '$x=Get-Content ...',
+        # '$x= Get-Content ...') hid the reader verb from the naive
+        # first-token check below -- '$x' became "verb" and 'Get-Content'
+        # was never inspected, even though secret_guard.ps1's own regex
+        # already treats '=' as a valid statement-start anchor (line 146ish,
+        # '(^|[;|&(=])'). Strip that prefix from the STATEMENT TEXT (not the
+        # token list) before tokenizing, so the reader verb after '=' is
+        # 'first' the same way it would be after ';'/'|'/'&'/'('. Only a
+        # plain '=' is handled (not '+=' etc.): the same narrower scope as
+        # this hook's other statement-anchored checks, not a full PowerShell
+        # parser (see the file header's documented residual-risk class).
+        if [[ $st =~ ^[[:space:]]*\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+            st="${BASH_REMATCH[1]}"
+        fi
         set -f; set -- $st; set +f
         [ $# -eq 0 ] && continue
         verb="$1"
