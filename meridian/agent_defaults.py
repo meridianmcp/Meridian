@@ -404,6 +404,11 @@ source FIRST — do not default to a generic web search:
 - **Academic / paper questions** — call the `paper_search` tool first (the paper-search
   MCP: a keyless arXiv/OpenAlex lookup, now in your tool list); fall back to web search
   only if it is unavailable. Cite the paper itself, not a secondary write-up.
+- **"Do we already have a source for this?" / citation-library questions** — call
+  `zotero_search` (library_id required; a public group library needs no key, a
+  private user library needs api_key or a server-side ZOTERO_API_KEY) BEFORE
+  paper_search when the user has a Zotero library — checking what's already saved
+  beats re-finding it from scratch.
 - **Social / discussion questions** (what are people saying about X, prior-art
   discussions, community sentiment) — call the `social_search` tool (keyless
   Hacker News search) before a generic web search.

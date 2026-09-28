@@ -257,6 +257,103 @@ def test_show_status_dialog_reads_runner_status_without_raising(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _run_tray -- auto-open the dashboard on launch (owner feedback 2026-09-27:
+# a bare tray icon gave zero visible feedback on launch). pystray/PIL are
+# faked via sys.modules, same technique the tkinter dialog tests above use --
+# never a real GUI loop; icon.run() is a mock, not an actual blocking call.
+# ---------------------------------------------------------------------------
+
+
+def _fake_pystray_and_pil(monkeypatch):
+    """Install fake pystray/PIL modules; return (fake_pystray, fake_icon)
+    so a test can assert icon.run() was reached (proving _run_tray got all
+    the way through, not just bailed early)."""
+    fake_icon_instance = mock.MagicMock()
+    fake_pystray = mock.MagicMock()
+    fake_pystray.Icon.return_value = fake_icon_instance
+    monkeypatch.setitem(sys.modules, "pystray", fake_pystray)
+
+    fake_image_module = mock.MagicMock()
+    fake_image_module.open.return_value = mock.MagicMock()
+    fake_PIL = mock.MagicMock()
+    fake_PIL.Image = fake_image_module
+    monkeypatch.setitem(sys.modules, "PIL", fake_PIL)
+    monkeypatch.setitem(sys.modules, "PIL.Image", fake_image_module)
+    return fake_pystray, fake_icon_instance
+
+
+def test_run_tray_opens_dashboard_after_fresh_start(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0
+    assert opened == [tray_main._dashboard_url()]
+    fake_runner.start.assert_called_once()
+
+
+def test_run_tray_opens_dashboard_when_attaching_to_already_running(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    # RunnerAlreadyRunningError(scope, record) -- record only needs .pid/.run_id
+    # for the exception's own message formatting, so a MagicMock is enough.
+    fake_runner.start.side_effect = tray_main.RunnerAlreadyRunningError(
+        "meridian-tray", mock.MagicMock()
+    )
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0
+    assert opened == [tray_main._dashboard_url()]
+
+
+def test_run_tray_browser_open_failure_does_not_crash_or_skip_the_icon(monkeypatch):
+    _, fake_icon_instance = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+
+    def _raise(url):
+        raise OSError("no default browser configured")
+
+    monkeypatch.setattr(tray_main.webbrowser, "open", _raise)
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0
+    # A failed browser-open must not prevent the tray icon itself from
+    # starting -- icon.run() still has to be reached.
+    fake_icon_instance.run.assert_called_once()
+
+
+def test_run_tray_does_not_auto_open_when_server_fails_to_start(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+    dialog_calls = []
+    monkeypatch.setattr(
+        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+    )
+
+    rc = tray_main._run_tray()
+
+    assert rc == 1
+    assert dialog_calls == [("Meridian failed to start", "boom")]
+    # A genuine startup failure must NOT auto-open a browser onto a server
+    # that isn't actually there.
+    assert opened == []
+
+
+# ---------------------------------------------------------------------------
 # Pre-ship validation checklist (507e55de) -- real-artifact consistency
 # checks between meridian-tray.spec, meridian/static/meridian-tray.ico, and
 # tray_main.py itself. These read the ACTUAL files on disk (never mocks),

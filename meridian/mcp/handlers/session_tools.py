@@ -1127,6 +1127,34 @@ async def handle_social_search(
     )
 
 
+async def handle_zotero_search(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: zotero_search.
+
+    7273d2fa — Zotero library search sibling to paper_search/social_search/
+    github_search (811881c6/f65f6111/d58000c6), following the identical
+    per-source pattern, but over the caller's OWN Zotero library rather than
+    a public corpus. A public group library needs no credential; a private
+    user library needs an api_key (or the server-side ZOTERO_API_KEY env
+    var) — see meridian/zotero_search.py's module docstring for why this is
+    config rather than a per-tenant BYOK secret.
+    """
+    from meridian.zotero_search import zotero_search  # noqa: PLC0415
+    return await zotero_search(
+        args.get("query", ""),
+        library_type=args.get("library_type", "user"),
+        library_id=args.get("library_id", ""),
+        api_key=args.get("api_key"),
+        limit=args.get("limit", 10),
+        sort_by=args.get("sort_by", "relevance"),
+    )
+
+
 async def handle_get_session_brief(
     args: dict[str, Any],
     db: Any,

@@ -541,7 +541,16 @@ canonical data source, and Codex/Cursor get parity through
 
 ## Tests & coverage
 
-- Run `pixi run test -n 3` **before and after** any change. It MUST pass.
+- Run `pixi run test` **before and after** any change. It MUST pass.
+- On a memory-constrained or shared machine, cap xdist workers with
+  `MERIDIAN_TEST_MAX_WORKERS=3 pixi run test` (default cap is 8, applied via
+  `--maxprocesses` in `scripts/run_tests.py`). **Do not** try `pixi run test -n 3`
+  for this — `scripts/run_tests.py::build_run_args` unconditionally strips any
+  caller-supplied `-n`/`--numprocesses`/`--dist`/`--maxprocesses` flag
+  (`_without_xdist_args`) before computing its own serial/auto scheduling
+  policy, so a trailing `-n 3` is silently discarded and has no effect
+  (confirmed 2026-09-27 investigation — this line previously documented that
+  no-op invocation).
 - New code must maintain **85%+ coverage** — never drop below it.
 - Every feature/bugfix sprint item ships with at least one test.
 
