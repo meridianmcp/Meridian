@@ -16,10 +16,13 @@ $TASK_NAME    = "MeridianTunnel"
 $MERIDIAN_DIR = Join-Path $env:USERPROFILE ".meridian"
 
 # -- locate the meridian executable -------------------------------------------
-$MeridianExe = (Get-Command meridian -ErrorAction SilentlyContinue)?.Source
+# No ?. here: the null-conditional operator is PowerShell 7-only, and this
+# installer must also parse on the Windows PowerShell 5.1 that ships with Windows.
+$MeridianCmd = Get-Command meridian -ErrorAction SilentlyContinue
+$MeridianExe = if ($MeridianCmd) { $MeridianCmd.Source } else { $null }
 if (-not $MeridianExe) {
     Write-Host "error: 'meridian' was not found on PATH."
-    Write-Host "Install it first:  pip install meridian-server   (or:  npm i -g meridian-mcp)"
+    Write-Host "Install it first:  pip install meridian-server   (or:  npm i -g @meridianmcp/mcp)"
     return
 }
 
@@ -60,8 +63,8 @@ Set-Location "$MeridianRepo"
 "@ | Set-Content -Path $LauncherScript -Encoding UTF8
 
 # -- register Task Scheduler job ----------------------------------------------
-$PwshExe = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
-if (-not $PwshExe) { $PwshExe = "powershell.exe" }
+$PwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
+$PwshExe = if ($PwshCmd) { $PwshCmd.Source } else { "powershell.exe" }
 
 $action  = New-ScheduledTaskAction -Execute $PwshExe `
                -Argument "-WindowStyle Hidden -NonInteractive -File `"$LauncherScript`""

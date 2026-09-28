@@ -3,7 +3,14 @@ generate_handoff hook-writer."""
 from __future__ import annotations
 
 import asyncio
+import http.server
+import json
+import os
 import re
+import shutil
+import socket
+import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -444,13 +451,18 @@ def test_sprint_guard_templates_have_feature_parity():
     sh = handoff_module._SPRINT_GUARD_SH
     ps1 = handoff_module._SPRINT_GUARD_PS1
     markers = (
-        "c0d2356d", "b4ce3274", "e2e1b682", "a03c0eeb",
+        "c0d2356d", "b4ce3274", "e2e1b682", "a03c0eeb", "41f26499", "55d48d69",
         "stop_hook_active", "pending_count", "verification_pending_count",
-        "worktrees/sweep",
+        "transcript_path", "claim_sprint_item", "MERIDIAN_GUARD", "sprint_guard",
     )
     for marker in markers:
         assert marker in sh, f"{marker!r} in _SPRINT_GUARD_PS1 but missing from _SPRINT_GUARD_SH"
         assert marker in ps1, f"{marker!r} in _SPRINT_GUARD_SH but missing from _SPRINT_GUARD_PS1"
+    # 55d48d69 fix round 1: the Stop hook no longer triggers the destructive
+    # worktree sweep (it force-removes terminal worktrees, dirty ones included).
+    for tpl in (sh, ps1):
+        assert "worktrees/sweep" not in tpl
+        assert all(ord(c) < 128 for c in tpl), "templates are pure ASCII (PS 5.1 reads BOM-less UTF-8 as cp1252)"
 
 
 def test_checked_in_sprint_guard_hooks_match_generator_output(tmp_path, monkeypatch):
@@ -527,3 +539,226 @@ def test_custom_hook_tools_registered():
     assert "delete_custom_hook" in _DESTRUCTIVE_TOOLS
     assert "add_custom_hook" not in _READ_ONLY_TOOLS
     assert "add_custom_hook" not in _DESTRUCTIVE_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# 41f26499 -- the Stop-hook's fail-open path (Meridian unreachable, or an
+# empty/malformed response) used to exit 0 SILENTLY. That's exactly the
+# window where this session's file claims can be abandoned with zero visible
+# signal (they then only clear via the 2h claim TTL). These tests run the
+# ACTUAL sprint_guard.{sh,ps1} hooks as real subprocesses (never sourced
+# in-process -- mirrors test_code_intel_guard.py / test_worktree_guard.py)
+# and assert a clear stderr warning now appears in both fail-open cases,
+# while fail-open itself (exit 0) and the ordinary reachable/no-pending path
+# are both unchanged.
+# ---------------------------------------------------------------------------
+
+_SG_REPO = Path(__file__).resolve().parent.parent
+_SG_HOOK_SH = _SG_REPO / ".claude" / "hooks" / "sprint_guard.sh"
+_SG_HOOK_PS1 = _SG_REPO / ".claude" / "hooks" / "sprint_guard.ps1"
+
+
+def _sg_bash() -> str | None:
+    """Git Bash, preferred over a bare ``bash`` PATH lookup.
+
+    On Windows, ``C:\\Windows\\System32\\bash.exe`` (the WSL launcher) can shadow
+    Git's own bash.exe on PATH. Under WSL, Windows-style paths (``C:\\Users\\...``,
+    as this file's transcript/payload paths are) never resolve, so the hook's own
+    ``[ -f "$tp" ]`` transcript check silently fails and every one of these tests
+    would report an unexplained "returncode 0, empty stdout/stderr" instead of
+    exercising sprint_guard.sh at all -- same fix as test_legacy_hooks_fix_round1.py's
+    ``_bash()``."""
+    for c in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"):
+        if os.name == "nt" and Path(c).exists():
+            return c
+    return shutil.which("bash")
+
+
+_SG_BASH = _sg_bash()
+
+_sg_needs_bash = pytest.mark.skipif(
+    not _SG_HOOK_SH.exists() or _SG_BASH is None,
+    reason="sprint_guard.sh or bash unavailable",
+)
+
+
+def _sg_powershell_exe() -> str | None:
+    for exe in ("pwsh", "powershell"):
+        found = shutil.which(exe)
+        if found:
+            return found
+    return None
+
+
+_sg_needs_powershell = pytest.mark.skipif(
+    _sg_powershell_exe() is None or not _SG_HOOK_PS1.exists(),
+    reason="no PowerShell interpreter (pwsh/powershell) available, or sprint_guard.ps1 missing",
+)
+
+# 55d48d69 fix round 1: only a session that claimed a sprint item is held back, so
+# these behaviour tests stop as an executor whose transcript shows a claim.
+import tempfile as _tempfile  # noqa: E402
+
+_SG_TRANSCRIPT = Path(_tempfile.gettempdir()) / "meridian-sprint-guard-test-transcript.jsonl"
+_SG_TRANSCRIPT.write_text(json.dumps({"type": "assistant", "message": {"content": [
+    {"type": "tool_use", "id": "t1", "name": "mcp__meridian__claim_sprint_item", "input": {"item_id": "x"}}]}}) + "\n",
+    encoding="utf-8")
+_SG_STOP_PAYLOAD = json.dumps({"session_id": "sess-41f26499-warn-test", "transcript_path": str(_SG_TRANSCRIPT)})
+
+
+def _sg_free_url() -> str:
+    """An address with nothing listening, so the hook hits a genuine
+    connection failure fast rather than a timeout hang."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
+def _sg_start_stub(*, body: str, status: int = 200):
+    """Minimal HTTP stub answering ANY GET with *body*/*status* -- the guard
+    only ever hits the single pending_count endpoint."""
+    body_bytes = body.encode("utf-8")
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.end_headers()
+            self.wfile.write(body_bytes)
+
+        def log_message(self, *a, **kw):  # noqa: N802
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return f"http://127.0.0.1:{port}", srv, t
+
+
+def _sg_run_sh(payload: str, *, meridian_url: str) -> subprocess.CompletedProcess:
+    # MERIDIAN_URL is exported INSIDE the bash command string (not via the
+    # subprocess env= dict) so it survives MSYS2/Git-Bash env handling on
+    # Windows -- same technique as test_code_intel_guard.py / test_worktree_guard.py.
+    setup = f'export MERIDIAN_URL="{meridian_url}"; '
+    cmd = setup + "exec bash .claude/hooks/sprint_guard.sh"
+    r = subprocess.run(
+        [_SG_BASH, "-c", cmd],
+        input=payload.encode("utf-8"),
+        cwd=str(_SG_REPO),
+        capture_output=True,
+        timeout=30,
+    )
+    return subprocess.CompletedProcess(
+        r.args, r.returncode,
+        stdout=(r.stdout or b"").decode("utf-8", "replace"),
+        stderr=(r.stderr or b"").decode("utf-8", "replace"),
+    )
+
+
+def _sg_run_ps1(payload: str, *, meridian_url: str) -> subprocess.CompletedProcess:
+    ps = _sg_powershell_exe()
+    env = dict(os.environ)
+    env["MERIDIAN_URL"] = meridian_url
+    r = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(_SG_HOOK_PS1)],
+        input=payload.encode("utf-8"),
+        cwd=str(_SG_REPO),
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    return subprocess.CompletedProcess(
+        r.args, r.returncode,
+        stdout=(r.stdout or b"").decode("utf-8", "replace"),
+        stderr=(r.stderr or b"").decode("utf-8", "replace"),
+    )
+
+
+@_sg_needs_bash
+def test_sh_hook_warns_and_stays_fail_open_when_server_unreachable():
+    r = _sg_run_sh(_SG_STOP_PAYLOAD, meridian_url=_sg_free_url())
+    assert r.returncode == 0, "fail-open behavior must be unchanged"
+    assert "41f26499" in r.stderr
+    assert "file claim" in r.stderr.lower()
+    assert "2h" in r.stderr
+
+
+@_sg_needs_bash
+def test_sh_hook_warns_on_empty_or_malformed_response():
+    url, srv, _t = _sg_start_stub(body="{}")  # 200 OK but no pending_count field
+    try:
+        r = _sg_run_sh(_SG_STOP_PAYLOAD, meridian_url=url)
+        assert r.returncode == 0, "fail-open behavior must be unchanged"
+        assert "41f26499" in r.stderr
+        assert "file claim" in r.stderr.lower()
+    finally:
+        srv.shutdown()
+
+
+@_sg_needs_bash
+def test_sh_hook_normal_no_pending_behavior_unaffected():
+    url, srv, _t = _sg_start_stub(body=json.dumps({"pending_count": 0}))
+    try:
+        r = _sg_run_sh(_SG_STOP_PAYLOAD, meridian_url=url)
+        assert r.returncode == 0
+        assert "41f26499" not in r.stderr  # new warning must not fire when reachable
+    finally:
+        srv.shutdown()
+
+
+@_sg_needs_bash
+def test_sh_hook_normal_pending_behavior_unaffected():
+    url, srv, _t = _sg_start_stub(body=json.dumps({"pending_count": 2}))
+    try:
+        r = _sg_run_sh(_SG_STOP_PAYLOAD, meridian_url=url)
+        assert r.returncode == 2, "still blocks the stop when items are genuinely pending"
+        assert "still pending" in r.stderr
+        assert "41f26499" not in r.stderr
+    finally:
+        srv.shutdown()
+
+
+@_sg_needs_powershell
+def test_ps1_hook_warns_and_stays_fail_open_when_server_unreachable():
+    r = _sg_run_ps1(_SG_STOP_PAYLOAD, meridian_url=_sg_free_url())
+    assert r.returncode == 0, "fail-open behavior must be unchanged"
+    assert "41f26499" in r.stderr
+    assert "file claim" in r.stderr.lower()
+    assert "2h" in r.stderr
+
+
+@_sg_needs_powershell
+def test_ps1_hook_warns_on_empty_or_malformed_response():
+    url, srv, _t = _sg_start_stub(body="{}")
+    try:
+        r = _sg_run_ps1(_SG_STOP_PAYLOAD, meridian_url=url)
+        assert r.returncode == 0, "fail-open behavior must be unchanged"
+        assert "41f26499" in r.stderr
+        assert "file claim" in r.stderr.lower()
+    finally:
+        srv.shutdown()
+
+
+@_sg_needs_powershell
+def test_ps1_hook_normal_no_pending_behavior_unaffected():
+    url, srv, _t = _sg_start_stub(body=json.dumps({"pending_count": 0}))
+    try:
+        r = _sg_run_ps1(_SG_STOP_PAYLOAD, meridian_url=url)
+        assert r.returncode == 0
+        assert "41f26499" not in r.stderr
+    finally:
+        srv.shutdown()
+
+
+@_sg_needs_powershell
+def test_ps1_hook_normal_pending_behavior_unaffected():
+    url, srv, _t = _sg_start_stub(body=json.dumps({"pending_count": 3}))
+    try:
+        r = _sg_run_ps1(_SG_STOP_PAYLOAD, meridian_url=url)
+        assert r.returncode == 2, "still blocks the stop when items are genuinely pending"
+        assert "still pending" in r.stderr
+        assert "41f26499" not in r.stderr
+    finally:
+        srv.shutdown()

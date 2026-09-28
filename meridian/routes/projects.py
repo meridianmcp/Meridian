@@ -128,14 +128,46 @@ async def create_project(
     body: ProjectCreate, request: Request
 ) -> dict[str, Any]:
     """Create a new project. 409 if the name is already in use."""
-    existing = await db_module.get_project_by_name(await _db(request), body.name)
+    tenant = await _get_tenant_from_request(request)
+    try:
+        db = await _db(request)
+    except HTTPException as exc:
+        # 8b6c19d3 — c3e91df4 (below) already anticipates an invited workspace
+        # member creating their own project later, but nothing actually
+        # provisions a Neon DB for that path: OAuth-login background
+        # provisioning only fires for tenants with no accepted workspace
+        # membership anywhere, so a member who never got a DB (or whose
+        # background attempt silently failed) hits "tenant database not
+        # provisioned" from _db() above with no way to recover. Self-heal
+        # here, the one action that actually requires a DB to exist, instead
+        # of hard-failing. Only intervene once _db() has already concluded
+        # there's genuinely nothing to connect to (503) — it has its own
+        # cache/admin-fallback resolution (e.g. the _tenant_db_cache test
+        # seam) that must stay the single source of truth for "does this
+        # tenant already have a usable DB", so re-checking neon_project_id
+        # here directly would just diverge from it and false-positive.
+        if exc.status_code != 503 or not (
+            tenant and _hosted_mode() and tenant.get("plan") != "admin"
+        ):
+            raise
+        from .. import hosted as hosted_module  # noqa: PLC0415
+        try:
+            await hosted_module.provision_with_retry(tenant["id"], request.app.state.db)
+        except Exception as provision_exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=503,
+                detail="tenant database is provisioning — please retry in a moment",
+            ) from provision_exc
+        tenant = await _get_tenant_from_request(request, force_refresh=True)
+        db = await _db(request)  # retry now that neon_db_url exists
+
+    existing = await db_module.get_project_by_name(db, body.name)
     if existing is not None:
         raise HTTPException(
             status_code=409, detail=f"project '{body.name}' already exists"
         )
-    tenant = await _get_tenant_from_request(request)
     if tenant and tenant.get("plan") == "free":
-        existing_projects = await db_module.list_projects(await _db(request))
+        existing_projects = await db_module.list_projects(db)
         if len(existing_projects) >= 1:
             raise HTTPException(
                 status_code=403,
@@ -143,9 +175,8 @@ async def create_project(
             )
     # G4.15 — safety limit: projects per tenant
     from .. import limits as _limits  # noqa: PLC0415
-    all_projects = await db_module.list_projects(await _db(request))
+    all_projects = await db_module.list_projects(db)
     _limits.check_projects_per_tenant(len(all_projects))
-    db = await _db(request)
     # 0bf67524 — pass tenant_id so the new project is seeded from the workspace's
     # cascade defaults (execution mode / HITL / code intel).
     # 3b6ff466 — optional parent_project_id makes this a one-level-deep subproject;
@@ -239,6 +270,10 @@ async def generate_codebase_map(project_id: str, request: Request) -> dict[str, 
     an optional system dependency — when ``dot`` isn't installed this returns a
     503 with an actionable install hint instead of failing opaquely.
     """
+    # ece2ac0a — this renders with graphviz on the server and never touched
+    # the DB, so it had no auth at all. Resolve the caller's DB like every
+    # sibling /projects/{id} route: _db() 401s an anonymous hosted caller.
+    await _db(request)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
@@ -570,8 +605,18 @@ async def get_agent_instructions(project_id: str, request: Request) -> dict[str,
 async def patch_agent_instructions(
     project_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    """Set or clear agent_instructions. Pass null to reset to server defaults."""
+    """Set or clear agent_instructions. Pass null to reset to server defaults.
+
+    acc7e504 -- mirrors the same best-effort content scan wired into the
+    set_agent_instructions MCP tool (mcp/handlers/session_tools.py): both are
+    write paths for a field start_session/checkpoint echo verbatim into every
+    future session, and pkg_install_guard.check_agent_instructions was built
+    for exactly this content but previously ran only in its own unit tests.
+    Non-blocking -- a finding surfaces as ``content_warnings``, the write is
+    never rejected on this heuristic alone.
+    """
     from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # noqa: PLC0415
+    from ..pkg_install_guard import check_agent_instructions  # noqa: PLC0415
     instructions = body.get("agent_instructions")
     if instructions is None:
         instructions = DEFAULT_AGENT_INSTRUCTIONS
@@ -580,6 +625,12 @@ async def patch_agent_instructions(
     result = await db_module.set_agent_instructions(
         await _db(request), project_id, instructions
     )
+    findings = check_agent_instructions(instructions)
+    if findings:
+        result["content_warnings"] = [
+            {"kind": f.kind, "description": f.description, "location": f.location}
+            for f in findings
+        ]
     return result
 
 

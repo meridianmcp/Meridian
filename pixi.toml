@@ -193,6 +193,12 @@ soundfile = ">=0.13.1, <0.14"
 google-api-python-client = ">=2.197.0, <3"
 google-auth-oauthlib = ">=1.4.0, <2"
 fpdf2 = ">=2.7"
+# 4e4c3817 -- Windows tray/GUI installer (meridian-tray.exe). Build-time only,
+# same as pyinstaller above: pystray/Pillow must be IMPORTABLE in this
+# environment for PyInstaller to trace and bundle them into the frozen exe,
+# but nothing outside that build step (and the frozen exe itself) needs them.
+pystray = ">=0.19"
+Pillow = ">=10.0"
 
 # Local-only semantic code-search environment. Keep model2vec out of the
 # default and hosted/prod environments; Claude Desktop can opt into this
@@ -204,10 +210,27 @@ psutil = ">=5.9"
 [feature.docs.pypi-dependencies]
 meridian-docs-mcp = { path = "extensions/meridian-docs", editable = true }
 
+# da8fbeec -- extensions/meridian-deep-research wraps langchain-ai/
+# open_deep_research (exact-pinned open-deep-research==0.0.16 in that
+# package's own pyproject.toml) as Meridian's deep-research MCP tool. OPT-IN
+# feature, mirroring the meridian-docs-mcp [feature.docs.pypi-dependencies]
+# editable-path pattern above -- NOT meridian-outputs' default-env mirroring.
+# open_deep_research pulls in ~30 transitive dependencies (LangGraph,
+# langchain-openai/-anthropic/-community, the optional Azure/AWS/GCP
+# provider SDKs, pandas, ipykernel, ...); nobody running a plain
+# `pixi run` should pay that install cost by default just to get the rest
+# of Meridian working.
+[feature.deep_research.dependencies]
+python = ">=3.11,<3.13"
+
+[feature.deep_research.pypi-dependencies]
+meridian-deep-research-mcp = { path = "extensions/meridian-deep-research", editable = true }
+
 [environments]
 dev = { features = ["dev"], solve-group = "default" }
 semantic = { features = ["semantic"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
+deep-research = { features = ["deep_research"], no-default-feature = true, solve-group = "deep-research" }
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
@@ -250,6 +273,7 @@ test-fast = "python scripts/run_tests.py tests/test_core.py tests/test_new_v25.p
 worktree-hygiene = "python -m meridian.worktree_hygiene --repo-root ."
 build-exe = "pyinstaller meridian.spec --clean"
 build-connect = "pyinstaller meridian-connect.spec --clean"
+build-tray = "pyinstaller meridian-tray.spec --clean"
 smoke-bundle = "node scripts/smoke_bundle.mjs"
 demo = "python scripts/demo.py"
 test-mcp = "python scripts/test_mcp.py"

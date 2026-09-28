@@ -82,14 +82,22 @@ class WebSocketBroadcaster:
         self._tasks: set[asyncio.Task] = set()
 
     async def serve(self, ws: WebSocket, project_id: str) -> None:
-        """Accept a WebSocket and pipe task events to it until it closes.
+        """Pipe task events to an already-accepted WebSocket until it closes.
+
+        4bea8629: the caller (``server.py``'s ``ws_project``) now accepts
+        the socket itself, BEFORE deciding (in hosted mode) whether the
+        connecting caller's tenant actually owns ``project_id`` — a
+        rejected/unauthenticated caller must never reach this method, and
+        must never learn of a project's existence via task-log events. This
+        method no longer accepts the socket itself; calling it on a socket
+        that hasn't been accepted yet is a bug in the caller, not something
+        this method should paper over.
 
         Reads from the socket are drained on a separate task so we notice
         when the client disconnects. We don't act on inbound messages
         (the dashboard pushes via HTTP, not WS) but we have to read them
         for the close handshake to land.
         """
-        await ws.accept()
         queue = db_module.subscribe_tasks(project_id)
 
         async def reader() -> None:

@@ -102,3 +102,83 @@ sprint item with a full-suite before/after run.
 `--durations=20` is present and retained on both `test-core` (line 31) and
 `test-postgres` (line 91) so the next green run keeps capturing per-test timings.
 No change required to keep the instrumentation; verified present as of this note.
+
+## Follow-up (item a8ff4caa, 2026-09-24) — accretion hypothesis re-checked, already fixed
+
+CI wall-clock for `test-core`/`test-postgres` was observed to have roughly
+doubled again since August (7-8m -> 13-15m), with `meridian/server.py`'s
+`lifespan()` accreting several sequential per-startup steps (doc-store open,
+OAuth cache hydration, tenant re-key, tunnel-tenant notify loop) flagged as
+the live suspect — plausible because those steps re-run on every single
+`client`-fixture `TestClient` open (~390+ tests in `test_core.py` alone).
+
+**Re-ran the methodology from this doc exactly**, on current `dev`
+(`timeout 900 pixi run python -m pytest tests/test_core.py --durations=25
+-p no:xdist --timeout=120 -q > durations.log 2>&1; echo "exit=$?"`, no pipe
+to `tail` this time so the real exit code is visible):
+
+```
+1129 passed, 6 skipped in 182.04s (0:03:02)
+exit=0
+```
+
+No hang. And — contrary to what the accretion hypothesis predicted — the
+`--durations=25` table shows **zero setup-phase entries** in the slowest 25
+(the July table above was almost entirely `setup`-phase entries at
+~0.8-1.0s each). Every entry now is a `call`-phase cost from an individual
+test's own body (a real subprocess spawn, a real network-call attempt with
+timeout, etc.), and total serial wall-clock is **182s — lower than the July
+baseline of 313s — despite ~190 more tests** having been added since.
+
+**Why:** the exact accretion this item hypothesized was already fixed by two
+commits that landed on `dev` in the 24 hours immediately before this
+re-check (both already present in the `origin/dev` this investigation
+branched from):
+
+- `2c3fe304` (2026-09-23) — `perf(tests): default MERIDIAN_DOC_STORE_URL to
+  :memory: in client fixture`. The lifespan's unconditional
+  `open_doc_store_for(...)` call was resolving to a real on-disk SQLite
+  sidecar per test (open + schema create + WAL/journal) — this, not the
+  other lifespan steps, was the actual dominant cost.
+- `0cbef4c9` (2026-09-24) — `fix(tests): stop leaking MERIDIAN_DOC_STORE_URL
+  across xdist workers`, closing a gap where the `:memory:` default from the
+  commit above could be defeated by a leaked real path from an earlier test
+  in the same xdist worker process.
+
+Both already have real regression coverage
+(`tests/test_doc_store.py::test_client_fixture_defaults_doc_store_to_memory`,
+plus the corrected env-var handling in
+`tests/test_5fdf8858_no_double_json_encode.py`). This investigation adds one
+more: `tests/test_a8ff4caa_lifespan_perf_budget.py` guards the *general
+class* of bug (a wall-clock budget on repeated fresh `TestClient` opens)
+rather than only the one already-fixed instance, so a *future* accretion of
+this kind fails fast in CI instead of silently doubling wall-clock over two
+months again.
+
+**Real CI history** (`gh run list`/`gh run view` job timings on `dev`,
+2026-09-20 through 2026-09-24) shows a directional improvement consistent
+with — though not yet a large enough sample to fully confirm — these fixes:
+`test-core` job duration was ~11-12m in the runs before either fix (Sep 20)
+and ~9-10m in the runs after both landed (Sep 24). Small sample (the fixes
+are less than a day old as of this note), so treat this as corroborating,
+not conclusive on its own.
+
+**NOT fixed by this investigation, explicitly out of scope:**
+- `test-postgres` is not merely slow — in every run sampled in the Sep 20-24
+  window (both before and after the two fixes above), it **concluded
+  `failure`**, not just a long duration. That looks like a separate,
+  more fundamental correctness/flakiness problem, independent of this
+  item's wall-clock-perf question, and needs its own investigation.
+- The separate catastrophic-hang pattern (`scripts/run_tests.py`'s
+  `post_results_hang` timeout_kind; see the 2026-09-17 incident,
+  commits `288dbae3`/`f74e95a1`) is NOT addressed here. This re-check's
+  clean `exit=0` with a complete durations table is at least evidence
+  the hang did not reproduce in THIS run, but one clean run does not rule
+  out an intermittent leak-driven hang — see
+  `reference_aiosqlite_exit_hang_diagnosis` for the follow-up technique
+  if it recurs.
+
+**Conclusion:** no further code fix was needed for the specific hypothesis
+this item raised — it was already fixed by other in-flight work before this
+item was picked up. Closing as verified-already-fixed, with one added
+regression test guarding the general class of bug going forward.

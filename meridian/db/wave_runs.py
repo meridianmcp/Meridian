@@ -2010,11 +2010,33 @@ async def record_wave_run_child_outcome(
     SQLite (aiosqlite, a real pending transaction) a cancellation before the
     one ``commit()`` call rolls back cleanly — every field this call touches
     is uncommitted together, so a retry sees the prior state, never a
-    half-written one. On Postgres (psycopg3, ``autocommit=True`` per this
-    repo's rules — every statement is already its own transaction) there is
-    only one statement to begin with, so there is no gap between two
-    transactions for a cancellation to land in. Either way, a cancellation
-    now loses BOTH fields or NEITHER — never one without the other.
+    half-written one.
+
+    408e5cea: on Postgres, a bare ``db.execute()`` is NOT the same kind of
+    "pending until commit()" write that aiosqlite gives you — with
+    ``PostgresConnection``'s default connection-per-statement model
+    (``autocommit=True`` per this repo's rules), the statement is already
+    durably applied to a DIFFERENT borrowed connection by the time
+    ``execute()`` returns, and the old ``PostgresConnection.commit()``/
+    ``rollback()`` were unconditional no-ops — so a cancellation landing
+    between this function's ``execute()`` and its ``commit()`` had nothing
+    left to undo: the write was already permanent, with no way for a
+    caller's subsequent ``rollback()`` to revert it (confirmed exactly this
+    gap: CI's test-postgres run showed the cancellation-path regression
+    tests asserting a reverted/absent row and observing the write had stuck
+    anyway). This function now runs its one write through
+    ``db.begin_transaction()`` when the connection supports it (Postgres;
+    aiosqlite is untouched, still going through the plain ``db.execute()``
+    path below) — a REAL, explicit, connection-pinned transaction that stays
+    open on that SAME connection until this function's own ``db.commit()``
+    call decides its fate, so a cancellation there leaves the write visible
+    but genuinely still-pending, and a caller's ``db.rollback()`` genuinely
+    undoes it — matching aiosqlite's behavior instead of merely resembling
+    it. See ``PostgresConnection.begin_transaction()`` for the full
+    mechanism. Either way, a cancellation now loses BOTH fields or NEITHER
+    — never one without the other — AND (on both backends, post-408e5cea)
+    an explicit rollback after a cancellation genuinely reverts the write
+    rather than leaving it stuck.
     """
     if status not in _WAVE_RUN_CHILD_TERMINAL_STATUSES:
         raise ValueError(
@@ -2037,54 +2059,72 @@ async def record_wave_run_child_outcome(
     existing = _row_to_dict(row)
     existing_failure_mode = (existing or {}).get("failure_mode") or "continue"
 
-    if existing is None:
-        # No prior child row for this (wave_run_id, sprint_item_id) — a
-        # single INSERT carries status, failure_mode, exit_code AND
-        # agent_id together, so there is no second statement left to lose.
-        await db.execute(
-            "INSERT INTO wave_run_children "
-            "(id, wave_run_id, sprint_item_id, failure_mode, status, "
-            "evidence, actor, exit_code, agent_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                _new_id(),
-                wave_run_id,
-                sprint_item_id,
-                existing_failure_mode,
-                status,
-                _json_or_none(evidence),
-                actor,
-                exit_code,
-                agent_id,
-            ),
-        )
+    # 408e5cea: on a connection that supports it (Postgres), run the write
+    # through a REAL pinned transaction so a cancellation before db.commit()
+    # leaves it genuinely revertible instead of already-durable-with-nothing-
+    # to-roll-back — see this function's docstring and
+    # PostgresConnection.begin_transaction(). aiosqlite has no such method,
+    # so _exec_db stays plain `db` there — zero behavior change on SQLite.
+    _pg_txn = db.begin_transaction() if hasattr(db, "begin_transaction") else None
+
+    async def _write(exec_db: Any) -> None:
+        if existing is None:
+            # No prior child row for this (wave_run_id, sprint_item_id) — a
+            # single INSERT carries status, failure_mode, exit_code AND
+            # agent_id together, so there is no second statement left to lose.
+            await exec_db.execute(
+                "INSERT INTO wave_run_children "
+                "(id, wave_run_id, sprint_item_id, failure_mode, status, "
+                "evidence, actor, exit_code, agent_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _new_id(),
+                    wave_run_id,
+                    sprint_item_id,
+                    existing_failure_mode,
+                    status,
+                    _json_or_none(evidence),
+                    actor,
+                    exit_code,
+                    agent_id,
+                ),
+            )
+        else:
+            # Existing row: one UPDATE carries the status transition AND the
+            # exit_code/agent_id bookkeeping together. failure_mode is
+            # re-written to its OWN current value here (this function never
+            # changes it) purely so this stays a single statement — a no-op
+            # write to the same value, not a behavior change.
+            await exec_db.execute(
+                "UPDATE wave_run_children SET failure_mode = ?, status = ?, "
+                "evidence = COALESCE(?, evidence), actor = COALESCE(?, actor), "
+                "exit_code = ?, agent_id = COALESCE(?, agent_id), "
+                "updated_at = datetime('now') "
+                "WHERE wave_run_id = ? AND sprint_item_id = ?",
+                (
+                    existing_failure_mode,
+                    status,
+                    _json_or_none(evidence),
+                    actor,
+                    exit_code,
+                    agent_id,
+                    wave_run_id,
+                    sprint_item_id,
+                ),
+            )
+
+    if _pg_txn is not None:
+        async with _pg_txn as txn_exec:
+            await _write(txn_exec)
+            await db.commit()
+    else:
+        await _write(db)
         await db.commit()
+
+    if existing is None:
         status_changed = True
         prior_status = None
     else:
-        # Existing row: one UPDATE carries the status transition AND the
-        # exit_code/agent_id bookkeeping together. failure_mode is
-        # re-written to its OWN current value here (this function never
-        # changes it) purely so this stays a single statement — a no-op
-        # write to the same value, not a behavior change.
-        await db.execute(
-            "UPDATE wave_run_children SET failure_mode = ?, status = ?, "
-            "evidence = COALESCE(?, evidence), actor = COALESCE(?, actor), "
-            "exit_code = ?, agent_id = COALESCE(?, agent_id), "
-            "updated_at = datetime('now') "
-            "WHERE wave_run_id = ? AND sprint_item_id = ?",
-            (
-                existing_failure_mode,
-                status,
-                _json_or_none(evidence),
-                actor,
-                exit_code,
-                agent_id,
-                wave_run_id,
-                sprint_item_id,
-            ),
-        )
-        await db.commit()
         prior_status = existing.get("status")
         status_changed = prior_status != status
 

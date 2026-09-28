@@ -49,3 +49,47 @@ def test_both_workflows_document_the_non_equivalent_release_path():
         assert "supplemental" in text.lower()
         assert "30182367824" in text
         assert "30182376358" in text
+
+
+def test_test_postgres_is_a_blocking_gate_for_auto_promote():
+    """Regression for sprint item 3fc08c7e.
+
+    auto-promote's ENTIRE gate is `github.event.workflow_run.conclusion ==
+    'success'` for the canonical "Test (dev branch)" run (see
+    test_deploy_auto_promote_consumes_the_canonical_workflow above) — it has
+    no separate, per-job check. That means every job in test.yml that can run
+    on a routine dev push must NOT carry `continue-on-error: true`, or a real
+    failure in it silently stops mattering to the promotion gate while still
+    reporting green.
+
+    Confirmed live via the GitHub API (2026-09-24): commit 0cbef4c9's
+    `test-postgres` check-run concluded `failure`, yet the "Test (dev
+    branch)" workflow run it belonged to still concluded `success` (because
+    test-postgres carried `continue-on-error: true` at the time) — and main
+    was auto-promoted past it minutes later. This test would have failed
+    against that historical config and must keep failing if the flag is
+    ever reintroduced on a routine (non-continue-on-error-exempted) job.
+    """
+    jobs = _load(TEST_WORKFLOW)["jobs"]
+
+    # test-postgres is the historical offender (KEYSTONE 98aa7eb7) and the
+    # specific subject of this regression -- assert it directly by name so a
+    # reintroduction of the flag on this exact job fails loudly and
+    # unambiguously, not just as a side effect of the sweep below.
+    assert "continue-on-error" not in jobs["test-postgres"], (
+        "test-postgres must not carry continue-on-error: true -- doing so "
+        "makes the whole 'Test (dev branch)' run report success even when "
+        "Postgres-path tests genuinely fail, which silently defeats "
+        "deploy.yml's auto-promote gate (see sprint item 3fc08c7e)."
+    )
+
+    # Sweep every job that actually runs on the routine dev-push path (i.e.
+    # everything except meridian-docs' own preflight dependency, which is
+    # legitimately gated by `needs:` rather than continue-on-error). None of
+    # them may silently no-op out of the promotion gate's conclusion either.
+    for job_id, job in jobs.items():
+        assert job.get("continue-on-error") not in (True, "true"), (
+            f"job '{job_id}' in test.yml carries continue-on-error: true -- "
+            "a real failure there would stop affecting this workflow's "
+            "overall conclusion, which is auto-promote's entire gate."
+        )

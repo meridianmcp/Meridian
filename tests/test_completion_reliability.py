@@ -99,20 +99,46 @@ def _init_git_repo(repo_dir: str) -> None:
     _run_git_cmd(["init"], repo_dir)
 
 
-def _blocking_subprocess_run_stub(*, delay: float):
-    """Stand-in for subprocess.run: sleeps `delay` seconds (a real, blocking
-    time.sleep) then returns a plausible, always-clean CompletedProcess —
-    HEAD resolves, the tree is never dirty, and every ancestry check passes.
-    Mirrors test_worktree_guard.py's helper of the same name/shape."""
+class _FakeSlowPopen:
+    """Minimal stand-in for subprocess.Popen exposing just the surface
+    _git() actually uses (communicate/kill/wait/args/returncode). Mirrors
+    test_worktree_guard.py's helper of the same name/shape.
 
-    def _stub(cmd, **kwargs):
-        time.sleep(delay)
-        args = list(cmd[1:]) if cmd and cmd[0] == "git" else list(cmd)
+    fecf3d24 — _git() was changed from a single subprocess.run() call to
+    Popen()+communicate() (so a real process handle is available to kill on
+    cancellation/timeout — see worktree_merge_guard._git). This fixture
+    patches subprocess.Popen (not subprocess.run) to match; patching run()
+    no longer has any effect since _git() never calls it."""
+
+    def __init__(self, cmd, *, delay: float):
+        self.args = cmd
+        self._delay = delay
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        time.sleep(self._delay)  # a real, blocking sleep
+        args = list(self.args[1:]) if self.args and self.args[0] == "git" else list(self.args)
         if args[:2] == ["rev-parse", "HEAD"]:
             stdout = ("b" * 40) + "\n"
         else:
             stdout = ""  # clean `status --porcelain`; `merge-base` success
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
+        return stdout, ""
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _blocking_subprocess_run_stub(*, delay: float):
+    """Stand-in for subprocess.Popen: returns a _FakeSlowPopen whose
+    communicate() performs a real, blocking time.sleep(delay) then returns a
+    plausible, always-clean result — HEAD resolves, the tree is never
+    dirty, and every ancestry check passes."""
+
+    def _stub(cmd, **kwargs):
+        return _FakeSlowPopen(cmd, delay=delay)
 
     return _stub
 
@@ -148,6 +174,14 @@ async def test_wave_run_bookkeeping_hang_does_not_block_completion(db, monkeypat
 
     from meridian.db import wave_runs as wave_runs_module
 
+    # CI-PERF-3A: _ADVISORY_PHASE_TIMEOUT_S is already a monkeypatchable
+    # module constant (meridian/db/sprint_items.py) — shrink it so this test
+    # doesn't actually wait out the real 5s advisory bound. complete_sprint_
+    # item's own asyncio.wait_for cancels the hang at this (now tiny) timeout
+    # regardless of how long the mock below would otherwise sleep, so the
+    # mechanism under test (fail-open on a hung advisory phase) is exercised
+    # identically, just fast.
+    monkeypatch.setattr(sprint_items_module, "_ADVISORY_PHASE_TIMEOUT_S", 0.05)
     _timeout_s = sprint_items_module._ADVISORY_PHASE_TIMEOUT_S
     _hang_s = _timeout_s + 3.0  # comfortably longer than the bound
 
@@ -220,7 +254,7 @@ async def test_worktree_merge_validation_slow_git_fails_closed_within_bound(
     )
 
     with patch(
-        "meridian.worktree_merge_guard.subprocess.run",
+        "meridian.worktree_merge_guard.subprocess.Popen",
         side_effect=_blocking_subprocess_run_stub(delay=0.5),
     ):
         start = time.monotonic()
@@ -326,7 +360,7 @@ async def test_concurrent_completions_across_distinct_items_stay_under_dispatch_
         entries.append((item["id"], session["id"], f"stress-corr-{i}"))
 
     with patch(
-        "meridian.worktree_merge_guard.subprocess.run",
+        "meridian.worktree_merge_guard.subprocess.Popen",
         # Realistic small per-call delay, not zero -- simulates genuine disk/
         # subprocess contention across many concurrently-active worktrees
         # without making the test itself slow.

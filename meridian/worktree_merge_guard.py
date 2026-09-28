@@ -69,14 +69,65 @@ async def _git(cwd: Path, args: list[str], *, timeout: int = 20) -> subprocess.C
     # ENTIRE server for every concurrently-handled session, not just this
     # request, for up to `timeout` seconds per invocation. asyncio.to_thread
     # moves the blocking call to a worker thread so the event loop stays free.
-    return await asyncio.to_thread(
-        subprocess.run,
+    #
+    # fecf3d24 — that fix alone left a distinct orphaned-process gap: a
+    # caller can wrap THIS coroutine in its own, shorter, asyncio-level
+    # timeout (e.g. mcp/handlers/sprint_tools.py wraps validate_worktree_merge
+    # — which calls this three times — in asyncio.wait_for(...,
+    # timeout=_MERGE_VALIDATION_TIMEOUT_S=10s), while this function's own
+    # default `timeout` is 20s). When that OUTER wait_for fires first, it
+    # cancels the Task awaiting this coroutine — but when the blocking work
+    # was a plain `subprocess.run(...)` hidden inside asyncio.to_thread, that
+    # cancellation could only stop the awaiting coroutine, never the real git
+    # subprocess: a concurrent.futures work item that has already started
+    # running on a worker thread cannot be interrupted, so the OS-level `git`
+    # process (and the worker thread blocked on it) kept running, unkilled
+    # and unreaped, until subprocess.run's OWN internal timeout eventually
+    # elapsed (up to a further 10s here) — or longer still if that process
+    # was itself blocked waiting on a repo lock held by a PREVIOUS leaked
+    # process. A burst of these compounds: each leaked subprocess pins one
+    # worker thread in the shared default ThreadPoolExecutor, so enough of
+    # them piling up starves every OTHER asyncio.to_thread call server-wide
+    # — the mechanism behind complete_sprint_item hanging permanently later,
+    # for callers with no connection to the original worktree at all.
+    #
+    # The fix: spawn via Popen (not run()) so this coroutine holds a live
+    # handle to the child process, and explicitly kill + reap it in BOTH
+    # failure paths — this function's own subprocess.TimeoutExpired (mirrors
+    # what subprocess.run does internally) and, critically, an
+    # asyncio.CancelledError delivered to this coroutine by an outer
+    # timeout/cancellation. Either way, the real process is dead and reaped
+    # before control leaves this function — never left orphaned for the
+    # caller's timeout window (or beyond).
+    proc = await asyncio.to_thread(
+        subprocess.Popen,
         ["git", *args],
         cwd=str(cwd),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
     )
+    try:
+        stdout, stderr = await asyncio.to_thread(proc.communicate, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Same recovery subprocess.run() performs internally on its own
+        # timeout: kill, then drain/reap via a second communicate() so no
+        # zombie is left behind.
+        proc.kill()
+        stdout, stderr = await asyncio.to_thread(proc.communicate)
+        raise
+    except asyncio.CancelledError:
+        # This coroutine itself was cancelled (e.g. an outer
+        # asyncio.wait_for with a shorter budget than `timeout` fired
+        # first). We hold the only handle to the real process, so we are
+        # the only thing that CAN clean it up — kill it and wait for it to
+        # actually exit (reap it) before letting the cancellation continue
+        # to propagate. Without this, the process above keeps running,
+        # unkilled, for up to `timeout` more seconds.
+        proc.kill()
+        await asyncio.to_thread(proc.wait)
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
 async def get_worktree_head(repo_root: Path, wt_path: str) -> str | None:

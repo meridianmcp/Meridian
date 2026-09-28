@@ -162,10 +162,30 @@ def search_outputs(
                         zero-hit answers with no way to tell why.
 
     Returns:
-      {outputs_dir, query, hits, total_indexed} plus optional {subtree,
-      partial, pending_stale_count, fts_pending, tantivy_lock_warning,
+      {outputs_dir, query, hits, total_indexed, backend} plus optional
+      {subtree, partial, pending_stale_count, fts_pending,
+      tantivy_lock_warning, tantivy_index_warning, backend_reason,
       index_lock_warning, db_write_error, zero_hits_warning, error,
       convergence}.
+      ``backend`` (MDE-6) is always present: ``"tantivy"`` when BM25 ranking
+      actually served this call's hits, or ``"deterministic_fallback"``
+      when Tantivy was unavailable this call (missing dependency, a
+      corrupted index directory that couldn't even cold-start recover, or
+      any other uncaught error) and a real, deterministic, non-ranked
+      substring search over the same indexed content was used instead --
+      never a silent empty result indistinguishable from a genuine
+      zero-hit answer. ``backend_reason`` is present alongside a
+      ``"deterministic_fallback"`` backend and explains why. A genuinely
+      empty Tantivy result set (the query legitimately matched nothing) is
+      reported as ``backend: "tantivy"`` with empty ``hits`` -- that is a
+      real answer, not a degraded one.
+      ``tantivy_index_warning`` (MDE-6) is present whenever Tantivy itself
+      could not be used this call for a reason OTHER than a lock conflict
+      (a corrupted on-disk index that was quarantined and rebuilt fresh, or
+      the ``tantivy`` dependency not being importable) -- distinct from
+      ``tantivy_lock_warning`` below, which is specifically a lock
+      conflict (self-heals once the other writer finishes; this does not
+      necessarily self-heal on its own).
       ``pending_stale_count`` (only present when ``partial`` is True) is the
       number of confirmed-stale files still queued for analysis+write --
       distinguishes a zero-hit result on a mid-pass index (more indexing

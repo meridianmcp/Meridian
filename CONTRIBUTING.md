@@ -73,6 +73,56 @@ Violations cause silent data corruption or crashes on Postgres. The adapter conv
 | `meridian/handoff.py` | Handoff generation (L0/L1/L2) |
 | `tests/test_core.py` | Full test suite (~540 tests) |
 
+## Local Linux verification via WSL (a70e6a33)
+
+Manual/interactive verification of Linux desktop-integration work -- tray
+icons (pystray backend availability), `.desktop` file validity, `systemd
+--user` units -- that a headless CI runner can't meaningfully exercise.
+**This is not a substitute for CI's own Linux runners**: `test-core`/
+`test-postgres` already run the full suite on `ubuntu-latest` in GitHub
+Actions on every push. This is for the narrower, genuinely-manual slice CI
+can't cover.
+
+**Two separate WSL distros -- don't confuse them:**
+
+| Distro | Purpose |
+|--------|---------|
+| `Ubuntu` | The daily-driver WSL environment. Do not repurpose it for verification runs -- confirmed live that running the wrong distro leaves real, unwanted side effects (a stray clone + `pixi install`) in its `$HOME`. |
+| `Ubuntu-20.04` | Dedicated, disposable Meridian test environment with its own checkout at `~/meridian-test` (set up during the 2026-09-22 clean-room validation, pinned decision b6a8f317). |
+
+**Run it**, from a Windows shell at the repo root:
+
+```powershell
+wsl.exe -d Ubuntu-20.04 -- bash scripts/wsl-linux-check.sh
+# with a targeted test subset afterwards:
+wsl.exe -d Ubuntu-20.04 -- bash scripts/wsl-linux-check.sh tests/test_install_linux_launcher.py
+```
+
+Always pass `-d Ubuntu-20.04` explicitly. Do not rely on a bare `bash` command
+resolving to the right place: confirmed live that a bare `bash` invoked from
+a Windows process can resolve to `%SystemRoot%\System32\bash.exe` (the
+legacy WSL launcher, which opens the *default* distro) even when
+`shutil.which("bash")`/`$PATH` would point at Git for Windows' own bash --
+Windows' process-creation search checks the fixed system directories before
+consulting `PATH` at all. `wsl.exe -d Ubuntu-20.04 --` sidesteps this
+ambiguity entirely by naming the distro directly.
+
+**Why this needs a script at all:** `~/meridian-test` is a `--depth 1`
+shallow clone that only tracks `main`, so `git fetch origin dev` alone does
+**not** create an `origin/dev` ref, and a plain `git checkout -b x
+origin/dev` fails outright. `scripts/wsl-linux-check.sh` fixes this at the
+root (`git remote set-branches --add origin dev` before fetching, so
+`origin/dev` becomes a real, persistent tracking ref) instead of the
+one-off `git checkout -B x FETCH_HEAD` workaround that has to be
+rediscovered by hand every time. It also works around a second, separately
+-confirmed gotcha: pixi's `PATH` export lives in `~/.bashrc`, but Ubuntu's
+default `~/.bashrc` returns immediately for non-interactive shells --
+exactly how `wsl.exe -- bash script.sh` invokes it -- so the script sets
+`PATH` itself rather than trusting shell rc files. See the script's own
+header comment for the full detail on both, plus the safety behavior around
+uncommitted local changes (`MERIDIAN_WSL_FORCE=1` to override) and the
+available env var overrides. Regression tests: `tests/test_wsl_linux_check.py`.
+
 ## Adding a new MCP tool
 
 1. **Add the tool definition** to `_MCP_TOOLS_LIST` in `meridian/server.py` — name, description, inputSchema.

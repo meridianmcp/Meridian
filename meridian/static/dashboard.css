@@ -126,7 +126,17 @@ html, body {
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column; align-items: center;
   padding-top: 6px; gap: 2px; z-index: 20; position: relative;
+  /* 52218bb7 — the strip's ancestor (.tab-body) is `overflow: hidden`. Without
+     its own overflow handling, a rail with more vtabs than fit vertically gets
+     silently CLIPPED by that ancestor instead of scrolling. Scope overflow to
+     the strip itself so extra icons stay reachable via scroll. */
+  overflow-y: auto; overflow-x: hidden;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
 }
+.vtab-strip::-webkit-scrollbar { width: 6px; }
+.vtab-strip::-webkit-scrollbar-track { background: transparent; }
+.vtab-strip::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.vtab-strip::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 .vtab-btn {
   width: 36px; height: 36px; border-radius: 6px;
   background: transparent; border: none; cursor: pointer;
@@ -726,6 +736,19 @@ select option {
 }
 .toast.show { display: block; }
 .toast.error { border-color: var(--status-failed); color: var(--status-failed); }
+
+/* afcbd8a2 — PWA install-prompt button (dashboard-pwa-install.ts). Bottom-left
+   so it never collides with .toast (bottom-right). Only ever inserted into
+   the DOM when a real `beforeinstallprompt` event fires, so it's invisible
+   on browsers/platforms without install support. */
+.pwa-install-button {
+  position: fixed; bottom: 16px; left: 16px; z-index: 150;
+  background: var(--accent); color: #06121f; border: none;
+  padding: 9px 16px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  font-family: 'IBM Plex Mono', monospace; cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+}
+.pwa-install-button:hover { filter: brightness(1.08); }
 
 /* v1.4.0 — vertical timeline log (newest first) */
 .timeline-log { display: flex; flex-direction: column; }

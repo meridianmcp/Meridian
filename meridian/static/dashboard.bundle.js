@@ -8339,6 +8339,57 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
+  // meridian/static/dashboard-pwa-install.ts
+  var PWA_INSTALL_BUTTON_ID = "pwa-install-button";
+  var deferredInstallPrompt = null;
+  function isRunningStandalone() {
+    const mq = typeof window.matchMedia === "function" && window.matchMedia("(display-mode: standalone)").matches;
+    const iosStandalone = navigator.standalone === true;
+    return Boolean(mq || iosStandalone);
+  }
+  function hideInstallButton() {
+    const btn = document.getElementById(PWA_INSTALL_BUTTON_ID);
+    if (btn) btn.remove();
+  }
+  async function handleInstallClick() {
+    const promptEvent = deferredInstallPrompt;
+    deferredInstallPrompt = null;
+    hideInstallButton();
+    if (!promptEvent) return;
+    try {
+      await promptEvent.prompt();
+      await promptEvent.userChoice;
+    } catch {
+    }
+  }
+  function showInstallButton() {
+    if (isRunningStandalone() || document.getElementById(PWA_INSTALL_BUTTON_ID)) return;
+    const btn = document.createElement("button");
+    btn.id = PWA_INSTALL_BUTTON_ID;
+    btn.type = "button";
+    btn.className = "pwa-install-button";
+    btn.textContent = "Install app";
+    btn.title = "Install Meridian as an app (ChromeOS, Windows, macOS, Android, Linux)";
+    btn.setAttribute("aria-label", "Install Meridian as an app");
+    btn.addEventListener("click", () => {
+      void handleInstallClick();
+    });
+    document.body.appendChild(btn);
+  }
+  function initPwaInstallPrompt() {
+    if (isRunningStandalone()) return;
+    window.addEventListener("beforeinstallprompt", (event) => {
+      event.preventDefault();
+      deferredInstallPrompt = event;
+      showInstallButton();
+    });
+    window.addEventListener("appinstalled", () => {
+      deferredInstallPrompt = null;
+      hideInstallButton();
+    });
+  }
+  initPwaInstallPrompt();
+
   // meridian/static/dashboard-blog.ts
   var _BLOG_STATUSES = ["draft", "published", "archived"];
   function blogEditorFormHtml(projectId, post) {
@@ -11241,7 +11292,7 @@ Existing folders: ${existing.join(", ")}` : "";
     const folder = (next || "").trim();
     toast(folder ? `Moved to folder "${folder}"` : `Moved to ${UNGROUPED_LABEL}`);
   }
-  async function _makeSubproject(t3) {
+  async function _makeSubproject(t3, anchor) {
     const candidates = eligibleParents(state.projects, t3.id);
     if (!candidates.length) {
       if (state.projects.some((p3) => p3.parent_project_id === t3.id)) {
@@ -11251,35 +11302,65 @@ Existing folders: ${existing.join(", ")}` : "";
       }
       return;
     }
-    const lines = candidates.map((p3, i3) => `${i3 + 1}. ${p3.name}`).join("\n");
-    const raw = window.prompt(
-      `Make "${t3.project.name}" a subproject of which project?
-
-${lines}
-
-Enter a number (or leave blank to cancel):`,
-      ""
-    );
-    if (raw === null) return;
-    const idx = parseInt(raw.trim(), 10) - 1;
-    if (Number.isNaN(idx) || idx < 0 || idx >= candidates.length) {
-      if (raw.trim() !== "") toast("Invalid selection", true);
-      return;
+    document.querySelectorAll(".subproject-parent-picker").forEach((d3) => d3.remove());
+    const sel = document.createElement("select");
+    sel.className = "subproject-parent-picker";
+    sel.style.cssText = "position:fixed;z-index:1002;background:var(--surface-2);color:var(--text);font-size:11px;font-family:var(--font-mono);border:1px solid var(--border);border-radius:4px;padding:4px 6px;cursor:pointer;outline:none;box-shadow:0 4px 12px rgba(0,0,0,0.4)";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = `Make "${t3.project.name}" a subproject of\u2026`;
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    sel.appendChild(placeholder);
+    candidates.forEach((p3) => {
+      const opt = document.createElement("option");
+      opt.value = p3.id;
+      opt.textContent = p3.name || "";
+      sel.appendChild(opt);
+    });
+    const rect = anchor && typeof anchor.getBoundingClientRect === "function" ? anchor.getBoundingClientRect() : { left: 0, bottom: 0, width: 200 };
+    sel.style.left = rect.left + "px";
+    sel.style.top = rect.bottom + 4 + "px";
+    sel.style.minWidth = Math.max(rect.width, 200) + "px";
+    document.body.appendChild(sel);
+    sel.focus({ preventScroll: true });
+    if (typeof sel.showPicker === "function") {
+      try {
+        sel.showPicker();
+      } catch (_2) {
+        sel.click();
+      }
+    } else {
+      sel.click();
     }
-    const parent = candidates[idx];
-    try {
-      await api(`/projects/${t3.id}/parent`, {
-        method: "POST",
-        body: JSON.stringify({ parent_project_id: parent.id })
-      });
-      t3.project = { ...t3.project, parent_project_id: parent.id };
-      const proj = state.projects.find((p3) => p3.id === t3.id);
-      if (proj) proj.parent_project_id = parent.id;
-      await loadProjects();
-      toast(`"${t3.project.name}" is now a subproject of "${parent.name}"`);
-    } catch (e3) {
-      toast("Could not set parent: " + e3.message, true);
-    }
+    let pickerRemoved = false;
+    const removeSel = () => {
+      if (pickerRemoved) return;
+      pickerRemoved = true;
+      try {
+        sel.remove();
+      } catch (_2) {
+      }
+    };
+    sel.onblur = () => removeSel();
+    sel.onchange = async () => {
+      const parent = candidates.find((p3) => p3.id === sel.value);
+      removeSel();
+      if (!parent) return;
+      try {
+        await api(`/projects/${t3.id}/parent`, {
+          method: "POST",
+          body: JSON.stringify({ parent_project_id: parent.id })
+        });
+        t3.project = { ...t3.project, parent_project_id: parent.id };
+        const proj = state.projects.find((p3) => p3.id === t3.id);
+        if (proj) proj.parent_project_id = parent.id;
+        await loadProjects();
+        toast(`"${t3.project.name}" is now a subproject of "${parent.name}"`);
+      } catch (e3) {
+        toast("Could not set parent: " + e3.message, true);
+      }
+    };
   }
   async function _detachSubproject(t3) {
     try {
@@ -11473,7 +11554,7 @@ Enter a number (or leave blank to cancel):`,
     if (t3.project && t3.project.parent_project_id) {
       menuItem("\u2934 Detach from parent", () => _detachSubproject(t3));
     } else {
-      menuItem("\u{1F517} Make subproject of\u2026", () => _makeSubproject(t3));
+      menuItem("\u{1F517} Make subproject of\u2026", () => _makeSubproject(t3, anchor));
     }
     menuItem("\u2B07 Download DB", () => window.open("/admin/snapshot", "_blank"));
     menuItem("\u{1F5D1} Delete project\u2026", () => _deleteProject(t3));
@@ -17774,8 +17855,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       } catch (_2) {
       }
     }
-    _checkGitStatus();
-    setInterval(_checkGitStatus, 6e4);
+    if (!isHostedMode() && !isDemoMode()) {
+      _checkGitStatus();
+      setInterval(_checkGitStatus, 6e4);
+    }
     const workspaceEntry = document.getElementById("workspace-entry");
     if (workspaceEntry) {
       workspaceEntry.onclick = () => {

@@ -1,6 +1,7 @@
 """Hooks, connections, and script-serving routes."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -8,8 +9,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from .._deps import _hosted_mode
+from .._deps import _db, _hosted_mode
+from .. import db as db_module
+from .. import guard_core as guard_core_module
 from .. import hook_paths as hook_paths_module
+from .. import session_brief as session_brief_module
+from ..session_brief import build_server_section
 
 router = APIRouter()
 
@@ -170,6 +175,16 @@ async def get_hooks_diagnostics() -> dict[str, Any]:
     ``settings_found: false`` with an empty ``hooks`` list rather than a
     404/500, since a diagnostics endpoint must never itself become a source
     of failure for a session that polls it during orientation.
+
+    55d48d69 -- ``guard`` reports the Meridian guard: whether it is
+    registered, whether every registered shim's runtime resolves, the
+    effective mode (``off`` / ``advisory`` / ``enforce``, from
+    ``MERIDIAN_GUARD`` and the owner's sentinel files) and the disabled
+    rules. ``status`` folds that into one word: ``not_installed``, ``off``,
+    ``runtime_missing``, ``advisory`` or ``enforce``. The guard fails open
+    when its runtime is missing, so this is where a broken install shows up.
+    Mode and runtime are computed from THIS server process's environment,
+    which can differ from the Claude Code session that runs the hooks.
     """
     repo_root = hook_paths_module.resolve_active_repo_root(cwd=str(Path.cwd()))
     settings_path = (repo_root / ".claude" / "settings.json") if repo_root else None
@@ -180,9 +195,10 @@ async def get_hooks_diagnostics() -> dict[str, Any]:
             "repo_root": str(repo_root) if repo_root else None,
             "hooks": [],
             "missing_required_count": 0,
+            "guard": _guard_status([]),
         }
     diagnostics = hook_paths_module.diagnose_configured_hooks(
-        settings_path, repo_root=repo_root
+        settings_path, repo_root=repo_root, guard_dir=_guard_state_dir()
     )
     missing_required = [
         d for d in diagnostics
@@ -194,7 +210,117 @@ async def get_hooks_diagnostics() -> dict[str, Any]:
         "repo_root": str(repo_root),
         "hooks": diagnostics,
         "missing_required_count": len(missing_required),
+        "guard": _guard_status(diagnostics),
     }
+
+
+def _guard_state_dir() -> str | None:
+    """The guard dir the brief shim reads ``config.json`` from (fail-soft)."""
+    try:
+        return session_brief_module.guard_dir(dict(os.environ))
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        return None
+
+
+def _guard_status(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize the Meridian guard for /hooks/diagnostics. Never raises."""
+    summary = hook_paths_module.summarize_guard(diagnostics)
+    try:
+        env = dict(os.environ)
+        summary["mode"] = guard_core_module.guard_mode(env)
+        summary["disabled_rules"] = sorted(
+            guard_core_module.disabled_rules(env), key=lambda r: int(r[1:])
+        )
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        summary["mode"] = None
+        summary["disabled_rules"] = []
+    if not summary["registered"]:
+        status = "not_installed"
+    elif summary["mode"] == "off":
+        status = "off"
+    elif not summary["runtime_ok"]:
+        status = "runtime_missing"
+    else:
+        status = summary["mode"] or "unknown"
+    summary["status"] = status
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Session-brief server section (55d48d69, guard rule G15)
+# ---------------------------------------------------------------------------
+
+_PRIORITY_RANK = {"critical": 0, "urgent": 0, "high": 1, "medium": 2, "normal": 2, "low": 3}
+
+@router.get("/projects/{project_id}/session-brief")
+async def get_project_session_brief(
+    project_id: str, request: Request, max_chars: int = 2000
+) -> dict[str, Any]:
+    """55d48d69 -- the optional, UNTRUSTED server section of the SessionStart brief.
+
+    ``.claude/hooks/meridian_guard_brief.*`` (via ``meridian.session_brief``)
+    asks for this on a loopback URL with a 1.5 s budget and labels it as
+    untrusted board data. It is built from a FIXED set of fields -- project
+    name, north star, sprint headline, pending / in-progress / pending-HITL
+    counts and the top pending item titles -- never from execution_policy,
+    pending_goal, agent instructions, note bodies or document content, and
+    every line that looks like an execution directive is dropped
+    (``session_brief.build_server_section``). ``max_chars`` is clamped to
+    [100, 4000] rather than rejected so the hook never gets a 422.
+
+    Each fact is gathered independently: a failing sub-query just omits that
+    line instead of turning the whole brief into a 500.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    facts: dict[str, Any] = {"project_name": project.get("name")}
+    try:
+        goal = await db_module.get_goal(db, project_id)
+        if isinstance(goal, dict):
+            facts["north_star"] = goal.get("north_star")
+            facts["sprint"] = goal.get("sprint")
+    except Exception:  # noqa: BLE001 - optional fact
+        pass
+    try:
+        facts["pending_count"] = int(await db_module.count_pending_sprint_items(db, project_id))
+    except Exception:  # noqa: BLE001 - optional fact
+        pass
+    try:
+        facts["in_progress_count"] = len(
+            await db_module.get_sprint_items(db, project_id, status="in_progress")
+        )
+    except Exception:  # noqa: BLE001 - optional fact
+        pass
+    try:
+        facts["hitl_pending_count"] = len(
+            await db_module.list_hitl_requests(db, project_id, status="pending", limit=50)
+        )
+    except Exception:  # noqa: BLE001 - optional fact
+        pass
+    try:
+        # Claimable not-yet-started work: both not-done "open" statuses
+        # (add_sprint_item creates ``todo``), each list already highest-
+        # priority-first; a stable sort on the priority rank merges them.
+        open_items: list[dict[str, Any]] = []
+        for status in ("pending", "todo"):
+            open_items.extend(
+                it for it in await db_module.get_sprint_items(
+                    db, project_id, status=status, show_blocked=False, include_deferred=False
+                )
+                if isinstance(it, dict)
+            )
+        open_items.sort(key=lambda it: _PRIORITY_RANK.get(str(it.get("priority") or "").lower(), 2))
+        facts["top_pending"] = [
+            {"id": it.get("id"), "title": it.get("title"), "priority": it.get("priority")}
+            for it in open_items[:5]
+        ]
+    except Exception:  # noqa: BLE001 - optional fact
+        pass
+    out = build_server_section(facts, max_chars)
+    out["project_id"] = project_id
+    return out
 
 
 # ---------------------------------------------------------------------------

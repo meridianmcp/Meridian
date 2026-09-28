@@ -8,7 +8,39 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # @meridianmcp/mcp now ships the meridian-latex engine as a real subpath
+  # (@meridianmcp/mcp/latex, via npm/scripts/bundle-latex.mjs's prepack
+  # step) and a second bin (meridian-latex), not a separate npm package --
+  # see workspace decision superseding 66089b95. This job gates `publish`
+  # on BOTH: the full, comprehensive functional suite (186 tests) running
+  # against the original source at extensions/meridian-latex/engine/
+  # (unchanged, still the source of truth), AND npm/'s own `npm test`
+  # (bundle-latex.mjs + a smoke import of the bundled output), which
+  # exercises the actual bundling mechanism a real publish depends on --
+  # not just the source it copies from. node-version '22' matches
+  # better-sqlite3's real engines floor (confirmed directly against its
+  # package.json) -- the OLD Node 20 pin here would only print a
+  # non-fatal EBADENGINE warning, not fail, but running on an engine the
+  # dependency itself declares unsupported is worth just not doing.
+  test-latex:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - name: Full meridian-latex functional suite (source of truth)
+        run: npm test
+        working-directory: extensions/meridian-latex/engine
+      - name: npm/ bundle + smoke test (the actual publish-time mechanism)
+        run: npm test
+        working-directory: npm
+
   publish:
+    needs: test-latex
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # needed for OIDC auth to MCP registry
@@ -18,7 +50,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Set version from tag

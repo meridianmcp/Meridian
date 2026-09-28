@@ -7892,6 +7892,8 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
     import asyncio
     from datetime import datetime, timezone
 
+    from meridian import _deps
+
     monkeypatch.setenv("MERIDIAN_HOSTED", "true")
     # Defensively blank a real Neon admin URL a dev .env might supply — the
     # owner tenant below is 'admin' plan specifically so the cross-workspace
@@ -7905,6 +7907,10 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
         await db.execute("UPDATE tenants SET plan='admin' WHERE id=?", (owner["id"],))
         member = await db_module.upsert_tenant(db, "batchdel-member@example.com")
         raw, _ = await db_module.create_api_token(db, member["id"])
+        # ece2ac0a — hosted mode now 401s anonymous callers instead of serving
+        # them the control-plane DB, so the owner's own checks below
+        # authenticate with the owner's API token (admin plan -> this same DB).
+        owner_raw, _ = await db_module.create_api_token(db, owner["id"])
         proj = await db_module.create_project(db, "batchdel-owner-proj")
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         await db.execute(
@@ -7915,10 +7921,12 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
              "member", "read", now),
         )
         await db.commit()
-        return owner["id"], raw, proj["id"]
+        return owner["id"], raw, owner_raw, proj["id"]
 
-    owner_id, member_token, pid = asyncio.run(_setup())
+    owner_id, member_token, owner_token, pid = asyncio.run(_setup())
+    monkeypatch.setitem(_deps._tenant_db_cache, owner_id, db)
     hdr = {"Authorization": f"Bearer {member_token}", "X-Workspace-Tenant-Id": owner_id}
+    owner_hdr = {"Authorization": f"Bearer {owner_token}"}
 
     # A 'member' has PERM_WRITE but not PERM_SETTINGS — the batch delete
     # of the owner's project must be rejected.
@@ -7927,14 +7935,14 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
     assert "settings" in r.text.lower()
 
     # The project must survive the rejected attempt.
-    assert client.get(f"/projects/{pid}").status_code == 200
+    assert client.get(f"/projects/{pid}", headers=owner_hdr).status_code == 200
 
-    # Sanity: the batch endpoint still works normally for a same-workspace /
-    # self-hosted caller (no cross-workspace header → no gate, per
-    # _enforcement_context's own no-header fast path).
-    r2 = client.delete("/projects", params={"project_id": [pid]})
+    # Sanity: the batch endpoint still works normally for the workspace's own
+    # owner (no cross-workspace header → no gate, per _enforcement_context's
+    # own no-header fast path).
+    r2 = client.delete("/projects", params={"project_id": [pid]}, headers=owner_hdr)
     assert r2.status_code == 200, r2.text
-    assert client.get(f"/projects/{pid}").status_code == 404
+    assert client.get(f"/projects/{pid}", headers=owner_hdr).status_code == 404
 
 
 def test_dashboard_js_has_project_mgmt(client):
@@ -8558,10 +8566,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_remote_tasks",
         "_migrate_pg_repo_identity",
         "_migrate_pg_docx_derivatives",
+        "_migrate_pg_sprint_item_lock_session_id",
+        "_migrate_pg_sprint_item_coarse_lock_files",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 171
+    assert len(allnames) == len(set(allnames)) == 173
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -9058,8 +9068,94 @@ async def test_get_tasks_includes_human_id(db):
     assert t["session_name"] == "test-session"
 
 
-def test_git_status_endpoint_returns_shape(client):
-    """GET /admin/git-status returns ok and behind fields; warning present when ok=True."""
+def test_git_status_endpoint_returns_shape(client, monkeypatch):
+    """GET /admin/git-status returns ok/behind/warning shape.
+
+    CI-PERF-2: fast unit test — mocks the 5 ``git`` subprocess calls (and the
+    ``git fetch origin`` network call among them) that ``admin.git_status``
+    makes, so this test never touches the network or spawns a real process.
+    Covers both success shapes (behind==0 -> warning None; behind>0 -> warning
+    a string) plus the exception fallback shape. See
+    ``test_git_status_endpoint_returns_shape_real_subprocess`` below for the
+    real-subprocess/network integration counterpart.
+    """
+    import subprocess as sp
+
+    def _fake_run(cmd, **kwargs):
+        assert cmd[0] == "git"
+        if cmd[1] == "fetch":
+            return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1:4] == ["rev-list", "--left-right", "--count"]:
+            return sp.CompletedProcess(cmd, 0, stdout="0\t2\n", stderr="")
+        if cmd[1:3] == ["rev-parse", "--abbrev-ref"]:
+            return sp.CompletedProcess(cmd, 0, stdout="dev\n", stderr="")
+        if cmd[-1] == "HEAD":
+            return sp.CompletedProcess(cmd, 0, stdout="abc1234\n", stderr="")
+        if cmd[-1] == "@{upstream}":
+            return sp.CompletedProcess(cmd, 0, stdout="def5678\n", stderr="")
+        raise AssertionError(f"unexpected git invocation in mocked test: {cmd}")
+
+    monkeypatch.setattr(sp, "run", _fake_run)
+    r = client.get("/admin/git-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {
+        "ok": True,
+        "branch": "dev",
+        "ahead": 0,
+        "behind": 2,
+        "local_hash": "abc1234",
+        "remote_hash": "def5678",
+        "up_to_date": False,
+        "warning": "2 commit(s) behind origin/dev",
+    }
+
+
+def test_git_status_endpoint_returns_shape_up_to_date_no_warning(client, monkeypatch):
+    """Same success path, but behind==0 -> warning must be None (not absent)."""
+    import subprocess as sp
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[1:4] == ["rev-list", "--left-right", "--count"]:
+            return sp.CompletedProcess(cmd, 0, stdout="0\t0\n", stderr="")
+        return sp.CompletedProcess(cmd, 0, stdout="deadbee\n", stderr="")
+
+    monkeypatch.setattr(sp, "run", _fake_run)
+    r = client.get("/admin/git-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["behind"] == 0
+    assert body["up_to_date"] is True
+    assert body["warning"] is None
+
+
+def test_git_status_endpoint_returns_shape_on_subprocess_error(client, monkeypatch):
+    """Any exception (e.g. git not installed / not a repo) -> ok=False shape,
+    never a 500 -- the endpoint's own try/except contract."""
+    import subprocess as sp
+
+    def _fake_run(cmd, **kwargs):
+        raise FileNotFoundError("git executable not found")
+
+    monkeypatch.setattr(sp, "run", _fake_run)
+    r = client.get("/admin/git-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["behind"] == 0
+    assert body["ahead"] == 0
+    assert isinstance(body["error"], str) and body["error"]
+
+
+@pytest.mark.subprocess_isolated
+def test_git_status_endpoint_returns_shape_real_subprocess(client):
+    """CI-PERF-2 integration counterpart: exercises the real ``git`` subprocess
+    calls (including a real ``git fetch origin`` network round-trip) against
+    this checkout. Marked subprocess_isolated (existing repo convention — see
+    pytest.ini) since it spawns real OS subprocesses and does real network
+    I/O, so it runs serially outside the main -n auto sweep instead of being
+    mocked like the fast unit tests above."""
     r = client.get("/admin/git-status")
     assert r.status_code == 200
     body = r.json()
@@ -9432,6 +9528,54 @@ def test_dashboard_js_renders_session_summary_in_live_tab(client):
     js = dashboard_source()
     assert "session_summary" in js, "renderLiveSessions must use session_summary"
     assert "active_only=false" in js, "LIVE tab must fetch with active_only=false"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_devlog_write_never_touches_real_repo(db, tmp_path):
+    """Regression for a real bug found 2026-09-15: a test using the bare
+    ``db`` fixture (no ``client``) that calls checkpoint() with a completed
+    task reaches server._finalize_session_md -> md_anchors.apply_append,
+    which falls back to the REAL repo root when MERIDIAN_MD_ROOT is unset --
+    silently appending to this checkout's actual DEVLOG.md and creating a
+    real git commit as a side effect of running the test suite. Confirmed
+    live in a cherry-pick landing worktree (two stray "docs: meridian
+    auto-update" commits with fixture session names baked into real
+    DEVLOG.md history). The fix is the autouse `_isolate_md_root` fixture in
+    conftest.py; this test verifies the write actually lands under
+    MERIDIAN_MD_ROOT (tmp_path here), never under the real repo, independent
+    of that autouse fixture continuing to exist."""
+    import meridian.server as srv
+    from meridian import md_anchors as md_anchors_module
+
+    # md_root()'s OWN fallback formula when MERIDIAN_MD_ROOT is unset -- but
+    # this test's autouse _isolate_md_root fixture already sets that env var
+    # (like every test), so calling md_root() here would just return
+    # tmp_path too. Replicate the no-override formula directly to get the
+    # REAL repo path this bug used to write to.
+    real_repo_devlog = Path(md_anchors_module.__file__).resolve().parent.parent / "DEVLOG.md"
+    real_repo_mtime_before = real_repo_devlog.stat().st_mtime if real_repo_devlog.exists() else None
+
+    p = await db_module.create_project(db, "ckpt-devlog-isolation-test")
+    s = await db_module.register_session(db, p["id"], "ckpt-devlog-isolation-session")
+    await db_module.log_task(db, s["id"], p["id"], "Did something devlog-worthy", status="done")
+    await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": p["id"]}, db, str(tmp_path)
+    )
+
+    # The write must land under MERIDIAN_MD_ROOT (== tmp_path, via the
+    # autouse _isolate_md_root fixture), never the real repo.
+    isolated_devlog = tmp_path / "DEVLOG.md"
+    assert isolated_devlog.exists(), "checkpoint's DEVLOG append should land under MERIDIAN_MD_ROOT"
+    assert "ckpt-devlog-isolation-session" in isolated_devlog.read_text(encoding="utf-8")
+
+    # The real repo's DEVLOG.md must be untouched by this test.
+    if real_repo_mtime_before is None:
+        assert not real_repo_devlog.exists() or "ckpt-devlog-isolation-session" not in real_repo_devlog.read_text(encoding="utf-8")
+    else:
+        assert real_repo_devlog.stat().st_mtime == real_repo_mtime_before, (
+            "checkpoint must never write to the real repo's DEVLOG.md during tests"
+        )
+        assert "ckpt-devlog-isolation-session" not in real_repo_devlog.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -11273,6 +11417,63 @@ async def test_g210_is_internal_backfill_and_churn_cleanup_skip():
             "SELECT id FROM tenants WHERE id = 't-internal'"
         ) as cur:
             assert (await cur.fetchone()) is not None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_churn_cleanup_drops_only_the_tenants_own_database(monkeypatch):
+    """Real bug found 2026-09-20 (never triggered in production -- this
+    function is dead code, never wired to any scheduler/startup hook):
+    run_churn_cleanup used to DELETE THE WHOLE NEON PROJECT on a churned
+    tenant's day-28 cleanup. Under the pool architecture a Neon project is
+    SHARED by up to 8 different tenants' own databases -- deleting it would
+    have destroyed every other tenant sharing that pool alongside the one
+    that actually churned. This asserts the fix: cleanup now calls the same
+    tenant-scoped _drop_tenant_neon_database the real, live delete_account
+    endpoint already uses correctly, and decrements the pool's customer
+    count -- never a whole-project delete.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from meridian import hosted as hosted_module
+
+    db = await db_module.init_db(":memory:")
+    try:
+        old_iso = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat().replace("+00:00", "Z")
+        await db.execute(
+            "INSERT INTO tenants (id, email, neon_project_id, pool_project_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("t-churned", "churned@example.com", "shared-pool-proj", "pool-row-1", old_iso),
+        )
+        await db.commit()
+
+        dropped = []
+
+        async def _fake_drop(tenant):
+            dropped.append(tenant["id"])
+
+        decremented = []
+
+        async def _fake_decrement(_db, neon_project_id):
+            decremented.append(neon_project_id)
+
+        monkeypatch.setattr(hosted_module, "_drop_tenant_neon_database", _fake_drop)
+        monkeypatch.setattr(db_module, "decrement_pool_project_count", _fake_decrement)
+
+        await hosted_module.run_churn_cleanup(db)
+
+        assert dropped == ["t-churned"], "must drop via the tenant-scoped helper, not a raw project DELETE"
+        assert decremented == ["shared-pool-proj"], "pool slot must be freed"
+
+        async with db.execute(
+            "SELECT neon_project_id, pool_project_id FROM tenants WHERE id='t-churned'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["neon_project_id"] is None
+        assert row["pool_project_id"] is None
     finally:
         await db.close()
 

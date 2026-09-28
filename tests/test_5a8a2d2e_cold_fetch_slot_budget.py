@@ -108,11 +108,30 @@ def test_cold_fetch_slots_here_match_the_client_side_source_of_truth():
 # 2. _fetch_slot_tools — budget-exhaustion-bound retries, not attempt-count-bound
 # ---------------------------------------------------------------------------
 
-def test_fetch_slot_tools_uses_the_full_explicit_budget_for_retries():
+def test_fetch_slot_tools_uses_the_full_explicit_budget_for_retries(monkeypatch):
     """A slot that fails many times before succeeding — more than the OLD
     hardcoded 4-attempt cap would ever allow — still succeeds when a large
     explicit budget is supplied, because the retry loop is now bound by the
     budget itself rather than a fixed attempt count."""
+    # CI-PERF-3A: the 0.5s inter-retry sleep inside _fetch_slot_tools is not
+    # itself under test here (the large 60s cold budget is what's being
+    # proven sufficient) — real time only comes from waiting out 8 real
+    # 0.5s sleeps between the flaky mock's attempts. Collapse that real
+    # wait to (near-)instant; the loop is still budget-bound (never hits
+    # `remaining <= 0` since the 60s budget vastly exceeds elapsed
+    # wall-clock time either way), so the exact same 9 calls / same
+    # success-on-the-9th-attempt behavior is exercised, just fast. Safe to
+    # patch globally: asyncio.wait_for's own timeout mechanism does not go
+    # through asyncio.sleep.
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(delay, *a, **k):
+        if delay and delay >= 0.5:
+            return await _real_sleep(0, *a, **k)
+        return await _real_sleep(delay, *a, **k)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
     tn._tunnel_docs_sockets["t-cold-docs"] = object()
     calls = {"n": 0}
 
@@ -200,8 +219,14 @@ def test_genuinely_dead_slot_still_reports_empty_within_a_large_budget():
     tn_mod._do_proxy = always_fails
     try:
         start = time.monotonic()
+        # CI-PERF-3A: `budget` is a plain call-site parameter of
+        # _fetch_slot_tools — shrink the explicit value passed here (it was
+        # already deliberately smaller than the cold budget) instead of
+        # waiting out a real ~2s retry loop; the mechanism under test
+        # (bounded near whatever budget is supplied, not a runaway wait) is
+        # unaffected by the budget's magnitude.
         label, tools = asyncio.run(
-            tn._fetch_slot_tools("t-dead-ppt", "ppt", budget=2.0)
+            tn._fetch_slot_tools("t-dead-ppt", "ppt", budget=0.05)
         )
         elapsed = time.monotonic() - start
     finally:
@@ -209,13 +234,19 @@ def test_genuinely_dead_slot_still_reports_empty_within_a_large_budget():
 
     assert label == "ppt"
     assert tools == []
-    assert elapsed < 3.0  # bounded near the small explicit budget, not runaway
+    assert elapsed < 1.0  # bounded near the small explicit budget, not runaway
 
 
-def test_default_budget_behavior_is_unchanged_when_no_budget_is_passed():
+def test_default_budget_behavior_is_unchanged_when_no_budget_is_passed(monkeypatch):
     """Omitting ``budget`` entirely must behave exactly as before — the flat
     ``_SLOT_TOOLS_FETCH_BUDGET`` — for backward compatibility with every
     existing caller that doesn't opt in to the cold-fetch-aware budget."""
+    # CI-PERF-3A: _SLOT_TOOLS_FETCH_BUDGET is already a monkeypatchable
+    # module constant (routes/tunnel.py) — shrink it so this test doesn't
+    # actually wait out the real 4s default budget; the mechanism under test
+    # (the flat default is used, and is wall-clock bounded, when no explicit
+    # budget is passed) is timeout-magnitude independent.
+    monkeypatch.setattr(tn, "_SLOT_TOOLS_FETCH_BUDGET", 0.05)
     tn._tunnel_code_sockets["t-slow-default"] = object()
 
     async def hangs(

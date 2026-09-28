@@ -304,15 +304,22 @@ async def get_document_peeks_endpoint(request: Request) -> dict[str, Any]:
     'Recently viewed (not saved)' section so stateless peeks stop being invisible.
     """
     from .. import doc_peeks  # noqa: PLC0415
-    from .._deps import _hosted_mode  # noqa: PLC0415
+    from .._deps import _get_tenant_from_request, _hosted_mode  # noqa: PLC0415
     scope = None
     if _hosted_mode():
+        # ece2ac0a — hosted callers only ever see their OWN tenant bucket. An
+        # unresolved caller (demo cookie, or a failed lookup) used to fall back
+        # to scope=None, i.e. the shared process-wide "local" bucket that the
+        # self-hosted single user owns; now they get an empty list instead.
+        # Session cookie OR Bearer token (was cookie-only, so API-token callers
+        # also landed in the shared bucket).
         try:
-            from ..hosted import get_current_tenant  # noqa: PLC0415
-            tenant = await get_current_tenant(request)
-            scope = (tenant or {}).get("id")
-        except Exception:  # noqa: BLE001 — unauthenticated → empty local scope
-            scope = None
+            tenant = await _get_tenant_from_request(request)
+        except Exception:  # noqa: BLE001 — lookup failure → nothing, never the shared bucket
+            tenant = None
+        scope = (tenant or {}).get("id")
+        if not scope:
+            return {"peeks": []}
     return {"peeks": doc_peeks.get_peeks(scope)}
 
 

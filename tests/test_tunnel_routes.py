@@ -17,6 +17,7 @@ Two layers are covered:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import types
 import uuid
@@ -399,7 +400,9 @@ def test_tunnel_status_reports_config_generation_and_drain_safety(monkeypatch, t
         me = client.get("/me", headers=hdr)
         tenant_id = me.json()["tenant_id"]
 
-        status = client.get(f"/tunnel/status/{tenant_id}")
+        # 4bea8629 — /tunnel/status/{tenant_id} now requires the caller be
+        # the named tenant in hosted mode; pass the owner's own credential.
+        status = client.get(f"/tunnel/status/{tenant_id}", headers=hdr)
         assert status.status_code == 200
         body = status.json()
         assert body["safe_to_restart"] is True
@@ -468,7 +471,8 @@ def test_tunnel_status_includes_profile_binding(monkeypatch, tmp_path):
         me = client.get("/me", headers=hdr)
         tenant_id = me.json()["tenant_id"]
 
-        status = client.get(f"/tunnel/status/{tenant_id}")
+        # 4bea8629 — auth now required in hosted mode; use the owner's own credential.
+        status = client.get(f"/tunnel/status/{tenant_id}", headers=hdr)
         assert status.status_code == 200
         binding = status.json()["profile_binding"]
         assert binding is not None
@@ -482,14 +486,15 @@ def test_tunnel_status_profile_binding_reflects_configured_workspace_layer(monke
         me = client.get("/me", headers=hdr)
         tenant_id = me.json()["tenant_id"]
 
-        before = client.get(f"/tunnel/status/{tenant_id}").json()["profile_binding"]
+        # 4bea8629 — auth now required in hosted mode; use the owner's own credential.
+        before = client.get(f"/tunnel/status/{tenant_id}", headers=hdr).json()["profile_binding"]
 
         from meridian import db as db_module
         _run(db_module.set_profile_layer(
             client.app.state.db, "workspace", "singleton", fields={"auto_worktrees": 0},
         ))
 
-        after = client.get(f"/tunnel/status/{tenant_id}").json()["profile_binding"]
+        after = client.get(f"/tunnel/status/{tenant_id}", headers=hdr).json()["profile_binding"]
         assert before["generation_key"] != after["generation_key"]
 
 
@@ -1231,3 +1236,181 @@ def test_active_repo_route_still_accepts_header_token(monkeypatch):
     ))
     assert resp.status_code == 200
     assert tn._tenant_active_repo.get(tenant_id) == "/worktrees/W"
+
+
+# ---------------------------------------------------------------------------
+# 5de3d422 — SECURITY FIX regression tests: the 10 HTTP MCP proxy routes
+# (fs/code/extract/ppt/word/dc/docs/zotero/outputs/debug, each registered
+# twice -- base path + /{rest:path}) previously took `tenant_id` straight
+# from the URL with ZERO authentication and explicitly stripped the client's
+# own Authorization header before forwarding it downstream. Anyone who knew
+# or guessed a tenant_id was proxied straight into that tenant's local
+# fs/code/docs/outputs/etc. process. `_authorize_tunnel_proxy_caller` closes
+# this by resolving the caller's own tenant via `_get_tenant_from_request`
+# (session cookie or bearer token) and hard-requiring it match the path's
+# tenant_id, mirroring tunnel_ws's existing WS-side check.
+# ---------------------------------------------------------------------------
+
+class _FakeProxyReq:
+    """Minimal Starlette Request stand-in for the HTTP MCP proxy route
+    wrappers (fs/code/extract/ppt/word/dc/docs/zotero/outputs/debug)."""
+
+    def __init__(self, path, query="", method="POST", headers=None, body=b"{}"):
+        self.method = method
+        self.headers = headers or {}
+        self.url = types.SimpleNamespace(path=path, query=query)
+        self._body = body
+        # 5fe96405 — _authorize_tunnel_proxy_caller's 401 now builds a
+        # WWW-Authenticate resource_metadata URL from request.base_url.
+        self.base_url = "https://usemeridian.us/"
+
+    async def body(self):
+        return self._body
+
+
+class _FakeTunnelSocket:
+    """Resolves the pending future inline when sent to (like the bridge
+    tests' `_FakeWS`) AND logs every `send_json` call, so a test can prove
+    both a genuine successful roundtrip and that a rejected/cross-tenant
+    request never even touched the socket."""
+
+    def __init__(self, pending, response):
+        self._pending = pending
+        self._response = response
+        self.sent = []
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+        fut = self._pending.get(payload["id"])
+        if fut is not None and not fut.done():
+            fut.set_result({**self._response, "id": payload["id"]})
+
+
+_PROXY_OWNER_TOKEN = "tok-owner"
+_PROXY_OTHER_TOKEN = "tok-other"
+_PROXY_OWNER_TENANT = "owner-tenant"
+_PROXY_OTHER_TENANT = "other-tenant"
+
+
+def _patch_proxy_auth(monkeypatch):
+    """Stub `_get_tenant_from_request` (the helper `_authorize_tunnel_proxy_caller`
+    actually calls -- NOT `_resolve_tenant_from_token`, which is a different
+    helper used only by the 3 plain-HTTP control routes) against a tiny fake
+    tenant table, so the proxy routes' new tenant-ownership check can be
+    exercised without a real hosted DB. Mirrors `_patch_manifest_auth` above
+    for that other helper."""
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    tokens = {_PROXY_OWNER_TOKEN: _PROXY_OWNER_TENANT, _PROXY_OTHER_TOKEN: _PROXY_OTHER_TENANT}
+
+    async def fake_get_tenant(request, **kwargs):
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        tenant_id = tokens.get(auth[len("Bearer "):])
+        return {"id": tenant_id} if tenant_id else None
+
+    monkeypatch.setattr(tn, "_get_tenant_from_request", fake_get_tenant)
+
+
+@pytest.mark.parametrize("route_name,path_tpl,is_subpath", [
+    # fs's own two handlers duplicate the guard inline (no shared helper).
+    ("fs_mcp_proxy", "/fs/mcp/{tid}", False),
+    ("fs_mcp_proxy_subpath", "/fs/mcp/{tid}/mcp", True),
+    # _code_proxy and _extract_proxy each have their own single choke point.
+    ("code_mcp_proxy", "/code/mcp/{tid}", False),
+    ("extract_mcp_proxy", "/extract/mcp/{tid}", False),
+    # _office_proxy is the ONE shared helper behind ppt/word/dc/docs/zotero/
+    # outputs/debug -- sampling two of its callers (base + subpath) exercises
+    # that shared code path without needing all 7*2 registrations individually.
+    ("ppt_mcp_proxy", "/ppt/mcp/{tid}", False),
+    ("docs_mcp_proxy_subpath", "/docs/mcp/{tid}/list", True),
+])
+def test_mcp_proxy_routes_enforce_tenant_ownership(monkeypatch, route_name, path_tpl, is_subpath):
+    """A request with no credential, or with a DIFFERENT tenant's valid
+    credential, must be rejected (401) even though the URL names the owning
+    tenant_id; the OWNING tenant's own credential must pass the auth gate and
+    reach the proxy layer (never 401)."""
+    _patch_proxy_auth(monkeypatch)
+    path = path_tpl.format(tid=_PROXY_OWNER_TENANT)
+    func = getattr(tn, route_name)
+
+    def call(headers):
+        req = _FakeProxyReq(path, headers=headers)
+        if is_subpath:
+            rest = path.split(f"{_PROXY_OWNER_TENANT}/", 1)[1]
+            return asyncio.run(func(_PROXY_OWNER_TENANT, rest, req))
+        return asyncio.run(func(_PROXY_OWNER_TENANT, req))
+
+    no_auth = call({})
+    assert no_auth.status_code == 401, f"{route_name}: unauthenticated request must be rejected"
+
+    cross_tenant = call({"authorization": f"Bearer {_PROXY_OTHER_TOKEN}"})
+    assert cross_tenant.status_code == 401, (
+        f"{route_name}: a different tenant's valid credential must not be "
+        f"proxied into {_PROXY_OWNER_TENANT}'s tunnel just because the URL names it"
+    )
+
+    owned = call({"authorization": f"Bearer {_PROXY_OWNER_TOKEN}"})
+    assert owned.status_code != 401, f"{route_name}: the owning tenant's own credential must authenticate"
+
+
+def test_fs_mcp_proxy_owning_tenant_forwards_and_roundtrips(monkeypatch):
+    """Beyond 'not 401': the owning tenant's authenticated request must
+    actually reach and round-trip through that tenant's connected tunnel
+    socket -- the auth gate must not become a dead end for legitimate use."""
+    _patch_proxy_auth(monkeypatch)
+    response = {
+        "status": 200,
+        "headers": {"content-type": "application/json"},
+        "body": base64.b64encode(b'{"ok":true}').decode(),
+    }
+    sock = _FakeTunnelSocket(tn._pending_reqs, response)
+    tn._tunnel_sockets[_PROXY_OWNER_TENANT] = sock
+    try:
+        req = _FakeProxyReq(f"/fs/mcp/{_PROXY_OWNER_TENANT}/mcp",
+                            headers={"authorization": f"Bearer {_PROXY_OWNER_TOKEN}"})
+        resp = asyncio.run(tn.fs_mcp_proxy(_PROXY_OWNER_TENANT, req))
+        assert resp.status_code == 200
+        assert resp.body == b'{"ok":true}'
+        assert len(sock.sent) == 1
+    finally:
+        tn._tunnel_sockets.pop(_PROXY_OWNER_TENANT, None)
+
+
+def test_fs_mcp_proxy_cross_tenant_credential_never_reaches_connected_socket(monkeypatch):
+    """The actual vulnerability, reproduced directly: a live, connected
+    tunnel socket for the owning tenant must not be reachable by a
+    DIFFERENT tenant's otherwise-valid credential just because the URL
+    names the owner's tenant_id. Confirms the request is rejected before
+    ever touching the socket (no partial/leaked forwarding)."""
+    _patch_proxy_auth(monkeypatch)
+    response = {
+        "status": 200,
+        "headers": {"content-type": "application/json"},
+        "body": base64.b64encode(b'{"leaked":true}').decode(),
+    }
+    sock = _FakeTunnelSocket(tn._pending_reqs, response)
+    tn._tunnel_sockets[_PROXY_OWNER_TENANT] = sock
+    try:
+        req = _FakeProxyReq(f"/fs/mcp/{_PROXY_OWNER_TENANT}/mcp",
+                            headers={"authorization": f"Bearer {_PROXY_OTHER_TOKEN}"})
+        resp = asyncio.run(tn.fs_mcp_proxy(_PROXY_OWNER_TENANT, req))
+        assert resp.status_code == 401
+        assert sock.sent == [], "a rejected cross-tenant request must never reach the tunnel socket"
+    finally:
+        tn._tunnel_sockets.pop(_PROXY_OWNER_TENANT, None)
+
+
+def test_mcp_proxy_routes_self_hosted_mode_unaffected_by_auth_gate(monkeypatch):
+    """Self-hosted (non-hosted) mode is single-user with no tenant concept:
+    the existing `_hosted_mode()` early-return (503) must still fire before
+    the new tenant-ownership check ever runs, so self-hosted usage is
+    unaffected by this fix."""
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
+
+    async def fail_if_called(request, **kwargs):
+        raise AssertionError("_get_tenant_from_request must not be called in self-hosted mode")
+
+    monkeypatch.setattr(tn, "_get_tenant_from_request", fail_if_called)
+    resp = asyncio.run(tn.fs_mcp_proxy("t1", _FakeProxyReq("/fs/mcp/t1")))
+    assert resp.status_code == 503

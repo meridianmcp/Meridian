@@ -1982,16 +1982,26 @@ async def test_export_tenant_data_returns_structure():
 
 
 @pytest.mark.anyio
-async def test_delete_tenant_records_removes_rows():
-    """delete_tenant_records removes user_sessions, api_tokens, workspace_members, and tenant."""
-    db = await db_module.init_db(":memory:")
+async def test_delete_tenant_records_removes_rows(db):
+    """delete_tenant_records removes every control-plane row for a tenant.
+
+    Uses the shared `db` fixture (not a hardcoded SQLite :memory: connection)
+    specifically so this ALSO runs against real Postgres under CI's
+    test-postgres job. Real bug, live in production until 2026-09-20: on
+    Postgres, oauth_tokens and tenant_environments both have a NO ACTION
+    foreign key to tenants(id) -- deleting a tenant with any row in either
+    table (i.e. anyone who ever logged in via OAuth) failed outright with an
+    unhandled IntegrityError, because the old version of this function never
+    cleaned those two tables before deleting the tenants row itself. A
+    SQLite-only test (SQLite doesn't enforce REFERENCES by default) would
+    never have caught this -- it has to run on Postgres to mean anything.
+    """
     import uuid
     tid = str(uuid.uuid4())
     await db.execute(
         "INSERT INTO tenants (id, email, plan) VALUES (?, ?, ?)",
         (tid, "del@example.com", "standard"),
     )
-    # Insert a session and token
     from datetime import datetime, timezone, timedelta
     expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     await db.execute(
@@ -2002,21 +2012,60 @@ async def test_delete_tenant_records_removes_rows():
         "INSERT INTO api_tokens (id, tenant_id, token_hash, label) VALUES (?, ?, ?, ?)",
         (str(uuid.uuid4()), tid, "fakehash", "test"),
     )
+    # The two tables whose real (Postgres) NO ACTION foreign key to tenants(id)
+    # made deletion fail outright before this fix.
+    await db.execute(
+        "INSERT INTO oauth_tokens (token_hash, tenant_id, exp) VALUES (?, ?, ?)",
+        ("oauth-hash-1", tid, 9999999999),
+    )
+    await db.execute(
+        "INSERT INTO tenant_environments (id, tenant_id, name) VALUES (?, ?, ?)",
+        (str(uuid.uuid4()), tid, "production"),
+    )
+    # No hard FK on these, but they're tenant PII that a GDPR deletion must
+    # not leave behind.
+    await db.execute(
+        "INSERT INTO oauth_codes (code, tenant_id, redirect_uri, code_challenge, expires_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("code-1", tid, "https://example.com/cb", "challenge", expires),
+    )
+    await db.execute(
+        "INSERT INTO oauth_refresh_tokens (token_hash, tenant_id, client_id, expires_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("refresh-hash-1", tid, "client-1", expires),
+    )
+    await db.execute(
+        "INSERT INTO device_codes (device_code, user_code, tenant_id, expires_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("device-1", "USER1", tid, expires),
+    )
+    await db.execute(
+        "INSERT INTO registered_hostnames (id, tenant_id, hostname, registration_token) "
+        "VALUES (?, ?, ?, ?)",
+        (str(uuid.uuid4()), tid, "test-host", "reg-token-1"),
+    )
+    await db.execute(
+        "INSERT INTO provision_queue (tenant_id, status) VALUES (?, ?)",
+        (tid, "pending"),
+    )
     await db.commit()
 
+    # Must not raise (this is exactly what the bug did on Postgres).
     await db_module.delete_tenant_records(db, tid)
 
-    async with db.execute("SELECT COUNT(*) FROM tenants WHERE id = ?", (tid,)) as cur:
-        row = await cur.fetchone()
-    assert (row["count"] if isinstance(row, dict) else row[0]) == 0
-
-    async with db.execute("SELECT COUNT(*) FROM user_sessions WHERE tenant_id = ?", (tid,)) as cur:
-        row = await cur.fetchone()
-    assert (row["count"] if isinstance(row, dict) else row[0]) == 0
-
-    async with db.execute("SELECT COUNT(*) FROM api_tokens WHERE tenant_id = ?", (tid,)) as cur:
-        row = await cur.fetchone()
-    assert (row["count"] if isinstance(row, dict) else row[0]) == 0
+    for table in (
+        "tenants", "user_sessions", "api_tokens",
+        "oauth_tokens", "tenant_environments", "oauth_codes",
+        "oauth_refresh_tokens", "device_codes", "registered_hostnames",
+        "provision_queue",
+    ):
+        id_col = "id" if table == "tenants" else "tenant_id"
+        async with db.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {id_col} = ?", (tid,)
+        ) as cur:
+            row = await cur.fetchone()
+        count = row["count"] if isinstance(row, dict) else row[0]
+        assert count == 0, f"{table} still has rows for the deleted tenant"
 
 
 def test_dashboard_js_has_export_button():

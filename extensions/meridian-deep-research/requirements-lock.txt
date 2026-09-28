@@ -1,0 +1,231 @@
+# Pinned dependency versions for reproducible installs (item da8fbeec).
+#
+# Generation method (mirrors commit 54d1cb5c's precedent for
+# extensions/meridian-outputs/requirements-lock.txt in spirit -- a real,
+# reproducibility-oriented artifact, not hand-guessed versions -- adapted to
+# this package's situation): meridian-outputs pinned only the handful of
+# version-sensitive dependencies actually recorded in a real research run's
+# manifest. This package has no such run-manifest evidence (it wraps a
+# third-party research agent, not something with its own instrumented run
+# harness), so instead this is a REAL, FULL `pip freeze` captured from a
+# clean install that actually succeeded end to end:
+#
+#   1. python -m venv (Python 3.12.13, inside this package's own
+#      requires-python range ">=3.11,<3.13")
+#   2. pip install "mcp>=1.27,<2" "open-deep-research==0.0.16"
+#      (exactly this package's own pyproject.toml dependencies -- nothing
+#      extra pinned by hand)
+#   3. pip freeze, with the throwaway venv's own dev-only `pytest` and this
+#      package's own editable self-entry stripped out
+#
+# Regenerate the same way after any dependency change. This documents what a
+# real install resolves TODAY, given open_deep_research's own transitive
+# dependencies are mostly loose (`>=`) version ranges -- see this package's
+# pyproject.toml's own comment on the exact-pin rationale for
+# `open-deep-research==0.0.16` itself. This file is NOT installed from
+# automatically (nothing in pyproject.toml or pixi.toml references it) --
+# it is a reproducibility record a maintainer can pass to
+# `pip install -r requirements-lock.txt` by hand when they need the exact
+# resolved graph a real install produced, e.g. to compare against a fresh
+# resolve after upstream's dependencies drift.
+#
+# Captured: 2026-09-23, win-64, Python 3.12.13.
+
+Bottleneck==1.6.0
+PyJWT==2.15.0
+PyYAML==6.0.3
+Pygments==2.21.0
+SQLAlchemy==2.0.54
+StrEnum==0.4.15
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-types==0.8.0
+anthropic==1.8.0
+anyio==4.15.1
+arxiv==4.0.1
+asttokens==3.0.2
+attrs==26.1.0
+azure-core==1.41.0
+azure-identity==1.25.3
+azure-search-documents==12.0.0
+azure-search==1.0.0b2
+beautifulsoup4==4.13.3
+blockbuster==1.5.28
+build==1.6.1
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.1
+click==8.5.0
+cloudpickle==3.1.2
+colorama==0.4.6
+comm==0.2.3
+croniter==6.2.4
+cryptography==46.0.7
+debugpy==1.8.22
+deprecation==2.1.0
+distro==1.9.0
+docstring_parser==0.18.0
+duckduckgo_search==8.1.1
+exa-py==2.22.2
+executing==2.2.1
+filetype==1.2.0
+forbiddenfruit==0.1.4
+frozenlist==1.8.0
+google-api-core==2.38.0
+google-auth==2.58.0
+google-cloud-aiplatform==1.165.1
+google-cloud-bigquery==3.45.2
+google-cloud-core==2.7.0
+google-cloud-resource-manager==1.18.0
+google-cloud-storage==3.14.1
+google-cloud-vectorsearch==0.11.3
+google-crc32c==1.8.0
+google-genai==2.25.0
+google-resumable-media==2.10.2
+googleapis-common-protos==1.75.3
+greenlet==3.5.6
+groq==0.37.1
+grpc-google-iam-v1==0.14.5
+grpcio-health-checking==1.81.1
+grpcio-status==1.84.0
+grpcio-tools==1.75.1
+grpcio==1.84.0
+h11==0.16.0
+h2==4.4.1
+hpack==4.2.0
+httpcore2==2.13.1
+httpcore==1.0.9
+httpx-sse==0.4.3
+httpx2==2.13.1
+httpx==0.28.1
+hyperframe==6.1.0
+idna==3.20
+iniconfig==2.3.0
+ipykernel==7.3.0
+ipython==9.17.1
+ipython_pygments_lexers==1.1.1
+isodate==0.7.2
+jedi==0.20.0
+jiter==0.17.0
+jsonpatch==1.33
+jsonpointer==3.1.1
+jsonschema-specifications==2025.9.1
+jsonschema==4.26.0
+jsonschema_rs==0.29.1
+jupyter_client==8.10.0
+jupyter_core==5.9.1
+langchain-anthropic==1.7.4
+langchain-classic==1.0.8
+langchain-community==0.4.2
+langchain-core==1.6.4
+langchain-deepseek==1.1.1
+langchain-google-genai==4.4.0
+langchain-google-vertexai==3.2.4
+langchain-groq==1.1.3
+langchain-mcp-adapters==0.3.2
+langchain-openai==1.6.5
+langchain-protocol==0.0.19
+langchain-tavily==0.2.18
+langchain-text-splitters==1.1.2
+langchain==1.4.2
+langgraph-api==0.7.27
+langgraph-checkpoint==4.2.0
+langgraph-cli==0.4.32
+langgraph-prebuilt==1.1.0
+langgraph-runtime-inmem==0.24.1
+langgraph-sdk==0.4.5
+langgraph==1.2.12
+langsmith==0.14.0
+linkup-sdk==0.23.0
+lxml==6.1.3
+markdown-it-py==4.2.0
+markdownify==1.2.3
+matplotlib-inline==0.2.2
+mcp==1.30.0
+mdurl==0.1.2
+msal-extensions==1.3.1
+msal==1.39.0
+msrest==0.7.1
+multidict==6.9.1
+nest-asyncio2==1.7.3
+numexpr==2.14.2
+numpy==2.5.3
+oauthlib==3.3.1
+open_deep_research==0.0.16
+openai==3.19.0
+opentelemetry-api==1.44.0
+opentelemetry-exporter-otlp-proto-common==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-proto==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-semantic-conventions==0.65b0
+orjson==3.12.0
+ormsgpack==1.12.2
+packaging==26.3
+parso==0.8.7
+pathspec==1.1.1
+platformdirs==4.11.12
+pluggy==1.6.0
+postgrest==2.31.0
+primp==2.0.1
+prompt_toolkit==3.0.53
+propcache==0.5.4
+proto-plus==1.28.4
+protobuf==6.33.6
+psutil==7.2.2
+pure_eval==0.2.4
+pyarrow==23.0.1
+pyasn1==0.6.4
+pyasn1_modules==0.4.2
+pycparser==3.0
+pydantic-settings==2.15.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+pymupdf==1.28.2
+pyproject_hooks==1.3.3
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.3
+python-multipart==0.0.32
+pywin32==312
+pyzmq==27.2.0
+realtime==2.31.0
+referencing==0.37.0
+regex==2026.9.10
+requests-oauthlib==2.0.0
+requests-toolbelt==1.0.0
+requests==2.34.2
+rich==15.0.0
+rpds-py==2026.6.3
+setuptools==84.0.0
+six==1.17.0
+sniffio==1.3.1
+soupsieve==2.9.2
+sse-starlette==2.1.3
+stack-data==0.6.3
+starlette==1.7.0
+storage3==2.31.0
+structlog==25.5.0
+supabase-auth==2.31.0
+supabase-functions==2.31.0
+supabase==2.31.0
+tavily-python==0.8.4
+tenacity==9.1.4
+tiktoken==0.14.0
+tornado==6.5.10
+traitlets==5.16.1
+truststore==0.10.4
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.8.0
+uuid_utils==0.17.1
+uvicorn==0.53.0
+validators==0.35.0
+watchfiles==1.3.0
+wcwidth==0.9.0
+websockets==15.0.1
+wheel==0.48.0
+xmltodict==1.0.4
+xxhash==4.0.1
+yarl==1.25.1
+zstandard==0.25.0

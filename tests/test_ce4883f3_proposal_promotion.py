@@ -506,3 +506,87 @@ async def test_override_reason_bypasses_hitl_and_proceeds(db):
     ) as cur:
         row = await cur.fetchone()
     assert (row["n"] if isinstance(row, dict) else row[0]) == 1
+
+
+# ---------------------------------------------------------------------------
+# b0ae9fc6 -- _classify_deviation negation / scope-awareness
+#
+# The old check was `any(kw in combined_text for kw in
+# _HITL_DESTRUCTIVE_KEYWORDS)` -- a bare substring scan that was both
+# negation-blind ("do NOT delete X" still matched on "delete") and
+# scope-blind (a keyword inside a quoted example or a code comment still
+# counted as a proposed action). These call `_classify_deviation` directly
+# (a sync, non-db helper) the same way the file already reaches into other
+# private module state, e.g. `proposal_promotion._DEPTH_RANK` above.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_deviation_still_flags_genuine_destructive_proposal():
+    # Baseline: a real destructive proposal, no negation/quoting involved,
+    # must still classify as destructive_behavior -- the fix must not
+    # weaken real detection.
+    category = proposal_promotion._classify_deviation(
+        "Purge stale rows",
+        "This proposal will purge and delete old records directly from production.",
+        [],
+    )
+    assert category == "destructive_behavior"
+
+
+def test_classify_deviation_ignores_negated_keyword():
+    # "does not delete" -- the keyword is present but explicitly negated in
+    # the same clause, so this must NOT be classified as destructive.
+    category = proposal_promotion._classify_deviation(
+        "Read-only audit",
+        "This proposal does not delete any records; it only reads and "
+        "reports on them.",
+        [],
+    )
+    assert category is None
+
+
+def test_classify_deviation_ignores_negated_keyword_with_contraction():
+    category = proposal_promotion._classify_deviation(
+        "Safer cleanup script",
+        "We won't remove any rows outside the test fixtures table.",
+        [],
+    )
+    assert category is None
+
+
+def test_classify_deviation_still_flags_destructive_alongside_unrelated_negation():
+    # A negation earlier in the text must not suppress a genuinely
+    # destructive statement in a later, separate clause.
+    category = proposal_promotion._classify_deviation(
+        "Cleanup",
+        "We will not touch the staging environment. Separately, purge all "
+        "expired sessions from the production database.",
+        [],
+    )
+    assert category == "destructive_behavior"
+
+
+def test_classify_deviation_ignores_keyword_inside_quoted_example():
+    # Scope-blindness: the keyword only appears inside a quoted/backticked
+    # code example, not as an actual proposed action.
+    category = proposal_promotion._classify_deviation(
+        "Fix stale docstring example",
+        "The docstring shows `cursor.execute(\"delete from stale_rows\")` "
+        "as a sample query; this proposal only rewords the surrounding "
+        "paragraph, no code or data changes.",
+        [],
+    )
+    assert category is None
+
+
+def test_classify_deviation_ignores_keyword_inside_code_comment():
+    # Scope-blindness: the keyword appears only in a code comment quoted in
+    # the proposal body, not as the proposal's own proposed action.
+    category = proposal_promotion._classify_deviation(
+        "Document the linter rule",
+        "Update the contributor guide to mention the existing lint "
+        "comment `# never delete files inside migrations/` so new "
+        "contributors understand the rule; no behavior changes.",
+        [],
+    )
+    assert category is None

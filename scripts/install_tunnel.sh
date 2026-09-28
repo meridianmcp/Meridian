@@ -25,7 +25,7 @@ esac
 MERIDIAN_BIN="$(command -v meridian || true)"
 if [ -z "$MERIDIAN_BIN" ]; then
   echo "error: 'meridian' was not found on PATH."
-  echo "Install it first:  pip install meridian-server   (or:  npm i -g meridian-mcp)"
+  echo "Install it first:  pip install meridian-server   (or:  npm i -g @meridianmcp/mcp)"
   exit 1
 fi
 

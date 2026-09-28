@@ -1111,6 +1111,20 @@ class _FakeReq:
         return self._body
 
 
+async def _allow_proxy_auth(tenant_id, request):
+    """Stand-in for `_authorize_tunnel_proxy_caller` that always authorizes.
+
+    5de3d422 — the proxy route wrappers now verify the caller owns
+    `tenant_id` before forwarding (via `_get_tenant_from_request`, which
+    needs a real Starlette `Request` — cookies/app.state.db/etc. that
+    `_FakeReq` above deliberately doesn't provide). These tests are about
+    tunnel-socket routing/forwarding mechanics, not auth, so they bypass the
+    auth gate explicitly; the auth gate itself is covered end-to-end (real
+    tenants/tokens, 401 on missing/cross-tenant auth) in
+    tests/test_tunnel_routes.py."""
+    return None
+
+
 def test_fs_mcp_proxy_503_when_not_hosted(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
     resp = asyncio.run(tn.fs_mcp_proxy("t1", _FakeReq("/fs/mcp/t1")))
@@ -1120,6 +1134,7 @@ def test_fs_mcp_proxy_503_when_not_hosted(monkeypatch):
 
 def test_fs_mcp_proxy_strips_prefix_and_503_without_tunnel(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     captured = {}
 
     async def fake_proxy(tenant_id, method, path, query, headers, body_bytes):
@@ -1139,6 +1154,7 @@ def test_fs_mcp_proxy_strips_prefix_and_503_without_tunnel(monkeypatch):
 
 def test_fs_mcp_proxy_subpath_builds_local_path(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     captured = {}
 
     async def fake_proxy(tenant_id, method, path, query, headers, body_bytes):
@@ -1241,6 +1257,7 @@ def test_slot_display_names_cover_all_labels():
 
 def test_code_mcp_proxy_routes_to_code_socket(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     resp = asyncio.run(tn.code_mcp_proxy("t1", _FakeReq("/code/mcp/t1")))
     # No code socket connected → 503 from _do_proxy.
     assert resp.status_code == 503
@@ -1249,6 +1266,7 @@ def test_code_mcp_proxy_routes_to_code_socket(monkeypatch):
 
 def test_extract_mcp_proxy_routes_to_extract_socket(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     resp = asyncio.run(tn.extract_mcp_proxy("t1", _FakeReq("/extract/mcp/t1")))
     assert resp.status_code == 503
     assert b"extract tunnel not connected" in resp.body
@@ -1274,6 +1292,7 @@ def test_word_proxy_503_when_not_hosted(monkeypatch):
 
 def test_ppt_proxy_503_when_no_socket(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     resp = asyncio.run(tn.ppt_mcp_proxy("t1", _FakeReq("/ppt/mcp/t1")))
     assert resp.status_code == 503
     assert b"ppt tunnel not connected" in resp.body
@@ -1281,6 +1300,7 @@ def test_ppt_proxy_503_when_no_socket(monkeypatch):
 
 def test_word_proxy_subpath_200_roundtrip(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     response = {"status": 200, "headers": {"content-type": "application/json"},
                 "body": base64.b64encode(b'{"ok":1}').decode()}
     tn._tunnel_word_sockets["t1"] = _FakeWS(tn._pending_word_reqs, response)

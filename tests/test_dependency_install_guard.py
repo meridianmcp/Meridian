@@ -178,6 +178,119 @@ def test_npm_ci_allowed():
 
 
 # ---------------------------------------------------------------------------
+# pixi -- this repo's actual package manager (8fae0e17)
+# ---------------------------------------------------------------------------
+
+@_needs_bash
+def test_pixi_add_known_pixi_toml_dependency_allowed():
+    # 'pytest' is a real [dependencies] entry in pixi.toml but is NOT declared
+    # in pyproject.toml/package.json -- only pixi.toml parsing catches it.
+    r = _run_hook(_bash_payload("pixi add pytest"))
+    assert r.returncode == 0
+
+
+@_needs_bash
+def test_pixi_add_known_pypi_dependencies_section_allowed():
+    # 'mcp' lives under pixi.toml's [pypi-dependencies] table.
+    r = _run_hook(_bash_payload("pixi add mcp"))
+    assert r.returncode == 0
+
+
+@_needs_bash
+def test_pixi_add_unknown_package_blocked():
+    r = _run_hook(_bash_payload("pixi add totally-unheard-of-pkg-9f2b31a4"))
+    assert r.returncode == 2
+    assert "totally-unheard-of-pkg-9f2b31a4" in r.stderr
+    assert "31a4a9c8" in r.stderr
+
+
+@_needs_bash
+def test_pixi_add_unknown_package_with_version_blocked():
+    r = _run_hook(_bash_payload("pixi add totally-unheard-of-pkg-9f2b31a4==1.0"))
+    assert r.returncode == 2
+
+
+@_needs_bash
+def test_pixi_install_bare_allowed():
+    # `pixi install` (from pixi.lock/pixi.toml) never names a new package --
+    # same treatment as bare `npm ci`.
+    r = _run_hook(_bash_payload("pixi install"))
+    assert r.returncode == 0
+
+
+@_needs_bash
+def test_pixi_install_with_flags_allowed():
+    r = _run_hook(_bash_payload("pixi install --frozen"))
+    assert r.returncode == 0
+
+
+@_needs_bash
+def test_pixi_run_test_is_not_an_install_and_is_never_flagged():
+    # The exact non-install case the sprint item calls out: an overly broad
+    # regex must NOT catch `pixi run test`.
+    r = _run_hook(_bash_payload("pixi run test"))
+    assert r.returncode == 0
+
+
+@_needs_bash
+def test_pixi_run_python_dash_m_pytest_not_flagged():
+    r = _run_hook(_bash_payload("pixi run python -m pytest tests/"))
+    assert r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# py -m pip install / conda install / poetry add / pipx install
+# ---------------------------------------------------------------------------
+
+@_needs_bash
+def test_py_dash_m_pip_install_known_dependency_allowed():
+    r = _run_hook(_bash_payload("py -m pip install fastapi"))
+    assert r.returncode == 0
+
+
+@_needs_bash
+def test_py_dash_m_pip_install_unknown_package_blocked():
+    r = _run_hook(_bash_payload("py -m pip install totally-unheard-of-pkg-9f2b31a4"))
+    assert r.returncode == 2
+
+
+@_needs_bash
+def test_conda_install_unknown_package_blocked():
+    r = _run_hook(_bash_payload("conda install totally-unheard-of-pkg-9f2b31a4"))
+    assert r.returncode == 2
+
+
+@_needs_bash
+def test_conda_install_file_manifest_allowed():
+    r = _run_hook(_bash_payload("conda install --file environment.yml"))
+    assert r.returncode == 0
+
+
+@_needs_bash
+def test_poetry_add_unknown_package_blocked():
+    r = _run_hook(_bash_payload("poetry add totally-unheard-of-pkg-9f2b31a4"))
+    assert r.returncode == 2
+
+
+@_needs_bash
+def test_poetry_add_known_dependency_with_caret_version_allowed():
+    r = _run_hook(_bash_payload("poetry add fastapi@^0.115"))
+    assert r.returncode == 0
+
+
+@_needs_bash
+def test_pipx_install_unknown_package_blocked():
+    r = _run_hook(_bash_payload("pipx install totally-unheard-of-pkg-9f2b31a4"))
+    assert r.returncode == 2
+
+
+@_needs_bash
+def test_pipx_install_known_builtin_tool_allowed():
+    r = _run_hook(_bash_payload("pipx install poetry"))
+    assert r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
 # Unknown packages -- blocked
 # ---------------------------------------------------------------------------
 
@@ -265,17 +378,27 @@ def test_dependency_install_guard_ps1_is_pure_ascii():
     )
 
 
+def _matches_shell_tools(entry: dict) -> bool:
+    """55d48d69 widened the matcher from ``Bash`` to ``Bash|PowerShell``: the
+    PowerShell tool runs the same pip/npm/... install commands."""
+    tools = str(entry.get("matcher") or "").split("|")
+    return "Bash" in tools and "PowerShell" in tools
+
+
 def test_settings_json_registers_bash_hook():
     settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
     pre_tool_use = settings["hooks"]["PreToolUse"]
     matches = [
         entry
         for entry in pre_tool_use
-        if entry.get("matcher") == "Bash"
+        if _matches_shell_tools(entry)
         for hook in entry.get("hooks", [])
         if "dependency_install_guard.ps1" in hook.get("command", "")
     ]
-    assert matches, "settings.json must register dependency_install_guard.ps1 under PreToolUse matcher 'Bash'"
+    assert matches, (
+        "settings.json must register dependency_install_guard.ps1 under a PreToolUse "
+        "matcher covering both Bash and PowerShell"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +418,7 @@ def test_dependency_install_guard_command_is_project_scoped_required_hook():
     command = next(
         hook.get("command", "")
         for entry in settings["hooks"]["PreToolUse"]
-        if entry.get("matcher") == "Bash"
+        if _matches_shell_tools(entry)
         for hook in entry.get("hooks", [])
         if "dependency_install_guard.ps1" in hook.get("command", "")
     )
@@ -313,7 +436,7 @@ def test_dependency_install_guard_command_resolves_ok_against_real_repo_root():
     command = next(
         hook.get("command", "")
         for entry in settings["hooks"]["PreToolUse"]
-        if entry.get("matcher") == "Bash"
+        if _matches_shell_tools(entry)
         for hook in entry.get("hooks", [])
         if "dependency_install_guard.ps1" in hook.get("command", "")
     )

@@ -268,15 +268,40 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
 # Primary DB resolver for request handlers
 # ---------------------------------------------------------------------------
 
+_AUTH_REQUIRED_HEADERS = {"WWW-Authenticate": "Bearer"}
+
+
+def _authentication_required() -> HTTPException:
+    """ece2ac0a — the single 401 raised when a hosted request has no valid
+    credential. Carries ``WWW-Authenticate: Bearer`` (RFC 7235) so API clients
+    know to retry with ``Authorization: Bearer sk_meridian_...``."""
+    return HTTPException(
+        status_code=401,
+        detail="authentication required",
+        headers=dict(_AUTH_REQUIRED_HEADERS),
+    )
+
+
 async def _db(request: Request) -> Any:
     """Return the active DB for this request.
 
-    - Demo cookie â†’ demo DB
-    - Hosted mode + session cookie â†’ tenant's own Neon DB (cached)
-    - Hosted mode + Bearer token â†’ tenant's own Neon DB (cached)
-    - Otherwise â†’ app.state.db
+    - Demo cookie -> demo DB
+    - Hosted mode + session cookie -> tenant's own Neon DB (cached)
+    - Hosted mode + Bearer token -> tenant's own Neon DB (cached)
+    - Hosted mode + NO valid credential -> 401 (ece2ac0a, fail closed)
+    - Self-hosted (MERIDIAN_HOSTED unset) -> app.state.db
+
+    ece2ac0a — the hosted branch used to fall through to ``app.state.db`` (the
+    shared control-plane DB, which also holds the admin tenant's real projects)
+    whenever neither credential resolved a tenant. Every route that resolved
+    its DB here was therefore readable AND writable anonymously on the hosted
+    service. Hosted mode now raises 401 instead; the fallback is reachable only
+    in self-hosted mode (single-user local server, open by design) and via the
+    demo cookie branch above it, both unchanged. Anonymous public pages that
+    genuinely need control-plane data read it through the narrowly scoped
+    accessors further down (``list_public_changelog_entries`` /
+    ``add_public_waitlist_entry``), never through this resolver.
     """
-    import hashlib as _hashlib
     cached = getattr(request.state, "_db_conn", None)
     if cached is not None:
         return cached
@@ -304,49 +329,38 @@ async def _db(request: Request) -> Any:
         return conn
 
     if _hosted_mode():
-        from .hosted import _SESSION_COOKIE, _read_session_cookie
         from . import db as db_module
 
-        current_tenant_id: str | None = None
+        # Same resolution order as before (session cookie, then Bearer
+        # sk_meridian_ token), now shared with -- and memoized by --
+        # _get_tenant_from_request so the hosted auth gate dependency and this
+        # resolver never disagree about who the caller is.
+        current_tenant = await _get_tenant_from_request(request)
+        if current_tenant is None or not current_tenant.get("id"):
+            # ece2ac0a — FAIL CLOSED. Raised before anything is cached on
+            # request.state._db_conn, so no later call in this request can
+            # pick up a connection. A logged-in tenant whose DB is not yet
+            # provisioned still gets _open_tenant_db_by_id's 503 below (the
+            # POST /projects self-heal depends on that distinction).
+            raise _authentication_required()
+        current_tenant_id: str = current_tenant["id"]
 
-        cookie_val = request.cookies.get(_SESSION_COOKIE)
-        if cookie_val:
-            session_id = _read_session_cookie(cookie_val)
-            if session_id:
-                auth_db = request.app.state.db
-                session = await db_module.get_user_session(auth_db, session_id)
-                if session:
-                    current_tenant_id = session["tenant_id"]
+        # Workspace switching: honour X-Workspace-Tenant-Id if the current
+        # user is an accepted member of the requested workspace.
+        ws_header = request.headers.get("x-workspace-tenant-id", "").strip()
+        if ws_header and ws_header != current_tenant_id:
+            auth_db = request.app.state.db
+            memberships = await db_module.get_workspaces_for_email(
+                auth_db, current_tenant.get("email", "")
+            )
+            if any(m["tenant_id"] == ws_header for m in memberships):
+                conn = await _open_tenant_db_by_id(request, ws_header)
+                request.state._db_conn = conn
+                return conn
 
-        if current_tenant_id is None:
-            auth_header = request.headers.get("authorization", "")
-            if auth_header.startswith("Bearer "):
-                token = auth_header[7:]
-                token_hash = _hashlib.sha256(token.encode()).hexdigest()
-                auth_db = request.app.state.db
-                tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
-                if tenant:
-                    current_tenant_id = tenant["id"]
-
-        if current_tenant_id is not None:
-            # Workspace switching: honour X-Workspace-Tenant-Id if the current
-            # user is an accepted member of the requested workspace.
-            ws_header = request.headers.get("x-workspace-tenant-id", "").strip()
-            if ws_header and ws_header != current_tenant_id:
-                auth_db = request.app.state.db
-                current_tenant = await db_module.get_tenant_by_id(auth_db, current_tenant_id)
-                if current_tenant:
-                    memberships = await db_module.get_workspaces_for_email(
-                        auth_db, current_tenant.get("email", "")
-                    )
-                    if any(m["tenant_id"] == ws_header for m in memberships):
-                        conn = await _open_tenant_db_by_id(request, ws_header)
-                        request.state._db_conn = conn
-                        return conn
-
-            conn = await _open_tenant_db_by_id(request, current_tenant_id)
-            request.state._db_conn = conn
-            return conn
+        conn = await _open_tenant_db_by_id(request, current_tenant_id)
+        request.state._db_conn = conn
+        return conn
 
     conn = request.app.state.db
     request.state._db_conn = conn
@@ -391,6 +405,12 @@ async def _get_tenant_from_request(request: Request, *, force_refresh: bool = Fa
 
     import hashlib as _hashlib
 
+    # ece2ac0a — which credential resolved the tenant, as ("cookie",
+    # user_session_id) or ("bearer", token_sha256), so a caller that outlives
+    # this request (an /mcp/sse session) can re-check that SAME credential
+    # later through _tenant_for_credential below. Never the raw token.
+    request.state._tenant_credential = None
+
     if not _hosted_mode():
         request.state._tenant = None
         return None
@@ -399,7 +419,6 @@ async def _get_tenant_from_request(request: Request, *, force_refresh: bool = Fa
         return None
 
     from .hosted import _SESSION_COOKIE, _read_session_cookie
-    from . import db as db_module
 
     auth_db = request.app.state.db
 
@@ -407,22 +426,58 @@ async def _get_tenant_from_request(request: Request, *, force_refresh: bool = Fa
     if cookie_val:
         session_id = _read_session_cookie(cookie_val)
         if session_id:
-            session = await db_module.get_user_session(auth_db, session_id)
-            if session:
-                tenant = await db_module.get_tenant_by_id(auth_db, session["tenant_id"])
+            credential = ("cookie", session_id)
+            tenant = await _tenant_for_credential(auth_db, credential)
+            if tenant is not _NO_SUCH_CREDENTIAL:
                 request.state._tenant = tenant
+                request.state._tenant_credential = credential
                 return tenant
 
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        token_hash = _hashlib.sha256(token.encode()).hexdigest()
-        tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
+        credential = ("bearer", _hashlib.sha256(token.encode()).hexdigest())
+        tenant = await _tenant_for_credential(auth_db, credential)
+        if tenant is _NO_SUCH_CREDENTIAL:
+            tenant = None
         request.state._tenant = tenant
+        request.state._tenant_credential = credential if tenant else None
         return tenant
 
     request.state._tenant = None
     return None
+
+
+# Returned by _tenant_for_credential when a session cookie names no live
+# session, so _get_tenant_from_request can fall through to the Bearer token
+# exactly as it always has (a live session whose tenant row is gone still
+# resolves to None WITHOUT falling through).
+_NO_SUCH_CREDENTIAL: Any = object()
+
+
+async def _tenant_for_credential(auth_db: Any, credential: "tuple[str, str]") -> Any:
+    """ece2ac0a — resolve one credential reference to its tenant row.
+
+    ``("cookie", user_session_id)`` -> the live session's tenant (None if the
+    tenant row is gone); ``("bearer", token_sha256)`` -> the API token's tenant,
+    carrying ``_token_type``. Returns ``_NO_SUCH_CREDENTIAL`` when the session
+    or token no longer exists (expired, revoked, signed out).
+
+    Shared by _get_tenant_from_request and the /mcp/sse session re-check so the
+    two can never disagree about what a credential means.
+    """
+    from . import db as db_module
+
+    kind, ref = credential
+    if kind == "cookie":
+        session = await db_module.get_user_session(auth_db, ref)
+        if not session:
+            return _NO_SUCH_CREDENTIAL
+        return await db_module.get_tenant_by_id(auth_db, session["tenant_id"])
+    if kind == "bearer":
+        tenant = await db_module.get_tenant_from_token_hash(auth_db, ref)
+        return _NO_SUCH_CREDENTIAL if tenant is None else tenant
+    return _NO_SUCH_CREDENTIAL
 
 
 async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None":
@@ -660,6 +715,74 @@ async def _get_authenticated_tenant(request: Request) -> "dict[str, Any]":
     if tenant is None:
         raise HTTPException(status_code=401, detail="authentication required")
     return tenant
+
+
+# ---------------------------------------------------------------------------
+# ece2ac0a — hosted operator (admin) guard for server-process routes
+# ---------------------------------------------------------------------------
+
+async def _require_hosted_operator(
+    request: Request, *, require_admin_password: bool = True,
+) -> None:
+    """Restrict a route that acts on the SERVER PROCESS itself (shutdown,
+    restart, git fetch, spawning subprocesses, the raw waitlist) to the
+    hosted service's operator.
+
+    Self-hosted mode is single-user and returns immediately (behaviour
+    unchanged). In hosted mode the caller must hold a signed session cookie
+    for an admin (``admins`` table / env allowlist via ``is_admin_db``) and,
+    when ``require_admin_password`` is set, the admin-password cookie too --
+    the same bar ``/admin/health`` and ``/admin/stats`` already enforce. A
+    Bearer API token is deliberately NOT enough: tokens are handed to agents
+    and scripts, and none of these routes has an agent use case.
+
+    Raises 401 (no/invalid session) or 403 (demo, not an admin, missing
+    admin password).
+    """
+    if not _hosted_mode():
+        return
+    if request.cookies.get(_DEMO_CONTEXT_COOKIE):
+        raise HTTPException(status_code=403, detail="Not available in demo mode.")
+    from .hosted import check_admin_password, get_current_tenant, is_admin_db  # noqa: PLC0415
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise _authentication_required() from None
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    if require_admin_password and not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
+
+
+# ---------------------------------------------------------------------------
+# ece2ac0a — narrowly scoped anonymous accessors to the control-plane DB
+# ---------------------------------------------------------------------------
+#
+# These are the ONLY sanctioned anonymous paths into ``app.state.db`` for
+# public pages. Each one serves exactly one kind of intentionally public data;
+# none hands a connection back to the caller, so a public route can never be
+# widened into a general read of the control-plane DB by accident. Do not add
+# a generic "public_db()" helper here -- add another single-purpose accessor.
+
+async def list_public_changelog_entries(request: Request) -> list[dict[str, Any]]:
+    """Published changelog entries for /changelog and /api/changelog-entries.
+
+    Always the control-plane DB (the one /api/admin/changelog-entries' admin
+    writes land in for the operator), regardless of who is asking, so every
+    visitor sees the same public changelog.
+    """
+    from . import db as db_module  # noqa: PLC0415
+    return await db_module.list_changelog_entries(request.app.state.db)
+
+
+async def add_public_waitlist_entry(
+    request: Request, email: str, note: "str | None",
+) -> dict[str, Any]:
+    """Append one waitlist signup (landing / pricing forms) to the
+    control-plane DB, where the operator's /admin/waitlist reads it. Write-only
+    from the caller's point of view: it returns only the row just created."""
+    from . import db as db_module  # noqa: PLC0415
+    return await db_module.add_waitlist_entry(request.app.state.db, email, note)
 
 
 def _mask_api_token_hash(token_hash: str | None) -> str:

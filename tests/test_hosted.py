@@ -565,6 +565,64 @@ async def test_create_neon_pool_project_omits_suspend_timeout(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_neon_pool_project_nests_quota_under_settings(monkeypatch):
+    """Real production bug, live until 2026-09-20: `quota` was sent as a
+    direct sibling of `default_endpoint_settings` under `project`, but
+    Neon's actual Create Project API schema nests it under
+    `project.settings.quota`. Sending the unrecognized top-level `quota`
+    key made Neon reject the WHOLE request with 400 Bad Request -- every
+    new-pool-project creation failed outright once the one pre-existing
+    pool project filled up, leaving new signups with no tenant DB at all
+    (_deps.py's "tenant database not provisioned" 503). This test asserts
+    the exact payload shape Neon's API actually requires, not just that
+    *a* request gets sent -- the prior test above would have stayed green
+    through this entire incident.
+    """
+    import httpx
+
+    import meridian.hosted as hosted_module
+
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "project": {"id": "neon-proj-1"},
+                "connection_uris": [{"connection_uri": "postgresql://tenant-db"}],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, headers=None, json=None):
+            seen["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda timeout=30: FakeClient())
+
+    await hosted_module._create_neon_pool_project("key", "pro")
+
+    project = seen["json"]["project"]
+    assert "quota" not in project, (
+        "quota must NOT be a direct property of `project` -- Neon's API "
+        "rejects it there with 400 Bad Request"
+    )
+    assert "settings" in project, "quota must be nested under project.settings"
+    quota = project["settings"]["quota"]
+    assert quota == {
+        "active_time_seconds": 300 * 3600,
+        "compute_time_seconds": 300 * 3600,
+    }
+
+
+@pytest.mark.asyncio
 async def test_create_customer_database_retries_locked_and_uses_role_name(monkeypatch):
     import httpx
 

@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Meridian LaTeX — Structural Overleaf Assistant",
+  "version": "0.0.1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuHs30J0XvRIf4qHtvD98OUK3v+V822nVnny4WsiXFMNYdFPgH8iPFfHaCc/xfiYx+njvgYiV42hD8+t0LjcVafmmC4clguTY37PtZW4/sMfjf00JGrehsyE7kGIoyb27097q0tTEIJONZvbBJIdbghZFpQ77nwpvusS7ugOEo1WhdbwhYyOO+XMxg3/TjM55aDr2x0OwfUWlPpfgbr/yNZW6PskEc+1NXwQTABkNZHEDlpvfyN8mSvjQ3Rn2HvwvWAyJJEHv9iecFK6itmsKkdU0QNSiCbppgpKzuzRR9pZob8lvJHknIo7NTJ9sHSb1J7tizPMmOqa/aT+Kab6XhQIDAQAB",
+  "description": "Reads and edits Overleaf's live .tex structure (sections, tables, equations, citations, figures) rather than raw text — prototype for the Digital Science Catalyst Grant submission.",
+  "permissions": ["activeTab", "storage", "scripting", "alarms", "tabs"],
+  "host_permissions": ["https://www.overleaf.com/*", "http://127.0.0.1:8471/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.overleaf.com/project/*"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["https://www.overleaf.com/*"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Meridian LaTeX"
+  }
+}

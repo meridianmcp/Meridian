@@ -11,7 +11,7 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from .._deps import _db, _hosted_mode, _is_demo_request
+from .._deps import _db, _hosted_mode, _is_demo_request, _require_hosted_operator
 from .. import db as db_module
 
 router = APIRouter()
@@ -150,8 +150,12 @@ async def admin_stats_json(request: Request) -> dict[str, Any]:
 
 
 @router.get("/admin/git-status")
-async def git_status() -> dict[str, Any]:
-    """Check if local repo is behind/ahead of remote."""
+async def git_status(request: Request) -> dict[str, Any]:
+    """Check if local repo is behind/ahead of remote.
+
+    ece2ac0a — runs ``git fetch`` on the server; operator-only when hosted.
+    """
+    await _require_hosted_operator(request, require_admin_password=False)
     import subprocess as sp
     try:
         cwd = str(Path(__file__).parent.parent.parent)
@@ -191,12 +195,17 @@ async def git_status() -> dict[str, Any]:
 
 @router.post("/admin/shutdown")
 async def admin_shutdown(request: Request) -> Response:
-    """Gracefully stop the server process."""
+    """Gracefully stop the server process.
+
+    ece2ac0a — was callable by anyone on the hosted service. Hosted mode now
+    requires the operator (admin session + admin password).
+    """
     if _is_demo_request(request):
         return JSONResponse(
             {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
             status_code=403,
         )
+    await _require_hosted_operator(request)
 
     async def _delayed_shutdown() -> None:
         await asyncio.sleep(0.5)
@@ -213,12 +222,16 @@ async def admin_restart(request: Request) -> Response:
     Requires an explicit ``{"confirm": true}`` body — a restart kills every
     active session on the machine (a real hazard on shared Fly machines), so an
     unconfirmed call returns a warning instead of restarting.
+
+    ece2ac0a — hosted mode requires the operator (admin session + admin
+    password); previously anyone could restart the hosted server.
     """
     if _is_demo_request(request):
         return JSONResponse(
             {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
             status_code=403,
         )
+    await _require_hosted_operator(request)
 
     try:
         body = await request.json()
@@ -257,6 +270,60 @@ async def admin_restart(request: Request) -> Response:
     return JSONResponse({"ok": True})
 
 
+@router.post("/admin/tenants/{tenant_id}/reset-provisioning")
+async def admin_reset_tenant_provisioning(tenant_id: str, request: Request) -> Response:
+    """Reset a tenant back to a de-novo, never-provisioned state -- admin/ops
+    tool for re-testing signup/provisioning against the same account without
+    a full (irreversible) account deletion + re-signup cycle each time.
+
+    Drops the tenant's own customer database (never the whole shared pool
+    project -- see hosted.reset_tenant_provisioning's docstring), clears its
+    Neon provisioning fields, and force-logs-out every existing session/API
+    token for that tenant. The tenant row itself, its email, plan, and
+    Stripe subscription are all left untouched -- this is NOT delete_account
+    (routes/export.py), which is permanent.
+
+    Requires an explicit ``{"confirm": true}`` body, matching admin_restart's
+    own confirmation pattern above.
+    """
+    from ..hosted import get_current_tenant, is_admin_db, check_admin_password, reset_tenant_provisioning  # noqa: PLC0415
+
+    if _is_demo_request(request):
+        return JSONResponse(
+            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
+            status_code=403,
+        )
+    try:
+        caller = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if not await is_admin_db(caller.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    if not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not (isinstance(body, dict) and body.get("confirm") is True):
+        return JSONResponse(
+            {
+                "warning": "This will drop the tenant's Neon database (if any) and "
+                           "log out every active session. The tenant account itself "
+                           "is kept. Confirm?",
+                "requires_confirm": True,
+            }
+        )
+
+    db = request.app.state.db
+    try:
+        result = await reset_tenant_provisioning(db, tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse({"reset": True, **result})
+
+
 @router.get("/admin/snapshot")
 async def download_snapshot(request: Request) -> Response:
     """Download the current DB as a SQLite snapshot file."""
@@ -264,7 +331,11 @@ async def download_snapshot(request: Request) -> Response:
     db = await _db(request)
     db_url = os.environ.get("MERIDIAN_DB_URL")
 
-    if not db_url:
+    # ece2ac0a — the raw-file branch copies the WHOLE local SQLite file. That
+    # is the single user's own DB when self-hosted, but on the hosted service
+    # it would be the shared control-plane DB, so hosted callers always take
+    # the table-copy branch below, which reads only their own resolved DB.
+    if not db_url and not _hosted_mode():
         db_path = os.environ.get("MERIDIAN_DB", str(Path("data") / "meridian.db"))
         if db_path == ":memory:":
             raise HTTPException(400, "Cannot snapshot in-memory database")

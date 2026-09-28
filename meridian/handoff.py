@@ -40,6 +40,12 @@ from . import capability_availability as capability_availability_module
 from . import capability_contract as capability_contract_module
 from . import continuation_gate as continuation_gate_module
 from . import db as db_module
+# SECURITY (1e9527a2) — gates the raw-absolute-path leak in
+# regenerate_handoff_correction's new_handoff_path field below. _deps.py is a
+# leaf module (no imports back into handoff.py / server.py), so this is safe
+# from server.py's own "shared helpers live in _deps.py to avoid circular
+# imports" pattern.
+from ._deps import _hosted_mode
 from . import dependency_graph as _dependency_graph  # 83a7586d (fan-out/fan-in frontier)
 from . import docx_integrity_gate as docx_integrity_gate_module
 from .db import ai_log as ai_log_module
@@ -1237,7 +1243,17 @@ async def regenerate_handoff_correction(
         "regenerated": True,
         "already_regenerated": False,
         "new_handoff_id": new_handoff_id,
-        "new_handoff_path": path,
+        # SECURITY (1e9527a2) — ``path`` is an absolute SERVER filesystem path
+        # (str(out_path.resolve()), rooted at the process-global output_dir,
+        # e.g. /app/data/... on the Fly.io hosted tier). On hosted Meridian the
+        # caller and server are different trust boundaries (one process serves
+        # many tenants), so this must never reach the client verbatim — same
+        # leak class, same fix, as start_session's handoff_path (server.py).
+        # Self-hosted is unaffected: there the caller IS the server. The
+        # handoffs DB row (new_handoff_id, fetched via new_handoff_content
+        # above) remains the canonical, Postgres-backed source of truth either
+        # way — this only changes what's echoed back over the wire.
+        "new_handoff_path": (None if _hosted_mode() else path),
         "new_handoff_content": content,
         "new_token": new_token,
         "new_body_hash": new_body_hash,
@@ -5935,7 +5951,9 @@ def build_declared_symbol_targets(item: dict[str, Any]) -> list[dict[str, Any]]:
                 # No ``::`` scope — treat the whole tail as the qualified_name.
                 symbols.append((body, None))
         elif s.startswith("file:"):
-            fp = s[len("file:"):].strip()
+            # 4e2bce48 — real file, not a "<path>:<symbol>" pseudo-path.
+            from meridian.db import _resource_file_of  # noqa: PLC0415
+            fp = (_resource_file_of(s.strip()) or s[len("file:"):]).strip()
             if fp:
                 files.append(fp)
     if not symbols:
@@ -7519,10 +7537,22 @@ fi
 sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)".*/\\1/' || true)"
 url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count"
 [ -n "$sid" ] && url="$url?session_id=$sid"
+# 41f26499 — a Meridian-unreachable window (or a malformed/empty response)
+# used to fail open SILENTLY here, which could abandon this session's file
+# claims with no visible signal (they then only clear via the file-claim 2h
+# TTL). Fail-open behavior is UNCHANGED (still exit 0) but now surfaces a
+# clear stderr warning so the human/agent notices instead of silently
+# continuing.
 resp="$(curl -sf --max-time 5 "$url" 2>/dev/null || true)"
-[ -z "$resp" ] && exit 0
+if [ -z "$resp" ]; then
+  echo "Meridian (41f26499): could not reach $MERIDIAN_URL to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again." >&2
+  exit 0
+fi
 pending="$(printf '%s' "$resp" | grep -oE '"pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
-[ -z "$pending" ] && exit 0
+if [ -z "$pending" ]; then
+  echo "Meridian (41f26499): got an empty or malformed response from $MERIDIAN_URL - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again." >&2
+  exit 0
+fi
 if [ "$pending" -gt 0 ] 2>/dev/null; then
   echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
   exit 2
@@ -7564,14 +7594,34 @@ try { $payload = $raw | ConvertFrom-Json } catch { $payload = $null }
 if ($payload -and $payload.stop_hook_active -eq $true) { exit 0 }
 # b4ce3274 — forward the session id (when present) so the override budget is
 # counted per session, not per project.
+# 41f26499 — MUST use ${reqUrl} (braced) here, not bare $reqUrl: PowerShell
+# treats "?" as a legal bare-variable-name character, so "$reqUrl?session_id="
+# parsed as the (nonexistent, empty) variable $reqUrl?session_id followed by
+# literal "=", silently dropping the whole base URL and producing an invalid
+# URI. That sent Invoke-RestMethod down the catch branch below on every stop
+# with a session_id present -- i.e. always -- making this whole endpoint a
+# silent no-op on Windows. Caught while adding the warning below, which would
+# otherwise have falsely reported "server unreachable" on every normal stop.
 $reqUrl = "$Url/projects/$ProjectId/sprint/pending_count"
 if ($payload -and $payload.session_id) {
-    $reqUrl = "$reqUrl?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
+    $reqUrl = "${reqUrl}?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
 }
+# 41f26499 — a Meridian-unreachable window (or a malformed/empty response)
+# used to fail open SILENTLY here, which could abandon this session's file
+# claims with no visible signal (they then only clear via the file-claim 2h
+# TTL). Fail-open behavior is UNCHANGED (still exit 0) but now surfaces a
+# clear stderr warning so the human/agent notices instead of silently
+# continuing.
 try {
     $r = Invoke-RestMethod -Method GET -Uri $reqUrl -TimeoutSec 5
-} catch { exit 0 }
-if ($null -eq $r -or $null -eq $r.pending_count) { exit 0 }
+} catch {
+    [Console]::Error.WriteLine("Meridian (41f26499): could not reach $Url to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again.")
+    exit 0
+}
+if ($null -eq $r -or $null -eq $r.pending_count) {
+    [Console]::Error.WriteLine("Meridian (41f26499): got an empty or malformed response from $Url - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again.")
+    exit 0
+}
 $pending = [int]$r.pending_count
 if ($pending -gt 0) {
     [Console]::Error.WriteLine("Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping.")

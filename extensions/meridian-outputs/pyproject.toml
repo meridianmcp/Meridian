@@ -93,6 +93,17 @@ numpy = ["numpy>=1.24"]
 # rather than a hard dependency; outputs_local.py's own lazy import already
 # degrades gracefully to _xxh3_file when it's absent.
 blake3 = ["blake3>=0.4"]
+# 2026-09-24 -- same class of genuine opt-in extra as blake3 above: has_secret_content
+# (outputs_local.py) backs NO default code path, reachable only via an explicit
+# content_secret_mode="scan" on OutputsFtsIndex.rebuild(). detect-secrets (Yelp/IBM,
+# Apache 2.0) is the real, independently-developed, actively-maintained content-based
+# secret scanner this uses -- distinct from and complementary to is_secret_path()'s
+# basename-only default filter, per the paper's own real-tool comparator finding
+# (results.tex \S\ref{sec:results-secret-comparator}): each mechanism has structural
+# blind spots the other doesn't share. outputs_local.py lazily imports this and
+# degrades to a no-op (content_secret_mode="scan" behaves identically to "off") when
+# it's absent, so this stays a genuine optional extra rather than a hard dependency.
+secrets = ["detect-secrets>=1.5"]
 
 [project.scripts]
 # Entry-point is "meridian-outputs-mcp" (NOT "meridian-outputs") to avoid a uvx

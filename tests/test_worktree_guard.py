@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -160,6 +161,22 @@ def _make_payload(tool: str, file_path: str) -> str:
     return json.dumps({"tool_name": tool, "tool_input": {"file_path": file_path}})
 
 
+def _make_notebook_payload(notebook_path: str) -> str:
+    """Build a PreToolUse payload shaped like a REAL NotebookEdit call.
+
+    Claude Code's own NotebookEdit tool schema requires `notebook_path` (and
+    `new_source`) -- it has no `file_path` key at all (additionalProperties:
+    false on the schema). The other _make_payload helper above builds a
+    synthetic {"file_path": ...} payload for NotebookEdit that a real Claude
+    Code session would never actually send; these tests instead exercise the
+    genuine field shape (6f07aa89).
+    """
+    return json.dumps({
+        "tool_name": "NotebookEdit",
+        "tool_input": {"notebook_path": notebook_path, "new_source": "print(1)"},
+    })
+
+
 # ---------------------------------------------------------------------------
 # Tests: fails open when no CLAUDE_PROJECT_DIR
 # ---------------------------------------------------------------------------
@@ -233,6 +250,65 @@ def test_hook_blocks_edit_of_sibling_worktree_file(tool):
         f"{tool}: editing a sibling worktree's file must be blocked"
     )
     assert "a3984d96" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Tests: 6f07aa89 -- NotebookEdit's REAL schema field is notebook_path, not
+# file_path. The parametrized NotebookEdit cases above all pass a synthetic
+# {"file_path": ...} payload (matching Edit/Write/MultiEdit's real shape, but
+# NOT NotebookEdit's), so they exercise the fallback path harmlessly but do
+# not, on their own, prove the guard handles a genuine NotebookEdit call.
+# These tests use _make_notebook_payload, which mirrors NotebookEdit's actual
+# tool_input schema (notebook_path + new_source, no file_path key at all).
+# ---------------------------------------------------------------------------
+
+@_needs_bash
+def test_hook_blocks_notebookedit_real_schema_outside_worktree():
+    """A genuine NotebookEdit payload (notebook_path, no file_path) targeting
+    the main tree from a worktree session must still be blocked (exit 2).
+
+    Before the 6f07aa89 fix, the guard only read tool_input.file_path, which
+    is absent from a real NotebookEdit call -- filePath would be empty and
+    the hook would fail open (exit 0), silently never enforcing the worktree
+    boundary for any real NotebookEdit call.
+    """
+    notebook_file = str(Path(_MAIN_FILE).with_suffix(".ipynb"))
+    payload = _make_notebook_payload(notebook_file)
+    r = _run_hook(payload, claude_project_dir=_WORKTREE_DIR)
+    assert r.returncode == 2, (
+        "a real NotebookEdit payload (notebook_path field) targeting the "
+        "main tree from a worktree session must be blocked"
+    )
+    assert "a3984d96" in r.stderr
+    assert "NotebookEdit" in r.stderr
+    # Not asserting the exact notebook_file substring here: on Windows the
+    # bash hook's raw (non-normalized) $file_path used in the error message
+    # carries JSON-escaped double backslashes, so a straight substring check
+    # against the single-backslash Python path would spuriously fail -- the
+    # same reason test_hook_blocks_edit_of_main_tree_file_from_worktree_session
+    # above checks for the worktree marker rather than the raw main-file path.
+    assert _WORKTREE_DIR in r.stderr or ".claude/worktrees/" in r.stderr
+
+
+@_needs_bash
+def test_hook_allows_notebookedit_real_schema_inside_worktree():
+    """A genuine NotebookEdit payload targeting a file inside the claimed
+    worktree must be allowed (exit 0)."""
+    notebook_file = str(Path(_WORKTREE_FILE).with_suffix(".ipynb"))
+    payload = _make_notebook_payload(notebook_file)
+    r = _run_hook(payload, claude_project_dir=_WORKTREE_DIR)
+    assert r.returncode == 0, (
+        "a real NotebookEdit payload inside the claimed worktree must be allowed"
+    )
+
+
+@_needs_bash
+def test_hook_fails_open_notebookedit_without_notebook_path_or_file_path():
+    """Neither field present (some other/unexpected shape) -- must still fail
+    open rather than raise or misbehave."""
+    payload = json.dumps({"tool_name": "NotebookEdit", "tool_input": {"new_source": "x"}})
+    r = _run_hook(payload, claude_project_dir=_WORKTREE_DIR)
+    assert r.returncode == 0, "must fail open when neither path field is present"
 
 
 # ---------------------------------------------------------------------------
@@ -629,19 +705,46 @@ async def test_validate_worktree_merge_hosted_skips_git_checks_but_checks_manife
 # ---------------------------------------------------------------------------
 
 
-def _blocking_subprocess_run_stub(*, delay: float):
-    """Stand-in for subprocess.run: sleeps `delay` seconds (a REAL, blocking
-    time.sleep -- this is what a slow git invocation looks like from the
-    caller's perspective) then returns a plausible CompletedProcess."""
+class _FakeSlowPopen:
+    """Minimal stand-in for subprocess.Popen exposing just the surface
+    _git() actually uses (communicate/kill/wait/args/returncode). Used by
+    _blocking_subprocess_run_stub below.
 
-    def _stub(cmd, **kwargs):
-        time.sleep(delay)
-        args = list(cmd[1:]) if cmd and cmd[0] == "git" else list(cmd)
+    fecf3d24 -- _git() was changed from a single subprocess.run() call to
+    Popen()+communicate() (so a real process handle is available to kill on
+    cancellation/timeout -- see worktree_merge_guard._git). These fixtures
+    patch subprocess.Popen (not subprocess.run) to match; patching run() no
+    longer has any effect since _git() never calls it."""
+
+    def __init__(self, cmd, *, delay: float):
+        self.args = cmd
+        self._delay = delay
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        time.sleep(self._delay)  # REAL, blocking sleep -- a slow `git` call
+        args = list(self.args[1:]) if self.args and self.args[0] == "git" else list(self.args)
         if args[:2] == ["rev-parse", "HEAD"]:
             stdout = ("b" * 40) + "\n"
         else:
             stdout = ""  # clean `status --porcelain`; ancestor `merge-base`
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
+        return stdout, ""
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _blocking_subprocess_run_stub(*, delay: float):
+    """Stand-in for subprocess.Popen: returns a _FakeSlowPopen whose
+    communicate() performs a REAL, blocking time.sleep(delay) -- what a
+    slow git invocation looks like from the caller's perspective -- then
+    returns plausible output."""
+
+    def _stub(cmd, **kwargs):
+        return _FakeSlowPopen(cmd, delay=delay)
 
     return _stub
 
@@ -673,7 +776,7 @@ async def test_git_helper_does_not_block_event_loop(tmp_path):
         git_finished_at = time.monotonic()
 
     with patch(
-        "meridian.worktree_merge_guard.subprocess.run",
+        "meridian.worktree_merge_guard.subprocess.Popen",
         side_effect=_blocking_subprocess_run_stub(delay=delay),
     ):
         start = time.monotonic()
@@ -689,6 +792,112 @@ async def test_git_helper_does_not_block_event_loop(tmp_path):
         "event loop was blocked (sleep couldn't run until git returned)"
     )
     assert sleep_fired_at - start < delay / 2
+
+
+# ---------------------------------------------------------------------------
+# fecf3d24 -- _git() must never leave an orphaned, unkilled OS subprocess
+# behind on a timeout. Both tests below substitute a REAL, genuinely
+# long-sleeping OS process for the "git" invocation (by patching
+# subprocess.Popen itself, which subprocess.run() also calls internally --
+# so this same substitution exercises whichever code path _git() actually
+# uses) and assert the real process is dead afterward, not merely that the
+# Python-level call returned/raised. A mocked CompletedProcess could never
+# catch this class of bug -- there would be no real process to leak.
+# ---------------------------------------------------------------------------
+
+
+def _spawn_real_sleeper_instead_of_git(spawned: list[subprocess.Popen]):
+    """Return a subprocess.Popen side_effect that ignores the requested argv
+    (["git", ...]) and spawns a real, long-sleeping Python child process
+    instead, recording the handle in `spawned` so the test can inspect its
+    real OS-level liveness afterward."""
+    real_popen = subprocess.Popen
+
+    def _fake_popen(_cmd, **kwargs):
+        proc = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs
+        )
+        spawned.append(proc)
+        return proc
+
+    return _fake_popen
+
+
+@pytest.mark.asyncio
+async def test_git_own_timeout_kills_and_reaps_real_subprocess(tmp_path):
+    """_git()'s own subprocess-level `timeout` firing must genuinely kill
+    (and reap) the real child process -- not merely raise TimeoutExpired in
+    Python while the OS process keeps running."""
+    spawned: list[subprocess.Popen] = []
+    with patch(
+        "meridian.worktree_merge_guard.subprocess.Popen",
+        side_effect=_spawn_real_sleeper_instead_of_git(spawned),
+    ):
+        with pytest.raises(subprocess.TimeoutExpired):
+            await _merge_guard_mod._git(tmp_path, ["status"], timeout=0.3)
+
+    assert len(spawned) == 1
+    proc = spawned[0]
+    deadline = time.monotonic() + 5
+    while proc.poll() is None and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert proc.poll() is not None, (
+        "the real child process was still alive after _git()'s own timeout "
+        "fired -- it was leaked as an orphan instead of being killed+reaped"
+    )
+
+
+@pytest.mark.asyncio
+async def test_git_cancelled_by_outer_timeout_still_kills_real_process(tmp_path):
+    """Regression test for the exact production shape of fecf3d24: a caller
+    (mcp/handlers/sprint_tools.py) wraps validate_worktree_merge -- which
+    calls _git() -- in asyncio.wait_for(..., timeout=_MERGE_VALIDATION_TIMEOUT_S
+    = 10s), a SHORTER budget than _git()'s own default 20s `timeout`. The
+    outer wait_for can therefore cancel _git() well before _git()'s own
+    subprocess-level timeout would ever fire.
+
+    Before the fix, that cancellation only stopped the awaiting coroutine --
+    the real OS git process, running inside a worker thread via
+    asyncio.to_thread, kept running unkilled for up to its own full internal
+    timeout (or longer, if it happened to be blocked on a repo lock). This
+    test reproduces that shape at a much smaller timescale (0.3s outer vs.
+    the 20s-default inner _git call) and asserts the real spawned process is
+    actually dead well before it would have hit its own internal timeout --
+    proving the process was proactively killed on cancellation, not merely
+    that the Python-level await raised.
+    """
+    spawned: list[subprocess.Popen] = []
+    with patch(
+        "meridian.worktree_merge_guard.subprocess.Popen",
+        side_effect=_spawn_real_sleeper_instead_of_git(spawned),
+    ):
+        with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+            # _git's own timeout defaults to 20s -- deliberately left alone
+            # here -- while the outer wait_for times out at 0.3s, mirroring
+            # the real 10s-outer-vs-20s-inner production shape.
+            await asyncio.wait_for(
+                _merge_guard_mod._git(tmp_path, ["status"]), timeout=0.3,
+            )
+
+    assert len(spawned) == 1
+    proc = spawned[0]
+    # Poll well short of the real sleeper's 30s lifetime and _git's own 20s
+    # internal timeout -- with the fix, cancellation kills the process
+    # immediately (asyncio.wait_for awaits the cancelled task's cleanup,
+    # which itself awaits the kill+reap, before raising), so this should
+    # already be true with no polling needed; the short loop only guards
+    # against incidental scheduling slack.
+    deadline = time.monotonic() + 5
+    while proc.poll() is None and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert proc.poll() is not None, (
+        "the real child process was still alive seconds after the outer "
+        "asyncio.wait_for cancelled _git() -- it was leaked as an orphan "
+        "instead of being killed+reaped on cancellation, which is exactly "
+        "the fecf3d24 bug (and has been observed to eventually starve the "
+        "shared thread-pool executor, hanging an unrelated later "
+        "complete_sprint_item call)"
+    )
 
 
 @pytest.mark.asyncio
@@ -725,7 +934,7 @@ async def test_validate_worktree_merge_runs_concurrently_with_other_coroutines(d
                 ticks_during_validate += 1
 
     with patch(
-        "meridian.worktree_merge_guard.subprocess.run",
+        "meridian.worktree_merge_guard.subprocess.Popen",
         side_effect=_blocking_subprocess_run_stub(delay=delay),
     ):
         ticker_task = asyncio.create_task(_ticker())

@@ -17,10 +17,43 @@ both sources uniformly.
 Pure parsing (:func:`parse_arxiv_atom`, :func:`parse_openalex_works`) is separated from the
 network calls (:func:`arxiv_search`, :func:`openalex_search`) so both can be unit-tested
 deterministically without hitting the network.
+
+9dc630de adds two more sources. Crossref (keyless) is the DOI registry itself: weaker than
+OpenAlex/Semantic Scholar for topical discovery (its relevance ranking is metadata matching),
+but authoritative for DOI resolution and venue metadata -- journal name, ISSN, publisher,
+work type -- which is what matters when targeting a specific journal. CORE aggregates
+open-access full text; unlike every other source here it needs an API key (an
+unauthenticated probe got HTTP 429 on its very first request), so :func:`core_search` fails
+closed with an explicit error when ``CORE_API_KEY`` is unset rather than degrading to a
+different source.
+
+454bdee5 makes ``arxiv_search`` survive hosted egress. From the hosted (Fly.io) server,
+arXiv's export API answers HTTP 406 to a request that returns 200 from a residential
+machine with the same URL and User-Agent, so this is an egress/IP refusal, not a
+request-format bug, and no header change fixes it. ``arxiv_search`` still tries arXiv
+first (the happy path is unchanged), and when arXiv refuses (403/406), stays rate-limited
+or erroring after backoff (429/5xx), is unreachable (a transport error), or answers with a
+body that is not an Atom feed, it falls back to OpenAlex restricted to works with an arXiv
+location, then to Semantic Scholar papers carrying an arXiv id. Fallback rows keep the
+arXiv row shape (``arxiv_id`` included, so watchlist dedup still works), and the result
+gains ``fallback_source``, ``warning`` and ``sources_tried``. Crossref is deliberately not a
+fallback: arXiv DOIs (10.48550/arXiv.*) are registered with DataCite, not Crossref, so
+Crossref cannot return arXiv ids. ``openalex_search`` now also goes through
+:func:`_fetch_with_backoff`, advertises a mailto in its User-Agent, and sends
+``OPENALEX_API_KEY`` (when set) as a bearer header: OpenAlex budgets anonymous use per IP
+(a live 2026-09-27 probe showed a 1000-credit daily budget with a search costing 10
+credits, and anonymous search being throttled with ``Retry-After: ~30`` under load), so
+on a shared hosted IP a free key, not a mailto, is what actually stops the 429s.
 """
 from __future__ import annotations
 
+import asyncio
+import email.utils
+import os
+import re
+import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Any
 
 # 995e27a5 — arXiv's export API now 301-redirects http -> https. httpx does NOT
@@ -38,6 +71,30 @@ _PUBMED_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 _PUBMED_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 _NCBI_TOOL = "Meridian"
 _NCBI_EMAIL = "research@usemeridian.us"
+# 9dc630de — Crossref REST (keyless; a mailto puts requests in the polite pool) and CORE v3
+# (key required). CORE's bare path 301-redirects to the trailing-slash form.
+_CROSSREF_API = "https://api.crossref.org/works"
+_CORE_API = "https://api.core.ac.uk/v3/search/works/"
+_CONTACT_EMAIL = "research@usemeridian.us"
+_POLITE_USER_AGENT = f"Meridian/paper_search (research routing; mailto:{_CONTACT_EMAIL})"
+_RETRY_DELAYS = (0.5, 1.5)  # waits [s] before attempt 2 and attempt 3; no wait before 1
+# 454bdee5 — a Retry-After longer than this means "not within this tool call": fail fast
+# (so a fallback source can answer) instead of sleeping, or retrying early for nothing.
+_MAX_RETRY_AFTER = 5.0
+# Statuses worth retrying for the sources routed through _fetch_with_backoff with an
+# explicit retry set (arXiv, OpenAlex, the arXiv fallbacks). Crossref/CORE keep the
+# original (429, 503) default.
+_TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
+# arXiv answers these to requests it refuses outright (hosted egress got 406 on
+# 2026-09-26); retrying cannot help, so they go straight to the fallback chain.
+_ARXIV_REFUSED_STATUSES = frozenset({403, 406})
+# Wall-clock cap [s] on arXiv's retry loop: no retry starts once elapsed + wait would
+# pass it. arXiv's Varnish was seen (2026-09-27) holding a request ~60s before a 503.
+_ARXIV_RETRY_BUDGET = 20.0
+# OpenAlex's id for the arXiv repository source ("arXiv (Cornell University)",
+# type=repository, host I205783295), verified live 2026-09-27 via GET /sources/S4306400194.
+_OPENALEX_ARXIV_SOURCE = "S4306400194"
+_MARKUP_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def parse_arxiv_atom(xml_text: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -45,10 +102,22 @@ def parse_arxiv_atom(xml_text: str, limit: int = 10) -> list[dict[str, Any]]:
     empty XML degrades to ``[]``. Each result:
     ``{arxiv_id, title, authors, summary, published, updated, url, pdf_url}``.
     """
+    return _parse_arxiv_feed(xml_text, limit) or []
+
+
+def _parse_arxiv_feed(xml_text: str, limit: int = 10) -> list[dict[str, Any]] | None:
+    """Like :func:`parse_arxiv_atom`, but ``None`` when the body is not an Atom feed at all.
+
+    That distinction is what lets ``arxiv_search`` tell "arXiv found nothing" (an empty
+    feed, ``[]``) from "something other than arXiv's API answered" (an HTML block or
+    challenge page, a proxy error body served with a 200), which is a reason to fall back.
+    """
     try:
         root = ET.fromstring(xml_text or "")
     except Exception:  # noqa: BLE001 — a bad feed must never crash a tool call
-        return []
+        return None
+    if root.tag != f"{_ATOM}feed":
+        return None
     out: list[dict[str, Any]] = []
     for entry in root.findall(f"{_ATOM}entry"):
         def _text(tag: str) -> str:
@@ -89,12 +158,21 @@ async def arxiv_search(
     ``sort_by``: ``'relevance'`` (default) or ``'date'`` (most-recently-updated first).
     Never raises — an empty query returns ``{error}`` and any network/parse failure
     degrades to ``{error, query}`` so a research call can't crash the MCP handler.
+
+    454bdee5 — arXiv is always tried first, with the same request as before. If arXiv
+    refuses (403/406), is still rate-limited or failing after backoff (429/5xx), cannot be
+    reached, or answers with something that is not an Atom feed, the search falls back to
+    OpenAlex and then Semantic Scholar (see :func:`_arxiv_fallback_search`). A fallback
+    answer has the same rows plus ``fallback_source``, ``warning`` and ``sources_tried``;
+    if every source fails, the result is the usual ``{error, query}`` plus
+    ``sources_tried``. Any other failure (e.g. a 400) is returned as an error without a
+    fallback, as before.
     """
     q = (query or "").strip()
     if not q:
         return {"error": "query is required"}
     n = max(1, min(int(limit or 10), 50))
-    sort = "lastUpdatedDate" if str(sort_by).lower() in ("date", "recent", "newest") else "relevance"
+    sort = "lastUpdatedDate" if _wants_date_sort(sort_by) else "relevance"
     params = {
         "search_query": f"all:{q}",
         "start": "0",
@@ -107,15 +185,27 @@ async def arxiv_search(
         # 995e27a5 — follow_redirects so a future http->https (or mirror) 301 is
         # honoured instead of silently parsing a redirect body to zero results.
         async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
-            resp = await http.get(
-                _ARXIV_API, params=params,
-                headers={"User-Agent": "Meridian/paper_search (research routing)"},
+            resp = await _fetch_with_backoff(
+                http, _ARXIV_API, params,
+                {"User-Agent": "Meridian/paper_search (research routing)"},
+                retry_statuses=_TRANSIENT_STATUSES,
+                # arXiv's Varnish has been seen holding a request ~60s before a 503;
+                # never spend more than this retrying when a fallback can answer.
+                budget=_ARXIV_RETRY_BUDGET,
             )
-            resp.raise_for_status()
-            results = parse_arxiv_atom(resp.text, n)
+            results = _parse_arxiv_feed(resp.text, n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
-        return {"error": f"arxiv search failed: {exc}", "query": q}
+        reason = _arxiv_unreachable_reason(exc)
+        if reason is None:
+            return {"error": f"arxiv search failed: {exc}", "query": q}
+        return await _arxiv_fallback_search(q, n, sort_by, reason)
+    if results is None:
+        return await _arxiv_fallback_search(q, n, sort_by, "response was not an Atom feed")
     return {"query": q, "count": len(results), "results": results}
+
+
+def _wants_date_sort(sort_by: Any) -> bool:
+    return str(sort_by).lower() in ("date", "recent", "newest")
 
 
 def _openalex_abstract(inverted_index: Any) -> str:
@@ -204,31 +294,60 @@ async def openalex_search(
     Never raises — an empty query returns ``{error}`` and any network/parse failure
     degrades to ``{error, query}`` so a research call can't crash the MCP handler. Mirrors
     ``arxiv_search`` exactly (keyless, best-effort, non-raising).
+
+    454bdee5 — sends ``mailto`` as a query parameter AND in the User-Agent (the Crossref
+    pattern), retries 429/5xx through :func:`_fetch_with_backoff`, and uses
+    ``OPENALEX_API_KEY`` when it is set (see :func:`_openalex_get_works`). A 429 that
+    outlasts the backoff says how to raise the budget.
     """
     q = (query or "").strip()
     if not q:
         return {"error": "query is required"}
     n = max(1, min(int(limit or 10), 50))
-    params = {
-        "search": q,
-        "per-page": str(n),
-        # A mailto puts the request in OpenAlex's faster "polite pool" (keyless still).
-        "mailto": "research@usemeridian.us",
-    }
-    if str(sort_by).lower() in ("date", "recent", "newest"):
-        params["sort"] = "publication_date:desc"
-    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    api_key = _openalex_api_key()
     try:
-        async with _httpx.AsyncClient(timeout=15.0) as http:
-            resp = await http.get(
-                _OPENALEX_API, params=params,
-                headers={"User-Agent": "Meridian/paper_search (research routing)"},
-            )
-            resp.raise_for_status()
-            results = parse_openalex_works(resp.json(), n)
+        payload = await _openalex_get_works(q, n, sort_by, api_key=api_key)
+        results = parse_openalex_works(payload, n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
-        return {"error": f"openalex search failed: {exc}", "query": q}
+        message = f"openalex search failed: {exc}"
+        if _http_status(exc) == 429 and not api_key:
+            message += (
+                " -- OpenAlex budgets anonymous search per IP; set OPENALEX_API_KEY "
+                "(free key: https://openalex.org/rest-api) for a higher limit"
+            )
+        return {"error": _redact(message, api_key), "query": q}
     return {"query": q, "count": len(results), "results": results}
+
+
+def _openalex_api_key() -> str:
+    return os.environ.get("OPENALEX_API_KEY", "").strip()
+
+
+async def _openalex_get_works(
+    q: str, n: int, sort_by: Any, *, api_key: str = "", filter_expr: str = ""
+) -> Any:
+    """GET OpenAlex ``/works?search=`` and return the decoded JSON; raises on failure.
+
+    Shared by :func:`openalex_search` and the arXiv fallback. ``mailto`` goes in both the
+    query string (OpenAlex's documented polite-pool parameter) and the User-Agent. The API
+    key, when there is one, goes only in an ``Authorization: Bearer`` header (documented as
+    equivalent to ``api_key=``), never the query string, because httpx puts the full
+    request URL into its exception messages.
+    """
+    params = {"search": q, "per-page": str(n), "mailto": _CONTACT_EMAIL}
+    if _wants_date_sort(sort_by):
+        params["sort"] = "publication_date:desc"
+    if filter_expr:
+        params["filter"] = filter_expr
+    headers = {"User-Agent": _POLITE_USER_AGENT}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
+        resp = await _fetch_with_backoff(
+            http, _OPENALEX_API, params, headers, retry_statuses=_TRANSIENT_STATUSES,
+        )
+        return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -560,3 +679,597 @@ async def pubmed_search(
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
         return {"error": f"pubmed search failed: {exc}", "query": q}
     return {"query": q, "count": len(results), "results": results}
+
+
+# ---------------------------------------------------------------------------
+# 9dc630de — Crossref + CORE
+# ---------------------------------------------------------------------------
+
+async def _fetch_with_backoff(
+    http: Any,
+    url: str,
+    params: dict[str, str],
+    headers: dict[str, str],
+    *,
+    retry_statuses: frozenset[int] | tuple[int, ...] = (429, 503),
+    budget: float | None = None,
+) -> Any:
+    """HTTP GET with backoff on ``retry_statuses`` (default 429/503); max 3 attempts.
+
+    Same contract as the helpers in github_search.py/social_search.py (each research
+    module keeps its own copy): no delay before the first attempt, and any other HTTP
+    error, or a transport error, propagates immediately so the caller degrades it without
+    retrying. 454bdee5 extensions, all no-ops for existing callers:
+
+    - ``retry_statuses`` widens the retried set (arXiv/OpenAlex pass 429 + 5xx).
+    - A ``Retry-After`` header is honoured: the wait is the larger of it and the scheduled
+      delay, and one above ``_MAX_RETRY_AFTER`` ends the loop at once (the server has said
+      an early retry will fail; a live OpenAlex 429 asked for ~30s).
+    - ``budget`` [s] stops retrying once elapsed time plus the next wait would exceed it.
+    """
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    started = time.monotonic()
+    delay = 0.0
+    for attempt in range(len(_RETRY_DELAYS) + 1):
+        if attempt > 0:
+            await asyncio.sleep(delay)
+        try:
+            resp = await http.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            return resp
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in retry_statuses or attempt == len(_RETRY_DELAYS):
+                raise
+            retry_after = _retry_after_seconds(exc.response)
+            if retry_after is not None and retry_after > _MAX_RETRY_AFTER:
+                raise
+            delay = max(_RETRY_DELAYS[attempt], retry_after or 0.0)
+            if budget is not None and time.monotonic() - started + delay > budget:
+                raise
+    raise AssertionError("unreachable: the last attempt returns or raises")  # pragma: no cover
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    """Seconds a ``Retry-After`` header asks for (delta-seconds or HTTP-date), else None."""
+    headers = getattr(response, "headers", None)
+    raw = headers.get("Retry-After") if headers is not None else None
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:  # pragma: no cover — older Pythons returned None instead of raising
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _http_status(exc: BaseException) -> int | None:
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _redact(text: str, secret: str) -> str:
+    return text.replace(secret, "***") if secret else text
+
+
+_BLOCK_TAG_RE = re.compile(r"</?(?:jats:)?(?:p|title|sec|list|list-item|br)\b[^>]*>", re.IGNORECASE)
+_JATS_TITLE_RE = re.compile(r"<(?:jats:)?title\b[^>]*>.*?</(?:jats:)?title>", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_markup(text: Any, *, drop_titles: bool = False) -> str:
+    """Remove JATS/HTML markup and collapse whitespace; non-strings degrade to ``""``.
+
+    Crossref titles carry inline tags (``<scp>DNA</scp>``, ``H<sub>2</sub>O``) that must
+    vanish without inserting spaces, while abstracts carry block tags (``<jats:p>``)
+    that must become paragraph breaks. ``drop_titles`` removes an abstract's own
+    ``<jats:title>Abstract</jats:title>`` heading.
+    """
+    if not isinstance(text, str):
+        return ""
+    if drop_titles:
+        text = _JATS_TITLE_RE.sub(" ", text)
+    text = _BLOCK_TAG_RE.sub(" ", text)
+    text = _MARKUP_TAG_RE.sub("", text)
+    return " ".join(text.split())
+
+
+def _crossref_date(item: dict[str, Any], *keys: str) -> str:
+    """First usable ``date-parts`` among ``keys`` as ``YYYY[-MM[-DD]]``, else ``""``.
+
+    Crossref pads unknown components with ``null`` (e.g. ``[[2021, null]]``) and some
+    records carry an empty ``[[null]]``; both stop at the last known component.
+    """
+    for key in keys:
+        block = item.get(key)
+        if not isinstance(block, dict):
+            continue
+        parts = block.get("date-parts")
+        if not (isinstance(parts, list) and parts and isinstance(parts[0], list)):
+            continue
+        fields: list[str] = []
+        for i, part in enumerate(parts[0][:3]):
+            if isinstance(part, bool):
+                break
+            try:
+                value = int(part)
+            except (TypeError, ValueError):
+                break
+            fields.append(str(value) if i == 0 else f"{value:02d}")
+        if fields:
+            return "-".join(fields)
+    return ""
+
+
+def parse_crossref_works(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Parse a Crossref ``/works`` JSON payload into normalized paper dicts.
+
+    Never raises — a malformed or empty payload degrades to ``[]``. Each result:
+    ``{doi, title, authors, summary, published, updated, url, pdf_url, venue, issn,
+    publisher, type, citation_count}``. ``venue`` is the first ``container-title``
+    (journal or proceedings name); ``pdf_url`` is only set when Crossref lists a link
+    whose content type is ``application/pdf``. Accepts the full response
+    (``{"message": {"items": [...]}}``), the ``message`` object, or a bare item list.
+    """
+    items: Any = None
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        items = message.get("items") if isinstance(message, dict) else payload.get("items")
+    elif isinstance(payload, (list, tuple)):
+        items = payload
+    if not isinstance(items, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        titles = item.get("title")
+        title = _strip_markup(titles[0] if isinstance(titles, list) and titles else titles)
+        authors: list[str] = []
+        for author in item.get("author") or []:
+            if not isinstance(author, dict):
+                continue
+            given = str(author.get("given") or "").strip()
+            family = str(author.get("family") or "").strip()
+            name = " ".join(p for p in (given, family) if p) or str(author.get("name") or "").strip()
+            if name:
+                authors.append(name)
+        containers = item.get("container-title")
+        venue = _strip_markup(
+            containers[0] if isinstance(containers, list) and containers else containers
+        )
+        raw_issn = item.get("ISSN")
+        issn = (
+            [str(x).strip() for x in raw_issn if str(x).strip()]
+            if isinstance(raw_issn, list)
+            else []
+        )
+        doi = str(item.get("DOI") or "").strip()
+        pdf_url = ""
+        for link in item.get("link") or []:
+            if (
+                isinstance(link, dict)
+                and str(link.get("content-type") or "").lower() == "application/pdf"
+            ):
+                pdf_url = str(link.get("URL") or "").strip()
+                if pdf_url:
+                    break
+        citation_count = item.get("is-referenced-by-count")
+        out.append({
+            "doi": doi,
+            "title": title,
+            "authors": authors,
+            "summary": _strip_markup(item.get("abstract"), drop_titles=True),
+            "published": _crossref_date(
+                item, "published", "issued", "published-print", "published-online"
+            ),
+            "updated": _crossref_date(item, "deposited"),
+            "url": str(item.get("URL") or "").strip() or (f"https://doi.org/{doi}" if doi else ""),
+            "pdf_url": pdf_url,
+            "venue": venue,
+            "issn": issn,
+            "publisher": str(item.get("publisher") or "").strip(),
+            "type": str(item.get("type") or "").strip(),
+            "citation_count": (
+                citation_count
+                if isinstance(citation_count, int) and not isinstance(citation_count, bool)
+                else 0
+            ),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def crossref_search(
+    query: str, limit: int = 10, sort_by: str = "relevance"
+) -> dict[str, Any]:
+    """Search Crossref (keyless) and return ``{query, count, results:[...]}``.
+
+    Rows share the ``title/authors/summary/published/updated/url/pdf_url`` base shape
+    with the other sources and add ``doi``, ``venue``, ``issn``, ``publisher``, ``type``
+    and ``citation_count``. ``sort_by='date'`` sorts by publication date, newest first.
+    Retries 429/503 with backoff; never raises — degrades to ``{error, query}``.
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"error": "query is required"}
+    n = max(1, min(int(limit or 10), 50))
+    params = {"query": q, "rows": str(n), "mailto": _CONTACT_EMAIL}
+    if str(sort_by).lower() in ("date", "recent", "newest"):
+        params["sort"] = "published"
+        params["order"] = "desc"
+    headers = {"User-Agent": f"Meridian/paper_search (research routing; mailto:{_CONTACT_EMAIL})"}
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    try:
+        async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
+            resp = await _fetch_with_backoff(http, _CROSSREF_API, params, headers)
+            results = parse_crossref_works(resp.json(), n)
+    except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
+        return {"error": f"crossref search failed: {exc}", "query": q}
+    return {"query": q, "count": len(results), "results": results}
+
+
+def parse_core_works(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Parse a CORE v3 ``/search/works`` JSON payload into normalized paper dicts.
+
+    Never raises — a malformed or empty payload degrades to ``[]``. Each result:
+    ``{core_id, title, authors, summary, published, updated, url, pdf_url, doi, venue,
+    publisher, has_full_text}``. CORE's ``fullText`` field can be an entire paper, so it
+    is deliberately NOT copied into the result; ``has_full_text`` says whether one
+    exists and ``pdf_url`` (CORE's ``downloadUrl``) is where to fetch it.
+    """
+    works = payload.get("results") if isinstance(payload, dict) else payload
+    if not isinstance(works, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for work in works:
+        if not isinstance(work, dict):
+            continue
+        core_id = str(work.get("id") or "").strip()
+        authors = [
+            " ".join(str(a.get("name") or "").split())
+            for a in (work.get("authors") or [])
+            if isinstance(a, dict) and str(a.get("name") or "").strip()
+        ]
+        published = str(work.get("publishedDate") or "").strip()[:10]
+        if not published and work.get("yearPublished"):
+            published = str(work.get("yearPublished")).strip()
+        display_url = ""
+        for link in work.get("links") or []:
+            if isinstance(link, dict) and link.get("type") == "display":
+                display_url = str(link.get("url") or "").strip()
+                if display_url:
+                    break
+        venue = ""
+        for journal in work.get("journals") or []:
+            if isinstance(journal, dict) and str(journal.get("title") or "").strip():
+                venue = " ".join(str(journal["title"]).split())
+                break
+        full_text = work.get("fullText")
+        out.append({
+            "core_id": core_id,
+            "title": " ".join(str(work.get("title") or "").split()),
+            "authors": authors,
+            "summary": " ".join(str(work.get("abstract") or "").split()),
+            "published": published,
+            "updated": str(work.get("updatedDate") or "").strip()[:10],
+            "url": display_url or (f"https://core.ac.uk/works/{core_id}" if core_id else ""),
+            "pdf_url": str(work.get("downloadUrl") or "").strip(),
+            "doi": str(work.get("doi") or "").strip(),
+            "venue": venue,
+            "publisher": str(work.get("publisher") or "").strip(),
+            "has_full_text": isinstance(full_text, str) and bool(full_text.strip()),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def core_search(
+    query: str, limit: int = 10, sort_by: str = "relevance", api_key: str | None = None
+) -> dict[str, Any]:
+    """Search CORE's open-access corpus and return ``{query, count, results:[...]}``.
+
+    Needs an API key (free registration): ``api_key`` if given, else the
+    ``CORE_API_KEY`` environment variable. With no key it returns an explicit error
+    WITHOUT making a request — never a silent fallback to another source. The key is
+    sent only as an ``Authorization: Bearer`` header (never a query parameter, which
+    would leak it into exception messages) and is redacted from any error text.
+    ``sort_by`` is accepted for API-shape consistency but not applied: CORE's date-sort
+    parameter could not be verified without a key, so results are always by relevance.
+    Retries 429/503 with backoff; never raises — degrades to ``{error, query}``.
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"error": "query is required"}
+    key = (api_key if api_key is not None else os.environ.get("CORE_API_KEY", "")).strip()
+    if not key:
+        return {
+            "error": (
+                "CORE requires an API key: set CORE_API_KEY (free registration at "
+                "https://core.ac.uk/services/api). Unauthenticated requests are rate-"
+                "limited to failure (HTTP 429)."
+            ),
+            "query": q,
+        }
+    n = max(1, min(int(limit or 10), 50))
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "User-Agent": f"Meridian/paper_search (research routing; mailto:{_CONTACT_EMAIL})",
+    }
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    try:
+        async with _httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http:
+            resp = await _fetch_with_backoff(http, _CORE_API, {"q": q, "limit": str(n)}, headers)
+            results = parse_core_works(resp.json(), n)
+    except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (401, 403):
+            message = f"CORE rejected the API key (HTTP {status}) -- check CORE_API_KEY"
+        else:
+            message = f"core search failed: {exc}"
+        return {"error": message.replace(key, "***"), "query": q}
+    return {"query": q, "count": len(results), "results": results}
+
+
+# ---------------------------------------------------------------------------
+# 454bdee5 — arXiv fallback for when arXiv refuses or cannot be reached
+# ---------------------------------------------------------------------------
+
+# An arXiv identifier, optionally versioned: new style YYMM.NNNN[N] (2007 on) or old style
+# archive[.SC]/YYMMNNN (e.g. hep-th/9901001, math.GT/0309136).
+_ARXIV_ID = r"(?:\d{4}\.\d{4,5}|[a-z][a-z\-]*(?:\.[a-z]{2})?/\d{7})(?:v\d+)?(?!\d)"
+# Where an arXiv id shows up in OpenAlex data, most faithful first: the OAI-PMH location
+# id ("pmh:oai:arXiv.org:<id>", original case), an arxiv.org abs/pdf URL (a pdf URL may
+# end in ".pdf", which the id pattern stops before), then arXiv's DataCite DOI
+# ("10.48550/arxiv.<id>"; OpenAlex lowercases DOIs, so this one comes last).
+_ARXIV_ID_PATTERNS = (
+    re.compile(rf"oai:arxiv\.org:({_ARXIV_ID})", re.IGNORECASE),
+    re.compile(rf"arxiv\.org/(?:abs|pdf)/({_ARXIV_ID})", re.IGNORECASE),
+    re.compile(rf"10\.48550/arxiv\.({_ARXIV_ID})", re.IGNORECASE),
+)
+
+
+def _arxiv_row(
+    arxiv_id: str, title: str, authors: list[str], summary: str, published: str
+) -> dict[str, Any]:
+    """A fallback row in exactly the :func:`parse_arxiv_atom` shape.
+
+    ``url``/``pdf_url`` are rebuilt from the id so they always point at arXiv itself.
+    ``updated`` stays blank: arXiv's "updated" is the latest version's date, and no
+    fallback source carries it (OpenAlex's ``updated_date`` is when OpenAlex last touched
+    its own record, which would be actively misleading here).
+    """
+    return {
+        "arxiv_id": arxiv_id,
+        "title": title,
+        "authors": authors,
+        "summary": summary,
+        "published": published,
+        "updated": "",
+        "url": f"https://arxiv.org/abs/{arxiv_id}",
+        "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+    }
+
+
+def _arxiv_id_from_openalex_work(work: dict[str, Any]) -> str:
+    """The arXiv id of an OpenAlex work, or ``""`` when none can be found.
+
+    A preprint-only work carries it in its DOI and primary location. A work that was also
+    published elsewhere is a single merged OpenAlex record whose ``doi`` is the journal's,
+    so the arXiv id is only in one of its ``locations`` — hence every location is checked.
+    """
+    candidates: list[Any] = []
+    primary = work.get("primary_location")
+    locations = work.get("locations")
+    for loc in [primary, *(locations if isinstance(locations, (list, tuple)) else [])]:
+        if isinstance(loc, dict):
+            candidates.extend(loc.get(key) for key in ("id", "landing_page_url", "pdf_url"))
+    candidates.append(work.get("doi"))
+    ids = work.get("ids")
+    if isinstance(ids, dict):
+        candidates.append(ids.get("doi"))
+    for pattern in _ARXIV_ID_PATTERNS:
+        for candidate in candidates:
+            if isinstance(candidate, str):
+                match = pattern.search(candidate)
+                if match:
+                    return match.group(1)
+    return ""
+
+
+def parse_openalex_arxiv_works(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Parse an OpenAlex ``/works`` payload into arXiv-shaped rows (see :func:`_arxiv_row`).
+
+    Works with no recoverable arXiv id are dropped, and so are repeats of an id already
+    returned (OpenAlex occasionally keeps a preprint and its published version as two
+    works). Never raises; a malformed payload degrades to ``[]``.
+    """
+    works = payload.get("results") if isinstance(payload, dict) else payload
+    if not isinstance(works, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for work in works:
+        if not isinstance(work, dict):
+            continue
+        arxiv_id = _arxiv_id_from_openalex_work(work)
+        if not arxiv_id or arxiv_id in seen:
+            continue
+        seen.add(arxiv_id)
+        base = parse_openalex_works([work], 1)[0]
+        out.append(_arxiv_row(
+            arxiv_id, base["title"], base["authors"], base["summary"], base["published"],
+        ))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def parse_semantic_scholar_arxiv_papers(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Parse a Semantic Scholar ``/paper/search`` payload into arXiv-shaped rows.
+
+    Only papers whose ``externalIds`` carry an ``ArXiv`` id are kept. Never raises; a
+    malformed payload degrades to ``[]``.
+    """
+    papers = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(papers, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for paper in papers:
+        if not isinstance(paper, dict):
+            continue
+        external_ids = paper.get("externalIds")
+        arxiv_id = (
+            str(external_ids.get("ArXiv") or "").strip() if isinstance(external_ids, dict) else ""
+        )
+        if not arxiv_id or arxiv_id in seen:
+            continue
+        seen.add(arxiv_id)
+        authors = [
+            str(a.get("name") or "").strip()
+            for a in (paper.get("authors") or [])
+            if isinstance(a, dict) and str(a.get("name") or "").strip()
+        ]
+        year = paper.get("year")
+        published = str(paper.get("publicationDate") or "").strip() or (
+            str(year) if isinstance(year, int) and not isinstance(year, bool) else ""
+        )
+        out.append(_arxiv_row(
+            arxiv_id,
+            " ".join(str(paper.get("title") or "").split()),
+            authors,
+            " ".join(str(paper.get("abstract") or "").split()),
+            published,
+        ))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _openalex_arxiv_rows(q: str, n: int, sort_by: Any) -> list[dict[str, Any]]:
+    """OpenAlex search restricted to works with an arXiv location; raises on failure.
+
+    ``locations.source.id`` rather than ``primary_location.source.id``: the latter only
+    matches preprint-only works and misses every arXiv paper that was later published
+    (verified live 2026-09-27: 23,829 such works for 2023 alone).
+    """
+    payload = await _openalex_get_works(
+        q, n, sort_by,
+        api_key=_openalex_api_key(),
+        filter_expr=f"locations.source.id:{_OPENALEX_ARXIV_SOURCE}",
+    )
+    return parse_openalex_arxiv_works(payload, n)
+
+
+async def _semantic_scholar_arxiv_rows(q: str, n: int, sort_by: Any) -> list[dict[str, Any]]:
+    """Semantic Scholar search keeping only papers with an arXiv id; raises on failure.
+
+    Asks for twice ``n`` (S2's cap is 100) because non-arXiv papers are dropped after the
+    fact: ``/paper/search`` has no arXiv filter. S2 has no date sort, so ``sort_by`` is
+    accepted for signature parity only.
+    """
+    params = {
+        "query": q,
+        "limit": str(min(100, n * 2)),
+        "fields": "title,authors,abstract,year,publicationDate,externalIds",
+    }
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
+        resp = await _fetch_with_backoff(
+            http, _S2_PAPER_API, params, {"User-Agent": _POLITE_USER_AGENT},
+            retry_statuses=_TRANSIENT_STATUSES,
+        )
+        return parse_semantic_scholar_arxiv_papers(resp.json(), n)
+
+
+def _describe_failure(exc: BaseException) -> str:
+    """One line for an error message: ``HTTP 406 Not Acceptable`` or ``ConnectError: ...``."""
+    status = _http_status(exc)
+    if status is not None:
+        phrase = str(getattr(getattr(exc, "response", None), "reason_phrase", "") or "")
+        return f"HTTP {status} {phrase}".strip()
+    text = " ".join(str(exc).split())
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _arxiv_unreachable_reason(exc: BaseException) -> str | None:
+    """Why arXiv could not answer, when that warrants a fallback; ``None`` otherwise.
+
+    Fallback-worthy: a refusal (403/406), a status that outlasted the backoff (429/5xx),
+    or any request-level failure (connect/read timeout, DNS, TLS, redirect loop). Anything
+    else — a 400, or a bug — keeps the pre-454bdee5 behavior of an error with no fallback,
+    so a malformed request is never masked by another source's results.
+    """
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    if isinstance(exc, _httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in _ARXIV_REFUSED_STATUSES or status in _TRANSIENT_STATUSES or status >= 500:
+            return _describe_failure(exc)
+        return None
+    if isinstance(exc, _httpx.RequestError):
+        return _describe_failure(exc)
+    return None
+
+
+async def _arxiv_fallback_search(
+    q: str, n: int, sort_by: Any, arxiv_reason: str
+) -> dict[str, Any]:
+    """Answer an arXiv query from OpenAlex, then Semantic Scholar; never raises.
+
+    The first source that answers wins, even with zero rows (an empty answer is still an
+    answer). Rows keep the arXiv shape, including ``arxiv_id``, which research watchlists
+    use as the dedup key. When every source fails, the result is the usual
+    ``{error, query}`` with ``sources_tried`` added.
+    """
+    fallbacks = (
+        ("openalex", "OpenAlex", _openalex_arxiv_rows),
+        ("semantic_scholar", "Semantic Scholar", _semantic_scholar_arxiv_rows),
+    )
+    tried = ["arxiv"]
+    failures: list[str] = []
+    for name, label, fetch in fallbacks:
+        tried.append(name)
+        try:
+            rows = await fetch(q, n, sort_by)
+        except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
+            detail = _describe_failure(exc)
+            if name == "openalex" and _http_status(exc) == 429 and not _openalex_api_key():
+                detail += " (anonymous budget; set OPENALEX_API_KEY)"
+            failures.append(f"{name}: {_redact(detail, _openalex_api_key())}")
+            continue
+        warning = (
+            f"arXiv was unreachable from this server ({arxiv_reason}), so these results "
+            f"come from {label}'s index of arXiv papers: ranking and coverage differ from "
+            "arXiv's own search, the newest submissions may be missing, and 'updated' is "
+            "blank."
+        )
+        if name == "semantic_scholar" and _wants_date_sort(sort_by):
+            warning += " Semantic Scholar cannot sort by date, so they are in relevance order."
+        if failures:
+            warning += " Also unavailable: " + "; ".join(failures) + "."
+        return {
+            "query": q,
+            "count": len(rows),
+            "results": rows,
+            "fallback_source": name,
+            "warning": warning,
+            "sources_tried": tried,
+        }
+    return {
+        "error": (
+            f"arxiv search failed: arXiv was unreachable from this server ({arxiv_reason}) "
+            f"and every fallback failed too ({'; '.join(failures)})"
+        ),
+        "query": q,
+        "sources_tried": tried,
+    }

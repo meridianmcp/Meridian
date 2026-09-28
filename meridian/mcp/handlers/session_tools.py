@@ -643,9 +643,18 @@ async def handle_get_server_logs(
     f0a48685 — returns recent application-level WARNING/ERROR/EXCEPTION log
     records from the server_logs ring-buffer.  Unlike get_connection_log (which
     is scoped per-tenant by /mcp request metadata), server_logs are process-global
-    and not scoped by tenant_id.  Any authenticated caller can read the full log
-    — this is intentional, since server errors are not tenant-private data and the
-    most common use case is incident diagnosis from a hosted-only session.
+    and not scoped by tenant_id: any authenticated caller (every hosted tenant)
+    can read the whole buffer, because the most common use case is incident
+    diagnosis from a hosted-only session.
+
+    7ef88e30 — process-global does NOT mean raw.  Auth-failure rows can carry
+    credential and client-IP material (the pre-7ef88e30 ``[mcp_auth]`` warning
+    logged ~full bearer tokens, client IPs and x-forwarded-for/signature
+    headers), and those rows persist in the ring-buffer and the DuckDB FTS
+    sidecar.  Every returned row's ``message``/``exc_text`` is therefore passed
+    through :func:`meridian.log_redaction.redact_log_text` (token fingerprints,
+    /24-/48 IPs, known secret shapes masked) at read time; stored rows are not
+    mutated.
 
     b241a437 — positional seeking: when ``seek_to`` is provided and the
     checkpoint index is warm, we derive a tight ``since=`` hint from the index
@@ -688,6 +697,10 @@ async def handle_get_server_logs(
         except Exception:  # noqa: BLE001
             pass
 
+    # 7ef88e30: redact credential/IP material just before returning.
+    from meridian.log_redaction import redact_log_row  # noqa: PLC0415
+    _entries = [redact_log_row(e) for e in _entries]
+
     return {
         "count": len(_entries),
         "since": _since,
@@ -715,6 +728,11 @@ async def handle_search_server_logs(
     FTS work is synchronous (DuckDB has its own thread safety model).  We avoid
     asyncio.run_in_executor because the index is tiny (max 2000 rows) and the
     BM25 search is sub-millisecond.
+
+    7ef88e30 — same visibility and redaction contract as get_server_logs: the
+    DuckDB sidecar indexes the raw stored text, so every hit's
+    ``message``/``exc_text`` is redacted via
+    :func:`meridian.log_redaction.redact_log_text` just before returning.
     """
     _query = (args.get("query") or "").strip()
     if not _query:
@@ -757,6 +775,10 @@ async def handle_search_server_logs(
         _slc.build_checkpoint(_all_rows)
     except Exception:  # noqa: BLE001
         pass
+
+    # 7ef88e30: redact credential/IP material just before returning.
+    from meridian.log_redaction import redact_log_row  # noqa: PLC0415
+    _result["hits"] = [redact_log_row(h) for h in (_result.get("hits") or [])]
 
     return _result
 
@@ -856,10 +878,32 @@ async def handle_set_agent_instructions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: set_agent_instructions."""
+    """MCP tool: set_agent_instructions.
+
+    acc7e504 -- this is the write path for the field ``start_session``/
+    ``checkpoint`` echo verbatim into every future session's agent_instructions.
+    ``pkg_install_guard.check_agent_instructions`` was built specifically to
+    scan this content for prompt-injection-shaped patterns (invisible unicode,
+    "ignore previous instructions", fake system-prompt delimiters, etc. -- see
+    its module docstring) but was never actually wired to either write path
+    (this tool, or routes/projects.py's PATCH /agent-instructions) -- it only
+    ran in its own unit tests. Best-effort and non-blocking, matching that
+    module's fail-open design: a finding is surfaced as ``content_warnings`` on
+    the response so the caller (dashboard, API client) can flag it, never
+    silently swallowed and never a hard rejection of the write.
+    """
+    from meridian.pkg_install_guard import check_agent_instructions  # noqa: PLC0415
+
     validate_input_size(args.get("instructions"), "agent_instructions", 100_000)
     instructions = (args.get("instructions") or "").strip() or None
-    return await db_module.set_agent_instructions(db, args["project_id"], instructions)
+    result = await db_module.set_agent_instructions(db, args["project_id"], instructions)
+    findings = check_agent_instructions(instructions)
+    if findings:
+        result["content_warnings"] = [
+            {"kind": f.kind, "description": f.description, "location": f.location}
+            for f in findings
+        ]
+    return result
 
 
 async def handle_set_executor_config(
@@ -1003,6 +1047,20 @@ async def handle_planning_search(
     )
 
 
+# paper_search 'source' -> function name in meridian.paper_search. Names, not
+# function objects, so the lookup happens at call time and tests can monkeypatch
+# the module attribute. The tool's inputSchema enum (mcp_tools.py) must list
+# exactly these keys; tests/test_crossref_core_paper_search.py enforces that.
+_PAPER_SEARCH_SOURCES: dict[str, str] = {
+    "arxiv": "arxiv_search",
+    "openalex": "openalex_search",
+    "semantic_scholar": "semantic_scholar_search",
+    "pubmed": "pubmed_search",
+    "crossref": "crossref_search",
+    "core": "core_search",
+}
+
+
 async def handle_paper_search(
     args: dict[str, Any],
     db: Any,
@@ -1014,14 +1072,27 @@ async def handle_paper_search(
 
     811881c6 — real callable arXiv search so the research-routing protocol's
     "use the paper-search MCP first" finally points at a tool that exists (it was
-    instruction-only before). Keyless external lookup; degrades to {error}, never
-    raises. No project scope needed — it's an external search.
-    f65f6111 — 'source' routes between two keyless sources: arxiv (default) and
-    openalex. Both return the same {query, count, results} shape.
+    instruction-only before). External lookup; degrades to {error}, never raises.
+    No project scope needed — it's an external search.
+    f65f6111 — 'source' routes between sources, all returning the same
+    {query, count, results} shape.
+    9dc630de — routes every source in _PAPER_SEARCH_SOURCES. Before this, any
+    source other than 'openalex' (including 'semantic_scholar' and 'pubmed',
+    which already existed in paper_search.py) silently returned arXiv results;
+    an unknown source is now an explicit error.
     """
-    from meridian.paper_search import arxiv_search, openalex_search  # noqa: PLC0415
+    import meridian.paper_search as paper_search  # noqa: PLC0415
     source = str(args.get("source", "arxiv") or "arxiv").strip().lower()
-    search = openalex_search if source == "openalex" else arxiv_search
+    fn_name = _PAPER_SEARCH_SOURCES.get(source)
+    if fn_name is None:
+        return {
+            "error": (
+                f"unknown paper_search source {source!r}; expected one of: "
+                + ", ".join(_PAPER_SEARCH_SOURCES)
+            ),
+            "query": args.get("query", ""),
+        }
+    search = getattr(paper_search, fn_name)
     return await search(
         args.get("query", ""),
         limit=args.get("limit", 10),

@@ -589,6 +589,33 @@ def test_dashboard_open_in_claude_not_dominant(client):
     )
 
 
+def test_vtab_strip_scrolls_instead_of_clipping(client):
+    """52218bb7 — the vtab rail's ancestor (.tab-body) is `overflow: hidden`.
+
+    Without the strip handling its own vertical overflow, a project with more
+    vtabs than fit in the rail's height gets those extra icons silently
+    CLIPPED by the ancestor instead of made reachable via scroll. The strip
+    must own its overflow (scroll), not rely on the ancestor to clip it.
+    """
+    import re
+
+    css = client.get("/static/dashboard.css").text
+    m = re.search(r'\.vtab-strip\s*\{([^}]+)\}', css)
+    assert m, ".vtab-strip CSS rule not found"
+    rule = m.group(1)
+    assert re.search(r'overflow-y\s*:\s*(auto|scroll)', rule), (
+        "Bug: .vtab-strip has no overflow-y: auto/scroll — extra vtab icons "
+        "beyond the rail's height are clipped by the .tab-body ancestor's "
+        "overflow: hidden instead of being scrollable."
+    )
+    # The strip is only 44px wide — horizontal scroll would be a broken glitch,
+    # not a fix, so it must be explicitly suppressed rather than left auto.
+    assert re.search(r'overflow-x\s*:\s*hidden', rule), (
+        ".vtab-strip should suppress horizontal overflow (it is a fixed-width "
+        "icon rail, not something that should scroll sideways)."
+    )
+
+
 def test_dashboard_live_tab_has_progress_bar(client, js):
     """LIVE tab shows a sprint progress bar ([████░░] done/total).
 
@@ -1105,3 +1132,24 @@ def test_pwa_dashboard_head_wires_manifest_and_sw(soup, html):
     assert "navigator.serviceWorker.register('/sw.js'" in html, (
         "dashboard must register /sw.js"
     )
+
+
+def test_pwa_install_prompt_wired(js):
+    """afcbd8a2 — beforeinstallprompt is captured (not left to the browser's own
+    mini-infobar) and replayed from a real user-gesture click, with the button
+    removed again on click or on appinstalled.
+
+    b03be6a6 shipped the installability requirements (manifest/SW/icons); this
+    covers the actual install AFFORDANCE, which was the remaining gap.
+    """
+    assert "beforeinstallprompt" in js, "beforeinstallprompt listener missing"
+    assert "event.preventDefault()" in js, (
+        "must preventDefault() beforeinstallprompt to suppress the browser's own UI"
+    )
+    assert "appinstalled" in js, "appinstalled listener missing (button must be hidden after install)"
+    assert "pwa-install-button" in js, "install button id/class missing"
+    assert "promptEvent.prompt()" in js, "captured event's prompt() must be replayed on click"
+
+    # Never shown when already running as an installed app.
+    assert "display-mode: standalone" in js, "standalone display-mode check missing"
+    assert "navigator.standalone" in js, "legacy iOS standalone check missing"

@@ -107,7 +107,9 @@ def _declared_evidence_paths(item: dict[str, Any]) -> list[str]:
     for rid in resources:
         rid_norm = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
         if rid_norm.startswith("file:"):
-            paths.append(rid_norm[len("file:"):])
+            # 4e2bce48 — real file, so strict evidence ("every modified file was
+            # claimed") matches a legacy "file:<path>:<symbol>" declaration.
+            paths.append(db_module._resource_file_of(rid_norm) or rid_norm[len("file:"):])
         elif rid_norm.startswith("symbol:"):
             paths.append(rid_norm[len("symbol:"):].partition("::")[0])
     return paths

@@ -1291,10 +1291,17 @@ def test_subproject_hierarchy_ui(demo_client):
        nesting is visible in the sidebar;
     4. the project kebab menu (_openTabMenu) shows "Make subproject of…" for a
        top-level project and "Detach from parent" for one with a parent.
+    5. a40ec229 — _makeSubproject renders a real <select> dropdown (never calls
+       window.prompt()) populated with exactly the eligibleParents candidates,
+       and choosing one still performs the original action: POST
+       /projects/{id}/parent with the chosen parent, then update local state.
 
     Uses the seeded demo project so the dashboard bundle is fully booted; the
     hierarchy logic is exercised with synthetic project rows injected into
-    window.state (no server write needed — writes are demo-blocked)."""
+    window.state (no server write needed for parts 1-4 — writes are
+    demo-blocked). Part 5 intercepts the POST route directly (page.route) so the
+    real onchange handler can run to completion without depending on demo-write
+    permissions."""
     from meridian import server as server_module
 
     with sync_playwright() as p:
@@ -1302,6 +1309,25 @@ def test_subproject_hierarchy_ui(demo_client):
         try:
             browser = p.chromium.launch()
             page = browser.new_page()
+
+            # a40ec229 — capture the POST /projects/topx/parent call the new
+            # dropdown's onchange handler makes, so part 5 below can assert the
+            # exact same request the old window.prompt() flow used to send.
+            captured_parent_posts = []
+
+            def _capture_parent_post(route):
+                if route.request.method == "POST":
+                    captured_parent_posts.append(json.loads(route.request.post_data or "{}"))
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"id": "topx", "parent_project_id": "topy"}),
+                    )
+                else:
+                    route.continue_()
+
+            page.route("**/projects/topx/parent", _capture_parent_post)
+
             page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2500)  # boot JS + auto-open seeded project
 
@@ -1310,7 +1336,8 @@ def test_subproject_hierarchy_ui(demo_client):
                 "() => typeof window.flattenHierarchy === 'function'"
                 " && typeof window.eligibleParents === 'function'"
                 " && typeof window._makeProjectItem === 'function'"
-                " && typeof window._openTabMenu === 'function'",
+                " && typeof window._openTabMenu === 'function'"
+                " && typeof window._makeSubproject === 'function'",
                 timeout=8000,
             )
 
@@ -1393,6 +1420,62 @@ def test_subproject_hierarchy_ui(demo_client):
             assert not any("Detach from parent" in t for t in menu["topItems"]), menu["topItems"]
             assert any("Detach from parent" in t for t in menu["subItems"]), menu["subItems"]
             assert not any("Make subproject of" in t for t in menu["subItems"]), menu["subItems"]
+
+            # --- (5): _makeSubproject uses a real <select> dropdown, not
+            # window.prompt(), and picking an option still performs the same
+            # POST /projects/{id}/parent action as the old numbered-list prompt. ---
+            picker = page.evaluate(
+                """async () => {
+                    document.querySelectorAll('.tab-context-menu, select.subproject-parent-picker')
+                        .forEach(m => m.remove());
+                    window.state.projects = [
+                        {id: 'topx', name: 'TopX', parent_project_id: null},
+                        {id: 'topy', name: 'TopY', parent_project_id: null},
+                    ];
+                    let promptCalled = false;
+                    const origPrompt = window.prompt;
+                    window.prompt = () => { promptCalled = true; return null; };
+                    try {
+                        const t = { id: 'topx', project: { id: 'topx', name: 'TopX' } };
+                        window._makeSubproject(t, document.body);
+                        const sel = document.querySelector('select.subproject-parent-picker');
+                        const optionLabels = sel
+                            ? Array.from(sel.options).map(o => o.textContent)
+                            : null;
+                        if (sel) {
+                            sel.value = 'topy';
+                            sel.dispatchEvent(new Event('change'));
+                            // Give the async onchange handler's awaited fetch +
+                            // toast + loadProjects a moment to settle.
+                            await new Promise(r => setTimeout(r, 400));
+                        }
+                        return {
+                            hasSelect: !!sel,
+                            promptCalled,
+                            optionLabels,
+                            stillInDom: !!document.querySelector('select.subproject-parent-picker'),
+                            // t.project is updated synchronously before the (real,
+                            // network-backed) loadProjects() call below it replaces
+                            // window.state.projects wholesale — read it off t, not
+                            // state, so this assertion doesn't depend on the demo
+                            // server actually knowing about synthetic 'topx'/'topy'.
+                            newParent: t.project.parent_project_id,
+                        };
+                    } finally {
+                        window.prompt = origPrompt;
+                    }
+                }"""
+            )
+            assert picker["hasSelect"] is True, picker  # real <select>, not a prompt
+            assert picker["promptCalled"] is False, picker  # window.prompt() never invoked
+            # Same candidate set eligibleParents would offer: 'topy' (eligible),
+            # never 'topx' itself (self is always excluded).
+            assert any("TopY" in (lbl or "") for lbl in (picker["optionLabels"] or [])), picker
+            assert not any(lbl == "TopX" for lbl in (picker["optionLabels"] or [])), picker
+            assert picker["stillInDom"] is False, picker  # picker removes itself on selection
+            assert picker["newParent"] == "topy", picker  # local state updated, same as before
+            assert captured_parent_posts, "onchange handler never POSTed /projects/topx/parent"
+            assert captured_parent_posts[0].get("parent_project_id") == "topy", captured_parent_posts
 
             browser.close()
         finally:

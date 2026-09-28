@@ -26,6 +26,24 @@ from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
 from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
 
+# CI-PERF-3B — named, overridable timeout constants (extracted from inline
+# literals scattered across the dispatch functions below) so tests can
+# monkeypatch a specific budget instead of waiting out a real timeout. Pure
+# refactor: values are unchanged from the literals they replace. Grouped here
+# rather than re-declared at each (often deeply-nested, multi-hundred-line)
+# dispatch function, since "near the call site" for these particular sites
+# would just mean "before a giant function" — this keeps them easy to find
+# and override as a set. Two more timeout constants (``_RECENT_COMMITS_TTL``,
+# ``_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S``) predate this block and stay
+# defined next to their single use below, unchanged.
+_GITHUB_TOOL_HTTP_TIMEOUT_S = 15.0  # _dispatch_github_tool's httpx client timeout
+_TUNNEL_TOOLS_LIST_TIMEOUT_S = 5.0  # tools/list's outer bound on the tunnel-tools fetch
+_GIT_DIFF_SUBPROCESS_TIMEOUT_S = 5.0  # `git diff --name-only` (staged + unstaged) in _unclaimed_file_warnings
+_GITHUB_COMMITS_FETCH_TIMEOUT_S = 8.0  # GitHub REST commits fetch in _fetch_recent_commits_uncached
+_GIT_LOG_SUBPROCESS_TIMEOUT_S = 5  # local `git log` fallback in _fetch_recent_commits_uncached
+_GENERATE_HANDOFF_TIMEOUT_S = 180.0  # outer wait_for around generate_handoff's core call (65c8b426)
+_TUNNEL_MANIFEST_REFRESH_TIMEOUT_S = 5.0  # refresh_tunnel_manifest bound (matches _TUNNEL_TOOLS_LIST_TIMEOUT_S)
+
 
 def _json_default(o: Any) -> Any:
     """JSON fallback for MCP tool results. On Postgres the timestamp columns
@@ -416,7 +434,7 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
     if not repo:
         return {"error": f"No GitHub repo connected for project {project_id} — use POST /projects/{project_id}/github/connect"}
     gh_headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github+json"}
-    async with _httpx.AsyncClient(timeout=15.0) as http:
+    async with _httpx.AsyncClient(timeout=_GITHUB_TOOL_HTTP_TIMEOUT_S) as http:
         if name == "read_file":
             path = args.get("path", "")
             ref = args.get("ref") or branch
@@ -1238,7 +1256,7 @@ async def _handle_mcp_request(
                     try:
                         tunnel_tools = await _asyncio.wait_for(
                             _tunnel_mod.list_tunnel_tools(tenant["id"], reserved),
-                            timeout=5.0,
+                            timeout=_TUNNEL_TOOLS_LIST_TIMEOUT_S,
                         )
                     except _asyncio.TimeoutError:
                         tunnel_tools = []
@@ -1533,7 +1551,37 @@ async def _handle_mcp_request(
                         pass
             return _server._jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result, default=_json_default)}]})
         except Exception as exc:
-            return _server._jsonrpc_err(req_id, -32603, str(exc))
+            # b0ed079a — a tool-level exception here was previously converted
+            # straight into a JSON-RPC error with zero durable trace: neither
+            # session_activity nor connection_events recorded that anything
+            # went wrong, leaving silent failures with no way to debug them
+            # after the fact. Record it into session_activity (mirroring the
+            # exact _EXECUTOR_SESSIONS/_ACTIVITY_SKIP_TOOLS gating the
+            # success-path activity heartbeat in _dispatch_mcp_tool already
+            # uses, so a failed call is observable via
+            # get_session_log/get_session_activity exactly where a successful
+            # one already would be) and tag the returned error so
+            # _remote_mcp_inner can record it distinctly in connection_events
+            # too (see _jsonrpc_err's docstring). Best-effort throughout —
+            # a logging failure must never mask or replace the original
+            # exception being returned to the caller below; the response
+            # shape and message are unchanged from before this fix.
+            try:
+                _exc_sid = args.get("session_id") if isinstance(args, dict) else None
+                if (
+                    _exc_sid
+                    and _exc_sid in _EXECUTOR_SESSIONS
+                    and name not in _ACTIVITY_SKIP_TOOLS
+                ):
+                    await db_module.record_session_activity(
+                        db, _exc_sid, name,
+                        f"EXCEPTION {type(exc).__name__}: {exc}"[:200],
+                    )
+            except Exception:  # noqa: BLE001 — never mask the real error below
+                pass
+            return _server._jsonrpc_err(
+                req_id, -32603, str(exc), data={"tool_exception": True},
+            )
 
     return _server._jsonrpc_err(req_id, -32601, f"method not found: {method}")
 
@@ -1940,13 +1988,19 @@ async def _sprint_item_resource_claim_gate(
 
     for resource in declared:
         if resource.startswith("file:"):
-            file_path = resource[len("file:"):]
+            # 4e2bce48 — lock the REAL file, resolved through the same canonical
+            # helper the scheduler and _claim_batch_resource (6b3b2c0e) use. The
+            # raw suffix turned a legacy "file:<path>:<symbol>" declaration into
+            # a lock on the nonexistent path "<path>:<symbol>", leaving <path>
+            # itself unprotected for the whole claim.
+            file_path = db_module._resource_file_of(resource) or resource[len("file:"):]
+            legacy_shorthand = file_path != resource[len("file:"):]
             pre_held = await _session_holds_file_lock(db, file_path, session_id)
             result = await db_module.claim_file(
                 db, file_path, session_id, mode="write", item_id=item_id,
             )
             if result.get("claimed"):
-                lock_scope.append({
+                acquired_entry: dict[str, Any] = {
                     "resource": resource, "scope": "file", "file_path": file_path,
                     "acquired": True, "newly_acquired": not pre_held,
                     # 0d0cada7 — claim_granularity/lease_expiry alongside
@@ -1955,23 +2009,29 @@ async def _sprint_item_resource_claim_gate(
                     # of which branch produced it.
                     "claim_granularity": "file",
                     "lease_expiry": result.get("expires_at"),
-                })
+                }
+                if legacy_shorthand:
+                    acquired_entry["resolved_from_legacy_shorthand"] = True
+                lock_scope.append(acquired_entry)
                 if not pre_held:
                     acquired_this_call.append({"kind": "file", "file_path": file_path})
                 continue
-            return await _blocked(
-                {
-                    "resource": resource, "scope": "file", "file_path": file_path,
-                    "acquired": False,
-                    "wait_reason": result.get("reason") or "locked",
-                    "claim_granularity": "file",
-                    "lease_expiry": result.get("expires_at"),
-                    "retry_after": db_module._seconds_until(result.get("expires_at")),
-                    "conflict": {
-                        "reason": result.get("reason") or "locked",
-                        "holder_session_id": result.get("holder_session_id"),
-                    },
+            blocked_entry: dict[str, Any] = {
+                "resource": resource, "scope": "file", "file_path": file_path,
+                "acquired": False,
+                "wait_reason": result.get("reason") or "locked",
+                "claim_granularity": "file",
+                "lease_expiry": result.get("expires_at"),
+                "retry_after": db_module._seconds_until(result.get("expires_at")),
+                "conflict": {
+                    "reason": result.get("reason") or "locked",
+                    "holder_session_id": result.get("holder_session_id"),
                 },
+            }
+            if legacy_shorthand:
+                blocked_entry["resolved_from_legacy_shorthand"] = True
+            return await _blocked(
+                blocked_entry,
                 f"Cannot claim sprint item: resource {resource!r} is locked by "
                 f"another live session ({result.get('holder_session_id')}).",
             )
@@ -2328,22 +2388,29 @@ def _check_file_only_resources_warning(
         if len(candidates) >= 5:
             break
 
+    # 4e2bce48 — recommend ONLY the canonical symbol:<path>::<symbol> form. The
+    # single-colon file:<path>:<symbol> shorthand resolves to the WHOLE file for
+    # both conflict grouping (_resource_file_of, 2a176d6d) and locking, so it
+    # never co-batches; advertising it as the co-batching form was wrong.
     affected = ", ".join(f"``{e}``" for e in file_only)
     if candidates:
         examples = " or ".join(
-            f"``{e}:{c}``" for e, c in zip(file_only[:2], candidates[:2])
+            f"``symbol:{e[len('file:'):]}::{c}``"
+            for e, c in zip(file_only[:2], candidates[:2])
         )
         hint = (
             f"SYMBOL_SCOPE_HINT: {affected} declared at file level. "
             f"Prefer symbol-scoped ids when items touch different functions in the "
             f"same file — e.g. {examples}. "
             f"This allows co-batching in the same parallel wave. "
-            f"(Non-fatal: item filed as-is. Use file:path.py:symbol_name format.)"
+            f"(Non-fatal: item filed as-is. Use the symbol:path.py::symbol_name "
+            f"format; a file:path.py:symbol_name suffix is treated as the whole "
+            f"file and does not co-batch.)"
         )
     else:
         hint = (
             f"SYMBOL_SCOPE_HINT: {affected} declared at file level. "
-            f"Prefer symbol-scoped ids (file:path.py:symbol_name or symbol:path::Name) "
+            f"Prefer symbol-scoped ids (symbol:path.py::symbol_name) "
             f"when two items touch different functions in the same file — "
             f"this allows them to co-batch in the same parallel wave. "
             f"(Non-fatal: item filed as-is.)"
@@ -2417,11 +2484,13 @@ def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
     symbols: list[str] = []
     for entry in _parse_touches_files(item.get("touches_resources")):
         if entry.startswith("file:"):
-            files.append(entry[len("file:"):])
+            # 4e2bce48 — the real file, not a "<path>:<symbol>" pseudo-path.
+            files.append(db_module._resource_file_of(entry) or entry[len("file:"):])
         elif entry.startswith("symbol:"):
             symbols.append(entry[len("symbol:"):])
         elif entry.startswith("inferred:file:"):
-            files.append(entry[len("inferred:file:"):])
+            tail = entry[len("inferred:file:"):]
+            files.append(db_module._resource_file_of("file:" + tail) or tail)
     if files or symbols:
         ctx: dict[str, Any] = {"source": "touches_resources"}
         if files:
@@ -2489,9 +2558,13 @@ async def _code_notes_for_item_resources(
     file_paths: list[str] = []
     for entry in _parse_touches_files(item.get("touches_resources")):
         if entry.startswith("file:"):
-            file_paths.append(entry[len("file:"):])
+            # 4e2bce48 — look notes up under the real file; a "<path>:<symbol>"
+            # pseudo-path never matches a code-anchored note, so the warning
+            # silently never surfaced at claim time.
+            file_paths.append(db_module._resource_file_of(entry) or entry[len("file:"):])
         elif entry.startswith("inferred:file:"):
-            file_paths.append(entry[len("inferred:file:"):])
+            tail = entry[len("inferred:file:"):]
+            file_paths.append(db_module._resource_file_of("file:" + tail) or tail)
     # Also extract symbol paths so the file portion can be included.
     for entry in _parse_touches_files(item.get("touches_resources")):
         if entry.startswith("symbol:"):
@@ -2723,14 +2796,14 @@ async def _unclaimed_file_warnings(
             "git", "diff", "--name-only", "HEAD",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_GIT_DIFF_SUBPROCESS_TIMEOUT_S)
         unstaged = set(stdout.decode().splitlines()) if stdout else set()
 
         proc2 = await asyncio.create_subprocess_exec(
             "git", "diff", "--name-only", "--cached",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5.0)
+        stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=_GIT_DIFF_SUBPROCESS_TIMEOUT_S)
         staged = set(stdout2.decode().splitlines()) if stdout2 else set()
 
         modified = {p for p in (unstaged | staged) if p}
@@ -2794,7 +2867,7 @@ async def _fetch_recent_commits_uncached(
                     "Authorization": f"token {pat}",
                     "Accept": "application/vnd.github+json",
                 }
-                async with _httpx.AsyncClient(timeout=8.0) as http:
+                async with _httpx.AsyncClient(timeout=_GITHUB_COMMITS_FETCH_TIMEOUT_S) as http:
                     r = await http.get(
                         f"https://api.github.com/repos/{repo}/commits",
                         headers=gh_headers,
@@ -2811,7 +2884,7 @@ async def _fetch_recent_commits_uncached(
     try:
         result = _sp.run(
             ["git", "log", "--oneline", "-20"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=_GIT_LOG_SUBPROCESS_TIMEOUT_S,
         )
         for line in result.stdout.splitlines():
             line = line.strip()
@@ -2864,6 +2937,15 @@ _PLANNER_REFRESH_TRIGGERS = frozenset({
 _EXECUTOR_SESSIONS: set[str] = set()
 _PLANNER_SESSIONS: set[str] = set()
 _SESSION_REFRESH_STATE: dict[str, dict] = {}
+
+# 8c147109 / b0ed079a — tool names that must never generate a session_activity
+# entry (observer/polling tools, not signal). Shared by the success-path
+# activity heartbeat in _dispatch_mcp_tool and the tool-exception recording
+# path in _handle_mcp_request's tools/call except-block, so the two "which
+# tool calls are signal, not polling noise" gates can never drift apart.
+_ACTIVITY_SKIP_TOOLS: frozenset[str] = frozenset({
+    "heartbeat", "get_session_log", "get_session_activity", "update_session_seen",
+})
 
 
 def _session_role_hint(session_id: "str | None") -> "str | None":
@@ -3285,7 +3367,7 @@ async def _handle_task_tools(
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
                 # Haiku calls that caused the live timeout; the higher ceiling is a
                 # backstop for DB-heavy projects.
-                timeout=180.0,
+                timeout=_GENERATE_HANDOFF_TIMEOUT_S,
             )
         except handoff_module_local.HandoffEvidenceRequired as exc:
             # 8a883f60 — strict_evidence=True and at least one best-effort
@@ -5122,7 +5204,23 @@ async def _handle_file_claims(
         }
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
-        return {"released": released, "file_path": args["file_path"]}
+        release_result: dict[str, Any] = {"released": released, "file_path": args["file_path"]}
+        if not released:
+            # 4e2bce48 — executors often release by the declared string (e.g.
+            # "pkg/mod.py:helper" from "file:pkg/mod.py:helper"), but claim time
+            # locks the real file, so fall back to it instead of leaking the lock.
+            raw = args["file_path"]
+            raw = raw[len("file:"):] if raw.startswith("file:") else raw
+            real = db_module._resource_file_of("file:" + raw)
+            if real and real != args["file_path"] and await db_module.release_file(
+                db, real, args["session_id"],
+            ):
+                release_result.update({
+                    "released": True,
+                    "released_file_path": real,
+                    "resolved_from_legacy_shorthand": True,
+                })
+        return release_result
     if name == "find_orphaned_docx_staged_files":
         # 6507e83a — maintenance diagnostic: staged-DOCX temp files left
         # behind by a process that crashed between STAGE and PROMOTE inside
@@ -5671,7 +5769,7 @@ async def _handle_plugin_tools(
             try:
                 import asyncio as _asyncio  # noqa: PLC0415
                 manifest["tunnel"] = await _asyncio.wait_for(
-                    _tunnel_mod.refresh_tunnel_manifest(_tid), timeout=5.0,
+                    _tunnel_mod.refresh_tunnel_manifest(_tid), timeout=_TUNNEL_MANIFEST_REFRESH_TIMEOUT_S,
                 )
                 manifest["list_changed_refired"] = True
             except _asyncio.TimeoutError:
@@ -7238,10 +7336,9 @@ async def _dispatch_mcp_tool(
             # signs of life via get_session_log even before the executor calls
             # log_task(). Only fires for executor sessions; never for the observer
             # tools (get_session_log/get_session_activity/heartbeat) themselves.
-            _ACTIVITY_SKIP_TOOLS = frozenset({
-                "heartbeat", "get_session_log", "get_session_activity",
-                "update_session_seen",
-            })
+            # b0ed079a — _ACTIVITY_SKIP_TOOLS now lives at module level (shared
+            # with the tool-exception recording path below); see its definition
+            # next to _EXECUTOR_SESSIONS above.
             try:
                 _act_sid = args.get("session_id")
                 if (

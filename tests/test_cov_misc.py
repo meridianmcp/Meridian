@@ -786,6 +786,129 @@ def test_admin_restart_confirmed_spawns_and_kills(client, monkeypatch):
     assert r.json()["ok"] is True
 
 
+def test_admin_reset_provisioning_403_when_unauthenticated(client):
+    """POST /admin/tenants/{id}/reset-provisioning returns 403 with no session."""
+    r = client.post("/admin/tenants/some-id/reset-provisioning", json={"confirm": True})
+    assert r.status_code == 403
+
+
+def test_admin_reset_provisioning_403_when_not_admin(monkeypatch, tmp_path):
+    """Signed-in non-admin tenant gets 403, never touches another tenant's state."""
+    from meridian import db as db_module
+    from meridian import hosted as hosted_module
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        monkeypatch.setenv("MERIDIAN_ADMIN_EMAILS", "")
+        db = client.app.state.db
+
+        async def _setup():
+            tenant = await db_module.upsert_tenant(db, "reset-plain@example.com")
+            session = await db_module.create_user_session(
+                db, tenant["id"], "2099-01-01T00:00:00+00:00"
+            )
+            return session
+
+        session = _run(_setup())
+        client.cookies.set(
+            hosted_module._SESSION_COOKIE,
+            hosted_module._make_session_cookie(session["id"]),
+        )
+        r = client.post("/admin/tenants/some-id/reset-provisioning", json={"confirm": True})
+        assert r.status_code == 403
+
+
+def test_admin_reset_provisioning_requires_confirm(monkeypatch, tmp_path):
+    """Without confirm:true, returns a warning and touches nothing."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        monkeypatch.delenv("MERIDIAN_ADMIN_PASSWORD", raising=False)
+        _auth_admin_session(client, monkeypatch, "reset-admin-1@example.com")
+        r = client.post("/admin/tenants/some-id/reset-provisioning", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body.get("requires_confirm") is True
+        assert "warning" in body
+
+
+def test_admin_reset_provisioning_404_for_unknown_tenant(monkeypatch, tmp_path):
+    """Confirmed reset against a tenant id that doesn't exist returns 404."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        monkeypatch.delenv("MERIDIAN_ADMIN_PASSWORD", raising=False)
+        _auth_admin_session(client, monkeypatch, "reset-admin-2@example.com")
+        r = client.post(
+            "/admin/tenants/does-not-exist/reset-provisioning", json={"confirm": True}
+        )
+        assert r.status_code == 404
+
+
+def test_admin_reset_provisioning_clears_state_keeps_tenant(monkeypatch, tmp_path):
+    """Confirmed reset on a real, provisioned-looking tenant: clears Neon fields
+    and every session/API token, but the tenant row itself (email, plan) stays --
+    this is the whole point, distinguishing it from delete_account.
+    """
+    from meridian import db as db_module
+    from meridian import hosted as hosted_module
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        monkeypatch.delenv("MERIDIAN_ADMIN_PASSWORD", raising=False)
+        admin_tenant = _auth_admin_session(client, monkeypatch, "reset-admin-3@example.com")
+        db = client.app.state.db
+
+        async def _setup_target():
+            target = await db_module.upsert_tenant(db, "reset-target@example.com")
+            await db.execute(
+                "UPDATE tenants SET neon_project_id=?, pool_project_id=?, neon_db_url=? "
+                "WHERE id=?",
+                ("fake-neon-proj", "fake-pool-row", "postgresql://fake", target["id"]),
+            )
+            await db.commit()
+            await db_module.create_user_session(
+                db, target["id"], "2099-01-01T00:00:00+00:00"
+            )
+            await db.execute(
+                "INSERT INTO api_tokens (id, tenant_id, token_hash, label) VALUES (?, ?, ?, ?)",
+                ("tok-1", target["id"], "fakehash", "test"),
+            )
+            await db.commit()
+            return target
+
+        target = _run(_setup_target())
+
+        async def _noop_drop(_tenant):
+            return None
+
+        monkeypatch.setattr(hosted_module, "_drop_tenant_neon_database", _noop_drop)
+
+        r = client.post(
+            f"/admin/tenants/{target['id']}/reset-provisioning", json={"confirm": True}
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["reset"] is True
+        assert body["had_neon_project"] is True
+        assert body["sessions_cleared"] == 1
+        assert body["api_tokens_cleared"] == 1
+
+        async def _check():
+            reloaded = await db_module.get_tenant_by_id(db, target["id"])
+            assert reloaded is not None, "tenant row must NOT be deleted"
+            assert reloaded["email"] == "reset-target@example.com"
+            assert reloaded["neon_project_id"] is None
+            assert reloaded["pool_project_id"] is None
+            assert reloaded["neon_db_url"] is None
+            async with db.execute(
+                "SELECT COUNT(*) AS n FROM user_sessions WHERE tenant_id=?", (target["id"],)
+            ) as cur:
+                row = await cur.fetchone()
+            assert (row["n"] if isinstance(row, dict) else row[0]) == 0
+            async with db.execute(
+                "SELECT COUNT(*) AS n FROM api_tokens WHERE tenant_id=?", (target["id"],)
+            ) as cur:
+                row = await cur.fetchone()
+            assert (row["n"] if isinstance(row, dict) else row[0]) == 0
+
+        _run(_check())
+
+
 def test_admin_snapshot_reads_db_file(client, monkeypatch, tmp_path):
     """GET /admin/snapshot streams the on-disk SQLite file when MERIDIAN_DB is a path."""
     db_file = tmp_path / "snap.db"

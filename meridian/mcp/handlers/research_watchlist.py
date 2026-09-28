@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 from meridian import db as db_module
@@ -73,6 +74,8 @@ _SOURCE_IDENTITY_FIELD: dict[str, str] = {
     "openalex": "openalex_id",
     "semantic_scholar": "s2_id",
     "pubmed": "pmid",
+    "crossref": "doi",
+    "core": "core_id",
     "github_code": "sha",
     "github_repo": "repo",
     "hn": "hn_id",
@@ -81,8 +84,8 @@ _SOURCE_IDENTITY_FIELD: dict[str, str] = {
 # source_type -> save_finding's closed source_type vocabulary (web|arxiv|code|
 # conversation, meridian/db/__init__.py:_FINDING_SOURCE_TYPES). Anything not
 # listed here falls back to "web" (save_finding's own default), which is
-# correct for openalex/semantic_scholar/pubmed/hn — none of those are "arxiv"
-# or "code" in the sense save_finding means.
+# correct for openalex/semantic_scholar/pubmed/crossref/core/hn — none of those
+# are "arxiv" or "code" in the sense save_finding means.
 _SAVE_FINDING_SOURCE_TYPE: dict[str, str] = {
     "arxiv": "arxiv",
     "github_code": "code",
@@ -110,6 +113,10 @@ def _resolve_search_fn(source_type: str) -> Any:
         from meridian.paper_search import semantic_scholar_search as fn  # noqa: PLC0415
     elif source_type == "pubmed":
         from meridian.paper_search import pubmed_search as fn  # noqa: PLC0415
+    elif source_type == "crossref":
+        from meridian.paper_search import crossref_search as fn  # noqa: PLC0415
+    elif source_type == "core":
+        from meridian.paper_search import core_search as fn  # noqa: PLC0415
     elif source_type == "github_code":
         from meridian.github_search import github_code_search as fn  # noqa: PLC0415
     elif source_type == "github_repo":
@@ -132,7 +139,7 @@ def _identity_key(source_type: str, item: dict[str, Any]) -> str:
     field = _SOURCE_IDENTITY_FIELD.get(source_type, "")
     key = str(item.get(field) or "").strip() if field else ""
     if key:
-        return f"{field}:{key}"
+        return _canonical_item_key(f"{field}:{key}")
     url = str(item.get("url") or "").strip()
     if url:
         return f"url:{url}"
@@ -140,6 +147,24 @@ def _identity_key(source_type: str, item: dict[str, Any]) -> str:
         json.dumps(item, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:16]
     return f"hash:{digest}"
+
+
+# 454bdee5 — arXiv's own API returns versioned ids ("2401.01234v1"); the fallback that
+# answers when arXiv is unreachable (OpenAlex / Semantic Scholar) can only recover the
+# bare id ("2401.01234"). Keying on the bare id keeps one paper one item across a run
+# answered by arXiv and a run answered by a fallback (and across a v1 -> v2 revision).
+_ARXIV_VERSION_SUFFIX_RE = re.compile(r"v\d+$")
+
+
+def _canonical_item_key(key: str) -> str:
+    """Normalize a dedup key: strip the version from an ``arxiv_id:`` key, else as-is.
+
+    Applied both to freshly computed keys and to ``item:`` tags written by earlier runs,
+    so tags stored before this normalization (versioned) still count as seen.
+    """
+    if key.startswith("arxiv_id:"):
+        return _ARXIV_VERSION_SUFFIX_RE.sub("", key)
+    return key
 
 
 def _parse_tags(tags: str | None) -> list[str]:
@@ -352,7 +377,7 @@ async def handle_run_watchlist_query(
     for prior in prior_notes:
         for tag in _parse_tags(prior.get("tags")):
             if tag.startswith("item:"):
-                seen_keys.add(tag[len("item:"):])
+                seen_keys.add(_canonical_item_key(tag[len("item:"):]))
 
     new_results: list[dict[str, Any]] = []
     captured: list[dict[str, Any]] = []

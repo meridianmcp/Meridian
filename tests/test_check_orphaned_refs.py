@@ -176,23 +176,39 @@ def test_third_party_import_is_ignored(fake_repo):
     assert _run(fake_repo, ["pkg"]) == []
 
 
-def test_real_repo_is_clean():
+@pytest.fixture(scope="module")
+def real_repo_check():
+    """Walk the real first-party source tree exactly once for this module.
+
+    CI-PERF-4: `test_real_repo_is_clean` and `test_main_returns_zero_on_clean_repo`
+    both need the result of parsing every first-party `.py` file under
+    `meridian/` and `scripts/` -- previously each test triggered its own
+    independent full-tree walk (the second one buried inside `main()`),
+    doubling this file's wall time for no benefit since both run against the
+    same on-disk tree in the same test session. `run_check()` is the single
+    shared walk; `test_main_returns_zero_on_clean_repo` reuses its result
+    instead of re-walking.
+    """
+    return check_orphaned_refs.run_check()
+
+
+def test_real_repo_is_clean(real_repo_check):
     """Guardrail: the actual first-party source tree must have zero orphaned
     local references. If this starts failing, either a real rename left a
     dangling caller (fix the caller) or a new dynamic-export pattern needs
     the same opaque-module treatment as the docs_intel/latex_intel shims."""
-    files = check_orphaned_refs.iter_source_files()
-    files = [f for f in files if f.name != check_orphaned_refs.SELF_NAME]
-    index = check_orphaned_refs.build_module_index(files + [Path(check_orphaned_refs.__file__).resolve()])
-    findings = []
-    for path in files:
-        findings.extend(check_orphaned_refs.check_file(path, index))
+    _files, findings = real_repo_check
     assert findings == [], "\n".join(
         f"{f.path}:{f.line_no} {f.reference} -- {f.reason}" for f in findings
     )
 
 
-def test_main_returns_zero_on_clean_repo(capsys):
+def test_main_returns_zero_on_clean_repo(capsys, real_repo_check, monkeypatch):
+    """Exercises `main()`'s own print/exit-code behavior. Reuses the shared
+    `real_repo_check` walk (via a monkeypatched `run_check`) rather than
+    letting `main()` trigger a second full-tree walk of its own."""
+    files, findings = real_repo_check
+    monkeypatch.setattr(check_orphaned_refs, "run_check", lambda: (files, findings))
     exit_code = check_orphaned_refs.main()
     captured = capsys.readouterr()
     assert exit_code == 0

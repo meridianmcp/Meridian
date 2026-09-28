@@ -41,7 +41,7 @@ from .. import db as db_module
 from .. import process_registry as process_registry_module
 from .. import profile_contract as profile_contract_module
 from .. import redis_bridge as _redis_bridge  # 2cf57fde — runtime diagnostics
-from .._deps import _hosted_mode, _get_tenant_from_request, _db
+from .._deps import _hosted_mode, _get_tenant_from_request, _db, _authentication_required
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
     migrate_retired_overrides, config_fingerprint,
@@ -182,6 +182,88 @@ _tunnel_outputs_sockets: dict[str, WebSocket] = {}
 # 121e6a27 — mcp-debugger slot (7-language DAP debugger via @debugmcp/mcp-debugger).
 _tunnel_debug_sockets: dict[str, WebSocket] = {}
 
+# e37187f3 — per-host coexistence bookkeeping: (tenant_id, slot_label) ->
+# {host_id: WebSocket}. Keyed by (tenant_id, slot_label) rather than bare
+# tenant_id because _serve_tunnel_ws below is ONE function shared by 7
+# different slots (ppt/word/dc/docs/zotero/outputs/debug), each with its own
+# separate `sockets` dict — the SAME host legitimately holds one live
+# connection per slot at once (e.g. both its ppt and word sockets), and
+# those must not be mistaken for each other's "same host reconnecting".
+# Purely ADDITIVE alongside the single-socket-per-tenant registries above
+# (_tunnel_sockets &c. stay the "active routing target" that every existing
+# proxy/dispatch call site already reads via plain `sockets[tenant_id]` —
+# unchanged). This lets a genuinely DIFFERENT host's still-open connection
+# survive a new connection from ANOTHER host, instead of being forcibly
+# closed the way the pre-fix code closed ANY existing socket for the tenant
+# regardless of which machine it belonged to (the two-machines-evict-each-
+# other bug). A same-host reconnect (the legitimate "local binary restarted"
+# case the original code comment described) still evicts its own prior
+# connection exactly as before. See _register_tunnel_socket_multi_host /
+# _unregister_tunnel_socket_multi_host below, used by every WS handler in
+# this module. Full multi-host REQUEST ROUTING (choosing which specific
+# connected host serves a given proxied call when 2+ are up) is explicitly
+# NOT built by this — the active-routing pointer just follows whichever
+# host connected most recently, same single-target semantics every
+# existing caller already assumes. A real per-request host selector is a
+# natural follow-up but a much bigger, separate change (it would need the
+# HTTP proxy routes themselves to carry a host selector, e.g. ?host=).
+_tunnel_sockets_by_host: dict[tuple[str, str], dict[str, WebSocket]] = {}
+
+
+def _tunnel_ws_host_id(ws: "WebSocket") -> str:
+    """The connecting client's self-reported host id (``?host=``), or a
+    shared ``"unknown"`` bucket for older clients that don't send one
+    (e37187f3). Clients sharing the "unknown" bucket keep the exact legacy
+    mutual-eviction behavior — we can't tell them apart, so we can't safely
+    let them coexist either.
+    """
+    try:
+        return (ws.query_params.get("host") or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _register_tunnel_socket_multi_host(
+    tenant_id: str, slot_label: str, host_id: str, ws: "WebSocket",
+    sockets: dict[str, WebSocket],
+) -> "WebSocket | None":
+    """Register *ws* as *tenant_id*'s active socket in *sockets* (unchanged
+    routing semantics for every existing caller), while only flagging for
+    eviction a PRIOR connection from the SAME (*slot_label*, *host_id*) —
+    a genuine same-machine reconnect on this same slot (e.g. the local
+    binary restarted). A different host's live socket — or this SAME host's
+    socket on a DIFFERENT slot — is left completely alone: registering this
+    new connection does not close it. Returns the same-slot-same-host socket
+    the caller should close (or ``None`` if there wasn't one / it's this
+    same object).
+    """
+    by_host = _tunnel_sockets_by_host.setdefault((tenant_id, slot_label), {})
+    same_host_old = by_host.get(host_id)
+    by_host[host_id] = ws
+    sockets[tenant_id] = ws
+    return same_host_old if same_host_old is not ws else None
+
+
+def _unregister_tunnel_socket_multi_host(
+    tenant_id: str, slot_label: str, host_id: str, ws: "WebSocket",
+    sockets: dict[str, WebSocket],
+) -> None:
+    """Clean up *ws* from both registries on disconnect (e37187f3).
+
+    Only clears the shared ACTIVE routing pointer (``sockets[tenant_id]``)
+    if it still points at THIS socket — a different host may since have
+    taken over as active on this slot while this connection was still open,
+    and this (now-closing) connection must not clobber that.
+    """
+    by_host = _tunnel_sockets_by_host.get((tenant_id, slot_label))
+    if by_host is not None and by_host.get(host_id) is ws:
+        by_host.pop(host_id, None)
+        if not by_host:
+            _tunnel_sockets_by_host.pop((tenant_id, slot_label), None)
+    if sockets.get(tenant_id) is ws:
+        sockets.pop(tenant_id, None)
+
+
 # 4d9ad87b — active repo per tenant, updated whenever set_active_repo is called.
 # Enables call_tunnel_tool to inject X-Meridian-Repo-Path so the SerenaDaemonPool
 # routes each tools/call to the correct per-repo daemon without a set_active_repo
@@ -255,6 +337,21 @@ _slot_health: dict[str, dict[str, bool]] = {}
 # re-advertises the slot and a real tools/call re-tests it (a still-broken slot
 # will simply report unhealthy again, re-arming the timer).
 _slot_unhealthy_since: dict[str, dict[str, float]] = {}
+
+# 43fcdf9f — wall-clock ``time.time()`` at which the server last RECEIVED a real
+# ``plugin_status`` report for a slot: tenant_id → {slot: epoch_seconds}. Neither
+# ``_slot_health`` nor ``_slot_unhealthy_since`` carries this: the former is just
+# a bare bool, and the latter is only ever stamped on an unhealthy transition
+# (monotonic, not wall-clock). Confirmed live: ``get_tunnel_diagnostics`` reported
+# "extract: healthy" at the exact moment real find_symbol/search_code calls were
+# failing with Cloudflare 502/504s, because "healthy" here has only ever meant
+# "the last plugin_status this process received said so" (or "never received one
+# at all" — ``_slot_health`` defaults absent to healthy) — never a live,
+# request-level check. This map is what lets ``build_tunnel_diagnostics`` report
+# an honest age/basis alongside that flag instead of a bare, undated "healthy"
+# a caller can mistake for "verified just now". Cleared alongside ``_slot_health``
+# in ``_clear_slot_health`` so the two never drift out of sync.
+_slot_health_reported_at: dict[str, dict[str, float]] = {}
 
 
 def _slot_unhealthy_ttl() -> float:
@@ -530,6 +627,10 @@ def _record_slot_health(
         return
     was_unhealthy = not _slot_is_healthy(tenant_id, slot)
     _slot_health.setdefault(tenant_id, {})[slot] = bool(healthy)
+    # 43fcdf9f — stamp wall-clock receipt time on EVERY report (healthy or not)
+    # so a diagnostics read can report how stale this flag actually is instead
+    # of a bare, undated bool.
+    _slot_health_reported_at.setdefault(tenant_id, {})[slot] = time.time()
     if healthy:
         _slot_status_detail.get(tenant_id, {}).pop(slot, None)
         # 16e02240 — clear the suppression timestamp so a future unhealthy report
@@ -601,6 +702,7 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
     if slot is None:
         _slot_health.pop(tenant_id, None)
         _slot_status_detail.pop(tenant_id, None)
+        _slot_health_reported_at.pop(tenant_id, None)  # 43fcdf9f
         _clear_slot_unhealthy_since(tenant_id)  # 16e02240
         _tools_list_changed_pending.discard(tenant_id)  # 54ddd609
         return
@@ -610,6 +712,11 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
         if not slots:
             _slot_health.pop(tenant_id, None)
     _clear_slot_unhealthy_since(tenant_id, slot)  # 16e02240
+    _reported = _slot_health_reported_at.get(tenant_id)  # 43fcdf9f
+    if _reported is not None:
+        _reported.pop(slot, None)
+        if not _reported:
+            _slot_health_reported_at.pop(tenant_id, None)
     _det = _slot_status_detail.get(tenant_id)
     if _det is not None:
         _det.pop(slot, None)
@@ -741,15 +848,17 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
     _log_ws_legacy_auth("fs", tenant_id, used_query_fallback)
 
-    # Evict any stale socket for this tenant (e.g. binary restarted)
-    old_ws = _tunnel_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket (e.g. binary restarted
+    # on this machine); a different host's live connection is left running.
+    # See _register_tunnel_socket_multi_host's docstring.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "fs", host_id, ws, _tunnel_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "fs")
     _invalidate_tunnel_manifest(tenant_id)  # 4331f9cd / 49d8244d — reconnect: rebuild tool routes
     # af5b5739 — record THIS Fly instance as the socket owner so a request that
@@ -813,7 +922,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_sockets.pop(tenant_id, None)
+        # e37187f3 — only clears the active-routing pointer if it's still
+        # THIS socket; a different host may have taken over in the meantime.
+        _unregister_tunnel_socket_multi_host(tenant_id, "fs", host_id, ws, _tunnel_sockets)
         _clear_tunnel_mcp_session(tenant_id, "fs", socket=ws)
         _clear_slot_health(tenant_id, "fs")
         # af5b5739 — forget our ownership claim only if it's still ours (a newer
@@ -865,14 +976,15 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = _tunnel_code_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "code", host_id, ws, _tunnel_code_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_code_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "code")
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that misses can Fly-replay to us (no-op off Fly). af5b5739 wired
@@ -917,7 +1029,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel-code: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_code_sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, "code", host_id, ws, _tunnel_code_sockets)
         _clear_tunnel_mcp_session(tenant_id, "code", socket=ws)
         _clear_slot_health(tenant_id, "code")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
@@ -956,14 +1068,15 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = _tunnel_extract_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "extract", host_id, ws, _tunnel_extract_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_extract_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "extract")
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that misses an extract request can Fly-replay to us (no-op off
@@ -1008,7 +1121,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel-extract: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_extract_sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, "extract", host_id, ws, _tunnel_extract_sockets)
         _clear_tunnel_mcp_session(tenant_id, "extract", socket=ws)
         _clear_slot_health(tenant_id, "extract")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
@@ -1056,14 +1169,15 @@ async def _serve_tunnel_ws(
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, label, host_id, ws, sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, label)
     # 4331f9cd / 49d8244d — a (re)connect may change the slot's tool set; drop the
     # cached routes (+ manifest timestamp, atomically) so the next tools/list
@@ -1116,7 +1230,7 @@ async def _serve_tunnel_ws(
     except Exception as exc:
         _log.debug("tunnel-%s: tenant %s disconnected: %s", label, tenant_id[:8], exc)
     finally:
-        sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, label, host_id, ws, sockets)
         _clear_tunnel_mcp_session(tenant_id, label, socket=ws)
         _clear_slot_health(tenant_id, label)
         # 4331f9cd / 49d8244d — slot dropped; if no tunnel remains, drop cached
@@ -1361,6 +1475,63 @@ async def get_tunnel_manifest_route(request: Request) -> Response:
 # Shared proxy helper
 # ---------------------------------------------------------------------------
 
+async def _authorize_tunnel_proxy_caller(tenant_id: str, request: "Request") -> "Response | None":
+    """Verify the HTTP caller is authenticated as, and owns, ``tenant_id``.
+
+    5de3d422 — the 10 HTTP MCP proxy routes (fs/code/extract/ppt/word/dc/
+    docs/zotero/outputs/debug, each registered twice: base path +
+    ``/{rest:path}``) previously took ``tenant_id`` straight from the URL
+    path with ZERO authentication, and explicitly strip the client's
+    ``Authorization`` header before forwarding it downstream (see
+    ``_skip``/``_fwd_headers`` below) — so anyone who knew or guessed a
+    tenant_id was proxied straight into that tenant's local fs/code/docs/
+    outputs/etc. process with no check at all.
+
+    This resolves the caller's own tenant via :func:`_get_tenant_from_request`
+    (session cookie or bearer token — the same helper used by every other
+    tenant-scoped route in this module, e.g. ``/tunnel/plugins``,
+    ``/tunnel/diagnostics/{tenant_id}``) and hard-requires it match the
+    ``tenant_id`` path parameter, exactly mirroring the existing WS tunnel
+    siblings' own check (``tunnel_ws`` et al.: ``if tenant is None or
+    tenant.get("id") != tenant_id: reject``).
+
+    Self-hosted (non-hosted) mode is single-user and has no tenant concept;
+    callers here are expected to have already returned early via
+    ``_hosted_mode()`` before reaching this check, matching every other
+    tenant-gated route in this file.
+
+    Returns an error ``Response`` (401) when the caller does not own
+    ``tenant_id``, or ``None`` when verified and proxying may proceed.
+
+    5fe96405 — this 401 used to carry no ``WWW-Authenticate`` header at all,
+    so an OAuth-capable MCP client hitting a slot URL with no (or a stale)
+    credential had no standard way to discover where to authenticate — it
+    just saw a bare 401 with no next step. Mirrors the header shape
+    ``server.py``'s own ``/mcp`` auth-failure path already sends (same
+    ``resource_metadata`` well-known URL), so both entry points give a
+    client the same discovery hint. The primary fix for the reported 401s is
+    ``_tunnel_mcp_entries`` now attaching the bearer token directly (see its
+    docstring) — this header is the belt-and-suspenders half for a caller
+    that reaches this route without one.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None or tenant.get("id") != tenant_id:
+        _base = str(request.base_url).rstrip("/")
+        return Response(
+            content='{"error":"invalid or mismatched tenant credential"}',
+            status_code=401,
+            media_type="application/json",
+            headers={
+                "WWW-Authenticate": (
+                    f'Bearer realm="MCP",'
+                    f' error="invalid_token",'
+                    f' resource_metadata="{_base}/.well-known/oauth-protected-resource"'
+                ),
+            },
+        )
+    return None
+
+
 async def _do_proxy(
     tenant_id: str,
     method: str,
@@ -1532,6 +1703,10 @@ async def fs_mcp_proxy(tenant_id: str, request: Request) -> Response:
             media_type="application/json",
         )
 
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
+
     body_bytes = await request.body()
     # Forward a safe subset of request headers; strip host/auth to avoid loops
     _skip = {"host", "authorization", "cookie", "x-forwarded-for"}
@@ -1572,6 +1747,10 @@ async def fs_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> R
             media_type="application/json",
         )
 
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
+
     body_bytes = await request.body()
     _skip = {"host", "authorization", "cookie", "x-forwarded-for"}
     fwd_headers = {
@@ -1607,6 +1786,9 @@ async def _code_proxy(tenant_id: str, local_path: str, request: Request) -> Resp
             status_code=503,
             media_type="application/json",
         )
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
     body_bytes = await request.body()
     return await _do_proxy(
         tenant_id=tenant_id,
@@ -1651,6 +1833,9 @@ async def _extract_proxy(tenant_id: str, local_path: str, request: Request) -> R
             status_code=503,
             media_type="application/json",
         )
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
     body_bytes = await request.body()
     return await _do_proxy(
         tenant_id=tenant_id,
@@ -1699,6 +1884,9 @@ async def _office_proxy(
             status_code=503,
             media_type="application/json",
         )
+    auth_error = await _authorize_tunnel_proxy_caller(tenant_id, request)
+    if auth_error is not None:
+        return auth_error
     body_bytes = await request.body()
     return await _do_proxy(
         tenant_id=tenant_id,
@@ -1861,7 +2049,9 @@ async def debug_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -
 
 
 # ---------------------------------------------------------------------------
-# GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
+# GET /tunnel/status/{tenant_id}  — lightweight status check
+# 4bea8629: hosted mode now hard-requires the caller be the named tenant
+# (see tunnel_status's own docstring below) — this used to be unauthenticated.
 # ---------------------------------------------------------------------------
 
 async def _build_tunnel_profile_binding(db: Any) -> "dict[str, Any] | None":
@@ -1902,7 +2092,28 @@ async def tunnel_status(tenant_id: str, request: Request = None) -> dict:  # typ
     default), so this stays a non-breaking change for both calling styles.
     ``profile_binding`` degrades to ``None`` (see below) when ``request`` is
     ``None``, exactly like every other best-effort field in this response.
+
+    4bea8629 — SECURITY FIX: this route previously had NO auth at all
+    (see the "no auth required" note that used to head this section),
+    unlike its documentary-tenant_id siblings ``/tunnel/diagnostics/{tenant_id}``
+    and ``/tunnel/launch-matrix/{tenant_id}`` (which resolve the REAL caller
+    via ``_get_tenant_from_request`` and treat the path's ``tenant_id`` as
+    informational only). Anyone who knew or guessed a ``tenant_id`` could
+    fetch this response — live per-slot health, config generation, and
+    in-flight request counts for that tenant. Fix: in hosted mode, resolve
+    the caller's own tenant the same way, and hard-require it match the
+    path's ``tenant_id`` (mirroring ``tunnel_ws``'s own WS-side check and
+    the tunnel HTTP/WS proxy routes' 5de3d422 fix). A direct, non-HTTP call
+    (``request is None`` — see above) is unaffected, same as the
+    ``profile_binding`` degrade. ``/tunnel/openai/diagnostics/{tenant_id}``
+    is intentionally unauthenticated per its own docstring and is NOT
+    touched by this fix.
     """
+    if request is not None and _hosted_mode():
+        caller = await _get_tenant_from_request(request)
+        if caller is None or caller.get("id") != tenant_id:
+            return _json_response({"error": "authentication required"}, status_code=401)
+
     return {
         "tenant_id": tenant_id,
         "active": tenant_id in _tunnel_sockets,
@@ -2514,6 +2725,25 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
             healthy_flag=healthy_flag,
             detail=detail,
         )
+        # 43fcdf9f — honesty contract: ``healthy_reported``/``state`` above are
+        # (and always have been) a CACHED last-known-state flag, never a live,
+        # request-level probe — confirmed live reporting "extract: healthy"
+        # at the exact moment real requests through that slot were failing
+        # with Cloudflare 502/504s. A genuine end-to-end probe on every
+        # diagnostics call would be expensive/slow, so instead of silently
+        # continuing to imply "healthy" means "verified just now", surface
+        # exactly how this flag was derived and how stale it is:
+        #   - health_basis: "client_reported" once ANY plugin_status message
+        #     has been received for this slot, else "default_assumed" — the
+        #     pre-existing "absent ⇒ healthy" default above, made explicit
+        #     instead of silently indistinguishable from a real report.
+        #   - health_reported_at / health_age_seconds: wall-clock receipt
+        #     time of that last report and its age — None/None when the
+        #     basis is "default_assumed" (there is nothing to date).
+        # None of this changes ``state``/``healthy_reported`` themselves —
+        # existing callers keyed on those keep their exact current behavior.
+        reported_at = _slot_health_reported_at.get(tid, {}).get(slot)
+        health_basis = "client_reported" if reported_at is not None else "default_assumed"
         slots[slot] = _diag_redact({
             # Persisted-in-dashboard state — NEVER reported as "active" here,
             # only as what is saved.
@@ -2528,6 +2758,11 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
             # as last reported by a plugin_status message — None if never reported.
             "external_child_state": (detail or {}).get("state"),
             "healthy_reported": healthy_flag,
+            "health_basis": health_basis,
+            "health_reported_at": reported_at,
+            "health_age_seconds": (
+                None if reported_at is None else max(0.0, generated_at - reported_at)
+            ),
             "retry_count": (detail or {}).get("retry_count"),
             "quarantine_reason": (detail or {}).get("quarantine_reason"),
             "last_error": (detail or {}).get("detail") or (detail or {}).get("reason"),
@@ -2712,8 +2947,13 @@ async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
     ``tenant_id`` in the path is documentary only (matches the sibling
     ``/tunnel/status/{tenant_id}`` route's shape); the actual tenant is
     resolved from the request's own auth, same as ``/tunnel/plugins``.
+
+    ece2ac0a — hosted callers must be authenticated: with no tenant this used
+    to return the process-wide (untenanted) diagnostics snapshot to anyone.
     """
     tenant = await _get_tenant_from_request(request)
+    if tenant is None and _hosted_mode():
+        raise _authentication_required()
     hostname = (request.query_params.get("hostname") or "").strip() or None
     return _json_response(build_tunnel_diagnostics(tenant, hostname))
 
@@ -2729,8 +2969,14 @@ async def tunnel_launch_matrix(tenant_id: str, request: Request) -> Response:
     degrades to an empty project set (diagnostics-only response) rather than
     failing the request — matches ``get_tunnel_filesystem_roots``'s existing
     best-effort convention for this same tenant/project join.
+
+    ece2ac0a — hosted callers must be authenticated. The ``_db`` call below is
+    wrapped in a broad ``except`` (best-effort project listing), so it cannot
+    be relied on to refuse an anonymous caller; refuse explicitly first.
     """
     tenant = await _get_tenant_from_request(request)
+    if tenant is None and _hosted_mode():
+        raise _authentication_required()
     hostname = (request.query_params.get("hostname") or "").strip() or None
     try:
         db = await _db(request)
@@ -2906,10 +3152,23 @@ async def install_plugin(request: Request) -> Response:
     Validates that the command starts with uvx or npx to prevent arbitrary
     execution. Returns {"ok": bool, "output": str}.
 
-    In hosted mode the server and user machine are different — this endpoint
-    still runs but installs on the server (not the user's machine). The
-    dashboard shows a copy-to-clipboard fallback for hosted users.
+    ece2ac0a — refused outright in hosted mode. It used to "still run" there,
+    unauthenticated: ``npx -y <pkg> --help`` / ``uvx <pkg> --help`` download
+    AND execute the named package's code, so anyone could run arbitrary code
+    on the hosted server. A hosted user's plugins run on their own machine via
+    the tunnel, so there is nothing legitimate to install server-side; the
+    dashboard already shows a copy-to-clipboard fallback for hosted users.
     """
+    if _hosted_mode():
+        return _json_response(
+            {
+                "ok": False,
+                "error": "Plugin install runs on the machine hosting Meridian and is "
+                         "disabled on hosted Meridian. Run the command on your own "
+                         "machine instead.",
+            },
+            status_code=403,
+        )
     import asyncio
     import sys
     try:

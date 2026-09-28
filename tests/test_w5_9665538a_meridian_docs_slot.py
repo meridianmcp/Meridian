@@ -205,6 +205,15 @@ class _FakeWS:
             fut.set_result({**self._response, "id": payload["id"]})
 
 
+async def _allow_proxy_auth(tenant_id, request):
+    """Bypass for `_authorize_tunnel_proxy_caller` (5de3d422) — these tests
+    exercise the docs-slot tunnel-routing/forwarding mechanics with a bare
+    `_FakeReq` (no real cookies/app.state.db), not the tenant-ownership auth
+    gate itself. The auth gate is covered end-to-end (real tenants/tokens)
+    in tests/test_tunnel_routes.py."""
+    return None
+
+
 def test_docs_mcp_proxy_503_when_not_hosted(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
     resp = asyncio.run(tn.docs_mcp_proxy("t1", _FakeReq("/docs/mcp/t1")))
@@ -214,6 +223,7 @@ def test_docs_mcp_proxy_503_when_not_hosted(monkeypatch):
 
 def test_docs_mcp_proxy_503_when_no_socket(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     resp = asyncio.run(tn.docs_mcp_proxy("t1", _FakeReq("/docs/mcp/t1")))
     assert resp.status_code == 503
     assert b"docs tunnel not connected" in resp.body
@@ -223,6 +233,7 @@ def test_docs_mcp_proxy_roundtrip_via_fake_socket(monkeypatch):
     """A connected docs socket relays a request and returns the inner response —
     proving the /docs/mcp route is wired to the docs socket/pending registries."""
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     response = {"status": 200, "headers": {"content-type": "application/json"},
                 "body": base64.b64encode(b'{"ok":1}').decode()}
     tn._tunnel_docs_sockets["t1"] = _FakeWS(tn._pending_docs_reqs, response)
@@ -233,6 +244,7 @@ def test_docs_mcp_proxy_roundtrip_via_fake_socket(monkeypatch):
 
 def test_docs_mcp_proxy_subpath_roundtrip(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(tn, "_authorize_tunnel_proxy_caller", _allow_proxy_auth)
     response = {"status": 200, "headers": {"content-type": "application/json"},
                 "body": base64.b64encode(b'{"ok":2}').decode()}
     tn._tunnel_docs_sockets["t1"] = _FakeWS(tn._pending_docs_reqs, response)
