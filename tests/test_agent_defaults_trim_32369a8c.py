@@ -42,7 +42,13 @@ _BEFORE_TRIM_CHAR_COUNT = 16309
 # github_search/social_search explicitly alongside paper_search -- again
 # genuine new-feature documentation, not re-inflation of previously-trimmed
 # prose. Ceiling recomputed directly from the merged file (19043 chars) + 100.
-_MAX_ALLOWED_CHARS = 19143
+# 2026-09-28 (v19->v20, commit aff4440f) added a zotero_search-first research-
+# routing bullet and a "Deep / multi-step research" bullet directing the
+# calling agent to its own native multi-turn research capability for actual
+# searching (no new Meridian-hosted orchestrator/BYOK) -- genuine new-feature
+# documentation. Ceiling recomputed directly from the merged file (20399
+# chars) + 100.
+_MAX_ALLOWED_CHARS = 20499
 
 
 def test_length_decreased_after_trim():

@@ -54,7 +54,13 @@ platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
 
 [dependencies]
 python = ">=3.11,<3.13"
-fastapi = ">=0.115"
+# Upper bound added 2026-09-28: an unbounded >=0.115 let a fresh `pixi lock`
+# float to fastapi 0.141.1 (conda-forge), which broke include_router() --
+# verified in isolation: a router with 91 routes added exactly 1 route to a
+# fresh FastAPI() app. Neither this branch nor origin/dev was ever tested
+# against anything past 0.137.1 (both independently locked 0.136.1/0.137.1
+# across platforms) -- cap until a deliberate, tested upgrade.
+fastapi = ">=0.115,<0.138"
 uvicorn = ">=0.30"
 aiosqlite = ">=0.20"
 pydantic = ">=2.0,<3"
