@@ -461,9 +461,16 @@ def test_windows_backend_spawn_assigns_job(monkeypatch):
     assert handle.pid == 555
     assert handle.job_id is not None
     kinds = [c[0] for c in fake_api.calls]
+    # CloseHandle on the OpenProcess handle is expected even on success --
+    # it's only needed transiently to make the Assign call, never for the
+    # job's continued lifetime (2026-09-28 handle-leak fix).
     assert kinds == [
         "CreateJobObjectW", "SetInformationJobObject", "OpenProcess", "AssignProcessToJobObject",
+        "CloseHandle",
     ]
+    proc_handle_closed = next(c for c in fake_api.calls if c[0] == "CloseHandle")
+    open_process_call = next(c for c in fake_api.calls if c[0] == "OpenProcess")
+    assert proc_handle_closed[1] == open_process_call[3]  # closed exactly the proc handle, not the job
 
 
 def test_windows_backend_spawn_degrades_without_api(monkeypatch):
@@ -484,6 +491,11 @@ def test_windows_backend_adopt_assigns_existing_process(monkeypatch):
 
 
 def test_windows_backend_close_terminates_job_and_taskkills(monkeypatch):
+    # Also doubles as the regression case for the create_time=None-but-job-
+    # terminated branch of the 2026-09-28 PID-reuse fix: this handle never
+    # captures create_time, yet taskkill still fires because job_terminated
+    # is True -- the job's own AssignProcessToJobObject already bound to
+    # this exact pid at spawn time, which counts as identity confirmation.
     run_calls = []
     monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
     fake_api = _FakeKernel32()
@@ -510,12 +522,50 @@ def test_windows_backend_close_idempotent(monkeypatch):
     assert run_calls == []
 
 
-def test_windows_backend_close_without_job_still_taskkills(monkeypatch):
+def test_windows_backend_close_skips_taskkill_when_identity_and_job_both_unverifiable(monkeypatch):
+    """Regression test for the 2026-09-28 PID-reuse fix: when create_time
+    was never captured (fast-crash race in adopt()) AND no Job Object was
+    ever assigned (api unavailable, or OpenProcess/AssignProcessToJobObject
+    failed on the already-exited child), close() has zero identity
+    confirmation left -- it must NOT taskkill by bare PID, since Windows
+    may have since recycled that PID for an unrelated process. This
+    replaces the old test of the same shape, which asserted the unsafe
+    behavior this fix removes."""
     run_calls = []
     monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
     backend = pl.WindowsJobObjectBackend(api_loader=lambda: None)
     handle = pl.OwnedProcessHandle(
         run_id="r", pid=42, executable="x", cwd=None, cmdline=["x"],
+    )
+    ok = backend.close(handle)
+    assert ok is True
+    assert handle.closed is True
+    assert run_calls == []  # unverifiable identity, no job -- refuse the destructive path
+
+
+def test_windows_backend_close_taskkills_when_create_time_verified_without_job(monkeypatch):
+    """The other half of the gate: a captured create_time is itself enough
+    confirmation to fall back to taskkill, even with no job assigned. Uses
+    a fake psutil (matching test_verify_handle_live_matching_create_time's
+    pattern) so verify_handle_live does a REAL matching comparison rather
+    than hitting its own no-psutil/mismatch defaults, which would either
+    mask or short-circuit the branch this test targets."""
+    fake_psutil = types.ModuleType("psutil")
+
+    class _P:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            return 100.0
+
+    fake_psutil.Process = _P
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    run_calls = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: None)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=42, executable="x", cwd=None, cmdline=["x"], create_time=100.0,
     )
     ok = backend.close(handle)
     assert ok is True
@@ -551,6 +601,28 @@ def test_assign_to_job_failure_leaves_job_id_none(monkeypatch):
     backend = pl.WindowsJobObjectBackend(api_loader=lambda: _FailingAPI())
     handle = backend.spawn(["node"])
     assert handle.job_id is None
+
+
+def test_assign_to_job_failure_closes_both_job_and_proc_handles(monkeypatch):
+    """Regression test for the 2026-09-28 handle-leak fix: when
+    AssignProcessToJobObject itself fails (job created, proc_handle
+    opened, but assignment fails), both the job handle and the process
+    handle must be explicitly closed -- previously NEITHER was closed on
+    this path (nor on the success path), leaking one kernel32 HANDLE per
+    spawn."""
+    fake_api = _FakeKernel32()
+    fake_api.AssignProcessToJobObject = lambda job_handle, process_handle: (
+        fake_api.calls.append(("AssignProcessToJobObject", job_handle, process_handle)) or 0
+    )
+    monkeypatch.setattr(pl.subprocess, "Popen", lambda cmd, env=None, cwd=None, **kw: _FakeProc(9))
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: pl.Win32JobAPI(fake_api))
+    handle = backend.spawn(["node"])
+    assert handle.job_id is None
+    close_calls = [c[1] for c in fake_api.calls if c[0] == "CloseHandle"]
+    job_handle = next(c[1] for c in fake_api.calls if c[0] == "CreateJobObjectW")
+    proc_handle = next(c[3] for c in fake_api.calls if c[0] == "OpenProcess")
+    assert job_handle in close_calls
+    assert proc_handle in close_calls
 
 
 # ---------------------------------------------------------------------------

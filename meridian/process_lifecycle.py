@@ -67,6 +67,7 @@ platform" trap already documented in ``tests/test_tunnel_client.py``.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import signal
 import subprocess
@@ -75,6 +76,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -586,27 +589,59 @@ class WindowsJobObjectBackend:
         *handle*'s pid to it. Any failure at any step leaves
         ``handle.job_id`` as ``None`` (taskkill-only teardown) and never
         raises -- this runs right after a successful spawn/adopt; it must
-        not turn a working spawn into a failed one."""
+        not turn a working spawn into a failed one.
+
+        Every kernel32 HANDLE obtained along the way is explicitly closed:
+        ``proc_handle`` is only ever needed transiently to make the
+        ``AssignProcessToJobObject`` call, never for the job's continued
+        lifetime, so it is closed on every path once that call returns
+        (previously leaked on every single spawn -- 2026-09-28 review).
+        ``job`` is closed on any failure path and left open only once
+        ownership has genuinely transferred to ``handle.job_id`` on
+        success. Each kernel32 failure is logged (previously silent)."""
         api = self._api_loader()
         if api is None:
             return
+        job = None
+        proc_handle = None
         try:
             job = api.create_job()
             if job is None:
+                _logger.warning("process_lifecycle: CreateJobObjectW failed for pid %s", handle.pid)
                 return
             if not api.set_kill_on_close(job):
-                api.close_handle(job)
+                _logger.warning(
+                    "process_lifecycle: SetInformationJobObject failed for pid %s", handle.pid
+                )
                 return
             proc_handle = api.open_process(handle.pid)
             if proc_handle is None:
-                api.close_handle(job)
+                _logger.warning("process_lifecycle: OpenProcess failed for pid %s", handle.pid)
                 return
             if not api.assign_process(job, proc_handle):
-                api.close_handle(job)
+                _logger.warning(
+                    "process_lifecycle: AssignProcessToJobObject failed for pid %s", handle.pid
+                )
                 return
             handle.job_id = job
+            job = None  # ownership transferred to handle.job_id -- don't close in finally
         except Exception:  # noqa: BLE001 — best-effort, never raise
+            _logger.warning(
+                "process_lifecycle: unexpected error assigning pid %s to a job object", handle.pid,
+                exc_info=True,
+            )
             handle.job_id = None
+        finally:
+            if proc_handle is not None:
+                try:
+                    api.close_handle(proc_handle)
+                except Exception:  # noqa: BLE001
+                    pass
+            if job is not None:
+                try:
+                    api.close_handle(job)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def close(self, handle: OwnedProcessHandle, *, grace_seconds: float = 5.0) -> bool:
         if handle.closed:
@@ -615,22 +650,37 @@ class WindowsJobObjectBackend:
             handle.closed = True
             return True
         api = self._api_loader()
+        job_terminated = False
         if api is not None and handle.job_id is not None:
             try:
                 api.terminate_job(handle.job_id, 1)
                 api.close_handle(handle.job_id)
+                job_terminated = True
             except Exception:  # noqa: BLE001
                 pass
-        # Guarded taskkill /T fallback -- always run regardless of whether
-        # the job existed/succeeded, mirrors
-        # tunnel_client._terminate_proc_tree exactly.
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(handle.pid)],
-                capture_output=True, check=False,
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        # Guarded taskkill /T fallback -- catches anything that raced its
+        # way out of the job before assignment completed. Gated on having
+        # SOME confirmation handle.pid is still the process we spawned:
+        # either a captured create_time (verify_handle_live above did a
+        # real comparison, not its unverifiable-default True), or a job
+        # that was actually assigned+terminated (bound to this exact pid
+        # in the same call as Popen, well before any reuse window could
+        # open). When NEITHER holds -- create_time was never captured
+        # (e.g. the child exited in the narrow race window before
+        # _safe_create_time ran in adopt()) AND no job exists to have
+        # already scoped the kill -- we have zero identity confirmation
+        # left. Killing "by PID" alone in that state risks hitting a
+        # completely unrelated process once Windows recycles the PID; skip
+        # the destructive fallback rather than risk it (real incident:
+        # process_lifecycle.py review, 2026-09-28).
+        if handle.create_time is not None or job_terminated:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(handle.pid)],
+                    capture_output=True, check=False,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         if handle.popen is not None:
             try:
                 handle.popen.wait(timeout=grace_seconds)
