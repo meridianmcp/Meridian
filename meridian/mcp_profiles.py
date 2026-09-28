@@ -82,6 +82,7 @@ OPENAI_PUBLIC_TOOL_NAMES: FrozenSet[str] = frozenset(
         "paper_search",
         "social_search",
         "github_search",
+        "zotero_search",
         "search_synthesis",
         "get_capability_manifest",
         "get_effective_capability_profile",
