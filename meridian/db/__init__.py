@@ -1380,7 +1380,15 @@ async def set_agent_instructions(
 async def get_project_by_name(
     db: aiosqlite.Connection, name: str
 ) -> dict[str, Any] | None:
-    """Look up a project by name using exact, then fuzzy case-insensitive match."""
+    """Look up a project by name: exact match, then case-insensitive EXACT match.
+
+    This is deliberately NOT a substring/partial match ("Kensington" does not
+    find "Kensington Park"): the resolver in ``mcp/handler.py`` uses this to
+    turn a caller-supplied ``project_name`` into a project id, where a partial
+    match could silently retarget a write. Returns ``None`` when neither pass
+    matches. (The HTTP route ``GET /projects/by-name/{name}`` layers its own
+    case-insensitive substring fallback on top of this function.)
+    """
     async with db.execute(
         "SELECT p.*, gs.goal_sprint AS sprint "
         "FROM projects p "

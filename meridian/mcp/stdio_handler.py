@@ -2120,8 +2120,9 @@ def build_mcp_server():
             Tool(
                 name="get_project_by_name",
                 description=(
-                    "Look up a project by name (case-insensitive substring "
-                    "match). Returns the first hit with id, name, and sprint. "
+                    "Look up a project by name (exact match, then "
+                    "case-insensitive exact match; not a substring search). "
+                    "Returns the match with id, name, and sprint. "
                     "Use this when you know the project name but not the UUID."
                 ),
                 inputSchema={
@@ -2130,8 +2131,9 @@ def build_mcp_server():
                         "name": {
                             "type": "string",
                             "description": (
-                                "Full or partial project name — "
-                                "case-insensitive substring match."
+                                "Full project name — exact match, then "
+                                "case-insensitive exact match (no partial "
+                                "or substring matching)."
                             ),
                         }
                     },

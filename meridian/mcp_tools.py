@@ -370,8 +370,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "get_project_by_name", "description":
         "Read-only: Find a project by name — look up, search, or resolve a project's project_id "
-        "from its name (case-insensitive substring match). Use when the user names a project but "
-        "you need its id. Returns the first hit with id, name, and sprint.",
+        "from its name (exact match, then case-insensitive exact match; not a substring search). "
+        "Use when the user names a project but you need its id. Returns the match with id, name, "
+        "and sprint.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}},
          "required": ["name"]}},
