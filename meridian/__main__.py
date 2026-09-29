@@ -197,8 +197,37 @@ def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
         return loop
 
 
+_SUBCOMMANDS = ("hooks", "memory")
+
+
+def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
+    """Offline maintenance subcommands (55d48d69), dispatched BEFORE the
+    server/--mcp/--tunnel argparse so none of those flags (or MERIDIAN_HOST /
+    MERIDIAN_PORT defaults) are consulted, no port is killed and no server is
+    started:
+
+    * ``hooks install-guard --repo P [--scope project|user]
+      [--mode enforce|advisory] [--dry-run] [--uninstall]`` -- idempotent
+      merge of the Meridian guard entries into a Claude Code settings.json.
+    * ``memory import [--out FILE] [--apply APPROVED_FILE]`` -- dry-run
+      auto-memory importer; ``--apply`` needs an owner-approved mapping.
+
+    Returns the exit code, or ``None`` when ``raw_argv`` is not a subcommand.
+    """
+    if not raw_argv or raw_argv[0] not in _SUBCOMMANDS:
+        return None
+    if raw_argv[0] == "hooks":
+        from .hook_settings_merge import cli_main as _hooks_cli
+
+        return _hooks_cli(raw_argv[1:])
+    from .memory_import import cli_main as _memory_cli
+
+    return _memory_cli(raw_argv[1:])
+
+
 def main(argv: list[str] | None = None) -> int:
-    """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``.
+    """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``,
+    offline ``hooks`` / ``memory`` subcommands (see ``_dispatch_subcommand``).
 
     Frozen-aware: when running as the downloadable binary (``sys.frozen``) with
     no explicit mode flag, dispatch defaults to the tunnel client rather than
@@ -207,6 +236,9 @@ def main(argv: list[str] | None = None) -> int:
     # Capture the exact argv we're dispatching on (not sys.argv) so the
     # frozen host/port heuristic is correct under tests and embedding.
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    sub_rc = _dispatch_subcommand(raw_argv)
+    if sub_rc is not None:
+        return sub_rc
     parser = argparse.ArgumentParser(
         prog="meridian",
         description="Multi-session Claude coordinator.",

@@ -7892,6 +7892,8 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
     import asyncio
     from datetime import datetime, timezone
 
+    from meridian import _deps
+
     monkeypatch.setenv("MERIDIAN_HOSTED", "true")
     # Defensively blank a real Neon admin URL a dev .env might supply — the
     # owner tenant below is 'admin' plan specifically so the cross-workspace
@@ -7905,6 +7907,10 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
         await db.execute("UPDATE tenants SET plan='admin' WHERE id=?", (owner["id"],))
         member = await db_module.upsert_tenant(db, "batchdel-member@example.com")
         raw, _ = await db_module.create_api_token(db, member["id"])
+        # ece2ac0a — hosted mode now 401s anonymous callers instead of serving
+        # them the control-plane DB, so the owner's own checks below
+        # authenticate with the owner's API token (admin plan -> this same DB).
+        owner_raw, _ = await db_module.create_api_token(db, owner["id"])
         proj = await db_module.create_project(db, "batchdel-owner-proj")
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         await db.execute(
@@ -7915,10 +7921,12 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
              "member", "read", now),
         )
         await db.commit()
-        return owner["id"], raw, proj["id"]
+        return owner["id"], raw, owner_raw, proj["id"]
 
-    owner_id, member_token, pid = asyncio.run(_setup())
+    owner_id, member_token, owner_token, pid = asyncio.run(_setup())
+    monkeypatch.setitem(_deps._tenant_db_cache, owner_id, db)
     hdr = {"Authorization": f"Bearer {member_token}", "X-Workspace-Tenant-Id": owner_id}
+    owner_hdr = {"Authorization": f"Bearer {owner_token}"}
 
     # A 'member' has PERM_WRITE but not PERM_SETTINGS — the batch delete
     # of the owner's project must be rejected.
@@ -7927,14 +7935,14 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
     assert "settings" in r.text.lower()
 
     # The project must survive the rejected attempt.
-    assert client.get(f"/projects/{pid}").status_code == 200
+    assert client.get(f"/projects/{pid}", headers=owner_hdr).status_code == 200
 
-    # Sanity: the batch endpoint still works normally for a same-workspace /
-    # self-hosted caller (no cross-workspace header → no gate, per
-    # _enforcement_context's own no-header fast path).
-    r2 = client.delete("/projects", params={"project_id": [pid]})
+    # Sanity: the batch endpoint still works normally for the workspace's own
+    # owner (no cross-workspace header → no gate, per _enforcement_context's
+    # own no-header fast path).
+    r2 = client.delete("/projects", params={"project_id": [pid]}, headers=owner_hdr)
     assert r2.status_code == 200, r2.text
-    assert client.get(f"/projects/{pid}").status_code == 404
+    assert client.get(f"/projects/{pid}", headers=owner_hdr).status_code == 404
 
 
 def test_dashboard_js_has_project_mgmt(client):

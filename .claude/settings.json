@@ -7,17 +7,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\hitl_guard.ps1\""
-                    }
-                ]
-            },
-            {
-                "matcher": "Grep|Glob",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\code_intel_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\hitl_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
@@ -27,37 +17,48 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\worktree_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\worktree_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
             {
-                "matcher": "Read|Bash|Grep|Glob",
+                "matcher": "Read|Bash|PowerShell|Grep|Glob|Write|Edit|MultiEdit",
                 "hooks": [
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\secret_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
             {
-                "matcher": "Bash",
+                "matcher": "Bash|PowerShell",
                 "hooks": [
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\dependency_install_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\dependency_install_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             },
             {
-                "matcher": "Bash",
+                "matcher": "Bash|PowerShell",
                 "hooks": [
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\pkg_install_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\pkg_install_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
+                    }
+                ]
+            },
+            {
+                "matcher": "Grep|Glob|Bash|PowerShell|Monitor|Write|Edit|MultiEdit|NotebookEdit|WebSearch|WebFetch|mcp__dc__.*|mcp__codebase-memory(-mcp)?__(search_graph|search_code|trace_path|get_code_snippet|query_graph|get_architecture)|mcp__.*__patch_file|mcp__.*__(write_memory|edit_memory|rename_memory)",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "timeout": 3
                     }
                 ]
             }
@@ -69,7 +70,18 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\test_tamper_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\test_tamper_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
+                    }
+                ]
+            },
+            {
+                "matcher": "WebSearch|WebFetch|mcp__codebase-memory(-mcp)?__.*|mcp__serena__find.*|mcp__.*__(paper_search|github_search|start_session|capture_research_finding|add_note|search_code|prospect_symbol|load_handoff|get_sprint_items|get_session_brief|refresh_context|get_agent_instructions|claim_sprint_item)",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_post.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "timeout": 3
                     }
                 ]
             }
@@ -81,7 +93,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\sprint_guard.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\sprint_guard.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
                     }
                 ]
             }
@@ -93,7 +105,31 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1\""
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"
+                    }
+                ]
+            },
+            {
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "timeout": 10
+                    }
+                ]
+            }
+        ],
+        "SubagentStart": [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "timeout": 10
                     }
                 ]
             }

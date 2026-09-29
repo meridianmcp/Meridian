@@ -24,7 +24,15 @@
   "remotes": [
     {
       "type": "sse",
-      "url": "https://usemeridian.us/mcp/sse"
+      "url": "https://usemeridian.us/mcp/sse",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Required. 'Bearer sk_meridian_...' with an API token from https://usemeridian.us/dashboard (or an OAuth access token; the 401 advertises the authorization server).",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
     }
   ]
 }

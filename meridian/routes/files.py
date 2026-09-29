@@ -11,7 +11,7 @@ import os
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .._deps import _db, _DEMO_CONTEXT_COOKIE
+from .._deps import _db, _DEMO_CONTEXT_COOKIE, _hosted_mode
 from .. import db as db_module
 from ..models import FileContent
 
@@ -296,6 +296,17 @@ Company standard, existing on-call rotation, Grafana integration already set up.
 }
 
 
+# ece2ac0a — the editable files are the SERVER's own repo-root AGENTS.md /
+# CLAUDE.md etc. On the hosted service that is one file shared by every tenant
+# (and before ece2ac0a it was readable and writable anonymously), so hosted mode
+# refuses the real read/write. The demo cookie's canned GET content is kept.
+_HOSTED_SERVER_FILES_DETAIL = (
+    "Editing instruction files is only available on self-hosted Meridian: these "
+    "files live on the server's filesystem, which hosted tenants do not share. "
+    "Edit AGENTS.md / CLAUDE.md in your own repository instead."
+)
+
+
 @router.get("/projects/{project_id}/files")
 async def list_project_files(
     project_id: str, request: Request
@@ -335,6 +346,8 @@ async def get_project_file(
         demo_files = _DEMO_FILE_CONTENT.get(proj_name, {})
         content = demo_files.get(filename, "")
         return JSONResponse(content={"filename": filename, "content": content}, headers={"Content-Type": "application/json; charset=utf-8"})
+    if _hosted_mode():
+        raise HTTPException(status_code=403, detail=_HOSTED_SERVER_FILES_DETAIL)
     path = _REPO_ROOT / filename
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     return JSONResponse(content={"filename": filename, "content": content}, headers={"Content-Type": "application/json; charset=utf-8"})
@@ -355,6 +368,9 @@ async def put_project_file(
         raise HTTPException(status_code=404, detail="project not found")
     if filename not in _EDITABLE_FILES:
         raise HTTPException(status_code=403, detail="file not in allow-list")
+    if _hosted_mode():
+        # Refused even for the demo cookie: this writes the SERVER's file.
+        raise HTTPException(status_code=403, detail=_HOSTED_SERVER_FILES_DETAIL)
     path = _REPO_ROOT / filename
     path.write_text(body.content, encoding="utf-8")
     return {"filename": filename, "size": len(body.content.encode("utf-8"))}

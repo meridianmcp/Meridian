@@ -2249,7 +2249,7 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     # Lazy reconnect loops spawn the proxy on connect (mirroring the first-request
     # behaviour) then return — no real WS. The idle-killer is a no-op. The legacy
     # watchdog (still used for eager custom plugins) also returns immediately.
-    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None):
+    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None, base_url=None):
         await proxy.ensure_running()
         return None
 
@@ -2262,7 +2262,7 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     # 64650cb4 — the default-Serena extract slot is now a SerenaDaemonPool, not a
     # SlotProxy. Its reconnect loop spawns the default-repo daemon (one Popen via
     # the pool, matching the per-slot proc accounting); the idle reaper is a no-op.
-    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract", tool_prefix=None):
+    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract", tool_prefix=None, base_url=None):
         pool.get_or_spawn(repo_path)
         return None
 
@@ -2536,6 +2536,37 @@ def test_run_tunnel_full_path_all_slots(monkeypatch, tmp_path):
     assert len(procs) == 3
     # .mcp.json was created then restored (removed) on shutdown.
     assert not (tmp_path / ".mcp.json").exists()
+
+
+def test_run_tunnel_exits_2_on_auth_rejected_close(monkeypatch, tmp_path):
+    """c7604ed7 -- when a reconnect loop raises TunnelAuthRejectedError (the
+    server rejected the shared credential via a 4401/4403 WS close), the
+    WHOLE tunnel must stop with a distinct, clear exit code -- never keep
+    the other slots limping along forever on the same now-rejected
+    credential. (The cache-invalidation side effect itself is the
+    reconnect loop's own responsibility and is covered directly by
+    tests/test_e37187f3_tunnel_multihost_auth.py; this test only exercises
+    run_tunnel's top-level TunnelAuthRejectedError handling around
+    asyncio.gather.)"""
+    _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "tid-9", "plan": "pro"}),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    async def raising_reconnect_lazy(ws_url, proxy, label, tool_prefix=None,
+                                      known_repo_paths=None, base_url=None):
+        if label == "fs":
+            raise tc.TunnelAuthRejectedError(
+                "fs: server rejected credential (close code 4401)"
+            )
+        return None  # code/extract slots: complete immediately, harmlessly
+
+    monkeypatch.setattr(tc, "_reconnect_loop_lazy", raising_reconnect_lazy)
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 2
 
 
 def test_run_tunnel_admin_plan_with_disabled_slots(monkeypatch, tmp_path):
@@ -2850,7 +2881,7 @@ def test_run_tunnel_fs_lazy_spawn_enoent_keeps_tunnel_up(monkeypatch, tmp_path):
 
     # Lazy reconnect drives the REAL ensure_running once then returns; idle-killer
     # + legacy watchdog are no-ops.
-    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None):
+    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None, base_url=None):
         await proxy.ensure_running()
         return None
 
@@ -2861,7 +2892,7 @@ def test_run_tunnel_fs_lazy_spawn_enoent_keeps_tunnel_up(monkeypatch, tmp_path):
         return None
 
     # 64650cb4 — pooled extract slot: no-op so the run_tunnel task gather returns.
-    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract", tool_prefix=None):
+    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract", tool_prefix=None, base_url=None):
         return None
 
     async def fake_pool_reaper(pool, idle_seconds=tc._IDLE_KILL_SECONDS):
@@ -3039,7 +3070,7 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
 
     # Lazy reconnect loops drive the real ensure_running (to hit its spawn-failure
     # branch) then return; idle-killer + legacy watchdog are no-ops.
-    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None):
+    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None, base_url=None):
         await proxy.ensure_running()
         return None
 
@@ -3051,7 +3082,7 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
 
     # 64650cb4 — pooled extract slot: no-op (spawn failures are handled per-request
     # at 503, not at startup, so the default extract spawns nothing here).
-    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract", tool_prefix=None):
+    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract", tool_prefix=None, base_url=None):
         return None
 
     async def fake_pool_reaper(pool, idle_seconds=tc._IDLE_KILL_SECONDS):

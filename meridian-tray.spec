@@ -40,7 +40,9 @@ macOS Gatekeeper will quarantine an unsigned downloaded .app (right-click ->
 Open bypasses it); that UX gap is tracked separately, not fixed by this spec.
 """
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 block_cipher = None
@@ -52,15 +54,21 @@ a = Analysis(
     pathex=[str(Path('.').resolve())],
     binaries=[],
     datas=[
-        ('meridian/static/meridian-tray.ico', '.'),
         # meridian/server.py mounts meridian/static/ as a StaticFiles
         # directory at import time (_NoCacheStaticFiles(directory=
         # _resource_path("meridian/static"))) -- confirmed live: the first
         # build of this spec crashed the --run-server child with
         # RuntimeError: Directory '...\meridian\static' does not exist,
-        # since only the single .ico file above was bundled. This build
-        # embeds the FULL server (unlike the slim meridian.spec, which never
-        # serves static files), so the whole directory must come along.
+        # since only a standalone .ico file was bundled. This build embeds
+        # the FULL server (unlike the slim meridian.spec, which never serves
+        # static files), so the whole directory must come along -- this
+        # ALSO carries meridian-tray.ico itself (it lives under
+        # meridian/static/), so there is deliberately no second, separate
+        # datas entry just for the icon (2026-09-28 review finding #23:
+        # that used to bundle the same file twice -- once here, once more
+        # explicitly at the bundle root). _icon_image_path() below resolves
+        # the frozen icon path under this SAME meridian/static/ location
+        # precisely so one copy suffices.
         ('meridian/static', 'meridian/static'),
         # meridian/_deps.py's Jinja2Templates(directory=_resource_path(
         # "meridian/templates")) needs the same treatment -- confirmed live:
@@ -88,6 +96,11 @@ a = Analysis(
         'PIL',
         'PIL.Image',
         'PIL.ImageDraw',
+        # tray_main._pid_owns_listening_port (2026-09-28 review finding #13)
+        # lazily imports psutil to cross-check the /health responder's PID
+        # against LocalRunner's own spawned child -- same lazy-import shape
+        # as pystray/PIL above, so it needs the same explicit safety net.
+        'psutil',
         # Uvicorn's own import-string dispatch (uvicorn.Config("meridian.server:app", ...))
         # needs its protocol/loop implementations declared explicitly, same
         # class of gap as httpx/websockets below.
@@ -162,6 +175,24 @@ if _IS_MACOS:
         },
     )
 else:
+    # 2026-09-28 review finding #5/#22 (secondary part): runtime_tmpdir=None
+    # (the previous setting) means the PyInstaller bootloader extracts into
+    # a freshly-named _MEIxxxxxx dir under the OS-wide default temp root
+    # EVERY launch -- and since tray_main.py's --run-server self-relaunch
+    # means every tray launch already self-extracts TWICE (tray process +
+    # supervised child), a forcibly-killed child (whenever the new
+    # graceful-CTRL_BREAK path in process_lifecycle.py still has to fall
+    # back to TerminateJobObject) leaves its extraction dir behind forever,
+    # scattered among every OTHER unrelated app's temp files. Pointing
+    # runtime_tmpdir at a FIXED, Meridian-owned parent directory instead
+    # means every extraction -- successful or orphaned -- lands under ONE
+    # common, well-known location tray_main.py's own
+    # _sweep_stale_runtime_extractions() can safely sweep at startup
+    # (skipping only the CURRENT run's own sys._MEIPASS), without ever
+    # touching unrelated files elsewhere in the OS temp root.
+    _TRAY_RUNTIME_TMPDIR = os.path.join(
+        os.environ.get('LOCALAPPDATA') or tempfile.gettempdir(), 'meridian', 'tray_runtime',
+    )
     exe = EXE(
         pyz,
         a.scripts,
@@ -175,7 +206,7 @@ else:
         strip=False,
         upx=True,
         upx_exclude=[],
-        runtime_tmpdir=None,
+        runtime_tmpdir=_TRAY_RUNTIME_TMPDIR,
         # No console window -- this is a tray/GUI app, not a CLI tool. Errors
         # before the tray icon itself can show (e.g. a corrupt install) fall
         # back to tray_main.py's own tkinter error dialog rather than a

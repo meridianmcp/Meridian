@@ -270,6 +270,10 @@ async def generate_codebase_map(project_id: str, request: Request) -> dict[str, 
     an optional system dependency — when ``dot`` isn't installed this returns a
     503 with an actionable install hint instead of failing opaquely.
     """
+    # ece2ac0a — this renders with graphviz on the server and never touched
+    # the DB, so it had no auth at all. Resolve the caller's DB like every
+    # sibling /projects/{id} route: _db() 401s an anonymous hosted caller.
+    await _db(request)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001

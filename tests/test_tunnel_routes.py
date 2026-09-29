@@ -1260,6 +1260,9 @@ class _FakeProxyReq:
         self.headers = headers or {}
         self.url = types.SimpleNamespace(path=path, query=query)
         self._body = body
+        # 5fe96405 — _authorize_tunnel_proxy_caller's 401 now builds a
+        # WWW-Authenticate resource_metadata URL from request.base_url.
+        self.base_url = "https://usemeridian.us/"
 
     async def body(self):
         return self._body
