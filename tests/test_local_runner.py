@@ -708,6 +708,74 @@ def test_status_recovers_exit_code_for_a_crash_discovered_later(state_dir):
 
 
 # ---------------------------------------------------------------------------
+# _spawn() cleans up an orphaned empty log file on backend.spawn() failure
+# (2026-09-28 review finding #9)
+# ---------------------------------------------------------------------------
+
+
+class _FailingBackend:
+    """Test double whose spawn() always raises AFTER LocalRunner._spawn()
+    has already opened+chmod'd the log file -- exercises the exact ordering
+    the real bug needed (Popen() failing inside backend.spawn()), without
+    depending on a REAL unlaunchable executable (which behaves differently
+    across platforms/shells)."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.spawn_calls = 0
+
+    def spawn(self, cmd, *, env=None, cwd=None, popen_kwargs=None):
+        self.spawn_calls += 1
+        raise self._exc
+
+
+def test_spawn_failure_removes_the_orphaned_empty_log_file(state_dir):
+    runner = _make_runner(
+        "spawn-fail-scope", ["irrelevant"], state_dir=state_dir, broker=None,
+        backend=_FailingBackend(RuntimeError("boom: launcher not found")),
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        runner.start()
+
+    log_dir = lr._scope_log_dir(state_dir, "spawn-fail-scope")
+    leftover_logs = list(log_dir.glob("*.log")) if log_dir.exists() else []
+    assert leftover_logs == [], f"a failed spawn must not orphan a log file, found: {leftover_logs}"
+
+
+def test_spawn_failure_still_prunes_older_logs(state_dir):
+    """A failed spawn attempt must not bypass max_log_files rotation --
+    older logs from PRIOR successful runs are still pruned down to the
+    configured cap even though this particular attempt failed."""
+    scope = "spawn-fail-prune-scope"
+    log_dir = lr._scope_log_dir(state_dir, scope)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(5):
+        (log_dir / f"old-{i}.log").write_text("x", encoding="utf-8")
+
+    runner = _make_runner(
+        scope, ["irrelevant"], state_dir=state_dir, broker=None, max_log_files=2,
+        backend=_FailingBackend(OSError("spawn failed")),
+    )
+    with pytest.raises(OSError):
+        runner.start()
+
+    remaining = list(log_dir.glob("*.log"))
+    assert len(remaining) <= 2
+
+
+def test_spawn_failure_exception_propagates_unchanged(state_dir):
+    """The cleanup must never mask or replace the ORIGINAL exception from
+    backend.spawn()."""
+    backend = _FailingBackend(FileNotFoundError("no such launcher"))
+    runner = _make_runner(
+        "spawn-fail-propagate", ["irrelevant"], state_dir=state_dir, broker=None, backend=backend,
+    )
+    with pytest.raises(FileNotFoundError, match="no such launcher"):
+        runner.start()
+    assert backend.spawn_calls == 1
+
+
+# ---------------------------------------------------------------------------
 # Bounded output -- tail_log() and script receipts never return more than
 # their configured cap, regardless of how much the child/script writes.
 # ---------------------------------------------------------------------------

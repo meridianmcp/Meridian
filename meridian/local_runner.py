@@ -1234,8 +1234,24 @@ class LocalRunner:
                 cwd=cwd,
                 popen_kwargs={"stdout": fh, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL},
             )
-        finally:
+        except Exception:
+            # 2026-09-28 review finding #9: a backend.spawn() failure (e.g.
+            # the launcher executable doesn't exist / isn't executable) used
+            # to leave behind an EMPTY log file that _prune_old_logs() never
+            # saw, since pruning previously only ran after a SUCCESSFUL
+            # spawn -- this bypassed max_log_files' rotation bound entirely,
+            # one leaked empty file per failed launch attempt. Clean up the
+            # orphan (and still run the normal prune, so the count stays
+            # bounded even if the unlink itself somehow fails) before
+            # re-raising -- a failed spawn must not orphan disk state.
             fh.close()
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
+            _prune_old_logs(log_path.parent, keep=self.max_log_files)
+            raise
+        fh.close()
         _prune_old_logs(log_path.parent, keep=self.max_log_files)
         return handle
 
