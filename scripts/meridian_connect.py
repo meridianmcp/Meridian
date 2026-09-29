@@ -52,9 +52,18 @@ def _http(method: str, url: str, *, token: str = "", body=None, timeout: int = 1
 
 
 def _settings_path() -> Path:
-    if platform.system() == "Windows":
-        appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
-        return Path(appdata) / "Claude" / "settings.json"
+    """Claude Code's USER settings file.
+
+    261e1527 -- documented location (Claude Code settings docs, checked
+    2026-09-28): ``~/.claude/settings.json``, which on Windows is
+    ``%USERPROFILE%\\.claude\\settings.json``; ``CLAUDE_CONFIG_DIR`` relocates
+    that directory. The previous Windows branch wrote to
+    ``%APPDATA%\\Claude\\settings.json`` -- Claude Desktop's folder, never read
+    by Claude Code -- so every hook this installer "installed" there was dead.
+    """
+    override = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser() / "settings.json"
     return Path.home() / ".claude" / "settings.json"
 
 
@@ -602,6 +611,168 @@ def _legacy_cursor_project_token_warning(cwd: Path) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# 261e1527 -- Claude Code: hooks in the file Claude Code actually reads, merged
+# (not overwritten), plus MCP registration through the documented CLI.
+# ---------------------------------------------------------------------------
+
+# A hook command is Meridian's own iff it calls that event's Meridian endpoint.
+_CLAUDE_HOOK_OWNERSHIP = {"SessionStart": "/hooks/session-start", "Stop": "/hooks/stop"}
+
+
+def _is_meridian_hook(hook, marker: str) -> bool:
+    return (
+        isinstance(hook, dict)
+        and hook.get("type") == "command"
+        and marker in str(hook.get("command", ""))
+    )
+
+
+def _detect_json_indent(raw: str):
+    """Indent of the first indented line, so a user's formatting survives."""
+    for line in raw.splitlines():
+        stripped = line.lstrip(" \t")
+        if stripped and stripped != line:
+            lead = line[: len(line) - len(stripped)]
+            return "\t" if lead.startswith("\t") else len(lead)
+    return 2
+
+
+def _configure_claude_hooks(settings_path: Path, start_cmd: str, stop_cmd: str):
+    """Merge Meridian's SessionStart / Stop hooks into ``settings_path``.
+
+    Touches ONLY Meridian-owned hook commands: the user's other settings, other
+    events, other matcher groups and any non-Meridian hook that shares a group
+    with ours are preserved. Idempotent (re-running replaces our own entry). A
+    file that is not valid JSON is never overwritten -- the old code fell back
+    to ``{}`` and rewrote the whole file with only the hooks. Returns
+    ``(ok, notes)``; nothing is written unless every check passed.
+    """
+    data: dict = {}
+    indent = 2
+    if settings_path.exists():
+        try:
+            raw = settings_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            return False, [f"WARNING: could not read {settings_path} ({exc}); hooks NOT written."]
+        if raw.strip():
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                return False, [
+                    f"WARNING: {settings_path} is not valid JSON; left untouched and the "
+                    "Meridian hooks were NOT written. Fix the file, then re-run."
+                ]
+            indent = _detect_json_indent(raw)
+    if not isinstance(data, dict):
+        return False, [f"WARNING: {settings_path} does not contain a JSON object; left untouched."]
+    hooks = data.get("hooks")
+    if hooks is None:
+        hooks = {}
+    if not isinstance(hooks, dict):
+        return False, [f"WARNING: 'hooks' in {settings_path} is not an object; left untouched."]
+
+    updated = dict(hooks)
+    for event, command in (("SessionStart", start_cmd), ("Stop", stop_cmd)):
+        groups = hooks.get(event)
+        if groups is None:
+            groups = []
+        if not isinstance(groups, list):
+            return False, [f"WARNING: hooks.{event} in {settings_path} is not a list; left untouched."]
+        marker = _CLAUDE_HOOK_OWNERSHIP[event]
+        kept = []
+        for group in groups:
+            inner = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(inner, list):
+                kept.append(group)
+                continue
+            remaining = [h for h in inner if not _is_meridian_hook(h, marker)]
+            if len(remaining) == len(inner):
+                kept.append(group)
+            elif remaining:  # a mixed group: drop only OUR command from it
+                kept.append({**group, "hooks": remaining})
+            # else: the group held only Meridian's hook -> dropped, re-added below
+        kept.append({"matcher": "", "hooks": [{"type": "command", "command": command}]})
+        updated[event] = kept
+    data["hooks"] = updated
+
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        _backup_once(settings_path)
+        _write_text_atomic(
+            settings_path, json.dumps(data, indent=indent, ensure_ascii=False) + "\n"
+        )
+    except OSError as exc:
+        return False, [f"WARNING: could not write {settings_path} ({exc})."]
+    return True, ["OK SessionStart + Stop hooks merged (your other settings and hooks were preserved)"]
+
+
+def _register_claude_mcp(meridian_url: str, token: str, claude_cli):
+    """Register the Meridian MCP server with Claude Code via ``claude mcp add``.
+
+    Claude Code keeps MCP servers in ``~/.claude.json``, a file it writes for
+    itself and documents as not meant for hand-editing, so this never writes it
+    directly: it uses the documented CLI (user scope, so it applies in every
+    project), or -- when the CLI is not installed -- prints the exact command to
+    run later. Returns ``(ok, notes)``.
+
+    Trade-off, stated plainly: ``claude mcp add`` takes the header on its command
+    line (``--header``), so the token is visible in a process listing for the
+    second or so the command runs. That is Claude Code's own documented
+    interface; the alternative (an ``Authorization: Bearer ${MERIDIAN_TOKEN}``
+    header) keeps the token out of argv but only works if the user exports
+    MERIDIAN_TOKEN for every Claude Code launch. The token is never printed.
+    """
+    mcp_url = f"{meridian_url}/mcp"
+    manual = (
+        f"claude mcp add --transport http --scope user meridian {mcp_url}"
+        + (' --header "Authorization: Bearer <your-meridian-token>"' if token else "")
+    )
+    if not claude_cli:
+        return False, [
+            "The Claude Code CLI ('claude') was not found on PATH, so the Meridian MCP server "
+            "was NOT registered.",
+            f"Once it is installed, run: {manual}",
+        ]
+    # ``--header`` is variadic in Claude's CLI: it must come AFTER the name and
+    # URL (as in Claude's own docs) or it swallows them.
+    args = [claude_cli, "mcp", "add", "--transport", "http", "--scope", "user", "meridian", mcp_url]
+    if token:
+        args += ["--header", f"Authorization: Bearer {token}"]
+    if platform.system() == "Windows" and Path(claude_cli).suffix.lower() in (".cmd", ".bat"):
+        # npm installs claude as a .cmd shim; cmd.exe would interpret these.
+        if any(ch in arg for arg in args[1:] for ch in '&|<>^%!"'):
+            return False, [
+                "Could not pass the arguments safely through cmd.exe; the Meridian MCP server "
+                "was NOT registered.",
+                f"Run: {manual}",
+            ]
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, [
+            f"WARNING: could not run 'claude mcp add' ({type(exc).__name__}).",
+            f"Run: {manual}",
+        ]
+    if proc.returncode == 0:
+        return True, ["OK registered the 'meridian' MCP server with Claude Code (user scope)"]
+    output = f"{proc.stdout or ''} {proc.stderr or ''}"
+    if "already exists" in output.lower():
+        return True, [
+            "The 'meridian' MCP server is already registered with Claude Code; left unchanged. "
+            "To point it at this server/token, run 'claude mcp remove meridian' and re-run this installer."
+        ]
+    detail = " ".join(output.split())
+    if token:
+        detail = detail.replace(token, "<redacted>")
+    return False, [
+        f"WARNING: 'claude mcp add' failed (exit {proc.returncode}): {detail[:200]}",
+        f"Run: {manual}",
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Meridian session hooks installer",
@@ -759,25 +930,21 @@ def main() -> int:
 
     # ---- Step 5: Claude Code -------------------------------------------------
     settings_path = _settings_path()
-    claude_detected = shutil.which("claude") is not None or settings_path.exists()
+    claude_cli = shutil.which("claude")
+    claude_detected = claude_cli is not None or settings_path.exists()
 
     if claude_detected:
         print()
-        print(f"Claude Code detected — writing hooks to {settings_path}")
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-
-        existing: dict = {}
-        if settings_path.exists():
-            try:
-                existing = json.loads(settings_path.read_text(encoding="utf-8"))
-            except Exception:
-                existing = {}
-
-        hooks = existing.setdefault("hooks", {})
-        hooks["SessionStart"] = [{"matcher": "", "hooks": [{"type": "command", "command": start_cmd}]}]
-        hooks["Stop"] = [{"matcher": "", "hooks": [{"type": "command", "command": stop_cmd}]}]
-        settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        print("  OK SessionStart + Stop hooks written")
+        print(f"Claude Code detected -- writing hooks to {settings_path}")
+        # 261e1527 -- ~/.claude/settings.json (NOT %APPDATA%\Claude), merged so
+        # only Meridian-owned hook entries change.
+        _hooks_ok, hook_notes = _configure_claude_hooks(settings_path, start_cmd, stop_cmd)
+        for note in hook_notes:
+            print(f"  {note}")
+        # 261e1527 -- hooks alone never gave Claude Code the Meridian MCP tools.
+        _mcp_ok, mcp_notes = _register_claude_mcp(meridian_url, token, claude_cli)
+        for note in mcp_notes:
+            print(f"  {note}")
 
     # ---- Step 6: Codex -------------------------------------------------------
     codex_dir = Path.home() / ".codex"
