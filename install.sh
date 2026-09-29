@@ -1,15 +1,47 @@
 #!/usr/bin/env sh
 set -e
-PLATFORM="$(uname -s)"
-ARCH="$(uname -m)"
-case "$PLATFORM" in
+OS_NAME="$(uname -s)"
+ARCH_NAME="$(uname -m)"
+PLATFORM=""
+ARCH=""
+case "$OS_NAME" in
   Darwin) PLATFORM="apple-darwin" ;;
   Linux)  PLATFORM="unknown-linux" ;;
 esac
-case "$ARCH" in
+case "$ARCH_NAME" in
   arm64|aarch64) ARCH="aarch64" ;;
   x86_64)        ARCH="x86_64" ;;
 esac
+
+# db03774e -- refuse unsupported platforms UP FRONT (before any network call).
+# release.yml only builds meridian-connect for Linux x86_64, macOS Apple Silicon
+# and Windows x86_64 (Intel macOS and Linux arm64 were dropped in 80f1d4bc: no
+# usable CI runner / pixi platform). Requesting any other asset just produces a
+# bare "curl: (22) ... 404" with no hint of what to do instead.
+case "${ARCH}-${PLATFORM}" in
+  x86_64-unknown-linux|aarch64-apple-darwin) ;;
+  *)
+    {
+      echo "error: no prebuilt meridian-connect binary is published for ${OS_NAME} ${ARCH_NAME}."
+      echo ""
+      echo "Prebuilt binaries exist for: Linux x86_64, macOS Apple Silicon (arm64), Windows x86_64."
+      echo ""
+      case "$OS_NAME" in
+        MINGW*|MSYS*|CYGWIN*)
+          echo "On Windows, run the PowerShell installer instead:"
+          echo "  irm https://usemeridian.us/install.ps1 | iex"
+          echo ""
+          ;;
+      esac
+      echo "On this platform, install the Meridian client from PyPI instead:"
+      echo "  uv tool install meridian-server      (or: pipx install meridian-server / pip install meridian-server)"
+      echo "  meridian --tunnel --repo ."
+      echo "or from npm:  npm i -g @meridianmcp/mcp"
+    } >&2
+    exit 1
+    ;;
+esac
+
 BINARY="meridian-connect-${ARCH}-${PLATFORM}"
 DEST="${MERIDIAN_BIN_DIR:-$HOME/.local/bin}/meridian-connect"
 RELEASE_URL="https://github.com/meridianmcp/Meridian/releases/latest/download"
