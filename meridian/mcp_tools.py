@@ -2363,25 +2363,36 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "built-in web search, the arXiv MCP, Serena, a teammate). Decoupled from "
         "search so capture survives regardless of how you found it. The summary's "
         "first line becomes the note title; the note is tagged 'finding' + the "
-        "source_type. Optionally links to a pinned decision. Returns the note.",
+        "source_type. Optionally links to a pinned decision. Returns the note. "
+        "In-project dedupe: if this project already has a finding for the same "
+        "source (case-folded DOI, arXiv id without version, PMID, or normalised "
+        "URL) nothing is created and the result carries existing_note_id (a soft "
+        "result, not an error); pass force_new=true to save a separate copy.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "summary": {"type": "string", "description": "The finding text (markdown). Its first line becomes the note title."},
          "source_url": {"type": "string", "description": "Provenance URL/path stored on the note."},
          "source_type": {"type": "string", "enum": ["web", "arxiv", "code", "conversation"], "description": "Where the finding came from. Default web; unknown values fall back to web."},
-         "decision_id": {"type": "string", "description": "Optional pinned-decision id to link this finding to (tagged decision:<id>)."}},
+         "decision_id": {"type": "string", "description": "Optional pinned-decision id to link this finding to (tagged decision:<id>)."},
+         "force_new": {"type": "boolean", "description": "Default false. true skips the in-project duplicate check and always creates a new finding note."}},
          "required": ["summary"]}},
     {"name": "capture_research_finding", "description":
         "Inline capture for web/paper research during planning: save a finding "
         "from a URL as an addressable note with the source link, optionally linked "
         "to a decision. A research-shaped wrapper over save_finding — arXiv URLs "
         "are tagged source_type=arxiv automatically, everything else as web. Turns "
-        "web-search results into durable Meridian artifacts instead of evaporating.",
+        "web-search results into durable Meridian artifacts instead of evaporating. "
+        "In-project dedupe: if this project already has a finding for the same "
+        "paper/page (case-folded DOI, arXiv id without version, PMID, or "
+        "normalised URL) nothing is created and the result carries "
+        "existing_note_id (a soft result, not an error); pass force_new=true to "
+        "save a separate copy.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "url": {"type": "string", "description": "Source URL of the web page or paper."},
          "summary": {"type": "string", "description": "Your summary of the finding (markdown)."},
-         "related_decision_id": {"type": "string", "description": "Optional pinned-decision id to link the finding to."}},
+         "related_decision_id": {"type": "string", "description": "Optional pinned-decision id to link the finding to."},
+         "force_new": {"type": "boolean", "description": "Default false. true skips the in-project duplicate check and always creates a new finding note."}},
          "required": ["url", "summary"]}},
     {"name": "get_notes", "description":
         "Read-only: List project notes (newest first), LIGHTWEIGHT by default — "

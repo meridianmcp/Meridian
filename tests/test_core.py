@@ -8575,10 +8575,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_docx_derivatives",
         "_migrate_pg_sprint_item_lock_session_id",
         "_migrate_pg_sprint_item_coarse_lock_files",
+        "_migrate_pg_backfill_finding_note_kind",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 173
+    assert len(allnames) == len(set(allnames)) == 174
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

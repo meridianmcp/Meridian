@@ -28,6 +28,7 @@ import aiosqlite
 
 from meridian import capability_manifest as _capability_manifest
 from meridian import capability_profile as _capability_profile
+from meridian.finding_identity import finding_identity as _finding_identity
 
 _log = logging.getLogger(__name__)
 
@@ -1171,6 +1172,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     # sprint_items.coarse_lock_files: whole-file locks a claim owns on behalf
     # of its symbol: declarations (so a symbol release frees only those).
     await _migrate_sprint_item_coarse_lock_files(db)
+    # fe0b0331 -- findings written before 'finding' joined add_project_note's
+    # kind allow-list were stored with note_kind NULL; backfill them.
+    await _migrate_backfill_finding_note_kind(db)
     return db
 
 
@@ -10495,6 +10499,11 @@ async def _unique_proposal_nickname(
         nickname = f"{base}-{n}"
 
 
+# The closed ``project_notes.note_kind`` vocabulary (NULL == 'wiki' to readers).
+# 'finding' is the kind save_finding writes (fe0b0331).
+_PROJECT_NOTE_KINDS = ("wiki", "insight", "reference", "code", "document", "finding")
+
+
 async def add_project_note(
     db: aiosqlite.Connection,
     project_id: str,
@@ -10510,8 +10519,13 @@ async def add_project_note(
     """Insert a project_notes row. tags is comma-separated free-form.
 
     ``kind`` is the note taxonomy (wiki | insight | reference | code |
-    document); NULL is treated as 'wiki' by readers. Unknown values are coerced
-    to NULL so the column stays a closed vocabulary.
+    document | finding); NULL is treated as 'wiki' by readers. Unknown values
+    are coerced to NULL so the column stays a closed vocabulary.
+
+    fe0b0331 — ``'finding'`` is the kind :func:`save_finding` writes. It was
+    missing from this allow-list, so every finding note was silently coerced to
+    NULL (and read back as 'wiki'). ``_migrate_backfill_finding_note_kind``
+    repairs the rows written before the fix.
 
     e3f150d0 — ``source`` records where a note was ingested from (a URL or file
     path), set by ``ingest_document`` for ``kind='document'`` notes. Nullable;
@@ -10533,7 +10547,7 @@ async def add_project_note(
     6fb48898 — a short memorable ``nickname`` (1-2 words) is also generated and
     stored, unique per project, using the same algorithm as sprint_items.nickname.
     """
-    if kind not in ("wiki", "insight", "reference", "code", "document"):
+    if kind not in _PROJECT_NOTE_KINDS:
         kind = None
     if priority not in ("high", "normal", "low"):
         priority = "normal"
@@ -12688,6 +12702,54 @@ async def validate_assumption(
 _FINDING_SOURCE_TYPES = ("web", "arxiv", "code", "conversation")
 
 
+def _is_finding_note(row: dict[str, Any]) -> bool:
+    """True for a finding note: ``note_kind='finding'`` or a ``finding`` tag token.
+
+    The tag test covers findings written before fe0b0331 (whose kind was
+    coerced to NULL) on a database the backfill migration has not reached.
+    """
+    if (row.get("note_kind") or "") == "finding":
+        return True
+    return "finding" in {
+        t.strip().lower() for t in (row.get("tags") or "").split(",") if t.strip()
+    }
+
+
+async def find_existing_finding(
+    db: aiosqlite.Connection, project_id: str, source: str | None
+) -> dict[str, Any] | None:
+    """fe0b0331 — the OLDEST finding note in ``project_id`` whose ``source``
+    resolves to the same canonical identity as ``source``, or ``None``.
+
+    Identity is :func:`meridian.finding_identity.finding_identity` (case-folded
+    DOI, arXiv id without version, PMID, else a normalised URL). A ``source``
+    with no identity (empty / free text) never matches anything. Scoped to ONE
+    project: the same paper in two projects is not a duplicate. Returns the
+    full note row.
+    """
+    identity = _finding_identity(source)
+    if identity is None:
+        return None
+    # Cheap SQL prefilter (kind or a 'finding' tag substring; the exact tag-token
+    # test is done in Python), no bodies fetched. The identity comparison itself
+    # can't be expressed in SQL, so it runs over the project's finding sources.
+    async with db.execute(
+        "SELECT id, source, tags, note_kind FROM project_notes "
+        "WHERE project_id = ? AND source IS NOT NULL AND source <> '' "
+        "AND (note_kind = 'finding' OR tags LIKE ?) "
+        "ORDER BY created_at ASC, id ASC",
+        (project_id, "%finding%"),
+    ) as cur:
+        rows = await cur.fetchall()
+    for raw in rows:
+        row = _row_to_dict(raw)
+        if row is None or not _is_finding_note(row):
+            continue
+        if _finding_identity(row.get("source")) == identity:
+            return await get_project_note(db, row["id"])
+    return None
+
+
 async def save_finding(
     db: aiosqlite.Connection,
     project_id: str,
@@ -12696,6 +12758,7 @@ async def save_finding(
     source_url: str | None = None,
     source_type: str = "web",
     decision_id: str | None = None,
+    force_new: bool = False,
 ) -> dict[str, Any]:
     """Persist a finding as an addressable ``kind='finding'`` note with provenance.
 
@@ -12704,8 +12767,20 @@ async def save_finding(
     ``decision_id`` is given — is also tagged ``decision:<id>`` to link it to that
     pinned decision. The note title is derived from the first line of ``summary``.
 
-    Returns ``{note, source_type, decision_id}``. Raises ValueError if
-    ``decision_id`` is given but no such decision exists.
+    fe0b0331 — in-project dedupe. When ``project_id`` already holds a finding
+    whose ``source_url`` has the same canonical identity (see
+    :func:`find_existing_finding`), NO copy is created: the result is the SOFT
+    ``{note: <existing>, existing_note_id, duplicate: True, identifier, message,
+    source_type, decision_id}`` -- not an error, and ``note`` is the existing row
+    so callers that read ``result["note"]["id"]`` keep working. A ``decision_id``
+    given with the duplicate is still honoured by adding its ``decision:<id>`` tag
+    to the existing note. ``force_new=True`` skips the check and always creates
+    the note (the escape hatch). The existing duplicates already in a project are
+    left alone -- never deleted.
+
+    Returns ``{note, source_type, decision_id}`` (plus the duplicate keys above
+    on a duplicate). Raises ValueError if ``decision_id`` is given but no such
+    decision exists.
     """
     st = (source_type or "web").strip().lower()
     if st not in _FINDING_SOURCE_TYPES:
@@ -12721,6 +12796,32 @@ async def save_finding(
             raise ValueError("decision not found")
         tags = f"{tags},decision:{decision_id}"
         linked = decision_id
+    if not force_new:
+        existing = await find_existing_finding(db, project_id, source_url)
+        if existing is not None:
+            note = existing
+            if linked:
+                link_tag = f"decision:{linked}"
+                have = (existing.get("tags") or "").strip(",")
+                if link_tag not in {t.strip() for t in have.split(",")}:
+                    updated = await update_project_note(
+                        db, existing["id"],
+                        tags=f"{have},{link_tag}" if have else link_tag,
+                    )
+                    note = updated or existing
+            return {
+                "note": note,
+                "source_type": st,
+                "decision_id": linked,
+                "existing_note_id": existing["id"],
+                "duplicate": True,
+                "identifier": _finding_identity(source_url),
+                "message": (
+                    "A finding for this source already exists in this project; "
+                    "nothing was created. Pass force_new=true to save a separate "
+                    "copy anyway."
+                ),
+            }
     note = await add_project_note(
         db, project_id, title, summary, tags,
         kind="finding", source=source_url,

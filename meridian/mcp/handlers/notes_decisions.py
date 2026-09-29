@@ -2166,6 +2166,17 @@ async def handle_get_insights(
     )
 
 
+def _flag(value: Any) -> bool:
+    """Parse an optional boolean tool argument.
+
+    MCP clients occasionally send ``"false"`` as a string; a bare ``bool()``
+    would read that as True, so strings are parsed explicitly.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y")
+    return bool(value)
+
+
 async def handle_save_finding(
     args: dict[str, Any],
     db: Any,
@@ -2176,6 +2187,10 @@ async def handle_save_finding(
     """MCP tool: save_finding.
 
     e1f43ee7 — phase-agnostic capture primitive (decoupled from search).
+
+    fe0b0331 — a finding whose ``source_url`` already has a finding in this
+    project returns the soft ``existing_note_id`` result instead of a copy;
+    ``force_new=true`` creates it anyway.
     """
     validate_input_size(args.get("summary"), "finding summary", 1_000_000)
     validate_input_size(args.get("source_url"), "source_url", 2_000)
@@ -2187,6 +2202,7 @@ async def handle_save_finding(
             source_url=args.get("source_url"),
             source_type=args.get("source_type", "web"),
             decision_id=args.get("decision_id"),
+            force_new=_flag(args.get("force_new")),
         )
     except ValueError as exc:
         return {"error": str(exc)}
@@ -2203,6 +2219,10 @@ async def handle_capture_research_finding(
 
     b1d36e93 — web/paper-shaped wrapper over save_finding; arXiv URLs are
     auto-tagged source_type=arxiv.
+
+    fe0b0331 — same in-project dedupe as save_finding: the same paper (matched
+    by case-folded DOI / arXiv id without version / PMID / normalised URL)
+    returns ``existing_note_id`` instead of a copy; ``force_new=true`` escapes.
     """
     validate_input_size(args.get("summary"), "finding summary", 1_000_000)
     validate_input_size(args.get("url"), "url", 2_000)
@@ -2217,6 +2237,7 @@ async def handle_capture_research_finding(
             db, args["project_id"], args.get("summary") or "",
             source_url=_url, source_type=_st,
             decision_id=args.get("related_decision_id"),
+            force_new=_flag(args.get("force_new")),
         )
     except ValueError as exc:
         return {"error": str(exc)}
