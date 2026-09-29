@@ -90,6 +90,11 @@ a = Analysis(
         'PIL',
         'PIL.Image',
         'PIL.ImageDraw',
+        # tray_main._pid_owns_listening_port (2026-09-28 review finding #13)
+        # lazily imports psutil to cross-check the /health responder's PID
+        # against LocalRunner's own spawned child -- same lazy-import shape
+        # as pystray/PIL above, so it needs the same explicit safety net.
+        'psutil',
         # Uvicorn's own import-string dispatch (uvicorn.Config("meridian.server:app", ...))
         # needs its protocol/loop implementations declared explicitly, same
         # class of gap as httpx/websockets below.

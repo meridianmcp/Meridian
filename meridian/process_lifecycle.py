@@ -126,6 +126,18 @@ class OwnedProcessHandle:
     ``closed`` makes :meth:`ProcessLifecycleBackend.close` idempotent: once
     True, a repeat ``close()`` call is a confirmed no-op rather than
     re-signalling (potentially a PID the OS has since reused).
+
+    ``job_id`` (2026-09-28 review finding #12) is a raw Windows kernel HANDLE
+    value -- meaningful ONLY inside the process that created it. A
+    DIFFERENT process reconstructing a handle via :meth:`from_dict` (e.g. a
+    standalone ``python -m meridian.local_runner stop`` invocation) must
+    NEVER treat a persisted ``job_id`` as a usable handle -- see
+    :class:`WindowsJobObjectBackend`'s own ``close()``, which uses
+    ``popen is None`` as the same-process/cross-process signal already used
+    elsewhere in this module. ``job_name`` is what makes cross-process
+    Job Object teardown actually work: a deterministic, run_id-derived
+    kernel-object NAME (unlike the handle int) IS valid to reopen from a
+    different process via ``OpenJobObjectW`` -- see :func:`_job_object_name`.
     """
 
     run_id: str
@@ -135,7 +147,8 @@ class OwnedProcessHandle:
     cmdline: "list[str]"
     create_time: "float | None" = None
     group_id: "int | None" = None  # POSIX process-group id (== pid when leader)
-    job_id: "int | None" = None  # opaque Windows job handle, if job assignment succeeded
+    job_id: "int | None" = None  # opaque Windows job HANDLE -- valid ONLY in the spawning process
+    job_name: "str | None" = None  # deterministic job NAME -- valid cross-process via OpenJobObjectW
     popen: "subprocess.Popen | None" = field(default=None, repr=False, compare=False)
     closed: bool = False
 
@@ -152,6 +165,7 @@ class OwnedProcessHandle:
             "create_time": self.create_time,
             "group_id": self.group_id,
             "job_id": self.job_id,
+            "job_name": self.job_name,
             "closed": self.closed,
         }
 
@@ -170,6 +184,7 @@ class OwnedProcessHandle:
             create_time=data.get("create_time"),
             group_id=data.get("group_id"),
             job_id=data.get("job_id"),
+            job_name=data.get("job_name"),
             popen=None,
             closed=bool(data.get("closed", False)),
         )
@@ -406,6 +421,23 @@ _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800  # never set — documents the polic
 _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000  # never set — documents the policy
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
+_JOB_OBJECT_TERMINATE = 0x0008  # access right needed for OpenJobObjectW + TerminateJobObject
+
+
+def _job_object_name(run_id: str) -> str:
+    """Deterministic Job Object name derived from *run_id* (2026-09-28
+    review finding #12) -- lets a LATER, DIFFERENT process reopen the exact
+    same kernel Job Object via ``OpenJobObjectW(name)`` instead of trying to
+    reuse the ORIGINAL process's raw job HANDLE value, which means nothing
+    outside that process's own handle table (and, worse, could silently
+    collide with some UNRELATED handle the new process happens to have open
+    at that same small integer value). ``Local\\`` keeps this in the
+    caller's own session namespace -- matches ``local_runner._scope_lock``'s
+    own convention for the exact same reason (never ``Global\\``, which
+    needs a privilege an ordinary user process doesn't have). ``run_id`` is
+    a ``uuid.uuid4().hex`` string (see ``new_run_id``) -- always safe
+    characters for a kernel object name, no sanitization needed."""
+    return f"Local\\meridian-job-{run_id}"
 
 
 class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
@@ -455,8 +487,18 @@ class Win32JobAPI:
     def __init__(self, kernel32: Any):
         self._k = kernel32
 
-    def create_job(self) -> "int | None":
-        h = self._k.CreateJobObjectW(None, None)
+    def create_job(self, name: "str | None" = None) -> "int | None":
+        h = self._k.CreateJobObjectW(None, name)
+        return int(h) if h else None
+
+    def open_job(self, name: str) -> "int | None":
+        """2026-09-28 review finding #12: reopen an EXISTING named Job
+        Object from a DIFFERENT process than the one that created it --
+        this is the whole point of naming the job at all (see
+        ``OwnedProcessHandle.job_name``'s own docstring). Returns ``None``
+        (never raises) if no such job exists (already closed/never
+        created), or the caller lacks the requested access right."""
+        h = self._k.OpenJobObjectW(_JOB_OBJECT_TERMINATE, False, name)
         return int(h) if h else None
 
     def set_kill_on_close(self, job_handle: int) -> bool:
@@ -499,6 +541,8 @@ def _load_win32_job_api() -> "Win32JobAPI | None":
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
         kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.OpenJobObjectW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.OpenJobObjectW.restype = ctypes.c_void_p
         kernel32.SetInformationJobObject.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
         ]
@@ -753,11 +797,12 @@ class WindowsJobObjectBackend:
         return handle
 
     def _assign_to_job(self, handle: OwnedProcessHandle) -> None:
-        """Best-effort: create a job, set KILL_ON_JOB_CLOSE, assign
+        """Best-effort: create a NAMED job (2026-09-28 review finding #12 --
+        see :func:`_job_object_name`), set KILL_ON_JOB_CLOSE, assign
         *handle*'s pid to it. Any failure at any step leaves
-        ``handle.job_id`` as ``None`` (taskkill-only teardown) and never
-        raises -- this runs right after a successful spawn/adopt; it must
-        not turn a working spawn into a failed one.
+        ``handle.job_id``/``handle.job_name`` as ``None`` (taskkill-only
+        teardown) and never raises -- this runs right after a successful
+        spawn/adopt; it must not turn a working spawn into a failed one.
 
         Every kernel32 HANDLE obtained along the way is explicitly closed:
         ``proc_handle`` is only ever needed transiently to make the
@@ -772,8 +817,9 @@ class WindowsJobObjectBackend:
             return
         job = None
         proc_handle = None
+        job_name = _job_object_name(handle.run_id)
         try:
-            job = api.create_job()
+            job = api.create_job(job_name)
             if job is None:
                 _logger.warning("process_lifecycle: CreateJobObjectW failed for pid %s", handle.pid)
                 return
@@ -792,6 +838,7 @@ class WindowsJobObjectBackend:
                 )
                 return
             handle.job_id = job
+            handle.job_name = job_name
             job = None  # ownership transferred to handle.job_id -- don't close in finally
         except Exception:  # noqa: BLE001 — best-effort, never raise
             _logger.warning(
@@ -799,6 +846,7 @@ class WindowsJobObjectBackend:
                 exc_info=True,
             )
             handle.job_id = None
+            handle.job_name = None
         finally:
             if proc_handle is not None:
                 try:
@@ -853,6 +901,34 @@ class WindowsJobObjectBackend:
             time.sleep(0.1)
         return _pid_confirmed_gone(handle.pid)
 
+    def _resolve_job_handle_for_close(
+        self, api: Win32JobAPI, handle: OwnedProcessHandle,
+    ) -> "int | None":
+        """2026-09-28 review finding #12: prefer reopening the job by its
+        deterministic NAME whenever ``handle.job_name`` is present -- this
+        works identically whether :meth:`close` runs in the SAME process
+        that spawned the child or a totally DIFFERENT one (e.g. a
+        standalone ``python -m meridian.local_runner stop`` invocation
+        reconstructing a ``RunnerRecord`` a different process persisted),
+        because Windows named kernel objects are safely reopenable from
+        anywhere in the same session namespace -- this sidesteps ever
+        needing to guess "are we the original process" at all, and a fresh
+        handle obtained this way is just as valid to terminate+close as the
+        original one would have been.
+
+        Falls back to the raw ``job_id`` HANDLE value only for a LEGACY
+        handle with no ``job_name`` at all (predates this fix, or a job
+        that was never successfully named) -- valid only when this really
+        is the same process, exactly the pre-existing (if silently unsafe
+        cross-process) assumption every caller already made before this
+        fix; never worse than the pre-existing behavior for that shape."""
+        if handle.job_name:
+            try:
+                return api.open_job(handle.job_name)
+            except Exception:  # noqa: BLE001
+                return None
+        return handle.job_id
+
     def close(self, handle: OwnedProcessHandle, *, grace_seconds: float = 5.0) -> bool:
         if handle.closed:
             return True
@@ -864,13 +940,15 @@ class WindowsJobObjectBackend:
             return True
         api = self._api_loader()
         job_terminated = False
-        if api is not None and handle.job_id is not None:
-            try:
-                api.terminate_job(handle.job_id, 1)
-                api.close_handle(handle.job_id)
-                job_terminated = True
-            except Exception:  # noqa: BLE001
-                pass
+        if api is not None:
+            job_handle = self._resolve_job_handle_for_close(api, handle)
+            if job_handle is not None:
+                try:
+                    api.terminate_job(job_handle, 1)
+                    api.close_handle(job_handle)
+                    job_terminated = True
+                except Exception:  # noqa: BLE001
+                    pass
         # Guarded taskkill /T fallback -- catches anything that raced its
         # way out of the job before assignment completed. Gated on having
         # SOME confirmation handle.pid is still the process we spawned:

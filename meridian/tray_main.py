@@ -92,20 +92,81 @@ def _dashboard_url() -> str:
     return f"http://127.0.0.1:{_default_port()}/"
 
 
-def _health_probe() -> bool:
+def _pid_owns_listening_port(pid: int, port: int) -> bool:
+    """True iff *pid* is CONFIRMED to itself hold a LISTENING socket on
+    *port* right now (2026-09-28 review finding #13). A bare "HTTP 200 on
+    127.0.0.1:port/health" has no identity binding at all on its own -- a
+    completely unrelated local process that happens to win the race to bind
+    that port first is indistinguishable from the real server without this
+    check. Degrades to True ("can't verify, don't block on it") when psutil
+    is unavailable or *pid* has already exited by the time this runs -- this
+    only ever NARROWS an already-successful HTTP response, never invents a
+    failure the response itself didn't report."""
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        # net_connections() is the modern (psutil>=6.0) name; connections()
+        # is the same call under its older, now-deprecated name -- this
+        # repo's own pin (psutil>=5.9) spans both, so try the modern one
+        # first and fall back rather than assuming either is present.
+        if hasattr(proc, "net_connections"):
+            conns = proc.net_connections(kind="inet")
+        else:
+            conns = proc.connections(kind="inet")
+    except Exception:  # noqa: BLE001
+        return True
+    return any(
+        getattr(c, "status", None) == psutil.CONN_LISTEN
+        and c.laddr and getattr(c.laddr, "port", None) == port
+        for c in conns
+    )
+
+
+def _expected_pid(runner: LocalRunner) -> "int | None":
+    """The PID :func:`_health_probe` should cross-check the ``/health``
+    responder against -- the CURRENTLY relevant child for *runner*'s scope.
+    Prefers the live in-process handle (set the instant ``_spawn()``
+    returns, well before the health-probe polling loop ever starts -- see
+    ``LocalRunner._spawn_and_record``) since it is always freshest; falls
+    back to the persisted record's pid for a read-only, status()-triggered
+    re-probe (see ``LocalRunner._build_local_mcp_status``'s stale-state
+    self-heal, 2026-09-28 review item #1c) where there may be no live
+    in-process handle at all. Returns ``None`` (probe degrades to the
+    HTTP-only check) when neither is available."""
+    live = runner._live_handle
+    if live is not None:
+        return live.pid
+    record = runner._load_record()
+    return record.pid if record is not None else None
+
+
+def _health_probe(expected_pid: "int | None" = None) -> bool:
     """LocalRunner's ``health_probe`` callable: a real HTTP GET against the
     server's own ``/health`` route (not a guess, not a bare port-open check
     -- a closed port never means "ready" and an open-but-not-yet-serving
     port never falsely reports ready either). Any failure means "not ready
     yet", never an exception escaping to ``LocalRunner`` (its own
     ``_await_readiness`` already treats a raising probe as "not ready" too,
-    but staying defensive here keeps this callable's own contract explicit)."""
+    but staying defensive here keeps this callable's own contract explicit).
+
+    *expected_pid*, when supplied, additionally cross-checks (via
+    :func:`_pid_owns_listening_port`) that the process actually LISTENING on
+    the port is the one LocalRunner spawned -- see that function's own
+    docstring for the finding this closes. Optional and defaults to
+    ``None`` (the pre-existing HTTP-only behavior) so this stays callable
+    standalone exactly as before; :func:`_build_runner` is what wires the
+    real cross-check in via a closure over the live runner."""
     url = f"http://127.0.0.1:{_default_port()}/health"
     try:
         with urllib.request.urlopen(url, timeout=_HEALTH_PROBE_TIMEOUT_SECONDS) as resp:
-            return 200 <= resp.status < 300
+            if not (200 <= resp.status < 300):
+                return False
     except (urllib.error.URLError, OSError, ValueError):
         return False
+    if expected_pid is None:
+        return True
+    return _pid_owns_listening_port(expected_pid, _default_port())
 
 
 def _server_command() -> "list[str]":
@@ -147,12 +208,19 @@ def _icon_image_path() -> Path:
 
 
 def _build_runner() -> LocalRunner:
-    return LocalRunner(
+    runner = LocalRunner(
         scope=SCOPE,
         command=_server_command(),
         env=_server_env(),
-        health_probe=_health_probe,
+        health_probe=None,  # bound to `runner` itself right below
     )
+    # A closure over `runner` (not a bare module-level callable) is what
+    # lets _health_probe cross-check the /health responder's identity
+    # (2026-09-28 review finding #13) -- LocalRunner's health_probe contract
+    # is a plain zero-arg Callable[[], bool], so the expected-pid lookup has
+    # to happen HERE, at call time, rather than being passed in once.
+    runner.health_probe = lambda: _health_probe(_expected_pid(runner))
+    return runner
 
 
 def _sweep_stale_runtime_extractions() -> None:

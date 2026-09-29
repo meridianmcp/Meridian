@@ -682,6 +682,7 @@ class RunnerRecord:
     group_id: "int | None"
     job_id: "int | None"
     started_at: float
+    job_name: "str | None" = None
     restart_count: int = 0
     log_path: "str | None" = None
     tunnel_label: "str | None" = None
@@ -718,6 +719,7 @@ class RunnerRecord:
             create_time=self.create_time,
             group_id=self.group_id,
             job_id=self.job_id,
+            job_name=self.job_name,
         )
 
 
@@ -1351,6 +1353,7 @@ class LocalRunner:
             create_time=handle.create_time,
             group_id=handle.group_id,
             job_id=handle.job_id,
+            job_name=handle.job_name,
             started_at=self._clock(),
             restart_count=restart_count,
             log_path=str(log_path),

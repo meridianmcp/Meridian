@@ -384,6 +384,7 @@ class _FakeKernel32:
     def __init__(self):
         self.calls = []
         self._next_handle = 1000
+        self._jobs_by_name = {}
 
     def _handle(self):
         self._next_handle += 1
@@ -391,7 +392,14 @@ class _FakeKernel32:
 
     def CreateJobObjectW(self, sec, name):
         h = self._handle()
-        self.calls.append(("CreateJobObjectW", h))
+        self.calls.append(("CreateJobObjectW", h, name))
+        if name:
+            self._jobs_by_name[name] = h
+        return h
+
+    def OpenJobObjectW(self, access, inherit, name):
+        h = self._jobs_by_name.get(name)
+        self.calls.append(("OpenJobObjectW", access, name, h))
         return h
 
     def SetInformationJobObject(self, job_handle, info_class, info_ptr, info_size):
@@ -608,6 +616,144 @@ def test_assign_to_job_failure_leaves_job_id_none(monkeypatch):
     backend = pl.WindowsJobObjectBackend(api_loader=lambda: _FailingAPI())
     handle = backend.spawn(["node"])
     assert handle.job_id is None
+
+
+def test_job_object_name_is_deterministic_per_run_id():
+    assert pl._job_object_name("abc123") == pl._job_object_name("abc123")
+    assert pl._job_object_name("abc123") != pl._job_object_name("xyz789")
+    assert pl._job_object_name("abc123").startswith("Local\\")
+
+
+def test_windows_backend_spawn_names_the_job_from_run_id(monkeypatch):
+    """2026-09-28 review finding #12: every NEW job is created with a
+    deterministic, run_id-derived NAME (not anonymous) so a LATER, DIFFERENT
+    process can reopen it."""
+    def fake_popen(cmd, env=None, cwd=None, **kwargs):
+        return _FakeProc(555)
+
+    monkeypatch.setattr(pl.subprocess, "Popen", fake_popen)
+    fake_api = _FakeKernel32()
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: pl.Win32JobAPI(fake_api))
+
+    handle = backend.spawn(["node", "server.js"])
+
+    assert handle.job_name == pl._job_object_name(handle.run_id)
+    create_call = next(c for c in fake_api.calls if c[0] == "CreateJobObjectW")
+    assert create_call[2] == handle.job_name
+
+
+def test_assign_to_job_failure_leaves_job_name_none(monkeypatch):
+    class _FailingAPI:
+        def create_job(self, name=None):
+            return 42
+
+        def set_kill_on_close(self, job_handle):
+            return False
+
+        def close_handle(self, handle):
+            return True
+
+    monkeypatch.setattr(pl.subprocess, "Popen", lambda cmd, env=None, cwd=None, **kw: _FakeProc(9))
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: _FailingAPI())
+    handle = backend.spawn(["node"])
+    assert handle.job_id is None
+    assert handle.job_name is None
+
+
+def _fake_psutil_matching(create_time_value):
+    """Fake psutil module whose Process(pid).create_time() always matches
+    *create_time_value* -- makes verify_handle_live() do a REAL matching
+    comparison (True) instead of hitting a genuine (and, on this dev
+    machine, failing) lookup against a fabricated PID that doesn't
+    correspond to a real running process. Mirrors
+    test_verify_handle_live_matching_create_time's own pattern."""
+    fake_psutil = types.ModuleType("psutil")
+
+    class _P:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            return create_time_value
+
+    fake_psutil.Process = _P
+    return fake_psutil
+
+
+def test_close_reopens_job_by_name_for_a_cross_process_handle(monkeypatch):
+    """The core fix: a handle reconstructed from a PERSISTED record (no
+    live popen -- exactly RunnerRecord.as_owned_handle()'s shape from a
+    standalone `python -m meridian.local_runner stop` invocation in a
+    DIFFERENT process than the one that spawned the child) must reopen the
+    job by NAME rather than trusting the stale job_id HANDLE INT, which
+    means nothing (and could even collide with an unrelated handle) outside
+    the ORIGINAL process's own handle table."""
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil_matching(100.0))
+    run_calls = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    fake_api = _FakeKernel32()
+    # Simulate the job having been created (with a name) by a DIFFERENT,
+    # now-gone process -- fake_api's own _jobs_by_name registry stands in
+    # for "the kernel still has this named job object alive".
+    fake_api._jobs_by_name["Local\\meridian-job-run-xyz"] = 777
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: pl.Win32JobAPI(fake_api))
+    # job_id is a bogus/stale int (e.g. reused by something unrelated in
+    # THIS process) -- must never be used directly when job_name is present.
+    handle = pl.OwnedProcessHandle(
+        run_id="run-xyz", pid=555, executable="node", cwd=None, cmdline=["node"],
+        job_id=999999, job_name="Local\\meridian-job-run-xyz", create_time=100.0,
+    )
+    ok = backend.close(handle)
+    assert ok is True
+    assert ("OpenJobObjectW", pl._JOB_OBJECT_TERMINATE, "Local\\meridian-job-run-xyz", 777) in fake_api.calls
+    assert ("TerminateJobObject", 777, 1) in fake_api.calls
+    # The bogus job_id (999999) must NEVER have been passed to TerminateJobObject.
+    assert not any(c[0] == "TerminateJobObject" and c[1] == 999999 for c in fake_api.calls)
+
+
+def test_close_falls_back_to_raw_job_id_for_legacy_handle_with_no_job_name(monkeypatch):
+    """A handle with no job_name at all (predates this fix) keeps the exact
+    pre-existing behavior -- direct use of the raw job_id value."""
+    run_calls = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    fake_api = _FakeKernel32()
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: pl.Win32JobAPI(fake_api))
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=555, executable="node", cwd=None, cmdline=["node"], job_id=100,
+    )
+    ok = backend.close(handle)
+    assert ok is True
+    assert ("TerminateJobObject", 100, 1) in fake_api.calls
+    assert not any(c[0] == "OpenJobObjectW" for c in fake_api.calls)
+
+
+def test_close_job_name_reopen_returns_none_when_job_already_gone(monkeypatch):
+    """The named job no longer exists (already terminated/closed elsewhere)
+    -- close() must not crash, and falls through to the taskkill fallback
+    for final cleanup."""
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil_matching(1.0))
+    run_calls = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    fake_api = _FakeKernel32()  # empty _jobs_by_name -- OpenJobObjectW returns None
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: pl.Win32JobAPI(fake_api))
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=42, executable="x", cwd=None, cmdline=["x"],
+        job_name="Local\\meridian-job-r", create_time=1.0,
+    )
+    ok = backend.close(handle)
+    assert ok is True
+    assert not any(c[0] == "TerminateJobObject" for c in fake_api.calls)
+    assert run_calls == [["taskkill", "/F", "/T", "/PID", "42"]]  # create_time confirms identity
+
+
+def test_owned_process_handle_job_name_round_trips_through_to_dict():
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=1, executable="x", cwd=None, cmdline=["x"], job_name="Local\\meridian-job-r",
+    )
+    data = handle.to_dict()
+    assert data["job_name"] == "Local\\meridian-job-r"
+    restored = pl.OwnedProcessHandle.from_dict(data)
+    assert restored.job_name == "Local\\meridian-job-r"
 
 
 def test_assign_to_job_failure_closes_both_job_and_proc_handles(monkeypatch):

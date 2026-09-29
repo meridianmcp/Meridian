@@ -149,6 +149,150 @@ def test_health_probe_false_on_os_error_never_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _pid_owns_listening_port / _expected_pid / _health_probe(expected_pid=...)
+# -- health-probe identity binding (2026-09-28 review finding #13)
+# ---------------------------------------------------------------------------
+
+
+class _FakeConn:
+    def __init__(self, status, port):
+        self.status = status
+        self.laddr = mock.MagicMock(port=port)
+
+
+class _FakePsutilProcess:
+    def __init__(self, pid, conns):
+        self.pid = pid
+        self._conns = conns
+
+    def net_connections(self, kind="inet"):
+        return self._conns
+
+
+def _install_fake_psutil(monkeypatch, conns_by_pid):
+    fake_psutil = mock.MagicMock()
+    fake_psutil.CONN_LISTEN = "LISTEN"
+
+    def _process(pid):
+        if pid not in conns_by_pid:
+            raise LookupError(f"no such pid {pid}")
+        return _FakePsutilProcess(pid, conns_by_pid[pid])
+
+    fake_psutil.Process = _process
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    return fake_psutil
+
+
+def test_pid_owns_listening_port_true_when_pid_listens_on_port(monkeypatch):
+    fake_psutil = _install_fake_psutil(monkeypatch, {123: [_FakeConn("LISTEN", 7878)]})
+    assert tray_main._pid_owns_listening_port(123, 7878) is True
+
+
+def test_pid_owns_listening_port_false_when_different_pid_holds_it(monkeypatch):
+    _install_fake_psutil(monkeypatch, {123: [_FakeConn("LISTEN", 9999)]})
+    assert tray_main._pid_owns_listening_port(123, 7878) is False
+
+
+def test_pid_owns_listening_port_false_when_pid_has_no_listening_conn(monkeypatch):
+    _install_fake_psutil(monkeypatch, {123: []})
+    assert tray_main._pid_owns_listening_port(123, 7878) is False
+
+
+def test_pid_owns_listening_port_degrades_true_when_psutil_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    # A completely unrelated process on the port would normally make this
+    # False, but with no way to verify, this NARROWING check must never
+    # invent a failure the HTTP response itself didn't report.
+    assert tray_main._pid_owns_listening_port(123, 7878) is True
+
+
+def test_pid_owns_listening_port_degrades_true_when_pid_already_exited(monkeypatch):
+    _install_fake_psutil(monkeypatch, {})  # 123 not in the fake process table at all
+    assert tray_main._pid_owns_listening_port(123, 7878) is True
+
+
+def test_pid_owns_listening_port_falls_back_to_connections_on_older_psutil(monkeypatch):
+    """psutil>=5.9 (this repo's own pin) may predate net_connections()
+    (added in psutil>=6.0) -- must fall back to the older connections()
+    name rather than crashing."""
+    fake_psutil = mock.MagicMock()
+    fake_psutil.CONN_LISTEN = "LISTEN"
+
+    class _OldStyleProcess:
+        net_connections = None  # deliberately absent -- see hasattr check
+
+        def __init__(self, pid):
+            self.pid = pid
+
+        def connections(self, kind="inet"):
+            return [_FakeConn("LISTEN", 7878)]
+
+    del _OldStyleProcess.net_connections  # simulate a version that never had it at all
+    fake_psutil.Process = _OldStyleProcess
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    assert tray_main._pid_owns_listening_port(123, 7878) is True
+
+
+def test_expected_pid_prefers_live_handle():
+    runner = mock.MagicMock()
+    runner._live_handle = mock.MagicMock(pid=111)
+    assert tray_main._expected_pid(runner) == 111
+    runner._load_record.assert_not_called()
+
+
+def test_expected_pid_falls_back_to_persisted_record(monkeypatch):
+    runner = mock.MagicMock()
+    runner._live_handle = None
+    runner._load_record.return_value = mock.MagicMock(pid=222)
+    assert tray_main._expected_pid(runner) == 222
+
+
+def test_expected_pid_none_when_neither_available():
+    runner = mock.MagicMock()
+    runner._live_handle = None
+    runner._load_record.return_value = None
+    assert tray_main._expected_pid(runner) is None
+
+
+def test_health_probe_cross_checks_pid_when_supplied(monkeypatch):
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", lambda url, timeout: _FakeResponse(200))
+    _install_fake_psutil(monkeypatch, {123: [_FakeConn("LISTEN", tray_main._default_port())]})
+    assert tray_main._health_probe(123) is True
+
+
+def test_health_probe_fails_when_pid_does_not_own_the_port(monkeypatch):
+    """The core fix: a 200 from /health is no longer sufficient on its own
+    when a different local process won the race to bind the port first."""
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", lambda url, timeout: _FakeResponse(200))
+    _install_fake_psutil(monkeypatch, {123: [_FakeConn("LISTEN", 9999)]})  # wrong port
+    assert tray_main._health_probe(123) is False
+
+
+def test_health_probe_skips_pid_check_when_http_already_failed(monkeypatch):
+    """No point cross-checking identity against a server that isn't even
+    responding -- and this must not touch psutil at all in that case."""
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", lambda url, timeout: _FakeResponse(503))
+    psutil_calls = []
+    monkeypatch.setitem(
+        sys.modules, "psutil",
+        mock.MagicMock(Process=lambda pid: psutil_calls.append(pid) or mock.MagicMock()),
+    )
+    assert tray_main._health_probe(123) is False
+    assert psutil_calls == []
+
+
+def test_build_runner_wires_a_pid_cross_checking_health_probe(monkeypatch):
+    """_build_runner's health_probe must be a closure bound to the SAME
+    runner it returns, not the bare module-level _health_probe -- otherwise
+    there is nothing for _expected_pid to read the live handle from."""
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", lambda url, timeout: _FakeResponse(200))
+    runner = tray_main._build_runner()
+    assert runner.health_probe is not tray_main._health_probe
+    _install_fake_psutil(monkeypatch, {})  # no live handle yet -- degrades to HTTP-only via None pid
+    assert runner.health_probe() is True
+
+
+# ---------------------------------------------------------------------------
 # _icon_image_path -- frozen (bundled under _MEIPASS) vs. source (static/)
 # ---------------------------------------------------------------------------
 
