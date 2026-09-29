@@ -760,6 +760,88 @@ add("G16_subagent_worktree_canonical", "SubagentStart", {"session_id": "s", "hoo
 add("G16_subagent_unindexed", "SubagentStart", {"session_id": "s", "hook_event_name": "SubagentStart", "cwd": LATEX}, "inject", "G16",
     contains=["no codebase-memory index covers"])
 
+# ---------------------------------------------------------------- G17 (cold-cache guard)
+# SessionStart-only (Claude Code has no UserPromptSubmit hook wired here): warns once when
+# either (a) the transcript's tail shows the last assistant turn idle > 55 min with > 300K
+# context tokens, or (b) the model on the last turn differs from the one before it, with
+# > 300K tokens now (warned once per switch via state.cold_cache_switch_warned).
+OPUS = "claude-opus-5"
+SONNET = "claude-sonnet-5"
+
+
+def aline(ts_iso, model, input_tokens, cache_creation, cache_read, output_tokens=50):
+    obj = {
+        "type": "assistant", "timestamp": ts_iso,
+        "message": {"model": model, "usage": {
+            "input_tokens": input_tokens, "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read, "output_tokens": output_tokens,
+        }},
+    }
+    return json.dumps(obj)
+
+
+def transcript(*lines):
+    return "\n".join(lines) + "\n"
+
+
+TS_IDLE = "2026-09-26T18:59:00Z"      # 61 min before NOW (2026-09-26T20:00:00Z)
+TS_RECENT = "2026-09-26T19:55:00Z"    # 5 min before NOW
+T_IDLE_LARGE = transcript(aline(TS_IDLE, SONNET, 500, 2500, 302000))       # 305000 tokens
+T_IDLE_SMALL = transcript(aline(TS_IDLE, SONNET, 500, 1000, 8500))         # 10000 tokens
+T_RECENT_LARGE = transcript(aline(TS_RECENT, SONNET, 500, 2500, 302000))   # 305000 tokens, not idle
+T_MALFORMED = "not json at all\n{\"also\": \"not closed\"\n\n"
+
+TS_A1, TS_A2, TS_SWITCH = "2026-09-26T18:00:00Z", "2026-09-26T18:30:00Z", "2026-09-26T19:00:00Z"
+TS_LAST_RECENT = "2026-09-26T19:58:00Z"  # 2 min before NOW: the switch fires, idle does not
+T_SWITCH = transcript(
+    aline(TS_A1, OPUS, 500, 1000, 98500),          # 100000 tokens
+    aline(TS_A2, OPUS, 500, 2000, 147500),         # 150000 tokens
+    aline(TS_SWITCH, SONNET, 500, 2000, 197500),   # 200000 tokens: first sonnet turn
+    aline(TS_LAST_RECENT, SONNET, 500, 2500, 307000),  # 310000 tokens: latest turn
+)
+T_SWITCH_AND_IDLE = transcript(
+    aline(TS_A1, OPUS, 500, 1000, 98500),
+    aline(TS_A2, OPUS, 500, 2000, 147500),
+    aline(TS_SWITCH, SONNET, 500, 2000, 197500),
+    aline(TS_IDLE, SONNET, 500, 2500, 302000),     # 305000 tokens, also 61 min idle
+)
+SWITCH_SIG = f"{OPUS}->{SONNET}@{ep(TS_SWITCH)}"
+
+
+def g17p(transcript_path=None, sid="g17"):
+    p = {"session_id": sid, "hook_event_name": "SessionStart", "source": "resume", "cwd": REPO_BS}
+    if transcript_path is not None:
+        p["transcript_path"] = transcript_path
+    return p
+
+
+add("G17_idle_large_context_warns", "SessionStart", g17p(PROJ + "/g17-idle-large.jsonl"), "inject", "G17",
+    fs_overlay={"files": {PROJ + "/g17-idle-large.jsonl": T_IDLE_LARGE}},
+    contains=["G17:", "idle about 61 min", "roughly 305K tokens", "cache-write rewrite", "/compact or /clear",
+              "[Meridian guard brief]"])
+add("G17_idle_but_small_context_no_warn", "SessionStart", g17p(PROJ + "/g17-idle-small.jsonl"), "inject", "G15",
+    fs_overlay={"files": {PROJ + "/g17-idle-small.jsonl": T_IDLE_SMALL}},
+    note="idle past the threshold, but under 300K tokens: no warning")
+add("G17_large_context_but_recent_no_warn", "SessionStart", g17p(PROJ + "/g17-recent-large.jsonl"), "inject", "G15",
+    fs_overlay={"files": {PROJ + "/g17-recent-large.jsonl": T_RECENT_LARGE}},
+    note="over 300K tokens, but only 5 min idle: no warning")
+add("G17_model_switch_warns", "SessionStart", g17p(PROJ + "/g17-switch.jsonl"), "inject", "G17",
+    fs_overlay={"files": {PROJ + "/g17-switch.jsonl": T_SWITCH}},
+    contains=["G17:", f"model switched from {OPUS} to {SONNET}", "roughly 310K tokens", "one-time notice"])
+add("G17_model_switch_already_warned_no_repeat", "SessionStart", g17p(PROJ + "/g17-switch.jsonl"), "inject", "G15",
+    fs_overlay={"files": {PROJ + "/g17-switch.jsonl": T_SWITCH}}, state={"cold_cache_switch_warned": SWITCH_SIG},
+    note="the exact same switch was already warned about in an earlier SessionStart: no repeat")
+add("G17_idle_and_switch_join", "SessionStart", g17p(PROJ + "/g17-both.jsonl"), "inject", "G17",
+    fs_overlay={"files": {PROJ + "/g17-both.jsonl": T_SWITCH_AND_IDLE}},
+    contains=["idle about 61 min", f"model switched from {OPUS} to {SONNET}"],
+    note="both triggers on one call: messages are joined, not one silently dropped")
+add("G17_disabled_env_still_gives_g15", "SessionStart", g17p(PROJ + "/g17-idle-large-2.jsonl"), "inject", "G15",
+    env={"MERIDIAN_GUARD_DISABLE": "G17"}, fs_overlay={"files": {PROJ + "/g17-idle-large-2.jsonl": T_IDLE_LARGE}})
+add("G17_no_transcript_path_no_warn", "SessionStart", g17p(None), "inject", "G15")
+add("G17_transcript_file_missing_no_warn", "SessionStart", g17p(PROJ + "/g17-nowhere.jsonl"), "inject", "G15")
+add("G17_transcript_malformed_lines_no_warn", "SessionStart", g17p(PROJ + "/g17-malformed.jsonl"), "inject", "G15",
+    fs_overlay={"files": {PROJ + "/g17-malformed.jsonl": T_MALFORMED}})
+
 # ---------------------------------------------------------------- escapes + breaker
 add("escape_identical_retry_still_denied", PRE, D1, "deny", "G1", state={"denies": 1})
 add("escape_consult_receipt_allows", PRE, D1, "allow", "G1", state={"denies": 1, "code_receipts": [[NOW - 120, True, SLUG_M]]},
@@ -852,12 +934,12 @@ DOC = {
                    "`fs_overlay` (same shape) is merged on top for that case only."),
         "state": "Per-session guard state (see guard_core docstring); absent means empty.",
         "expected_decision": "allow | deny | ask | inject",
-        "expected_rule": "Short rule id (G0..G16) or null for an unattributed allow.",
+        "expected_rule": "Short rule id (G0..G17) or null for an unattributed allow.",
         "expected_project": "When present, the winning codebase-memory project the result must name.",
         "expected_reason_contains": "Substrings the reason text must contain.",
         "expected_reason_excludes": "Substrings the reason text must NOT contain.",
         "source": "replay-2026-09-26 = real calls made in the owner's session; rule = synthetic rule coverage.",
-        "group": "Rule family (G0..G16, escape, breaker, malformed, replay); used by coverage assertions.",
+        "group": "Rule family (G0..G17, escape, breaker, malformed, replay); used by coverage assertions.",
         "path_roots": ("Every absolute path in this file lives under one of `path_roots`. A shim harness that has to "
                        "run against a real temp filesystem may relocate each root by a case-insensitive, "
                        "separator-insensitive prefix rewrite applied uniformly to payloads, env, snapshots, "
@@ -868,8 +950,9 @@ DOC = {
                              "receipt windows are also measured from `now`. `filesystems[*].mtimes` carries the "
                              "db mtimes a harness must reproduce (e.g. with os.utime)."),
         "state_shape": ("{v, denies, code_receipts:[[ts, ok, project|null]], research_receipts:[[ts, ok]], "
-                        "capture_receipts:[ts], degraded_until, advisory_seen:{root_key: ts}, web_reminder_at}; "
-                        "missing keys default to empty/0."),
+                        "capture_receipts:[ts], degraded_until, advisory_seen:{root_key: ts}, web_reminder_at, "
+                        "cold_cache_switch_warned:'prev_model->cur_model@switch_ts'|''}; missing keys default "
+                        "to empty/0."),
         "output_mapping": ("deny/ask => PreToolUse hookSpecificOutput.permissionDecision + permissionDecisionReason; "
                            "inject => hookSpecificOutput.additionalContext; allow => no stdout. Exit code is always 0."),
     },

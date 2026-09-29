@@ -188,6 +188,9 @@ def test_realfs_probe(tmp_path):
     assert fs.kind(None) is None  # type: ignore[arg-type]
     assert fs.read_text(str(f), 5) == "hello"
     assert fs.read_text(str(tmp_path / "nope")) is None
+    assert fs.read_tail(str(f), 5) == "world"
+    assert fs.read_tail(str(f), 1000) == "hello world", "a limit bigger than the file returns it all"
+    assert fs.read_tail(str(tmp_path / "nope")) is None
     assert fs.mtime(str(f)) == pytest.approx(f.stat().st_mtime)
     assert fs.mtime(str(tmp_path / "nope")) is None
 
@@ -198,6 +201,7 @@ def test_dictfs_probe():
     assert fs.kind("c:\\A\\B") == "dir" and fs.kind("C:/") == "dir" and fs.kind("C:/z") == "dir"
     assert fs.kind("C:/a/F.TXT") == "file" and fs.kind("C:/nope") is None and fs.kind("") is None
     assert fs.read_text("C:/a/f.txt", 2) == "ab" and fs.read_text("C:/a/n.bin") is None and fs.read_text("") is None
+    assert fs.read_tail("C:/a/f.txt", 2) == "bc" and fs.read_tail("C:/a/n.bin") is None and fs.read_tail("") is None
     assert fs.mtime("c:/a/f.txt") == 10.0 and fs.mtime("C:/a/bad") is None and fs.mtime("") is None
     assert DictFS("not a dict").kind("C:/") is None  # type: ignore[arg-type]
 

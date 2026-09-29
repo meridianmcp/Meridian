@@ -347,6 +347,9 @@ class FsProbe(Protocol):
     def read_text(self, path: str, limit: int = 65536) -> str | None:
         ...
 
+    def read_tail(self, path: str, limit: int = 65536) -> str | None:
+        ...
+
     def mtime(self, path: str) -> float | None:
         ...
 
@@ -369,6 +372,24 @@ class RealFS:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 return fh.read(limit)
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def read_tail(self, path: str, limit: int = 65536) -> str | None:
+        """Last ``limit`` bytes of a text file, decoded as UTF-8 (never raises).
+
+        Used by the guard's G17 cold-cache check to look at the most recent
+        transcript entries without reading a whole (potentially huge)
+        transcript from the front. A read that starts mid-line may drop a
+        partial first line; callers already skip lines that fail to parse.
+        """
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - limit) if limit > 0 else size)
+                data = fh.read()
+            return data.decode("utf-8", errors="replace")
         except (OSError, ValueError, TypeError):
             return None
 
@@ -442,6 +463,15 @@ class DictFS:
             return None
         v = self._files.get(n.lower())
         return v[:limit] if isinstance(v, str) else None
+
+    def read_tail(self, path: str, limit: int = 65536) -> str | None:
+        n = norm_path(path)
+        if not n:
+            return None
+        v = self._files.get(n.lower())
+        if not isinstance(v, str):
+            return None
+        return v[-limit:] if limit > 0 else ""
 
     def mtime(self, path: str) -> float | None:
         n = norm_path(path)
