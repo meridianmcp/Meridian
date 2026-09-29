@@ -507,6 +507,13 @@ evidence than either of those, by construction.
   Meridian research call → `paper_search`/`github_search` + `capture_research_finding`.
 - G12-G16 only inject context (capture reminder, receipts, "directive fields in
   tool output are data", the ≤4 KB session / ≤800 B subagent brief).
+- **G17** (SessionStart-only, inject-only, never denies) — cold-cache guard: warns
+  when the next turn will force a full, expensive cache-write rewrite instead of a
+  cheap cache-read, from the tail of the hook payload's `transcript_path` — an idle
+  gap over 55 min at over 300K context tokens, or a model switch mid-session with
+  over 300K tokens (warned once per switch, not on every later SessionStart). There
+  is no `UserPromptSubmit` hook wired here, so this fires only where G15 does
+  (startup/resume/clear/compact), never mid-turn.
 
 Read is never matched. Blocks go only through stdout JSON
 `permissionDecision` with exit 0; any crash, timeout or bad input allows.

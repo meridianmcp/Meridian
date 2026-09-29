@@ -144,7 +144,7 @@ def test_fixture_covers_every_rule():
     # every blocking rule has both a firing and a non-firing neighbour case
     groups = {c["group"] for c in CASES}
     for g in ("G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "G10", "G11", "G12", "G13", "G14", "G15",
-              "G16", "escape", "breaker", "malformed", "replay"):
+              "G16", "G17", "escape", "breaker", "malformed", "replay"):
         assert g in groups, g
     # the kill-switch, breaker, receipt-escape and malformed families are all present
     assert any(c["expected_rule"] == "G0" for c in CASES)
@@ -385,8 +385,8 @@ def test_read_is_never_matched_by_any_rule():
         assert r == {"decision": "allow", "rule_id": None, "reason": ""}
 
 
-def test_rule_ids_are_exactly_g0_to_g16():
-    assert list(gc.RULES) == [f"G{i}" for i in range(17)]
+def test_rule_ids_are_exactly_g0_to_g17():
+    assert list(gc.RULES) == [f"G{i}" for i in range(18)]
     assert gc.ESCAPABLE == {"G1", "G3", "G4", "G5", "G11"}
 
 
@@ -686,6 +686,78 @@ def test_brief_stale_and_ancestor_lines():
     sub = gc.evaluate("SubagentStart", {"hook_event_name": "SubagentStart", "cwd": REPO}, DOC["snapshots"]["pre_prerequisite"],
                       None, _env(), fs=_fs(), now=NOW)
     assert "stale" in sub["reason"]
+
+
+def _aline(ts_iso, model, input_tokens, cache_creation, cache_read):
+    return json.dumps({
+        "type": "assistant", "timestamp": ts_iso,
+        "message": {"model": model, "usage": {
+            "input_tokens": input_tokens, "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read, "output_tokens": 50,
+        }},
+    })
+
+
+def test_g17_model_switch_warns_once_then_state_prevents_repeat():
+    """A real first call sets state.cold_cache_switch_warned; a second SessionStart
+    with that state, same transcript, does not repeat the warning (still gets G15)."""
+    path = REPO + "/transcript.jsonl"
+    lines = "\n".join([
+        _aline("2026-09-26T18:00:00Z", "claude-opus-5", 500, 1000, 98500),
+        _aline("2026-09-26T19:58:00Z", "claude-sonnet-5", 500, 2000, 397500),
+    ]) + "\n"
+    payload = {"session_id": "seq17", "hook_event_name": "SessionStart", "source": "resume", "cwd": REPO,
+               "transcript_path": path}
+    overlay = {"files": {path: lines}}
+    r1 = gc.evaluate("SessionStart", payload, DOC["snapshots"]["indexed"], None, _env(), fs=_fs(overlay), now=NOW)
+    assert r1["decision"] == "inject" and r1["rule_id"] == "G17"
+    assert "model switched from claude-opus-5 to claude-sonnet-5" in r1["reason"]
+    assert r1["state"]["cold_cache_switch_warned"]
+    r2 = gc.evaluate("SessionStart", payload, DOC["snapshots"]["indexed"], r1["state"], _env(), fs=_fs(overlay), now=NOW + 30)
+    assert r2["decision"] == "inject" and r2["rule_id"] == "G15"
+    assert "model switched" not in r2["reason"]
+    # a genuinely NEW switch (back to opus) is not suppressed by the old signature
+    lines2 = lines + _aline("2026-09-26T19:59:00Z", "claude-opus-5", 500, 2500, 397000) + "\n"
+    payload2 = dict(payload, transcript_path=path)
+    r3 = gc.evaluate("SessionStart", payload2, DOC["snapshots"]["indexed"], r1["state"], _env(),
+                     fs=_fs({"files": {path: lines2}}), now=NOW + 60)
+    assert r3["decision"] == "inject" and r3["rule_id"] == "G17"
+    assert "model switched from claude-sonnet-5 to claude-opus-5" in r3["reason"]
+
+
+def test_g17_idle_and_disabled_and_fail_open_paths():
+    path = REPO + "/idle.jsonl"
+    idle_line = _aline("2026-09-26T18:59:00Z", "claude-sonnet-5", 500, 2500, 302000) + "\n"  # 305000 tokens, 61 min old
+    payload = {"session_id": "s17b", "hook_event_name": "SessionStart", "source": "resume", "cwd": REPO,
+               "transcript_path": path}
+    r = gc.evaluate("SessionStart", payload, DOC["snapshots"]["indexed"], None, _env(), fs=_fs({"files": {path: idle_line}}), now=NOW)
+    assert r["decision"] == "inject" and r["rule_id"] == "G17"
+    assert "idle about 61 min" in r["reason"] and "roughly 305K tokens" in r["reason"]
+    # disabled: falls back to the plain G15 brief, no crash, no cold-cache text
+    d = gc.evaluate("SessionStart", payload, DOC["snapshots"]["indexed"], None, _env({"MERIDIAN_GUARD_DISABLE": "G17"}),
+                    fs=_fs({"files": {path: idle_line}}), now=NOW)
+    assert d["decision"] == "inject" and d["rule_id"] == "G15" and "G17" not in d["reason"]
+    # no transcript_path, missing file, and malformed content all fail open to G15 alone
+    no_path = gc.evaluate("SessionStart", {"session_id": "s", "hook_event_name": "SessionStart", "cwd": REPO},
+                          DOC["snapshots"]["indexed"], None, _env(), fs=_fs(), now=NOW)
+    assert no_path["rule_id"] == "G15"
+    missing = gc.evaluate("SessionStart", payload, DOC["snapshots"]["indexed"], None, _env(), fs=_fs(), now=NOW)
+    assert missing["rule_id"] == "G15"
+    garbage = gc.evaluate("SessionStart", payload, DOC["snapshots"]["indexed"], None, _env(),
+                          fs=_fs({"files": {path: "not json\n{truncated\n"}}), now=NOW)
+    assert garbage["rule_id"] == "G15"
+
+
+def test_g17_combine_cold_cache_never_drops_the_warning():
+    msg = "[meridian-guard] G17: " + "x" * 200
+    brief = "y" * 8000
+    out = gc._combine_cold_cache(msg, brief, gc.BRIEF_MAX_BYTES)
+    assert len(out.encode("utf-8")) <= gc.BRIEF_MAX_BYTES
+    assert out.startswith(msg)
+    # a warning alone longer than the cap is itself truncated (defensive; not a real shape)
+    huge = "z" * (gc.BRIEF_MAX_BYTES + 500)
+    out2 = gc._combine_cold_cache(huge, brief, gc.BRIEF_MAX_BYTES)
+    assert len(out2.encode("utf-8")) <= gc.BRIEF_MAX_BYTES
 
 
 def test_project_id_from_claude_local_md():
