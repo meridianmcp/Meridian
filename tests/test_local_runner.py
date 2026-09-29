@@ -273,6 +273,92 @@ def test_start_requires_a_command(state_dir):
 
 
 # ---------------------------------------------------------------------------
+# `detached` -- Windows Job Object KILL_ON_JOB_CLOSE opt-out (d397bb71)
+# ---------------------------------------------------------------------------
+
+
+def test_detached_false_by_default_requests_kill_on_job_close(state_dir, monkeypatch):
+    """The default (tray / programmatic) construction must be byte-for-byte
+    unchanged: kill_on_job_close=True is still requested from the default
+    backend."""
+    captured = {}
+
+    def fake_get_default_backend(**kwargs):
+        captured.update(kwargs)
+        return process_lifecycle.PosixProcessGroupBackend()
+
+    monkeypatch.setattr(process_lifecycle, "get_default_backend", fake_get_default_backend)
+    lr.LocalRunner("detached-default-scope", None, state_dir=state_dir, broker=None)
+    assert captured["kill_on_job_close"] is True
+
+
+def test_detached_true_requests_kill_on_job_close_disabled(state_dir, monkeypatch):
+    """A `detached=True` LocalRunner (the bare CLI start/restart path) must
+    build its default backend with kill_on_job_close=False -- see
+    LocalRunner.__init__'s own `detached` docstring for the full Windows
+    Job Object rationale (d397bb71)."""
+    captured = {}
+
+    def fake_get_default_backend(**kwargs):
+        captured.update(kwargs)
+        return process_lifecycle.PosixProcessGroupBackend()
+
+    monkeypatch.setattr(process_lifecycle, "get_default_backend", fake_get_default_backend)
+    runner = lr.LocalRunner(
+        "detached-true-scope", None, state_dir=state_dir, broker=None, detached=True,
+    )
+    assert captured["kill_on_job_close"] is False
+    assert runner.detached is True
+
+
+def test_detached_ignored_when_explicit_backend_supplied(state_dir):
+    """An explicitly-supplied backend (every test in this file, and any
+    caller with its own lifecycle backend) is never second-guessed by
+    `detached` -- matches `ensure_console_for_graceful_shutdown`'s own
+    documented no-op-for-explicit-backend contract."""
+    explicit_backend = process_lifecycle.PosixProcessGroupBackend()
+    runner = lr.LocalRunner(
+        "detached-explicit-scope", None, state_dir=state_dir, broker=None,
+        backend=explicit_backend, detached=True,
+    )
+    assert runner._backend is explicit_backend
+
+
+def test_cli_start_and_restart_build_detached_runner(state_dir, monkeypatch):
+    """main()'s `start`/`restart` subcommands must construct their
+    LocalRunner via `_runner_from_args(args, detached=True)` -- the whole
+    fix is worthless if the CLI entry point forgets to opt in. `status`/
+    `doctor`/`preflight` never spawn a persisting child from this call path,
+    so they must stay `False` (unaffected)."""
+    seen = []
+    real_runner_from_args = lr._runner_from_args
+
+    def spy(args, *, detached=False):
+        seen.append((args.command, detached))
+        return real_runner_from_args(args, detached=detached)
+
+    monkeypatch.setattr(lr, "_runner_from_args", spy)
+
+    state_dir_arg = str(state_dir / "detached_cli_state")
+    base = ["--state-dir", state_dir_arg]
+    sleep_cmd = ["--", sys.executable, "-c", "import time; time.sleep(30)"]
+    exit_cmd = ["--", sys.executable, "-c", "import sys; sys.exit(0)"]
+    try:
+        lr.main(base + ["start", "--scope", "detached-cli-scope"] + sleep_cmd)
+        lr.main(base + ["restart", "--scope", "detached-cli-scope"] + sleep_cmd)
+        lr.main(base + ["doctor", "--scope", "detached-cli-scope"] + exit_cmd)
+        lr.main(base + ["preflight", "--scope", "detached-cli-scope"] + exit_cmd)
+    finally:
+        lr.main(base + ["stop", "--scope", "detached-cli-scope"])
+
+    by_command = dict(seen)
+    assert by_command["start"] is True
+    assert by_command["restart"] is True
+    assert by_command["doctor"] is False
+    assert by_command["preflight"] is False
+
+
+# ---------------------------------------------------------------------------
 # Cross-process start() mutex -- TOCTOU race (2026-09-28 review finding #1a)
 # ---------------------------------------------------------------------------
 
@@ -1453,3 +1539,83 @@ def test_cli_module_invocation_via_subprocess(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["child"]["state"] == "not_started"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason=(
+        "d397bb71: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE handle-lifetime "
+        "semantics are Windows-only -- POSIX's start_new_session=True "
+        "already leaves a spawned child fully independent of its spawning "
+        "process, so there is no equivalent hazard to reproduce there."
+    ),
+)
+def test_cli_start_child_survives_bare_cli_process_exit(tmp_path):
+    """Regression test for d397bb71: a bare, fire-and-forget
+    ``python -m meridian.local_runner start ...`` CLI invocation must NOT
+    kill the child it just spawned once the CLI process itself exits.
+
+    This can only be observed at the OS-process level: the bug is that the
+    Windows Job Object the CLI process creates has
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, and the CLI process is the ONLY
+    process holding a handle to it -- when that process exits, the OS
+    closes its last handle to the job, and KILL_ON_JOB_CLOSE then
+    terminates every process still assigned to it, including the child that
+    was spawned specifically to keep running in the background. A
+    same-process unit test cannot observe this at all (nothing here ever
+    calls Python's own process-exit path); this launches the real CLI
+    entry point as a genuine OS child process via ``subprocess.run``, waits
+    for THAT process to fully exit, then checks -- from this completely
+    separate test process -- whether the grandchild it spawned is still
+    alive well afterward."""
+    state_dir_arg = str(tmp_path / "cli_survive_state")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(lr.__file__)))
+    scope = "cli-survive-scope"
+    grandchild_pid = None
+    try:
+        cli = subprocess.run(
+            [
+                sys.executable, "-m", "meridian.local_runner",
+                "--state-dir", state_dir_arg,
+                "start", "--scope", scope,
+                "--", sys.executable, "-c", "import time; time.sleep(30)",
+            ],
+            capture_output=True, text=True, check=False, cwd=repo_root, timeout=30,
+        )
+        # The subprocess.run() call above only returns once the CLI process
+        # (the one that owned the Job Object handle) has FULLY exited -- if
+        # the bug is present, the OS will already have torn the grandchild
+        # down as part of that very exit, before we ever get here.
+        assert cli.returncode == 0, cli.stderr
+        payload = json.loads(cli.stdout)
+        assert payload["child"]["state"] == "running", payload
+        grandchild_pid = payload["child"]["pid"]
+
+        assert _pid_alive(grandchild_pid), (
+            "the grandchild the CLI `start` invocation spawned was killed "
+            "when the fire-and-forget CLI process itself exited -- "
+            "KILL_ON_JOB_CLOSE fired on the CLI's own (last) Job Object "
+            "handle closing, defeating `start`'s entire fire-and-forget "
+            "purpose (d397bb71)"
+        )
+        # A delayed-but-eventual teardown would still be the same bug --
+        # re-check after a beat so a race with an async kill can't mask it.
+        time.sleep(1.0)
+        assert _pid_alive(grandchild_pid)
+    finally:
+        # Clean up via the runner's own `stop`, with a hard psutil fallback
+        # -- this test must never leave a real subprocess behind, even on
+        # assertion failure (matches this file's own isolation contract).
+        subprocess.run(
+            [
+                sys.executable, "-m", "meridian.local_runner",
+                "--state-dir", state_dir_arg, "stop", "--scope", scope,
+            ],
+            capture_output=True, text=True, check=False, cwd=repo_root, timeout=30,
+        )
+        if grandchild_pid is not None and _pid_alive(grandchild_pid):
+            try:
+                import psutil  # type: ignore
+                psutil.Process(grandchild_pid).kill()
+            except Exception:  # noqa: BLE001
+                pass

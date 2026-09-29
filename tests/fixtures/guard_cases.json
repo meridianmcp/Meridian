@@ -7,15 +7,15 @@
   "fs_key": "Key into `filesystems`, a virtual filesystem: `dirs` (every ancestor is implicitly a dir), `files` (path -> content or null) and `mtimes` (path -> epoch seconds). Lookups are case-insensitive. `fs_overlay` (same shape) is merged on top for that case only.",
   "state": "Per-session guard state (see guard_core docstring); absent means empty.",
   "expected_decision": "allow | deny | ask | inject",
-  "expected_rule": "Short rule id (G0..G16) or null for an unattributed allow.",
+  "expected_rule": "Short rule id (G0..G17) or null for an unattributed allow.",
   "expected_project": "When present, the winning codebase-memory project the result must name.",
   "expected_reason_contains": "Substrings the reason text must contain.",
   "expected_reason_excludes": "Substrings the reason text must NOT contain.",
   "source": "replay-2026-09-26 = real calls made in the owner's session; rule = synthetic rule coverage.",
-  "group": "Rule family (G0..G16, escape, breaker, malformed, replay); used by coverage assertions.",
+  "group": "Rule family (G0..G17, escape, breaker, malformed, replay); used by coverage assertions.",
   "path_roots": "Every absolute path in this file lives under one of `path_roots`. A shim harness that has to run against a real temp filesystem may relocate each root by a case-insensitive, separator-insensitive prefix rewrite applied uniformly to payloads, env, snapshots, filesystems and expected_reason_* strings. Project names never contain paths, and slug_match is precomputed in the snapshot rows, so decisions, rules and expected_project are invariant under that rewrite.",
   "clock_and_mtimes": "Freshness = max(indexed_epoch, mtime(db), mtime(db-wal)) within 7 days of `now`; receipt windows are also measured from `now`. `filesystems[*].mtimes` carries the db mtimes a harness must reproduce (e.g. with os.utime).",
-  "state_shape": "{v, denies, code_receipts:[[ts, ok, project|null]], research_receipts:[[ts, ok]], capture_receipts:[ts], degraded_until, advisory_seen:{root_key: ts}, web_reminder_at}; missing keys default to empty/0.",
+  "state_shape": "{v, denies, code_receipts:[[ts, ok, project|null]], research_receipts:[[ts, ok]], capture_receipts:[ts], degraded_until, advisory_seen:{root_key: ts}, web_reminder_at, cold_cache_switch_warned:'prev_model->cur_model@switch_ts'|''}; missing keys default to empty/0.",
   "output_mapping": "deny/ask => PreToolUse hookSpecificOutput.permissionDecision + permissionDecisionReason; inject => hookSpecificOutput.additionalContext; allow => no stdout. Exit code is always 0."
  },
  "path_roots": [
@@ -12988,6 +12988,252 @@
    "expected_reason_contains": [
     "no codebase-memory index covers"
    ]
+  },
+  {
+   "name": "G17_idle_large_context_warns",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-idle-large.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G17",
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-idle-large.jsonl": "{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:59:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2500, \"cache_read_input_tokens\": 302000, \"output_tokens\": 50}}}\n"
+    }
+   },
+   "expected_reason_contains": [
+    "G17:",
+    "idle about 61 min",
+    "roughly 305K tokens",
+    "cache-write rewrite",
+    "/compact or /clear",
+    "[Meridian guard brief]"
+   ]
+  },
+  {
+   "name": "G17_idle_but_small_context_no_warn",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-idle-small.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G15",
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-idle-small.jsonl": "{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:59:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 1000, \"cache_read_input_tokens\": 8500, \"output_tokens\": 50}}}\n"
+    }
+   },
+   "note": "idle past the threshold, but under 300K tokens: no warning"
+  },
+  {
+   "name": "G17_large_context_but_recent_no_warn",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-recent-large.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G15",
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-recent-large.jsonl": "{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T19:55:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2500, \"cache_read_input_tokens\": 302000, \"output_tokens\": 50}}}\n"
+    }
+   },
+   "note": "over 300K tokens, but only 5 min idle: no warning"
+  },
+  {
+   "name": "G17_model_switch_warns",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-switch.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G17",
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-switch.jsonl": "{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:00:00Z\", \"message\": {\"model\": \"claude-opus-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 1000, \"cache_read_input_tokens\": 98500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:30:00Z\", \"message\": {\"model\": \"claude-opus-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2000, \"cache_read_input_tokens\": 147500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T19:00:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2000, \"cache_read_input_tokens\": 197500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T19:58:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2500, \"cache_read_input_tokens\": 307000, \"output_tokens\": 50}}}\n"
+    }
+   },
+   "expected_reason_contains": [
+    "G17:",
+    "model switched from claude-opus-5 to claude-sonnet-5",
+    "roughly 310K tokens",
+    "one-time notice"
+   ]
+  },
+  {
+   "name": "G17_model_switch_already_warned_no_repeat",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-switch.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G15",
+   "state": {
+    "cold_cache_switch_warned": "claude-opus-5->claude-sonnet-5@1790449200"
+   },
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-switch.jsonl": "{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:00:00Z\", \"message\": {\"model\": \"claude-opus-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 1000, \"cache_read_input_tokens\": 98500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:30:00Z\", \"message\": {\"model\": \"claude-opus-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2000, \"cache_read_input_tokens\": 147500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T19:00:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2000, \"cache_read_input_tokens\": 197500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T19:58:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2500, \"cache_read_input_tokens\": 307000, \"output_tokens\": 50}}}\n"
+    }
+   },
+   "note": "the exact same switch was already warned about in an earlier SessionStart: no repeat"
+  },
+  {
+   "name": "G17_idle_and_switch_join",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-both.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G17",
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-both.jsonl": "{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:00:00Z\", \"message\": {\"model\": \"claude-opus-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 1000, \"cache_read_input_tokens\": 98500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:30:00Z\", \"message\": {\"model\": \"claude-opus-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2000, \"cache_read_input_tokens\": 147500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T19:00:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2000, \"cache_read_input_tokens\": 197500, \"output_tokens\": 50}}}\n{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:59:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2500, \"cache_read_input_tokens\": 302000, \"output_tokens\": 50}}}\n"
+    }
+   },
+   "expected_reason_contains": [
+    "idle about 61 min",
+    "model switched from claude-opus-5 to claude-sonnet-5"
+   ],
+   "note": "both triggers on one call: messages are joined, not one silently dropped"
+  },
+  {
+   "name": "G17_disabled_env_still_gives_g15",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-idle-large-2.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {
+    "MERIDIAN_GUARD_DISABLE": "G17"
+   },
+   "expected_decision": "inject",
+   "expected_rule": "G15",
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-idle-large-2.jsonl": "{\"type\": \"assistant\", \"timestamp\": \"2026-09-26T18:59:00Z\", \"message\": {\"model\": \"claude-sonnet-5\", \"usage\": {\"input_tokens\": 500, \"cache_creation_input_tokens\": 2500, \"cache_read_input_tokens\": 302000, \"output_tokens\": 50}}}\n"
+    }
+   }
+  },
+  {
+   "name": "G17_no_transcript_path_no_warn",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G15"
+  },
+  {
+   "name": "G17_transcript_file_missing_no_warn",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-nowhere.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G15"
+  },
+  {
+   "name": "G17_transcript_malformed_lines_no_warn",
+   "group": "G17",
+   "source": "rule",
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "g17",
+    "hook_event_name": "SessionStart",
+    "source": "resume",
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository",
+    "transcript_path": "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-malformed.jsonl"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "inject",
+   "expected_rule": "G15",
+   "fs_overlay": {
+    "files": {
+     "C:/Users/13144/.claude/projects/C--Users-13144-Documents-Meridian-repository/g17-malformed.jsonl": "not json at all\n{\"also\": \"not closed\"\n\n"
+    }
+   }
   },
   {
    "name": "escape_identical_retry_still_denied",

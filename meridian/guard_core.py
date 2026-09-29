@@ -6,7 +6,7 @@ decisions. Entry point::
 
     evaluate(event, payload, snapshot, state, env, *, fs=None, now=None)
         -> {"decision": "allow"|"deny"|"ask"|"inject",
-            "rule_id": "G0".."G16" | None, "reason": str, ...}
+            "rule_id": "G0".."G17" | None, "reason": str, ...}
 
 ``evaluate`` never raises: any internal error yields ``allow`` (fail open).
 When the per-session ``state`` changes, the result carries the full new state
@@ -41,6 +41,24 @@ defaults to ENFORCE, including G1/G3/G11)::
   G14 directive quarantine   PostToolUse inject on execution directives / >60K output
   G15 session brief          SessionStart inject, <= 4096 bytes
   G16 subagent brief         SubagentStart inject, <= 800 bytes
+  G17 cold-cache guard       SessionStart inject-only (never denies); warns when the next
+                             turn will force a full cache-write rewrite instead of a cheap
+                             cache-read. Two triggers, computed from the tail of the hook
+                             payload's transcript_path (JSONL): (a) idle gap since the last
+                             assistant turn > COLD_CACHE_IDLE_S (55 min) AND current context
+                             > COLD_CACHE_CONTEXT_TOKENS (300K tokens); (b) the model named on
+                             the most recent assistant turn differs from the one before it,
+                             with > 300K tokens of context at the switch -- warned once per
+                             switch (see "cold_cache_switch_warned" in state below), not on
+                             every later SessionStart. NOTE: Claude Code has no UserPromptSubmit
+                             hook wired in .claude/settings.json (and it is not in EVENTS
+                             below), so this fires only where G15 already does -- SessionStart
+                             (startup/resume/clear/compact) -- and never mid-turn. Missing or
+                             unparsable transcript data means no warning (fail open, like every
+                             other rule here). When it fires, its message is combined with the
+                             G15 brief text (G17's warning first, byte-truncated to the same
+                             4096-byte cap) and reported as rule_id "G17"; otherwise G15 alone
+                             is reported exactly as before.
 
 Escapes (G1/G3/G4/G5/G11 only -- G6..G10 are pure path/verb matches with NO
 escape): a code-intel receipt (any codebase-memory / Serena find_* /
@@ -70,7 +88,8 @@ State (per Claude Code session, the shim stores it at
    "code_receipts": [[ts, ok, project_or_null], ...],   # last 20
    "research_receipts": [[ts, ok], ...],                # last 10
    "capture_receipts": [ts, ...],                       # last 10
-   "degraded_until": ts, "advisory_seen": {root_key: ts}, "web_reminder_at": ts}
+   "degraded_until": ts, "advisory_seen": {root_key: ts}, "web_reminder_at": ts,
+   "cold_cache_switch_warned": "prev_model->cur_model@switch_ts" | ""}  # G17, see above
 
 Hook output mapping (:func:`render_output`): ``deny``/``ask`` ->
 ``{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision":
@@ -85,6 +104,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
@@ -113,6 +133,7 @@ RULES: dict[str, str] = {
     "G14": "G14-directive-quarantine",
     "G15": "G15-session-brief",
     "G16": "G16-subagent-brief",
+    "G17": "G17-cold-cache-guard",
 }
 DECISIONS = ("allow", "deny", "ask", "inject")
 EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "SubagentStart")
@@ -139,6 +160,15 @@ OVERSIZE_CHARS = 60000
 BRIEF_MAX_BYTES = 4096
 SUBAGENT_BRIEF_MAX_BYTES = 800
 NAMED_FILES_MAX = 3
+# G17 cold-cache guard (2026-09-29 usage audit: 20 cold main-loop requests rewrote ~7.7M
+# tokens at 1h cache-write price for ~$47, vs ~$2 warm; 15/20 followed a >60min idle gap,
+# 6/20 a model switch). Thresholds below are intentionally a bit tighter than the audit's
+# observed 60 min / not-quantified context size, so the warning lands before the expensive
+# turn rather than only explaining it after the fact.
+COLD_CACHE_IDLE_S = 55 * 60
+COLD_CACHE_CONTEXT_TOKENS = 300_000
+TRANSCRIPT_TAIL_BYTES = 200_000
+TRANSCRIPT_SCAN_LINES = 200
 # Shell analysis caps (G3/G7/G9). A command over either cap is not tokenized: G3
 # allows it, and G7/G9 deny only when the raw text names the auto-memory or guard
 # directory (split the command to get a precise decision). Unquoted words cost
@@ -1254,6 +1284,7 @@ def _norm_state(state: Any) -> dict[str, Any]:
     raw_seen = s.get("advisory_seen") if isinstance(s.get("advisory_seen"), dict) else {}
     seen = {k: float(v) for k, v in raw_seen.items() if isinstance(k, str) and isinstance(v, (int, float))}
     denies = s.get("denies")
+    switch_warned = s.get("cold_cache_switch_warned")
     return {
         "v": 1,
         "denies": int(denies) if isinstance(denies, int) and not isinstance(denies, bool) and denies >= 0 else 0,
@@ -1263,6 +1294,7 @@ def _norm_state(state: Any) -> dict[str, Any]:
         "degraded_until": _num(s.get("degraded_until")),
         "advisory_seen": seen,
         "web_reminder_at": _num(s.get("web_reminder_at")),
+        "cold_cache_switch_warned": switch_warned if isinstance(switch_warned, str) else "",
     }
 
 
@@ -2438,6 +2470,149 @@ def build_brief(ctx: _Ctx, kind: str, mode: str = "enforce") -> str:
 
 
 # ---------------------------------------------------------------------------
+# G17: cold-cache guard (SessionStart-only; advisory / inject-only, never denies)
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso_ts(v: Any) -> float | None:
+    """Epoch seconds from an ISO-8601 transcript timestamp, or a bare epoch number."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if not isinstance(v, str) or not v:
+        return None
+    s = v.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
+def _transcript_tail_entries(ctx: _Ctx, path: str) -> list[dict[str, Any]]:
+    """Best-effort assistant-turn facts from the tail of a transcript JSONL file.
+
+    Returns entries oldest to newest: ``[{"ts": epoch|None, "model": str|None,
+    "context_tokens": int|None}, ...]``. Reads at most TRANSCRIPT_TAIL_BYTES from
+    the END of the file (a transcript only ever grows, and G17 needs just the last
+    few turns) via ``fs.read_tail`` when the probe has it, else falls back to a
+    head read of the same file (only correct for a transcript smaller than the
+    cap, which every unit-test fixture is). Only the last TRANSCRIPT_SCAN_LINES
+    of that text are parsed. A line that is not a JSON object -- including a
+    partial first line cut off by the tail read -- is skipped; this never raises,
+    and [] (no data) means "no warning", same fail-open stance as every other rule.
+    """
+    reader = getattr(ctx.fs, "read_tail", None)
+    try:
+        text = reader(path, TRANSCRIPT_TAIL_BYTES) if reader else ctx.fs.read_text(path, TRANSCRIPT_TAIL_BYTES)
+    except Exception:
+        text = None
+    if not text:
+        return []
+    out: list[dict[str, Any]] = []
+    for raw_line in text.splitlines()[-TRANSCRIPT_SCAN_LINES:]:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        ts = _parse_iso_ts(obj.get("timestamp"))
+        model = msg.get("model") if isinstance(msg.get("model"), str) and msg.get("model") else None
+        tokens: int | None = None
+        usage = msg.get("usage")
+        if isinstance(usage, dict):
+            nums = [usage.get(k) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+            nums = [n for n in nums if isinstance(n, (int, float)) and not isinstance(n, bool)]
+            if nums:
+                tokens = int(sum(nums))
+        if ts is None and model is None and tokens is None:
+            continue
+        out.append({"ts": ts, "model": model, "context_tokens": tokens})
+    return out
+
+
+def _combine_cold_cache(msg: str, brief: str, limit: int) -> str:
+    """``msg`` (the G17 warning) then ``brief`` (the G15 text), bounded to ``limit``
+    UTF-8 bytes: the warning is never dropped, the brief is truncated first."""
+    msg_b = len(msg.encode("utf-8"))
+    if msg_b >= limit:
+        enc = msg.encode("utf-8")[: max(0, limit - 3)]
+        return enc.decode("utf-8", "ignore") + "..."
+    room = limit - msg_b - 1  # 1 byte for the joining newline
+    if room <= 0:
+        return msg
+    if len(brief.encode("utf-8")) <= room:
+        return msg + "\n" + brief
+    enc = brief.encode("utf-8")[: max(0, room - 3)]
+    return msg + "\n" + enc.decode("utf-8", "ignore") + "..."
+
+
+def _g17_cold_cache(ctx: _Ctx) -> tuple[str | None, bool]:
+    """G17 advisory text (or None), and whether it changed ``ctx.state`` in place.
+
+    Two independent triggers (see the module docstring's G17 entry); their
+    messages are space-joined when both fire on the same call. Any missing or
+    unparsable transcript data yields ``(None, False)`` -- fail open.
+    """
+    path = ctx.payload.get("transcript_path") if isinstance(ctx.payload, dict) else None
+    if not isinstance(path, str) or not path:
+        return None, False
+    try:
+        entries = _transcript_tail_entries(ctx, path)
+    except Exception:
+        entries = []
+    if not entries:
+        return None, False
+    msgs: list[str] = []
+    changed = False
+
+    last = entries[-1]
+    if last.get("ts") is not None and isinstance(last.get("context_tokens"), int):
+        idle = ctx.now - last["ts"]
+        if idle > COLD_CACHE_IDLE_S and last["context_tokens"] > COLD_CACHE_CONTEXT_TOKENS:
+            mins = int(idle // 60)
+            msgs.append(
+                "[meridian-guard] G17: this session has been idle about "
+                f"{mins} min with roughly {last['context_tokens'] // 1000}K tokens of existing "
+                "context. The next turn will force a full, expensive cache-write rewrite "
+                "instead of a cheap cache-read -- run /compact or /clear first."
+            )
+
+    with_model = [e for e in entries if e.get("model")]
+    if len(with_model) >= 2:
+        cur_model = with_model[-1]["model"]
+        prev_idx = next(
+            (i for i in range(len(with_model) - 2, -1, -1) if with_model[i]["model"] != cur_model), None
+        )
+        if prev_idx is not None:
+            prev_model = with_model[prev_idx]["model"]
+            switch_entry = with_model[prev_idx + 1]  # the first turn on the current model
+            cur_tokens = with_model[-1].get("context_tokens")
+            if isinstance(cur_tokens, int) and cur_tokens > COLD_CACHE_CONTEXT_TOKENS:
+                switch_ts = switch_entry.get("ts")
+                # int(): a stable, whole-second dedup key (sub-second precision buys nothing here).
+                sig = f"{prev_model}->{cur_model}@{int(switch_ts) if switch_ts is not None else 'na'}"
+                if ctx.state.get("cold_cache_switch_warned") != sig:
+                    msgs.append(
+                        f"[meridian-guard] G17: the model switched from {prev_model} to {cur_model} "
+                        f"mid-session with roughly {cur_tokens // 1000}K tokens of existing context. "
+                        "The first turn on the new model will force a full, expensive cache-write "
+                        "rewrite instead of a cheap cache-read (one-time notice for this switch)."
+                    )
+                    ctx.state["cold_cache_switch_warned"] = sig
+                    changed = True
+
+    return (" ".join(msgs) if msgs else None), changed
+
+
+# ---------------------------------------------------------------------------
 # Kill switch + top level
 # ---------------------------------------------------------------------------
 
@@ -2523,7 +2698,15 @@ def _evaluate(event: Any, payload: Any, snapshot: Any, state: Any, env: Any, fs:
     if ev == "SessionStart":
         if "G15" in disabled:
             return _allow("G15 disabled")
-        return _res("inject", "G15", build_brief(ctx, "session", mode))
+        brief = build_brief(ctx, "session", mode)
+        if "G17" not in disabled:
+            msg, changed = _g17_cold_cache(ctx)
+            if msg:
+                result = _res("inject", "G17", _combine_cold_cache(msg, brief, BRIEF_MAX_BYTES))
+                if changed:
+                    result["state"] = ctx.state
+                return result
+        return _res("inject", "G15", brief)
     if ev == "SubagentStart":
         if "G16" in disabled:
             return _allow("G16 disabled")
