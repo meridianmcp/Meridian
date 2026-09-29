@@ -40,7 +40,9 @@ macOS Gatekeeper will quarantine an unsigned downloaded .app (right-click ->
 Open bypasses it); that UX gap is tracked separately, not fixed by this spec.
 """
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 block_cipher = None
@@ -162,6 +164,24 @@ if _IS_MACOS:
         },
     )
 else:
+    # 2026-09-28 review finding #5/#22 (secondary part): runtime_tmpdir=None
+    # (the previous setting) means the PyInstaller bootloader extracts into
+    # a freshly-named _MEIxxxxxx dir under the OS-wide default temp root
+    # EVERY launch -- and since tray_main.py's --run-server self-relaunch
+    # means every tray launch already self-extracts TWICE (tray process +
+    # supervised child), a forcibly-killed child (whenever the new
+    # graceful-CTRL_BREAK path in process_lifecycle.py still has to fall
+    # back to TerminateJobObject) leaves its extraction dir behind forever,
+    # scattered among every OTHER unrelated app's temp files. Pointing
+    # runtime_tmpdir at a FIXED, Meridian-owned parent directory instead
+    # means every extraction -- successful or orphaned -- lands under ONE
+    # common, well-known location tray_main.py's own
+    # _sweep_stale_runtime_extractions() can safely sweep at startup
+    # (skipping only the CURRENT run's own sys._MEIPASS), without ever
+    # touching unrelated files elsewhere in the OS temp root.
+    _TRAY_RUNTIME_TMPDIR = os.path.join(
+        os.environ.get('LOCALAPPDATA') or tempfile.gettempdir(), 'meridian', 'tray_runtime',
+    )
     exe = EXE(
         pyz,
         a.scripts,
@@ -175,7 +195,7 @@ else:
         strip=False,
         upx=True,
         upx_exclude=[],
-        runtime_tmpdir=None,
+        runtime_tmpdir=_TRAY_RUNTIME_TMPDIR,
         # No console window -- this is a tray/GUI app, not a CLI tool. Errors
         # before the tray icon itself can show (e.g. a corrupt install) fall
         # back to tray_main.py's own tkinter error dialog rather than a

@@ -45,7 +45,9 @@ follow-up, not required for a working v1.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import shutil
 import sys
 import threading
 import urllib.error
@@ -74,6 +76,8 @@ from .local_runner import (
     LocalRunner,
     RunnerAlreadyRunningError,
 )
+
+_logger = logging.getLogger(__name__)
 
 SCOPE = "meridian-tray"
 _RUN_SERVER_FLAG = "--run-server"
@@ -151,6 +155,43 @@ def _build_runner() -> LocalRunner:
     )
 
 
+def _sweep_stale_runtime_extractions() -> None:
+    """2026-09-28 review finding #5/#22 (secondary part): best-effort sweep
+    of orphaned PyInstaller onefile extraction dirs left behind by a
+    forcibly-killed --run-server child (whenever the graceful-CTRL_BREAK
+    path in process_lifecycle.py still had to fall back to
+    TerminateJobObject). ``meridian-tray.spec`` now pins ``runtime_tmpdir``
+    to a FIXED, Meridian-owned directory (instead of the OS-wide default
+    temp root) specifically so this sweep can safely delete stale
+    ``_MEI*`` siblings without ever touching an unrelated app's temp files.
+
+    A no-op when not frozen (running from source has no ``sys._MEIPASS`` /
+    onefile extraction concept at all) and never raises -- a sweep failure
+    (e.g. a sibling still locked by a concurrently-running second tray
+    instance -- see this module's own "known limitation" docstring note)
+    must never prevent the tray itself from starting.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return
+    try:
+        current = Path(meipass).resolve()
+        runtime_tmpdir = current.parent
+        for sibling in runtime_tmpdir.iterdir():
+            if sibling == current or not sibling.is_dir():
+                continue
+            if not sibling.name.startswith("_MEI"):
+                continue  # never touch anything this sweep didn't itself create
+            try:
+                shutil.rmtree(sibling, ignore_errors=True)
+            except Exception:  # noqa: BLE001 -- best-effort, one bad sibling must not stop the sweep
+                pass
+    except Exception:  # noqa: BLE001 -- must never prevent the tray from starting
+        _logger.warning("tray_main: stale runtime-extraction sweep failed", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Tkinter dialogs -- each opens its OWN fresh Tk root and tears it down when
 # closed, rather than keeping a persistent root alongside pystray's own event
@@ -213,6 +254,7 @@ def _run_tray() -> int:
     import pystray
     from PIL import Image
 
+    _sweep_stale_runtime_extractions()
     runner = _build_runner()
 
     # 4e4c3817 follow-up (owner feedback 2026-09-27): a bare tray icon gives

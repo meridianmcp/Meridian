@@ -168,6 +168,94 @@ def test_icon_image_path_frozen_resolves_under_meipass(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _sweep_stale_runtime_extractions -- orphaned onefile _MEI* dir cleanup
+# (2026-09-28 review finding #5/#22, secondary part)
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_stale_extractions_noop_when_not_frozen(monkeypatch, tmp_path):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    (tmp_path / "_MEI12345").mkdir()
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "_MEIcurrent"), raising=False)
+    tray_main._sweep_stale_runtime_extractions()  # must not raise, must not touch tmp_path
+    assert (tmp_path / "_MEI12345").exists()
+
+
+def test_sweep_stale_extractions_noop_when_no_meipass(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    tray_main._sweep_stale_runtime_extractions()  # must not raise
+
+
+def test_sweep_stale_extractions_removes_siblings_but_not_current(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    current = tmp_path / "_MEIcurrent"
+    stale_a = tmp_path / "_MEIstale1"
+    stale_b = tmp_path / "_MEIstale2"
+    for d in (current, stale_a, stale_b):
+        d.mkdir()
+        (d / "marker.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(sys, "_MEIPASS", str(current), raising=False)
+
+    tray_main._sweep_stale_runtime_extractions()
+
+    assert current.exists() and (current / "marker.txt").exists()
+    assert not stale_a.exists()
+    assert not stale_b.exists()
+
+
+def test_sweep_stale_extractions_never_touches_non_mei_entries(monkeypatch, tmp_path):
+    """The runtime_tmpdir is Meridian-owned per meridian-tray.spec, but this
+    sweep is still deliberately conservative: it only ever deletes entries
+    whose name starts with '_MEI' -- never a bare file, never an unrelated
+    directory that happens to live alongside the extraction dirs."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    current = tmp_path / "_MEIcurrent"
+    current.mkdir()
+    monkeypatch.setattr(sys, "_MEIPASS", str(current), raising=False)
+    unrelated_dir = tmp_path / "not-a-mei-dir"
+    unrelated_dir.mkdir()
+    unrelated_file = tmp_path / "_MEIsomething.txt"  # starts with _MEI but is a FILE
+    unrelated_file.write_text("x", encoding="utf-8")
+
+    tray_main._sweep_stale_runtime_extractions()
+
+    assert unrelated_dir.exists()
+    assert unrelated_file.exists()
+
+
+def test_sweep_stale_extractions_degrades_on_error(monkeypatch, tmp_path):
+    """A sweep failure (e.g. a sibling still locked by a concurrently
+    running second tray instance) must never crash tray startup."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    current = tmp_path / "_MEIcurrent"
+    current.mkdir()
+    stale = tmp_path / "_MEIstale"
+    stale.mkdir()
+    monkeypatch.setattr(sys, "_MEIPASS", str(current), raising=False)
+    monkeypatch.setattr(
+        tray_main.shutil, "rmtree",
+        lambda path, ignore_errors=False: (_ for _ in ()).throw(OSError("locked")),
+    )
+
+    tray_main._sweep_stale_runtime_extractions()  # must not raise
+
+
+def test_run_tray_calls_sweep_before_building_runner(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.NOT_CONFIGURED)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda url: None)
+    calls = []
+    monkeypatch.setattr(tray_main, "_sweep_stale_runtime_extractions", lambda: calls.append(1))
+
+    tray_main._run_tray()
+
+    assert calls == [1]
+
+
+# ---------------------------------------------------------------------------
 # main() -- --run-server dispatch vs. normal tray launch
 # ---------------------------------------------------------------------------
 
