@@ -53,6 +53,21 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
+      # 2026-09-29 reconciliation: bundle-latex.mjs now copies
+      # extensions/meridian-latex/engine/DIST (tsc/esbuild-compiled
+      # output), not engine/src, so it exists on disk in npm/'s own
+      # "prepack" hook (`npm publish` below). This job is a FRESH
+      # checkout on its own runner -- test-latex's build above ran in a
+      # different job and does not carry over -- so without an explicit
+      # build here, engine/dist would not exist yet and
+      # bundle-latex.mjs's readdirSync would throw, failing the publish
+      # outright. Root `npm ci` installs the engine's build-time
+      # devDependencies (esbuild, typescript) via the workspace.
+      - name: Install deps + build the meridian-latex engine (dist/ source for the npm bundle)
+        run: |
+          npm ci
+          npm run build --workspace=extensions/meridian-latex/engine
+
       - name: Set version from tag
         run: |
           TAG=${GITHUB_REF#refs/tags/v}
