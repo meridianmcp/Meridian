@@ -72,7 +72,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--token",
         default=None,
-        help="API token (defaults to MERIDIAN_API_KEY / BEARER_TOKEN).",
+        help=(
+            "API token (defaults to MERIDIAN_TOKEN / MERIDIAN_API_KEY / "
+            "BEARER_TOKEN, in that order). Prefer the env var: a --token value "
+            "is visible in process listings."
+        ),
     )
     parser.add_argument(
         "--server",

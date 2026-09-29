@@ -4516,17 +4516,34 @@ def _force_utf8_io() -> None:
 # Config resolution (pure — unit tested)
 # ---------------------------------------------------------------------------
 
-def _resolve_token(arg_token: str | None = None) -> str:
-    """Resolve the API token: CLI arg > MERIDIAN_API_KEY > BEARER_TOKEN.
+# 9784f8ef — the token env var names the installers, the tunnel client and the
+# MCP client configs historically disagreed on (install.ps1 -> MERIDIAN_TOKEN,
+# install_tunnel.* -> MERIDIAN_API_KEY, mcp-remote configs -> BEARER_TOKEN), so a
+# token exported for one component was silently invisible to the others.
+# Precedence, highest first; the CLI ``--token`` value always beats all of them.
+# ``MERIDIAN_TOKEN`` is the canonical name; ``MERIDIAN_API_KEY`` and
+# ``BEARER_TOKEN`` are kept as legacy aliases so existing launchers/configs keep
+# working. scripts/meridian_connect.py carries an identical tuple (it is a
+# dependency-free PyInstaller entry point and cannot import this module); a test
+# pins the two together.
+TOKEN_ENV_VARS: tuple[str, ...] = ("MERIDIAN_TOKEN", "MERIDIAN_API_KEY", "BEARER_TOKEN")
 
-    A leading ``Bearer `` prefix (e.g. copied from a header) is stripped.
+
+def _resolve_token(arg_token: str | None = None) -> str:
+    """Resolve the API token: CLI arg > MERIDIAN_TOKEN > MERIDIAN_API_KEY > BEARER_TOKEN.
+
+    Env vars are the preferred way to hand a token to the tunnel: unlike
+    ``--token`` they never appear in a process listing's command line. The
+    first non-blank source wins. A leading ``Bearer `` prefix (e.g. copied from
+    a header) is stripped.
     """
-    token = (
-        arg_token
-        or os.environ.get("MERIDIAN_API_KEY")
-        or os.environ.get("BEARER_TOKEN")
-        or ""
-    ).strip()
+    token = (arg_token or "").strip()
+    if not token:
+        for name in TOKEN_ENV_VARS:
+            candidate = (os.environ.get(name) or "").strip()
+            if candidate:
+                token = candidate
+                break
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
     return token

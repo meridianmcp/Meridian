@@ -16,6 +16,7 @@ import platform
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -24,6 +25,14 @@ import webbrowser
 from pathlib import Path
 
 DEFAULT_URL = "https://usemeridian.us"
+
+# 9784f8ef — env var names that may carry the API token, highest precedence
+# first (the --token flag beats all of them). MERIDIAN_TOKEN is canonical;
+# MERIDIAN_API_KEY / BEARER_TOKEN are legacy aliases. This mirrors
+# meridian.tunnel_client.TOKEN_ENV_VARS -- duplicated on purpose because this
+# script is dependency-free (PyInstaller entry point, no ``meridian`` import);
+# tests/test_9784f8ef_install_token_exposure.py pins the two together.
+TOKEN_ENV_VARS = ("MERIDIAN_TOKEN", "MERIDIAN_API_KEY", "BEARER_TOKEN")
 
 
 def _http(method: str, url: str, *, token: str = "", body=None, timeout: int = 10):
@@ -49,6 +58,88 @@ def _settings_path() -> Path:
     return Path.home() / ".claude" / "settings.json"
 
 
+def _token_from_env() -> str:
+    """Return the API token from the environment, or "".
+
+    9784f8ef — an env var is the preferred way to hand this script a token: a
+    ``--token`` value sits on the command line, visible to every other process
+    in a process listing. Precedence follows ``TOKEN_ENV_VARS``; the first
+    non-blank value wins and a pasted ``Bearer `` prefix is stripped.
+    """
+    for name in TOKEN_ENV_VARS:
+        candidate = (os.environ.get(name) or "").strip()
+        if candidate:
+            if candidate.lower().startswith("bearer "):
+                candidate = candidate[7:].strip()
+            if candidate:
+                return candidate
+    return ""
+
+
+def _windows_principal() -> str:
+    """``DOMAIN\\user`` for the current Windows account (for icacls grants)."""
+    import getpass
+
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    domain = os.environ.get("USERDOMAIN", "")
+    return f"{domain}\\{user}" if domain else user
+
+
+def _restrict_to_owner(path) -> bool:
+    """Restrict ``path`` to the current user only. True when the change applied.
+
+    9784f8ef — ``os.chmod(path, 0o600)`` is a no-op on Windows (it only toggles
+    the read-only bit), so the old "restrictive permissions" on hook_auth.conf
+    were never real there. On Windows this drops inherited ACEs and grants only
+    the current user via ``icacls``; on POSIX it is chmod 600 (700 for a
+    directory). Never raises: a missing ``icacls``, a non-zero exit or an OS
+    error returns False so the caller can warn instead of crashing the install.
+    """
+    path = Path(path)
+    is_dir = path.is_dir()
+    if platform.system() == "Windows":
+        icacls = shutil.which("icacls")
+        if not icacls:
+            return False
+        principal = _windows_principal()
+        grant = f"{principal}:(OI)(CI)F" if is_dir else f"{principal}:F"
+        try:
+            proc = subprocess.run(
+                [icacls, str(path), "/inheritance:r", "/grant:r", grant],
+                capture_output=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+    try:
+        os.chmod(path, 0o700 if is_dir else 0o600)
+    except OSError:
+        return False
+    return True
+
+
+def _write_private_file(path, text: str) -> bool:
+    """Write ``text`` to ``path`` without ever exposing it in a shared file.
+
+    The file is created (empty) and locked down to the current user BEFORE the
+    secret is written, so there is no window in which the token sits in a file
+    other local users can read. Returns whether owner-only permissions were
+    applied; raises OSError only when the write itself fails.
+    """
+    path = Path(path)
+    if platform.system() == "Windows":
+        path.write_text("", encoding="utf-8")
+        hardened = _restrict_to_owner(path)
+        path.write_text(text, encoding="utf-8")
+        return hardened
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    # os.open's mode only applies at creation; tighten a pre-existing file too.
+    return _restrict_to_owner(path)
+
+
 def _write_curl_header_config(token: str) -> str:
     """Write a local curl `-K` config file holding the Authorization header.
 
@@ -59,6 +150,11 @@ def _write_curl_header_config(token: str) -> str:
     Returns "" when there is no token (self-hosted/local, no auth needed) --
     callers must treat an empty return as "omit the auth flag entirely",
     never as a config file with an empty header.
+
+    9784f8ef — the file is owner-only on every platform (icacls on Windows,
+    where the previous chmod was a silent no-op). If hardening could not be
+    applied the file is still written (auth would otherwise silently vanish
+    from the hooks) but a warning naming the path is printed to stderr.
     """
     if not token:
         return ""
@@ -70,15 +166,17 @@ def _write_curl_header_config(token: str) -> str:
     cfg_path = cfg_dir / "hook_auth.conf"
     try:
         # curl -K config-file syntax: one `option = "value"` per line.
-        cfg_path.write_text(
-            f'header = "Authorization: Bearer {token}"\n', encoding="utf-8"
+        hardened = _write_private_file(
+            cfg_path, f'header = "Authorization: Bearer {token}"\n'
         )
-        try:
-            os.chmod(cfg_path, 0o600)  # best-effort on POSIX; no-op on Windows
-        except OSError:
-            pass
     except OSError:
         return ""
+    if not hardened:
+        print(
+            f"  WARNING: could not restrict {cfg_path} to your user account; "
+            "check its permissions (it holds your Meridian token).",
+            file=sys.stderr,
+        )
     return str(cfg_path)
 
 
@@ -105,7 +203,16 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--url", default="", help=f"Meridian server URL (default: {DEFAULT_URL})")
-    parser.add_argument("--token", default="", help="Bearer token (skips browser auth)")
+    parser.add_argument(
+        "--token",
+        default="",
+        help=(
+            "Bearer token (skips browser auth). Prefer setting MERIDIAN_TOKEN "
+            "(or the legacy MERIDIAN_API_KEY / BEARER_TOKEN) in the "
+            "environment instead: a --token value is visible to other "
+            "processes in a process listing."
+        ),
+    )
     parser.add_argument("--project-id", default="", help="Project ID (optional)")
     parser.add_argument(
         "--tunnel",
@@ -146,6 +253,11 @@ def main() -> int:
     # ---- Step 2: Auth --------------------------------------------------------
     is_local = bool(re.match(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?(/|$)", meridian_url))
     token = args.token.strip()
+    if not token and not is_local:
+        # 9784f8ef — env-var hand-off (install.ps1 sets MERIDIAN_TOKEN for this
+        # process only) so the token never has to ride on the command line.
+        # Hosted only: a hosted token must not be forwarded to a local server.
+        token = _token_from_env()
 
     if not is_local:
         if not token:
@@ -162,7 +274,11 @@ def main() -> int:
                 import getpass
                 token = getpass.getpass("Paste the token shown in your browser: ").strip()
             else:
-                print("Error: token is required for hosted Meridian (pass --token).", file=sys.stderr)
+                print(
+                    "Error: token is required for hosted Meridian "
+                    "(set MERIDIAN_TOKEN, or pass --token).",
+                    file=sys.stderr,
+                )
                 return 1
 
         token = token.replace(" ", "")
