@@ -5965,9 +5965,9 @@ class _FakeWin32JobAPIForTunnel:
         self._next += 1
         return self._next
 
-    def create_job(self):
+    def create_job(self, name=None):
         h = self._h()
-        self.calls.append(("create_job", h))
+        self.calls.append(("create_job", h, name))
         return h
 
     def set_kill_on_close(self, job_handle):
