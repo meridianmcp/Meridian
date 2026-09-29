@@ -31,9 +31,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
@@ -148,6 +150,98 @@ _STALENESS_CHECK_INTERVAL_SECONDS = 5 * 60.0
 _SLOT_REPROBE_INTERVAL = 60.0
 
 
+# 4d6e87dd — where the tunnel mirrors its stdout/stderr, and when it rotates.
+# ``MERIDIAN_TUNNEL_LOG`` (a FILE path) overrides the default
+# ``~/.meridian/tunnel.log``. tests/conftest.py's autouse ``_isolate_tunnel_log``
+# fixture sets it to a per-test temp file for every test — before this, every
+# test that drove ``run_tunnel`` appended to the developer's REAL log (22.1 MB /
+# 11,003 pytest "serving" lines, burying the real indexing-worker crash lines).
+_TUNNEL_LOG_ENV = "MERIDIAN_TUNNEL_LOG"
+# Minimal size-based rotation: when the log already exceeds this at tunnel
+# start, it is moved to ``<log>.1`` (replacing any older backup) and a fresh log
+# is started. Checked once per start, not per write — one backup, no cron.
+_TUNNEL_LOG_ROTATE_BYTES = 5 * 1024 * 1024
+
+
+def _tunnel_log_path() -> Path:
+    """Path of the persistent tunnel log: ``$MERIDIAN_TUNNEL_LOG`` when set and
+    non-blank, else ``~/.meridian/tunnel.log``."""
+    override = os.environ.get(_TUNNEL_LOG_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".meridian" / "tunnel.log"
+
+
+def _iso_timestamp_now() -> str:
+    """Local wall-clock time as ISO-8601 with millisecond precision and a UTC
+    offset, e.g. ``2026-09-28T05:54:12.123-05:00`` (unambiguous across DST and
+    machines, and lexicographically sortable within one machine's log)."""
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def _rotate_tunnel_log_if_large(log_path: Path, max_bytes: int | None = None) -> None:
+    """Move *log_path* to ``<name>.1`` (replacing an older backup) when it is
+    larger than *max_bytes* (default ``_TUNNEL_LOG_ROTATE_BYTES``). Best-effort:
+    a missing file, or a rename that fails (e.g. another tunnel process on
+    Windows still holds the log open), leaves the log where it is."""
+    limit = _TUNNEL_LOG_ROTATE_BYTES if max_bytes is None else max_bytes
+    try:
+        if log_path.stat().st_size > limit:
+            os.replace(log_path, log_path.with_name(log_path.name + ".1"))
+    except OSError:
+        pass
+
+
+class _TimestampedLogFile:
+    """4d6e87dd — file-like sink that puts an ISO-8601 timestamp at the start of
+    every LINE written to the underlying file (the tunnel's own diagnostics
+    carried no timestamps at all, so "when did this slot die?" meant guessing
+    from process start times).
+
+    ``print()`` emits its text and the trailing newline as separate ``write``
+    calls, and stdout and stderr (two ``_TeeStream`` s) share one sink, so line
+    state — "is the next character the start of a line?" — lives here, guarded
+    by a lock, not in the callers: a line split across several writes gets ONE
+    timestamp, and concurrent writers from the watchdog threads and the event
+    loop can never tear or double-stamp a line.
+    """
+
+    def __init__(self, raw, clock=_iso_timestamp_now) -> None:
+        self._raw = raw
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._at_line_start = True
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+        pieces: list[str] = []
+        with self._lock:
+            parts = data.split("\n")
+            last = len(parts) - 1
+            for i, part in enumerate(parts):
+                if i == last and part == "":
+                    break  # data ended with "\n": nothing pending on a new line
+                if self._at_line_start:
+                    pieces.append(self._clock() + " ")
+                pieces.append(part)
+                if i < last:
+                    pieces.append("\n")
+                    self._at_line_start = True
+                else:
+                    self._at_line_start = False
+            self._raw.write("".join(pieces))
+        return len(data)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._raw.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._raw.close()
+
+
 class _TeeStream:
     """2026-07-19 — mirror writes to the original stream AND a persistent log
     file, so tunnel diagnostics (watchdog retries, TAR_ENTRY_ERROR detection,
@@ -158,6 +252,10 @@ class _TeeStream:
     directories, because none of the tunnel's own diagnostic trail was ever
     persisted anywhere. Never raises — a broken log file must not take down the
     tunnel's real stdout/stderr.
+
+    The console side is passed through untouched; only the log file (a
+    :class:`_TimestampedLogFile` when installed by
+    :func:`_install_tunnel_log_tee`) gets timestamps.
     """
 
     def __init__(self, original, log_file) -> None:
@@ -184,27 +282,31 @@ class _TeeStream:
         return getattr(self._original, name)
 
 
-def _install_tunnel_log_tee() -> None:
-    """Mirror stdout/stderr to ~/.meridian/tunnel.log (append mode, one line
-    header per run) so the watchdog/spawn-retry diagnostics that normally only
-    ever reach an attached console are recoverable after the fact — pairs with
-    1662873f's lightweight log-search tool. Best-effort: any failure to open
-    the log file silently skips teeing rather than blocking tunnel startup.
+def _install_tunnel_log_tee() -> "Path | None":
+    """Mirror stdout/stderr to the tunnel log (:func:`_tunnel_log_path`,
+    default ~/.meridian/tunnel.log; append mode, one timestamped header line per
+    run, every line ISO-timestamped) so the watchdog/spawn-retry diagnostics that
+    normally only ever reach an attached console are recoverable after the fact
+    — pairs with 1662873f's lightweight log-search tool. An oversized existing
+    log is rotated to ``<log>.1`` first (:func:`_rotate_tunnel_log_if_large`).
+    Best-effort: any failure to open the log file silently skips teeing rather
+    than blocking tunnel startup. Returns the log path in use, or ``None`` when
+    teeing was skipped.
     """
     try:
-        log_dir = Path.home() / ".meridian"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "tunnel.log"
-        log_file = open(log_path, "a", encoding="utf-8", errors="replace")
-        log_file.write(
-            f"\n=== tunnel started {time.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(pid={os.getpid()}) ===\n"
+        log_path = _tunnel_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_tunnel_log_if_large(log_path)
+        log_file = _TimestampedLogFile(
+            open(log_path, "a", encoding="utf-8", errors="replace")
         )
+        log_file.write(f"=== tunnel started (pid={os.getpid()}) ===\n")
         log_file.flush()
         sys.stdout = _TeeStream(sys.stdout, log_file)
         sys.stderr = _TeeStream(sys.stderr, log_file)
+        return log_path
     except Exception:  # noqa: BLE001 — logging must never block tunnel startup
-        pass
+        return None
 
 # 089a936a — the DEFAULT first-spawn pre-flight probe budget (attempts, delay):
 # attempts=2 × delay=3s with a 10s per-attempt httpx timeout ≈ up to ~23s. Fine
