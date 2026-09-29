@@ -48,6 +48,18 @@ _GOOD_PAYLOAD = {
 }
 
 
+async def _ok_run(db, pid, *, exit_code=0, status="ok"):
+    """0ff5e59f — a genuine, server-recorded run_verification run (the same
+    create -> complete lifecycle the run_verification MCP tool performs). The
+    gate is now bound to this stored record, not to a hand-typed dict."""
+    run = await db_module.create_verification_run(db, pid, "pixi run test")
+    done = await db_module.complete_verification_run(
+        db, run["id"], status=status, exit_code=exit_code,
+        passed=42, failed=0, stdout_tail="42 passed in 5.3s",
+    )
+    return done["id"]
+
+
 # ---------------------------------------------------------------------------
 # 1. Missing verification_payload
 # ---------------------------------------------------------------------------
@@ -171,7 +183,7 @@ async def test_gate_accepted_with_passing_payload(db):
     result = await srv._dispatch_mcp_tool(
         "complete_wave_gate",
         {"project_id": pid, "wave_label": "wave-1",
-         "verification_payload": _GOOD_PAYLOAD},
+         "verification_run_id": await _ok_run(db, pid)},
         db, "/tmp",
     )
     assert result.get("gate_completed") is True
@@ -203,7 +215,7 @@ async def test_gate_reports_next_wave_items(db):
     result = await srv._dispatch_mcp_tool(
         "complete_wave_gate",
         {"project_id": pid, "wave_label": "wave-1",
-         "verification_payload": _GOOD_PAYLOAD},
+         "verification_run_id": await _ok_run(db, pid)},
         db, "/tmp",
     )
     assert result.get("gate_completed") is True
@@ -223,7 +235,7 @@ async def test_gate_duplicate_rejected(db):
     first = await srv._dispatch_mcp_tool(
         "complete_wave_gate",
         {"project_id": pid, "wave_label": "wave-1",
-         "verification_payload": _GOOD_PAYLOAD},
+         "verification_run_id": await _ok_run(db, pid)},
         db, "/tmp",
     )
     assert first.get("gate_completed") is True
@@ -232,7 +244,7 @@ async def test_gate_duplicate_rejected(db):
     second = await srv._dispatch_mcp_tool(
         "complete_wave_gate",
         {"project_id": pid, "wave_label": "wave-1",
-         "verification_payload": _GOOD_PAYLOAD},
+         "verification_run_id": await _ok_run(db, pid)},
         db, "/tmp",
     )
     assert "error" in second
@@ -252,10 +264,16 @@ def test_complete_wave_gate_registered_in_tools_list():
     assert "project_id" in props
     assert "wave_label" in props
     assert "verification_payload" in props
+    # 0ff5e59f — the unlock is bound to a stored run_verification record.
+    assert "verification_run_id" in props
+    assert "override_unbound_payload" in props
+    assert "override_reason" in props
+    assert "override_hitl_id" in props
     assert "actor" in props
-    # wave_label and verification_payload are required
+    # Only wave_label is unconditionally required: the evidence is EITHER a
+    # verification_run_id or (human-approved override only) a payload.
     assert "wave_label" in schema.get("required", [])
-    assert "verification_payload" in schema.get("required", [])
+    assert "verification_payload" not in schema.get("required", [])
     # Not read-only (it writes a gate result).
     assert "complete_wave_gate" not in _READ_ONLY_TOOLS
     # Has a title override.
@@ -276,7 +294,7 @@ async def test_complete_wave_gate_dispatch_works(db):
     # A call with missing project_id should return an error dict, not raise.
     result = await srv._dispatch_mcp_tool(
         "complete_wave_gate",
-        {"wave_label": "wave-1", "verification_payload": _GOOD_PAYLOAD},
+        {"wave_label": "wave-1", "verification_run_id": await _ok_run(db, pid)},
         db, "/tmp",
     )
     # Should return an error about missing project_id, not _MISS sentinel.
@@ -288,7 +306,7 @@ async def test_complete_wave_gate_dispatch_works(db):
     versioned = await srv._dispatch_mcp_tool(
         "complete_wave_gate",
         {"project_id": pid, "wave_label": "wave-1",
-         "verification_payload": _GOOD_PAYLOAD, "version": "v-dispatch"},
+         "verification_run_id": await _ok_run(db, pid), "version": "v-dispatch"},
         db, "/tmp",
     )
     assert versioned.get("gate_completed") is True
@@ -305,7 +323,7 @@ async def test_complete_wave_gate_project_name_resolution(db):
     result = await srv._dispatch_mcp_tool(
         "complete_wave_gate",
         {"project_name": "gate-by-name", "wave_label": "wave-1",
-         "verification_payload": _GOOD_PAYLOAD},
+         "verification_run_id": await _ok_run(db, pid)},
         db, "/tmp",
     )
     assert result.get("gate_completed") is True
@@ -339,7 +357,7 @@ async def test_db_complete_wave_gate_rejects_error_status(db):
 @pytest.mark.asyncio
 async def test_db_complete_wave_gate_succeeds(db):
     pid = (await db_module.create_project(db, name="gate-db-success"))["id"]
-    result = await db_module.complete_wave_gate(db, pid, "wave-1", _GOOD_PAYLOAD)
+    result = await db_module.complete_wave_gate(db, pid, "wave-1", verification_run_id=await _ok_run(db, pid))
     assert result["gate_completed"] is True
     assert result["wave_label"] == "wave-1"
     assert result["next_wave_label"] == "wave-2"
@@ -398,7 +416,7 @@ async def test_two_versions_same_wave_label_do_not_cross_contaminate(db):
 
     # GATE COMPLETION + next-wave READINESS: complete version A's gate only.
     result_a = await db_module.complete_wave_gate(
-        db, pid, "wave-1", _GOOD_PAYLOAD, version="vA",
+        db, pid, "wave-1", verification_run_id=await _ok_run(db, pid), version="vA",
     )
     assert result_a["gate_completed"] is True
     assert result_a["version"] == "vA"
@@ -420,7 +438,7 @@ async def test_two_versions_same_wave_label_do_not_cross_contaminate(db):
     # completion of the same wave_label (the exact bug: a shared
     # UNIQUE(project_id, wave_label) row would have rejected this as a dup).
     result_b = await db_module.complete_wave_gate(
-        db, pid, "wave-1", _GOOD_PAYLOAD, version="vB",
+        db, pid, "wave-1", verification_run_id=await _ok_run(db, pid), version="vB",
     )
     assert result_b["gate_completed"] is True
     assert result_b["version"] == "vB"
@@ -449,7 +467,7 @@ async def test_unversioned_legacy_wave_gate_still_project_wide(db):
     assert blocked.get("blocked") is True
     assert blocked.get("error") == "WAVE_GATE_PENDING"
 
-    result = await db_module.complete_wave_gate(db, pid, "wave-1", _GOOD_PAYLOAD)
+    result = await db_module.complete_wave_gate(db, pid, "wave-1", verification_run_id=await _ok_run(db, pid))
     assert result["gate_completed"] is True
     assert result["version"] is None
     assert result["next_wave_item_ids"] == [item["id"]]
@@ -558,13 +576,13 @@ async def test_pre_existing_table_blocks_multi_version_gate_before_migration(db)
     await _downgrade_wave_gate_tables_to_pre_ed8e4524(db)
 
     result_a = await db_module.complete_wave_gate(
-        db, pid, "wave-1", _GOOD_PAYLOAD, version="vA",
+        db, pid, "wave-1", verification_run_id=await _ok_run(db, pid), version="vA",
     )
     assert result_a["gate_completed"] is True
 
     with pytest.raises(_integrity_error_types()):
         await db_module.complete_wave_gate(
-            db, pid, "wave-1", _GOOD_PAYLOAD, version="vB",
+            db, pid, "wave-1", verification_run_id=await _ok_run(db, pid), version="vB",
         )
 
 
@@ -604,7 +622,7 @@ async def test_version_unique_migration_repairs_pre_existing_table(db):
 
     # Existing (pre-migration) data that must survive the rebuild.
     result_a = await db_module.complete_wave_gate(
-        db, pid, "wave-1", _GOOD_PAYLOAD, version="vA",
+        db, pid, "wave-1", verification_run_id=await _ok_run(db, pid), version="vA",
     )
     assert result_a["gate_completed"] is True
     cfg = await db_module.configure_wave_gate(
@@ -645,7 +663,7 @@ async def test_version_unique_migration_repairs_pre_existing_table(db):
     # The actual repro: version B can now complete its OWN gate for the
     # SAME wave_label — no more duplicate-key error.
     result_b = await db_module.complete_wave_gate(
-        db, pid, "wave-1", _GOOD_PAYLOAD, version="vB",
+        db, pid, "wave-1", verification_run_id=await _ok_run(db, pid), version="vB",
     )
     assert result_b["gate_completed"] is True
     assert result_b["version"] == "vB"

@@ -4014,7 +4014,8 @@ def _build_quick_start_goal(
             f"until the wave gate(s) at {_xml_escape(', '.join(_boundaries))} "
             "complete: run the configured action pipeline (push_dev/push_main/"
             "deploy/wait/run_verification) then call complete_wave_gate with the "
-            "real run_verification result. This is enforced at claim time, not "
+            "verification_run_id that run_verification returned (a hand-typed "
+            "result is refused). This is enforced at claim time, not "
             "just this prose note. -->"
         )
     # 83a7586d — DEPENDENCY / FAN-IN BARRIER: exclude items whose frontier

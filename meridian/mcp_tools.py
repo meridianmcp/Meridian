@@ -128,7 +128,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "export_ai_log_artifacts": 'export_ai_log_artifacts(project_id="abc-123", content_hashes=["sha256:..."])',
     "purge_ai_log": 'purge_ai_log(project_id="abc-123", cutoff="2025-01-01T00:00:00Z")',
     "search_ai_log": 'search_ai_log(project_id="abc-123", correlation_id="run-42", event_type="tool.invoked", limit=50)',
-    "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
+    "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_run_id="<verification_run_id returned by run_verification>")',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
@@ -3016,7 +3016,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "wave": {"type": "string",
                   "description": "58a45b92 — set/clear the stored wave label (e.g. 'wave-1') for enforced parallel-batch grouping. Hand-override of what assign_sprint_waves computes. Pass an empty string to CLEAR (unassigned); omit to leave unchanged."},
          "prospect_bypass": {"type": "boolean",
-                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. Set false to re-enable the structural gate. Omit to leave unchanged. Executor sessions must NOT set this field."},
+                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. 0ff5e59f — setting it true is an AUDITED override: it requires a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise) and writes an action_audit_log row. Set false to re-enable the structural gate (no reason needed). Omit to leave unchanged. Executor sessions must NOT set this field."},
+         "override_reason": {"type": "string", "description": "0ff5e59f — REQUIRED with prospect_bypass=true: why this item may be claimed without prospecting evidence. Recorded to action_audit_log (who/when/why)."},
          "depends_on": {"type": "string",
                         "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
          "require_verification": {"type": "boolean",
@@ -3040,9 +3041,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "or a task_id, or completion is refused (EVIDENCE_REQUIRED). If the item is "
         "flagged require_verification (e2e1b682), completion is refused "
         "(VERIFICATION_REQUIRED) unless an independent PASS is on file: pass "
-        "verifier_session_id (a DIFFERENT session id from actor — a fresh, no-memory "
-        "subsession that inspected the change with read-only tools) and "
-        "verification_verdict='pass' to file and check the verdict in this same call. "
+        "verifier_session_id (a DIFFERENT, REAL session of this project — the fresh, "
+        "no-memory subsession's own start_session id; an unregistered/made-up id, another "
+        "project's session, the completing actor, or the claim holder is refused, 0ff5e59f) "
+        "and verification_verdict='pass' to file and check the verdict in this same call. "
         "fdaa5b55 — if the item has a linked GitHub issue, the response carries a "
         "github_issue_action field: issues Meridian itself created (github_issue_source="
         "'meridian_auto') are commented on and auto-closed; any other issue (manual/legacy) "
@@ -3079,13 +3081,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "notes": {"type": "string", "description": "Evidence for the completion (what shipped / how it was verified). Persisted on the item; satisfies the required_notes gate."},
          "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id). Checked against the item's claim owner (8693b6a8) — a mismatch on a live, non-stale claim is refused unless force_foreign_claim=true."},
          "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."},
-         "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must differ from actor/session_id or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
+         "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must be a REAL session of this project (0ff5e59f: the id the verifier's own start_session returned) that differs from actor/session_id and from the claim holder, or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
          "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
          "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."},
-         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit override, never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit, AUDITED override (0ff5e59f): it must be paired with a non-empty override_reason in the SAME call or the completion is refused (CLAIM_MISMATCH), and an action_audit_log row is written. Never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "override_ci": {"type": "boolean", "description": "427b7902 — explicit override of a CI_FAILING rejection (GitHub Actions is genuinely failing for the commit named in the notes). 0ff5e59f — must be paired with a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise); audited to action_audit_log."},
          "strict_evidence": {"type": "boolean", "description": "5fe3502e — opt in to the STRICT, fail-closed evidence gate for THIS call only (see meridian.sprint_evidence_guard). Omit/false preserves the exact pre-existing advisory-only behavior. Equivalent, persistent alternative: update_sprint_item(require_strict_evidence=true)."},
          "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit, audited override of a STRICT_EVIDENCE_BLOCKED rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Never inferred; omit/false for normal strict behavior."},
-         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside override_strict_evidence=true (or a8c0f3b7's override_code_intel_receipt=true): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
+         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside ANY override flag (override_strict_evidence, override_code_intel_receipt, override_test_run_receipt, override_ci, force_foreign_claim): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
          "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit, audited override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Only relevant for a project that declared the 'code_intel_prospecting' capability."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
@@ -3277,13 +3280,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "complete_wave_gate", "description":
         "d2430713 — EXECUTOR GATE: call this AFTER you have actually run a wave's gate "
         "action list (push, deploy, wait, run_verification) to unblock the next wave's "
-        "sprint items. You MUST pass the REAL structured result from run_verification as "
-        "verification_payload — the server validates it (status=='ok', exit_code==0). "
-        "A self-report ('I think it passed') or a fabricated payload is rejected with a "
-        "clear error. On success, writes a wave_gate_results row and returns "
-        "{gate_completed, wave_label, next_wave_label, next_wave_item_count, "
-        "next_wave_item_ids, gate_id}. Each wave gate may only be completed once "
-        "(duplicate calls return an error). Security note: this is a deploy-adjacent "
+        "sprint items. 0ff5e59f — pass verification_run_id: the id that run_verification "
+        "returns for the real, server-recorded test run. The RECORDED run's own "
+        "status/exit_code decide the unlock (status=='ok', exit_code==0, same project, "
+        "completed, and not already spent on another gate) — nothing you type is "
+        "consulted. A hand-typed verification_payload is a self-report and is REFUSED "
+        "(WaveGateUnboundPayload); the only escape hatch is a HUMAN's decision: pass "
+        "override_unbound_payload=true with override_reason, which files a require_human "
+        "gate-override HITL (it cannot be auto-answered) and returns "
+        "HUMAN_APPROVAL_REQUIRED + hitl_id; after a human answers Yes, retry with "
+        "override_hitl_id. The approval is single-use, bound to this wave gate, and the "
+        "override is audited to action_audit_log. On success, writes a wave_gate_results "
+        "row and returns {gate_completed, wave_label, next_wave_label, "
+        "next_wave_item_count, next_wave_item_ids, gate_id, evidence_source}. Each wave "
+        "gate may only be completed once (duplicate calls return an error). Security "
+        "note: this is a deploy-adjacent "
         "gate — only actual run_verification output satisfies it. ed8e4524 — SCOPED "
         "TO SPRINT VERSION: pass version (or session_id to auto-resolve the calling "
         "session's scope) so two different sprint versions that happen to share the "
@@ -3294,11 +3305,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "wave_label": {"type": "string", "description": "The wave whose gate is being completed, e.g. 'wave-1'. Must match the wave field on sprint_items that were just executed."},
-         "verification_payload": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Any other value (non-zero exit, error, not_configured, not_connected) is rejected. Do NOT fabricate or self-report — the server validates the payload."},
+         "verification_run_id": {"type": "string", "description": "0ff5e59f — the verification_run_id returned by run_verification. The stored run's recorded status/exit_code decide the unlock. Required unless a human-approved override is used."},
+         "verification_payload": {"type": "object", "description": "A hand-typed result dict. IGNORED when verification_run_id is given; on its own it is a self-report and is refused unless carried by override_unbound_payload=true + override_reason + a human-answered override_hitl_id (it must still have status='ok' and exit_code=0). Do NOT fabricate or self-report."},
+         "override_unbound_payload": {"type": "boolean", "description": "0ff5e59f — request the human-approved escape hatch for a verification_payload that is not backed by a recorded run (e.g. the tunnel is down). Requires override_reason. The first call files a require_human gate-override HITL and returns HUMAN_APPROVAL_REQUIRED with its id."},
+         "override_reason": {"type": "string", "description": "0ff5e59f — REQUIRED with override_unbound_payload=true: why a human should let this gate open without a recorded run. Recorded to action_audit_log."},
+         "override_hitl_id": {"type": "string", "description": "0ff5e59f — id of the answered (Yes) gate-override HITL a human approved for this wave gate. Single-use; bound to this wave label/version."},
          "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."},
          "version": {"type": "string", "description": "ed8e4524 — Optional sprint-version bucket this gate belongs to (e.g. 'v0.2.6'). Wins over session_id's resolved scope. Omit (and omit session_id) for the legacy project-wide gate behavior."},
          "session_id": {"type": "string", "description": "ed8e4524 — Optional: resolve the version scope from this session's own sprint_version (same helper handoff._resolve_session_sprint_version uses for checkpoint) when version is not given explicitly."}},
-         "required": ["wave_label", "verification_payload"]}},
+         "required": ["wave_label"]}},
     {"name": "start_wave_run", "description":
         "2a654cb0 — DURABLE WAVE STATE: open a wave run before dispatching a parallel "
         "wave. Returns an immutable wave_run_id pinned to the canonical expanded board "
@@ -4520,7 +4535,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "description":
         "0e973e52 — run the project's stored test_cmd on YOUR local machine via the "
         "tunnel and return a REAL, structured result — not self-reported. "
-        "Fields: {exit_code, passed, failed, stdout_tail, stderr_tail, status, timed_out}. "
+        "Fields: {exit_code, passed, failed, stdout_tail, stderr_tail, status, timed_out, "
+        "verification_run_id}. Pass verification_run_id to complete_wave_gate — the "
+        "server-recorded run, not a hand-typed result, is what unlocks a wave gate "
+        "(0ff5e59f). "
         "Returns {status: 'not_configured'} (never an error) when no test_cmd is set; "
         "call set_executor_config(test_cmd='pixi run test') first. "
         "Requires an active `meridian --tunnel`; the hosted server has no access to "
