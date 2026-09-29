@@ -1657,6 +1657,8 @@ async def handle_complete_sprint_item(
         _board_change_for_session,
         _close_or_propose_github_issue,
     )
+    from ... import gate_override as _gate_override_mod  # noqa: PLC0415
+    from ...db import sprint_items as _sprint_items_mod  # noqa: PLC0415
     # a2a027cf — correlation id: caller-supplied (threaded down from the
     # dispatch layer / an HTTP request id when available) or freshly minted
     # here so it exists even when this handler is invoked directly (tests,
@@ -1937,7 +1939,6 @@ async def handle_complete_sprint_item(
                     "auditable."
                 ),
             }
-        from meridian import gate_override as _gate_override_mod  # noqa: PLC0415
         _ci_audit = await _gate_override_mod.record_override_audit(
             db, _gate_override_mod.CI_OVERRIDE_EVENT_TYPE, args["project_id"],
             subject_id=args["item_id"], actor=_complete_actor,
@@ -2121,6 +2122,29 @@ async def handle_complete_sprint_item(
                     "message": _tr_check.get("message"),
                 }
 
+    # 275a8631 — the artifact-pointer gate (opt-in per item) is enforced inside
+    # db.complete_sprint_item; the only way past it is a HUMAN-approved override.
+    # Parse the request here: reason is mandatory, and the approval (a
+    # require_human gate-override HITL a human answered Yes) is verified, spent
+    # and audited by the DB layer only if the gate actually blocks this item.
+    _ap_override_requested = bool(args.get("override_artifact_pointer"))
+    _ap_override_reason = (args.get("override_reason") or "").strip()
+    _ap_override_hitl_id = (args.get("override_hitl_id") or "").strip() or None
+    _ap_override: dict[str, Any] | None = None
+    if _ap_override_requested:
+        if not _ap_override_reason:
+            return {
+                "error": "OVERRIDE_REASON_REQUIRED",
+                "item_id": args["item_id"],
+                "message": (
+                    "override_artifact_pointer=true requires a non-empty "
+                    "override_reason — an override with no stated reason is not "
+                    "auditable and is refused."
+                ),
+            }
+        if _ap_override_hitl_id is not None:
+            _ap_override = {"reason": _ap_override_reason, "hitl_id": _ap_override_hitl_id}
+
     # 5823db0b — quality gate + actor attribution. Pass evidence notes and
     # the completing actor; surface the required_notes gate as a clean error.
     try:
@@ -2146,10 +2170,70 @@ async def handle_complete_sprint_item(
             # completion through.
             override_reason=args.get("override_reason"),
             tenant_id=(tenant or {}).get("id"),
+            artifact_pointer_override=_ap_override,
             # a2a027cf — threaded through so DB-level phase timings/logs and
             # this handler's response agree on one id for the whole call.
             correlation_id=_correlation_id,
         )
+    except _sprint_items_mod.SprintItemArtifactPointerRequired as exc:
+        _ap_verdict = exc.verdict or {}
+        _ap_detail = {
+            "triggers": _ap_verdict.get("triggers"),
+            "warning_code": _ap_verdict.get("warning_code"),
+            "required_remediation": _ap_verdict.get("required_remediation"),
+            "classification": (_ap_verdict.get("classification") or {}).get("classification"),
+            "policy": _ap_verdict.get("policy"),
+        }
+        if _ap_override_requested and _ap_override is None:
+            # Override asked for but no approval yet: file the require_human
+            # approval request (cannot be auto-answered) and say how to proceed.
+            try:
+                _ap_hitl = await _gate_override_mod.request_gate_override_hitl(
+                    db, args["project_id"],
+                    gate=_gate_override_mod.GATE_ARTIFACT_POINTER,
+                    subject_id=args["item_id"], reason=_ap_override_reason,
+                    description=(
+                        f"An executor wants to complete sprint item {args['item_id']!r} "
+                        "without the exact output pointer its artifact policy "
+                        f"requires ({', '.join(_ap_detail['triggers'] or [])}; "
+                        f"{_ap_detail['warning_code']})."
+                    ),
+                    session_id=_complete_session_id or None,
+                    requested_by=_complete_actor,
+                )
+            except ValueError as hitl_exc:
+                return {"error": str(hitl_exc), "item_id": args["item_id"]}
+            return {
+                "error": "HUMAN_APPROVAL_REQUIRED",
+                "item_id": args["item_id"],
+                "hitl_id": _ap_hitl.get("id"),
+                "gate": _gate_override_mod.GATE_ARTIFACT_POINTER,
+                "artifact_pointer": _ap_detail,
+                "correlation_id": _correlation_id,
+                "message": (
+                    "Completing this item without its required output pointer "
+                    "needs a human's approval. A require_human HITL "
+                    f"({_ap_hitl.get('id')}) was filed — it cannot be "
+                    "auto-answered. Once a human answers it Yes, retry "
+                    "complete_sprint_item with the same arguments plus "
+                    "override_hitl_id=<that id>. Preferred: attach the exact "
+                    "output pointer instead."
+                ),
+            }
+        return {
+            "error": "ARTIFACT_POINTER_REQUIRED",
+            "item_id": args["item_id"],
+            "artifact_pointer": _ap_detail,
+            "correlation_id": _correlation_id,
+            "message": str(exc),
+        }
+    except _gate_override_mod.GateOverrideError as exc:
+        return {
+            "error": exc.code,
+            "item_id": args["item_id"],
+            "correlation_id": _correlation_id,
+            "message": str(exc),
+        }
     except db_module.SprintItemEvidenceRequired as exc:
         return {
             "error": "EVIDENCE_REQUIRED",

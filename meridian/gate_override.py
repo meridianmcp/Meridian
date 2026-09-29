@@ -54,9 +54,11 @@ GATE_OVERRIDE_HITL_KIND = "gate_override"
 #: Stable gate identifiers (bound into the HITL payload so an approval for one
 #: gate/subject can never be replayed against another).
 GATE_WAVE_GATE_UNBOUND_PAYLOAD = "wave_gate_unbound_payload"
+GATE_ARTIFACT_POINTER = "artifact_pointer"
 
 #: ``action_audit_log.event_type`` values written by :func:`record_override_audit`.
 WAVE_GATE_UNBOUND_PAYLOAD_EVENT_TYPE = "wave_gate_unbound_payload_override"
+ARTIFACT_POINTER_OVERRIDE_EVENT_TYPE = "sprint_item_artifact_pointer_override"
 CI_OVERRIDE_EVENT_TYPE = "sprint_item_ci_override"
 FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE = "sprint_item_foreign_claim_override"
 PROSPECT_BYPASS_OVERRIDE_EVENT_TYPE = "sprint_item_prospect_bypass_override"
@@ -193,6 +195,12 @@ async def request_gate_override_hitl(
     existing = await _find_pending_override_hitl(db, project_id, gate, subject_id, text)
     if existing is not None:
         return existing
+    # hitl_requests.session_id is a foreign key: an unregistered id (a caller
+    # passing an arbitrary label) must not turn "ask a human" into a crash.
+    if session_id:
+        async with db.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)) as cur:
+            if await cur.fetchone() is None:
+                session_id = None
     question = (
         f"Approve gate override? Gate: {gate}. Subject: {subject_id}. "
         f"{description} Requested reason: {text}. "

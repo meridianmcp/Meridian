@@ -2285,6 +2285,139 @@ async def _check_stored_evidence(
 _VALID_GITHUB_ISSUE_SOURCES = {"meridian_auto", "manual"}
 
 
+class SprintItemArtifactPointerRequired(ValueError):
+    """275a8631 — raised by :func:`complete_sprint_item` when an item opted into
+    artifact-pointer enforcement (``artifact_policy.artifact_pointer_check ==
+    "strict"``, or ``require_exact_figure_output_pointer`` /
+    ``require_exact_table_output_pointer``) and is figure/table work with no
+    exact output pointer on file. ``verdict`` is the full
+    :func:`evaluate_artifact_pointer_gate` result (triggers, warning_code,
+    remediation, classification, policy) for a structured error response."""
+
+    def __init__(self, message: str, verdict: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.verdict = verdict or {}
+
+
+async def evaluate_artifact_pointer_gate(
+    db: aiosqlite.Connection, item: dict[str, Any],
+) -> dict[str, Any] | None:
+    """275a8631 — the completion-time artifact-pointer verdict for ONE item, or
+    ``None`` when the gate does not apply (the item did not opt in).
+
+    Until this gate existed ``artifact_pointer_check="strict"`` and
+    ``require_exact_figure/table_output_pointer`` only changed what a HANDOFF
+    said (``pointers.evaluate_artifact_pointer_policy`` marks the item
+    non-executable in the /goal block); nothing stopped ``complete_sprint_item``
+    from marking a strict item done with no output pointer, and the MCP schema
+    text claimed a block that did not exist.
+
+    OPT-IN ONLY, so no behavior changes for an item that did not declare a
+    policy: an item with no ``artifact_policy`` resolves to the project default
+    (``artifact_pointer_check="warn"``, every flag false) and returns ``None``
+    here, as does ``artifact_pointer_check="off"`` ("off = no enforcement",
+    which also switches off the two ``require_exact_*`` flags). Otherwise the
+    item is judged by the SAME classifier and pointer-sufficiency rules the
+    handoff already uses — never a second definition of "exact":
+
+    * ``strict``: the gate fails when
+      :func:`meridian.pointers.evaluate_artifact_pointer_policy` says
+      ``ready=False`` (figure/table-sensitive work whose only candidate
+      pointers are missing, a bare .docx, a directory, a generic reference or
+      an unsupported type).
+    * ``require_exact_figure_output_pointer`` / ``..._table_...``: the gate
+      fails when the item classifies as that kind and no candidate output
+      pointer resolves to a concrete file of that kind.
+
+    Candidate pointers are ``planned_output`` targets, the item's durable
+    ``sprint_item_pointers`` rows (loaded here — the DB row itself does not
+    carry them) and ``file:`` ``touches_resources`` entries. Fails CLOSED if the
+    pointer rows cannot be loaded (an enforced gate that silently skips on a DB
+    hiccup is the failure mode this item exists to remove); only opted-in items
+    ever reach that query.
+
+    Returns ``{"applicable": True, "ok": bool, ...}``; when ``ok`` is False it
+    also carries ``code``, ``triggers``, ``warning_code``, ``required_remediation``,
+    ``classification``, ``policy`` and a ready-to-show ``message``.
+    """
+    from .. import artifact_classification as _ac  # noqa: PLC0415 — avoid import cycle
+    from .. import pointers as _pointers  # noqa: PLC0415
+
+    if not isinstance(item, dict) or not item.get("id"):
+        return None
+    policy = _artifact_declaration.effective_artifact_policy(item)
+    level = policy.get("artifact_pointer_check")
+    require_figure = bool(policy.get("require_exact_figure_output_pointer"))
+    require_table = bool(policy.get("require_exact_table_output_pointer"))
+    strict = level == "strict"
+    if level == "off" or not (strict or require_figure or require_table):
+        return None
+
+    stored = await get_sprint_item_pointers(db, item["id"])
+    enriched = dict(item)
+    enriched["pointer_records"] = [
+        {"id": p.get("id"), "targets": p.get("targets") or []}
+        for p in stored if isinstance(p, dict)
+    ]
+    classification = _ac.classify_artifact_work(enriched)
+    kind = classification.get("classification")
+
+    triggers: list[str] = []
+    warning_code: str | None = None
+    remediation: str | None = None
+    if strict:
+        verdict = _pointers.evaluate_artifact_pointer_policy(enriched)
+        if not verdict.get("ready", True):
+            triggers.append("artifact_pointer_check=strict")
+            warning_code = verdict.get("warning_code")
+            remediation = verdict.get("required_remediation")
+    for flag, want, enabled in (
+        ("require_exact_figure_output_pointer", "figure", require_figure),
+        ("require_exact_table_output_pointer", "table", require_table),
+    ):
+        if not enabled or kind != want:
+            continue
+        have_exact = any(
+            _ac._classify_uri(uri) == want  # noqa: SLF001 — same-package rule reuse
+            for uri, _source, _pid in _ac._iter_candidate_uris(enriched)  # noqa: SLF001
+        )
+        if have_exact:
+            continue
+        triggers.append(flag)
+        if warning_code is None:
+            warning_code, _affected = _ac.artifact_pointer_insufficiency_evidence(enriched)
+            warning_code = warning_code or _ac.INSUFFICIENT_MISSING_POINTER
+            remediation = _ac._INSUFFICIENCY_REMEDIATION.get(  # noqa: SLF001
+                warning_code,
+                _ac._INSUFFICIENCY_REMEDIATION[_ac.INSUFFICIENT_MISSING_POINTER],  # noqa: SLF001
+            )
+
+    result: dict[str, Any] = {
+        "applicable": True,
+        "ok": not triggers,
+        "policy": policy,
+        "classification": classification,
+    }
+    if triggers:
+        result.update({
+            "code": "ARTIFACT_POINTER_REQUIRED",
+            "triggers": triggers,
+            "warning_code": warning_code,
+            "required_remediation": remediation,
+            "message": (
+                f"item {item['id']} is {kind} work under an enforced artifact "
+                f"policy ({', '.join(triggers)}) but has no exact output pointer "
+                f"on file ({warning_code}). {remediation} Attach the pointer "
+                "(planned_output or add_sprint_item_pointer) and retry. Only a "
+                "human-approved override can complete it without one: "
+                "override_artifact_pointer=true + override_reason + "
+                "override_hitl_id (the first call files the require_human "
+                "approval request)."
+            ),
+        })
+    return result
+
+
 async def link_sprint_item_github_issue(
     db: aiosqlite.Connection,
     project_id: str,
@@ -2394,8 +2527,20 @@ async def complete_sprint_item(
     exit_code: int | None = None,
     override_reason: str | None = None,
     tenant_id: str | None = None,
+    artifact_pointer_override: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
+
+    275a8631 — artifact-pointer gate (OPT-IN per item): an item whose
+    ``artifact_policy`` sets ``artifact_pointer_check="strict"`` or a
+    ``require_exact_figure/table_output_pointer`` flag is refused with
+    :class:`SprintItemArtifactPointerRequired` while it is figure/table work
+    with no exact output pointer (see :func:`evaluate_artifact_pointer_gate`).
+    Items that never declared such a policy are unaffected. The only way past
+    it is ``artifact_pointer_override={"reason": ..., "hitl_id": ...}`` — a
+    non-empty reason plus a human-answered, ``require_human`` gate-override HITL
+    (spent and audited BEFORE the transition, like the wave-gate override); the
+    returned row then carries ``artifact_pointer_override``.
 
     0ff5e59f — ``force_foreign_claim`` is now an AUDITED override: when it is
     what lets a completion through (a live, non-stale claim held by a different
@@ -2599,6 +2744,7 @@ async def complete_sprint_item(
     _stored_evidence_warning: str | None = None
     _blocker_kind_completion_warning: str | None = None
     _foreign_claim_override: dict[str, Any] | None = None
+    _artifact_pointer_override_record: dict[str, Any] | None = None
     if item is not None and item.get("project_id") == project_id:
         # 07229675 — WARN-ONLY blocker_kind re-check at completion time.
         # claim_sprint_item hard-gates blocker_kind in ('superseded',
@@ -2831,6 +2977,43 @@ async def complete_sprint_item(
             )
         except Exception:  # noqa: BLE001 — never block completion
             _stored_evidence_warning = None
+        # 275a8631 — opt-in artifact-pointer gate. Deliberately the LAST gate
+        # before the transition, so a human approval spent on an override is
+        # never burned by an earlier gate refusing the same call. A None verdict
+        # (item did not opt in) costs nothing and changes nothing.
+        _ap_verdict = await evaluate_artifact_pointer_gate(db, item)
+        if _ap_verdict is not None and not _ap_verdict["ok"]:
+            if artifact_pointer_override is None:
+                raise SprintItemArtifactPointerRequired(
+                    _ap_verdict["message"], _ap_verdict
+                )
+            from .. import gate_override as _gate_override  # noqa: PLC0415
+            _ap_reason = _gate_override.require_override_reason(
+                artifact_pointer_override.get("reason"),
+                flag="override_artifact_pointer",
+            )
+            _ap_approval = await _gate_override.consume_gate_override_approval(
+                db, project_id, artifact_pointer_override.get("hitl_id"),
+                gate=_gate_override.GATE_ARTIFACT_POINTER, subject_id=item_id,
+                consumed_by=(actor or None),
+            )
+            _ap_audit = await _gate_override.record_override_audit(
+                db, _gate_override.ARTIFACT_POINTER_OVERRIDE_EVENT_TYPE, project_id,
+                subject_id=item_id, actor=(actor or None), reason=_ap_reason,
+                tenant_id=tenant_id,
+                extra={
+                    "hitl_id": _ap_approval["hitl_id"],
+                    "triggers": _ap_verdict.get("triggers"),
+                    "warning_code": _ap_verdict.get("warning_code"),
+                },
+            )
+            _artifact_pointer_override_record = {
+                "reason": _ap_reason,
+                "hitl_id": _ap_approval["hitl_id"],
+                "audit_id": (_ap_audit or {}).get("id"),
+                "triggers": _ap_verdict.get("triggers"),
+                "warning_code": _ap_verdict.get("warning_code"),
+            }
     _mark_phase("evidence_check")
     _completion_outcome: str | None = None
     try:
@@ -2919,6 +3102,8 @@ async def complete_sprint_item(
         result = dict(result)
         if _foreign_claim_override:
             result["foreign_claim_override"] = _foreign_claim_override
+        if _artifact_pointer_override_record:
+            result["artifact_pointer_override"] = _artifact_pointer_override_record
         if _advisory_deferred:
             result["advisory_work_deferred"] = True
             # 394bcbdf — resource-aware diagnostic: best-effort self-sample

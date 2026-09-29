@@ -271,18 +271,32 @@ _PLANNED_OUTPUT_SCHEMA: dict[str, Any] = {
 _ARTIFACT_POLICY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": (
-        "2f9cb288 — per-item override of how strictly a missing/wrong artifact "
-        "output pointer is enforced. Absent (omit, or on update_sprint_item pass "
-        "null to clear) falls back to the project default: artifact_pointer_check="
-        "'warn', every guard flag false — never a silent 'off', never a silent "
-        "'strict'. See meridian.artifact_declaration.effective_artifact_policy."
+        "2f9cb288 / 275a8631 — per-item, OPT-IN override of how strictly a "
+        "missing/wrong artifact output pointer is enforced. Absent (omit, or on "
+        "update_sprint_item pass null to clear) falls back to the project default: "
+        "artifact_pointer_check='warn', every guard flag false — never a silent "
+        "'off', never a silent 'strict'; an item that declares no policy is never "
+        "blocked. ENFORCEMENT (275a8631): complete_sprint_item refuses (error "
+        "ARTIFACT_POINTER_REQUIRED) a figure/table item under 'strict' or a "
+        "require_exact_* flag that has no EXACT output pointer — a planned_output "
+        "target, a sprint_item_pointer, or a file: touches_resources entry whose uri "
+        "is a concrete figure file (.png/.jpg/.jpeg/.gif/.svg/.webp/.tif/.tiff/.eps/"
+        ".bmp) or table file (.csv/.tsv/.xlsx/.xls); a bare .docx, a directory or a "
+        "generic mcp_tool:/db:/route: reference does not count. Whether an item is "
+        "figure/table work is the classifier's verdict (declared artifact_kind, else "
+        "title/notes/pointer evidence) — a policy flag can never talk an item out of "
+        "it. The only way past the block is a human-approved override "
+        "(override_artifact_pointer + override_reason + override_hitl_id on "
+        "complete_sprint_item). See meridian.artifact_declaration."
+        "effective_artifact_policy and meridian.db.sprint_items."
+        "evaluate_artifact_pointer_gate."
     ),
     "properties": {
         "artifact_pointer_check": {"type": "string", "enum": ["off", "warn", "strict"],
-            "description": "off = no enforcement; warn = surface but don't block (default); strict = block completion without a valid planned_output pointer."},
-        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, a figure-kind item must declare an exact planned_output pointer (default false)."},
-        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, a table-kind item must declare an exact planned_output pointer (default false)."},
-        "allow_document_only_override": {"type": "boolean", "description": "When true, a document_only-kind item may override/bypass the pointer check (default false)."},
+            "description": "off = no enforcement of any kind (also switches off the require_exact_* flags); warn = surface the finding in handoffs but never block (default); strict = the handoff marks the item non-executable AND complete_sprint_item refuses it (ARTIFACT_POINTER_REQUIRED) while it is figure/table work with no exact output pointer. Items that are not figure/table work (document_only, caption/equation/code-only, no signal) are unaffected."},
+        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a figure-kind item that has no exact figure-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). Default false."},
+        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a table-kind item that has no exact table-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). Default false."},
+        "allow_document_only_override": {"type": "boolean", "description": "Reserved — currently NOT consulted by any enforcement path (a figure/table item can never self-declare its way out of the pointer check, and a document_only-kind item is never pointer-checked in the first place). Stored and echoed only. Default false."},
     },
 }
 
@@ -3073,7 +3087,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "is availability_policy='required' and code-intel itself is unavailable. Pass "
         "override_code_intel_receipt=true with a non-empty override_reason to acknowledge and "
         "complete anyway (audited). 'optional'/'degraded_ok' policies never block — they degrade "
-        "with a code_intel_receipt_warning on the returned item instead.",
+        "with a code_intel_receipt_warning on the returned item instead. "
+        "275a8631 — ARTIFACT-POINTER gate (OPT-IN per item): if the item's policy "
+        "(update_sprint_item policy=...) sets artifact_pointer_check='strict' or "
+        "require_exact_figure/table_output_pointer, completion is refused "
+        "(ARTIFACT_POINTER_REQUIRED, with an artifact_pointer detail block) while the item "
+        "is figure/table work with no exact output pointer on file. Items with no such "
+        "policy are unaffected. The only way past it is a HUMAN-approved override: pass "
+        "override_artifact_pointer=true + override_reason; the first call files a "
+        "require_human gate-override HITL (it cannot be auto-answered) and returns "
+        "HUMAN_APPROVAL_REQUIRED with its id; after a human answers Yes, retry with "
+        "override_hitl_id. The approval is single-use, bound to this item, and audited.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -3085,10 +3109,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
          "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."},
          "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit, AUDITED override (0ff5e59f): it must be paired with a non-empty override_reason in the SAME call or the completion is refused (CLAIM_MISMATCH), and an action_audit_log row is written. Never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "override_artifact_pointer": {"type": "boolean", "description": "275a8631 — request the HUMAN-approved override of an ARTIFACT_POINTER_REQUIRED rejection. Requires override_reason. The first call files a require_human gate-override HITL and returns HUMAN_APPROVAL_REQUIRED + hitl_id; after a human answers Yes, retry with override_hitl_id. Ignored when the gate does not block this item."},
+         "override_hitl_id": {"type": "string", "description": "275a8631 — id of the answered (Yes) gate-override HITL a human approved for THIS item's artifact-pointer override. Single-use; bound to this item."},
          "override_ci": {"type": "boolean", "description": "427b7902 — explicit override of a CI_FAILING rejection (GitHub Actions is genuinely failing for the commit named in the notes). 0ff5e59f — must be paired with a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise); audited to action_audit_log."},
          "strict_evidence": {"type": "boolean", "description": "5fe3502e — opt in to the STRICT, fail-closed evidence gate for THIS call only (see meridian.sprint_evidence_guard). Omit/false preserves the exact pre-existing advisory-only behavior. Equivalent, persistent alternative: update_sprint_item(require_strict_evidence=true)."},
          "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit, audited override of a STRICT_EVIDENCE_BLOCKED rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Never inferred; omit/false for normal strict behavior."},
-         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside ANY override flag (override_strict_evidence, override_code_intel_receipt, override_test_run_receipt, override_ci, force_foreign_claim): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
+         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside ANY override flag (override_strict_evidence, override_code_intel_receipt, override_test_run_receipt, override_ci, force_foreign_claim, override_artifact_pointer): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
          "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit, audited override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Only relevant for a project that declared the 'code_intel_prospecting' capability."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
