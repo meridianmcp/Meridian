@@ -136,28 +136,25 @@ def test_find_npx_windows_last_resort_literal(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _download_codebase_memory_mcp — "no suitable asset" branch (436-441)
+# _download_codebase_memory_mcp — "no pinned build for this platform" branch
+# (f66e8f23: replaces the old "no suitable asset" heuristic branch)
 # ---------------------------------------------------------------------------
 
 def test_download_returns_none_when_no_suitable_asset(monkeypatch, tmp_path):
     monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
-    monkeypatch.setattr(tc, "_pick_release_asset", lambda assets: None)
+    # No pinned entry for this platform -> refuse without any network call.
+    monkeypatch.setattr(tc, "_CBM_PINNED_ASSETS", {})
+
+    client_built = []
 
     def make_client(*a, **kw):
-        class FakeResp:
-            def raise_for_status(self): pass
-            def json(self): return {"tag_name": "v1", "assets": []}
-
-        class FakeClient:
-            async def __aenter__(self): return self
-            async def __aexit__(self, *a): pass
-            async def get(self, url, **kw): return FakeResp()
-
-        return FakeClient()
+        client_built.append(True)
+        raise RuntimeError("must not touch the network when nothing is pinned")
 
     import httpx as _httpx
     monkeypatch.setattr(_httpx, "AsyncClient", make_client)
     assert asyncio.run(tc._download_codebase_memory_mcp()) is None
+    assert client_built == []
 
 
 # ---------------------------------------------------------------------------

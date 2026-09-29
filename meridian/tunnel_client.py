@@ -5364,125 +5364,240 @@ def _find_codebase_memory_mcp() -> str | None:
     return None
 
 
-def _pick_release_asset(assets: list[dict]) -> "dict | None":
-    """Pick the best GitHub release asset for the current platform and arch.
+# ---------------------------------------------------------------------------
+# codebase-memory-mcp auto-download: pinned release + SHA-256 verification
+# (f66e8f23)
+# ---------------------------------------------------------------------------
+# This used to fetch DeusData's *latest* release through the GitHub API, pick an
+# asset by filename heuristics, write the bytes to ~/.meridian/bin and later run
+# them -- with no integrity check of any kind, so whatever the latest release (or
+# a hijacked one) contained ran on the user's machine. It now downloads exactly
+# one fixed asset per platform (same tag, hard-coded name) and refuses to touch
+# the bytes unless their SHA-256 equals the pin below. Verification happens on the
+# archive as downloaded, BEFORE anything is extracted, written to disk or run, and
+# it fails closed: a mismatch, an unsupported platform, or a missing table entry
+# means no download is installed. There is deliberately NO "unpinned latest"
+# fallback; anyone who wants a different build installs codebase-memory-mcp
+# themselves (PATH or npm global), which _find_codebase_memory_mcp() honours first.
+#
+# WHERE THE PINS CAME FROM (re-derive the same way when bumping the tag):
+#   gh api repos/DeusData/codebase-memory-mcp/releases/tags/<tag> \
+#       --jq '.assets[] | "\(.digest) \(.name)"'
+# `digest` is the SHA-256 GitHub itself computed over the uploaded asset bytes.
+# v0.11.0 was published 2026-09-15 as a non-prerelease *immutable* release (its
+# assets cannot be swapped after publication). The hashes were read from that
+# API metadata only -- no release asset was downloaded, unpacked or executed to
+# produce them. Linux uses the "-portable" (fully static) archives because they
+# do not depend on the host's libc; the other platforms only ship one build.
+_CBM_REPO = "DeusData/codebase-memory-mcp"
+_CBM_PINNED_TAG = "v0.11.0"
+# (os, arch) -> (release asset name, sha256 hex digest of that archive)
+_CBM_PINNED_ASSETS: "dict[tuple[str, str], tuple[str, str]]" = {
+    ("windows", "amd64"): (
+        "codebase-memory-mcp-windows-amd64.zip",
+        "6eb6beaf261b19e419766e78baf93cbc3cf1c6338cff8fb7c0234859f96d1685",
+    ),
+    ("windows", "arm64"): (
+        "codebase-memory-mcp-windows-arm64.zip",
+        "52b29881214fce47d529e098308b1de77c40f6812e20a34d588ee4c25b84fd1a",
+    ),
+    ("darwin", "amd64"): (
+        "codebase-memory-mcp-darwin-amd64.tar.gz",
+        "dbf1c73bfcbde64e7dde4cd1320da7afc02e2c972ee1789ae039521411f5132e",
+    ),
+    ("darwin", "arm64"): (
+        "codebase-memory-mcp-darwin-arm64.tar.gz",
+        "4dee7f38b63740e6751d7a7ed7eb10291c1f2a3ea2415f599dc68370ca0a2d18",
+    ),
+    ("linux", "amd64"): (
+        "codebase-memory-mcp-linux-amd64-portable.tar.gz",
+        "1f9e8293eb2bc5c05cfa27a7e8fc033da6d729ffad525ccfcdaa3fd606306683",
+    ),
+    ("linux", "arm64"): (
+        "codebase-memory-mcp-linux-arm64-portable.tar.gz",
+        "d62eeb224d5ee3eba3070938ec62cf1033f10b041ec1c4b2fb67f7aef390cc7b",
+    ),
+}
+# Upper bound for the executable pulled out of a (hash-verified) archive.
+_CBM_MAX_BINARY_BYTES = 512 * 1024 * 1024
 
-    Hard-excludes assets for other platforms before scoring so an arch-only
-    match can never cause a cross-platform download (e.g. darwin-amd64 on
-    Windows when no windows asset is present).
-    """
+
+def _cbm_platform_key() -> "tuple[str, str] | None":
+    """Return the ``(os, arch)`` key of this machine in the pin table's
+    vocabulary, or None when the OS or CPU architecture is not one we pin."""
     import platform as _platform
 
-    machine = _platform.machine().lower()
-    is_arm = machine in ("arm64", "aarch64")
-
     if sys.platform == "win32":
-        os_kws = ["win", "windows"]
-        os_exclude = ["linux", "darwin", "macos", "mac", "apple"]
+        os_key = "windows"
     elif sys.platform == "darwin":
-        os_kws = ["darwin", "macos", "mac", "apple"]
-        # "win" is a substring of "darwin" — never use it as an exclusion keyword here
-        os_exclude = ["linux", "windows", "msvc"]
+        os_key = "darwin"
+    elif sys.platform.startswith("linux"):
+        os_key = "linux"
     else:
-        os_kws = ["linux"]
-        os_exclude = ["darwin", "macos", "mac", "apple", "windows", "win"]
-
-    arch_kws = ["aarch64", "arm64"] if is_arm else ["x86_64", "amd64", "x64"]
-
-    def _score(name: str) -> int:
-        n = name.lower()
-        # Hard-exclude wrong-platform assets — never download a binary that
-        # won't run on this OS, even if the arch matches.
-        if any(kw in n for kw in os_exclude):
-            return -100
-        s = 0
-        for kw in os_kws:
-            if kw in n:
-                s += 10
-                break
-        for kw in arch_kws:
-            if kw in n:
-                s += 5
-                break
-        if sys.platform == "win32" and n.endswith(".exe"):
-            s += 3
-        elif sys.platform != "win32" and not any(n.endswith(e) for e in (".exe", ".zip", ".tar.gz", ".tgz")):
-            s += 1
-        if any(n.endswith(e) for e in (".tar.gz", ".tgz", ".zip")):
-            s -= 5
-        return s
-
-    candidates = [
-        (a, _score(a["name"]))
-        for a in assets
-        if a.get("name") and a.get("browser_download_url")
-    ]
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    if not candidates or candidates[0][1] <= 0:
         return None
-    return candidates[0][0]
+    machine = _platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        arch_key = "arm64"
+    elif machine in ("x86_64", "amd64", "x64"):
+        arch_key = "amd64"
+    else:
+        return None
+    return os_key, arch_key
+
+
+def _cbm_sha256_matches(data: bytes, expected_hex: str) -> bool:
+    """Constant-time comparison of ``sha256(data)`` against a pinned hex digest."""
+    import hashlib
+    import hmac
+
+    return hmac.compare_digest(
+        hashlib.sha256(data).hexdigest(), str(expected_hex).strip().lower()
+    )
+
+
+def _extract_cbm_binary(archive: bytes, asset_name: str, bin_name: str) -> "bytes | None":
+    """Return the bytes of the ``bin_name`` executable inside *archive*, or None.
+
+    Only call this on an archive whose SHA-256 already matched its pin. Every
+    other member (the release ships install scripts and docs next to the
+    executable) is ignored, and no member name is ever used to build a
+    filesystem path, so a crafted archive cannot write outside ``dest`` (no
+    path traversal, no symlink/hardlink following, nothing is extracted to disk
+    here at all). Directory, link and device members are skipped, and the
+    executable's size is capped so the in-memory read stays bounded.
+    """
+    import io
+    import posixpath
+
+    limit = _CBM_MAX_BINARY_BYTES
+    if asset_name.endswith(".zip"):
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                if posixpath.basename(info.filename.replace("\\", "/")) != bin_name:
+                    continue
+                if info.file_size > limit:
+                    return None
+                with zf.open(info) as fh:
+                    data = fh.read(limit + 1)
+                return data if len(data) <= limit else None
+        return None
+    if asset_name.endswith((".tar.gz", ".tgz")):
+        import tarfile
+
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                if posixpath.basename(member.name) != bin_name:
+                    continue
+                if member.size > limit:
+                    return None
+                fh = tf.extractfile(member)
+                if fh is None:
+                    return None
+                data = fh.read(limit + 1)
+                return data if len(data) <= limit else None
+        return None
+    return None
 
 
 async def _download_codebase_memory_mcp() -> "str | None":
-    """Download the latest codebase-memory-mcp release for this platform.
+    """Download the *pinned* codebase-memory-mcp release for this platform.
 
-    Saves to ~/.meridian/bin/ and makes the file executable. Returns the path
-    on success, None on failure (error printed to stderr).
+    f66e8f23 -- fetches the fixed asset from ``_CBM_PINNED_ASSETS``, verifies its
+    SHA-256 against the pin BEFORE extracting or writing anything, then installs
+    only the executable to ~/.meridian/bin/ (atomically) and marks it
+    executable. Returns the path on success, None on any failure (error printed
+    to stderr). Fails closed: an unsupported platform, a download error, a hash
+    mismatch, or an archive without the executable all leave nothing installed.
     """
+    import platform as _platform
+
     import httpx
 
-    bin_dir = _managed_bin_dir()
-    bin_dir.mkdir(parents=True, exist_ok=True)
     bin_name = "codebase-memory-mcp.exe" if sys.platform == "win32" else "codebase-memory-mcp"
-    dest = bin_dir / bin_name
+
+    key = _cbm_platform_key()
+    pin = _CBM_PINNED_ASSETS.get(key) if key is not None else None
+    if pin is None:
+        print(
+            "  code-intel: no verified codebase-memory-mcp build is pinned for this "
+            f"platform ({sys.platform}/{_platform.machine() or 'unknown'}) -- refusing to "
+            "download an unverified binary. Install codebase-memory-mcp manually "
+            "(e.g. `npm install -g codebase-memory-mcp`) and re-run `meridian --tunnel`.",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    asset_name, expected_sha256 = pin
 
     print("  code-intel: codebase-memory-mcp not found — downloading from GitHub...", flush=True)
 
-    api_url = "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
+    url = f"https://github.com/{_CBM_REPO}/releases/download/{_CBM_PINNED_TAG}/{asset_name}"
+    tmp: "Path | None" = None
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            r = await client.get(api_url, headers={"Accept": "application/vnd.github+json"})
-            r.raise_for_status()
-            release = r.json()
-
-        assets = release.get("assets", [])
-        asset = _pick_release_asset(assets)
-        if asset is None:
-            print(
-                "  code-intel: no suitable binary found in the GitHub release — "
-                "install codebase-memory-mcp manually and re-run `meridian --tunnel`.",
-                file=sys.stderr, flush=True,
-            )
-            return None
-
-        version = release.get("tag_name", "unknown")
-        print(f"  code-intel: downloading {asset['name']} ({version})...", flush=True)
-
+        print(f"  code-intel: downloading {asset_name} ({_CBM_PINNED_TAG})...", flush=True)
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            r = await client.get(asset["browser_download_url"])
+            r = await client.get(url)
             r.raise_for_status()
-            dest.write_bytes(r.content)
+            archive = r.content
 
-        # Sanity-check: a real binary should be well over 1 MB. A redirect page
-        # or partial download will be tiny — reject it so we don't silently cache
-        # a broken file that produces "path not found" on every tunnel start.
-        if dest.stat().st_size < 1_000_000:
-            dest.unlink(missing_ok=True)
+        # Integrity gate: nothing below runs unless the bytes are exactly the
+        # pinned release asset. (Constant-time compare; never extract first.)
+        if not _cbm_sha256_matches(archive, expected_sha256):
+            import hashlib
+
             print(
-                f"  code-intel: downloaded file is too small ({dest.stat().st_size if dest.exists() else 0} bytes) "
-                "— likely a corrupt download. Try: npm install -g codebase-memory-mcp",
+                f"  code-intel: SHA-256 MISMATCH for {asset_name} ({_CBM_PINNED_TAG}): "
+                f"expected {expected_sha256}, got {hashlib.sha256(archive).hexdigest()}. "
+                "Refusing to install or run it. Install codebase-memory-mcp manually "
+                "and re-run `meridian --tunnel`.",
                 file=sys.stderr, flush=True,
             )
             return None
 
+        binary = _extract_cbm_binary(archive, asset_name, bin_name)
+        if binary is None:
+            print(
+                f"  code-intel: verified archive {asset_name} does not contain a usable "
+                f"'{bin_name}' executable -- refusing to install.",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
+        # Sanity-check: a real binary should be well over 1 MB. Cheap defence
+        # against a wrongly-pinned (e.g. checksums-only) asset.
+        if len(binary) < 1_000_000:
+            print(
+                f"  code-intel: extracted executable is too small ({len(binary)} bytes) "
+                "— likely the wrong file. Try: npm install -g codebase-memory-mcp",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
+        bin_dir = _managed_bin_dir()
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        dest = bin_dir / bin_name
+        # Write next to the destination then rename, so a crash mid-write can
+        # never leave a truncated file where _find_codebase_memory_mcp() looks.
+        tmp = bin_dir / f"{bin_name}.{os.getpid()}.part"
+        tmp.write_bytes(binary)
         if sys.platform != "win32":
-            dest.chmod(dest.stat().st_mode | 0o111)  # make executable
+            tmp.chmod(tmp.stat().st_mode | 0o111)  # make executable
+        os.replace(tmp, dest)
+        tmp = None
 
         print(f"  code-intel: installed to {dest}", flush=True)
         return str(dest)
     except Exception as exc:
         print(f"  code-intel: download failed ({exc})", file=sys.stderr, flush=True)
         return None
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 async def _ensure_codebase_memory_mcp() -> "str | None":

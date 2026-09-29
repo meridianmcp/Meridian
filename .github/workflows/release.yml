@@ -188,6 +188,44 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist-artifacts
+      # f66e8f23 — publish SHA-256 checksums for every binary this release ships.
+      # install.sh / install.ps1 / scripts/install-windows.ps1 download SHA256SUMS
+      # from the same release and refuse to install or run a binary whose hash is
+      # not listed (they fail closed). The hashes are computed here over the exact
+      # files that are uploaded below, in `sha256sum` format ("<hex>  <basename>"),
+      # so `sha256sum -c SHA256SUMS` also works for a manual download. The asset
+      # list below MUST stay in sync with the `files:` list of the next step
+      # (tests/test_f66e8f23_download_integrity.py pins this). A platform that did
+      # not build is skipped, mirroring fail_on_unmatched_files: false.
+      # NOTE: this proves the bytes match what the release workflow produced; it
+      # does not authenticate the workflow itself -- detached signing of the
+      # release assets is a separate follow-up.
+      - name: Generate SHA256SUMS for every release binary
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          : > release-assets/SHA256SUMS
+          for f in \
+            dist-artifacts/meridian-windows/meridian.exe \
+            dist-artifacts/meridian-tray-windows/meridian-tray.exe \
+            dist-artifacts/meridian-tray-mac/meridian-tray-mac.zip \
+            dist-artifacts/meridian-linux/meridian-linux \
+            dist-artifacts/meridian-mac-arm64/meridian-mac-arm64 \
+            dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux \
+            dist-artifacts/meridian-connect-aarch64-apple-darwin/meridian-connect-aarch64-apple-darwin \
+            dist-artifacts/meridian-connect-x86_64-windows.exe/meridian-connect-x86_64-windows.exe
+          do
+            if [ -f "$f" ]; then
+              (cd "$(dirname "$f")" && sha256sum "$(basename "$f")") >> release-assets/SHA256SUMS
+            else
+              echo "::warning::not checksummed (artifact missing, will not be released): $f"
+            fi
+          done
+          if [ ! -s release-assets/SHA256SUMS ]; then
+            echo "::error::no release binaries were found to checksum"
+            exit 1
+          fi
+          cat release-assets/SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -204,6 +242,7 @@ jobs:
             dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux
             dist-artifacts/meridian-connect-aarch64-apple-darwin/meridian-connect-aarch64-apple-darwin
             dist-artifacts/meridian-connect-x86_64-windows.exe/meridian-connect-x86_64-windows.exe
+            release-assets/SHA256SUMS
           generate_release_notes: true
 
   docker-publish:

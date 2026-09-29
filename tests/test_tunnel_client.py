@@ -1184,74 +1184,11 @@ def test_find_codebase_memory_mcp_npm_global_cmd_on_windows(monkeypatch, tmp_pat
 
 
 # ---------------------------------------------------------------------------
-# _pick_release_asset
+# Pinned-release selection (f66e8f23). The old _pick_release_asset() heuristic
+# scored the *latest* release's assets by filename; it was replaced by the
+# hard-coded _CBM_PINNED_ASSETS table, covered in
+# tests/test_f66e8f23_download_integrity.py.
 # ---------------------------------------------------------------------------
-
-_FAKE_ASSETS = [
-    {"name": "codebase-memory-mcp-x86_64-pc-windows-msvc.exe", "browser_download_url": "https://gh/win.exe"},
-    {"name": "codebase-memory-mcp-x86_64-unknown-linux-musl",  "browser_download_url": "https://gh/linux"},
-    {"name": "codebase-memory-mcp-aarch64-apple-darwin",        "browser_download_url": "https://gh/mac-arm"},
-    {"name": "codebase-memory-mcp-x86_64-apple-darwin",         "browser_download_url": "https://gh/mac-x64"},
-    {"name": "codebase-memory-mcp-source.tar.gz",               "browser_download_url": "https://gh/src.tar.gz"},
-]
-
-
-def test_pick_release_asset_windows(monkeypatch):
-    monkeypatch.setattr(tc.sys, "platform", "win32")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "AMD64")
-    asset = tc._pick_release_asset(_FAKE_ASSETS)
-    assert asset is not None
-    assert asset["name"].endswith(".exe")
-
-
-def test_pick_release_asset_windows_never_picks_darwin(monkeypatch):
-    """Core regression: darwin-amd64 must NOT be selected on Windows even if
-    no Windows asset exists — arch match alone must not beat hard OS exclusion."""
-    monkeypatch.setattr(tc.sys, "platform", "win32")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "AMD64")
-    darwin_only = [
-        {"name": "codebase-memory-mcp-x86_64-apple-darwin",
-         "browser_download_url": "https://gh/mac-x64"},
-        {"name": "codebase-memory-mcp-aarch64-apple-darwin",
-         "browser_download_url": "https://gh/mac-arm"},
-    ]
-    assert tc._pick_release_asset(darwin_only) is None
-
-
-def test_pick_release_asset_linux_never_picks_windows(monkeypatch):
-    monkeypatch.setattr(tc.sys, "platform", "linux")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "x86_64")
-    win_only = [
-        {"name": "codebase-memory-mcp-x86_64-pc-windows-msvc.exe",
-         "browser_download_url": "https://gh/win.exe"},
-    ]
-    assert tc._pick_release_asset(win_only) is None
-
-
-def test_pick_release_asset_linux(monkeypatch):
-    monkeypatch.setattr(tc.sys, "platform", "linux")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "x86_64")
-    asset = tc._pick_release_asset(_FAKE_ASSETS)
-    assert asset is not None
-    assert "linux" in asset["name"]
-    assert not asset["name"].endswith(".tar.gz")
-
-
-def test_pick_release_asset_macos_arm(monkeypatch):
-    monkeypatch.setattr(tc.sys, "platform", "darwin")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "arm64")
-    asset = tc._pick_release_asset(_FAKE_ASSETS)
-    assert asset is not None
-    assert "aarch64" in asset["name"] or "arm64" in asset["name"]
-
-
-def test_pick_release_asset_returns_none_for_empty():
-    assert tc._pick_release_asset([]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1279,23 +1216,35 @@ def test_ensure_returns_none_on_download_failure(monkeypatch):
 
 
 def test_download_codebase_memory_mcp_installs_binary(monkeypatch, tmp_path):
-    """_download_codebase_memory_mcp writes binary and returns its path."""
+    """_download_codebase_memory_mcp verifies the pinned archive, extracts only the
+    executable, writes it to the managed dir and returns its path (f66e8f23)."""
+    import hashlib
+    import io
+    import tarfile
+
     monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
 
-    fake_release = {
-        "tag_name": "v1.2.3",
-        "assets": [
-            {"name": "codebase-memory-mcp-x86_64-unknown-linux-musl",
-             "browser_download_url": "https://gh/linux"},
-        ],
-    }
     fake_content = b"\x7fELF fake binary" + b"\x00" * (1024 * 1024)  # >1MB to pass size check
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo("codebase-memory-mcp")
+        info.size = len(fake_content)
+        tf.addfile(info, io.BytesIO(fake_content))
+    archive = buf.getvalue()
+
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    import platform as _p
+    monkeypatch.setattr(_p, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        tc, "_CBM_PINNED_ASSETS",
+        {("linux", "amd64"): ("codebase-memory-mcp-linux-amd64-portable.tar.gz",
+                              hashlib.sha256(archive).hexdigest())},
+    )
 
     def make_mock_client(*args, **kwargs):
         class FakeResp:
             def raise_for_status(self): pass
-            def json(self): return fake_release
-            content = fake_content
+            content = archive
 
         class FakeClient:
             async def __aenter__(self): return self
@@ -1303,9 +1252,6 @@ def test_download_codebase_memory_mcp_installs_binary(monkeypatch, tmp_path):
             async def get(self, url, **kw): return FakeResp()
 
         return FakeClient()
-
-    monkeypatch.setattr(tc.sys, "platform", "linux")
-    monkeypatch.setattr(tc, "_pick_release_asset", lambda assets: assets[0])
 
     import httpx as _httpx
     monkeypatch.setattr(_httpx, "AsyncClient", make_mock_client)
