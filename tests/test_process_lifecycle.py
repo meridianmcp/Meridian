@@ -488,6 +488,43 @@ def test_windows_backend_spawn_assigns_job(monkeypatch):
     assert proc_handle_closed[1] == open_process_call[3]  # closed exactly the proc handle, not the job
 
 
+def test_windows_backend_spawn_skips_kill_on_close_when_disabled(monkeypatch):
+    """d397bb71: kill_on_job_close=False must never call
+    SetInformationJobObject at all, but the job is still created and the
+    child still assigned to it -- explicit TerminateJobObject-based teardown
+    later is unaffected either way (see WindowsJobObjectBackend's own
+    docstring)."""
+    monkeypatch.setattr(pl.subprocess, "Popen", lambda cmd, env=None, cwd=None, **kw: _FakeProc(555))
+    fake_api = _FakeKernel32()
+    backend = pl.WindowsJobObjectBackend(
+        api_loader=lambda: pl.Win32JobAPI(fake_api), kill_on_job_close=False,
+    )
+
+    handle = backend.spawn(["node", "server.js"])
+
+    assert handle.job_id is not None
+    assert handle.job_name is not None
+    kinds = [c[0] for c in fake_api.calls]
+    assert "SetInformationJobObject" not in kinds
+    assert kinds == [
+        "CreateJobObjectW", "OpenProcess", "AssignProcessToJobObject", "CloseHandle",
+    ]
+
+
+def test_windows_backend_spawn_sets_kill_on_close_by_default(monkeypatch):
+    """The default (no kill_on_job_close passed) must be unchanged from the
+    pre-d397bb71 behavior -- SetInformationJobObject still runs."""
+    monkeypatch.setattr(pl.subprocess, "Popen", lambda cmd, env=None, cwd=None, **kw: _FakeProc(556))
+    fake_api = _FakeKernel32()
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: pl.Win32JobAPI(fake_api))
+
+    handle = backend.spawn(["node", "server.js"])
+
+    assert handle.job_id is not None
+    kinds = [c[0] for c in fake_api.calls]
+    assert "SetInformationJobObject" in kinds
+
+
 def test_windows_backend_spawn_degrades_without_api(monkeypatch):
     monkeypatch.setattr(pl.subprocess, "Popen", lambda cmd, env=None, cwd=None, **kw: _FakeProc(777))
     backend = pl.WindowsJobObjectBackend(api_loader=lambda: None)
@@ -1080,4 +1117,24 @@ def test_get_default_backend_console_flag_passthrough(monkeypatch):
 def test_get_default_backend_console_flag_ignored_on_posix(monkeypatch):
     monkeypatch.setattr(pl.sys, "platform", "linux")
     backend = pl.get_default_backend(ensure_console_for_graceful_shutdown=True)
+    assert isinstance(backend, pl.PosixProcessGroupBackend)  # no crash, no such attribute needed
+
+
+def test_get_default_backend_kill_on_job_close_defaults_true(monkeypatch):
+    monkeypatch.setattr(pl.sys, "platform", "win32")
+    backend = pl.get_default_backend()
+    assert backend._kill_on_job_close is True
+
+
+def test_get_default_backend_kill_on_job_close_passthrough_false(monkeypatch):
+    """d397bb71: a detached/fire-and-forget caller opts out via this
+    passthrough."""
+    monkeypatch.setattr(pl.sys, "platform", "win32")
+    backend = pl.get_default_backend(kill_on_job_close=False)
+    assert backend._kill_on_job_close is False
+
+
+def test_get_default_backend_kill_on_job_close_ignored_on_posix(monkeypatch):
+    monkeypatch.setattr(pl.sys, "platform", "linux")
+    backend = pl.get_default_backend(kill_on_job_close=False)
     assert isinstance(backend, pl.PosixProcessGroupBackend)  # no crash, no such attribute needed

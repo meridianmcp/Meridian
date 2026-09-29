@@ -1015,6 +1015,7 @@ class LocalRunner:
         max_log_files: int = DEFAULT_MAX_LOG_FILES,
         scope_lock_timeout: float = _SCOPE_LOCK_TIMEOUT_SECONDS,
         scope_lock_api_loader: "Callable[[], Win32MutexAPI | None] | None" = None,
+        detached: bool = False,
     ) -> None:
         """*command* may be ``None`` for a "reconnect to an existing scope"
         instance used for read-only/recovery operations (``status``,
@@ -1034,6 +1035,33 @@ class LocalRunner:
         cross-process ``start()`` mutex (2026-09-28 review finding #1a) --
         see :func:`_scope_lock`. Production callers never need to pass
         either.
+
+        *detached* (d397bb71, 2026-09-29): set ``True`` when THIS
+        ``LocalRunner`` instance's own process is a bare, fire-and-forget
+        invocation that spawns a child and then exits immediately (the
+        standalone ``python -m meridian.local_runner start``/``restart`` CLI
+        path -- see ``_runner_from_args``) -- as opposed to a long-lived
+        supervisor that stays alive for the child's whole lifetime (the
+        tray, via ``tray_main._build_runner``, which never passes this).
+
+        On Windows this matters concretely: ``WindowsJobObjectBackend``
+        assigns every spawned child to a fresh Job Object, and by default
+        sets ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` on it, so the whole
+        group is torn down automatically if the spawning process ever dies
+        without explicit cleanup -- exactly the safety net a long-lived
+        supervisor (the tray) wants. But for a ``detached`` invocation, the
+        spawning process is EXPECTED to exit right after spawning, which
+        closes its (only) handle to that job -- with the flag set, that
+        alone would immediately kill the child it just spawned, defeating
+        the entire point of a fire-and-forget launch. Passing
+        ``detached=True`` builds the default backend with
+        ``kill_on_job_close=False`` instead (see
+        ``process_lifecycle.get_default_backend``), so the child survives
+        this process's exit; explicit ``stop()``/``TerminateJobObject``
+        teardown (including from a LATER process reopening the job by name)
+        is completely unaffected either way. A no-op on POSIX (no equivalent
+        hazard) and for any caller that supplies its own explicit
+        ``backend=``.
         """
         if not scope or not scope.strip():
             raise ValueError("scope must be a non-empty string")
@@ -1043,14 +1071,19 @@ class LocalRunner:
         self.env = env
         self._state_dir = state_dir or default_state_dir()
         self._state_path = _scope_state_path(self._state_dir, scope)
+        self.detached = detached
         # ensure_console_for_graceful_shutdown=True (2026-09-28 review
         # finding #5/#22): on Windows, this is what makes
         # WindowsJobObjectBackend.close()'s CTRL_BREAK graceful-shutdown
         # attempt deliverable at all -- see that class's own docstring for
         # the empirical confirmation. A no-op on POSIX and for any caller
         # that supplies its own explicit `backend=`.
+        #
+        # kill_on_job_close=not detached (d397bb71): see this method's own
+        # `detached` docstring above.
         self._backend = backend or process_lifecycle.get_default_backend(
             ensure_console_for_graceful_shutdown=True,
+            kill_on_job_close=not detached,
         )
         self._broker = process_registry.get_broker() if broker is _UNSET else broker
         self._clock = clock
@@ -1866,7 +1899,14 @@ def _normalize_cmd_arg(cmd: "list[str] | None") -> "list[str] | None":
     return cmd or None
 
 
-def _runner_from_args(args: argparse.Namespace) -> LocalRunner:
+def _runner_from_args(args: argparse.Namespace, *, detached: bool = False) -> LocalRunner:
+    """*detached* (d397bb71): pass ``True`` from ``main()`` for the ``start``
+    and ``restart`` commands -- the two CLI subcommands that spawn a NEW
+    child meant to outlive this bare CLI invocation once it prints its JSON
+    result and exits. See ``LocalRunner.__init__``'s own ``detached``
+    docstring for the full Windows Job Object rationale. Every other
+    subcommand (``status``, ``doctor``, ``preflight``, ...) never spawns a
+    persisting child from this call, so it stays ``False`` (unaffected)."""
     return LocalRunner(
         scope=args.scope,
         command=_normalize_cmd_arg(getattr(args, "cmd", None)),
@@ -1874,6 +1914,7 @@ def _runner_from_args(args: argparse.Namespace) -> LocalRunner:
         state_dir=_state_dir_from_args(args),
         tunnel_label=getattr(args, "tunnel_label", None),
         cold_start_timeout=getattr(args, "cold_start_timeout", DEFAULT_COLD_START_TIMEOUT_SECONDS),
+        detached=detached,
     )
 
 
@@ -1890,14 +1931,14 @@ def main(argv: "list[str] | None" = None) -> int:
 
     try:
         if args.command == "start":
-            result = _runner_from_args(args).start(force=args.force).as_dict()
+            result = _runner_from_args(args, detached=True).start(force=args.force).as_dict()
         elif args.command == "stop":
             runner = LocalRunner(
                 scope=args.scope, command=None, state_dir=_state_dir_from_args(args),
             )
             result = runner.stop().as_dict()
         elif args.command == "restart":
-            result = _runner_from_args(args).restart().as_dict()
+            result = _runner_from_args(args, detached=True).restart().as_dict()
         elif args.command == "status":
             result = _runner_from_args(args).status().as_dict()
         elif args.command == "doctor":

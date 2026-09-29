@@ -19,15 +19,22 @@ of relying on process-NAME matching (explicitly out of scope per the sprint
 notes -- "No name-based cleanup"):
 
 * **Windows** -- a Job Object (``CreateJobObject`` +
-  ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``, with no breakaway limit set, so a
-  child can never detach itself from the job even if it launches a
+  ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` by default, with no breakaway limit
+  set, so a child can never detach itself from the job even if it launches a
   grandchild with ``CREATE_BREAKAWAY_FROM_JOB`` -- that flag only works when
   the job itself opts in via ``JOB_OBJECT_LIMIT_(SILENT_)BREAKAWAY_OK``,
   which we never set). ``TerminateJobObject`` kills every process still
   assigned to the job in one syscall -- the whole tree, not just the direct
   child -- and we ALSO run the existing guarded ``taskkill /F /T`` sweep
   underneath it as a fallback for anything that raced its way out before
-  assignment completed (see :class:`WindowsJobObjectBackend`).
+  assignment completed (see :class:`WindowsJobObjectBackend`). The
+  KILL_ON_JOB_CLOSE flag itself is opt-out (``kill_on_job_close=False`` --
+  d397bb71): it makes the OS auto-kill the whole group the instant the
+  SPAWNING process's own (last) handle to the job closes, which is the
+  right safety net for a long-lived supervisor (the tray) but is wrong for
+  a bare, fire-and-forget CLI launch that is expected to exit immediately
+  and whose child must survive that exit -- see :class:`WindowsJobObjectBackend`
+  and :func:`get_default_backend`.
 * **POSIX** -- a new session/process group (``start_new_session=True``,
   equivalent to calling ``setsid()`` before exec), so the whole tree can be
   signalled at once via ``os.killpg`` instead of only the root PID, with a
@@ -698,6 +705,25 @@ class WindowsJobObjectBackend:
     reason (non-Windows, ``ctypes`` bind failure, ``CreateJobObjectW``/
     ``AssignProcessToJobObject`` failure) -- ``spawn()``/``adopt()`` never
     fail just because job-object OR console setup failed.
+
+    ``kill_on_job_close`` (d397bb71, 2026-09-29) controls whether the job is
+    given ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` at all -- default ``True``
+    preserves the exact pre-existing behaviour for every caller that doesn't
+    opt out (tunnel_client.py's owned spawns, and ``LocalRunner`` for its
+    normal supervised usage from the tray: "if the supervisor dies
+    unexpectedly, kill its children too" is the correct safety net there).
+    Pass ``False`` when the SPAWNING process itself is expected to exit
+    immediately after spawning and the child is meant to keep running past
+    that exit (a bare, fire-and-forget CLI invocation) -- with the flag set,
+    the OS closes the spawning process's own (only) handle to the job the
+    instant it exits, and ``KILL_ON_JOB_CLOSE`` semantics then terminate
+    every process still assigned to that job, including the child that was
+    just spawned specifically to persist. ``TerminateJobObject`` (the
+    explicit teardown path in :meth:`close`) always kills every assigned
+    process regardless of this flag -- it is only the OS's *implicit*
+    last-handle-closed teardown that this controls, so explicit ``stop``/
+    ``close()`` teardown (including a later process reopening the job by
+    its :func:`_job_object_name`) is completely unaffected either way.
     """
 
     def __init__(
@@ -706,11 +732,13 @@ class WindowsJobObjectBackend:
         *,
         ensure_console_for_graceful_shutdown: bool = False,
         console_api_loader: "Callable[[], Win32ConsoleAPI | None] | None" = None,
+        kill_on_job_close: bool = True,
     ):
         self._api_loader = api_loader or _load_win32_job_api
         self._ensure_console_for_graceful_shutdown = ensure_console_for_graceful_shutdown
         self._console_api_loader = console_api_loader or _load_win32_console_api
         self._console_ensured = False
+        self._kill_on_job_close = kill_on_job_close
 
     def _ensure_console(self) -> None:
         """Best-effort, attempted at most ONCE per backend instance: give
@@ -798,11 +826,13 @@ class WindowsJobObjectBackend:
 
     def _assign_to_job(self, handle: OwnedProcessHandle) -> None:
         """Best-effort: create a NAMED job (2026-09-28 review finding #12 --
-        see :func:`_job_object_name`), set KILL_ON_JOB_CLOSE, assign
-        *handle*'s pid to it. Any failure at any step leaves
-        ``handle.job_id``/``handle.job_name`` as ``None`` (taskkill-only
-        teardown) and never raises -- this runs right after a successful
-        spawn/adopt; it must not turn a working spawn into a failed one.
+        see :func:`_job_object_name`), optionally set KILL_ON_JOB_CLOSE (see
+        ``kill_on_job_close`` on :meth:`__init__` -- skipped entirely when
+        ``False``, d397bb71), assign *handle*'s pid to it. Any failure at
+        any step leaves ``handle.job_id``/``handle.job_name`` as ``None``
+        (taskkill-only teardown) and never raises -- this runs right after a
+        successful spawn/adopt; it must not turn a working spawn into a
+        failed one.
 
         Every kernel32 HANDLE obtained along the way is explicitly closed:
         ``proc_handle`` is only ever needed transiently to make the
@@ -823,7 +853,7 @@ class WindowsJobObjectBackend:
             if job is None:
                 _logger.warning("process_lifecycle: CreateJobObjectW failed for pid %s", handle.pid)
                 return
-            if not api.set_kill_on_close(job):
+            if self._kill_on_job_close and not api.set_kill_on_close(job):
                 _logger.warning(
                     "process_lifecycle: SetInformationJobObject failed for pid %s", handle.pid
                 )
@@ -990,7 +1020,9 @@ class WindowsJobObjectBackend:
 
 
 def get_default_backend(
-    *, ensure_console_for_graceful_shutdown: bool = False,
+    *,
+    ensure_console_for_graceful_shutdown: bool = False,
+    kill_on_job_close: bool = True,
 ) -> "PosixProcessGroupBackend | WindowsJobObjectBackend":
     """Select the portable owned-process lifecycle backend for the current
     platform.
@@ -1003,9 +1035,19 @@ def get_default_backend(
     tunnel_client.py's owned spawns) -- only ``LocalRunner`` currently asks
     for ``True``, since a hidden console allocated in the CALLING process is
     what makes CTRL_BREAK graceful shutdown deliverable at all (see that
-    class's own docstring)."""
+    class's own docstring).
+
+    *kill_on_job_close* (d397bb71) is likewise a passthrough to
+    :class:`WindowsJobObjectBackend` -- ignored on POSIX, which has no
+    equivalent "auto-kill on last handle close" hazard (a POSIX child
+    spawned with ``start_new_session=True`` is already independent of its
+    spawning process once that process exits). Defaults to ``True``, the
+    exact pre-existing behavior for every caller that doesn't opt out; pass
+    ``False`` for a spawn that must outlive the SPAWNING process's own exit
+    -- see :class:`WindowsJobObjectBackend`'s own docstring."""
     if sys.platform == "win32":
         return WindowsJobObjectBackend(
             ensure_console_for_graceful_shutdown=ensure_console_for_graceful_shutdown,
+            kill_on_job_close=kill_on_job_close,
         )
     return PosixProcessGroupBackend()
