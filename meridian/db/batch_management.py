@@ -625,7 +625,7 @@ async def _compensate_pointer_entry(
 ) -> None:
     try:
         _, pointer_id = comp_state
-        await db_module.delete_sprint_item_pointer(db, pointer_id)
+        await db_module.delete_sprint_item_pointer(db, project_id, pointer_id)
     except Exception:  # noqa: BLE001 -- compensation must never mask the original abort
         pass
 

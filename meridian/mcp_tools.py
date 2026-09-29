@@ -84,7 +84,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
-    "delete_sprint_item_pointer": 'delete_sprint_item_pointer(pointer_id="pointer-uuid")',
+    "delete_sprint_item_pointer": 'delete_sprint_item_pointer(project_id="abc-123", pointer_id="pointer-uuid")',
     "relocate_sprint_item_pointer": 'relocate_sprint_item_pointer(project_id="abc-123", pointer_id="pointer-uuid", targets=[{"uri": "src/chapter1.tex", "selector": {"type": "range", "start_line": 1, "end_line": 40}, "repo_root": "/home/alice/thesis-repo"}])',
     "execute_batch": 'execute_batch(project_id="abc-123", operation="sprint_items", entries=[{"title": "Add rate limiting", "correlation_key": "a"}, {"title": "Add retry backoff", "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-05-batch-1")',
     "batch_read": 'batch_read(project_id="abc-123", requests=[{"request_id": "items", "adapter": "sprint_board", "operation": "get_sprint_items", "args": {"status": "pending"}}, {"request_id": "ptrs", "adapter": "sprint_board", "operation": "get_sprint_item_pointers", "args": {"sprint_item_id": "item-uuid"}, "depends_on": ["items"]}])',
@@ -2146,8 +2146,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "place instead — preserving its id/created_at, and without the data-loss/"
         "visibility window a delete-then-re-add pair has — use "
         "relocate_sprint_item_pointer (W1-J); reserve this tool for when you actually "
-        "want the pointer gone.",
+        "want the pointer gone. project_id (or project_name) is required (6f7ce9d6) "
+        "and is enforced in the delete itself: a pointer id that belongs to a "
+        "DIFFERENT project deletes nothing and is reported exactly like a "
+        "nonexistent one ({deleted:false}) — never distinguished.",
      "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "pointer_id": {"type": "string", "description": "The id of the pointer to delete."}},
          "required": ["pointer_id"]}},
     {"name": "relocate_sprint_item_pointer", "description":

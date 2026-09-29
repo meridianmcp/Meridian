@@ -10564,11 +10564,32 @@ async def add_project_note(
 
 
 async def get_project_note(
-    db: aiosqlite.Connection, note_id: str
+    db: aiosqlite.Connection,
+    note_id: str,
+    *,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
-    async with db.execute(
-        "SELECT * FROM project_notes WHERE id = ?", (note_id,)
-    ) as cur:
+    """Fetch one project note by its id.
+
+    6f7ce9d6 — ``project_id`` (keyword-only, optional) scopes the lookup to a
+    single project: when supplied, the row is matched ONLY if it belongs to that
+    project (``WHERE id = ? AND project_id = ?``), so a note id that exists in a
+    DIFFERENT project comes back as ``None`` — indistinguishable from a
+    nonexistent id, never leaking whether (or what) the foreign row is. Every
+    caller that resolves an id on behalf of a project-scoped request (the
+    sprint-item pointer ``finding_id`` resolver) MUST pass it. Omitting it
+    (``None``) keeps the legacy bare-id behaviour for the internal callers that
+    have just written or already own the row (``add_project_note``'s read-back,
+    ``update_project_note``, ...). An empty-string ``project_id`` is a scoped
+    lookup that matches nothing (fails closed), never an unscoped one.
+    """
+    if project_id is None:
+        sql = "SELECT * FROM project_notes WHERE id = ?"
+        params: tuple[Any, ...] = (note_id,)
+    else:
+        sql = "SELECT * FROM project_notes WHERE id = ? AND project_id = ?"
+        params = (note_id, project_id)
+    async with db.execute(sql, params) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
 

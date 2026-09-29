@@ -3250,7 +3250,7 @@ class DocStructureStore:
         return {"markers": markers}
 
     async def get_element_by_id(
-        self, element_id: str
+        self, element_id: str, project_id: str | None = None
     ) -> dict[str, Any] | None:
         """Return a single stored element (with its parent doc) by its id, or None.
 
@@ -3260,12 +3260,33 @@ class DocStructureStore:
         owning document header) so the pointer can surface a source/title. Returns
         None for an unknown id. Never raises upward (the resolver guards, but this
         stays a plain best-effort lookup).
+
+        6f7ce9d6 — ``project_id`` scopes the lookup to one project. ``doc_elements``
+        carries no ``project_id`` column of its own (ownership lives on the parent
+        ``doc_documents`` row), so a scoped lookup JOINs the element to its
+        document and matches only when ``doc_documents.project_id`` equals
+        ``project_id``. An element id that exists in a DIFFERENT project — or
+        whose document row is missing entirely — comes back as ``None``,
+        indistinguishable from an unknown id, so a pointer on a project-A item
+        can never read project B's document element by bare id. Every
+        project-scoped caller (the sprint-item pointer ``node_id`` resolver)
+        MUST pass it; ``None`` keeps the legacy unscoped read for callers that
+        already own the id. An empty-string ``project_id`` is a scoped lookup
+        that matches nothing (fails closed), never an unscoped one.
         """
         if not isinstance(element_id, str) or not element_id.strip():
             return None
-        async with self._db.execute(
-            "SELECT * FROM doc_elements WHERE id = ?", (element_id.strip(),)
-        ) as cur:
+        if project_id is None:
+            query = "SELECT * FROM doc_elements WHERE id = ?"
+            params: tuple[Any, ...] = (element_id.strip(),)
+        else:
+            query = (
+                "SELECT e.* FROM doc_elements e "
+                "JOIN doc_documents d ON d.id = e.document_id "
+                "WHERE e.id = ? AND d.project_id = ?"
+            )
+            params = (element_id.strip(), project_id)
+        async with self._db.execute(query, params) as cur:
             row = await cur.fetchone()
         element = _row_to_dict(row, _ELEMENT_COLUMNS)
         if element is None:

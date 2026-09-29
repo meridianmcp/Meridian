@@ -6814,15 +6814,29 @@ async def get_sprint_item_pointers(
 
 
 async def delete_sprint_item_pointer(
-    db: aiosqlite.Connection, pointer_id: str
+    db: aiosqlite.Connection, project_id: str, pointer_id: str
 ) -> bool:
-    """2976e168 — delete one pointer by id. Return True if a row was removed."""
+    """2976e168 — delete one pointer by id. Return True if a row was removed.
+
+    6f7ce9d6 — cross-project isolation, matching ``add`` / ``get`` (handler-
+    verified) / ``resolve`` / ``relocate_sprint_item_pointer``: ``project_id``
+    is REQUIRED and the delete is ``WHERE id = ? AND project_id = ?``, so a
+    caller scoped to project A who knows (or guesses) a project-B pointer id
+    deletes nothing. A foreign-project pointer id is reported exactly like a
+    nonexistent one (``False``) — never distinguished — so this cannot be used
+    to probe for another project's pointer ids. ``project_id`` is deliberately
+    positional-required (no default): a stale two-argument call
+    ``(db, pointer_id)`` fails loudly with ``TypeError`` instead of silently
+    running unscoped.
+    """
     async with db.execute(
-        "SELECT 1 FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+        "SELECT 1 FROM sprint_item_pointers WHERE id = ? AND project_id = ?",
+        (pointer_id, project_id),
     ) as cur:
         existed = await cur.fetchone() is not None
     await db.execute(
-        "DELETE FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+        "DELETE FROM sprint_item_pointers WHERE id = ? AND project_id = ?",
+        (pointer_id, project_id),
     )
     await db.commit()
     return existed

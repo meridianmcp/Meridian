@@ -1036,12 +1036,49 @@ async def _resolve_symbol(
     return out
 
 
+def _payload_in_foreign_project(project_id: str, *payload_project_ids: Any) -> bool:
+    """6f7ce9d6 — ``True`` when a resolver's returned row names an owning project
+    that is NOT ``project_id`` (the pointer's own project).
+
+    Defense in depth behind the scoped lookups themselves
+    (``db.get_project_note(project_id=...)`` /
+    ``DocStructureStore.get_element_by_id(project_id=...)``): whatever resolver
+    seam a caller injects, a ``finding_id`` / ``node_id`` target may only ever
+    surface a row from the pointer's OWN project. A row that self-identifies a
+    different project is treated exactly like a not-found id by the callers
+    (same reason string, no body), so a pointer on a project-A item can never
+    read a project-B note or document element by bare id.
+
+    Only a POSITIVE mismatch rejects. A payload that carries no project
+    identity at all (a bare test stub) cannot be checked here — the seam owner
+    is then responsible for scoping, and every in-repo seam is scoped. An
+    empty ``project_id`` (a caller that supplied no scope and whose pointer
+    row names none) has nothing to compare against and never rejects here; the
+    DEFAULT resolvers fail closed in that case instead.
+    """
+    if not project_id:
+        return False
+    return any(
+        isinstance(p, str) and p and p != project_id for p in payload_project_ids
+    )
+
+
 async def _resolve_node_id(
     selector: dict[str, Any],
     uri: str,
     node_resolver: NodeResolver | None,
+    project_id: str = "",
 ) -> dict[str, Any]:
-    """``node_id`` — look an element up in the doc_store by its id (9ee6d2ec)."""
+    """``node_id`` — look an element up in the doc_store by its id (9ee6d2ec).
+
+    6f7ce9d6 — only an element owned by ``project_id`` (the pointer's own
+    project) may resolve. The injected ``node_resolver`` is expected to be
+    scoped already (the MCP handler's is); this also rejects a resolved row
+    whose ``document.project_id`` names a different project, reporting it
+    with the SAME ``"no element with that id"`` reason a genuinely unknown id
+    gets, so the result never confirms that a foreign row exists nor returns
+    any of its body.
+    """
     nid = selector.get("id")
     if node_resolver is None:
         return _unresolved("no doc_store available", selector_type="node_id",
@@ -1052,6 +1089,16 @@ async def _resolve_node_id(
         _log.debug("node_id resolve failed for %r", nid, exc_info=True)
         return _unresolved("doc_store lookup failed", selector_type="node_id",
                            uri=uri, id=nid)
+    if found and isinstance(found, dict):
+        _doc = found.get("document")
+        if _payload_in_foreign_project(
+            project_id, _doc.get("project_id") if isinstance(_doc, dict) else None
+        ):
+            _log.warning(
+                "node_id pointer target %r rejected: element belongs to a "
+                "different project than the pointer's (%s)", nid, project_id,
+            )
+            found = None
     if not found:
         return _unresolved("no element with that id", selector_type="node_id",
                            uri=uri, id=nid)
@@ -1127,8 +1174,17 @@ async def _resolve_finding_id(
     selector: dict[str, Any],
     uri: str,
     finding_resolver: FindingResolver | None,
+    project_id: str = "",
 ) -> dict[str, Any]:
-    """``finding_id`` — resolve a save_finding artifact (a note) by id (1f1cd4d9)."""
+    """``finding_id`` — resolve a save_finding artifact (a note) by id (1f1cd4d9).
+
+    6f7ce9d6 — only a note owned by ``project_id`` (the pointer's own project)
+    may resolve. The default resolver is scoped at the SQL layer; this also
+    rejects a resolved row whose ``project_id`` names a different project
+    (whatever resolver was injected), reporting it with the SAME ``"no finding
+    artifact with that id"`` reason a genuinely unknown id gets, so the result
+    never confirms that a foreign note exists nor returns any of its body.
+    """
     fid = selector.get("id")
     if finding_resolver is None:
         return _unresolved("no finding resolver available",
@@ -1139,6 +1195,14 @@ async def _resolve_finding_id(
         _log.debug("finding_id resolve failed for %r", fid, exc_info=True)
         return _unresolved("finding lookup failed",
                            selector_type="finding_id", uri=uri, id=fid)
+    if found and isinstance(found, dict) and _payload_in_foreign_project(
+        project_id, found.get("project_id")
+    ):
+        _log.warning(
+            "finding_id pointer target %r rejected: note belongs to a "
+            "different project than the pointer's (%s)", fid, project_id,
+        )
+        found = None
     if not found:
         return _unresolved("no finding artifact with that id",
                            selector_type="finding_id", uri=uri, id=fid)
@@ -1387,13 +1451,13 @@ async def _resolve_selector(
     if stype == "symbol":
         return await _resolve_symbol(db, project_id, selector, uri, symbol_resolver)
     if stype == "node_id":
-        return await _resolve_node_id(selector, uri, node_resolver)
+        return await _resolve_node_id(selector, uri, node_resolver, project_id)
     if stype == "zotero_key":
         return await _resolve_zotero_key(selector, uri, citation_resolver)
     if stype == "text_quote":
         return await _resolve_text_quote(selector, uri, web_fetcher)
     if stype == "finding_id":
-        return await _resolve_finding_id(selector, uri, finding_resolver)
+        return await _resolve_finding_id(selector, uri, finding_resolver, project_id)
     if stype == "directory":
         return await _resolve_directory(selector, uri, directory_resolver)
     if stype == "git":
@@ -1488,6 +1552,15 @@ async def resolve_pointer(
     ``range`` is echoed as ``narrowed_range`` — "these lines, within this
     function"). **NEVER raises** — malformed targets degrade to unresolved.
 
+    6f7ce9d6 — ``finding_id`` / ``node_id`` targets resolve ONLY within the
+    pointer's owning project (``project_id``, else the pointer row's own
+    ``project_id``): a note / document-element id belonging to another project
+    is reported as the ordinary not-found unresolved result (same reason as an
+    unknown id, no body), never as a hit. A caller injecting its own
+    ``node_resolver`` should scope it to that project too (the MCP handler
+    does); a resolved row that self-identifies another project is rejected
+    here regardless.
+
     Resolver seams default to the real implementations
     (``db.search_graph_entities`` / doc_store / ``zotero_client``); tests inject
     stubs so no network / live Zotero is touched. 62640241 —
@@ -1540,12 +1613,26 @@ async def resolve_pointer(
         async def web_fetcher(_uri: str):  # type: ignore[misc]
             return await _wf(_uri)
 
+    # 6f7ce9d6 — the pointer's OWNING project: the caller-supplied scope, else
+    # the stored pointer row's own ``project_id``. Every finding_id / node_id
+    # target must resolve only inside it (see _resolve_finding_id /
+    # _resolve_node_id). Computed BEFORE the default resolvers below so the
+    # default finding resolver can be scoped to it.
+    pid = project_id or pointer.get("project_id") or ""
+
     if finding_resolver is None:
         # 1f1cd4d9 — a save_finding artifact IS a kind='finding' project note.
         from .db import get_project_note as _gn  # noqa: PLC0415
 
         async def finding_resolver(_id: str):  # type: ignore[misc]
-            return await _gn(db, _id)
+            # 6f7ce9d6 — scoped to the pointer's own project at the SQL layer
+            # (WHERE id = ? AND project_id = ?): another project's note id
+            # comes back as None, i.e. "no finding artifact with that id".
+            # With no owning project at all there is nothing to scope by, so
+            # fail closed rather than fall back to the old bare-id lookup.
+            if not pid:
+                return None
+            return await _gn(db, _id, project_id=pid)
 
     # 62640241 — core-local, local-filesystem-only defaults. remote_fs has
     # deliberately NO default (see the docstring above).
@@ -1556,7 +1643,6 @@ async def resolve_pointer(
     if artifact_resolver is None:
         artifact_resolver = _default_artifact_resolver()
 
-    pid = project_id or pointer.get("project_id") or ""
     source_type = pointer.get("source_type")
     targets = pointer.get("targets") or []
 

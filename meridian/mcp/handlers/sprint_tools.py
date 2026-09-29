@@ -2525,7 +2525,12 @@ async def handle_resolve_sprint_item_pointers(
         if _ptr_store is None:
             return None
         try:
-            return await _ptr_store.get_element_by_id(element_id)
+            # 6f7ce9d6 — scope the element lookup to THIS item's project (the
+            # one verified above): another project's doc element id resolves
+            # as not-found, never as that project's element body.
+            return await _ptr_store.get_element_by_id(
+                element_id, project_id=args["project_id"]
+            )
         except Exception:  # noqa: BLE001 — resolver seam must never raise
             return None
 
@@ -2567,10 +2572,25 @@ async def handle_delete_sprint_item_pointer(
     MCP tool wrapped it — a pointer could be created / listed / resolved yet
     never removed. Idempotent: {deleted:false} when no pointer had that id,
     rather than an error.
+
+    6f7ce9d6 — cross-project isolation: ``project_id`` is now REQUIRED (or pass
+    ``project_name``, which the dispatch layer folds into ``project_id``) and is
+    enforced in the DELETE itself (``WHERE id = ? AND project_id = ?``), like
+    ``add`` / ``get`` / ``resolve`` / ``relocate_sprint_item_pointer``. Before
+    this the handler took only ``pointer_id`` and deleted by bare id, so a
+    caller scoped to one project could delete ANOTHER project's pointer by
+    knowing or guessing its id. A pointer id that belongs to a different
+    project is reported exactly like a nonexistent one
+    (``{deleted:false}``) — never distinguished — so this can't be used to
+    probe for foreign pointer ids.
     """
     if not args.get("pointer_id"):
         return {"error": "pointer_id is required"}
-    removed = await db_module.delete_sprint_item_pointer(db, args["pointer_id"])
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    removed = await db_module.delete_sprint_item_pointer(
+        db, args["project_id"], args["pointer_id"]
+    )
     return {"pointer_id": args["pointer_id"], "deleted": removed}
 
 
