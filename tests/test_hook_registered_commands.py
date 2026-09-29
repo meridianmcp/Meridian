@@ -510,7 +510,33 @@ def test_launcher_exit_code_semantics(name, tmp_path, stub_url):
 def test_missing_script_is_a_visible_non_blocking_error(tmp_path, stub_url):
     command = hsm.ps_launch(hsm.ps_project_script(".claude\\hooks\\no_such_hook.ps1"))
     r = _run_registered(command, {}, _base_env(tmp_path, tmp_path, stub_url, None), tmp_path)
-    assert r.returncode == 1 and _NOT_RECOGNIZED in r.stderr
+    # The exit code is the load-bearing assertion (PS_EXIT_SUFFIX derives it from
+    # PowerShell's own $?/$LASTEXITCODE, not from OS/version-specific error text),
+    # so it stays pinned at 1 (visible, non-blocking) on every PowerShell version.
+    #
+    # The message WORDING for "this script doesn't exist" genuinely differs by
+    # platform, confirmed 2026-09-29: Windows PowerShell 5.1 resolves the
+    # backslash-separated registered path as a filesystem path and reports
+    # CommandNotFoundException as "...is not recognized as the name of a
+    # cmdlet, function, script file, or operable program" (_NOT_RECOGNIZED).
+    # CI's ubuntu-latest runner uses `pwsh` (PowerShell Core) instead, where `\`
+    # is not a path separator -- the registered ".claude\\hooks\\no_such_hook.ps1"
+    # form (baked in for the Windows boxes these hooks actually run on) no longer
+    # parses as a filesystem path at all, so pwsh's command discovery instead
+    # treats the trailing "...\no_such_hook.ps1" segment as a module-qualified
+    # command reference (PowerShell's `Module\Command` syntax) and reports a
+    # distinct "... module ... could not be loaded ..." CommandNotFoundException
+    # instead. Both are the SAME underlying event (the registered command
+    # references a script that doesn't exist) surfacing through a genuinely
+    # different, version-dependent PowerShell code path -- not a behavior
+    # regression -- so this accepts either phrasing rather than pinning one
+    # platform's exact text.
+    assert r.returncode == 1, (r.returncode, r.stdout[-500:], r.stderr[-1000:])
+    stderr_lower = r.stderr.lower()
+    assert (
+        _NOT_RECOGNIZED in r.stderr
+        or (b"module" in stderr_lower and b"could not be loaded" in stderr_lower)
+    ), r.stderr[-1000:]
 
 
 @needs_ps
