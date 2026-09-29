@@ -149,7 +149,10 @@ psutil = ">=5.9"
 # falling back to the (also-correct, but untested-by-default) missing-
 # dependency degrade path.
 pypdf = ">=4.0"
-mcp = ">=1.0"
+# mcp 2.x removed the Server.list_prompts() decorator that meridian/mcp/stdio_handler.py
+# uses (found 2026-09-29 when a from-scratch `pixi lock` floated it to 2.2.0). Stay on 1.x
+# until stdio_handler is ported to the 2.x server API.
+mcp = ">=1.0,<2"
 anthropic = ">=0.40"
 python-dotenv = ">=1.0"
 psycopg = {version = ">=3.1", extras = ["binary"]}
