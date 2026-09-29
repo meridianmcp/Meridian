@@ -365,9 +365,49 @@ async def handle_start_session(
             # for THIS project never reaches the session that resolved via
             # the default-project fallback, even though the session itself
             # was correctly created under that project.
+            # 0527f636 — pending_goal is ONE read-once slot per project; before
+            # this, ANY sibling start_session popped it, so a handoff written
+            # for one session was silently consumed by whichever parallel
+            # session (another executor, a verifier subagent, a resumed
+            # session) started first. Identify THIS caller (the name it is
+            # registering under, its role, its cwd) so an ADDRESSED handoff
+            # (generate_handoff(receiver=...)) is delivered — and cleared —
+            # only to its intended receiver. An UNADDRESSED handoff (the
+            # default) is still delivered to whoever starts first, exactly as
+            # before.
+            _pg_claimant = {
+                "session_name": _sname,
+                "role": args.get("role"),
+                "cwd": args.get("cwd"),
+            }
             _pg_meta = await db_module.pop_pending_goal_with_meta(
-                db, _pid
+                db, _pid, claimant=_pg_claimant,
             )
+            if not _pg_meta:
+                # Nothing was delivered. If a goal is still pending it is
+                # addressed to a DIFFERENT receiver: leave it untouched
+                # (NOT consumed) and say so, so this session neither loses
+                # nor steals it and can read it via the idempotent
+                # load_handoff if it is in fact the intended receiver.
+                _pg_receiver = await db_module.get_pending_goal_receiver(db, _pid)
+                if _pg_receiver:
+                    result["pending_goal_withheld"] = {
+                        "reason": "addressed_to_other_receiver",
+                        "receiver": _pg_receiver,
+                        "mismatched_fields": (
+                            db_module.pending_goal_receiver_mismatches(
+                                _pg_receiver, _pg_claimant,
+                            )
+                        ),
+                        "consumed": False,
+                        "message": (
+                            "A handoff /goal is pending for this project but is "
+                            "addressed to a different receiver than this session, "
+                            "so it was NOT delivered or consumed. If it is yours, "
+                            "call load_handoff() (read-only) or start_session "
+                            "again with the matching session_name/role/cwd."
+                        ),
+                    }
             if _pg_meta:
                 result["pending_goal"] = _pg_meta["goal"]
                 # 22f2604d — explicit, machine-readable trust marker

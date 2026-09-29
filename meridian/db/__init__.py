@@ -11152,9 +11152,191 @@ async def pop_queued_session(
 # defer to any direct /goal instruction they received in chat.
 PENDING_GOAL_STALE_HOURS: int = 24
 
+# 0527f636 — receiver binding for the read-once pending_goal slot.
+#
+# Root cause being closed: ``projects.pending_goal`` is ONE slot per project
+# and every ``start_session`` used to pop it, so with parallel sessions (a
+# sibling executor, an independent verifier subagent, a resumed session, ...)
+# whichever session called ``start_session`` first silently consumed a
+# handoff that was written for a DIFFERENT session, leaving the intended
+# receiver with nothing.
+#
+# Fix: a handoff may be ADDRESSED to its intended receiver at
+# ``generate_handoff`` time (any subset of ``session_name`` / ``role`` /
+# ``worktree``).  An addressed goal is only delivered -- and only cleared --
+# when the claiming ``start_session`` matches EVERY field of the address; a
+# non-matching sibling neither receives nor consumes it (the stored handoff
+# stays readable through the idempotent ``load_handoff``).  An UNADDRESSED
+# handoff (the default: every pre-existing caller) behaves exactly as before.
+#
+# Storage deliberately needs NO schema change (no migration on either the
+# SQLite or the Postgres path): the address rides in the SAME
+# ``projects.pending_goal`` cell as a single-line, server-authored header
+# ahead of the goal body, so body + address are always written and cleared
+# by ONE atomic UPDATE and can never drift apart.  Every reader of that cell
+# goes through the helpers below (``get_pending_goal`` /
+# ``pop_pending_goal`` / ``pop_pending_goal_with_meta`` /
+# ``get_pending_goal_receiver``), which strip the header, so no consumer ever
+# sees it mixed into a goal body -- and the body (which the goal_token's
+# body-hash covers) is stored byte-for-byte untouched.
+PENDING_GOAL_RECEIVER_FIELDS: tuple[str, ...] = ("session_name", "role", "worktree")
+_PENDING_GOAL_ENVELOPE_PREFIX = "<!--meridian:pending-goal-receiver:v1 "
+_PENDING_GOAL_ENVELOPE_SUFFIX = "-->"
+_PENDING_GOAL_RECEIVER_MAX_LEN = 512
+
+
+def normalize_pending_goal_receiver(
+    receiver: object,
+) -> dict[str, str] | None:
+    """0527f636 -- validate + canonicalise a handoff receiver address.
+
+    ``receiver`` is ``None``/empty (-> ``None``, i.e. an UNADDRESSED handoff,
+    today's behaviour) or a mapping with any subset of ``session_name`` /
+    ``role`` / ``worktree`` (non-empty strings; whitespace-stripped).  Fields
+    that are ``None``/blank are dropped.  A mapping whose every field is
+    blank also normalises to ``None``.
+
+    Fails LOUDLY (``ValueError``) on anything that would otherwise silently
+    degrade an addressed handoff into an unaddressed one -- a non-mapping
+    value, an unknown key (e.g. the typo ``session`` for ``session_name``),
+    a non-string field, or an over-long value -- so a caller who asked for
+    receiver protection can never think they have it when they do not.
+    """
+    if receiver is None:
+        return None
+    if not isinstance(receiver, dict):
+        raise ValueError(
+            "receiver must be an object with any of: "
+            + ", ".join(PENDING_GOAL_RECEIVER_FIELDS)
+        )
+    unknown = sorted(str(k) for k in receiver if k not in PENDING_GOAL_RECEIVER_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"receiver has unknown field(s) {unknown}; allowed: "
+            + ", ".join(PENDING_GOAL_RECEIVER_FIELDS)
+        )
+    out: dict[str, str] = {}
+    for key in PENDING_GOAL_RECEIVER_FIELDS:
+        val = receiver.get(key)
+        if val is None:
+            continue
+        if not isinstance(val, str):
+            raise ValueError(f"receiver.{key} must be a string")
+        val = val.strip()
+        if not val:
+            continue
+        if len(val) > _PENDING_GOAL_RECEIVER_MAX_LEN:
+            raise ValueError(
+                f"receiver.{key} is longer than {_PENDING_GOAL_RECEIVER_MAX_LEN} characters"
+            )
+        out[key] = val
+    return out or None
+
+
+def _encode_pending_goal(goal: str, receiver: dict[str, str] | None) -> str:
+    """Serialise ``goal`` (+ optional receiver address) into the stored cell.
+
+    Unaddressed goals are stored EXACTLY as before (the bare body).  A body
+    that itself happens to start with the header prefix is given an explicit
+    empty header so :func:`_decode_pending_goal` round-trips it unchanged.
+    """
+    if not receiver and not goal.startswith(_PENDING_GOAL_ENVELOPE_PREFIX):
+        return goal
+    header = json.dumps(receiver or {}, sort_keys=True, ensure_ascii=True)
+    return (
+        f"{_PENDING_GOAL_ENVELOPE_PREFIX}{header}{_PENDING_GOAL_ENVELOPE_SUFFIX}\n{goal}"
+    )
+
+
+def _decode_pending_goal(raw: str | None) -> tuple[str | None, dict[str, str] | None]:
+    """Inverse of :func:`_encode_pending_goal` -> ``(goal, receiver)``.
+
+    A cell without the header (every legacy / unaddressed row) decodes to
+    ``(raw, None)``.  A well-formed header whose JSON payload is unusable is
+    still stripped from the goal (never leaked into a delivered body) and
+    decodes as unaddressed; a cell whose header line is structurally broken
+    (no newline / no closing marker) is returned whole as an unaddressed
+    body.  The server only ever writes well-formed headers, so both are
+    defensive paths, not expected states.
+    """
+    if not raw:
+        return (raw or None), None
+    if not raw.startswith(_PENDING_GOAL_ENVELOPE_PREFIX):
+        return raw, None
+    header_line, sep, body = raw.partition("\n")
+    if not sep or not header_line.endswith(_PENDING_GOAL_ENVELOPE_SUFFIX):
+        return raw, None
+    payload = header_line[
+        len(_PENDING_GOAL_ENVELOPE_PREFIX): -len(_PENDING_GOAL_ENVELOPE_SUFFIX)
+    ]
+    receiver: dict[str, str] | None = None
+    try:
+        receiver = normalize_pending_goal_receiver(json.loads(payload))
+    except (ValueError, TypeError):
+        receiver = None
+    return (body or None), receiver
+
+
+def _normalize_receiver_path(path: str) -> str:
+    """Slash-normalise a worktree path for comparison (drive-letter paths are
+    compared case-insensitively, POSIX paths case-sensitively)."""
+    norm = path.strip().replace("\\", "/")
+    while "//" in norm:
+        norm = norm.replace("//", "/")
+    norm = norm.rstrip("/") or norm
+    if re.match(r"^[A-Za-z]:(/|$)", norm):
+        norm = norm.casefold()
+    return norm
+
+
+def pending_goal_receiver_mismatches(
+    receiver: dict[str, str] | None,
+    claimant: dict[str, Any] | None,
+) -> list[str]:
+    """0527f636 -- which fields of ``receiver`` the ``claimant`` fails to match.
+
+    An empty list means the claimant IS the intended receiver (also the case
+    for an unaddressed goal, ``receiver`` falsy).  ``claimant`` carries the
+    calling ``start_session``'s ``session_name`` / ``role`` / ``cwd``; a field
+    the receiver constrains but the claimant did not supply counts as a
+    mismatch (fail-closed: an unverifiable claimant never consumes an
+    addressed goal).  ``session_name``/``role`` compare case-insensitively;
+    ``worktree`` matches when the claimant's ``cwd`` IS that worktree or lies
+    inside it.
+    """
+    if not receiver:
+        return []
+    claimant = claimant or {}
+    bad: list[str] = []
+    want_name = receiver.get("session_name")
+    if want_name:
+        got = str(claimant.get("session_name") or "").strip()
+        if not got or got.casefold() != want_name.casefold():
+            bad.append("session_name")
+    want_role = receiver.get("role")
+    if want_role:
+        got = str(claimant.get("role") or "").strip()
+        if not got or got.casefold() != want_role.casefold():
+            bad.append("role")
+    want_tree = receiver.get("worktree")
+    if want_tree:
+        got = str(claimant.get("cwd") or "").strip()
+        if not got:
+            bad.append("worktree")
+        else:
+            tree = _normalize_receiver_path(want_tree)
+            here = _normalize_receiver_path(got)
+            if here != tree and not here.startswith(tree.rstrip("/") + "/"):
+                bad.append("worktree")
+    return bad
+
 
 async def set_pending_goal(
-    db: aiosqlite.Connection, project_id: str, goal: str | None
+    db: aiosqlite.Connection,
+    project_id: str,
+    goal: str | None,
+    *,
+    receiver: dict[str, str] | None = None,
 ) -> None:
     """Persist the handoff /goal so the next start_session can surface it through
     a trusted MCP tool result (keyed on project_id) instead of a copy-pasted,
@@ -11162,29 +11344,84 @@ async def set_pending_goal(
 
     590dcdd5: also writes pending_goal_at (UTC ISO-8601) so pop_pending_goal_with_meta
     can expose the goal's age and flag it as possibly-stale when it is older than
-    PENDING_GOAL_STALE_HOURS hours."""
+    PENDING_GOAL_STALE_HOURS hours.
+
+    0527f636: optional ``receiver`` (see :func:`normalize_pending_goal_receiver`)
+    addresses the goal to its intended receiving session so a sibling
+    ``start_session`` cannot consume it.  ``None`` (the default) is an
+    unaddressed goal -- exactly the pre-existing behaviour.  Body and address
+    are written by one UPDATE, so they can never disagree; a later
+    ``set_pending_goal`` (a fresh or amended handoff) replaces both."""
     now_iso: str | None = (
         _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ") if goal else None
     )
+    stored: str | None = (
+        _encode_pending_goal(goal, normalize_pending_goal_receiver(receiver))
+        if goal else None
+    )
     await db.execute(
         "UPDATE projects SET pending_goal = ?, pending_goal_at = ? WHERE id = ?",
-        ((goal or None), now_iso, project_id),
+        (stored, now_iso, project_id),
     )
     await db.commit()
+
+
+async def _read_pending_goal_cell(
+    db: aiosqlite.Connection, project_id: str
+) -> tuple[str | None, str | None]:
+    """Raw ``(pending_goal, pending_goal_at)`` cell values (header included)."""
+    async with db.execute(
+        "SELECT pending_goal, pending_goal_at FROM projects WHERE id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None, None
+    if isinstance(row, dict):
+        return row.get("pending_goal") or None, row.get("pending_goal_at")
+    return (row[0] or None), (row[1] if len(row) > 1 else None)
 
 
 async def get_pending_goal(
     db: aiosqlite.Connection, project_id: str
 ) -> str | None:
-    """Return the stored handoff /goal, or None when nothing is pending."""
+    """Return the stored handoff /goal body, or None when nothing is pending.
+
+    0527f636: the receiver-address header (if any) is stripped -- callers only
+    ever see the goal body; use :func:`get_pending_goal_receiver` for the
+    address."""
+    raw, _ = await _read_pending_goal_cell(db, project_id)
+    return _decode_pending_goal(raw)[0]
+
+
+async def get_pending_goal_receiver(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, str] | None:
+    """0527f636 -- the receiver address of the pending /goal, or None when
+    nothing is pending or the pending goal is unaddressed.  Read-only."""
+    raw, _ = await _read_pending_goal_cell(db, project_id)
+    goal, receiver = _decode_pending_goal(raw)
+    return receiver if goal else None
+
+
+async def _clear_pending_goal_if_unchanged(
+    db: aiosqlite.Connection, project_id: str, raw: str
+) -> bool:
+    """Atomically clear the pending_goal cell iff it still holds ``raw``.
+
+    Compare-and-clear, so two ``start_session`` calls racing on the same slot
+    cannot BOTH be handed the goal: exactly one UPDATE matches a row.  Returns
+    True when this call cleared it (i.e. won the delivery).  When the driver
+    reports no usable rowcount the call is treated as the winner (the legacy,
+    unconditional behaviour)."""
     async with db.execute(
-        "SELECT pending_goal FROM projects WHERE id = ?", (project_id,)
+        "UPDATE projects SET pending_goal = NULL, pending_goal_at = NULL"
+        " WHERE id = ? AND pending_goal = ?",
+        (project_id, raw),
     ) as cur:
-        row = await cur.fetchone()
-    if row is None:
-        return None
-    val = row["pending_goal"] if isinstance(row, dict) else row[0]
-    return val or None
+        rowcount = cur.rowcount
+    await db.commit()
+    return rowcount is None or rowcount < 0 or rowcount > 0
 
 
 async def pop_pending_goal(
@@ -11192,9 +11429,16 @@ async def pop_pending_goal(
 ) -> str | None:
     """Return the pending /goal and clear it (read-once) so start_session
     surfaces it exactly once and a stale goal never resurfaces in a later
-    session."""
-    goal = await get_pending_goal(db, project_id)
-    if goal:
+    session.
+
+    0527f636: this is the UNCONDITIONAL, administrative pop (e.g. a handoff
+    correction discarding the superseded goal): it clears the slot regardless
+    of any receiver address and returns just the goal body.  Delivery to a
+    claiming session goes through :func:`pop_pending_goal_with_meta`, which
+    honours the address."""
+    raw, _ = await _read_pending_goal_cell(db, project_id)
+    goal, _receiver = _decode_pending_goal(raw)
+    if raw:
         await db.execute(
             "UPDATE projects SET pending_goal = NULL, pending_goal_at = NULL"
             " WHERE id = ?",
@@ -11205,33 +11449,41 @@ async def pop_pending_goal(
 
 
 async def pop_pending_goal_with_meta(
-    db: aiosqlite.Connection, project_id: str
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    claimant: dict[str, Any] | None = None,
 ) -> dict[str, object] | None:
     """590dcdd5 — read-once pop with staleness metadata.
 
-    Returns a dict ``{"goal": str, "age_hours": float, "stale": bool}`` when a
-    pending_goal exists, or ``None`` when nothing is pending.
+    Returns a dict ``{"goal": str, "age_hours": float, "stale": bool,
+    "receiver": dict | None}`` when a pending_goal is DELIVERED to the caller,
+    or ``None`` when nothing was delivered.
 
     ``stale`` is ``True`` when the goal is older than PENDING_GOAL_STALE_HOURS.
     Executors SHOULD treat a stale pending_goal as advisory only and defer to
     any direct /goal instruction received in chat, because the human may have
     started the session with a completely different intent since the handoff was
     written.  The goal is still cleared read-once regardless of staleness.
+
+    0527f636 — ``None`` covers three cases, none of which consumes anything
+    the caller was not entitled to: (1) nothing pending; (2) the goal is
+    ADDRESSED to a receiver (see :func:`set_pending_goal`) that ``claimant``
+    (the calling start_session's ``session_name`` / ``role`` / ``cwd``) does
+    not match -- the goal is left in place for its real receiver and stays
+    readable through ``load_handoff``; a call that supplies no ``claimant``
+    at all can never consume an addressed goal; (3) another concurrent call
+    won the compare-and-clear race for the same goal.  An UNADDRESSED goal
+    is delivered to any caller, exactly as before.
     """
-    async with db.execute(
-        "SELECT pending_goal, pending_goal_at FROM projects WHERE id = ?",
-        (project_id,),
-    ) as cur:
-        row = await cur.fetchone()
-    if row is None:
+    raw, raw_at = await _read_pending_goal_cell(db, project_id)
+    if not raw:
         return None
-    if isinstance(row, dict):
-        raw_goal = row.get("pending_goal")
-        raw_at = row.get("pending_goal_at")
-    else:
-        raw_goal = row[0]
-        raw_at = row[1] if len(row) > 1 else None
+    raw_goal, receiver = _decode_pending_goal(raw)
     if not raw_goal:
+        return None
+    if receiver and pending_goal_receiver_mismatches(receiver, claimant):
+        # Addressed to someone else: neither deliver nor clear.
         return None
     # Compute age in hours; treat missing/malformed timestamp as 0 (unknown age).
     age_hours: float = 0.0
@@ -11244,14 +11496,16 @@ async def pop_pending_goal_with_meta(
         except (ValueError, TypeError):
             age_hours = 0.0
     stale = age_hours >= PENDING_GOAL_STALE_HOURS
-    # Clear read-once regardless of staleness.
-    await db.execute(
-        "UPDATE projects SET pending_goal = NULL, pending_goal_at = NULL"
-        " WHERE id = ?",
-        (project_id,),
-    )
-    await db.commit()
-    return {"goal": raw_goal, "age_hours": round(age_hours, 2), "stale": stale}
+    # Clear read-once regardless of staleness -- but only if THIS call still
+    # owns the slot (compare-and-clear), so a racing sibling cannot also get it.
+    if not await _clear_pending_goal_if_unchanged(db, project_id, raw):
+        return None
+    return {
+        "goal": raw_goal,
+        "age_hours": round(age_hours, 2),
+        "stale": stale,
+        "receiver": receiver,
+    }
 
 
 # ---------------------------------------------------------------------------

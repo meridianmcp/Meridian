@@ -3337,6 +3337,13 @@ async def _handle_task_tools(
         # acf6f51a — opt-in, off by default; see generate_handoff's own
         # emit_manifest docstring. Currently only mode="goal" acts on this.
         _emit_manifest = bool(args.get("emit_manifest"))
+        # 0527f636 — optional receiver address for the persisted pending_goal
+        # (session_name/role/worktree). Passed through RAW: generate_handoff
+        # validates it up front (a malformed address raises before anything is
+        # rendered or persisted) so it can never silently degrade to an
+        # unaddressed, sibling-stealable handoff. Absent -> None -> today's
+        # behaviour. See generate_handoff's own pending_goal_receiver docstring.
+        _pending_goal_receiver = args.get("receiver")
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -3362,6 +3369,7 @@ async def _handle_task_tools(
                     strict_continuation=_strict_continuation,
                     continuation_status=_continuation_status,
                     emit_manifest=_emit_manifest,
+                    pending_goal_receiver=_pending_goal_receiver,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -3789,6 +3797,14 @@ async def _handle_task_tools(
             _pending = await db_module.get_pending_goal(db, _pid)
         except Exception:  # noqa: BLE001
             _pending = None
+        # 0527f636 — the {session_name, role, worktree} address the pending
+        # goal was generated FOR (None: unaddressed, or nothing pending).
+        # Read-only, best-effort, purely additive to the response.
+        _pending_receiver = None
+        try:
+            _pending_receiver = await db_module.get_pending_goal_receiver(db, _pid)
+        except Exception:  # noqa: BLE001
+            _pending_receiver = None
         # 3af86d28 — surface the latest corrective handoff (any status)
         # directly, so a receiving executor never has to reconstruct a
         # correction from narrative notes. None when the project has no
@@ -3802,6 +3818,7 @@ async def _handle_task_tools(
             _correction = None
         return {
             "pending_goal": _pending,
+            "pending_goal_receiver": _pending_receiver,
             # 22f2604d — explicit, machine-readable trust marker (requirement
             # 4): load_handoff always returns the exact stored,
             # project-scoped payload straight from this project's own DB

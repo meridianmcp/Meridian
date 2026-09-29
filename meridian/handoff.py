@@ -106,8 +106,16 @@ async def _persist_handoff_history_and_pending_goal(
     content: str,
     session_id: "str | None",
     pending_goal_body: str,
+    receiver: "dict[str, str] | None" = None,
 ) -> bool:
     """aec043cb — shared amend-vs-fresh persistence + pending_goal write.
+
+    0527f636 — ``receiver`` (already normalised by ``generate_handoff`` via
+    ``db.normalize_pending_goal_receiver``; ``None`` = unaddressed, today's
+    behaviour) is stored alongside ``pending_goal_body`` in the same
+    ``set_pending_goal`` write, so only the addressed receiving session's
+    ``start_session`` can consume the trusted-channel goal — a sibling
+    session's ``start_session`` can no longer silently pop it.
 
     Extracted VERBATIM (zero behavior change) from the pre-existing full/
     delta code path in ``generate_handoff`` so ``mode == "goal"`` — now
@@ -161,7 +169,12 @@ async def _persist_handoff_history_and_pending_goal(
     # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
     # guarded so a pre-migration DB never breaks handoff generation.
     try:
-        await db_module.set_pending_goal(db, project_id, pending_goal_body)
+        if receiver:
+            await db_module.set_pending_goal(
+                db, project_id, pending_goal_body, receiver=receiver
+            )
+        else:
+            await db_module.set_pending_goal(db, project_id, pending_goal_body)
     except Exception:  # noqa: BLE001
         pass
     return amended
@@ -1193,6 +1206,21 @@ async def regenerate_handoff_correction(
     # touched. Best-effort/guarded: a pre-migration DB missing the column
     # must not break regeneration (amend is merely a redundant-row nicety,
     # not a correctness requirement, on such a DB).
+    #
+    # 0527f636 — the pop below also discards the unconsumed goal's receiver
+    # address (it lives in the same cell). Capture it first and re-apply it to
+    # the regenerated handoff, so correcting a handoff that was addressed to a
+    # specific session never silently turns it into an unaddressed
+    # (sibling-stealable) one. An explicit pending_goal_receiver already in
+    # generate_handoff_kwargs wins.
+    try:
+        _prior_receiver = await db_module.get_pending_goal_receiver(db, project_id)
+    except Exception:  # noqa: BLE001
+        _prior_receiver = None
+    if _prior_receiver and "pending_goal_receiver" not in generate_handoff_kwargs:
+        generate_handoff_kwargs = {
+            **generate_handoff_kwargs, "pending_goal_receiver": _prior_receiver,
+        }
     try:
         await db_module.pop_pending_goal(db, project_id)
     except Exception:  # noqa: BLE001
@@ -11988,8 +12016,27 @@ async def generate_handoff(
     research_evidence_envelope: Any = None,
     proposal_scope: "dict[str, Any] | None" = None,
     goal_string_out: "dict[str, Any] | None" = None,
+    pending_goal_receiver: "dict[str, Any] | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
+
+    ``pending_goal_receiver`` (0527f636) — optional, ``None`` by default (every
+    pre-existing call site: zero behaviour change). An object with any subset
+    of ``session_name`` / ``role`` / ``worktree`` naming the session this
+    handoff is FOR. ``projects.pending_goal`` is one read-once slot per
+    project, and before this argument existed ANY sibling ``start_session``
+    popped it — so a parallel session (another executor, a verifier subagent,
+    a resumed session) could silently consume a handoff addressed to a
+    different session and leave the intended receiver with nothing. When
+    given, the persisted ``pending_goal`` (``full``/``delta``/``goal`` modes —
+    the only ones that persist it) is delivered, and cleared, ONLY to a
+    ``start_session`` whose ``session_name`` / ``role`` / ``cwd`` match EVERY
+    given field; any other session neither receives nor consumes it, and the
+    stored handoff stays readable through the idempotent ``load_handoff``.
+    Validated up front (a non-object, unknown key, non-string or over-long
+    field raises ``ValueError`` before anything is rendered or persisted) so
+    a mistyped address can never silently degrade to an unaddressed handoff.
+    Ignored by the non-persisting ``planner``/``starter``/``compact`` modes.
 
     ``emit_manifest`` (acf6f51a) — opt-in, defaults to False (zero behaviour
     change for every existing caller). Currently wired for ``mode="goal"``
@@ -12404,6 +12451,12 @@ async def generate_handoff(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise ValueError(f"project not found: {project_id}")
+    # 0527f636 — validate/canonicalise the receiver address BEFORE anything is
+    # rendered or persisted: a bad address must raise, never silently persist
+    # as an unaddressed (sibling-stealable) handoff. None -> unaddressed.
+    _pending_goal_receiver = db_module.normalize_pending_goal_receiver(
+        pending_goal_receiver
+    )
     # 248c0bb9 — resolve the mode-aware max_content_bytes default ONCE, before
     # any mode branch below. An explicit argument (any int, or None to opt out
     # of budgeting) always wins — see the docstring above.
@@ -12574,6 +12627,7 @@ async def generate_handoff(
         # here: the entire goal-only body IS the /goal snippet.
         _g_amended = await _persist_handoff_history_and_pending_goal(
             db, project_id, "goal", _g_content, session_id, _g_content,
+            receiver=_pending_goal_receiver,
         )
         return (
             _g_path,
@@ -13588,6 +13642,7 @@ async def generate_handoff(
     # mode can reuse it too. See that function's own docstring.
     _amended = await _persist_handoff_history_and_pending_goal(
         db, project_id, mode, content, session_id, quick_start_goal,
+        receiver=_pending_goal_receiver,
     )
     # 5abf3e12 — measure & persist this session's goal compliance (did its /goal
     # item list get fully complete_sprint_item()'d?) at the canonical session-end
