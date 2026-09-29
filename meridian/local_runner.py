@@ -1027,7 +1027,15 @@ class LocalRunner:
         self.env = env
         self._state_dir = state_dir or default_state_dir()
         self._state_path = _scope_state_path(self._state_dir, scope)
-        self._backend = backend or process_lifecycle.get_default_backend()
+        # ensure_console_for_graceful_shutdown=True (2026-09-28 review
+        # finding #5/#22): on Windows, this is what makes
+        # WindowsJobObjectBackend.close()'s CTRL_BREAK graceful-shutdown
+        # attempt deliverable at all -- see that class's own docstring for
+        # the empirical confirmation. A no-op on POSIX and for any caller
+        # that supplies its own explicit `backend=`.
+        self._backend = backend or process_lifecycle.get_default_backend(
+            ensure_console_for_graceful_shutdown=True,
+        )
         self._broker = process_registry.get_broker() if broker is _UNSET else broker
         self._clock = clock
         self.health_probe = health_probe

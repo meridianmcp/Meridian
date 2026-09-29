@@ -11,11 +11,18 @@ Covers:
 5. ``Win32JobAPI`` / ``WindowsJobObjectBackend`` -- fake kernel32 double
    (never touches real ``ctypes.WinDLL``, which doesn't exist off Windows),
    including the no-breakaway limit-flags assertion.
-6. ``get_default_backend`` -- platform selection.
+6. ``Win32ConsoleAPI`` / graceful CTRL_BREAK shutdown (2026-09-28 review
+   finding #5/#22) -- fake kernel32/user32 doubles for the opt-in
+   ensure_console_for_graceful_shutdown path, plus one real, non-mocked,
+   Windows-only end-to-end integration test proving the full pipeline
+   (AllocConsole + console inheritance + GenerateConsoleCtrlEvent + the
+   target's own SetConsoleCtrlHandler) genuinely delivers CTRL_BREAK.
+7. ``get_default_backend`` -- platform selection + console-flag passthrough.
 """
 from __future__ import annotations
 
 import sys
+import time
 import types
 
 import pytest
@@ -626,7 +633,277 @@ def test_assign_to_job_failure_closes_both_job_and_proc_handles(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 6. get_default_backend -- platform selection
+# 6. Graceful CTRL_BREAK shutdown before the forceful path (2026-09-28
+#    review finding #5/#22) -- opt-in via ensure_console_for_graceful_shutdown,
+#    default False (every pre-existing caller/test above is unaffected).
+# ---------------------------------------------------------------------------
+
+
+class _FakeConsoleKernel32:
+    """Fake kernel32 double for pl.Win32ConsoleAPI -- never touches a real
+    ctypes.WinDLL. `alloc_result`/`alloc_error` and `ctrl_break_result`
+    control AllocConsole/GenerateConsoleCtrlEvent outcomes per test."""
+
+    def __init__(self, *, alloc_result=1, alloc_error=0, ctrl_break_result=1):
+        self.calls = []
+        self.alloc_result = alloc_result
+        self.alloc_error = alloc_error
+        self.ctrl_break_result = ctrl_break_result
+        self._console_window = 0
+
+    def GetConsoleWindow(self):
+        return self._console_window
+
+    def AllocConsole(self):
+        self.calls.append("AllocConsole")
+        if self.alloc_result:
+            self._console_window = 999
+        return self.alloc_result
+
+    def GenerateConsoleCtrlEvent(self, ctrl_type, pid):
+        self.calls.append(("GenerateConsoleCtrlEvent", ctrl_type, pid))
+        return self.ctrl_break_result
+
+
+class _FakeUser32:
+    def __init__(self):
+        self.calls = []
+
+    def ShowWindow(self, hwnd, cmd):
+        self.calls.append(("ShowWindow", hwnd, cmd))
+        return 1
+
+
+def _fake_console_api(**kwargs):
+    kernel32 = _FakeConsoleKernel32(**kwargs)
+    api = pl.Win32ConsoleAPI(kernel32, _FakeUser32(), get_last_error=lambda: kernel32.alloc_error)
+    return api, kernel32
+
+
+def test_win32_console_api_alloc_then_hide():
+    api, kernel32 = _fake_console_api()
+    assert api.get_console_window() == 0
+    assert api.alloc_console() is True
+    api.hide_console_window()
+    assert api.get_console_window() == 999
+
+
+def test_ensure_console_noop_when_flag_not_set():
+    """Default backend (the pre-existing behavior for every OTHER caller,
+    e.g. tunnel_client.py) never touches the console API at all."""
+    api, kernel32 = _fake_console_api()
+    backend = pl.WindowsJobObjectBackend(api_loader=lambda: None, console_api_loader=lambda: api)
+    backend._ensure_console()
+    assert kernel32.calls == []
+
+
+def test_ensure_console_calls_alloc_exactly_once_across_multiple_spawns(monkeypatch):
+    """Attempted at most once per backend INSTANCE, not once per spawn()."""
+    api, kernel32 = _fake_console_api()
+    monkeypatch.setattr(pl.subprocess, "Popen", lambda cmd, env=None, cwd=None, **kw: _FakeProc(1))
+    backend = pl.WindowsJobObjectBackend(
+        api_loader=lambda: None, ensure_console_for_graceful_shutdown=True, console_api_loader=lambda: api,
+    )
+    backend.spawn(["node"])
+    backend.spawn(["node"])
+    assert kernel32.calls.count("AllocConsole") == 1
+
+
+def test_ensure_console_skips_warning_on_access_denied(caplog):
+    """ERROR_ACCESS_DENIED means a console already exists -- benign, no
+    warning (confirmed empirically: GetConsoleWindow() is unreliable under a
+    ConPTY-backed terminal, so AllocConsole's own return code is the
+    authority, not a pre-check)."""
+    api, kernel32 = _fake_console_api(alloc_result=0, alloc_error=pl._ERROR_ACCESS_DENIED)
+    backend = pl.WindowsJobObjectBackend(
+        api_loader=lambda: None, ensure_console_for_graceful_shutdown=True, console_api_loader=lambda: api,
+    )
+    with caplog.at_level("WARNING"):
+        backend._ensure_console()
+    assert not any("AllocConsole failed" in r.message for r in caplog.records)
+
+
+def test_ensure_console_warns_on_genuine_failure(caplog):
+    api, kernel32 = _fake_console_api(alloc_result=0, alloc_error=1234)
+    backend = pl.WindowsJobObjectBackend(
+        api_loader=lambda: None, ensure_console_for_graceful_shutdown=True, console_api_loader=lambda: api,
+    )
+    with caplog.at_level("WARNING"):
+        backend._ensure_console()
+    assert any("AllocConsole failed" in r.message for r in caplog.records)
+
+
+def test_close_graceful_ctrl_break_skips_the_forceful_path_entirely(monkeypatch):
+    """When CTRL_BREAK is delivered AND the process exits within
+    grace_seconds, TerminateJobObject/taskkill must never run at all --
+    "escalating to the forceful path only on timeout"."""
+    run_calls = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    api, kernel32 = _fake_console_api(ctrl_break_result=1)
+    fake_job_api = _FakeKernel32()
+    backend = pl.WindowsJobObjectBackend(
+        api_loader=lambda: pl.Win32JobAPI(fake_job_api),
+        ensure_console_for_graceful_shutdown=True, console_api_loader=lambda: api,
+    )
+    proc = _FakeProc(42)  # wait() succeeds immediately -- clean CTRL_BREAK exit
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=42, executable="x", cwd=None, cmdline=["x"], job_id=100, popen=proc,
+    )
+    ok = backend.close(handle, grace_seconds=1.0)
+    assert ok is True
+    assert handle.closed is True
+    assert ("GenerateConsoleCtrlEvent", pl._CTRL_BREAK_EVENT, 42) in kernel32.calls
+    assert run_calls == []  # forceful path never ran
+    assert not any(c[0] == "TerminateJobObject" for c in fake_job_api.calls)
+
+
+def test_close_falls_through_to_forceful_when_ctrl_break_send_fails(monkeypatch):
+    run_calls = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    api, kernel32 = _fake_console_api(ctrl_break_result=0)  # GenerateConsoleCtrlEvent fails
+    fake_job_api = _FakeKernel32()
+    backend = pl.WindowsJobObjectBackend(
+        api_loader=lambda: pl.Win32JobAPI(fake_job_api),
+        ensure_console_for_graceful_shutdown=True, console_api_loader=lambda: api,
+    )
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=42, executable="x", cwd=None, cmdline=["x"], job_id=100,
+    )
+    ok = backend.close(handle)
+    assert ok is True
+    assert ("TerminateJobObject", 100, 1) in fake_job_api.calls
+    assert run_calls == [["taskkill", "/F", "/T", "/PID", "42"]]
+
+
+def test_close_falls_through_to_forceful_when_ctrl_break_times_out(monkeypatch):
+    """CTRL_BREAK is delivered (sent=True) but the process never actually
+    exits within grace_seconds -- must still escalate to the forceful path,
+    not report a false success."""
+    run_calls = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    api, kernel32 = _fake_console_api(ctrl_break_result=1)
+    fake_job_api = _FakeKernel32()
+    backend = pl.WindowsJobObjectBackend(
+        api_loader=lambda: pl.Win32JobAPI(fake_job_api),
+        ensure_console_for_graceful_shutdown=True, console_api_loader=lambda: api,
+    )
+
+    class _NeverExitsProc(_FakeProc):
+        def wait(self, timeout=None):
+            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
+
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=42, executable="x", cwd=None, cmdline=["x"], job_id=100,
+        popen=_NeverExitsProc(42),
+    )
+    ok = backend.close(handle, grace_seconds=0.1)
+    assert ok is True
+    assert ("TerminateJobObject", 100, 1) in fake_job_api.calls
+    assert run_calls == [["taskkill", "/F", "/T", "/PID", "42"]]
+
+
+def test_close_graceful_path_is_a_noop_when_flag_not_set(monkeypatch):
+    """Every EXISTING test in this file constructs WindowsJobObjectBackend
+    without ensure_console_for_graceful_shutdown -- this documents (and
+    locks in) that default=False means the console API is never even
+    loaded, let alone called, from close()."""
+    run_calls = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    console_loader_calls = []
+
+    def _tracking_console_loader():
+        console_loader_calls.append(1)
+        return None
+
+    fake_job_api = _FakeKernel32()
+    backend = pl.WindowsJobObjectBackend(
+        api_loader=lambda: pl.Win32JobAPI(fake_job_api), console_api_loader=_tracking_console_loader,
+    )
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=42, executable="x", cwd=None, cmdline=["x"], job_id=100,
+    )
+    backend.close(handle)
+    assert console_loader_calls == []  # _attempt_graceful_ctrl_break short-circuited before loading
+
+
+def test_pid_confirmed_gone_uses_psutil_when_available(monkeypatch):
+    fake_psutil = types.ModuleType("psutil")
+    fake_psutil.pid_exists = lambda pid: pid != 999
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    assert pl._pid_confirmed_gone(999) is True
+    assert pl._pid_confirmed_gone(1) is False
+
+
+def test_pid_confirmed_gone_false_when_psutil_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    assert pl._pid_confirmed_gone(999) is False  # unverifiable -- never claim "gone"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="CTRL_BREAK/console/Job Object mechanics are Windows-only",
+)
+def test_real_ctrl_break_graceful_shutdown_end_to_end(tmp_path):
+    """Deliberate exception to this file's own 'all OS calls mocked' rule
+    (see module docstring): a REAL, non-mocked integration test, because the
+    2026-09-28 investigation's whole point was that fakes can't prove
+    GenerateConsoleCtrlEvent is actually DELIVERABLE from a genuinely
+    console-less caller -- only a real Windows process can. Spawns a real
+    child via WindowsJobObjectBackend(ensure_console_for_graceful_shutdown=
+    True) and verifies the full pipeline -- AllocConsole + the child
+    inheriting that console + GenerateConsoleCtrlEvent + the child's own
+    SetConsoleCtrlHandler -- genuinely delivers CTRL_BREAK end to end. This
+    is the same mechanism manually confirmed during triage (see
+    WindowsJobObjectBackend's own docstring) and the reason the real
+    production --run-server child (uvicorn, which maps SIGBREAK to its own
+    graceful handle_exit on Windows) can shut down cleanly instead of being
+    torn out mid-run by TerminateJobObject.
+    """
+    marker_path = tmp_path / "graceful_marker.txt"
+    ready_path = tmp_path / "graceful_ready.txt"
+    child_script = tmp_path / "graceful_child.py"
+    child_script.write_text(
+        "import ctypes, os, time\n"
+        "HANDLER = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint32)\n"
+        "def handler(ctrl_type):\n"
+        f"    open(r'{marker_path}', 'w').write(str(ctrl_type))\n"
+        "    os._exit(0)\n"  # a console-ctrl handler runs on its OWN OS
+        # thread -- sys.exit() there would only end that thread, not the
+        # process; os._exit() is the correct, thread-safe way to actually
+        # terminate here, exactly what a real graceful-shutdown handler
+        # (e.g. uvicorn's) does after finishing its own cleanup.
+        "_h = HANDLER(handler)\n"
+        "ctypes.WinDLL('kernel32', use_last_error=True).SetConsoleCtrlHandler(_h, True)\n"
+        # Explicit readiness signal -- polled below instead of a blind sleep,
+        # so this test cannot flake on host-load timing (the same class of
+        # subprocess-timing flake already documented elsewhere in this repo's
+        # test suite): the CTRL_BREAK send is never attempted until the
+        # handler is DEMONSTRABLY registered, not just "probably by now".
+        f"open(r'{ready_path}', 'w').write('ready')\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    backend = pl.WindowsJobObjectBackend(ensure_console_for_graceful_shutdown=True)
+    handle = backend.spawn([sys.executable, str(child_script)])
+    try:
+        deadline = time.monotonic() + 10.0
+        while not ready_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_path.exists(), "child never signaled its handler was registered"
+
+        ok = backend.close(handle, grace_seconds=5.0)
+        assert ok is True
+        assert marker_path.exists(), (
+            "the child's own CTRL_BREAK handler never fired -- graceful "
+            "shutdown was not delivered end-to-end"
+        )
+        assert marker_path.read_text().strip() == str(pl._CTRL_BREAK_EVENT)
+    finally:
+        if handle.popen is not None and handle.popen.poll() is None:
+            handle.popen.kill()
+
+
+# ---------------------------------------------------------------------------
+# 7. get_default_backend -- platform selection + console-flag passthrough
 # ---------------------------------------------------------------------------
 
 
@@ -640,3 +917,21 @@ def test_get_default_backend_posix(monkeypatch):
     monkeypatch.setattr(pl.sys, "platform", "linux")
     backend = pl.get_default_backend()
     assert isinstance(backend, pl.PosixProcessGroupBackend)
+
+
+def test_get_default_backend_console_flag_defaults_false(monkeypatch):
+    monkeypatch.setattr(pl.sys, "platform", "win32")
+    backend = pl.get_default_backend()
+    assert backend._ensure_console_for_graceful_shutdown is False
+
+
+def test_get_default_backend_console_flag_passthrough(monkeypatch):
+    monkeypatch.setattr(pl.sys, "platform", "win32")
+    backend = pl.get_default_backend(ensure_console_for_graceful_shutdown=True)
+    assert backend._ensure_console_for_graceful_shutdown is True
+
+
+def test_get_default_backend_console_flag_ignored_on_posix(monkeypatch):
+    monkeypatch.setattr(pl.sys, "platform", "linux")
+    backend = pl.get_default_backend(ensure_console_for_graceful_shutdown=True)
+    assert isinstance(backend, pl.PosixProcessGroupBackend)  # no crash, no such attribute needed
