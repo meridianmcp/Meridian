@@ -54,15 +54,21 @@ a = Analysis(
     pathex=[str(Path('.').resolve())],
     binaries=[],
     datas=[
-        ('meridian/static/meridian-tray.ico', '.'),
         # meridian/server.py mounts meridian/static/ as a StaticFiles
         # directory at import time (_NoCacheStaticFiles(directory=
         # _resource_path("meridian/static"))) -- confirmed live: the first
         # build of this spec crashed the --run-server child with
         # RuntimeError: Directory '...\meridian\static' does not exist,
-        # since only the single .ico file above was bundled. This build
-        # embeds the FULL server (unlike the slim meridian.spec, which never
-        # serves static files), so the whole directory must come along.
+        # since only a standalone .ico file was bundled. This build embeds
+        # the FULL server (unlike the slim meridian.spec, which never serves
+        # static files), so the whole directory must come along -- this
+        # ALSO carries meridian-tray.ico itself (it lives under
+        # meridian/static/), so there is deliberately no second, separate
+        # datas entry just for the icon (2026-09-28 review finding #23:
+        # that used to bundle the same file twice -- once here, once more
+        # explicitly at the bundle root). _icon_image_path() below resolves
+        # the frozen icon path under this SAME meridian/static/ location
+        # precisely so one copy suffices.
         ('meridian/static', 'meridian/static'),
         # meridian/_deps.py's Jinja2Templates(directory=_resource_path(
         # "meridian/templates")) needs the same treatment -- confirmed live:

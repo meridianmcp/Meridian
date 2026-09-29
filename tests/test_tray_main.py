@@ -82,6 +82,69 @@ def test_server_env_returns_a_copy_not_the_real_os_environ(monkeypatch):
     assert os.environ["SHOULD_NOT_LEAK"] == "1"
 
 
+def test_server_env_unfrozen_never_sets_meipass2(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    env = tray_main._server_env()
+    assert "_MEIPASS2" not in env
+
+
+def test_server_env_frozen_propagates_meipass2(monkeypatch, tmp_path):
+    """2026-09-28 review finding #17: the frozen --run-server child reuses
+    the TRAY's own already-extracted onefile directory via PyInstaller's own
+    _MEIPASS2 mechanism, instead of independently re-extracting itself."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    env = tray_main._server_env()
+    assert env["_MEIPASS2"] == str(tmp_path)
+
+
+def test_server_env_frozen_without_meipass_sets_nothing(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    env = tray_main._server_env()
+    assert "_MEIPASS2" not in env
+
+
+# ---------------------------------------------------------------------------
+# _cold_start_timeout -- frozen-aware default + env override
+# (2026-09-28 review finding #17)
+# ---------------------------------------------------------------------------
+
+
+def test_cold_start_timeout_unfrozen_default(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.delenv("MERIDIAN_TRAY_COLD_START_TIMEOUT", raising=False)
+    assert tray_main._cold_start_timeout() == tray_main._DEFAULT_COLD_START_TIMEOUT_SECONDS
+
+
+def test_cold_start_timeout_frozen_gets_a_larger_default(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delenv("MERIDIAN_TRAY_COLD_START_TIMEOUT", raising=False)
+    assert tray_main._cold_start_timeout() == tray_main._FROZEN_COLD_START_TIMEOUT_SECONDS
+    assert tray_main._FROZEN_COLD_START_TIMEOUT_SECONDS > tray_main._DEFAULT_COLD_START_TIMEOUT_SECONDS
+
+
+def test_cold_start_timeout_env_override_wins(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("MERIDIAN_TRAY_COLD_START_TIMEOUT", "45")
+    assert tray_main._cold_start_timeout() == 45.0
+
+
+def test_cold_start_timeout_invalid_override_falls_back(monkeypatch, caplog):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setenv("MERIDIAN_TRAY_COLD_START_TIMEOUT", "not-a-number")
+    with caplog.at_level("WARNING"):
+        result = tray_main._cold_start_timeout()
+    assert result == tray_main._DEFAULT_COLD_START_TIMEOUT_SECONDS
+    assert any("invalid" in r.message.lower() for r in caplog.records)
+
+
+def test_build_runner_passes_cold_start_timeout(monkeypatch):
+    monkeypatch.setattr(tray_main, "_cold_start_timeout", lambda: 42.0)
+    runner = tray_main._build_runner()
+    assert runner.cold_start_timeout == 42.0
+
+
 # ---------------------------------------------------------------------------
 # _default_port / _dashboard_url
 # ---------------------------------------------------------------------------
@@ -305,10 +368,15 @@ def test_icon_image_path_unfrozen_resolves_under_static(monkeypatch):
 
 
 def test_icon_image_path_frozen_resolves_under_meipass(monkeypatch, tmp_path):
+    """2026-09-28 review finding #23: resolves under meridian/static/ (the
+    SAME sub-path the unfrozen branch uses, and the ONLY place
+    meridian-tray.spec's datas= now bundles the icon -- see that file's own
+    comment), not the bundle root -- there is no separate root-level copy
+    to resolve against any more."""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
     path = tray_main._icon_image_path()
-    assert path == tmp_path / "meridian-tray.ico"
+    assert path == tmp_path / "meridian" / "static" / "meridian-tray.ico"
 
 
 # ---------------------------------------------------------------------------
@@ -722,9 +790,19 @@ class TestTraySpecPreShipConsistency:
         # the bundled server's StaticFiles mount, and a missing
         # 'meridian/templates' entry 500'd `GET /` (Jinja2Templates).
         datas_sources = {src for src, _dest in _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["datas"]}
-        assert "meridian/static/meridian-tray.ico" in datas_sources
         assert "meridian/static" in datas_sources
         assert "meridian/templates" in datas_sources
+
+    def test_spec_does_not_bundle_the_icon_a_second_time_separately(self):
+        # 2026-09-28 review finding #23: meridian-tray.ico used to be
+        # bundled TWICE -- once via a standalone datas entry at the bundle
+        # root, again as part of the whole meridian/static directory copy.
+        # There must now be exactly one datas entry whose source is the
+        # icon file itself (the whole-directory 'meridian/static' entry
+        # still carries it, just not as a SEPARATE, redundant entry).
+        datas_sources = [src for src, _dest in _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["datas"]]
+        assert datas_sources.count("meridian/static/meridian-tray.ico") == 0
+        assert datas_sources.count("meridian/static") == 1
 
     def test_spec_exe_icon_kwarg_points_at_the_real_ico_file(self):
         # occurrence=2: the Windows-only EXE() call (see 73257801) -- the

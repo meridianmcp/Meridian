@@ -6,10 +6,15 @@ around the already-built-and-tested :mod:`meridian.local_runner` primitive
 (item 899936dd) -- ``LocalRunner`` already solves "supervise one child
 process, don't double-spawn, recover from a stale PID, bound the log/output"
 in general; this module's only job is the thin tray UI on top of it, wired
-to the real Meridian HTTP server. Ships UNSIGNED per decision 8460f167 (code
-signing deferred until money/time allow -- Microsoft killed the instant
-SmartScreen reputation win for signed binaries in March 2024, so signing is
-not a launch blocker).
+to the real Meridian HTTP server. Ships UNSIGNED per decision 8460f167 --
+full id 8460f167-55fe-4130-ae10-5b8416781f71, "Code signing: skip-or-cheap-
+DIY for launch, defer subscription/EV until revenue" -- re-verified live via
+get_pinned_decisions 2026-09-28/29 (status=active; genuinely exists in
+Meridian's decision store even though no DECISIONS.md file exists in this
+checkout to grep against -- decisions here live in that store, not a
+committed markdown file). Signing is deferred until money/time allow --
+Microsoft killed the instant SmartScreen reputation win for signed binaries
+in March 2024, so this is not a launch blocker.
 
 Two-mode single binary, no separate "full server" exe needed
 --------------------------------------------------------------
@@ -188,20 +193,69 @@ def _server_command() -> "list[str]":
 
 def _server_env() -> "dict[str, str]":
     """The child's environment. Must be the FULL parent environment plus our
-    one addition, never a bare ``{"MERIDIAN_FROZEN_MODE": "server"}`` dict --
+    additions, never a bare ``{"MERIDIAN_FROZEN_MODE": "server"}`` dict --
     ``subprocess.Popen(env=...)`` REPLACES the environment entirely rather
-    than merging, and the child needs PATH/etc. to function at all."""
+    than merging, and the child needs PATH/etc. to function at all.
+
+    2026-09-28 review finding #17: when frozen, the ``--run-server`` child
+    self-relaunches the SAME onefile exe, which would otherwise independently
+    re-extract itself (a second, redundant PyInstaller bootloader
+    extraction, fully counted inside ``cold_start_timeout``'s window) even
+    though the TRAY process just did the exact same extraction moments ago.
+    ``_MEIPASS2`` is PyInstaller's own documented mechanism for exactly this
+    self-relaunch case (see PyInstaller's "Sometimes a frozen app needs to
+    restart itself" advanced-topics note): a child launched with
+    ``_MEIPASS2`` set to an already-extracted onefile directory reuses it
+    directly instead of extracting a fresh one. Only set when frozen and a
+    real ``sys._MEIPASS`` exists -- a no-op (key simply absent) otherwise."""
     env = dict(os.environ)
     env["MERIDIAN_FROZEN_MODE"] = "server"
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            env["_MEIPASS2"] = str(meipass)
     return env
+
+
+_DEFAULT_COLD_START_TIMEOUT_SECONDS = 20.0  # matches local_runner's own default explicitly, for clarity here
+_FROZEN_COLD_START_TIMEOUT_SECONDS = 30.0  # extra headroom for the frozen path's own import/startup cost
+
+
+def _cold_start_timeout() -> float:
+    """2026-09-28 review finding #17: the frozen ``--run-server`` child's
+    own Python import/startup cost (fastapi/uvicorn/psycopg, etc.) is real
+    even with ``_MEIPASS2`` reuse eliminating the DOUBLE extraction above --
+    give the frozen path a larger default window, and let
+    ``MERIDIAN_TRAY_COLD_START_TIMEOUT`` override either path for field
+    debugging without a code change. Falls back to the default on a
+    missing/invalid override rather than raising."""
+    override = os.environ.get("MERIDIAN_TRAY_COLD_START_TIMEOUT", "").strip()
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            _logger.warning(
+                "tray_main: ignoring invalid MERIDIAN_TRAY_COLD_START_TIMEOUT=%r", override,
+            )
+    if getattr(sys, "frozen", False):
+        return _FROZEN_COLD_START_TIMEOUT_SECONDS
+    return _DEFAULT_COLD_START_TIMEOUT_SECONDS
 
 
 def _icon_image_path() -> Path:
     """Resolve ``meridian-tray.ico`` both frozen (PyInstaller bundles it
     under ``sys._MEIPASS`` per the ``datas=`` entry in meridian-tray.spec)
-    and from source (``meridian/static/``)."""
+    and from source (``meridian/static/``).
+
+    Frozen resolution deliberately matches the SAME ``meridian/static/``
+    sub-path the unfrozen branch already uses (2026-09-28 review finding
+    #23), rather than the bundle root -- meridian-tray.spec's ``datas=``
+    only ever copies the WHOLE ``meridian/static`` directory once (needed
+    for ``server.py``'s StaticFiles mount, which the icon file rides along
+    with for free); there is no second, separate root-level copy of the
+    icon to resolve against any more."""
     if getattr(sys, "frozen", False):
-        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "meridian" / "static"
     else:
         base = Path(__file__).resolve().parent / "static"
     return base / "meridian-tray.ico"
@@ -213,6 +267,7 @@ def _build_runner() -> LocalRunner:
         command=_server_command(),
         env=_server_env(),
         health_probe=None,  # bound to `runner` itself right below
+        cold_start_timeout=_cold_start_timeout(),
     )
     # A closure over `runner` (not a bare module-level callable) is what
     # lets _health_probe cross-check the /health responder's identity
