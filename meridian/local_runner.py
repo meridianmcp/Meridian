@@ -454,7 +454,21 @@ class _PosixScopeLock:
                 self._lock_path,
             )
             return self
+        dir_existed = self._lock_path.parent.exists()
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if not dir_existed:
+            # Mirrors _atomic_write_json's / _prepare_log_path's own
+            # chmod-on-first-creation convention -- this lock's parent IS
+            # state_dir itself (see _scope_lock), and this __enter__ can now
+            # be the FIRST thing to ever create state_dir (it runs before
+            # _prepare_log_path/_atomic_write_json get a chance to), so it
+            # must hardened it here too or state_dir is silently left at
+            # default (world-readable) permissions forever -- exactly the
+            # 2026-09-28 review finding #11 bug, via a new code path.
+            try:
+                self._lock_path.parent.chmod(0o700)
+            except Exception:  # noqa: BLE001
+                pass
         fh = open(self._lock_path, "a+")
         deadline = time.monotonic() + max(0.0, self._timeout_seconds)
         while True:
