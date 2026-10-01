@@ -95,7 +95,10 @@ def test_main_invokes_run_tunnel(monkeypatch):
     monkeypatch.setattr(tunnel_client, "run_tunnel", fake_run_tunnel)
 
     rc = tunnel_main.main(
-        ["--token", "sk_t", "--server", "https://s", "--repo", "/r", "--tunnel-port", "8888"]
+        [
+            "--token", "sk_t", "--server", "https://s", "--repo", "/r",
+            "--tunnel-port", "8888", "--_tunnel-child",
+        ]
     )
     assert rc == 0
     assert captured == {
@@ -119,7 +122,7 @@ def test_main_repo_multipath_splits_first_vs_rest(monkeypatch):
     from meridian import tunnel_client
     monkeypatch.setattr(tunnel_client, "run_tunnel", fake_run_tunnel)
 
-    rc = tunnel_main.main(["--repo", "/first", "/second", "/third"])
+    rc = tunnel_main.main(["--repo", "/first", "/second", "/third", "--_tunnel-child"])
     assert rc == 0
     assert captured["repo_path"] == "/first"
     assert captured["extra_fs_roots"] == ["/second", "/third"]
@@ -157,7 +160,7 @@ def test_main_handles_keyboard_interrupt(monkeypatch):
     from meridian import tunnel_client
 
     monkeypatch.setattr(tunnel_client, "run_tunnel", boom)
-    assert tunnel_main.main([]) == 0
+    assert tunnel_main.main(["--_tunnel-child"]) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -268,3 +271,119 @@ def test_entry_import_excludes_server_stack():
     )
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
+
+
+def test_build_child_command_preserves_options_and_keeps_token_off_argv(monkeypatch):
+    monkeypatch.setattr(tunnel_main.sys, "executable", "python.exe")
+    monkeypatch.delattr(tunnel_main.sys, "frozen", raising=False)
+    args = tunnel_main._build_parser().parse_args(
+        [
+            "--token", "secret-token", "--server", "https://server.test", "--repo",
+            "C:/repo", "C:/extra", "--tunnel-port", "8899", "--no-kill",
+            "--code-dir", "C:/code-a", "--code-dir", "C:/code-b",
+        ]
+    )
+
+    command, child_env = tunnel_main._build_child_command(args)
+
+    assert command == [
+        "python.exe", "-m", "meridian.tunnel_main", "--_tunnel-child",
+        "--server", "https://server.test", "--repo", "C:/repo", "C:/extra",
+        "--tunnel-port", "8899", "--no-kill", "--code-dir", "C:/code-a",
+        "--code-dir", "C:/code-b",
+    ]
+    assert "secret-token" not in command
+    assert child_env["MERIDIAN_TOKEN"] == "secret-token"
+
+
+def test_build_child_command_relaunches_frozen_executable(monkeypatch):
+    monkeypatch.setattr(tunnel_main.sys, "executable", "C:/app/meridian.exe")
+    monkeypatch.setattr(tunnel_main.sys, "frozen", True, raising=False)
+    args = tunnel_main._build_parser().parse_args([])
+
+    command, _child_env = tunnel_main._build_child_command(args)
+
+    assert command == [
+        "C:/app/meridian.exe", "--_tunnel-child", "--tunnel-port", "8808",
+    ]
+
+
+def test_supervisor_restarts_crashed_child_and_stops_on_interrupt(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from meridian.local_runner import ChildState
+
+    instances = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.started = 0
+            self.restarted = 0
+            self.stopped = 0
+            self.log_reads = 0
+            instances.append(self)
+
+        def start(self):
+            self.started += 1
+
+        def status(self):
+            return SimpleNamespace(
+                child=SimpleNamespace(
+                    state=ChildState.CRASHED,
+                    restart_count=0,
+                    exit_code=7,
+                )
+            )
+
+        def restart(self):
+            self.restarted += 1
+
+        def tail_log(self, *, max_bytes):
+            assert max_bytes == 16 * 1024
+            self.log_reads += 1
+            return f"tunnel output {self.log_reads}\n"
+
+        def stop(self):
+            self.stopped += 1
+
+    import meridian.local_runner as local_runner
+
+    monkeypatch.setattr(local_runner, "LocalRunner", FakeRunner)
+    sleeps = []
+
+    def interrupt_after_restart(delay):
+        sleeps.append(delay)
+        if len(sleeps) == 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(tunnel_main.time, "sleep", interrupt_after_restart)
+    args = tunnel_main._build_parser().parse_args(["--tunnel-port", "8899"])
+
+    assert tunnel_main._run_supervised(args) == 0
+    fake_runner = instances[0]
+    assert fake_runner.started == 1
+    assert fake_runner.restarted == 1
+    assert fake_runner.stopped == 1
+    assert fake_runner.log_reads == 2
+    assert sleeps == [1.0, 1.0, 1.0]
+    assert fake_runner.kwargs["scope"] == "meridian-tunnel-client-8899"
+    assert fake_runner.kwargs["command"][0] == tunnel_main.sys.executable
+    assert capsys.readouterr().out == "tunnel output 1\ntunnel output 2\n"
+
+
+def test_restart_backoff_is_exponential_and_capped():
+    assert tunnel_main._restart_delay(0) == 1.0
+    assert tunnel_main._restart_delay(1) == 2.0
+    assert tunnel_main._restart_delay(0, consecutive_failures=2) == 4.0
+    assert tunnel_main._restart_delay(20) == 30.0
+
+
+def test_main_uses_supervisor_unless_internal_worker_flag_is_set(monkeypatch):
+    seen = []
+    monkeypatch.setattr(tunnel_main, "_run_supervised", lambda args: seen.append(args) or 23)
+    monkeypatch.setattr(tunnel_main, "_run_tunnel", lambda args: 24)
+
+    assert tunnel_main.main([]) == 23
+    assert len(seen) == 1
+    assert tunnel_main.main(["--_tunnel-child"]) == 24

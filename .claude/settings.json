@@ -132,6 +132,16 @@
                         "timeout": 10
                     }
                 ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\tunnel_health_check.ps1\"",
+                        "timeout": 3
+                    }
+                ]
             }
         ]
     },
