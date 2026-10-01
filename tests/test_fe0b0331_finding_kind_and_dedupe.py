@@ -269,6 +269,15 @@ async def test_dedupe_and_force_new_survive_the_real_mcp_dispatch(db, project):
     first = await mh._dispatch_mcp_tool("save_finding", dict(args), db, _DATA_DIR)
     dup = await mh._dispatch_mcp_tool("save_finding", dict(args), db, _DATA_DIR)
     assert dup["existing_note_id"] == first["note"]["id"]
+    # ``project_notes.created_at`` defaults to second precision in SQLite.
+    # Give the original an unambiguous earlier timestamp before exercising
+    # oldest-match selection; otherwise two same-second notes are ordered by
+    # their random UUIDs instead of insertion time.
+    await db.execute(
+        "UPDATE project_notes SET created_at = ? WHERE id = ?",
+        ("2000-01-01 00:00:00", first["note"]["id"]),
+    )
+    await db.commit()
     forced = await mh._dispatch_mcp_tool(
         "save_finding", {**args, "force_new": True}, db, _DATA_DIR,
     )
