@@ -200,7 +200,8 @@ def _write_curl_header_config(token: str) -> str:
     if not hardened:
         print(
             f"  WARNING: could not restrict {cfg_path} to your user account; "
-            "check its permissions (it holds your Meridian token).",
+            "the current token was not written. Check/remove old contents, "
+            "fix permissions, and rerun the installer.",
             file=sys.stderr,
         )
         return ""
