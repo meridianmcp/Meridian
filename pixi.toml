@@ -59,8 +59,10 @@ python = ">=3.11,<3.13"
 # verified in isolation: a router with 91 routes added exactly 1 route to a
 # fresh FastAPI() app. Neither this branch nor origin/dev was ever tested
 # against anything past 0.137.1 (both independently locked 0.136.1/0.137.1
-# across platforms) -- cap until a deliberate, tested upgrade.
-fastapi = ">=0.115,<0.138"
+# across platforms). On this branch, FastAPI 0.137.1 and 0.137.2 both make
+# app.routes omit registered tunnel routes; the origin/dev lock at 0.136.1
+# passes that same route-registration test. Hold to the known-good 0.136 line.
+fastapi = ">=0.115,<0.137"
 uvicorn = ">=0.30"
 aiosqlite = ">=0.20"
 pydantic = ">=2.0,<3"

@@ -131,10 +131,12 @@ def _restrict_to_owner(path) -> bool:
 def _write_private_file(path, text: str) -> bool:
     """Write ``text`` to ``path`` without ever exposing it in a shared file.
 
-    The file is created (empty) and locked down to the current user BEFORE the
-    secret is written, so there is no window in which the token sits in a file
-    other local users can read. Returns whether owner-only permissions were
-    applied; raises OSError only when the write itself fails.
+    New POSIX files are created with mode 0600. An existing file is restricted
+    to the current user BEFORE it is opened and truncated; if that restriction
+    fails, it is left unchanged and the secret is not written. On Windows the
+    empty-file/ACL/write sequence gives the same ordering. Returns whether
+    owner-only permissions were applied; raises OSError only when the write
+    itself fails.
     """
     path = Path(path)
     if platform.system() == "Windows":
@@ -142,11 +144,24 @@ def _write_private_file(path, text: str) -> bool:
         hardened = _restrict_to_owner(path)
         path.write_text(text, encoding="utf-8")
         return hardened
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+
+    if path.exists():
+        # os.open(..., mode=0o600) does not change permissions on an existing
+        # file. Protect its old contents before truncation can put the new
+        # token there; fail closed if chmod cannot be applied.
+        if not _restrict_to_owner(path):
+            return False
+        fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC)
+    else:
+        # O_EXCL prevents a race from following a file another process creates
+        # after the existence check; a newly-created file is owner-only from
+        # its first byte.
+        fd = os.open(
+            str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(text)
-    # os.open's mode only applies at creation; tighten a pre-existing file too.
-    return _restrict_to_owner(path)
+    return True
 
 
 def _write_curl_header_config(token: str) -> str:

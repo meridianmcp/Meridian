@@ -325,6 +325,36 @@ def test_write_private_file_creates_posix_file_with_mode_600(tmp_path, monkeypat
     assert target.read_text(encoding="utf-8") == "abc"
 
 
+def test_write_private_file_hardens_existing_posix_file_before_overwrite(tmp_path, monkeypatch):
+    mod = _load_connect()
+    target = tmp_path / "hook_auth.conf"
+    target.write_text("previous contents", encoding="utf-8")
+    monkeypatch.setattr(mod, "platform", types.SimpleNamespace(system=lambda: "Linux"))
+    content_seen_during_hardening: list[str] = []
+
+    def fake_restrict(path):
+        content_seen_during_hardening.append(Path(path).read_text(encoding="utf-8"))
+        return True
+
+    monkeypatch.setattr(mod, "_restrict_to_owner", fake_restrict)
+    assert mod._write_private_file(target, f"secret {_FAKE}") is True
+    assert content_seen_during_hardening == ["previous contents"]
+    assert target.read_text(encoding="utf-8") == f"secret {_FAKE}"
+
+
+def test_write_private_file_does_not_write_if_existing_posix_file_cannot_be_hardened(
+    tmp_path, monkeypatch
+):
+    mod = _load_connect()
+    target = tmp_path / "hook_auth.conf"
+    target.write_text("previous contents", encoding="utf-8")
+    monkeypatch.setattr(mod, "platform", types.SimpleNamespace(system=lambda: "Linux"))
+    monkeypatch.setattr(mod, "_restrict_to_owner", lambda path: False)
+
+    assert mod._write_private_file(target, f"secret {_FAKE}") is False
+    assert target.read_text(encoding="utf-8") == "previous contents"
+
+
 def test_curl_header_config_warns_but_still_writes_when_hardening_fails(tmp_path, monkeypatch, capsys):
     mod = _load_connect()
     monkeypatch.setattr(mod.Path, "home", staticmethod(lambda: tmp_path))

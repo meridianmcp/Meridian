@@ -62,8 +62,26 @@ def reachable_meridian_url():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _HitlStubHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        yield f"http://127.0.0.1:{server.server_address[1]}"
+        # The hook runs in Bash, which can be a separate WSL network namespace
+        # when pytest itself runs on Windows. Prove the stub is reachable from
+        # that exact subprocess before asserting the hook's block behavior;
+        # otherwise it correctly fails open and the test would report a false
+        # product failure unrelated to jq extraction.
+        try:
+            probe = subprocess.run(
+                ["bash", "-c", 'curl -fsS "$MERIDIAN_URL/health" >/dev/null'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=dict(os.environ, MERIDIAN_URL=url),
+            )
+        except (OSError, subprocess.SubprocessError):
+            pytest.skip("reachable Meridian stub cannot be probed from Bash")
+        if probe.returncode != 0:
+            pytest.skip("reachable Meridian stub is not reachable from Bash")
+        yield url
     finally:
         server.shutdown()
         server.server_close()
