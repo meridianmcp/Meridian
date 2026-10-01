@@ -187,13 +187,26 @@ def test_version_constant_and_embedded_marker_agree():
     stale against its own governing constant."""
     embedded = agent_defaults.parse_standard_version(agent_defaults.DEFAULT_AGENT_INSTRUCTIONS)
     assert embedded == agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION
-    # 20, not 19 -- one more real changelog entry landed after the 18->19 bump
-    # above: v20 (2026-09-28, commit aff4440f) added a zotero_search-first
-    # research-routing bullet and a "Deep / multi-step research" bullet
-    # directing the calling agent to its own native multi-turn research
-    # capability for actual searching, per the changelog comment above
-    # AGENT_INSTRUCTIONS_STANDARD_VERSION in agent_defaults.py, which already
-    # documents the bump in full.
+    # 19, not 18 -- two more real changelog entries landed on dev after the
+    # 17->18 bump above: v18 (d5de2d23, sprint items 94f48e4d/92ac025c) fixed
+    # the stale Context7 `get-library-docs` tool name and added the
+    # documentation_retrieval capability contract; v19 (c8c5d1ac, b924fd7c)
+    # documented the save_watchlist_query/run_watchlist_query research
+    # watchlist mechanism and named github_search/social_search explicitly in
+    # the RESEARCH ROUTING PROTOCOL. Verified via `git log -- meridian/agent_defaults.py`
+    # and the changelog comment above AGENT_INSTRUCTIONS_STANDARD_VERSION in
+    # agent_defaults.py, which already documents both bumps in full.
+    # 20, not 19 -- aff4440f ("docs(research): add deep/multi-step research
+    # routing, bump instructions v20") added a RESEARCH ROUTING PROTOCOL bullet
+    # telling the calling agent to use its own native multi-turn research
+    # capability for deep/multi-step questions, with paper_search/github_search/
+    # social_search/zotero_search + capture_research_finding as the source+record
+    # layer (Meridian deliberately isn't a deep-research orchestrator, decision
+    # caf1a346). Both the constant and the embedded `<!-- meridian-executor-
+    # standard: v20 -->` marker were bumped together in that commit (see the
+    # `embedded == AGENT_INSTRUCTIONS_STANDARD_VERSION` assertion above, which
+    # already covers marker/constant drift) -- this is a real, intentional bump,
+    # not a hardcoded-number omission.
     assert agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION == 20
 
 

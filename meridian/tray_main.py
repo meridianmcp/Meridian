@@ -6,10 +6,15 @@ around the already-built-and-tested :mod:`meridian.local_runner` primitive
 (item 899936dd) -- ``LocalRunner`` already solves "supervise one child
 process, don't double-spawn, recover from a stale PID, bound the log/output"
 in general; this module's only job is the thin tray UI on top of it, wired
-to the real Meridian HTTP server. Ships UNSIGNED per decision 8460f167 (code
-signing deferred until money/time allow -- Microsoft killed the instant
-SmartScreen reputation win for signed binaries in March 2024, so signing is
-not a launch blocker).
+to the real Meridian HTTP server. Ships UNSIGNED per decision 8460f167 --
+full id 8460f167-55fe-4130-ae10-5b8416781f71, "Code signing: skip-or-cheap-
+DIY for launch, defer subscription/EV until revenue" -- re-verified live via
+get_pinned_decisions 2026-09-28/29 (status=active; genuinely exists in
+Meridian's decision store even though no DECISIONS.md file exists in this
+checkout to grep against -- decisions here live in that store, not a
+committed markdown file). Signing is deferred until money/time allow --
+Microsoft killed the instant SmartScreen reputation win for signed binaries
+in March 2024, so this is not a launch blocker.
 
 Two-mode single binary, no separate "full server" exe needed
 --------------------------------------------------------------
@@ -45,7 +50,9 @@ follow-up, not required for a working v1.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import shutil
 import sys
 import threading
 import urllib.error
@@ -75,6 +82,8 @@ from .local_runner import (
     RunnerAlreadyRunningError,
 )
 
+_logger = logging.getLogger(__name__)
+
 SCOPE = "meridian-tray"
 _RUN_SERVER_FLAG = "--run-server"
 _HEALTH_PROBE_TIMEOUT_SECONDS = 1.5
@@ -88,20 +97,81 @@ def _dashboard_url() -> str:
     return f"http://127.0.0.1:{_default_port()}/"
 
 
-def _health_probe() -> bool:
+def _pid_owns_listening_port(pid: int, port: int) -> bool:
+    """True iff *pid* is CONFIRMED to itself hold a LISTENING socket on
+    *port* right now (2026-09-28 review finding #13). A bare "HTTP 200 on
+    127.0.0.1:port/health" has no identity binding at all on its own -- a
+    completely unrelated local process that happens to win the race to bind
+    that port first is indistinguishable from the real server without this
+    check. Degrades to True ("can't verify, don't block on it") when psutil
+    is unavailable or *pid* has already exited by the time this runs -- this
+    only ever NARROWS an already-successful HTTP response, never invents a
+    failure the response itself didn't report."""
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        # net_connections() is the modern (psutil>=6.0) name; connections()
+        # is the same call under its older, now-deprecated name -- this
+        # repo's own pin (psutil>=5.9) spans both, so try the modern one
+        # first and fall back rather than assuming either is present.
+        if hasattr(proc, "net_connections"):
+            conns = proc.net_connections(kind="inet")
+        else:
+            conns = proc.connections(kind="inet")
+    except Exception:  # noqa: BLE001
+        return True
+    return any(
+        getattr(c, "status", None) == psutil.CONN_LISTEN
+        and c.laddr and getattr(c.laddr, "port", None) == port
+        for c in conns
+    )
+
+
+def _expected_pid(runner: LocalRunner) -> "int | None":
+    """The PID :func:`_health_probe` should cross-check the ``/health``
+    responder against -- the CURRENTLY relevant child for *runner*'s scope.
+    Prefers the live in-process handle (set the instant ``_spawn()``
+    returns, well before the health-probe polling loop ever starts -- see
+    ``LocalRunner._spawn_and_record``) since it is always freshest; falls
+    back to the persisted record's pid for a read-only, status()-triggered
+    re-probe (see ``LocalRunner._build_local_mcp_status``'s stale-state
+    self-heal, 2026-09-28 review item #1c) where there may be no live
+    in-process handle at all. Returns ``None`` (probe degrades to the
+    HTTP-only check) when neither is available."""
+    live = runner._live_handle
+    if live is not None:
+        return live.pid
+    record = runner._load_record()
+    return record.pid if record is not None else None
+
+
+def _health_probe(expected_pid: "int | None" = None) -> bool:
     """LocalRunner's ``health_probe`` callable: a real HTTP GET against the
     server's own ``/health`` route (not a guess, not a bare port-open check
     -- a closed port never means "ready" and an open-but-not-yet-serving
     port never falsely reports ready either). Any failure means "not ready
     yet", never an exception escaping to ``LocalRunner`` (its own
     ``_await_readiness`` already treats a raising probe as "not ready" too,
-    but staying defensive here keeps this callable's own contract explicit)."""
+    but staying defensive here keeps this callable's own contract explicit).
+
+    *expected_pid*, when supplied, additionally cross-checks (via
+    :func:`_pid_owns_listening_port`) that the process actually LISTENING on
+    the port is the one LocalRunner spawned -- see that function's own
+    docstring for the finding this closes. Optional and defaults to
+    ``None`` (the pre-existing HTTP-only behavior) so this stays callable
+    standalone exactly as before; :func:`_build_runner` is what wires the
+    real cross-check in via a closure over the live runner."""
     url = f"http://127.0.0.1:{_default_port()}/health"
     try:
         with urllib.request.urlopen(url, timeout=_HEALTH_PROBE_TIMEOUT_SECONDS) as resp:
-            return 200 <= resp.status < 300
+            if not (200 <= resp.status < 300):
+                return False
     except (urllib.error.URLError, OSError, ValueError):
         return False
+    if expected_pid is None:
+        return True
+    return _pid_owns_listening_port(expected_pid, _default_port())
 
 
 def _server_command() -> "list[str]":
@@ -123,32 +193,126 @@ def _server_command() -> "list[str]":
 
 def _server_env() -> "dict[str, str]":
     """The child's environment. Must be the FULL parent environment plus our
-    one addition, never a bare ``{"MERIDIAN_FROZEN_MODE": "server"}`` dict --
+    additions, never a bare ``{"MERIDIAN_FROZEN_MODE": "server"}`` dict --
     ``subprocess.Popen(env=...)`` REPLACES the environment entirely rather
-    than merging, and the child needs PATH/etc. to function at all."""
+    than merging, and the child needs PATH/etc. to function at all.
+
+    2026-09-28 review finding #17: when frozen, the ``--run-server`` child
+    self-relaunches the SAME onefile exe, which would otherwise independently
+    re-extract itself (a second, redundant PyInstaller bootloader
+    extraction, fully counted inside ``cold_start_timeout``'s window) even
+    though the TRAY process just did the exact same extraction moments ago.
+    ``_MEIPASS2`` is PyInstaller's own documented mechanism for exactly this
+    self-relaunch case (see PyInstaller's "Sometimes a frozen app needs to
+    restart itself" advanced-topics note): a child launched with
+    ``_MEIPASS2`` set to an already-extracted onefile directory reuses it
+    directly instead of extracting a fresh one. Only set when frozen and a
+    real ``sys._MEIPASS`` exists -- a no-op (key simply absent) otherwise."""
     env = dict(os.environ)
     env["MERIDIAN_FROZEN_MODE"] = "server"
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            env["_MEIPASS2"] = str(meipass)
     return env
+
+
+_DEFAULT_COLD_START_TIMEOUT_SECONDS = 20.0  # matches local_runner's own default explicitly, for clarity here
+_FROZEN_COLD_START_TIMEOUT_SECONDS = 30.0  # extra headroom for the frozen path's own import/startup cost
+
+
+def _cold_start_timeout() -> float:
+    """2026-09-28 review finding #17: the frozen ``--run-server`` child's
+    own Python import/startup cost (fastapi/uvicorn/psycopg, etc.) is real
+    even with ``_MEIPASS2`` reuse eliminating the DOUBLE extraction above --
+    give the frozen path a larger default window, and let
+    ``MERIDIAN_TRAY_COLD_START_TIMEOUT`` override either path for field
+    debugging without a code change. Falls back to the default on a
+    missing/invalid override rather than raising."""
+    override = os.environ.get("MERIDIAN_TRAY_COLD_START_TIMEOUT", "").strip()
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            _logger.warning(
+                "tray_main: ignoring invalid MERIDIAN_TRAY_COLD_START_TIMEOUT=%r", override,
+            )
+    if getattr(sys, "frozen", False):
+        return _FROZEN_COLD_START_TIMEOUT_SECONDS
+    return _DEFAULT_COLD_START_TIMEOUT_SECONDS
 
 
 def _icon_image_path() -> Path:
     """Resolve ``meridian-tray.ico`` both frozen (PyInstaller bundles it
     under ``sys._MEIPASS`` per the ``datas=`` entry in meridian-tray.spec)
-    and from source (``meridian/static/``)."""
+    and from source (``meridian/static/``).
+
+    Frozen resolution deliberately matches the SAME ``meridian/static/``
+    sub-path the unfrozen branch already uses (2026-09-28 review finding
+    #23), rather than the bundle root -- meridian-tray.spec's ``datas=``
+    only ever copies the WHOLE ``meridian/static`` directory once (needed
+    for ``server.py``'s StaticFiles mount, which the icon file rides along
+    with for free); there is no second, separate root-level copy of the
+    icon to resolve against any more."""
     if getattr(sys, "frozen", False):
-        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "meridian" / "static"
     else:
         base = Path(__file__).resolve().parent / "static"
     return base / "meridian-tray.ico"
 
 
 def _build_runner() -> LocalRunner:
-    return LocalRunner(
+    runner = LocalRunner(
         scope=SCOPE,
         command=_server_command(),
         env=_server_env(),
-        health_probe=_health_probe,
+        health_probe=None,  # bound to `runner` itself right below
+        cold_start_timeout=_cold_start_timeout(),
     )
+    # A closure over `runner` (not a bare module-level callable) is what
+    # lets _health_probe cross-check the /health responder's identity
+    # (2026-09-28 review finding #13) -- LocalRunner's health_probe contract
+    # is a plain zero-arg Callable[[], bool], so the expected-pid lookup has
+    # to happen HERE, at call time, rather than being passed in once.
+    runner.health_probe = lambda: _health_probe(_expected_pid(runner))
+    return runner
+
+
+def _sweep_stale_runtime_extractions() -> None:
+    """2026-09-28 review finding #5/#22 (secondary part): best-effort sweep
+    of orphaned PyInstaller onefile extraction dirs left behind by a
+    forcibly-killed --run-server child (whenever the graceful-CTRL_BREAK
+    path in process_lifecycle.py still had to fall back to
+    TerminateJobObject). ``meridian-tray.spec`` now pins ``runtime_tmpdir``
+    to a FIXED, Meridian-owned directory (instead of the OS-wide default
+    temp root) specifically so this sweep can safely delete stale
+    ``_MEI*`` siblings without ever touching an unrelated app's temp files.
+
+    A no-op when not frozen (running from source has no ``sys._MEIPASS`` /
+    onefile extraction concept at all) and never raises -- a sweep failure
+    (e.g. a sibling still locked by a concurrently-running second tray
+    instance -- see this module's own "known limitation" docstring note)
+    must never prevent the tray itself from starting.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return
+    try:
+        current = Path(meipass).resolve()
+        runtime_tmpdir = current.parent
+        for sibling in runtime_tmpdir.iterdir():
+            if sibling == current or not sibling.is_dir():
+                continue
+            if not sibling.name.startswith("_MEI"):
+                continue  # never touch anything this sweep didn't itself create
+            try:
+                shutil.rmtree(sibling, ignore_errors=True)
+            except Exception:  # noqa: BLE001 -- best-effort, one bad sibling must not stop the sweep
+                pass
+    except Exception:  # noqa: BLE001 -- must never prevent the tray from starting
+        _logger.warning("tray_main: stale runtime-extraction sweep failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +377,7 @@ def _run_tray() -> int:
     import pystray
     from PIL import Image
 
+    _sweep_stale_runtime_extractions()
     runner = _build_runner()
 
     # 4e4c3817 follow-up (owner feedback 2026-09-27): a bare tray icon gives

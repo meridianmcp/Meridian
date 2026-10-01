@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -272,6 +273,447 @@ def test_start_requires_a_command(state_dir):
 
 
 # ---------------------------------------------------------------------------
+# `detached` -- Windows Job Object KILL_ON_JOB_CLOSE opt-out (d397bb71)
+# ---------------------------------------------------------------------------
+
+
+def test_detached_false_by_default_requests_kill_on_job_close(state_dir, monkeypatch):
+    """The default (tray / programmatic) construction must be byte-for-byte
+    unchanged: kill_on_job_close=True is still requested from the default
+    backend."""
+    captured = {}
+
+    def fake_get_default_backend(**kwargs):
+        captured.update(kwargs)
+        return process_lifecycle.PosixProcessGroupBackend()
+
+    monkeypatch.setattr(process_lifecycle, "get_default_backend", fake_get_default_backend)
+    lr.LocalRunner("detached-default-scope", None, state_dir=state_dir, broker=None)
+    assert captured["kill_on_job_close"] is True
+
+
+def test_detached_true_requests_kill_on_job_close_disabled(state_dir, monkeypatch):
+    """A `detached=True` LocalRunner (the bare CLI start/restart path) must
+    build its default backend with kill_on_job_close=False -- see
+    LocalRunner.__init__'s own `detached` docstring for the full Windows
+    Job Object rationale (d397bb71)."""
+    captured = {}
+
+    def fake_get_default_backend(**kwargs):
+        captured.update(kwargs)
+        return process_lifecycle.PosixProcessGroupBackend()
+
+    monkeypatch.setattr(process_lifecycle, "get_default_backend", fake_get_default_backend)
+    runner = lr.LocalRunner(
+        "detached-true-scope", None, state_dir=state_dir, broker=None, detached=True,
+    )
+    assert captured["kill_on_job_close"] is False
+    assert runner.detached is True
+
+
+def test_detached_ignored_when_explicit_backend_supplied(state_dir):
+    """An explicitly-supplied backend (every test in this file, and any
+    caller with its own lifecycle backend) is never second-guessed by
+    `detached` -- matches `ensure_console_for_graceful_shutdown`'s own
+    documented no-op-for-explicit-backend contract."""
+    explicit_backend = process_lifecycle.PosixProcessGroupBackend()
+    runner = lr.LocalRunner(
+        "detached-explicit-scope", None, state_dir=state_dir, broker=None,
+        backend=explicit_backend, detached=True,
+    )
+    assert runner._backend is explicit_backend
+
+
+def test_cli_start_and_restart_build_detached_runner(state_dir, monkeypatch):
+    """main()'s `start`/`restart` subcommands must construct their
+    LocalRunner via `_runner_from_args(args, detached=True)` -- the whole
+    fix is worthless if the CLI entry point forgets to opt in. `status`/
+    `doctor`/`preflight` never spawn a persisting child from this call path,
+    so they must stay `False` (unaffected)."""
+    seen = []
+    real_runner_from_args = lr._runner_from_args
+
+    def spy(args, *, detached=False):
+        seen.append((args.command, detached))
+        return real_runner_from_args(args, detached=detached)
+
+    monkeypatch.setattr(lr, "_runner_from_args", spy)
+
+    state_dir_arg = str(state_dir / "detached_cli_state")
+    base = ["--state-dir", state_dir_arg]
+    sleep_cmd = ["--", sys.executable, "-c", "import time; time.sleep(30)"]
+    exit_cmd = ["--", sys.executable, "-c", "import sys; sys.exit(0)"]
+    try:
+        lr.main(base + ["start", "--scope", "detached-cli-scope"] + sleep_cmd)
+        lr.main(base + ["restart", "--scope", "detached-cli-scope"] + sleep_cmd)
+        lr.main(base + ["doctor", "--scope", "detached-cli-scope"] + exit_cmd)
+        lr.main(base + ["preflight", "--scope", "detached-cli-scope"] + exit_cmd)
+    finally:
+        lr.main(base + ["stop", "--scope", "detached-cli-scope"])
+
+    by_command = dict(seen)
+    assert by_command["start"] is True
+    assert by_command["restart"] is True
+    assert by_command["doctor"] is False
+    assert by_command["preflight"] is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-process start() mutex -- TOCTOU race (2026-09-28 review finding #1a)
+# ---------------------------------------------------------------------------
+
+
+class _FakeMutexKernel32:
+    """Fake kernel32 double for lr.Win32MutexAPI -- never touches a real
+    ctypes.WinDLL, so this is exercisable on any platform. A single shared
+    instance simulates ONE named-mutex OS object: `held_by` tracks who
+    currently owns it (None = free), matching real Windows semantics closely
+    enough for this module's purposes (mutual exclusion + WAIT_TIMEOUT)."""
+
+    def __init__(self):
+        self.held_by = None
+        self._next_handle = 5000
+        self.calls = []
+
+    def CreateMutexW(self, sec, initial_owner, name):
+        self._next_handle += 1
+        self.calls.append(("CreateMutexW", name))
+        return self._next_handle
+
+    def WaitForSingleObject(self, handle, timeout_ms):
+        self.calls.append(("WaitForSingleObject", handle, timeout_ms))
+        if self.held_by is None:
+            self.held_by = handle
+            return lr._WAIT_OBJECT_0
+        return 0x00000102  # WAIT_TIMEOUT
+
+    def ReleaseMutex(self, handle):
+        self.calls.append(("ReleaseMutex", handle))
+        if self.held_by == handle:
+            self.held_by = None
+            return 1
+        return 0
+
+    def CloseHandle(self, handle):
+        self.calls.append(("CloseHandle", handle))
+        return 1
+
+
+def test_windows_scope_lock_acquire_release_round_trip():
+    fake = _FakeMutexKernel32()
+    api = lr.Win32MutexAPI(fake)
+    lock = lr._WindowsScopeLock("test-mutex", api_loader=lambda: api)
+    with lock:
+        assert fake.held_by is not None
+    assert fake.held_by is None  # released on __exit__
+    assert ("CreateMutexW", "test-mutex") in fake.calls
+
+
+def test_windows_scope_lock_second_acquirer_times_out_while_first_holds():
+    fake = _FakeMutexKernel32()
+    api = lr.Win32MutexAPI(fake)
+    lock_a = lr._WindowsScopeLock("contended", timeout_seconds=0.2, api_loader=lambda: api)
+    lock_b = lr._WindowsScopeLock("contended", timeout_seconds=0.2, api_loader=lambda: api)
+    with lock_a:
+        with pytest.raises(lr.ScopeLockTimeoutError):
+            with lock_b:
+                pass
+    # First lock released on its own __exit__ -- a THIRD attempt now succeeds.
+    lock_c = lr._WindowsScopeLock("contended", timeout_seconds=0.2, api_loader=lambda: api)
+    with lock_c:
+        pass
+
+
+def test_windows_scope_lock_degrades_unlocked_when_api_unavailable():
+    """A caller whose Win32 API can't even be loaded must not brick every
+    start() -- degrades to running unlocked (logged, never silent, never
+    fatal). Never raises ScopeLockTimeoutError in this case."""
+    lock = lr._WindowsScopeLock("no-api", api_loader=lambda: None)
+    with lock:
+        pass  # must not raise
+
+
+def test_windows_scope_lock_treats_wait_abandoned_as_acquired():
+    class _AbandonedKernel32(_FakeMutexKernel32):
+        def WaitForSingleObject(self, handle, timeout_ms):
+            self.calls.append(("WaitForSingleObject", handle, timeout_ms))
+            return lr._WAIT_ABANDONED
+
+    fake = _AbandonedKernel32()
+    api = lr.Win32MutexAPI(fake)
+    lock = lr._WindowsScopeLock("abandoned", api_loader=lambda: api)
+    with lock:
+        pass  # WAIT_ABANDONED must be treated as a successful acquisition
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX-only")
+def test_posix_scope_lock_acquire_release_round_trip(tmp_path):
+    lock_path = tmp_path / "scope.lock"
+    lock = lr._PosixScopeLock(lock_path, timeout_seconds=2.0)
+    with lock:
+        assert lock_path.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX-only")
+def test_posix_scope_lock_second_acquirer_times_out_while_first_holds(tmp_path):
+    lock_path = tmp_path / "scope.lock"
+    lock_a = lr._PosixScopeLock(lock_path, timeout_seconds=0.3, poll_interval=0.02)
+    lock_b = lr._PosixScopeLock(lock_path, timeout_seconds=0.3, poll_interval=0.02)
+    with lock_a:
+        with pytest.raises(lr.ScopeLockTimeoutError):
+            with lock_b:
+                pass
+
+
+def test_scope_lock_selects_windows_implementation(monkeypatch, tmp_path):
+    monkeypatch.setattr(lr.sys, "platform", "win32")
+    lock = lr._scope_lock("some-scope", tmp_path)
+    assert isinstance(lock, lr._WindowsScopeLock)
+
+
+def test_scope_lock_selects_posix_implementation(monkeypatch, tmp_path):
+    monkeypatch.setattr(lr.sys, "platform", "linux")
+    lock = lr._scope_lock("some-scope", tmp_path)
+    assert isinstance(lock, lr._PosixScopeLock)
+
+
+def test_scope_lock_windows_name_incorporates_both_scope_and_state_dir(monkeypatch, tmp_path):
+    """Two DIFFERENT state dirs with the identical scope STRING must never
+    contend on the same OS mutex -- only a genuinely identical (scope,
+    state_dir) pair should (see _scope_lock's own docstring)."""
+    monkeypatch.setattr(lr.sys, "platform", "win32")
+    lock_a = lr._scope_lock("shared-name", tmp_path / "dir-a")
+    lock_b = lr._scope_lock("shared-name", tmp_path / "dir-b")
+    lock_c = lr._scope_lock("shared-name", tmp_path / "dir-a")
+    assert lock_a._name != lock_b._name
+    assert lock_a._name == lock_c._name
+
+
+def test_start_locked_acquires_and_releases_scope_lock(state_dir, monkeypatch):
+    """The cross-process scope lock must actually be acquired for the
+    duration of the load-record -> check-liveness -> spawn -> save-record
+    critical section, and released again once it returns -- verified via a
+    spy lock injected in place of the real platform lock."""
+    events = []
+
+    class _SpyLock:
+        def __enter__(self):
+            events.append("acquired")
+            return self
+
+        def __exit__(self, *exc):
+            events.append("released")
+
+    monkeypatch.setattr(lr, "_scope_lock", lambda *a, **k: _SpyLock())
+    with _make_runner("spy-lock-scope", _sleepy_cmd(), state_dir=state_dir, broker=None) as runner:
+        runner.start()
+    assert events == ["acquired", "released"]
+
+
+def test_scope_lock_timeout_propagates_out_of_start(state_dir, monkeypatch):
+    """A genuine lock-contention timeout must surface as a clear error from
+    start(), not be silently swallowed or misreported as some other
+    failure."""
+    def _always_times_out(*args, **kwargs):
+        raise lr.ScopeLockTimeoutError("simulated contention")
+
+    monkeypatch.setattr(lr, "_scope_lock", _always_times_out)
+    runner = _make_runner("timeout-scope", _sleepy_cmd(), state_dir=state_dir, broker=None)
+    with pytest.raises(lr.ScopeLockTimeoutError):
+        runner.start()
+
+
+_RACE_RUNNER_SCRIPT = """
+import json
+import sys
+from meridian import local_runner as lr
+
+runner = lr.LocalRunner(
+    sys.argv[1], [sys.executable, "-c", "import time; time.sleep(30)"],
+    state_dir=lr.Path(sys.argv[2]), broker=None,
+)
+try:
+    status = runner.start()
+    print(json.dumps({"ok": True, "pid": status.child.pid}), flush=True)
+except lr.RunnerAlreadyRunningError:
+    print(json.dumps({"ok": False, "error": "RunnerAlreadyRunningError"}), flush=True)
+    sys.exit(0)
+
+# Stay alive -- keeps this process's Job Object handle open on Windows (a
+# fire-and-forget CLI invocation that exits immediately after start() would
+# tear its OWN just-spawned child down right then, via
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE firing when the OS closes this
+# process's handles on exit -- that is a real, separate, PRE-EXISTING
+# property of the one-shot CLI path, not something this test is trying to
+# exercise). This mirrors the real production scenario instead: a
+# long-running supervisor (the tray) that holds its LocalRunner/handle alive
+# for as long as it itself keeps running.
+sys.stdin.readline()
+runner.stop()
+"""
+
+
+def test_two_real_processes_racing_start_only_one_spawns_a_server_child(tmp_path):
+    """Genuine two-PROCESS race test (2026-09-28 review finding #1a) -- not
+    a single-process simulation. Two real, independent Python processes
+    (each a small persistent supervisor script, NOT the fire-and-forget CLI
+    -- see _RACE_RUNNER_SCRIPT's own comment on why) call LocalRunner.start()
+    for the EXACT SAME scope + state-dir, launched back-to-back with no
+    synchronization between them, so their load-record -> check-liveness ->
+    spawn -> save-record windows genuinely overlap however the OS happens to
+    schedule the two processes. Before the cross-process mutex fix, this
+    raced: both processes could observe "no existing record" and both spawn
+    a server child for the same scope, one orphaned. With the fix, the mutex
+    -- not scheduling luck -- decides the ordering: exactly one process's
+    start() succeeds, and the other deterministically observes the winner's
+    already-saved, still-alive record and raises RunnerAlreadyRunningError.
+    """
+    state_dir_arg = str(tmp_path / "race_state")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(lr.__file__)))
+    script_path = tmp_path / "race_runner.py"
+    script_path.write_text(_RACE_RUNNER_SCRIPT, encoding="utf-8")
+    argv = [sys.executable, str(script_path), "real-race-scope", state_dir_arg]
+    # Running a bare script file (not `-m`) puts the SCRIPT's own directory
+    # on sys.path[0], not the cwd -- PYTHONPATH is what makes `import
+    # meridian` resolve here (mirrors how every OTHER real-subprocess test
+    # in this file passes cwd=repo_root for `-m meridian.local_runner`,
+    # which doesn't need this since `-m` already adds the cwd itself).
+    child_env = dict(os.environ, PYTHONPATH=repo_root)
+
+    proc_a = subprocess.Popen(
+        argv, cwd=repo_root, env=child_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    proc_b = subprocess.Popen(
+        argv, cwd=repo_root, env=child_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        line_a = proc_a.stdout.readline()
+        line_b = proc_b.stdout.readline()
+        assert line_a, f"process A produced no output; stderr={proc_a.stderr.read()}"
+        assert line_b, f"process B produced no output; stderr={proc_b.stderr.read()}"
+        results = [json.loads(line_a), json.loads(line_b)]
+
+        successes = [r for r in results if r["ok"]]
+        errors = [r for r in results if not r["ok"]]
+
+        assert len(successes) == 1, f"expected exactly ONE winner, got: {results}"
+        assert len(errors) == 1, f"expected exactly ONE RunnerAlreadyRunningError, got: {results}"
+        assert errors[0]["error"] == "RunnerAlreadyRunningError"
+        winner_pid = successes[0]["pid"]
+        assert _wait_until(lambda: _pid_alive(winner_pid), timeout=5.0)
+    finally:
+        # Cleanup -- tell the still-alive winner (and, harmlessly, the
+        # already-exited loser) to stop, then reap both processes.
+        for proc in (proc_a, proc_b):
+            try:
+                proc.stdin.write("stop\n")
+                proc.stdin.flush()
+            except Exception:  # noqa: BLE001 -- loser already exited, pipe may be closed
+                pass
+        for proc in (proc_a, proc_b):
+            try:
+                proc.wait(timeout=10)
+            except Exception:  # noqa: BLE001
+                proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# tray-thread races -- instance-level lock (2026-09-28 review finding #1b)
+# ---------------------------------------------------------------------------
+
+
+def test_thread_lock_serializes_concurrent_restart_and_stop_from_different_threads(state_dir, monkeypatch):
+    """Simulates tray_main.py's real shape: Status/Logs/Restart on their own
+    threading.Thread, Quit on pystray's own callback thread, all driving the
+    SAME LocalRunner instance. Establishes a real, live child first (so both
+    racing calls have genuine work to do -- restart() terminates the old
+    child then spawns a new one; stop() terminates whichever is current),
+    then widens the race window by making the ACTUAL underlying
+    _spawn_and_record/_terminate calls artificially slow, fires restart()
+    and stop() from two threads at (as close to) the same instant as Python
+    allows, and asserts the recorded [in, out) intervals for every call
+    NEVER overlap -- proof that self._thread_lock genuinely serialized the
+    two calls' real critical-section work, not just "no exception raised"
+    (which could pass even with real interleaving corrupting the on-disk
+    record)."""
+    runner = _make_runner("thread-race-scope", _sleepy_cmd(), state_dir=state_dir, broker=None)
+    runner.start()  # establish a live record BEFORE the race begins
+
+    events = []
+    events_lock = threading.Lock()
+    real_spawn_and_record = runner._spawn_and_record
+    real_terminate = runner._terminate
+
+    def _make_slow(kind, real_fn):
+        def _slow(*args, **kwargs):
+            with events_lock:
+                events.append((kind, "in"))
+            time.sleep(0.1)
+            result = real_fn(*args, **kwargs)
+            with events_lock:
+                events.append((kind, "out"))
+            return result
+        return _slow
+
+    monkeypatch.setattr(runner, "_spawn_and_record", _make_slow("spawn", real_spawn_and_record))
+    monkeypatch.setattr(runner, "_terminate", _make_slow("terminate", real_terminate))
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def _do_restart():
+        barrier.wait()
+        try:
+            runner.restart()
+        except Exception as exc:  # noqa: BLE001 -- surfaced via `errors`, not silently lost
+            errors.append(exc)
+
+    def _do_stop():
+        barrier.wait()
+        try:
+            runner.stop()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_do_restart)
+    t2 = threading.Thread(target=_do_stop)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    try:
+        assert not errors, f"unexpected exceptions from restart()/stop(): {errors}"
+        assert events, "neither call reached its instrumented critical-section work"
+        # Pair up each "in"/"out" into a (start_index, end_index) interval,
+        # per call occurrence (a stack per kind handles restart() calling
+        # BOTH _terminate then _spawn_and_record within its own single
+        # locked critical section).
+        intervals = []
+        pending: "dict[str, list[int]]" = {}
+        for i, (kind, phase) in enumerate(events):
+            if phase == "in":
+                pending.setdefault(kind, []).append(i)
+            else:
+                intervals.append((pending[kind].pop(), i))
+        intervals.sort()
+        for (_s1, e1), (s2, _e2) in zip(intervals, intervals[1:]):
+            assert e1 < s2, f"critical sections overlapped in time: {events}"
+    finally:
+        runner.stop()
+
+
+def test_thread_lock_is_a_plain_non_reentrant_lock(state_dir):
+    """Documents the design choice (see LocalRunner.__init__'s own comment):
+    a plain Lock is correct here because _terminate() is only ever reached
+    FROM inside one of start()/stop()/restart(), never re-entered."""
+    runner = _make_runner("lock-type-scope", None, state_dir=state_dir, broker=None)
+    assert type(runner._thread_lock) is type(threading.Lock())
+
+
+# ---------------------------------------------------------------------------
 # Stale PID / recovery
 # ---------------------------------------------------------------------------
 
@@ -349,6 +791,74 @@ def test_status_recovers_exit_code_for_a_crash_discovered_later(state_dir):
         assert _wait_until(lambda: runner.status().child.state is lr.ChildState.CRASHED, timeout=5.0)
         final = runner.status()
         assert final.child.exit_code == 5
+
+
+# ---------------------------------------------------------------------------
+# _spawn() cleans up an orphaned empty log file on backend.spawn() failure
+# (2026-09-28 review finding #9)
+# ---------------------------------------------------------------------------
+
+
+class _FailingBackend:
+    """Test double whose spawn() always raises AFTER LocalRunner._spawn()
+    has already opened+chmod'd the log file -- exercises the exact ordering
+    the real bug needed (Popen() failing inside backend.spawn()), without
+    depending on a REAL unlaunchable executable (which behaves differently
+    across platforms/shells)."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.spawn_calls = 0
+
+    def spawn(self, cmd, *, env=None, cwd=None, popen_kwargs=None):
+        self.spawn_calls += 1
+        raise self._exc
+
+
+def test_spawn_failure_removes_the_orphaned_empty_log_file(state_dir):
+    runner = _make_runner(
+        "spawn-fail-scope", ["irrelevant"], state_dir=state_dir, broker=None,
+        backend=_FailingBackend(RuntimeError("boom: launcher not found")),
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        runner.start()
+
+    log_dir = lr._scope_log_dir(state_dir, "spawn-fail-scope")
+    leftover_logs = list(log_dir.glob("*.log")) if log_dir.exists() else []
+    assert leftover_logs == [], f"a failed spawn must not orphan a log file, found: {leftover_logs}"
+
+
+def test_spawn_failure_still_prunes_older_logs(state_dir):
+    """A failed spawn attempt must not bypass max_log_files rotation --
+    older logs from PRIOR successful runs are still pruned down to the
+    configured cap even though this particular attempt failed."""
+    scope = "spawn-fail-prune-scope"
+    log_dir = lr._scope_log_dir(state_dir, scope)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(5):
+        (log_dir / f"old-{i}.log").write_text("x", encoding="utf-8")
+
+    runner = _make_runner(
+        scope, ["irrelevant"], state_dir=state_dir, broker=None, max_log_files=2,
+        backend=_FailingBackend(OSError("spawn failed")),
+    )
+    with pytest.raises(OSError):
+        runner.start()
+
+    remaining = list(log_dir.glob("*.log"))
+    assert len(remaining) <= 2
+
+
+def test_spawn_failure_exception_propagates_unchanged(state_dir):
+    """The cleanup must never mask or replace the ORIGINAL exception from
+    backend.spawn()."""
+    backend = _FailingBackend(FileNotFoundError("no such launcher"))
+    runner = _make_runner(
+        "spawn-fail-propagate", ["irrelevant"], state_dir=state_dir, broker=None, backend=backend,
+    )
+    with pytest.raises(FileNotFoundError, match="no such launcher"):
+        runner.start()
+    assert backend.spawn_calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +984,94 @@ def test_status_downgrades_local_mcp_once_child_is_no_longer_running(state_dir):
         # RUNNING, local_mcp must never claim READY.
         if status.child.state is not lr.ChildState.RUNNING:
             assert status.local_mcp.state is not lr.LocalMcpState.READY
+
+
+# ---------------------------------------------------------------------------
+# Stale LocalMcpState self-heal on status() (2026-09-28 review finding #1c)
+# ---------------------------------------------------------------------------
+
+
+def test_status_self_heals_cold_start_timeout_once_probe_starts_succeeding(state_dir):
+    """Regression test: local_mcp_state used to be written ONCE inside
+    _await_readiness and never re-checked -- once a launch recorded
+    COLD_START_TIMEOUT, status() kept reporting that stale reading forever
+    even after the server actually became healthy later (e.g. a slow
+    first-run migration finishing seconds after the bounded start() wait
+    gave up). A later status() call, with the child still RUNNING and the
+    probe now succeeding, must self-heal to READY without requiring an
+    explicit restart."""
+    probe_state = {"ready": False}
+
+    with _make_runner(
+        "self-heal-scope", _sleepy_cmd(), state_dir=state_dir, broker=None,
+        health_probe=lambda: probe_state["ready"], cold_start_timeout=0.15, poll_interval=0.02,
+    ) as runner:
+        status = runner.start()
+        assert status.local_mcp.state is lr.LocalMcpState.COLD_START_TIMEOUT
+        assert status.child.state is lr.ChildState.RUNNING
+
+        # Server "finishes starting up" strictly after the bounded wait gave up.
+        probe_state["ready"] = True
+        healed = runner.status()
+        assert healed.local_mcp.state is lr.LocalMcpState.READY
+        assert "stale" in healed.local_mcp.detail
+
+        # And the healed reading is PERSISTED, not just returned once.
+        record = runner._load_record()
+        assert record.local_mcp_state == lr.LocalMcpState.READY.value
+
+
+def test_status_leaves_cold_start_timeout_alone_if_probe_still_failing(state_dir):
+    """The self-heal re-probe must not fabricate readiness -- if the probe
+    still reports not-ready, status() keeps reporting the honest
+    COLD_START_TIMEOUT state (just with a freshened checked_at, proving a
+    re-check genuinely happened)."""
+    with _make_runner(
+        "self-heal-still-failing", _sleepy_cmd(), state_dir=state_dir, broker=None,
+        health_probe=lambda: False, cold_start_timeout=0.1, poll_interval=0.02,
+    ) as runner:
+        status = runner.start()
+        assert status.local_mcp.state is lr.LocalMcpState.COLD_START_TIMEOUT
+        first_checked_at = status.local_mcp.checked_at
+
+        time.sleep(0.05)
+        rechecked = runner.status()
+        assert rechecked.local_mcp.state is lr.LocalMcpState.COLD_START_TIMEOUT
+        assert rechecked.local_mcp.checked_at > first_checked_at
+
+
+def test_status_does_not_reprobe_when_no_health_probe_configured(state_dir):
+    """No health_probe at all -> NOT_CONFIGURED forever, never touches this
+    new branch (nothing to probe with)."""
+    with _make_runner(
+        "self-heal-no-probe", _sleepy_cmd(), state_dir=state_dir, broker=None,
+    ) as runner:
+        status = runner.start()
+        assert status.local_mcp.state is lr.LocalMcpState.NOT_CONFIGURED
+        again = runner.status()
+        assert again.local_mcp.state is lr.LocalMcpState.NOT_CONFIGURED
+
+
+def test_status_reprobe_survives_a_broken_probe(state_dir):
+    """A probe that raises during the self-heal re-check must degrade to
+    'still not ready', exactly like the original _await_readiness probe
+    contract -- never crash status()."""
+    calls = {"n": 0}
+
+    def flaky_probe():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return False
+        raise RuntimeError("boom on later calls")
+
+    with _make_runner(
+        "self-heal-broken-probe", _sleepy_cmd(), state_dir=state_dir, broker=None,
+        health_probe=flaky_probe, cold_start_timeout=0.1, poll_interval=0.02,
+    ) as runner:
+        status = runner.start()
+        assert status.local_mcp.state is lr.LocalMcpState.COLD_START_TIMEOUT
+        rechecked = runner.status()  # probe now raises -- must not crash
+        assert rechecked.local_mcp.state is lr.LocalMcpState.COLD_START_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -941,3 +1539,83 @@ def test_cli_module_invocation_via_subprocess(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["child"]["state"] == "not_started"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason=(
+        "d397bb71: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE handle-lifetime "
+        "semantics are Windows-only -- POSIX's start_new_session=True "
+        "already leaves a spawned child fully independent of its spawning "
+        "process, so there is no equivalent hazard to reproduce there."
+    ),
+)
+def test_cli_start_child_survives_bare_cli_process_exit(tmp_path):
+    """Regression test for d397bb71: a bare, fire-and-forget
+    ``python -m meridian.local_runner start ...`` CLI invocation must NOT
+    kill the child it just spawned once the CLI process itself exits.
+
+    This can only be observed at the OS-process level: the bug is that the
+    Windows Job Object the CLI process creates has
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, and the CLI process is the ONLY
+    process holding a handle to it -- when that process exits, the OS
+    closes its last handle to the job, and KILL_ON_JOB_CLOSE then
+    terminates every process still assigned to it, including the child that
+    was spawned specifically to keep running in the background. A
+    same-process unit test cannot observe this at all (nothing here ever
+    calls Python's own process-exit path); this launches the real CLI
+    entry point as a genuine OS child process via ``subprocess.run``, waits
+    for THAT process to fully exit, then checks -- from this completely
+    separate test process -- whether the grandchild it spawned is still
+    alive well afterward."""
+    state_dir_arg = str(tmp_path / "cli_survive_state")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(lr.__file__)))
+    scope = "cli-survive-scope"
+    grandchild_pid = None
+    try:
+        cli = subprocess.run(
+            [
+                sys.executable, "-m", "meridian.local_runner",
+                "--state-dir", state_dir_arg,
+                "start", "--scope", scope,
+                "--", sys.executable, "-c", "import time; time.sleep(30)",
+            ],
+            capture_output=True, text=True, check=False, cwd=repo_root, timeout=30,
+        )
+        # The subprocess.run() call above only returns once the CLI process
+        # (the one that owned the Job Object handle) has FULLY exited -- if
+        # the bug is present, the OS will already have torn the grandchild
+        # down as part of that very exit, before we ever get here.
+        assert cli.returncode == 0, cli.stderr
+        payload = json.loads(cli.stdout)
+        assert payload["child"]["state"] == "running", payload
+        grandchild_pid = payload["child"]["pid"]
+
+        assert _pid_alive(grandchild_pid), (
+            "the grandchild the CLI `start` invocation spawned was killed "
+            "when the fire-and-forget CLI process itself exited -- "
+            "KILL_ON_JOB_CLOSE fired on the CLI's own (last) Job Object "
+            "handle closing, defeating `start`'s entire fire-and-forget "
+            "purpose (d397bb71)"
+        )
+        # A delayed-but-eventual teardown would still be the same bug --
+        # re-check after a beat so a race with an async kill can't mask it.
+        time.sleep(1.0)
+        assert _pid_alive(grandchild_pid)
+    finally:
+        # Clean up via the runner's own `stop`, with a hard psutil fallback
+        # -- this test must never leave a real subprocess behind, even on
+        # assertion failure (matches this file's own isolation contract).
+        subprocess.run(
+            [
+                sys.executable, "-m", "meridian.local_runner",
+                "--state-dir", state_dir_arg, "stop", "--scope", scope,
+            ],
+            capture_output=True, text=True, check=False, cwd=repo_root, timeout=30,
+        )
+        if grandchild_pid is not None and _pid_alive(grandchild_pid):
+            try:
+                import psutil  # type: ignore
+                psutil.Process(grandchild_pid).kill()
+            except Exception:  # noqa: BLE001
+                pass

@@ -104,15 +104,18 @@ bounded output, cold-start timeout, and recovery.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -124,6 +127,16 @@ from . import process_registry
 from . import tunnel_lifecycle
 from . import tunnel_preflight
 from .capability_manifest import _SECRET_LIKE_RE
+
+# fcntl only exists on POSIX -- guarded exactly like process_lifecycle.py
+# guards os.killpg/signal.SIGKILL, so this module stays importable (and its
+# Windows code path testable via a monkeypatched sys.platform) on any OS.
+try:
+    import fcntl
+except ImportError:  # pragma: no cover -- exercised only off-Windows
+    fcntl = None  # type: ignore[assignment]
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tunable constants
@@ -249,6 +262,268 @@ def _tail(text: "str | None", limit: int) -> str:
     if not text:
         return ""
     return text[-limit:]
+
+
+# ---------------------------------------------------------------------------
+# Cross-process start() mutex (2026-09-28 review finding #1a) -- a genuine
+# OS-level lock closing the TOCTOU race in LocalRunner.start(): two
+# near-simultaneous SEPARATE PROCESSES (e.g. a Startup-folder launch and a
+# double-click landing within milliseconds of each other) racing
+# load-record -> check-liveness -> spawn -> save-record for the SAME scope
+# could previously both pass the liveness check and both spawn a server
+# child -- process_registry.ProcessLeaseBroker is only an advisory JSON
+# registry (no real mutual exclusion), and its lease was acquired AFTER
+# spawn anyway, too late to prevent the double-spawn itself. This lock wraps
+# the WHOLE critical section (see LocalRunner._start_locked), named/pathed
+# deterministically from the same scope slug _scope_state_path uses, so two
+# processes targeting the identical scope always contend on the identical
+# OS primitive. Windows uses a named mutex via raw ctypes kernel32 bindings
+# (no pywin32 dependency, matching process_lifecycle.py's own documented
+# convention for the exact same reason); POSIX uses an flock'd lockfile,
+# mirroring PosixProcessGroupBackend's existing style elsewhere in this
+# codebase. Bounded acquisition -- see ScopeLockTimeoutError -- never a bare
+# blocking wait that could hang a tray launch forever if a holder never
+# releases.
+# ---------------------------------------------------------------------------
+
+_SCOPE_LOCK_TIMEOUT_SECONDS = 15.0
+
+# Windows WaitForSingleObject return codes (winbase.h) -- ctypes hands back
+# bare ints, so these are just named here rather than imported from anywhere.
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+
+
+class ScopeLockTimeoutError(RuntimeError):
+    """Raised when the cross-process start() mutex for a scope could not be
+    acquired within ``_SCOPE_LOCK_TIMEOUT_SECONDS`` -- almost certainly
+    because another process is genuinely still inside ITS OWN start()
+    critical section for the SAME scope (the exact race this lock exists to
+    serialize), not spuriously raised just because the lock primitive
+    itself is unavailable -- that degrades to running unlocked instead (see
+    ``_scope_lock``'s docstring and its two concrete implementations)."""
+
+
+class Win32MutexAPI:
+    """Thin, injectable wrapper over the handful of kernel32 calls a named
+    mutex needs -- mirrors ``process_lifecycle.Win32JobAPI``'s own
+    injectable-loader pattern exactly, so tests can exercise this on
+    non-Windows CI via a fake kernel32 double, same rationale as that
+    class's own docstring (a monkeypatched ``sys.platform = 'win32'`` must
+    never touch a real ``ctypes.WinDLL``, which doesn't exist off Windows)."""
+
+    def __init__(self, kernel32: Any):
+        self._k = kernel32
+
+    def create_mutex(self, name: str) -> "int | None":
+        h = self._k.CreateMutexW(None, False, name)
+        return int(h) if h else None
+
+    def wait(self, handle: int, timeout_ms: int) -> int:
+        return int(self._k.WaitForSingleObject(handle, timeout_ms))
+
+    def release(self, handle: int) -> bool:
+        return bool(self._k.ReleaseMutex(handle))
+
+    def close_handle(self, handle: int) -> bool:
+        return bool(self._k.CloseHandle(handle))
+
+
+def _load_win32_mutex_api() -> "Win32MutexAPI | None":
+    """Real loader: binds + prototypes ``ctypes.WinDLL('kernel32')`` for the
+    named-mutex calls. Returns ``None`` (never raises) off Windows, or if the
+    bind fails for any reason -- ``_WindowsScopeLock`` degrades to running
+    UNLOCKED in that case (see its own docstring): a lock primitive that
+    can't even be created must never brick every tray launch outright."""
+    if sys.platform != "win32":
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        kernel32.ReleaseMutex.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        return Win32MutexAPI(kernel32)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class _WindowsScopeLock:
+    """Named-mutex cross-process lock for one scope. ``__enter__`` blocks
+    (bounded by *timeout_seconds*) until the mutex is acquired; raises
+    :class:`ScopeLockTimeoutError` on a genuine timeout (someone else holds
+    it), or degrades to an unlocked no-op if the Win32 API itself could not
+    be loaded/created (see :func:`_load_win32_mutex_api`) -- logged, never
+    silent, but never fatal either (see module-level rationale above)."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        timeout_seconds: float = _SCOPE_LOCK_TIMEOUT_SECONDS,
+        api_loader: "Callable[[], Win32MutexAPI | None] | None" = None,
+    ) -> None:
+        self._name = name
+        self._timeout_seconds = timeout_seconds
+        self._api_loader = api_loader or _load_win32_mutex_api
+        self._api: "Win32MutexAPI | None" = None
+        self._handle: "int | None" = None
+
+    def __enter__(self) -> "_WindowsScopeLock":
+        api = self._api_loader()
+        if api is None:
+            _logger.warning(
+                "local_runner: Win32 mutex API unavailable -- running scope "
+                "lock %r UNLOCKED (degraded, best-effort)", self._name,
+            )
+            return self
+        handle = api.create_mutex(self._name)
+        if handle is None:
+            _logger.warning(
+                "local_runner: CreateMutexW failed for %r -- running UNLOCKED", self._name,
+            )
+            return self
+        result = api.wait(handle, int(max(0.0, self._timeout_seconds) * 1000))
+        if result in (_WAIT_OBJECT_0, _WAIT_ABANDONED):
+            # WAIT_ABANDONED means the previous owner terminated without
+            # releasing -- Windows still transfers ownership to us; treated
+            # as a normal acquisition (there is nothing to "clean up" here,
+            # since this lock guards a critical section, not shared data).
+            self._api = api
+            self._handle = handle
+            return self
+        # Timeout (or WAIT_FAILED) -- never acquired; close the handle we
+        # opened and surface genuine contention rather than barging through
+        # the very race this lock exists to prevent.
+        try:
+            api.close_handle(handle)
+        except Exception:  # noqa: BLE001
+            pass
+        raise ScopeLockTimeoutError(
+            f"could not acquire cross-process start() lock {self._name!r} within "
+            f"{self._timeout_seconds:.1f}s -- another process appears to be "
+            "genuinely mid-start for this scope"
+        )
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._api is not None and self._handle is not None:
+            try:
+                self._api.release(self._handle)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._api.close_handle(self._handle)
+            except Exception:  # noqa: BLE001
+                pass
+        self._api = None
+        self._handle = None
+
+
+class _PosixScopeLock:
+    """``flock``-based cross-process lock for one scope, mirroring
+    ``PosixProcessGroupBackend``'s existing poll-loop style
+    (``process_lifecycle._signal_and_wait``). ``flock`` has no native
+    timeout, so acquisition is LOCK_EX|LOCK_NB polled at a short interval up
+    to *timeout_seconds* -- bounded, never a real blocking ``flock()`` call
+    that could hang this process forever if a holder never releases. A
+    crashed holder's flock is released by the KERNEL the instant its file
+    descriptor closes (however the process exits) -- unlike the Windows
+    named-mutex path, there is no "abandoned" state to special-case here at
+    all."""
+
+    def __init__(
+        self,
+        lock_path: Path,
+        *,
+        timeout_seconds: float = _SCOPE_LOCK_TIMEOUT_SECONDS,
+        poll_interval: float = 0.05,
+    ) -> None:
+        self._lock_path = lock_path
+        self._timeout_seconds = timeout_seconds
+        self._poll_interval = poll_interval
+        self._fh: "Any | None" = None
+
+    def __enter__(self) -> "_PosixScopeLock":
+        if fcntl is None:
+            _logger.warning(
+                "local_runner: fcntl unavailable -- running scope lock %s UNLOCKED",
+                self._lock_path,
+            )
+            return self
+        dir_existed = self._lock_path.parent.exists()
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if not dir_existed:
+            # Mirrors _atomic_write_json's / _prepare_log_path's own
+            # chmod-on-first-creation convention -- this lock's parent IS
+            # state_dir itself (see _scope_lock), and this __enter__ can now
+            # be the FIRST thing to ever create state_dir (it runs before
+            # _prepare_log_path/_atomic_write_json get a chance to), so it
+            # must hardened it here too or state_dir is silently left at
+            # default (world-readable) permissions forever -- exactly the
+            # 2026-09-28 review finding #11 bug, via a new code path.
+            try:
+                self._lock_path.parent.chmod(0o700)
+            except Exception:  # noqa: BLE001
+                pass
+        fh = open(self._lock_path, "a+")
+        deadline = time.monotonic() + max(0.0, self._timeout_seconds)
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._fh = fh
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    fh.close()
+                    raise ScopeLockTimeoutError(
+                        f"could not acquire cross-process start() lock {self._lock_path} "
+                        f"within {self._timeout_seconds:.1f}s -- another process appears "
+                        "to be genuinely mid-start for this scope"
+                    )
+                time.sleep(self._poll_interval)
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._fh.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._fh = None
+
+
+def _scope_lock(
+    scope: str,
+    state_dir: Path,
+    *,
+    timeout_seconds: float = _SCOPE_LOCK_TIMEOUT_SECONDS,
+    api_loader: "Callable[[], Win32MutexAPI | None] | None" = None,
+) -> "_WindowsScopeLock | _PosixScopeLock":
+    """Select the platform cross-process lock for *scope*, named/pathed
+    deterministically from the SAME scope slug :func:`_safe_scope_slug` uses
+    for the state file, so two processes targeting the identical scope
+    always contend on the identical OS-level primitive. The POSIX lockfile
+    naturally lives UNDER *state_dir* already; the Windows mutex name also
+    folds in a short hash of *state_dir* for the same reason, so two
+    unrelated deployments (or tests) that happen to reuse an identical scope
+    STRING but point at DIFFERENT backing state directories are never
+    needlessly serialized against each other -- only genuinely the same
+    (scope, state_dir) pair contends."""
+    slug = _safe_scope_slug(scope)
+    if sys.platform == "win32":
+        state_digest = hashlib.sha256(str(state_dir).encode("utf-8")).hexdigest()[:12]
+        return _WindowsScopeLock(
+            f"Local\\meridian-local-runner-{slug}-{state_digest}",
+            timeout_seconds=timeout_seconds, api_loader=api_loader,
+        )
+    return _PosixScopeLock(state_dir / f".{slug}.lock", timeout_seconds=timeout_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +696,7 @@ class RunnerRecord:
     group_id: "int | None"
     job_id: "int | None"
     started_at: float
+    job_name: "str | None" = None
     restart_count: int = 0
     log_path: "str | None" = None
     tunnel_label: "str | None" = None
@@ -457,6 +733,7 @@ class RunnerRecord:
             create_time=self.create_time,
             group_id=self.group_id,
             job_id=self.job_id,
+            job_name=self.job_name,
         )
 
 
@@ -736,6 +1013,9 @@ class LocalRunner:
         crash_settle_seconds: float = DEFAULT_CRASH_SETTLE_SECONDS,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         max_log_files: int = DEFAULT_MAX_LOG_FILES,
+        scope_lock_timeout: float = _SCOPE_LOCK_TIMEOUT_SECONDS,
+        scope_lock_api_loader: "Callable[[], Win32MutexAPI | None] | None" = None,
+        detached: bool = False,
     ) -> None:
         """*command* may be ``None`` for a "reconnect to an existing scope"
         instance used for read-only/recovery operations (``status``,
@@ -750,6 +1030,38 @@ class LocalRunner:
         explicitly to disable cross-tool lease registration entirely (tests
         should always pass an explicit broker or ``None`` -- never rely on
         the real, home-directory-backed default).
+
+        *scope_lock_timeout*/*scope_lock_api_loader* are test seams for the
+        cross-process ``start()`` mutex (2026-09-28 review finding #1a) --
+        see :func:`_scope_lock`. Production callers never need to pass
+        either.
+
+        *detached* (d397bb71, 2026-09-29): set ``True`` when THIS
+        ``LocalRunner`` instance's own process is a bare, fire-and-forget
+        invocation that spawns a child and then exits immediately (the
+        standalone ``python -m meridian.local_runner start``/``restart`` CLI
+        path -- see ``_runner_from_args``) -- as opposed to a long-lived
+        supervisor that stays alive for the child's whole lifetime (the
+        tray, via ``tray_main._build_runner``, which never passes this).
+
+        On Windows this matters concretely: ``WindowsJobObjectBackend``
+        assigns every spawned child to a fresh Job Object, and by default
+        sets ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` on it, so the whole
+        group is torn down automatically if the spawning process ever dies
+        without explicit cleanup -- exactly the safety net a long-lived
+        supervisor (the tray) wants. But for a ``detached`` invocation, the
+        spawning process is EXPECTED to exit right after spawning, which
+        closes its (only) handle to that job -- with the flag set, that
+        alone would immediately kill the child it just spawned, defeating
+        the entire point of a fire-and-forget launch. Passing
+        ``detached=True`` builds the default backend with
+        ``kill_on_job_close=False`` instead (see
+        ``process_lifecycle.get_default_backend``), so the child survives
+        this process's exit; explicit ``stop()``/``TerminateJobObject``
+        teardown (including from a LATER process reopening the job by name)
+        is completely unaffected either way. A no-op on POSIX (no equivalent
+        hazard) and for any caller that supplies its own explicit
+        ``backend=``.
         """
         if not scope or not scope.strip():
             raise ValueError("scope must be a non-empty string")
@@ -759,7 +1071,20 @@ class LocalRunner:
         self.env = env
         self._state_dir = state_dir or default_state_dir()
         self._state_path = _scope_state_path(self._state_dir, scope)
-        self._backend = backend or process_lifecycle.get_default_backend()
+        self.detached = detached
+        # ensure_console_for_graceful_shutdown=True (2026-09-28 review
+        # finding #5/#22): on Windows, this is what makes
+        # WindowsJobObjectBackend.close()'s CTRL_BREAK graceful-shutdown
+        # attempt deliverable at all -- see that class's own docstring for
+        # the empirical confirmation. A no-op on POSIX and for any caller
+        # that supplies its own explicit `backend=`.
+        #
+        # kill_on_job_close=not detached (d397bb71): see this method's own
+        # `detached` docstring above.
+        self._backend = backend or process_lifecycle.get_default_backend(
+            ensure_console_for_graceful_shutdown=True,
+            kill_on_job_close=not detached,
+        )
         self._broker = process_registry.get_broker() if broker is _UNSET else broker
         self._clock = clock
         self.health_probe = health_probe
@@ -770,6 +1095,20 @@ class LocalRunner:
         self.max_log_files = max_log_files
         self._owner_key = f"local-runner:{scope}"
         self._live_handle: "process_lifecycle.OwnedProcessHandle | None" = None
+        # 2026-09-28 review finding #1b: an instance-level lock guarding
+        # start/stop/restart/_terminate -- tray_main.py's _run_tray wires
+        # Status/Logs/Restart to their own threading.Thread (plus Quit on
+        # pystray's own callback thread), all driving this SAME LocalRunner
+        # instance with no synchronization; rapid tray-menu clicks could
+        # previously interleave two start/stop/restart-shaped critical
+        # sections against each other. Never re-entered by this class itself
+        # (start()/stop()/restart() each acquire it exactly once per call,
+        # and _terminate() is only ever reached FROM inside one of those
+        # three, already-locked call paths -- a plain, non-reentrant Lock is
+        # therefore correct and simpler than an RLock).
+        self._thread_lock = threading.Lock()
+        self._scope_lock_timeout = scope_lock_timeout
+        self._scope_lock_api_loader = scope_lock_api_loader
 
     def __enter__(self) -> "LocalRunner":
         return self
@@ -915,11 +1254,25 @@ class LocalRunner:
 
     def _prepare_log_path(self) -> Path:
         log_dir = _scope_log_dir(self._state_dir, self.scope)
+        state_dir_existed = self._state_dir.exists()
         log_dir.mkdir(parents=True, exist_ok=True)
         try:
             log_dir.chmod(0o700)
         except Exception:  # noqa: BLE001 -- best-effort, mirrors _atomic_write_json
             pass
+        if not state_dir_existed:
+            # mkdir(parents=True) above may have just created self._state_dir
+            # itself as an unhardened INTERMEDIATE directory (log_dir is
+            # state_dir/logs/scope) -- if this runs before _atomic_write_json
+            # ever saves a record (the only other place that hardens
+            # state_dir), state_dir would otherwise be left at default
+            # (world-readable) permissions forever, since _atomic_write_json
+            # only chmods on its OWN first creation and would see
+            # state_dir already existing by the time it runs.
+            try:
+                self._state_dir.chmod(0o700)
+            except Exception:  # noqa: BLE001
+                pass
         token = process_lifecycle.new_run_id()
         return log_dir / f"{token}.log"
 
@@ -938,8 +1291,24 @@ class LocalRunner:
                 cwd=cwd,
                 popen_kwargs={"stdout": fh, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL},
             )
-        finally:
+        except Exception:
+            # 2026-09-28 review finding #9: a backend.spawn() failure (e.g.
+            # the launcher executable doesn't exist / isn't executable) used
+            # to leave behind an EMPTY log file that _prune_old_logs() never
+            # saw, since pruning previously only ran after a SUCCESSFUL
+            # spawn -- this bypassed max_log_files' rotation bound entirely,
+            # one leaked empty file per failed launch attempt. Clean up the
+            # orphan (and still run the normal prune, so the count stays
+            # bounded even if the unlink itself somehow fails) before
+            # re-raising -- a failed spawn must not orphan disk state.
             fh.close()
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
+            _prune_old_logs(log_path.parent, keep=self.max_log_files)
+            raise
+        fh.close()
         _prune_old_logs(log_path.parent, keep=self.max_log_files)
         return handle
 
@@ -1003,7 +1372,7 @@ class LocalRunner:
             record.local_mcp_checked_at = self._clock()
         self._save_record(record)
 
-    def _start_internal(
+    def _spawn_and_record(
         self,
         *,
         command: "Sequence[str]",
@@ -1011,7 +1380,12 @@ class LocalRunner:
         restart_count: int,
         recovered_from_pid: "int | None" = None,
         force_lease: bool = False,
-    ) -> RunnerStatus:
+    ) -> RunnerRecord:
+        """Spawn + persist a fresh :class:`RunnerRecord` -- the half of the
+        old ``_start_internal`` that must run under the cross-process scope
+        lock (see :meth:`_start_locked`). Deliberately does NOT await
+        readiness -- that happens afterward, OUTSIDE the lock (see
+        :meth:`start`'s own docstring for why)."""
         log_path = self._prepare_log_path()
         handle = self._spawn(command, cwd, log_path)
         self._live_handle = handle
@@ -1026,6 +1400,7 @@ class LocalRunner:
             create_time=handle.create_time,
             group_id=handle.group_id,
             job_id=handle.job_id,
+            job_name=handle.job_name,
             started_at=self._clock(),
             restart_count=restart_count,
             log_path=str(log_path),
@@ -1034,8 +1409,69 @@ class LocalRunner:
             recovered_from_stale_pid=recovered_from_pid,
         )
         self._save_record(record)
+        return record
+
+    def _start_internal(
+        self,
+        *,
+        command: "Sequence[str]",
+        cwd: "str | None",
+        restart_count: int,
+        recovered_from_pid: "int | None" = None,
+        force_lease: bool = False,
+    ) -> RunnerStatus:
+        """Used by :meth:`restart` (which does not need the cross-process
+        scope lock -- see that method's own docstring): spawn + record, then
+        await readiness, then report status. :meth:`start` does NOT call
+        this directly -- see :meth:`_start_locked`."""
+        record = self._spawn_and_record(
+            command=command, cwd=cwd, restart_count=restart_count,
+            recovered_from_pid=recovered_from_pid, force_lease=force_lease,
+        )
         self._await_readiness(record)
         return self.status()
+
+    def _acquire_scope_lock(self) -> "_WindowsScopeLock | _PosixScopeLock":
+        return _scope_lock(
+            self.scope, self._state_dir,
+            timeout_seconds=self._scope_lock_timeout, api_loader=self._scope_lock_api_loader,
+        )
+
+    def _start_locked(self, *, force: bool) -> RunnerRecord:
+        """The start() critical section -- load-record -> check-liveness ->
+        (force-terminate any live prior record) -> spawn -> save-record --
+        run under a genuine cross-process OS mutex scoped to ``self.scope``
+        (2026-09-28 review finding #1a). Closes the TOCTOU race where two
+        near-simultaneous SEPARATE PROCESSES (e.g. a Startup-folder launch
+        and a double-click landing within milliseconds of each other) could
+        both pass the liveness check below and both spawn a server child for
+        the same scope -- one orphaned. Called from inside :meth:`start`,
+        which ALSO already holds ``self._thread_lock`` (finding #1b) by the
+        time this runs, so a single process's own concurrent start() calls
+        (from different threads) are already serialized before this method
+        is even entered."""
+        with self._acquire_scope_lock():
+            existing = self._load_record()
+            recovered_from_pid: "int | None" = None
+            restart_count = 0
+            force_lease = False
+            if existing is not None:
+                alive = self._is_pid_alive(existing)
+                if alive is not False:  # True (running) or None (unverifiable) -> block unless forced
+                    if not force:
+                        raise RunnerAlreadyRunningError(self.scope, existing)
+                    self._terminate(existing)
+                    force_lease = True
+                else:
+                    recovered_from_pid = existing.pid
+                    restart_count = existing.restart_count
+            return self._spawn_and_record(
+                command=self.command,
+                cwd=self.cwd,
+                restart_count=restart_count,
+                recovered_from_pid=recovered_from_pid,
+                force_lease=force_lease,
+            )
 
     # -- public operations ---------------------------------------------------
 
@@ -1044,59 +1480,65 @@ class LocalRunner:
         (:class:`RunnerAlreadyRunningError`) if a prior record is still
         verified alive (or unverifiable) unless ``force=True``. A prior
         record CONFIRMED gone is recovered automatically -- no ``force``
-        needed (see module docstring pillar 2)."""
+        needed (see module docstring pillar 2).
+
+        Guarded by TWO locks (2026-09-28 review findings #1a/#1b):
+        ``self._thread_lock`` serializes concurrent THREADS within this SAME
+        process/instance (tray_main.py's Status/Logs/Restart/Quit menu
+        actions each run on their own thread against one shared LocalRunner);
+        the cross-process scope lock (see :meth:`_start_locked`) serializes
+        concurrent PROCESSES. The readiness wait is deliberately OUTSIDE
+        BOTH locks -- once a record is saved, any other thread/process's own
+        load-record+liveness-check already correctly detects it as live, so
+        holding either lock for the entire (up to ``cold_start_timeout``)
+        readiness wait would only add needless latency to an already-rare
+        simultaneous-launch case without closing any additional race."""
         if not self.command:
             raise ValueError(f"local runner scope {self.scope!r}: start() requires a command")
-        existing = self._load_record()
-        recovered_from_pid: "int | None" = None
-        restart_count = 0
-        force_lease = False
-        if existing is not None:
-            alive = self._is_pid_alive(existing)
-            if alive is not False:  # True (running) or None (unverifiable) -> block unless forced
-                if not force:
-                    raise RunnerAlreadyRunningError(self.scope, existing)
-                self._terminate(existing)
-                force_lease = True
-            else:
-                recovered_from_pid = existing.pid
-                restart_count = existing.restart_count
-        return self._start_internal(
-            command=self.command,
-            cwd=self.cwd,
-            restart_count=restart_count,
-            recovered_from_pid=recovered_from_pid,
-            force_lease=force_lease,
-        )
+        with self._thread_lock:
+            record = self._start_locked(force=force)
+        self._await_readiness(record)
+        return self.status()
 
     def stop(self) -> RunnerStatus:
         """Gracefully (then forcibly) stop this scope's child, if any.
         Idempotent -- safe to call when nothing is running."""
-        record = self._load_record()
-        if record is None:
+        with self._thread_lock:
+            record = self._load_record()
+            if record is None:
+                return self.status()
+            ok = self._terminate(record)
+            record.last_exit_code = 0 if ok else record.last_exit_code
+            record.last_exit_reason = "stopped" if ok else "stop_unconfirmed"
+            record.last_exit_at = self._clock()
+            self._save_record(record)
             return self.status()
-        ok = self._terminate(record)
-        record.last_exit_code = 0 if ok else record.last_exit_code
-        record.last_exit_reason = "stopped" if ok else "stop_unconfirmed"
-        record.last_exit_at = self._clock()
-        self._save_record(record)
-        return self.status()
 
     def restart(self) -> RunnerStatus:
         """Stop (if running) then respawn, unconditionally -- restart never
         raises :class:`RunnerAlreadyRunningError`, unlike :meth:`start`.
         Recovers the command/cwd from the last persisted record when this
         instance was constructed with ``command=None`` (see
-        :meth:`_resolve_command_for_readonly_op`)."""
-        existing = self._load_record()
-        command = self._resolve_command_for_readonly_op()
-        cwd = self._resolve_cwd_for_readonly_op(existing)
-        restart_count = (existing.restart_count + 1) if existing is not None else 0
-        if existing is not None:
-            self._terminate(existing)
-        return self._start_internal(
-            command=command, cwd=cwd, restart_count=restart_count, force_lease=True,
-        )
+        :meth:`_resolve_command_for_readonly_op`).
+
+        Guarded by ``self._thread_lock`` only (2026-09-28 review finding
+        #1b) -- NOT the cross-process scope lock, which exists specifically
+        to close start()'s "two separate PROCESSES both pass the liveness
+        check" race (e.g. Startup-folder launch racing a double-click).
+        restart() is only ever invoked from an already-attached tray/CLI
+        against a scope it (or a sibling in THIS process) already knows
+        about, never from two independent cold-launch processes racing each
+        other -- the scenario the cross-process lock targets."""
+        with self._thread_lock:
+            existing = self._load_record()
+            command = self._resolve_command_for_readonly_op()
+            cwd = self._resolve_cwd_for_readonly_op(existing)
+            restart_count = (existing.restart_count + 1) if existing is not None else 0
+            if existing is not None:
+                self._terminate(existing)
+            return self._start_internal(
+                command=command, cwd=cwd, restart_count=restart_count, force_lease=True,
+            )
 
     def status(self) -> RunnerStatus:
         """Bounded, read-only status snapshot -- one state-file read plus
@@ -1172,6 +1614,38 @@ class LocalRunner:
         ):
             state_value = LocalMcpState.FAILED.value
             detail = "child process is not running"
+        elif (
+            child.state is ChildState.RUNNING
+            and state_value in (LocalMcpState.COLD_START_TIMEOUT.value, LocalMcpState.FAILED.value)
+            and self.health_probe is not None
+        ):
+            # 2026-09-28 review finding #1c: local_mcp_state is written ONCE
+            # inside _await_readiness and was never re-checked afterward --
+            # once a launch recorded COLD_START_TIMEOUT/FAILED (e.g. a slow
+            # first-run migration finishing seconds after the bounded
+            # start() wait gave up), the tray's Status dialog (and doctor())
+            # kept reporting that stale reading forever, even after the
+            # server actually became healthy later. One bounded,
+            # NON-LOOPING re-probe here -- status() must stay O(1), see
+            # module docstring pillar 3 -- lets a LATER status()/doctor()
+            # call self-heal the reading without requiring an explicit
+            # restart. Only refreshes when the child is confirmed RUNNING
+            # (a dead child already goes through the branch above instead).
+            try:
+                refreshed_ready = bool(self.health_probe())
+            except Exception:  # noqa: BLE001 -- a broken probe must never crash status()
+                refreshed_ready = False
+            checked_at = self._clock()
+            if refreshed_ready:
+                state_value = LocalMcpState.READY.value
+                detail = "health probe reported ready on re-check (was stale)"
+            # else: leave state_value/detail as the original timeout/failure
+            # reading -- still honestly not ready, just with a fresher
+            # checked_at so an operator can tell this was actually re-tried.
+            record.local_mcp_state = state_value
+            record.local_mcp_detail = detail
+            record.local_mcp_checked_at = checked_at
+            self._save_record(record)
         try:
             state = LocalMcpState(state_value)
         except ValueError:
@@ -1425,7 +1899,14 @@ def _normalize_cmd_arg(cmd: "list[str] | None") -> "list[str] | None":
     return cmd or None
 
 
-def _runner_from_args(args: argparse.Namespace) -> LocalRunner:
+def _runner_from_args(args: argparse.Namespace, *, detached: bool = False) -> LocalRunner:
+    """*detached* (d397bb71): pass ``True`` from ``main()`` for the ``start``
+    and ``restart`` commands -- the two CLI subcommands that spawn a NEW
+    child meant to outlive this bare CLI invocation once it prints its JSON
+    result and exits. See ``LocalRunner.__init__``'s own ``detached``
+    docstring for the full Windows Job Object rationale. Every other
+    subcommand (``status``, ``doctor``, ``preflight``, ...) never spawns a
+    persisting child from this call, so it stays ``False`` (unaffected)."""
     return LocalRunner(
         scope=args.scope,
         command=_normalize_cmd_arg(getattr(args, "cmd", None)),
@@ -1433,6 +1914,7 @@ def _runner_from_args(args: argparse.Namespace) -> LocalRunner:
         state_dir=_state_dir_from_args(args),
         tunnel_label=getattr(args, "tunnel_label", None),
         cold_start_timeout=getattr(args, "cold_start_timeout", DEFAULT_COLD_START_TIMEOUT_SECONDS),
+        detached=detached,
     )
 
 
@@ -1449,14 +1931,14 @@ def main(argv: "list[str] | None" = None) -> int:
 
     try:
         if args.command == "start":
-            result = _runner_from_args(args).start(force=args.force).as_dict()
+            result = _runner_from_args(args, detached=True).start(force=args.force).as_dict()
         elif args.command == "stop":
             runner = LocalRunner(
                 scope=args.scope, command=None, state_dir=_state_dir_from_args(args),
             )
             result = runner.stop().as_dict()
         elif args.command == "restart":
-            result = _runner_from_args(args).restart().as_dict()
+            result = _runner_from_args(args, detached=True).restart().as_dict()
         elif args.command == "status":
             result = _runner_from_args(args).status().as_dict()
         elif args.command == "doctor":

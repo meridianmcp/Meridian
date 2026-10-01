@@ -82,6 +82,69 @@ def test_server_env_returns_a_copy_not_the_real_os_environ(monkeypatch):
     assert os.environ["SHOULD_NOT_LEAK"] == "1"
 
 
+def test_server_env_unfrozen_never_sets_meipass2(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    env = tray_main._server_env()
+    assert "_MEIPASS2" not in env
+
+
+def test_server_env_frozen_propagates_meipass2(monkeypatch, tmp_path):
+    """2026-09-28 review finding #17: the frozen --run-server child reuses
+    the TRAY's own already-extracted onefile directory via PyInstaller's own
+    _MEIPASS2 mechanism, instead of independently re-extracting itself."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    env = tray_main._server_env()
+    assert env["_MEIPASS2"] == str(tmp_path)
+
+
+def test_server_env_frozen_without_meipass_sets_nothing(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    env = tray_main._server_env()
+    assert "_MEIPASS2" not in env
+
+
+# ---------------------------------------------------------------------------
+# _cold_start_timeout -- frozen-aware default + env override
+# (2026-09-28 review finding #17)
+# ---------------------------------------------------------------------------
+
+
+def test_cold_start_timeout_unfrozen_default(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.delenv("MERIDIAN_TRAY_COLD_START_TIMEOUT", raising=False)
+    assert tray_main._cold_start_timeout() == tray_main._DEFAULT_COLD_START_TIMEOUT_SECONDS
+
+
+def test_cold_start_timeout_frozen_gets_a_larger_default(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delenv("MERIDIAN_TRAY_COLD_START_TIMEOUT", raising=False)
+    assert tray_main._cold_start_timeout() == tray_main._FROZEN_COLD_START_TIMEOUT_SECONDS
+    assert tray_main._FROZEN_COLD_START_TIMEOUT_SECONDS > tray_main._DEFAULT_COLD_START_TIMEOUT_SECONDS
+
+
+def test_cold_start_timeout_env_override_wins(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("MERIDIAN_TRAY_COLD_START_TIMEOUT", "45")
+    assert tray_main._cold_start_timeout() == 45.0
+
+
+def test_cold_start_timeout_invalid_override_falls_back(monkeypatch, caplog):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setenv("MERIDIAN_TRAY_COLD_START_TIMEOUT", "not-a-number")
+    with caplog.at_level("WARNING"):
+        result = tray_main._cold_start_timeout()
+    assert result == tray_main._DEFAULT_COLD_START_TIMEOUT_SECONDS
+    assert any("invalid" in r.message.lower() for r in caplog.records)
+
+
+def test_build_runner_passes_cold_start_timeout(monkeypatch):
+    monkeypatch.setattr(tray_main, "_cold_start_timeout", lambda: 42.0)
+    runner = tray_main._build_runner()
+    assert runner.cold_start_timeout == 42.0
+
+
 # ---------------------------------------------------------------------------
 # _default_port / _dashboard_url
 # ---------------------------------------------------------------------------
@@ -149,6 +212,150 @@ def test_health_probe_false_on_os_error_never_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _pid_owns_listening_port / _expected_pid / _health_probe(expected_pid=...)
+# -- health-probe identity binding (2026-09-28 review finding #13)
+# ---------------------------------------------------------------------------
+
+
+class _FakeConn:
+    def __init__(self, status, port):
+        self.status = status
+        self.laddr = mock.MagicMock(port=port)
+
+
+class _FakePsutilProcess:
+    def __init__(self, pid, conns):
+        self.pid = pid
+        self._conns = conns
+
+    def net_connections(self, kind="inet"):
+        return self._conns
+
+
+def _install_fake_psutil(monkeypatch, conns_by_pid):
+    fake_psutil = mock.MagicMock()
+    fake_psutil.CONN_LISTEN = "LISTEN"
+
+    def _process(pid):
+        if pid not in conns_by_pid:
+            raise LookupError(f"no such pid {pid}")
+        return _FakePsutilProcess(pid, conns_by_pid[pid])
+
+    fake_psutil.Process = _process
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    return fake_psutil
+
+
+def test_pid_owns_listening_port_true_when_pid_listens_on_port(monkeypatch):
+    fake_psutil = _install_fake_psutil(monkeypatch, {123: [_FakeConn("LISTEN", 7878)]})
+    assert tray_main._pid_owns_listening_port(123, 7878) is True
+
+
+def test_pid_owns_listening_port_false_when_different_pid_holds_it(monkeypatch):
+    _install_fake_psutil(monkeypatch, {123: [_FakeConn("LISTEN", 9999)]})
+    assert tray_main._pid_owns_listening_port(123, 7878) is False
+
+
+def test_pid_owns_listening_port_false_when_pid_has_no_listening_conn(monkeypatch):
+    _install_fake_psutil(monkeypatch, {123: []})
+    assert tray_main._pid_owns_listening_port(123, 7878) is False
+
+
+def test_pid_owns_listening_port_degrades_true_when_psutil_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    # A completely unrelated process on the port would normally make this
+    # False, but with no way to verify, this NARROWING check must never
+    # invent a failure the HTTP response itself didn't report.
+    assert tray_main._pid_owns_listening_port(123, 7878) is True
+
+
+def test_pid_owns_listening_port_degrades_true_when_pid_already_exited(monkeypatch):
+    _install_fake_psutil(monkeypatch, {})  # 123 not in the fake process table at all
+    assert tray_main._pid_owns_listening_port(123, 7878) is True
+
+
+def test_pid_owns_listening_port_falls_back_to_connections_on_older_psutil(monkeypatch):
+    """psutil>=5.9 (this repo's own pin) may predate net_connections()
+    (added in psutil>=6.0) -- must fall back to the older connections()
+    name rather than crashing."""
+    fake_psutil = mock.MagicMock()
+    fake_psutil.CONN_LISTEN = "LISTEN"
+
+    class _OldStyleProcess:
+        net_connections = None  # deliberately absent -- see hasattr check
+
+        def __init__(self, pid):
+            self.pid = pid
+
+        def connections(self, kind="inet"):
+            return [_FakeConn("LISTEN", 7878)]
+
+    del _OldStyleProcess.net_connections  # simulate a version that never had it at all
+    fake_psutil.Process = _OldStyleProcess
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    assert tray_main._pid_owns_listening_port(123, 7878) is True
+
+
+def test_expected_pid_prefers_live_handle():
+    runner = mock.MagicMock()
+    runner._live_handle = mock.MagicMock(pid=111)
+    assert tray_main._expected_pid(runner) == 111
+    runner._load_record.assert_not_called()
+
+
+def test_expected_pid_falls_back_to_persisted_record(monkeypatch):
+    runner = mock.MagicMock()
+    runner._live_handle = None
+    runner._load_record.return_value = mock.MagicMock(pid=222)
+    assert tray_main._expected_pid(runner) == 222
+
+
+def test_expected_pid_none_when_neither_available():
+    runner = mock.MagicMock()
+    runner._live_handle = None
+    runner._load_record.return_value = None
+    assert tray_main._expected_pid(runner) is None
+
+
+def test_health_probe_cross_checks_pid_when_supplied(monkeypatch):
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", lambda url, timeout: _FakeResponse(200))
+    _install_fake_psutil(monkeypatch, {123: [_FakeConn("LISTEN", tray_main._default_port())]})
+    assert tray_main._health_probe(123) is True
+
+
+def test_health_probe_fails_when_pid_does_not_own_the_port(monkeypatch):
+    """The core fix: a 200 from /health is no longer sufficient on its own
+    when a different local process won the race to bind the port first."""
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", lambda url, timeout: _FakeResponse(200))
+    _install_fake_psutil(monkeypatch, {123: [_FakeConn("LISTEN", 9999)]})  # wrong port
+    assert tray_main._health_probe(123) is False
+
+
+def test_health_probe_skips_pid_check_when_http_already_failed(monkeypatch):
+    """No point cross-checking identity against a server that isn't even
+    responding -- and this must not touch psutil at all in that case."""
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", lambda url, timeout: _FakeResponse(503))
+    psutil_calls = []
+    monkeypatch.setitem(
+        sys.modules, "psutil",
+        mock.MagicMock(Process=lambda pid: psutil_calls.append(pid) or mock.MagicMock()),
+    )
+    assert tray_main._health_probe(123) is False
+    assert psutil_calls == []
+
+
+def test_build_runner_wires_a_pid_cross_checking_health_probe(monkeypatch):
+    """_build_runner's health_probe must be a closure bound to the SAME
+    runner it returns, not the bare module-level _health_probe -- otherwise
+    there is nothing for _expected_pid to read the live handle from."""
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", lambda url, timeout: _FakeResponse(200))
+    runner = tray_main._build_runner()
+    assert runner.health_probe is not tray_main._health_probe
+    _install_fake_psutil(monkeypatch, {})  # no live handle yet -- degrades to HTTP-only via None pid
+    assert runner.health_probe() is True
+
+
+# ---------------------------------------------------------------------------
 # _icon_image_path -- frozen (bundled under _MEIPASS) vs. source (static/)
 # ---------------------------------------------------------------------------
 
@@ -161,10 +368,103 @@ def test_icon_image_path_unfrozen_resolves_under_static(monkeypatch):
 
 
 def test_icon_image_path_frozen_resolves_under_meipass(monkeypatch, tmp_path):
+    """2026-09-28 review finding #23: resolves under meridian/static/ (the
+    SAME sub-path the unfrozen branch uses, and the ONLY place
+    meridian-tray.spec's datas= now bundles the icon -- see that file's own
+    comment), not the bundle root -- there is no separate root-level copy
+    to resolve against any more."""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
     path = tray_main._icon_image_path()
-    assert path == tmp_path / "meridian-tray.ico"
+    assert path == tmp_path / "meridian" / "static" / "meridian-tray.ico"
+
+
+# ---------------------------------------------------------------------------
+# _sweep_stale_runtime_extractions -- orphaned onefile _MEI* dir cleanup
+# (2026-09-28 review finding #5/#22, secondary part)
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_stale_extractions_noop_when_not_frozen(monkeypatch, tmp_path):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    (tmp_path / "_MEI12345").mkdir()
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "_MEIcurrent"), raising=False)
+    tray_main._sweep_stale_runtime_extractions()  # must not raise, must not touch tmp_path
+    assert (tmp_path / "_MEI12345").exists()
+
+
+def test_sweep_stale_extractions_noop_when_no_meipass(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    tray_main._sweep_stale_runtime_extractions()  # must not raise
+
+
+def test_sweep_stale_extractions_removes_siblings_but_not_current(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    current = tmp_path / "_MEIcurrent"
+    stale_a = tmp_path / "_MEIstale1"
+    stale_b = tmp_path / "_MEIstale2"
+    for d in (current, stale_a, stale_b):
+        d.mkdir()
+        (d / "marker.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(sys, "_MEIPASS", str(current), raising=False)
+
+    tray_main._sweep_stale_runtime_extractions()
+
+    assert current.exists() and (current / "marker.txt").exists()
+    assert not stale_a.exists()
+    assert not stale_b.exists()
+
+
+def test_sweep_stale_extractions_never_touches_non_mei_entries(monkeypatch, tmp_path):
+    """The runtime_tmpdir is Meridian-owned per meridian-tray.spec, but this
+    sweep is still deliberately conservative: it only ever deletes entries
+    whose name starts with '_MEI' -- never a bare file, never an unrelated
+    directory that happens to live alongside the extraction dirs."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    current = tmp_path / "_MEIcurrent"
+    current.mkdir()
+    monkeypatch.setattr(sys, "_MEIPASS", str(current), raising=False)
+    unrelated_dir = tmp_path / "not-a-mei-dir"
+    unrelated_dir.mkdir()
+    unrelated_file = tmp_path / "_MEIsomething.txt"  # starts with _MEI but is a FILE
+    unrelated_file.write_text("x", encoding="utf-8")
+
+    tray_main._sweep_stale_runtime_extractions()
+
+    assert unrelated_dir.exists()
+    assert unrelated_file.exists()
+
+
+def test_sweep_stale_extractions_degrades_on_error(monkeypatch, tmp_path):
+    """A sweep failure (e.g. a sibling still locked by a concurrently
+    running second tray instance) must never crash tray startup."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    current = tmp_path / "_MEIcurrent"
+    current.mkdir()
+    stale = tmp_path / "_MEIstale"
+    stale.mkdir()
+    monkeypatch.setattr(sys, "_MEIPASS", str(current), raising=False)
+    monkeypatch.setattr(
+        tray_main.shutil, "rmtree",
+        lambda path, ignore_errors=False: (_ for _ in ()).throw(OSError("locked")),
+    )
+
+    tray_main._sweep_stale_runtime_extractions()  # must not raise
+
+
+def test_run_tray_calls_sweep_before_building_runner(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.NOT_CONFIGURED)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda url: None)
+    calls = []
+    monkeypatch.setattr(tray_main, "_sweep_stale_runtime_extractions", lambda: calls.append(1))
+
+    tray_main._run_tray()
+
+    assert calls == [1]
 
 
 # ---------------------------------------------------------------------------
@@ -551,9 +851,19 @@ class TestTraySpecPreShipConsistency:
         # the bundled server's StaticFiles mount, and a missing
         # 'meridian/templates' entry 500'd `GET /` (Jinja2Templates).
         datas_sources = {src for src, _dest in _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["datas"]}
-        assert "meridian/static/meridian-tray.ico" in datas_sources
         assert "meridian/static" in datas_sources
         assert "meridian/templates" in datas_sources
+
+    def test_spec_does_not_bundle_the_icon_a_second_time_separately(self):
+        # 2026-09-28 review finding #23: meridian-tray.ico used to be
+        # bundled TWICE -- once via a standalone datas entry at the bundle
+        # root, again as part of the whole meridian/static directory copy.
+        # There must now be exactly one datas entry whose source is the
+        # icon file itself (the whole-directory 'meridian/static' entry
+        # still carries it, just not as a SEPARATE, redundant entry).
+        datas_sources = [src for src, _dest in _spec_call_kwargs(_TRAY_SPEC_PATH, "Analysis")["datas"]]
+        assert datas_sources.count("meridian/static/meridian-tray.ico") == 0
+        assert datas_sources.count("meridian/static") == 1
 
     def test_spec_exe_icon_kwarg_points_at_the_real_ico_file(self):
         # occurrence=2: the Windows-only EXE() call (see 73257801) -- the
@@ -651,3 +961,64 @@ def test_running_tray_main_as_a_direct_script_does_not_hit_relative_import_error
     assert "--run-server" not in result.stdout, (
         "the internal --run-server flag must stay hidden from --help output"
     )
+
+
+def test_run_tray_does_not_auto_open_on_cold_start_timeout(monkeypatch):
+    """Regression test for 2026-09-28 review finding #14/#18: start() can
+    report a non-ready state via a NORMAL RETURN (RunnerStatus with
+    local_mcp.state == COLD_START_TIMEOUT/FAILED), not just by raising --
+    the previous code discarded start()'s return value entirely and always
+    opened the browser. This is the case test_run_tray_does_not_auto_open_
+    when_server_fails_to_start (a raising start()) does NOT cover."""
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.COLD_START_TIMEOUT)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+    dialog_calls = []
+    monkeypatch.setattr(
+        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+    )
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0  # the tray icon still starts -- this is a degrade, not a crash
+    assert opened == []
+    assert dialog_calls  # the human gets told, instead of a silently dead browser tab
+
+
+def test_run_tray_does_not_auto_open_when_attaching_to_unhealthy_existing_run(monkeypatch):
+    """Regression test for finding #15: 'already running' means the prior
+    record's pid is alive, not that the server is healthy -- attaching must
+    re-check status() before opening a browser."""
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.side_effect = tray_main.RunnerAlreadyRunningError(
+        "meridian-tray", mock.MagicMock()
+    )
+    fake_runner.status.return_value = _fake_status(tray_main.LocalMcpState.FAILED)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0
+    assert opened == []
+
+
+def test_run_tray_opens_dashboard_when_local_mcp_not_configured(monkeypatch):
+    """A health_probe-less runner (local_mcp state NOT_CONFIGURED, never
+    READY) must still auto-open -- there's nothing to have timed out."""
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.NOT_CONFIGURED)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0
+    assert opened == [tray_main._dashboard_url()]
