@@ -27,6 +27,14 @@ import argparse
 import asyncio
 import os
 import sys
+import time
+from typing import Any
+
+
+_TUNNEL_CHILD_FLAG = "--_tunnel-child"
+_SUPERVISOR_POLL_SECONDS = 1.0
+_RESTART_BASE_SECONDS = 1.0
+_RESTART_MAX_SECONDS = 30.0
 
 # 7b457c55 — REVERSED (was: force WindowsSelectorEventLoopPolicy here). This
 # module is the slim, tunnel-ONLY PyInstaller entry point (no --mcp/--server
@@ -107,6 +115,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "port-kill loop, so this is a no-op here. (a887155d)",
     )
     parser.add_argument(
+        _TUNNEL_CHILD_FLAG,
+        dest="tunnel_child",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--code-dir",
         action="append",
         metavar="PATH",
@@ -115,6 +129,157 @@ def _build_parser() -> argparse.ArgumentParser:
         "(repeatable: --code-dir /repo1 --code-dir /repo2).",
     )
     return parser
+
+
+def _build_child_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
+    """Return the tunnel worker invocation and inherited environment.
+
+    The parent process owns restart supervision. A source checkout is relaunched
+    as a module; a frozen PyInstaller executable relaunches itself. Credentials
+    stay out of the worker command line even when the caller used ``--token``.
+    """
+    child_args = [_TUNNEL_CHILD_FLAG]
+    if args.server is not None:
+        child_args.extend(("--server", args.server))
+    if args.repo:
+        child_args.extend(("--repo", *args.repo))
+    child_args.extend(("--tunnel-port", str(args.tunnel_port)))
+    if args.no_kill:
+        child_args.append("--no-kill")
+    for code_dir in args.code_dirs or ():
+        child_args.extend(("--code-dir", code_dir))
+
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, *child_args]
+    else:
+        command = [sys.executable, "-m", "meridian.tunnel_main", *child_args]
+
+    child_env = os.environ.copy()
+    if args.token:
+        child_env["MERIDIAN_TOKEN"] = args.token
+    return command, child_env
+
+
+def _restart_delay(restart_count: int, consecutive_failures: int = 0) -> float:
+    """Exponential process-restart backoff, capped to keep recovery bounded."""
+    exponent = min(5, max(0, restart_count) + max(0, consecutive_failures))
+    return min(_RESTART_MAX_SECONDS, _RESTART_BASE_SECONDS * (2**exponent))
+
+
+def _show_child_log(runner: Any) -> None:
+    """Show the latest bounded worker log so the tunnel URL remains visible."""
+    try:
+        output = runner.tail_log(max_bytes=16 * 1024)
+    except Exception:  # noqa: BLE001 — logging must not interfere with supervision
+        return
+    if output:
+        sys.stdout.write(output)
+        if not output.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def _run_supervised(args: argparse.Namespace) -> int:
+    """Keep the tunnel worker alive through LocalRunner's owned-process API."""
+    from .local_runner import ChildState, LocalRunner, RunnerAlreadyRunningError
+
+    command, child_env = _build_child_command(args)
+    runner = LocalRunner(
+        scope=f"meridian-tunnel-client-{args.tunnel_port}",
+        command=command,
+        cwd=os.getcwd(),
+        env=child_env,
+        tunnel_label="tunnel-client",
+    )
+    started = False
+    consecutive_failures = 0
+    try:
+        while True:
+            try:
+                runner.start()
+                started = True
+                _show_child_log(runner)
+                break
+            except RunnerAlreadyRunningError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — transient spawn failures get retried
+                delay = _restart_delay(0, consecutive_failures)
+                consecutive_failures += 1
+                print(
+                    f"tunnel: client start failed ({type(exc).__name__}); retrying in {delay:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+
+        while True:
+            time.sleep(_SUPERVISOR_POLL_SECONDS)
+            status = runner.status()
+            if status.child.state is ChildState.RUNNING:
+                consecutive_failures = 0
+                continue
+
+            delay = _restart_delay(status.child.restart_count, consecutive_failures)
+            print(
+                f"tunnel: client process {status.child.state.value} "
+                f"(exit={status.child.exit_code}); restarting in {delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+            while True:
+                try:
+                    runner.restart()
+                    consecutive_failures = 0
+                    _show_child_log(runner)
+                    break
+                except Exception as exc:  # noqa: BLE001 — keep retrying the owned child
+                    retry_delay = _restart_delay(
+                        status.child.restart_count, consecutive_failures + 1
+                    )
+                    consecutive_failures += 1
+                    print(
+                        f"tunnel: client restart failed ({type(exc).__name__}); "
+                        f"retrying in {retry_delay:.0f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(retry_delay)
+    except KeyboardInterrupt:
+        return 0
+    except RunnerAlreadyRunningError as exc:
+        print(f"tunnel: {exc}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        if started:
+            try:
+                runner.stop()
+            except Exception:  # noqa: BLE001 — don't mask the supervisor's exit
+                pass
+
+
+def _run_tunnel(args: argparse.Namespace) -> int:
+    """Run one tunnel worker; the normal entry point wraps this with a supervisor."""
+    # Import lazily so importing the entry module doesn't pull tunnel deps in.
+    from .tunnel_client import run_tunnel
+
+    loop = _resolve_loop()
+    _repo_list = args.repo if isinstance(args.repo, list) else ([args.repo] if args.repo else [])
+    _repo_path = _repo_list[0] if _repo_list else None
+    _extra_roots = _repo_list[1:]
+    try:
+        return loop.run_until_complete(
+            run_tunnel(
+                token=args.token,
+                base_url=args.server,
+                repo_path=_repo_path,
+                extra_fs_roots=_extra_roots,
+                port=args.tunnel_port,
+                code_dirs=args.code_dirs,
+            )
+        )
+    except KeyboardInterrupt:
+        return 0
 
 
 def _resolve_loop() -> asyncio.AbstractEventLoop:
@@ -141,36 +306,12 @@ def _resolve_loop() -> asyncio.AbstractEventLoop:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the tunnel client. Returns a process exit code."""
+    """Run the supervised tunnel client or its internal worker process."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-
-    # Import lazily so merely importing this module (e.g. in tests or at frozen
-    # bootstrap) does not pull httpx/websockets into sys.modules.
-    from .tunnel_client import run_tunnel
-
-    # Reuse the module-scope SelectorEventLoop on Windows (set above); elsewhere
-    # create a fresh loop. asyncio.get_event_loop() is unreliable off the main
-    # thread / after a loop is closed, so resolve it defensively.
-    loop = _resolve_loop()
-    # cbbd0eb4 — --repo is nargs='+': first path is the active repo, the rest are
-    # extra filesystem roots.
-    _repo_list = args.repo if isinstance(args.repo, list) else ([args.repo] if args.repo else [])
-    _repo_path = _repo_list[0] if _repo_list else None
-    _extra_roots = _repo_list[1:]
-    try:
-        return loop.run_until_complete(
-            run_tunnel(
-                token=args.token,
-                base_url=args.server,
-                repo_path=_repo_path,
-                extra_fs_roots=_extra_roots,
-                port=args.tunnel_port,
-                code_dirs=args.code_dirs,
-            )
-        )
-    except KeyboardInterrupt:
-        return 0
+    if args.tunnel_child:
+        return _run_tunnel(args)
+    return _run_supervised(args)
 
 
 if __name__ == "__main__":
