@@ -788,11 +788,11 @@ async def test_db_pointer_add_get_delete_round_trip(db):
     assert got[0]["id"] == stored["id"]
     assert got[0]["targets"] == stored["targets"]
 
-    removed = await db_module.delete_sprint_item_pointer(db, stored["id"])
+    removed = await db_module.delete_sprint_item_pointer(db, p["id"], stored["id"])
     assert removed is True
     assert await db_module.get_sprint_item_pointers(db, item["id"]) == []
     # Deleting again is a no-op returning False.
-    assert await db_module.delete_sprint_item_pointer(db, stored["id"]) is False
+    assert await db_module.delete_sprint_item_pointer(db, p["id"], stored["id"]) is False
 
 
 @pytest.mark.asyncio
@@ -1236,7 +1236,8 @@ async def test_mcp_delete_pointer_removes_and_is_idempotent(db):
 
     # delete the real pointer -> deleted True, and the item has no pointers left
     deleted = await srv._dispatch_mcp_tool(
-        "delete_sprint_item_pointer", {"pointer_id": ptr_id}, db, "/tmp",
+        "delete_sprint_item_pointer",
+        {"project_id": p["id"], "pointer_id": ptr_id}, db, "/tmp",
     )
     assert deleted == {"pointer_id": ptr_id, "deleted": True}
     listed = await srv._dispatch_mcp_tool(
@@ -1248,7 +1249,8 @@ async def test_mcp_delete_pointer_removes_and_is_idempotent(db):
 
     # deleting again is idempotent (not an error) -> deleted False
     again = await srv._dispatch_mcp_tool(
-        "delete_sprint_item_pointer", {"pointer_id": ptr_id}, db, "/tmp",
+        "delete_sprint_item_pointer",
+        {"project_id": p["id"], "pointer_id": ptr_id}, db, "/tmp",
     )
     assert again == {"pointer_id": ptr_id, "deleted": False}
 

@@ -3404,21 +3404,20 @@ async def test_dispatch_project_scoped_tool_with_only_project_name(db):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_project_id_wins_over_project_name(db):
-    """a9c041d7 — CORRECTED: this test's original name/docstring claimed
-    project_id takes precedence over project_name when both are supplied.
-    That was never true of the resolver (``_lookup = _pname_raw or
-    _pid_raw`` picks project_name whenever it is present) and the original
-    assertion (``isinstance(items, list)``) was too weak to notice: it passed
-    regardless of which project's data actually came back. Verified here by
-    seeding each project with a distinguishing sprint item and asserting on
-    identity — project_name's project id (the decoy) is what actually gets
-    dispatched against, not the supplied project_id. This resolver precedence
-    is a separate, pre-existing behavior from the scoped_project_ids bypass
-    fixed by a9c041d7 (see the dedicated scoped_project_ids tests below) —
-    changing WHICH of project_id/project_name wins during resolution is out
-    of that fix's scope, so this test now documents the real behavior instead
-    of asserting a false one."""
+async def test_dispatch_project_id_conflicting_project_name_is_rejected(db):
+    """3f47cc6e — a project_id and a project_name that resolve to DIFFERENT
+    projects are rejected with a clear error instead of silently dispatching
+    against one of them.
+
+    History: a9c041d7 first CORRECTED this test's original claim that
+    project_id wins (the resolver's ``_lookup = _pname_raw or _pid_raw`` let a
+    resolvable project_name silently override a supplied project_id, so
+    dispatch ran against the decoy). 3f47cc6e then fixed the resolver itself:
+    an explicit id is never overridden by a name that resolves elsewhere
+    (rename/merge free old names, so a stale name could otherwise retarget a
+    call). The full matrix — matching pair, unresolvable name keeps the id,
+    stale names after rename/merge, scoped tokens — lives in
+    tests/test_3f47cc6e_project_resolution_precedence.py."""
     from meridian import server as srv
 
     real = await db_module.create_project(db, "wins-real")
@@ -3426,18 +3425,21 @@ async def test_dispatch_project_id_wins_over_project_name(db):
     await db_module.add_sprint_item(db, real["id"], "v1", "real-project-item")
     await db_module.add_sprint_item(db, decoy["id"], "v1", "decoy-project-item")
 
+    with pytest.raises(ValueError, match="refer to different projects"):
+        await srv._dispatch_mcp_tool(
+            "get_sprint_items",
+            {"project_id": real["id"], "project_name": "wins-decoy"},
+            db, "/tmp",
+        )
+
+    # The same id with its OWN name is fine and stays on the real project.
     items = await srv._dispatch_mcp_tool(
         "get_sprint_items",
-        {"project_id": real["id"], "project_name": "wins-decoy"},
+        {"project_id": real["id"], "project_name": "wins-real"},
         db, "/tmp",
     )
-    assert isinstance(items, list)
-    titles = {it["title"] for it in items}
-    # The resolver overrides the supplied project_id with project_name's
-    # project — dispatch actually runs against the DECOY project.
-    assert titles == {"decoy-project-item"}
-    assert "real-project-item" not in titles
-    assert all(it["project_id"] == decoy["id"] for it in items)
+    assert {it["title"] for it in items} == {"real-project-item"}
+    assert all(it["project_id"] == real["id"] for it in items)
 
 
 @pytest.mark.asyncio
@@ -3480,9 +3482,13 @@ async def test_scoped_project_ids_blocks_project_name_override_of_in_scope_id(db
     _handle_mcp_request only inspects the raw project_id and lets this
     through; without the a9c041d7 post-resolution re-check, the resolver in
     _dispatch_mcp_tool would then silently swap in the out-of-scope project
-    (project_name wins — see test_dispatch_project_id_wins_over_project_name)
-    and dispatch would proceed against data the caller has no access to. Must
-    be denied with the same -32603 "access scope" shape as the pre-check gate."""
+    (before 3f47cc6e a resolvable project_name beat project_id — see
+    test_dispatch_project_id_conflicting_project_name_is_rejected) and
+    dispatch would proceed against data the caller has no access to. Must
+    be denied with the same -32603 "access scope" shape as the pre-check gate
+    (3f47cc6e keeps this opaque: the out-of-scope check runs BEFORE the
+    id/name conflict error, so a conflict message can never confirm that a
+    name resolves to a project outside the caller's scope)."""
     from meridian.mcp.handler import _handle_mcp_request
 
     in_scope = await db_module.create_project(db, "scope-in-a9c041d7")
@@ -3514,10 +3520,11 @@ async def test_scoped_project_ids_blocks_project_name_override_of_in_scope_id(db
 @pytest.mark.asyncio
 async def test_scoped_project_ids_none_unaffected_by_new_check(db):
     """No scoping in effect (self-host / owner / workspace-wide member) —
-    the a9c041d7 post-resolution check must not fire at all. Combined
-    in-scope-shaped id + a different project_name still resolves and
-    dispatches against whatever project_name resolves to, matching the
-    documented pre-existing resolver precedence."""
+    the a9c041d7 post-resolution scope check must not fire at all. A combined
+    id + a DIFFERENT project_name is still rejected, but by the 3f47cc6e
+    id/name conflict rule (previously the name silently won and dispatch ran
+    against the name's project) — never with the "access scope" error, and
+    never dispatched against either project."""
     from meridian.mcp.handler import _handle_mcp_request
 
     id_only_project = await db_module.create_project(db, "noscope-id-a9c041d7")
@@ -3538,10 +3545,10 @@ async def test_scoped_project_ids_none_unaffected_by_new_check(db):
         db=db, data_dir="/tmp",
         scoped_project_ids=None,
     )
-    assert "error" not in resp, resp
-    payload = json.loads(resp["result"]["content"][0]["text"])
-    assert isinstance(payload, list)
-    assert any(it["title"] == "name-project-item" for it in payload)
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == -32603
+    assert "refer to different projects" in resp["error"]["message"]
+    assert "access scope" not in resp["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -8568,10 +8575,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_docx_derivatives",
         "_migrate_pg_sprint_item_lock_session_id",
         "_migrate_pg_sprint_item_coarse_lock_files",
+        "_migrate_pg_backfill_finding_note_kind",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 173
+    assert len(allnames) == len(set(allnames)) == 174
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

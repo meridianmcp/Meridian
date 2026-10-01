@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "journal": "de_gruyter",
+    "display_name": "De Gruyter journals",
+    "publisher": "De Gruyter",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. De Gruyter publishes many distinct journal families (Mouton, STEM, law, etc.), each with its own style sheet, so the values captured here are a conservative cross-imprint floor rather than a single blanket fact.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "not_fixed",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "degruyterbrill.com Instructions-for-Authors (Discrete Mathematics and Applications); De Gruyter Mouton journal style-sheet PDFs",
+        "note": "Vancouver preferred, Harvard or Chicago author-date acceptable for others -- varies by publication, hence not_fixed."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "degruyterbrill.com Instructions-for-Authors (Discrete Mathematics and Applications); De Gruyter Mouton journal style-sheet PDFs",
+        "note": "figure resolution requirements vary widely by imprint (300-1200 dpi depending on figure type and journal family); the STEM guidance page's own blanket floor of 300 dpi is used here as the most conservative cross-imprint figure -- the style-sheet PDFs were consulted for corroboration of the range, not as the source of this specific value."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

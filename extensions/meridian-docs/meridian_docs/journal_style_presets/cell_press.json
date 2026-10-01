@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "journal": "cell_press",
+    "display_name": "Cell Press journals",
+    "publisher": "Cell Press",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. Cell Press is Elsevier-owned but editorially distinct -- deliberately a separate preset from 'elsevier'.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "not_fixed",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "cell.com/information-for-authors/figure-guidelines",
+        "note": "citation style varies by title within Cell Press -- Cell itself uses numbered superscript citations, while Cell Reports uses an author-date style -- an explicit cross-title inconsistency, hence not_fixed rather than picking one flagship title's convention."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "cell.com/information-for-authors/figure-guidelines",
+        "note": "color/grayscale halftone floor."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 1000,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "cell.com/information-for-authors/figure-guidelines"
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

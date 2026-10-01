@@ -50,16 +50,16 @@ project_id = "5787cc92-ba7d-4788-b17c-28ab7938b839"
 Add to the existing `meridian.toml` at the repo root (or create one).  The
 `[default]`, `[connections.*]`, and `[project]` sections coexist freely.
 
-**Option B — environment variable (CI, containers, MCP env block):**
+**Option B — environment variable (CI, containers, self-hosted MCP env block):**
 
 ```json
 {
   "mcpServers": {
     "meridian": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
+      "command": "pixi",
+      "args": ["run", "python", "-m", "meridian", "--mcp"],
+      "cwd": "/path/to/Meridian",
       "env": {
-        "BEARER_TOKEN": "sk_meridian_YOUR_TOKEN",
         "MERIDIAN_PROJECT_ID": "5787cc92-ba7d-4788-b17c-28ab7938b839"
       }
     }
@@ -67,7 +67,16 @@ Add to the existing `meridian.toml` at the repo root (or create one).  The
 }
 ```
 
-Once either is set, this one-liner starts a tracked session:
+**Self-hosted only.** `MERIDIAN_PROJECT_ID` is read by the Meridian server
+process itself, so it only takes effect when that process receives the
+variable (the stdio `--mcp` launcher above, or a container/CI job running the
+server). It does **not** work on the hosted tier: an `env` block on the
+`mcp-remote` launcher goes to the local `mcp-remote` process, which never
+forwards it to usemeridian.us, and `meridian.toml` is not shipped in the
+hosted image either, so Option A does not apply there. On the hosted tier
+pass `project_id` (or `project_name`) explicitly on every call.
+
+Once either is set (self-hosted), this one-liner starts a tracked session:
 
 ```python
 start_session(session_name="describe-what-youre-doing")

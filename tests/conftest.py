@@ -621,6 +621,30 @@ def _isolate_md_root(monkeypatch, tmp_path):
     monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_tunnel_log(monkeypatch, tmp_path_factory):
+    """4d6e87dd -- point ``MERIDIAN_TUNNEL_LOG`` at a per-test temp file for
+    EVERY test.
+
+    ``tunnel_client.run_tunnel`` calls ``_install_tunnel_log_tee()``, which
+    mirrors stdout/stderr into ``tunnel_client._tunnel_log_path()`` --
+    ``~/.meridian/tunnel.log`` unless overridden. Dozens of tests drive
+    ``run_tunnel`` (early-exit and happy paths alike), so before this fixture
+    every test run appended to the developer's REAL tunnel log: confirmed live
+    at 22.1 MB / 11,003 ``meridian tunnel: serving`` lines from pytest, none
+    timestamped, burying the real indexing-worker crash lines a live tunnel
+    wrote to the same file. Same pattern as ``_isolate_md_root`` above: an
+    env override (so it also reaches child processes tests spawn), applied
+    autouse so no current or future test can forget it.
+
+    The log lives in its own ``tmp_path_factory`` dir, NOT inside the test's
+    ``tmp_path`` -- tests that list or assert on their own ``tmp_path``
+    contents must not see a stray log file in it.
+    """
+    log_dir = tmp_path_factory.mktemp("tunnel_log")
+    monkeypatch.setenv("MERIDIAN_TUNNEL_LOG", str(log_dir / "tunnel.log"))
+
+
 @pytest_asyncio.fixture
 async def db(request):
     """Meridian's schema on the active backend, isolated per test.

@@ -486,8 +486,6 @@ def test_windows_backend_spawn_assigns_job(monkeypatch):
     proc_handle_closed = next(c for c in fake_api.calls if c[0] == "CloseHandle")
     open_process_call = next(c for c in fake_api.calls if c[0] == "OpenProcess")
     assert proc_handle_closed[1] == open_process_call[3]  # closed exactly the proc handle, not the job
-
-
 def test_windows_backend_spawn_skips_kill_on_close_when_disabled(monkeypatch):
     """d397bb71: kill_on_job_close=False must never call
     SetInformationJobObject at all, but the job is still created and the

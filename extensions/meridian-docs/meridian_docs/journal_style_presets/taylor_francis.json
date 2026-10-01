@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "journal": "taylor_francis",
+    "display_name": "Taylor & Francis journals (Author Services electronic-artwork guidance)",
+    "publisher": "Taylor & Francis",
+    "status": "populated",
+    "status_detail": "Round 1 (workspace proposal 3674c0c1) migration. Verified 2026-09-11 against authorservices.taylorandfrancis.com/editorial-policies/images-and-figures/ and the Author Services 'Submission of electronic artwork' PDF. citation_style was deliberately left unset in the original dict entry -- the pages checked in this pass covered artwork submission only and did not state a citation convention (Taylor & Francis journals are known to vary this per title/subject area) -- and stays absent here.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "authorservices.taylorandfrancis.com/editorial-policies/images-and-figures/ and the Author Services 'Submission of electronic artwork' PDF",
+        "note": "Photographic images need at least 300 dpi."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "authorservices.taylorandfrancis.com/editorial-policies/images-and-figures/ and the Author Services 'Submission of electronic artwork' PDF",
+        "quote": "all other types of artwork",
+        "note": "'All other types of artwork' (including line art) need at least 600 dpi at final output size."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

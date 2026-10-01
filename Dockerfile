@@ -30,6 +30,26 @@ COPY . .
 # server process.
 RUN uv pip install --system ./extensions/meridian-codeindex
 
+# c11c5117 -- install the detachable meridian-docparse package
+# (packages/docparse, pure stdlib, its own standalone pyproject.toml).
+# meridian/docs_intel.py and meridian/latex_intel.py are thin shims over it
+# (`from docparse import ...`), so without this the hosted image fails every
+# get_latex_structure / docx-structure call with "No module named 'docparse'".
+# Locally it only resolves via the editable path install in pixi.toml
+# ([pypi-dependencies] meridian-docparse); the `uv pip install --system .` above
+# installs pyproject.toml's dependency list, which does not (and, being a
+# separate detachable package, should not) pull it in. It must run AFTER
+# `COPY . .` because ./packages/docparse only exists in the image from that
+# point, and packages/ must stay out of .dockerignore's exclusions.
+RUN uv pip install --system ./packages/docparse
+
+# Build-time smoke check: fail the image build (not a prod request, later) if
+# docparse is not importable from the system interpreter uvicorn runs under.
+# WORKDIR is /app, which has no top-level docparse/ dir (the source lives at
+# /app/packages/docparse/docparse), so this only passes when the install above
+# really put the package into site-packages.
+RUN python -c "import docparse; from docparse import docs_intel, latex_intel"
+
 EXPOSE 8000
 
 # Cache-bust query param for static assets. git is not installed in this

@@ -4,7 +4,15 @@
 // snapshots, duplicate text (ambiguous locator), long paragraphs (preview
 // truncation), missing IDs (not_found locator), and mixed native/legacy
 // captions (caption category + type label).
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+// journalPresetOptionsHtml/journalPresetSelectHtml call the ambient global
+// escapeHtml (bundled app-wide by esbuild at runtime — see this file's own
+// header comment on the window re-exposure convention). Under vitest each
+// module is isolated, so it must be registered explicitly: importing
+// dashboard-utils for its side effect runs its own `Object.assign(window,
+// {escapeHtml, ...})`, after which the bare `escapeHtml` identifier resolves
+// via jsdom's global object exactly like it does in the real bundled app.
+import "./dashboard-utils";
 import {
   groupFindingsByCategory,
   summarizeLocator,
@@ -12,10 +20,14 @@ import {
   isReviewEmpty,
   isReviewStale,
   isReviewError,
+  journalPresetOptionsHtml,
+  journalPresetSelectHtml,
+  fetchJournalStylePresets,
   REVIEW_CATEGORY_ORDER,
   type ReviewFinding,
   type ReviewLocator,
   type DocumentReviewResult,
+  type JournalStylePresetInfo,
 } from "./dashboard-documents";
 
 const resolvedLocator = (over: Partial<ReviewLocator> = {}): ReviewLocator => ({
@@ -240,5 +252,130 @@ describe("review-level state helpers", () => {
     expect(isReviewError({ error: "file not found on server: x.docx" })).toBe(true);
     expect(isReviewError({ status: "ok" })).toBe(false);
     expect(isReviewError(undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// journalPresetOptionsHtml / journalPresetSelectHtml — 9c1a3fd2 preset picker.
+// ---------------------------------------------------------------------------
+describe("journalPresetOptionsHtml", () => {
+  const presets: JournalStylePresetInfo[] = [
+    { name: "nature", source: "built_in", shadows_builtin: false },
+    { name: "jcshm", source: "built_in", shadows_builtin: false },
+  ];
+
+  it("always leads with a selected-by-default 'No journal check' option", () => {
+    const html = journalPresetOptionsHtml([]);
+    expect(html).toContain('<option value="" selected>No journal check</option>');
+  });
+
+  it("lists built-in presets sorted by name, value = name", () => {
+    const html = journalPresetOptionsHtml(presets);
+    const jcshmIndex = html.indexOf("jcshm");
+    const natureIndex = html.indexOf("nature");
+    expect(jcshmIndex).toBeGreaterThan(-1);
+    expect(jcshmIndex).toBeLessThan(natureIndex); // alphabetical: jcshm before nature
+    expect(html).toContain('<option value="jcshm">jcshm</option>');
+  });
+
+  it("labels a user preset that shadows a built-in as '(custom)', distinct from the built-in it amends", () => {
+    const html = journalPresetOptionsHtml([
+      { name: "jcshm", source: "user", shadows_builtin: true },
+    ]);
+    expect(html).toContain('<option value="jcshm">jcshm (custom)</option>');
+  });
+
+  it("a user preset NOT shadowing any built-in gets no '(custom)' suffix", () => {
+    const html = journalPresetOptionsHtml([
+      { name: "my_lab_house_style", source: "user", shadows_builtin: false },
+    ]);
+    expect(html).toContain('<option value="my_lab_house_style">my_lab_house_style</option>');
+  });
+
+  it("marks the currently-selected preset (not the default) as selected, for Re-check re-rendering", () => {
+    const html = journalPresetOptionsHtml(presets, "jcshm");
+    expect(html).toContain('<option value="">No journal check</option>');
+    expect(html).toContain('<option value="jcshm" selected>jcshm</option>');
+  });
+
+  it("null/undefined presets never throws — degrades to just the default option", () => {
+    expect(() => journalPresetOptionsHtml(null)).not.toThrow();
+    expect(() => journalPresetOptionsHtml(undefined)).not.toThrow();
+    expect(journalPresetOptionsHtml(null)).toContain("No journal check");
+  });
+
+  it("escapes a preset name that contains HTML-significant characters", () => {
+    const html = journalPresetOptionsHtml([
+      { name: '<script>"</script>', source: "user", shadows_builtin: false },
+    ]);
+    expect(html).not.toContain("<script>");
+  });
+});
+
+describe("journalPresetSelectHtml", () => {
+  it("scopes the <select> to one document via data-did, matching wireDocumentReviewButtons' lookup", () => {
+    const html = journalPresetSelectHtml("doc-42", []);
+    expect(html).toContain('class="doc-review-journal-select"');
+    expect(html).toContain('data-did="doc-42"');
+  });
+
+  it("escapes the document id", () => {
+    const html = journalPresetSelectHtml('"><script>evil()</script>', []);
+    expect(html).not.toContain("<script>evil()</script>");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchJournalStylePresets — 9c1a3fd2 preset catalog fetch. `api` is the
+// ambient global set up by dashboard-core.ts's own `Object.assign(window,
+// {api, ...})` at runtime; stub it the same way dashboard-settings-lazy.test.ts
+// stubs it for _loadSettingsAccountPane.
+// ---------------------------------------------------------------------------
+describe("fetchJournalStylePresets", () => {
+  afterEach(() => {
+    delete (globalThis as any).api;
+    delete (window as any).api;
+  });
+
+  it("resolves to result.presets on a successful fetch", async () => {
+    const presets: JournalStylePresetInfo[] = [{ name: "jcshm", source: "built_in", shadows_builtin: false }];
+    const apiStub = vi.fn(async (_url: string) => ({ presets }));
+    (globalThis as any).api = apiStub;
+    (window as any).api = apiStub;
+
+    await expect(fetchJournalStylePresets()).resolves.toEqual(presets);
+    expect(apiStub).toHaveBeenCalledWith("/journal-style-presets");
+  });
+
+  // b67ec6b5/9c1a3fd2 cache-staleness fix: an earlier version memoized the
+  // result for the page's lifetime, so a preset saved elsewhere (e.g. the
+  // separate save_user_journal_style_preset MCP surface) in the same browser
+  // session never showed up without a full reload. Guard against that
+  // regression returning: every call must hit the network.
+  it("calls the API again on every call rather than caching across calls", async () => {
+    const apiStub = vi.fn(async (_url: string) => ({ presets: [] }));
+    (globalThis as any).api = apiStub;
+    (window as any).api = apiStub;
+
+    await fetchJournalStylePresets();
+    await fetchJournalStylePresets();
+
+    expect(apiStub).toHaveBeenCalledTimes(2);
+  });
+
+  it("a throwing api resolves to [] rather than rejecting", async () => {
+    const apiStub = vi.fn(async (_url: string) => { throw new Error("network down"); });
+    (globalThis as any).api = apiStub;
+    (window as any).api = apiStub;
+
+    await expect(fetchJournalStylePresets()).resolves.toEqual([]);
+  });
+
+  it("a response with a missing or mistyped presets field resolves to [] rather than throwing", async () => {
+    const apiStub = vi.fn(async (_url: string) => ({ presets: "not-an-array" }));
+    (globalThis as any).api = apiStub;
+    (window as any).api = apiStub;
+
+    await expect(fetchJournalStylePresets()).resolves.toEqual([]);
   });
 });

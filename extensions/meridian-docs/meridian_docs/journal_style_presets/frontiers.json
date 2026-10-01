@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "journal": "frontiers",
+    "display_name": "Frontiers journals",
+    "publisher": "Frontiers Media SA",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "not_fixed",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "frontiersin.org/guidelines/author-guidelines",
+        "note": "journals use either Harvard (author-date) or Vancouver (numbered) style depending on the journal -- an explicit defers-to-the-individual-journal fact, hence not_fixed."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "frontiersin.org/guidelines/author-guidelines",
+        "note": "all images need 300 dpi at final size (blanket, not broken out by art type)."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

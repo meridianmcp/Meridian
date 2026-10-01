@@ -32,36 +32,36 @@ and tested, not a work-in-progress snapshot.
 
 - **`engine/`** — Node package, zero new runtime dependencies except
   `better-sqlite3` (bundled prebuild, no compile toolchain needed — see
-  `store.js`'s own comment if `npm install` tries to compile from source).
-  - `src/outline.js` — parses `.tex` via `@unified-latex/unified-latex-util-parse`
+  `store.ts`'s own comment if `npm install` tries to compile from source).
+  - `src/outline.ts` — parses `.tex` via `@unified-latex/unified-latex-util-parse`
     into addressable structural nodes (headings, citations, tables, figures,
     equations), each with a **content-fingerprint id** (not positional —
     survives unrelated upstream edits) and source line range.
-  - `src/matching.js` — `matchOutlines(old, new)`: diffs two parses of the
+  - `src/matching.ts` — `matchOutlines(old, new)`: diffs two parses of the
     same document (id-join for the easy case, kind-aware LCS alignment for
     content that changed enough to change its fingerprint) so a node's
     identity survives being retitled or shifted.
-  - `src/store.js` / `src/claims.js` — local SQLite project index (auto-
+  - `src/store.ts` / `src/claims.ts` — local SQLite project index (auto-
     registered per Overleaf project id, no manual setup) and node/whole-
     document claim-lease conflict rules, mirroring meridian-docs'
     region-claim model conceptually but fully self-contained (no dependency
     on the Meridian server).
-  - `src/provenance.js` — a durable LOCAL audit trail (same SQLite store) of
+  - `src/provenance.ts` — a durable LOCAL audit trail (same SQLite store) of
     every edit actually dispatched through `applyEdits`: which project,
-    which node, which field, old/new value, when. Distinct from `claims.js`
+    which node, which field, old/new value, when. Distinct from `claims.ts`
     (a claim is "who's allowed to write right now"; a provenance row is
     "what was actually written"). Deliberately does NOT call meridian-outputs
-    directly — `server.js` is a headless local Node process with no MCP
+    directly — `server.ts` is a headless local Node process with no MCP
     client of its own, so it can't. Instead it's a pull-based buffer: a
     `synced_to_meridian_outputs` flag per row lets a LATER agent session (one
     that genuinely has MCP access) pull unsynced rows and push them into
     meridian-outputs itself. See "What's real" below for what's built vs.
     what's still a manual/future step.
-  - `src/zotero.js` — citation-key validation against the LOCAL Zotero
+  - `src/zotero.ts` — citation-key validation against the LOCAL Zotero
     desktop app's HTTP API (127.0.0.1:23119, not the Meridian tunnel).
     `lookupCitationKey()` returns a three-way resolved/not-resolved/
     couldn't-check result via the library's own `:key:` tag convention.
-  - `src/server.js` — plain Node `http`, no framework. `POST /outline`,
+  - `src/server.ts` — plain Node `http`, no framework. `POST /outline`,
     `POST /claim`, `POST /lease`, `POST /release`, `GET /claims`,
     `POST /provenance`, `GET /provenance`, `POST /provenance/mark-synced`,
     `GET /zotero-lookup`, `GET /extension-version` (for the extension's
@@ -78,10 +78,10 @@ and tested, not a work-in-progress snapshot.
     legacy, pre-spec Socket.IO 0.9.x framing. Written from protocol facts
     read out of Overleaf's own open-source server and cross-checked twice
     against `github.com/overleaf/overleaf`'s real source — not copied from
-    any AGPL-licensed client (see `src/overleaf-ot-client.js`'s own header
-    for why forking one was rejected). `packet.js` is pure encode/decode;
-    `client.js` is the WebSocket transport + heartbeat/ack handling.
-  - `src/overleaf-ot-client.js` — `connectToProject`/`joinDoc`/`applyUpdate`
+    any AGPL-licensed client (see `src/overleaf-ot-client.ts`'s own header
+    for why forking one was rejected). `packet.ts` is pure encode/decode;
+    `client.ts` is the WebSocket transport + heartbeat/ack handling.
+  - `src/overleaf-ot-client.ts` — `connectToProject`/`joinDoc`/`applyUpdate`
     built on `socketio09/`: a direct, no-browser-tab connection to a live
     Overleaf project's document. `applyUpdate()` deliberately waits for both
     the ack AND the async `otUpdateApplied`/`otUpdateError` broadcast before
@@ -89,11 +89,11 @@ and tested, not a work-in-progress snapshot.
     reading the server's own callback wiring, not assumed).
     `trackChangesOnForUser()` drives `meta.tc` for routing an edit through
     Overleaf's native tracked-changes mode.
-  - `src/overleaf-login.js` — the ONLY place in this codebase that ever
+  - `src/overleaf-login.ts` — the ONLY place in this codebase that ever
     touches a real Overleaf session cookie. Spawns a dedicated, isolated
     Chrome profile via CDP, lets a human log in themselves (2FA/SSO/captcha
     all just work, since it's a real browser window), reads the resulting
-    cookie back. Must be run directly by a human (`node src/overleaf-login.js
+    cookie back. Must be run directly by a human (`node dist/overleaf-login.js
     login`) — never invoked from inside an agent session.
 
 - **`extension/`** — Chrome MV3 extension, loadable unpacked. Self-reloading
@@ -133,7 +133,7 @@ and tested, not a work-in-progress snapshot.
 - The full claim→edit→write→release flow, for **`heading` titles,
   `citation` keys, and — new, 2026-09-18 — `table`/`figure` captions and
   any environment-shaped equation's (`equation`, `align`, ...) label.**
-  Engine-side fix that made the last three safe to add: `outline.js`'s
+  Engine-side fix that made the last three safe to add: `outline.ts`'s
   caption/label extraction now stops at a nested structural boundary
   (`findFirstMacroInOwnScope`) instead of recursing through it, so a
   `tabular` float's own caption inside an outer `table` is never
@@ -197,7 +197,7 @@ and tested, not a work-in-progress snapshot.
 **Unit-tested (113/113 passing), NOT yet live-verified:**
 - **A second, independent way to write into a live Overleaf document: a
   direct Socket.IO 0.9.x + OT-protocol client (`src/socketio09/` +
-  `src/overleaf-ot-client.js`), talking straight to Overleaf's real-time
+  `src/overleaf-ot-client.ts`), talking straight to Overleaf's real-time
   backend over WebSocket — no browser tab, no extension, no CM6 DOM
   involved at all.** This is a different write path from everything above
   (which all goes through the extension driving a real editor tab); the two
@@ -207,16 +207,16 @@ and tested, not a work-in-progress snapshot.
   distinction, tracked-changes `meta.tc` wiring) using dependency-injected
   fakes — no live network or real credentials touched during development.
   **What's NOT yet confirmed: an actual connection to a real Overleaf
-  project.** That requires a human running `node src/overleaf-login.js
-  login` themselves (see `src/overleaf-login.js` above — an agent session
-  must never do this step) and then exercising `overleaf-ot-client.js`
+  project.** That requires a human running `node dist/overleaf-login.js
+  login` themselves (see `src/overleaf-login.ts` above — an agent session
+  must never do this step) and then exercising `overleaf-ot-client.ts`
   against the resulting cookie. Until that happens, treat this path as
   logically sound and thoroughly tested in isolation, not as proven against
   the real service — the same honesty standard this README already applies
   to every other capability above.
-- **A durable local audit trail of every applied edit (`src/provenance.js`,
-  new `provenance` table in `store.js`'s SQLite schema, `POST /provenance` /
-  `GET /provenance` / `POST /provenance/mark-synced` on `server.js`), wired
+- **A durable local audit trail of every applied edit (`src/provenance.ts`,
+  new `provenance` table in `store.ts`'s SQLite schema, `POST /provenance` /
+  `GET /provenance` / `POST /provenance/mark-synced` on `server.ts`), wired
   into `popup.js`'s `applyBatch()`.** Every queued edit's old value is
   captured at queue time (before the user's typed replacement overwrites the
   input); after a batch is dispatched and readback-verified, one provenance
@@ -253,11 +253,11 @@ and tested, not a work-in-progress snapshot.
   own logic was reasoned through and syntax-checked, not driven end-to-end
   in a real popup).
   A real bug caught while building this: SQLite's `REFERENCES` clause in
-  `store.js`'s schema turned out to be genuinely ENFORCED (better-sqlite3
+  `store.ts`'s schema turned out to be genuinely ENFORCED (better-sqlite3
   defaults `PRAGMA foreign_keys=ON` — confirmed live, `db.pragma("foreign_keys",
   {simple:true}) === 1`), not merely documentation-only as an earlier draft
   of this same change assumed; `recordEdit()` calls `ensureProjectRow()`
-  first (mirroring `claims.js`'s `insertClaimRow`) so provenance can still be
+  first (mirroring `claims.ts`'s `insertClaimRow`) so provenance can still be
   recorded for a project row that doesn't exist yet, rather than throwing.
 
 **Multi-project robustness (2026-09-18) — real, live-verified:**
@@ -290,11 +290,11 @@ and tested, not a work-in-progress snapshot.
   caption-less outline node that `popup.js` offered a dead-end "Claim to
   edit" button for. The outline data itself is unchanged on purpose (an
   existing, deliberate prior decision keeps that node addressable for a
-  future cell/column-edit feature — see `outline.test.js`'s own "documented
+  future cell/column-edit feature — see `outline.test.ts`'s own "documented
   behavior change" test); fixed at the actual point of confusion instead —
   `popup.js` now shows "(no editable fields yet)" instead of a working-
   looking button that does nothing once clicked.
-- **Citation-key validation against the local Zotero library** (`src/zotero.js`,
+- **Citation-key validation against the local Zotero library** (`src/zotero.ts`,
   `GET /zotero-lookup`, a non-blocking status indicator in `popup.js`).
   Confirmed live before building anything: the Meridian-hosted `zotero-mcp`
   tunnel slot is disabled, Better BibTeX is not installed, but a real,
@@ -308,7 +308,7 @@ and tested, not a work-in-progress snapshot.
   key (from the new ooxml-graph-paper project, which hasn't had the tagging
   convention applied to it yet) correctly resolves false, not a false
   positive or a crash.
-- A stray literal NUL byte was found in `outline.js`'s `fingerprint()`
+- A stray literal NUL byte was found in `outline.ts`'s `fingerprint()`
   function (pre-existing, not introduced this session) — makes git treat
   the whole file as binary. NOT fixed here on purpose: naively replacing it
   would change every fingerprint's hash input, silently invalidating every
@@ -318,8 +318,8 @@ and tested, not a work-in-progress snapshot.
 
 **Independent multi-agent code review (2026-09-18) — 20 more real bugs found and fixed:**
 Rather than stop after the natbib/tables fixes above, a background review
-workflow (5 dimensions covering outline.js, matching.js, claims.js/store.js,
-the extension, server.js, and the whole OT-client stack, with every
+workflow (5 dimensions covering outline.ts, matching.ts, claims.ts/store.ts,
+the extension, server.ts, and the whole OT-client stack, with every
 candidate finding adversarially re-verified by a separate agent before
 being trusted) went looking for more of the same "overfit to one document/
 scenario" class of bug. 24 of 26 candidates were confirmed real; 20 are
@@ -338,7 +338,7 @@ fixed here (the other 4 are documented below, not silently dropped):
 - **Every table/figure number was inflated** by `collectLabels` counting a
   nested tabular/subfigure as a second increment of the same counter --
   corrupting every `\ref{}` to a table/figure past the first.
-- **Type-confusion in claims.js**: bare truthiness checks (`!x`) let a JSON
+- **Type-confusion in claims.ts**: bare truthiness checks (`!x`) let a JSON
   number sail past validation and get silently coerced to SQLite TEXT.
 - **6 fixes in popup.js's claim/release/batch-apply flow**: a released
   claim's already-queued edit wasn't purged (could still be dispatched); the
@@ -356,7 +356,7 @@ fixed here (the other 4 are documented below, not silently dropped):
   connection used to fail a pending write LATE with a misleading timeout
   instead of immediately with the real cause), two more dangling-waiter/
   timer-leak paths (matching the exact class of bug found and fixed in
-  `overleaf-ot-client.js` earlier the same day), and an unbounded-growth
+  `overleaf-ot-client.ts` earlier the same day), and an unbounded-growth
   `Map` that never pruned empty entries.
 - **CORS accepted ANY installed browser extension**, not just this repo's
   own -- fixed by pinning the extension's id (`manifest.json` now declares
@@ -367,15 +367,15 @@ fixed here (the other 4 are documented below, not silently dropped):
   intended "body too large" error.
 
 **Found, deliberately NOT fixed, with reasoning (not silently skipped):**
-- `store.js`'s `upsertProject`/`ensureProjectRow`/`getProject` don't wrap
-  themselves in try/catch, unlike claims.js/provenance.js's own documented
+- `store.ts`'s `upsertProject`/`ensureProjectRow`/`getProject` don't wrap
+  themselves in try/catch, unlike claims.ts/provenance.ts's own documented
   convention. Traced every real call site: each one is already inside a
-  caller's own try/catch (server.js's route handlers, claims.js's own
+  caller's own try/catch (server.ts's route handlers, claims.ts's own
   wrapped functions), so this is a real consistency gap, not a live crash
   risk today -- left as a defense-in-depth item rather than forcing an
   unclear "what does upsertProject even return on failure" design decision
   under review-pass time pressure.
-- `matching.js`'s `isAlignable` has no content discriminator at all for
+- `matching.ts`'s `isAlignable` has no content discriminator at all for
   citations/equations, so two same-kind nodes that are BOTH reordered and
   retitled in the same edit could theoretically be cross-matched by the LCS
   fallback. Traced where a `matched` pair's specific old/new ids are
@@ -388,7 +388,7 @@ fixed here (the other 4 are documented below, not silently dropped):
   "Claim to edit" can orphan a claim past the pagehide beacon) -- real but
   low-likelihood and expensive to fix properly given Chrome's popup
   lifecycle; the claim still self-heals via its 30-minute TTL regardless.
-- Every `server.js` catch block returns the raw internal error message
+- Every `server.ts` catch block returns the raw internal error message
   verbatim, which could leak filesystem paths to a caller. For a
   single-user, localhost-only, now CORS-pinned dev tool where Adam himself
   reads these errors to debug, this is closer to a useful feature than a
@@ -413,10 +413,10 @@ harness).
   client-side, before dispatch — they never exercised that path at all) are
   all still open. Decision `c01875cf` has the full list. **Now blocked
   specifically on a human step, not on more engine work**: the new OT client
-  (`overleaf-ot-client.js`) is the actual right tool to exercise this (two
+  (`overleaf-ot-client.ts`) is the actual right tool to exercise this (two
   independent OT-client connections, no browser tab needed at all, could
   simulate real concurrent writers), but every path to it needs a real
-  session cookie, which only `node src/overleaf-login.js login` (human-only,
+  session cookie, which only `node dist/overleaf-login.js login` (human-only,
   see above) can produce.
 - **Routing through Overleaf's own native track-changes/Review panel** —
   superseded, not abandoned: the OT client's `meta.tc`/`trackChangesOnForUser`
@@ -446,7 +446,7 @@ The engine server auto-starts on Windows login (Startup-folder shortcut →
 start it manually:
 ```
 cd engine
-node src/server.js
+node dist/server.ts
 ```
 Listens on `http://127.0.0.1:8471` (override with `MERIDIAN_LATEX_PORT`).
 
@@ -467,7 +467,7 @@ mysteriously hanging.
 declares a `"key"` (a public key -- safe to commit, not the private signing
 key, which this project never generates or needs) so Chrome assigns the SAME
 id every time the extension is loaded unpacked, instead of a fresh random one
-per load. This closes a real gap `server.js`'s CORS check had (it used to
+per load. This closes a real gap `server.ts`'s CORS check had (it used to
 accept any `chrome-extension://` origin, not just this one). **If you already
 had the extension loaded from before this change, remove it and re-load it
 unpacked** so Chrome picks up the new fixed id — otherwise the popup's calls
@@ -483,8 +483,8 @@ requests failing).
   copy, but concurrency/network-drop/server-desync behavior is still
   untested — treat a real document as higher-stakes than the test project
   until those gaps close.
-- **Running `node src/overleaf-login.js login`** to capture a real Overleaf
-  session cookie, and then confirming `overleaf-ot-client.js` actually
+- **Running `node dist/overleaf-login.js login`** to capture a real Overleaf
+  session cookie, and then confirming `overleaf-ot-client.ts` actually
   connects and joins a real document with it. Hard rule, not a convenience
   choice: an agent session must never capture, handle, or transmit a real
   account credential or session cookie itself — this step only ever runs

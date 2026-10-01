@@ -1897,6 +1897,72 @@ async def get_latest_sprint_item_verification(
     return _row_to_dict(row) if row is not None else None
 
 
+async def _verifier_session_problem(
+    db: aiosqlite.Connection,
+    project_id: str,
+    verifier_session_id: str | None,
+    *,
+    completing_actor: str | None,
+    item: dict[str, Any],
+) -> str | None:
+    """0ff5e59f — why ``verifier_session_id`` cannot vouch for this completion,
+    or ``None`` when it can.
+
+    Before this check the ``require_verification`` gate compared the verifier's
+    id to the completing actor's id as plain strings, so any made-up string
+    ("verifier-1") passed as an "independent" verifier. A verifier must be a
+    REAL session that:
+
+    * exists in ``sessions`` and belongs to THIS project (an id from another
+      project, or one that was never registered, proves nothing),
+    * is not the completing actor (the session cannot mark its own homework),
+    * is not the session that holds the item's claim (the implementer — the
+      completing actor may legitimately be a different orchestrator id, but the
+      verifier must still be neither).
+
+    Fails CLOSED on a lookup error: this is a structural attestation gate, so an
+    unverifiable session is treated as not-real rather than waved through (the
+    opposite of this module's fail-open claim-time gates, deliberately —
+    fail-open is exactly what made the audited gate bypassable).
+    """
+    vid = (verifier_session_id or "").strip()
+    if not vid:
+        return "verifier_session_id is empty"
+    if completing_actor and vid == completing_actor.strip():
+        return (
+            f"verifier_session_id {vid!r} is the session completing the item — "
+            "that is not independent"
+        )
+    if vid in _claim_owner_identities(item):
+        return (
+            f"verifier_session_id {vid!r} is the session that holds this item's "
+            "claim (the implementer) — that is not independent"
+        )
+    try:
+        async with db.execute(
+            "SELECT id, project_id FROM sessions WHERE id = ?", (vid,)
+        ) as cur:
+            row = await cur.fetchone()
+        sess = _row_to_dict(row)
+    except Exception as exc:  # noqa: BLE001 — attestation gate fails closed
+        return (
+            f"could not confirm verifier_session_id {vid!r} is a real session "
+            f"({type(exc).__name__}) — refusing rather than trusting it"
+        )
+    if sess is None:
+        return (
+            f"verifier_session_id {vid!r} is not a registered session — a "
+            "verifier must be a real session (call start_session in the fresh "
+            "verifier subsession and pass ITS session id)"
+        )
+    if sess.get("project_id") != project_id:
+        return (
+            f"verifier_session_id {vid!r} belongs to a different project — a "
+            "verifier session must be a session of this project"
+        )
+    return None
+
+
 async def count_sprint_items_awaiting_verification(
     db: aiosqlite.Connection, project_id: str
 ) -> int:
@@ -2219,6 +2285,139 @@ async def _check_stored_evidence(
 _VALID_GITHUB_ISSUE_SOURCES = {"meridian_auto", "manual"}
 
 
+class SprintItemArtifactPointerRequired(ValueError):
+    """275a8631 — raised by :func:`complete_sprint_item` when an item opted into
+    artifact-pointer enforcement (``artifact_policy.artifact_pointer_check ==
+    "strict"``, or ``require_exact_figure_output_pointer`` /
+    ``require_exact_table_output_pointer``) and is figure/table work with no
+    exact output pointer on file. ``verdict`` is the full
+    :func:`evaluate_artifact_pointer_gate` result (triggers, warning_code,
+    remediation, classification, policy) for a structured error response."""
+
+    def __init__(self, message: str, verdict: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.verdict = verdict or {}
+
+
+async def evaluate_artifact_pointer_gate(
+    db: aiosqlite.Connection, item: dict[str, Any],
+) -> dict[str, Any] | None:
+    """275a8631 — the completion-time artifact-pointer verdict for ONE item, or
+    ``None`` when the gate does not apply (the item did not opt in).
+
+    Until this gate existed ``artifact_pointer_check="strict"`` and
+    ``require_exact_figure/table_output_pointer`` only changed what a HANDOFF
+    said (``pointers.evaluate_artifact_pointer_policy`` marks the item
+    non-executable in the /goal block); nothing stopped ``complete_sprint_item``
+    from marking a strict item done with no output pointer, and the MCP schema
+    text claimed a block that did not exist.
+
+    OPT-IN ONLY, so no behavior changes for an item that did not declare a
+    policy: an item with no ``artifact_policy`` resolves to the project default
+    (``artifact_pointer_check="warn"``, every flag false) and returns ``None``
+    here, as does ``artifact_pointer_check="off"`` ("off = no enforcement",
+    which also switches off the two ``require_exact_*`` flags). Otherwise the
+    item is judged by the SAME classifier and pointer-sufficiency rules the
+    handoff already uses — never a second definition of "exact":
+
+    * ``strict``: the gate fails when
+      :func:`meridian.pointers.evaluate_artifact_pointer_policy` says
+      ``ready=False`` (figure/table-sensitive work whose only candidate
+      pointers are missing, a bare .docx, a directory, a generic reference or
+      an unsupported type).
+    * ``require_exact_figure_output_pointer`` / ``..._table_...``: the gate
+      fails when the item classifies as that kind and no candidate output
+      pointer resolves to a concrete file of that kind.
+
+    Candidate pointers are ``planned_output`` targets, the item's durable
+    ``sprint_item_pointers`` rows (loaded here — the DB row itself does not
+    carry them) and ``file:`` ``touches_resources`` entries. Fails CLOSED if the
+    pointer rows cannot be loaded (an enforced gate that silently skips on a DB
+    hiccup is the failure mode this item exists to remove); only opted-in items
+    ever reach that query.
+
+    Returns ``{"applicable": True, "ok": bool, ...}``; when ``ok`` is False it
+    also carries ``code``, ``triggers``, ``warning_code``, ``required_remediation``,
+    ``classification``, ``policy`` and a ready-to-show ``message``.
+    """
+    from .. import artifact_classification as _ac  # noqa: PLC0415 — avoid import cycle
+    from .. import pointers as _pointers  # noqa: PLC0415
+
+    if not isinstance(item, dict) or not item.get("id"):
+        return None
+    policy = _artifact_declaration.effective_artifact_policy(item)
+    level = policy.get("artifact_pointer_check")
+    require_figure = bool(policy.get("require_exact_figure_output_pointer"))
+    require_table = bool(policy.get("require_exact_table_output_pointer"))
+    strict = level == "strict"
+    if level == "off" or not (strict or require_figure or require_table):
+        return None
+
+    stored = await get_sprint_item_pointers(db, item["id"])
+    enriched = dict(item)
+    enriched["pointer_records"] = [
+        {"id": p.get("id"), "targets": p.get("targets") or []}
+        for p in stored if isinstance(p, dict)
+    ]
+    classification = _ac.classify_artifact_work(enriched)
+    kind = classification.get("classification")
+
+    triggers: list[str] = []
+    warning_code: str | None = None
+    remediation: str | None = None
+    if strict:
+        verdict = _pointers.evaluate_artifact_pointer_policy(enriched)
+        if not verdict.get("ready", True):
+            triggers.append("artifact_pointer_check=strict")
+            warning_code = verdict.get("warning_code")
+            remediation = verdict.get("required_remediation")
+    for flag, want, enabled in (
+        ("require_exact_figure_output_pointer", "figure", require_figure),
+        ("require_exact_table_output_pointer", "table", require_table),
+    ):
+        if not enabled or kind != want:
+            continue
+        have_exact = any(
+            _ac._classify_uri(uri) == want  # noqa: SLF001 — same-package rule reuse
+            for uri, _source, _pid in _ac._iter_candidate_uris(enriched)  # noqa: SLF001
+        )
+        if have_exact:
+            continue
+        triggers.append(flag)
+        if warning_code is None:
+            warning_code, _affected = _ac.artifact_pointer_insufficiency_evidence(enriched)
+            warning_code = warning_code or _ac.INSUFFICIENT_MISSING_POINTER
+            remediation = _ac._INSUFFICIENCY_REMEDIATION.get(  # noqa: SLF001
+                warning_code,
+                _ac._INSUFFICIENCY_REMEDIATION[_ac.INSUFFICIENT_MISSING_POINTER],  # noqa: SLF001
+            )
+
+    result: dict[str, Any] = {
+        "applicable": True,
+        "ok": not triggers,
+        "policy": policy,
+        "classification": classification,
+    }
+    if triggers:
+        result.update({
+            "code": "ARTIFACT_POINTER_REQUIRED",
+            "triggers": triggers,
+            "warning_code": warning_code,
+            "required_remediation": remediation,
+            "message": (
+                f"item {item['id']} is {kind} work under an enforced artifact "
+                f"policy ({', '.join(triggers)}) but has no exact output pointer "
+                f"on file ({warning_code}). {remediation} Attach the pointer "
+                "(planned_output or add_sprint_item_pointer) and retry. Only a "
+                "human-approved override can complete it without one: "
+                "override_artifact_pointer=true + override_reason + "
+                "override_hitl_id (the first call files the require_human "
+                "approval request)."
+            ),
+        })
+    return result
+
+
 async def link_sprint_item_github_issue(
     db: aiosqlite.Connection,
     project_id: str,
@@ -2326,8 +2525,34 @@ async def complete_sprint_item(
     force_foreign_claim: bool = False,
     correlation_id: str | None = None,
     exit_code: int | None = None,
+    override_reason: str | None = None,
+    tenant_id: str | None = None,
+    artifact_pointer_override: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
+
+    275a8631 — artifact-pointer gate (OPT-IN per item): an item whose
+    ``artifact_policy`` sets ``artifact_pointer_check="strict"`` or a
+    ``require_exact_figure/table_output_pointer`` flag is refused with
+    :class:`SprintItemArtifactPointerRequired` while it is figure/table work
+    with no exact output pointer (see :func:`evaluate_artifact_pointer_gate`).
+    Items that never declared such a policy are unaffected. The only way past
+    it is ``artifact_pointer_override={"reason": ..., "hitl_id": ...}`` — a
+    non-empty reason plus a human-answered, ``require_human`` gate-override HITL
+    (spent and audited BEFORE the transition, like the wave-gate override); the
+    returned row then carries ``artifact_pointer_override``.
+
+    0ff5e59f — ``force_foreign_claim`` is now an AUDITED override: when it is
+    what lets a completion through (a live, non-stale claim held by a different
+    actor) it requires a non-empty ``override_reason`` (otherwise
+    :class:`SprintItemClaimMismatch` is raised, exactly as if no force had been
+    passed) and an ``action_audit_log`` row
+    (``sprint_item_foreign_claim_override``: who/when/why, attributed to
+    ``tenant_id`` when given) is written BEFORE the status transition — a
+    failed audit write aborts the completion. The returned row then carries
+    ``foreign_claim_override``. A force flag that was not needed (the caller
+    owns the claim, or the claim is stale) needs no reason and writes no audit
+    row: nothing was overridden.
 
     8693b6a8 — claim-ownership verification: previously ANY caller could
     complete ANY ``in_progress`` item regardless of who held its claim (the
@@ -2518,6 +2743,8 @@ async def complete_sprint_item(
     _evidence_quality_warning: str | None = None
     _stored_evidence_warning: str | None = None
     _blocker_kind_completion_warning: str | None = None
+    _foreign_claim_override: dict[str, Any] | None = None
+    _artifact_pointer_override_record: dict[str, Any] | None = None
     if item is not None and item.get("project_id") == project_id:
         # 07229675 — WARN-ONLY blocker_kind re-check at completion time.
         # claim_sprint_item hard-gates blocker_kind in ('superseded',
@@ -2614,18 +2841,57 @@ async def complete_sprint_item(
                     "held by a different session. If the claiming session is "
                     "dead/abandoned but the claim hasn't crossed the "
                     f"{_CLAIM_OWNERSHIP_STALE_HOURS}h staleness threshold yet, "
-                    "pass force_foreign_claim=true to acknowledge and complete "
-                    "anyway."
+                    "pass force_foreign_claim=true together with a non-empty "
+                    "override_reason to acknowledge and complete anyway "
+                    "(audited)."
                 )
+            if not _claim_is_stale and force_foreign_claim:
+                # 0ff5e59f — the force flag is what lets this completion through,
+                # so it is an override: it needs a stated reason and an audit
+                # row, written BEFORE the transition (fail closed — if the audit
+                # cannot be written the completion does not happen).
+                if not (override_reason or "").strip():
+                    raise SprintItemClaimMismatch(
+                        f"item {item_id} is claimed by actor {_claim_owner!r}, not "
+                        f"{_completing_actor!r}: force_foreign_claim=true also "
+                        "requires a non-empty override_reason (why this live, "
+                        "non-stale claim is being overridden) — refusing without "
+                        "one."
+                    )
+                from .. import gate_override as _gate_override  # noqa: PLC0415
+                _audit_row = await _gate_override.record_override_audit(
+                    db, _gate_override.FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE, project_id,
+                    subject_id=item_id, actor=_completing_actor or None,
+                    reason=override_reason, tenant_id=tenant_id,
+                    extra={"claim_owner": _claim_owner},
+                )
+                _foreign_claim_override = {
+                    "claim_owner": _claim_owner,
+                    "completing_actor": _completing_actor,
+                    "reason": (override_reason or "").strip(),
+                    "audit_id": (_audit_row or {}).get("id"),
+                }
         _mark_phase("ownership_check")
         if item.get("require_verification"):
+            _completing_actor = (actor or "").strip()
             if verifier_session_id and verification_verdict:
+                # 0ff5e59f — the verifier must be a REAL, distinct session of
+                # this project BEFORE its verdict is persisted at all, so a
+                # fabricated id never even lands in sprint_item_verifications.
+                _vprob = await _verifier_session_problem(
+                    db, project_id, verifier_session_id,
+                    completing_actor=_completing_actor, item=item,
+                )
+                if _vprob:
+                    raise SprintItemVerificationRequired(
+                        f"item {item_id}: {_vprob}. The verification verdict was "
+                        "NOT recorded."
+                    )
                 await record_sprint_item_verification(
                     db, project_id, item_id, verifier_session_id,
                     verification_verdict, notes=verification_notes,
                 )
             verification = await get_latest_sprint_item_verification(db, project_id, item_id)
-            _completing_actor = (actor or "").strip()
             if verification is None:
                 raise SprintItemVerificationRequired(
                     f"item {item_id} requires an independent fresh-session "
@@ -2659,6 +2925,19 @@ async def complete_sprint_item(
                     "— that is not independent. A fresh, separate subsession "
                     "(different session_id, no memory of the implementation) "
                     "must file the PASS verdict."
+                )
+            # 0ff5e59f — the on-file PASS (whether filed just above or earlier,
+            # via any other path) must ALSO have been filed by a real session of
+            # this project that is neither the completer nor the claim holder.
+            _vprob = await _verifier_session_problem(
+                db, project_id, verification.get("verifier_session_id"),
+                completing_actor=_completing_actor, item=item,
+            )
+            if _vprob:
+                raise SprintItemVerificationRequired(
+                    f"item {item_id}'s on-file PASS is not from an independent "
+                    f"verifier: {_vprob}. File a fresh PASS from a real, separate "
+                    "verifier session."
                 )
         _mark_phase("verification_check")
         if item.get("required_notes"):
@@ -2698,6 +2977,43 @@ async def complete_sprint_item(
             )
         except Exception:  # noqa: BLE001 — never block completion
             _stored_evidence_warning = None
+        # 275a8631 — opt-in artifact-pointer gate. Deliberately the LAST gate
+        # before the transition, so a human approval spent on an override is
+        # never burned by an earlier gate refusing the same call. A None verdict
+        # (item did not opt in) costs nothing and changes nothing.
+        _ap_verdict = await evaluate_artifact_pointer_gate(db, item)
+        if _ap_verdict is not None and not _ap_verdict["ok"]:
+            if artifact_pointer_override is None:
+                raise SprintItemArtifactPointerRequired(
+                    _ap_verdict["message"], _ap_verdict
+                )
+            from .. import gate_override as _gate_override  # noqa: PLC0415
+            _ap_reason = _gate_override.require_override_reason(
+                artifact_pointer_override.get("reason"),
+                flag="override_artifact_pointer",
+            )
+            _ap_approval = await _gate_override.consume_gate_override_approval(
+                db, project_id, artifact_pointer_override.get("hitl_id"),
+                gate=_gate_override.GATE_ARTIFACT_POINTER, subject_id=item_id,
+                consumed_by=(actor or None),
+            )
+            _ap_audit = await _gate_override.record_override_audit(
+                db, _gate_override.ARTIFACT_POINTER_OVERRIDE_EVENT_TYPE, project_id,
+                subject_id=item_id, actor=(actor or None), reason=_ap_reason,
+                tenant_id=tenant_id,
+                extra={
+                    "hitl_id": _ap_approval["hitl_id"],
+                    "triggers": _ap_verdict.get("triggers"),
+                    "warning_code": _ap_verdict.get("warning_code"),
+                },
+            )
+            _artifact_pointer_override_record = {
+                "reason": _ap_reason,
+                "hitl_id": _ap_approval["hitl_id"],
+                "audit_id": (_ap_audit or {}).get("id"),
+                "triggers": _ap_verdict.get("triggers"),
+                "warning_code": _ap_verdict.get("warning_code"),
+            }
     _mark_phase("evidence_check")
     _completion_outcome: str | None = None
     try:
@@ -2784,6 +3100,10 @@ async def complete_sprint_item(
             await _rollback_best_effort(db)
         _mark_phase("continuation_state")
         result = dict(result)
+        if _foreign_claim_override:
+            result["foreign_claim_override"] = _foreign_claim_override
+        if _artifact_pointer_override_record:
+            result["artifact_pointer_override"] = _artifact_pointer_override_record
         if _advisory_deferred:
             result["advisory_work_deferred"] = True
             # 394bcbdf — resource-aware diagnostic: best-effort self-sample
@@ -3307,8 +3627,9 @@ async def claim_sprint_item(
                 f"({_blocking_gate.get('actions')!r}). That gate has not completed "
                 "yet — run its action pipeline (push_dev/push_main/deploy/wait/"
                 "run_verification as configured) then call complete_wave_gate("
-                f"project_id=..., wave_label={_gate_end!r}, verification_payload="
-                "<real run_verification result>) before this item can be claimed."
+                f"project_id=..., wave_label={_gate_end!r}, verification_run_id="
+                "<the verification_run_id run_verification returned>) before this "
+                "item can be claimed."
             ),
             "wave": item.get("wave"),
             "gate_wave_start": _blocking_gate.get("wave_start"),
@@ -6730,9 +7051,14 @@ async def add_sprint_item_pointer(
     ``{source_type, targets:[{uri, selector, subSelector?, target_kind?}], label?}``
     shape via :mod:`meridian.pointers` (raising ``ValueError`` on a malformed
     pointer BEFORE any write), serializes ``targets`` to the JSON column, and
-    inserts one ``sprint_item_pointers`` row. ``targets`` is an ARRAY (native
-    multi-file); the composite shape is stored as JSON, NOT per-domain columns.
-    The returned dict is the deserialized pointer (targets back as a list).
+    inserts one ``sprint_item_pointers`` row. The insert is conditional on the
+    sprint item belonging to ``project_id``; keeping that ownership check in
+    the INSERT statement makes the check and association atomic across both
+    SQLite and Postgres. A missing or foreign item raises the same
+    ``ValueError`` so callers cannot use this tool to probe another project's
+    item ids. ``targets`` is an ARRAY (native multi-file); the composite shape
+    is stored as JSON, NOT per-domain columns. The returned dict is the
+    deserialized pointer (targets back as a list).
 
     ``target_kind`` (300a063d) — per-target ``"existing"`` (default) |
     ``"planned_new"``. When a caller EXPLICITLY marks a target
@@ -6769,16 +7095,22 @@ async def add_sprint_item_pointer(
     )
     pid = _new_id()
     targets_json = serialize_targets(normalized["targets"])
-    await db.execute(
+    cur = await db.execute(
         "INSERT INTO sprint_item_pointers "
         "(id, project_id, sprint_item_id, source_type, targets, label) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "SELECT ?, ?, ?, ?, ?, ? "
+        "WHERE EXISTS (SELECT 1 FROM sprint_items WHERE id = ? AND project_id = ?)",
         (
             pid, project_id, sprint_item_id,
             normalized["source_type"], targets_json, label,
+            sprint_item_id, project_id,
         ),
     )
+    # Close SQLite's write transaction even when the ownership predicate
+    # matched no rows; Postgres production connections autocommit here.
     await db.commit()
+    if cur.rowcount != 1:
+        raise ValueError("sprint item not found in project")
     async with db.execute(
         "SELECT * FROM sprint_item_pointers WHERE id = ?", (pid,)
     ) as cur:
@@ -6814,15 +7146,29 @@ async def get_sprint_item_pointers(
 
 
 async def delete_sprint_item_pointer(
-    db: aiosqlite.Connection, pointer_id: str
+    db: aiosqlite.Connection, project_id: str, pointer_id: str
 ) -> bool:
-    """2976e168 — delete one pointer by id. Return True if a row was removed."""
+    """2976e168 — delete one pointer by id. Return True if a row was removed.
+
+    6f7ce9d6 — cross-project isolation, matching ``add`` / ``get`` (handler-
+    verified) / ``resolve`` / ``relocate_sprint_item_pointer``: ``project_id``
+    is REQUIRED and the delete is ``WHERE id = ? AND project_id = ?``, so a
+    caller scoped to project A who knows (or guesses) a project-B pointer id
+    deletes nothing. A foreign-project pointer id is reported exactly like a
+    nonexistent one (``False``) — never distinguished — so this cannot be used
+    to probe for another project's pointer ids. ``project_id`` is deliberately
+    positional-required (no default): a stale two-argument call
+    ``(db, pointer_id)`` fails loudly with ``TypeError`` instead of silently
+    running unscoped.
+    """
     async with db.execute(
-        "SELECT 1 FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+        "SELECT 1 FROM sprint_item_pointers WHERE id = ? AND project_id = ?",
+        (pointer_id, project_id),
     ) as cur:
         existed = await cur.fetchone() is not None
     await db.execute(
-        "DELETE FROM sprint_item_pointers WHERE id = ?", (pointer_id,)
+        "DELETE FROM sprint_item_pointers WHERE id = ? AND project_id = ?",
+        (pointer_id, project_id),
     )
     await db.commit()
     return existed
@@ -9399,11 +9745,14 @@ async def analyze_sprint(
 # is the REAL structured run_verification result payload — a plain self-reported
 # "I think it passed" boolean is explicitly rejected.
 #
-# Evidence contract (caller must supply AT LEAST ONE of):
-#   verification_payload — the full dict returned by run_verification:
-#       {status: "ok", exit_code: 0, passed: N, failed: 0, ...}
-#   Both status=="ok" AND exit_code==0 must hold.  Any other value (failed run,
-#   non-zero exit, error status, not_configured, not_connected) is rejected.
+# Evidence contract (0ff5e59f — bound to a STORED record, not a typed dict):
+#   verification_run_id — the id run_verification returns for the durable
+#       verification_runs row it wrote. The RECORDED status=="ok" AND
+#       exit_code==0 decide; nothing the caller types is consulted.
+#   A hand-typed verification_payload dict alone is a self-report and is refused
+#   unless carried by an audited, human-approved unbound_payload_override.
+#   Any other recorded outcome (failed run, non-zero exit, error/timeout status,
+#   not_configured, not_connected, still running) is rejected.
 #
 # On success this function:
 #   1. Writes a row into wave_gate_results with the evidence snapshot.
@@ -9450,25 +9799,146 @@ async def _ensure_wave_gate_results_table(db: aiosqlite.Connection) -> None:
     await db.execute(_WAVE_GATE_RESULTS_TABLE_DDL)
 
 
+class WaveGateUnboundPayload(ValueError):
+    """0ff5e59f — raised by :func:`complete_wave_gate` when the supplied
+    ``verification_payload`` is well-formed but is NOT bound to a recorded
+    ``run_verification`` run and no ``unbound_payload_override`` accompanies it.
+    Distinct from the other evidence ``ValueError``s so the MCP handler can tell
+    "this payload is bad" (fix and retry) apart from "this payload is a
+    self-report" (use ``verification_run_id``, or ask a human for the
+    override)."""
+
+
+async def _wave_gate_evidence_from_run(
+    db: aiosqlite.Connection, project_id: str, verification_run_id: str,
+) -> dict[str, Any]:
+    """0ff5e59f — resolve a stored ``run_verification`` record into wave-gate
+    evidence, or raise ``ValueError`` explaining why it cannot unlock a gate.
+
+    ``run_verification`` persists a durable ``verification_runs`` row (525d86bb)
+    and returns its id as ``verification_run_id``; the row is written ONLY by the
+    server, from the real synchronous result of the tunnel-run test command
+    (see ``meridian.db.verification_runs``). Reading the recorded outcome back
+    from that row — instead of trusting a dict the caller typed — is what makes
+    the unlock un-self-attestable: the caller can name a run, but cannot choose
+    what the run recorded.
+    """
+    from .verification_runs import get_verification_run  # noqa: PLC0415
+
+    rid = (verification_run_id or "").strip()
+    run = await get_verification_run(db, rid) if rid else None
+    if run is None:
+        raise ValueError(
+            f"Wave gate rejected: verification_run_id {verification_run_id!r} is not a "
+            "recorded run_verification run. Call run_verification and pass the "
+            "verification_run_id it returns — a hand-typed result is not evidence."
+        )
+    if run.get("project_id") != project_id:
+        raise ValueError(
+            f"Wave gate rejected: verification run {rid!r} belongs to a different "
+            "project. Run run_verification for THIS project and pass its "
+            "verification_run_id."
+        )
+    if run.get("ended_at") is None or run.get("status") == "running":
+        raise ValueError(
+            f"Wave gate rejected: verification run {rid!r} has not completed "
+            "(status='running'). Wait for run_verification to return, then pass "
+            "its verification_run_id."
+        )
+    v_status = run.get("status")
+    v_exit = run.get("exit_code")
+    if v_status != "ok":
+        raise ValueError(
+            f"Wave gate rejected: recorded verification run {rid!r} has "
+            f"status={v_status!r}, not 'ok' (message={run.get('message')!r}). Only a "
+            "run whose test command actually executed and exited 0 satisfies the "
+            "gate — fix the cause, re-run run_verification, and pass the new "
+            "verification_run_id."
+        )
+    if isinstance(v_exit, bool) or v_exit != 0:
+        raise ValueError(
+            f"Wave gate rejected: recorded verification run {rid!r} has "
+            f"exit_code={v_exit!r} (failed={run.get('failed')!r}), not 0. Fix the "
+            "failures, re-run run_verification, and pass the new verification_run_id."
+        )
+    return {
+        "status": "ok",
+        "exit_code": 0,
+        "passed": run.get("passed"),
+        "failed": run.get("failed"),
+        "stdout_tail": run.get("stdout_tail") or "",
+        "stderr_tail": run.get("stderr_tail") or "",
+        "verification_run_id": run["id"],
+        "command": run.get("command"),
+        "ended_at": run.get("ended_at"),
+    }
+
+
+async def _wave_gate_run_already_used(
+    db: aiosqlite.Connection, project_id: str, verification_run_id: str,
+) -> str | None:
+    """0ff5e59f — the ``wave_gate_results.id`` that already consumed this
+    verification run, or ``None``. One recorded run attests to one gate: a passing
+    run from before wave N's work says nothing about wave N+1."""
+    async with db.execute(
+        "SELECT id, evidence_snapshot FROM wave_gate_results WHERE project_id = ?",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    for r in rows:
+        gate_id = r[0] if not isinstance(r, dict) else r["id"]
+        snap = r[1] if not isinstance(r, dict) else r["evidence_snapshot"]
+        try:
+            parsed = json.loads(snap) if isinstance(snap, str) else None
+        except (TypeError, ValueError):
+            parsed = None
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("evidence_source") == "verification_run"
+            and parsed.get("verification_run_id") == verification_run_id
+        ):
+            return gate_id
+    return None
+
+
 async def complete_wave_gate(
     db: aiosqlite.Connection,
     project_id: str,
     wave_label: str,
-    verification_payload: dict[str, Any],
+    verification_payload: dict[str, Any] | None = None,
     actor: str | None = None,
     version: str | None = None,
+    *,
+    verification_run_id: str | None = None,
+    unbound_payload_override: dict[str, Any] | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """d2430713 — record a verified wave gate completion and report next-wave readiness.
 
-    The caller MUST supply the full structured result dict from run_verification
-    as ``verification_payload``.  The dict is validated server-side:
+    0ff5e59f — the unlock is bound to a STORED ``run_verification`` record. The
+    caller passes ``verification_run_id`` (returned by ``run_verification``); the
+    recorded row's own ``status``/``exit_code`` decide the unlock (see
+    :func:`_wave_gate_evidence_from_run`): ``status`` must be ``"ok"`` and
+    ``exit_code`` exactly ``0``, the run must belong to this project, be
+    completed, and not already have unlocked another gate. A supplied
+    ``verification_payload`` is IGNORED when a run id is given — the recorded
+    result is authoritative, the typed one is never consulted.
+
+    A bare ``verification_payload`` dict (no run id) is a self-report and is
+    REFUSED — that hole let a hand-typed ``{"status": "ok", "exit_code": 0}``
+    unlock the next wave. The only way to use a raw dict is
+    ``unbound_payload_override={"reason": ..., "hitl_id": ...}``: a non-empty
+    reason plus an answered, ``require_human`` gate-override HITL approval
+    (:func:`meridian.gate_override.consume_gate_override_approval`), audited to
+    ``action_audit_log`` BEFORE the unlock is written. The dict itself is still
+    validated exactly as before (``status`` ``"ok"``, ``exit_code`` ``0``):
       * ``status`` must be ``"ok"`` (not "error", "not_configured", "not_connected").
       * ``exit_code`` must be exactly ``0`` (integer).  Non-zero means tests failed.
 
     Any other value raises ValueError with a clear diagnostic.  This means an
     executor cannot satisfy the gate by passing a fabricated or self-reported payload;
-    only the genuine output of run_verification — which runs the REAL test suite on
-    the caller's machine — is accepted.
+    only the genuine, server-recorded output of run_verification — which runs the REAL
+    test suite on the caller's machine — is accepted without a human's sign-off.
 
     ``version`` (ed8e4524) scopes this gate completion to ONE sprint-version
     bucket, closing the cross-version leak where two different sprint versions
@@ -9503,6 +9973,23 @@ async def complete_wave_gate(
     version = (version or "").strip() or None
 
     # ── 1. Validate evidence ────────────────────────────────────────────────────
+    # 0ff5e59f — a recorded run_verification run is the ONLY evidence accepted
+    # without a human's sign-off; its stored outcome (not any caller-typed dict)
+    # decides. See _wave_gate_evidence_from_run.
+    _run_id = (verification_run_id or "").strip() or None
+    _evidence_source = "verification_run"
+    if _run_id is not None:
+        verification_payload = await _wave_gate_evidence_from_run(db, project_id, _run_id)
+    elif verification_payload is None:
+        raise ValueError(
+            "complete_wave_gate requires verification_run_id — the id that "
+            "run_verification returns for a real, recorded test run. (A bare "
+            "verification_payload dict is a self-report and is refused; see "
+            "unbound_payload_override for the human-approved escape hatch.)"
+        )
+    else:
+        _evidence_source = "unbound_payload_override"
+
     if not isinstance(verification_payload, dict):
         raise ValueError(
             "complete_wave_gate requires a verification_payload dict (the full result "
@@ -9550,6 +10037,25 @@ async def complete_wave_gate(
             f"run_verification, and pass the result when all tests pass."
         )
 
+    # 0ff5e59f — a well-formed but caller-typed dict is a self-report: refuse it
+    # unless it is carried by an audited, human-approved override.
+    if _evidence_source == "unbound_payload_override":
+        _ov_reason = ((unbound_payload_override or {}).get("reason") or "").strip()
+        if unbound_payload_override is None:
+            raise WaveGateUnboundPayload(
+                "Wave gate rejected: verification_payload is a hand-typed result "
+                "that is not bound to a recorded run_verification run — a "
+                "self-report cannot unlock the next wave. Call run_verification "
+                "and pass the verification_run_id it returns. (If the tunnel is "
+                "down and a human has decided to unlock the gate anyway, use the "
+                "human-approved override: override_unbound_payload=true with "
+                "override_reason and override_hitl_id.)"
+            )
+        from .. import gate_override as _gate_override  # noqa: PLC0415
+        _gate_override.require_override_reason(
+            _ov_reason, flag="complete_wave_gate unbound payload override"
+        )
+
     # ── 2. Check for duplicate gate completion ────────────────────────────────────
     await _ensure_wave_gate_results_table(db)
     # ed8e4524 — scope the duplicate check to `version` when given (a DIFFERENT
@@ -9575,6 +10081,16 @@ async def complete_wave_gate(
             f"has already been completed (gate_id={existing_id!r}). Each wave gate "
             f"may only be completed once."
         )
+    if _run_id is not None:
+        _used_by = await _wave_gate_run_already_used(db, project_id, _run_id)
+        if _used_by is not None:
+            raise ValueError(
+                f"Wave gate rejected: verification run {_run_id!r} already unlocked "
+                f"another wave gate (gate_id={_used_by!r}). A passing run only "
+                "attests to the work that existed when it ran — re-run "
+                "run_verification for this wave and pass the new "
+                "verification_run_id."
+            )
 
     # ── 3. Determine the next wave label ─────────────────────────────────────────
     # wave_label is expected to be 'wave-N'; next wave is 'wave-(N+1)'.
@@ -9608,8 +10124,43 @@ async def complete_wave_gate(
         ]
 
     # ── 5. Write gate result ──────────────────────────────────────────────────────
+    # 0ff5e59f — for a hand-typed payload, verify + spend the human approval and
+    # write the audit row BEFORE the unlock row exists (fail closed: if either
+    # step raises, the gate stays locked).
+    _override_record: dict[str, Any] | None = None
+    if _evidence_source == "unbound_payload_override":
+        from .. import gate_override as _gate_override  # noqa: PLC0415
+        _subject = _gate_override.wave_gate_subject(wave_label, version)
+        _approval = await _gate_override.consume_gate_override_approval(
+            db, project_id, (unbound_payload_override or {}).get("hitl_id"),
+            gate=_gate_override.GATE_WAVE_GATE_UNBOUND_PAYLOAD,
+            subject_id=_subject, consumed_by=actor,
+        )
+        _ov_reason = ((unbound_payload_override or {}).get("reason") or "").strip()
+        _audit_row = await _gate_override.record_override_audit(
+            db, _gate_override.WAVE_GATE_UNBOUND_PAYLOAD_EVENT_TYPE, project_id,
+            subject_id=_subject, actor=actor, reason=_ov_reason, tenant_id=tenant_id,
+            extra={"hitl_id": _approval["hitl_id"], "payload": verification_payload},
+        )
+        _override_record = {
+            "reason": _ov_reason,
+            "hitl_id": _approval["hitl_id"],
+            "audit_id": (_audit_row or {}).get("id"),
+        }
     gate_id = _new_id()
-    evidence_snapshot = json.dumps(verification_payload)
+    # A caller-typed dict must never be able to plant a verification_run_id of
+    # its own (it would falsely mark a real run as already spent), so the stored
+    # snapshot is rebuilt from the dict minus the keys this function owns.
+    _snapshot_body = {
+        k: v for k, v in verification_payload.items()
+        if k not in ("evidence_source", "override")
+        and (_evidence_source == "verification_run" or k != "verification_run_id")
+    }
+    evidence_snapshot = json.dumps({
+        **_snapshot_body,
+        "evidence_source": _evidence_source,
+        **({"override": _override_record} if _override_record else {}),
+    })
     await db.execute(
         "INSERT INTO wave_gate_results "
         "(id, project_id, wave_label, version, gate_passed, exit_code, passed_count, "
@@ -9630,7 +10181,7 @@ async def complete_wave_gate(
     )
     await db.commit()
 
-    return {
+    _gate_result: dict[str, Any] = {
         "gate_completed": True,
         "wave_label": wave_label,
         "version": version,
@@ -9638,7 +10189,13 @@ async def complete_wave_gate(
         "next_wave_item_count": len(next_wave_item_ids),
         "next_wave_item_ids": next_wave_item_ids,
         "gate_id": gate_id,
+        "evidence_source": _evidence_source,
     }
+    if _run_id is not None:
+        _gate_result["verification_run_id"] = _run_id
+    if _override_record is not None:
+        _gate_result["override"] = _override_record
+    return _gate_result
 
 
 # ---------------------------------------------------------------------------

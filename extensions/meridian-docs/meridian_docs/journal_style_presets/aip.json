@@ -1,0 +1,53 @@
+{
+  "meta": {
+    "journal": "aip",
+    "display_name": "AIP Publishing journals",
+    "publisher": "AIP Publishing",
+    "status": "partially_populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. CAVEAT (inherited from proposal 64266f13, not independently re-verified in this pass): round-2 noted an unspecified sub-journal inconsistency for AIP, the way ACM's round-1 preset flagged one for its own sub-formats. This pass's search reached AIP's general author-instructions and style-manual pages (not each individual AIP sub-journal's own guide -- e.g. Journal of Applied Physics vs. Applied Physics Letters each maintain separate pages), so the specific sub-journal inconsistency the proposal had in mind was not independently confirmed or refuted here. Marked partially_populated rather than silently upgraded to an unqualified tier 2, per this caveat.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_superscript",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "publishing.aip.org/resources/researchers/author-instructions/; annotated AIP Style Manual (Carleton College mirror)",
+        "quote": "references are numbered in order of appearance, cited as superscript arabic numerals",
+        "note": "See meta.status_detail for the inherited sub-journal-inconsistency caveat."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_halftone": {
+      "value": 264,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "publishing.aip.org/resources/researchers/author-instructions/; annotated AIP Style Manual (Carleton College mirror)",
+        "note": "figure DPI floors broken out by art type -- halftones 264 dpi. See meta.status_detail for the inherited sub-journal-inconsistency caveat."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "publishing.aip.org/resources/researchers/author-instructions/; annotated AIP Style Manual (Carleton College mirror)",
+        "note": "See meta.status_detail for the inherited sub-journal-inconsistency caveat."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_combination": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "publishing.aip.org/resources/researchers/author-instructions/; annotated AIP Style Manual (Carleton College mirror)",
+        "note": "See meta.status_detail for the inherited sub-journal-inconsistency caveat."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

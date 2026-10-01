@@ -5493,6 +5493,26 @@ async def _migrate_pg_sprint_item_coarse_lock_files(conn: PostgresConnection) ->
     )
 
 
+async def _migrate_pg_backfill_finding_note_kind(conn: PostgresConnection) -> None:
+    """fe0b0331 -- Postgres mirror of
+    db.migrations._migrate_backfill_finding_note_kind: set
+    ``project_notes.note_kind = 'finding'`` on every NULL-kind note carrying a
+    ``finding`` tag token (rows ``save_finding`` wrote while 'finding' was missing
+    from add_project_note's kind allow-list and got coerced to NULL).
+
+    Touches only ``note_kind IS NULL`` rows, so re-running is a no-op; never
+    deletes, never touches ``updated_at``. STRPOS is used instead of a LIKE
+    pattern so the SQL carries no literal ``%`` for the adapter to escape. PG runs
+    autocommit -- no commit.
+    """
+    await conn.execute(
+        "UPDATE project_notes SET note_kind = 'finding' "
+        "WHERE note_kind IS NULL "
+        "AND STRPOS(',' || REPLACE(LOWER(COALESCE(tags, '')), ' ', '') || ',', "
+        "',finding,') > 0"
+    )
+
+
 async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     """7c96d41b — Postgres mirror of the paper_contract schema: the
     first-class versioned editorial-intent document for Meridian's
@@ -5785,4 +5805,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_docx_derivatives,
     _migrate_pg_sprint_item_lock_session_id,
     _migrate_pg_sprint_item_coarse_lock_files,
+    _migrate_pg_backfill_finding_note_kind,
 )

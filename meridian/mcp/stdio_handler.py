@@ -583,6 +583,27 @@ def build_mcp_server():
                                 "blocker_kind while execution_mode=autonomous."
                             ),
                         },
+                        "receiver": {
+                            "type": "object",
+                            "properties": {
+                                "session_name": {"type": "string"},
+                                "role": {"type": "string"},
+                                "worktree": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                            "description": (
+                                "(0527f636) Optional. Address the persisted "
+                                "handoff /goal (full/delta/goal modes) to the "
+                                "session it is FOR so a sibling start_session "
+                                "cannot consume it: it is then delivered, and "
+                                "cleared, only to a start_session whose "
+                                "session_name / role / cwd match every field "
+                                "given here. Omit for today's behaviour (any "
+                                "start_session receives it). Non-matching "
+                                "sessions leave it untouched; it stays "
+                                "readable via load_handoff."
+                            ),
+                        },
                     },
                     "required": [],
                 },
@@ -2099,8 +2120,9 @@ def build_mcp_server():
             Tool(
                 name="get_project_by_name",
                 description=(
-                    "Look up a project by name (case-insensitive substring "
-                    "match). Returns the first hit with id, name, and sprint. "
+                    "Look up a project by name (exact match, then "
+                    "case-insensitive exact match; not a substring search). "
+                    "Returns the match with id, name, and sprint. "
                     "Use this when you know the project name but not the UUID."
                 ),
                 inputSchema={
@@ -2109,8 +2131,9 @@ def build_mcp_server():
                         "name": {
                             "type": "string",
                             "description": (
-                                "Full or partial project name — "
-                                "case-insensitive substring match."
+                                "Full project name — exact match, then "
+                                "case-insensitive exact match (no partial "
+                                "or substring matching)."
                             ),
                         }
                     },
@@ -2463,6 +2486,9 @@ def build_mcp_server():
                 _stdio_checkpoint = bool(arguments.get("checkpoint"))
                 _stdio_strict_continuation = bool(arguments.get("strict_continuation"))
                 _stdio_continuation_status: dict[str, Any] = {}
+                # 0527f636 — mirror handler.py: optional receiver address for
+                # the persisted pending_goal; validated inside generate_handoff.
+                _stdio_pending_goal_receiver = arguments.get("receiver")
                 _handoff_evidence_blocked = False
                 _handoff_continuation_blocked = False
                 _handoff_stale_reference_blocked = False
@@ -2487,6 +2513,7 @@ def build_mcp_server():
                             checkpoint=_stdio_checkpoint,
                             strict_continuation=_stdio_strict_continuation,
                             continuation_status=_stdio_continuation_status,
+                            pending_goal_receiver=_stdio_pending_goal_receiver,
                         ),
                         timeout=90.0,
                     )

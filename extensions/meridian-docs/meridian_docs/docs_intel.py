@@ -54,6 +54,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from . import ooxml_integrity, render_gate
@@ -135,6 +136,33 @@ _REFERENCES_RE = re.compile(
     r"^(references?|bibliography|works?\s+cited|literature\s+cited)$",
     re.IGNORECASE,
 )
+
+# docs-intel-jcshm-linter-gap-cleanup-20260918 -- audit_manuscript_structure
+# needs to find THE Abstract heading specifically, not any front-matter
+# heading _ABSTRACT_RE happens to also classify into the same region.
+# _ABSTRACT_RE above is deliberately broad (abstract|summary|executive
+# summary|synopsis|preface|foreword|acknowledgements?|dedication) because
+# _classify_heading_text/_assign_section_types only need to know "this is
+# front matter, not main-body text" -- lumping those seven together is
+# correct for THAT purpose. It is NOT correct for locating "the Abstract":
+# a manuscript or SI with no literal "Abstract" heading but an early
+# "Acknowledgements"/"Summary"/"Preface" heading would otherwise have THAT
+# section's word count checked against the Abstract's 150-250 rule (found
+# by direct repro during this session's own review -- see the code review
+# notes for docs-intel-jcshm-linter-gap-cleanup-20260918). A dedicated,
+# narrow pattern avoids that entirely.
+_ABSTRACT_HEADING_ONLY_RE = re.compile(
+    r"^(abstract|structured\s+abstract|graphical\s+abstract)$", re.IGNORECASE
+)
+
+# docs-intel-jcshm-linter-gap-cleanup-20260918 -- matches a "Keywords:" /
+# "Key words:" / "Keyword:" line's leading label, so its position and the
+# term list following it can be found the same text-pattern way
+# _ABSTRACT_RE/_REFERENCES_RE already locate their own sections, rather
+# than assuming Keywords has a heading/style of its own (JCSHM's own
+# convention: a plain paragraph immediately after the Abstract body, no
+# dedicated heading style). Used by audit_manuscript_structure.
+_KEYWORDS_LABEL_RE = re.compile(r"^key\s*words?\s*[:.]?\s*", re.IGNORECASE)
 
 SectionType = str  # "abstract" | "toc" | "lof" | "main" | "appendix"
 
@@ -6000,6 +6028,267 @@ def find_image_paragraph(
     }
 
 
+def _resolve_relationship_target(rels_root: ET.Element, relationship_id: str) -> str | None:
+    """Resolve a ``word/_rels/document.xml.rels`` relationship id to its
+    normalized ``word/...`` package part path.
+
+    ``Target`` values are conventionally relative to ``word/`` (e.g.
+    ``"media/image3.png"`` -> ``"word/media/image3.png"``); an already
+    ``word/``-rooted target is returned as-is. An ``External`` relationship
+    (``TargetMode="External"``, e.g. a linked-not-embedded image, or a
+    hyperlink) has no local package part to resolve to and returns
+    ``None``, same as an unknown relationship id.
+    """
+    for rel in rels_root:
+        if rel.get("Id") == relationship_id:
+            if rel.get("TargetMode") == "External":
+                return None
+            target = (rel.get("Target") or "").lstrip("/")
+            if not target:
+                return None
+            return target if target.startswith("word/") else f"word/{target}"
+    return None
+
+
+def extract_paragraph_images(
+    docx_path: str,
+    anchor: str | dict[str, Any],
+    out_dir: str | None = None,
+) -> dict[str, Any]:
+    """b2e6a7d0 -- extract EVERY image embedded in one paragraph to real
+    files on disk, with basic metadata, so a caller can hand the resulting
+    paths straight to an image-capable Read instead of hand-rolling a
+    disposable "open the docx as a zip, find the blip, resolve rId -> media
+    via rels, dump the bytes" script every time a figure needs to actually
+    be LOOKED AT (compare a figure against its caption, check panel order,
+    spot a wrong/swapped image, ...) -- the recurring pattern this session
+    hit repeatedly.
+
+    Blip-complete BY CONSTRUCTION: walks every ``<w:drawing>`` in the
+    anchored paragraph and, within each, every ``<a:blip>`` it contains
+    (almost always exactly one, but never assumed to be) -- NOT just the
+    first ``<a:blip>`` in the paragraph. A prior hand-rolled audit script in
+    this same session had a ``blip_rid(p)`` helper that returned only the
+    FIRST blip per paragraph, silently dropping legitimate 2nd/3rd/4th
+    panel images and producing 18 false-positive findings before an
+    independent cross-check caught it -- this function is built specifically
+    so that bug class cannot recur here. (Separately, ``audit_document``'s
+    own ``orphan_image``/``_verify_image_ownership`` checks were confirmed
+    to already walk every blip per paragraph via
+    :func:`_image_paragraph_relationship_ids` -- no fix needed there; this
+    function is new functionality, not a fix to those.)
+
+    Args:
+      docx_path:  Absolute path to the .docx file. Never mutated -- this is
+                  a pure read/export.
+      anchor:      Either a raw paragraph id (str -- w14:paraId, the
+                  sp<hash> synth id, or legacy p{N}, the same schemes
+                  :func:`_find_para_by_id`/:func:`flag_for_review` already
+                  resolve), OR a :func:`locate_anchor`-style query dict
+                  (e.g. ``{"text": "..."}``, ``{"caption_label": "Figure
+                  3"}``) resolved read-only first. A query that resolves
+                  ambiguously, to nothing, or to a table/table-cell target
+                  is refused with the full locator detail attached -- never
+                  guessed. Only images inside THIS one paragraph are
+                  returned -- a multi-paragraph composite figure (this
+                  codebase's own side-by-side-images convention; see
+                  ``_direct_body_image_paragraphs``) needs one call per
+                  member paragraph.
+      out_dir:     Directory to write extracted image files into. Created
+                  if missing. Defaults to a fresh ``tempfile.mkdtemp``
+                  directory when omitted.
+
+    Returns ``{status: "extracted"|"no_images", anchor_para_id,
+    element_type?, section_path?, image_count, images: [...], out_dir,
+    docx_path}`` where each entry in ``images`` is ``{blip_index,
+    relationship_id, media_part, extracted_path, file_size_bytes,
+    pixel_width?, pixel_height?, displayed_extent_emu?,
+    displayed_extent_inches?}`` in document order (1-based ``blip_index``),
+    or ``{..., "error": <message>}`` in place of the extraction fields for
+    one image whose relationship/media part is dangling or unreadable --
+    a single bad reference among several good images never aborts the
+    whole call. Top-level ``{"error": <message>}`` only for a validation,
+    anchor-resolution, or whole-file failure.
+    """
+    element_type: str | None = None
+    section_path: str | None = None
+
+    if isinstance(anchor, str):
+        if not anchor.strip():
+            return {"error": "anchor must be a non-empty para_id string, or a query dict"}
+        anchor_para_id = anchor
+    elif isinstance(anchor, dict):
+        if not anchor:
+            return {"error": "anchor query dict must be non-empty"}
+        located = locate_anchor(docx_path, anchor)
+        if located.get("error"):
+            return {"error": f"anchor resolution failed: {located['error']}"}
+        status = located.get("status")
+        if status != "resolved":
+            return {
+                "error": (
+                    f"anchor query did not resolve to exactly one location "
+                    f"(status={status!r}) -- narrow the query and retry"
+                ),
+                "locate_result": located,
+            }
+        if located.get("element_type") in ("table", "table_cell"):
+            return {
+                "error": (
+                    "anchor resolved to a "
+                    f"{located['element_type']!r} element (para_id "
+                    f"{located.get('target_para_id')!r}) -- "
+                    "extract_paragraph_images only supports paragraph/"
+                    "heading/caption anchors, not table or table-cell targets"
+                ),
+                "locate_result": located,
+            }
+        anchor_para_id = located["target_para_id"]
+        element_type = located.get("element_type")
+        section_path = located.get("section_path")
+    else:
+        return {"error": f"anchor must be a str para_id or a query dict, got {type(anchor).__name__}"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    found = _find_para_by_id(root, anchor_para_id)
+    if found is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _body, paragraph, _child_index = found
+
+    drawings = list(paragraph.iter(_q(_W, "drawing")))
+    if not drawings:
+        result = {
+            "status": "no_images",
+            "anchor_para_id": anchor_para_id,
+            "image_count": 0,
+            "images": [],
+            "out_dir": out_dir,
+            "docx_path": docx_path,
+        }
+        if element_type is not None:
+            result["element_type"] = element_type
+        if section_path is not None:
+            result["section_path"] = section_path
+        return result
+
+    if out_dir is None:
+        out_dir = tempfile.mkdtemp(prefix="meridian_docx_images_")
+    else:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            return {"error": f"could not create out_dir {out_dir!r}: {exc}"}
+
+    safe_para = re.sub(r"[^A-Za-z0-9_-]", "_", anchor_para_id) or "para"
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            names = set(archive.namelist())
+            try:
+                rels_root = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+            except (KeyError, ET.ParseError):
+                rels_root = ET.Element(_q(_REL_NS, "Relationships"))
+
+            images: list[dict[str, Any]] = []
+            blip_index = 0
+            for drawing in drawings:
+                container = drawing.find(_q(_WP, "inline"))
+                if container is None:
+                    container = drawing.find(_q(_WP, "anchor"))
+                extent_el = (
+                    container.find(_q(_WP, "extent")) if container is not None else None
+                )
+                extent_cx = extent_cy = None
+                if extent_el is not None:
+                    try:
+                        extent_cx = int(extent_el.get("cx", ""))
+                        extent_cy = int(extent_el.get("cy", ""))
+                    except ValueError:
+                        extent_cx = extent_cy = None
+
+                # Blip-complete: every <a:blip> in THIS drawing, not just
+                # the first -- see this function's own docstring for why.
+                for blip in drawing.iter(_q(_A, "blip")):
+                    blip_index += 1
+                    entry: dict[str, Any] = {
+                        "blip_index": blip_index,
+                        "relationship_id": blip.get(_q(_IMAGE_REL_NS, "embed")),
+                    }
+                    if extent_cx is not None and extent_cy is not None:
+                        entry["displayed_extent_emu"] = {"cx": extent_cx, "cy": extent_cy}
+                        entry["displayed_extent_inches"] = {
+                            "width": round(extent_cx / _EMU_PER_INCH, 3),
+                            "height": round(extent_cy / _EMU_PER_INCH, 3),
+                        }
+
+                    relationship_id = entry["relationship_id"]
+                    if not relationship_id:
+                        entry["error"] = "blip has no r:embed relationship id"
+                        images.append(entry)
+                        continue
+
+                    media_part = _resolve_relationship_target(rels_root, relationship_id)
+                    if media_part is None:
+                        entry["error"] = (
+                            f"relationship {relationship_id!r} not found (or is "
+                            "an external target) in "
+                            "word/_rels/document.xml.rels"
+                        )
+                        images.append(entry)
+                        continue
+                    entry["media_part"] = media_part
+                    if media_part not in names:
+                        entry["error"] = (
+                            f"referenced media part {media_part!r} is missing "
+                            "from the .docx package"
+                        )
+                        images.append(entry)
+                        continue
+
+                    media_bytes = archive.read(media_part)
+                    extension = os.path.splitext(media_part)[1].lower()
+                    out_name = f"{safe_para}_image{blip_index}{extension}"
+                    out_path = os.path.join(out_dir, out_name)
+                    try:
+                        with open(out_path, "wb") as fh:
+                            fh.write(media_bytes)
+                    except OSError as exc:
+                        entry["error"] = (
+                            f"could not write extracted image to {out_path}: {exc}"
+                        )
+                        images.append(entry)
+                        continue
+
+                    entry["extracted_path"] = out_path
+                    entry["file_size_bytes"] = len(media_bytes)
+                    dims = _image_dimensions_px(media_bytes, extension)
+                    if dims is not None:
+                        entry["pixel_width"], entry["pixel_height"] = dims
+                    images.append(entry)
+    except zipfile.BadZipFile as exc:
+        return {"error": f"{docx_path} is not a readable ZIP package: {exc}"}
+
+    result = {
+        "status": "extracted",
+        "anchor_para_id": anchor_para_id,
+        "image_count": len(images),
+        "images": images,
+        "out_dir": out_dir,
+        "docx_path": docx_path,
+    }
+    if element_type is not None:
+        result["element_type"] = element_type
+    if section_path is not None:
+        result["section_path"] = section_path
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public caption API: insert / edit / remove
 # ---------------------------------------------------------------------------
@@ -8137,8 +8426,27 @@ def _validate_omml_structure(omml_raw: str) -> ET.Element:
             missing = [child for child in required if child not in children]
             if missing:
                 raise ValueError(f"OMML <m:{name}> is missing required child element(s): {', '.join(missing)}")
-        if name in {"num", "den"} and element.find(_qm("e")) is None:
-            raise ValueError(f"OMML <m:{name}> must contain <m:e>")
+        if name in {"num", "den"} and len(element) == 0:
+            # 2026-09-22 — was `element.find(_qm("e")) is None`, which
+            # rejected real, valid OOXML math wherever a fraction's
+            # numerator/denominator holds its content directly (runs,
+            # `m:sSup`, etc.) rather than wrapped in an `m:e` element.
+            # Per the actual OOXML math schema, `m:num`/`m:den` (unlike
+            # `m:sSup`/`m:sSub`/`m:rad`/`m:func`/`m:d`/`m:acc`, which DO
+            # require an `m:e` base argument) are themselves argument
+            # containers — they do not need an additional `m:e` wrapper.
+            # Real-world equations (Word's own equation editor, LaTeX/
+            # MathType converters — anything not authored by this
+            # project's own `insert_equation` writer, which happens to
+            # always emit the `m:e`-wrapped shape) commonly place content
+            # directly inside `m:num`/`m:den`; the old check flagged all
+            # of it as malformed. What genuinely IS malformed is a
+            # numerator/denominator with NO content at all (`<m:num/>`),
+            # which this still catches — same "zero children" scope the
+            # `<m:oMath>`-body-empty check above already uses, for the
+            # same reason (a run with empty/whitespace text is a
+            # different, narrower case, deliberately left untouched here).
+            raise ValueError(f"OMML <m:{name}> is empty -- a fraction's {name} must contain at least one child element")
     flat = _omml_flatten_text_local(omml_raw).casefold()
     names = {el.tag.rsplit("}", 1)[-1] for el in root.iter() if "}" in el.tag}
     for marker, structural_names in _OMML_FALLBACK_MARKERS.items():
@@ -8322,6 +8630,63 @@ def _cell_has_omath(tc: ET.Element) -> bool:
     return tc.find(f".//{_qm('oMath')}") is not None
 
 
+def _match_table_numbered_row(
+    cells: list[ET.Element],
+) -> tuple[ET.Element | None, str | None, bool]:
+    """9c1a3fd2 -- locate the (anchor_cell, number_text) pairing in a
+    numbered-equation table row, tolerating a leading indent/spacer cell.
+
+    The original implementation (both here and in audit_equation_integrity's
+    own copy of this same check) hardcoded ``cells[0]`` as the equation cell
+    and ``cells[1]`` as the number cell -- correct for a plain 2-column
+    [equation, number] row, but a real JCSHM manuscript caught this false:
+    Word's own "insert equation numbering" convention commonly produces a
+    3-column row instead -- [empty indent spacer, equation, number] -- and
+    cells[0] there is the EMPTY spacer, not the equation. Every equation in
+    that row was silently misclassified as "standalone" (number=None),
+    which cascaded into 28 false ``equation_number_gap`` findings on a
+    document whose equations were, in fact, numbered correctly and
+    completely (1)-(30) -- caught by manually cross-checking every "(N)"
+    occurrence in the raw document.xml against its actual table-cell
+    position before trusting the tool's own output.
+
+    Generalizes to: the number lives in the LAST cell (right-aligned in
+    every observed template, 2- or 3-column); the equation lives in
+    whichever EARLIER cell actually carries an <m:oMath> -- found by
+    position, not assumed at a fixed index, so any number of leading
+    spacer/label cells works, not just exactly one.
+
+    Returns ``(anchor_cell, number_text, has_omath)``:
+      - ``(cell, "(N)", True)``     -- a genuine numbered equation row;
+        ``cell`` is the one actually carrying the <m:oMath>.
+      - ``(cell, "(N)", False)``    -- the LAST cell matches the number
+        pattern but NO earlier cell has any <m:oMath> at all -- a real
+        "numbered but the equation itself is missing" case. ``cell`` here
+        is a best-guess anchor (the cell immediately before the number
+        cell -- cells[0] for a plain 2-column row, matching every prior
+        caller's expectation) used ONLY to report a sensible location for
+        the finding, never treated as carrying real equation content.
+      - ``(None, None, False)``    -- not a numbered-equation row at all
+        (fewer than 2 cells, or the last cell isn't a parenthesized
+        number) -- an ordinary content table, left untouched. Distinguish
+        this "not a numbered row" case from the "numbered but missing"
+        case above by ``anchor_cell is None`` (never by ``has_omath``
+        alone) -- an ordinary table row and a broken numbered row both
+        have ``has_omath=False``, but only one should be reported.
+    """
+    if len(cells) < 2:
+        return None, None, False
+    number_text = _cell_text(cells[-1]).strip()
+    if not _EQ_NUMBER_RE.match(number_text):
+        return None, None, False
+    omath_idx = next(
+        (i for i, c in enumerate(cells[:-1]) if _cell_has_omath(c)), None
+    )
+    if omath_idx is not None:
+        return cells[omath_idx], number_text, True
+    return cells[-2], number_text, False
+
+
 def parse_docx_equations_local(
     source: str | bytes | bytearray,
 ) -> list[dict[str, Any]]:
@@ -8347,12 +8712,16 @@ def parse_docx_equations_local(
        (including inside table cells that are not numbered-equation tables).
        ``number`` is ``None``.
 
-    2. **table-numbered**: a <w:tbl> row where the first cell contains an
-       <m:oMath> and the second cell contains a parenthesised equation number
-       (e.g. "(1)", "(2a)").  The number is extracted and associated as the
-       equation's ``number`` field.  The ``para_id`` is synthesized from the
-       table's position in the body (``tbl{body_child_index}``) unless the cell
-       paragraph has a real w14:paraId.
+    2. **table-numbered**: a <w:tbl> row whose LAST cell contains a
+       parenthesised equation number (e.g. "(1)", "(2a)") and some EARLIER
+       cell contains an <m:oMath> (see :func:`_match_table_numbered_row` --
+       found by position, not assumed at a fixed index, so a leading empty
+       indent/spacer cell before the equation, e.g. [spacer, equation,
+       number], is recognized exactly like a plain [equation, number] row).
+       The number is extracted and associated as the equation's ``number``
+       field.  The ``para_id`` is synthesized from the table's position in
+       the body (``tbl{body_child_index}``) unless the cell paragraph has a
+       real w14:paraId.
 
     A document with no equations returns [].
     """
@@ -8400,33 +8769,35 @@ def parse_docx_equations_local(
             p_global_idx += 1
 
         elif child.tag == w_tbl:
-            # Check every row for the equation-with-numbering pattern:
-            # first cell has oMath, second cell has a parenthesised number.
+            # Check every row for the equation-with-numbering pattern: some
+            # earlier cell has oMath (position-found, not assumed at cells[0]
+            # -- a leading empty indent/spacer cell is a real, common
+            # template shape, see _match_table_numbered_row), last cell has
+            # a parenthesised number.
             for tr in child.findall(f".//{w_tr}"):
                 cells = tr.findall(w_tc)
-                if len(cells) >= 2 and _cell_has_omath(cells[0]):
-                    number_text = _cell_text(cells[1]).strip()
-                    if _EQ_NUMBER_RE.match(number_text):
-                        # Table-numbered equation.
-                        # Use the first paragraph's para_id inside the cell, or synth.
-                        cell0_para = cells[0].find(w_p)
-                        if cell0_para is not None:
-                            para_id = cell0_para.get(w14_para_id) or f"tbl{body_child_idx}"
-                        else:
-                            para_id = f"tbl{body_child_idx}"
-                        for omath_el in cells[0].iter(m_omath):
-                            equations.append({
-                                "ordinal": ordinal,
-                                "para_id": para_id,
-                                "omml_raw": ET.tostring(omath_el, encoding="unicode"),
-                                "pattern": "table-numbered",
-                                "number": number_text,
-                                "flat_text": _omml_flatten_text_local(
-                                    ET.tostring(omath_el, encoding="unicode")
-                                ),
-                            })
-                            ordinal += 1
-                        continue  # handled — don't fall through to standalone scan
+                eq_cell, number_text, has_omath = _match_table_numbered_row(cells)
+                if has_omath:
+                    # Table-numbered equation.
+                    # Use the first paragraph's para_id inside the cell, or synth.
+                    cell0_para = eq_cell.find(w_p)
+                    if cell0_para is not None:
+                        para_id = cell0_para.get(w14_para_id) or f"tbl{body_child_idx}"
+                    else:
+                        para_id = f"tbl{body_child_idx}"
+                    for omath_el in eq_cell.iter(m_omath):
+                        equations.append({
+                            "ordinal": ordinal,
+                            "para_id": para_id,
+                            "omml_raw": ET.tostring(omath_el, encoding="unicode"),
+                            "pattern": "table-numbered",
+                            "number": number_text,
+                            "flat_text": _omml_flatten_text_local(
+                                ET.tostring(omath_el, encoding="unicode")
+                            ),
+                        })
+                        ordinal += 1
+                    continue  # handled — don't fall through to standalone scan
 
                 # Not a numbered-equation table row — scan any oMath as standalone.
                 for omath_el in tr.iter(m_omath):
@@ -8578,6 +8949,146 @@ _VALID_CITATION_STYLES = {
     "unspecified",
 }
 
+# docs-intel-journal-preset-externalization-20260918 -- companion to
+# JOURNAL_STYLE_PRESETS below: the full per-field EVIDENCE record (value +
+# tier + source + verified_date, plus the file's own "meta" block) for each
+# built-in preset, keyed the same way as JOURNAL_STYLE_PRESETS itself.
+# Populated as a side effect of _load_builtin_journal_style_presets() (same
+# file-walk pass, so there is no separate read of the JSON files just to
+# build this) -- see get_journal_style_preset_provenance for the lookup
+# surface over this dict. JOURNAL_STYLE_PRESETS itself carries only VALUES
+# (what resolve_style_policy needs); this dict carries the "how do we know"
+# behind each of those values, for a caller auditing preset trustworthiness
+# rather than just consuming the resolved policy.
+_JOURNAL_STYLE_PRESET_PROVENANCE: dict[str, dict[str, Any]] = {}
+
+
+def _load_builtin_journal_style_presets() -> dict[str, dict[str, Any]]:
+    """docs-intel-journal-preset-externalization-20260918 -- load the
+    built-in journal-style-preset catalog from per-journal JSON files under
+    ``journal_style_presets/`` (one file per preset, named ``"<key>.json"``)
+    instead of a single hand-maintained dict literal in this module.
+
+    This replaces the original 4d0ca929/4544bbe5 ``JOURNAL_STYLE_PRESETS``
+    dict literal (29 entries, one per publisher plus "default") with an
+    equivalent catalog assembled at IMPORT time from
+    ``journal_style_presets/<key>.json`` files, each shaped::
+
+        {
+          "meta": {"journal": ..., "display_name": ..., "publisher": ...,
+                    "status": "populated" | "partially_populated" | "baseline",
+                    "status_detail": ..., "last_verified": ...},
+          "fields": {
+            "<style_policy key>": {
+              "value": <the value, or null for an open/unresolved question>,
+              "tier": 1-4,
+              "source": {"type": ..., "citation": ..., ...},
+              "verified_date": ... or null,
+              "status": "open_question",   # optional
+            },
+            ...
+          },
+        }
+
+    Only each field's ``"value"`` feeds the returned style-policy override
+    dict -- a field a journal's preset never set is simply ABSENT from
+    ``"fields"``, matching how the old dict literal just omitted unset keys
+    and let them fall through to :func:`_style_policy_defaults`'s
+    ``None``/``"unspecified"`` sentinel; nothing here invents a value or a
+    tier for a key the preset never actually set.
+
+    Every extracted override dict is run through :func:`resolve_style_policy`
+    immediately, in this same loader pass -- FAIL-CLOSED at import time: a
+    malformed preset file (unknown style-policy key, out-of-range value,
+    wrong type) raises here, blocking the whole module from importing,
+    rather than surfacing later as a confusing error only when that one
+    preset happens to be looked up.
+
+    Also populates the module-level :data:`_JOURNAL_STYLE_PRESET_PROVENANCE`
+    dict (each file's full ``"meta"``/``"fields"``, unmodified) in this same
+    pass, so :func:`get_journal_style_preset_provenance` never has to
+    re-read the files itself.
+
+    Returns:
+      ``{<preset key>: <fully-resolved style-policy dict>, ...}`` -- one
+      entry per ``journal_style_presets/*.json`` file, keyed by that file's
+      stem (e.g. ``journal_style_presets/jcshm.json`` -> key ``"jcshm"``).
+
+    Raises:
+      ValueError: the ``journal_style_presets/`` directory is missing or
+        empty (see the reviewer-caught-gap comment on the directory check
+        below -- ``Path.glob()`` on a missing directory silently yields
+        nothing, which would otherwise leave :data:`JOURNAL_STYLE_PRESETS`
+        empty instead of failing loudly); a preset file isn't valid JSON,
+        isn't a JSON object with ``"meta"``/``"fields"`` keys; a field entry
+        isn't a JSON object with a ``"value"`` key; or a field's ``"value"``
+        fails :func:`resolve_style_policy` validation (unknown style-policy
+        key or an invalid value for a known one).
+    """
+    presets_dir = Path(__file__).parent / "journal_style_presets"
+    presets: dict[str, dict[str, Any]] = {}
+    provenance: dict[str, dict[str, Any]] = {}
+
+    # Reviewer-caught gap (docs-intel-journal-preset-externalization-20260918
+    # adversarial review): Path.glob() on a MISSING directory silently
+    # returns an empty iterator rather than raising -- without this check,
+    # a deleted/renamed/not-packaged journal_style_presets/ directory would
+    # make the whole built-in catalog silently empty (JOURNAL_STYLE_PRESETS
+    # == {}) instead of failing loudly, defeating this loader's own stated
+    # fail-closed intent. "default" is always expected to exist, so treat
+    # zero files found the same as a missing directory.
+    if not presets_dir.is_dir():
+        raise ValueError(
+            f"journal style preset directory {presets_dir} does not exist "
+            "(or is not a directory) -- expected one *.json file per "
+            "built-in preset (at least 'default.json')"
+        )
+
+    for file_path in sorted(presets_dir.glob("*.json")):
+        key = file_path.stem
+        with open(file_path, "r", encoding="utf-8") as fh:
+            try:
+                data = json.load(fh)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"journal style preset file {file_path} is not valid JSON: {exc}"
+                ) from exc
+
+        if not isinstance(data, dict) or "meta" not in data or "fields" not in data:
+            raise ValueError(
+                f"journal style preset file {file_path} must be a JSON object "
+                f"with 'meta' and 'fields' keys"
+            )
+
+        fields = data["fields"]
+        if not isinstance(fields, dict):
+            raise ValueError(
+                f"journal style preset file {file_path}: 'fields' must be a JSON object"
+            )
+
+        overrides = {}
+        for field_name, entry in fields.items():
+            if not isinstance(entry, dict) or "value" not in entry:
+                raise ValueError(
+                    f"journal style preset file {file_path}: field {field_name!r} "
+                    "must be a JSON object with a 'value' key"
+                )
+            overrides[field_name] = entry["value"]
+        # Fail-closed: an invalid value in ANY one preset file blocks the
+        # whole module from importing (see docstring above).
+        presets[key] = resolve_style_policy(overrides)
+        provenance[key] = {"journal": key, "meta": data["meta"], "fields": fields}
+
+    if not presets:
+        raise ValueError(
+            f"journal style preset directory {presets_dir} exists but contains "
+            "no *.json files -- expected at least 'default.json'"
+        )
+
+    _JOURNAL_STYLE_PRESET_PROVENANCE.clear()
+    _JOURNAL_STYLE_PRESET_PROVENANCE.update(provenance)
+    return presets
+
 
 def _style_policy_defaults() -> dict[str, Any]:
     """Built-in defaults -- reproduce today's pre-4efc63fd behavior except
@@ -8600,6 +9111,19 @@ def _style_policy_defaults() -> dict[str, Any]:
     sites and tests) sees byte-identical output to before this change; a
     caller opts into the new behavior only by supplying a non-``None`` value.
 
+    9c1a3fd2 -- ``table_alignment`` closes a gap :func:`insert_table` had
+    since its own creation: it never wrote a table-level ``<w:tblPr><w:jc>``
+    at all, so every newly inserted table defaulted to Word's own
+    left-aligned table justification -- caught not by inspection but by a
+    real JCSHM manuscript/SI pair where the overwhelming majority of tables
+    (38/42 and 48/76 respectively) turned out to be genuinely left-aligned
+    for exactly this reason. Same ``None``-default, opt-in-only discipline
+    as the two ``table_*_column_alignment`` keys above (byte-identical
+    output for any caller that doesn't set it); the ``"jcshm"`` preset sets
+    it to ``"center"``, verified against every pre-existing, already-correct
+    content table in both real documents (100% used ``center``, 0% used any
+    other value).
+
     4d0ca929 -- fourteen more keys back the "journal style preset" catalog in
     :data:`JOURNAL_STYLE_PRESETS` below, so a preset can express publisher
     facts beyond the original caption/equation/heading/table knobs: heading
@@ -8612,6 +9136,32 @@ def _style_policy_defaults() -> dict[str, Any]:
     guessed value -- exactly like ``heading_terminal_punctuation`` and the
     two ``table_*_column_alignment`` keys above. A caller that never touches
     these fourteen keys sees byte-identical behavior to before this change.
+
+    df716454 -- eight more keys back :func:`audit_heading_style` (per-level
+    H1/H2/H3 heading spacing) and :func:`audit_cross_document_consistency`
+    (body-text typography). ``heading_spacing_before_h{1,2,3}_twips`` /
+    ``heading_spacing_after_h{1,2,3}_twips`` express the paragraph-level
+    ``<w:spacing w:before/w:after>`` a heading of that level is expected to
+    carry, in TWIPS (1/20 pt) -- matching ``body_indent_twips``'s existing
+    unit convention above, the only other explicitly-unit-suffixed key in
+    this schema, rather than inventing a separate "body-line multiplier"
+    unit. ``body_text_font_family`` / ``body_text_font_size_pt`` express the
+    document's body-text paragraph style's (``Normal``/``BodyText``)
+    expected font: a real JCSHM manuscript/SI pair had the SI's body text at
+    12pt against JCSHM's own stated "10-point Times Roman" guideline -- a
+    real mismatch caught only by eye, never by tooling, before this. All
+    eight default to ``None``/``"unspecified"`` -- same "unverified means
+    don't guess" discipline as every key above.
+
+    docs-intel-jcshm-linter-gap-cleanup-20260918 -- four more keys back
+    :func:`audit_manuscript_structure`: ``abstract_word_count_min``/
+    ``abstract_word_count_max``/``keyword_count_min``/``keyword_count_max``.
+    Same discipline as every key above -- all default to ``None`` (no
+    verified rule -- don't check the corresponding count at all), populated
+    only by a preset (e.g. ``"jcshm"``) that has sourced a real numeric
+    submission requirement. :func:`audit_reference_consistency`'s checks are
+    unconditional (structural correctness, not a style preference), so it
+    adds no new policy keys of its own.
     """
     return {
         "caption_centered": False,
@@ -8624,6 +9174,7 @@ def _style_policy_defaults() -> dict[str, Any]:
         "heading_terminal_punctuation": None,
         "table_label_column_alignment": None,
         "table_data_column_alignment": None,
+        "table_alignment": None,
         "heading_numbering_visible": None,
         "heading_levels_max": None,
         "emphasis_style": "unspecified",
@@ -8631,6 +9182,8 @@ def _style_policy_defaults() -> dict[str, Any]:
         "table_caption_bold": None,
         "figure_caption_label_punctuation": "unspecified",
         "table_caption_label_punctuation": "unspecified",
+        "figure_caption_terminal_punctuation": None,
+        "table_caption_terminal_punctuation": None,
         "paragraph_indent_method": "unspecified",
         "figure_dpi_minimum_general": None,
         "figure_dpi_minimum_halftone": None,
@@ -8638,6 +9191,18 @@ def _style_policy_defaults() -> dict[str, Any]:
         "figure_dpi_minimum_combination": None,
         "si_reformatting_policy": "unspecified",
         "citation_style": "unspecified",
+        "heading_spacing_before_h1_twips": None,
+        "heading_spacing_after_h1_twips": None,
+        "heading_spacing_before_h2_twips": None,
+        "heading_spacing_after_h2_twips": None,
+        "heading_spacing_before_h3_twips": None,
+        "heading_spacing_after_h3_twips": None,
+        "body_text_font_family": None,
+        "body_text_font_size_pt": None,
+        "abstract_word_count_min": None,
+        "abstract_word_count_max": None,
+        "keyword_count_min": None,
+        "keyword_count_max": None,
     }
 
 
@@ -8696,6 +9261,19 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
                                     ``table_label_column_alignment`` but for
                                     every column after column 0 ("data
                                     columns") of a newly inserted table.
+      table_alignment (str | None): 9c1a3fd2 -- one of "left"/"center"/
+                                    "right"/"both" -- the table-level
+                                    ``<w:tblPr><w:jc>`` :func:`insert_table`
+                                    writes (and :func:`audit_table_style`
+                                    treats as "correct"). ``None`` (the
+                                    default) adds no ``w:jc`` at all,
+                                    matching pre-9c1a3fd2 behavior (Word's
+                                    own default, effectively left-aligned) --
+                                    distinct from ``table_label_column_alignment``/
+                                    ``table_data_column_alignment`` above,
+                                    which set alignment on individual CELL
+                                    paragraphs, not the table's own position
+                                    on the page.
       heading_numbering_visible (bool | None): 4d0ca929 -- whether the
                                     publisher requires a visible decimal/
                                     numeric heading scheme (e.g. "1.2.3").
@@ -8722,6 +9300,27 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
       table_caption_label_punctuation (str): 4d0ca929 -- same as
                                     ``figure_caption_label_punctuation`` but
                                     for table labels.
+      figure_caption_terminal_punctuation (str | None): 8e2f4a17 -- same
+                                    mechanism as ``heading_terminal_punctuation``
+                                    (see above), applied to the END of a
+                                    figure caption's full text instead of a
+                                    heading: ``None`` means "no policy, don't
+                                    check"; ``""`` enforces "no trailing
+                                    punctuation on the caption at all"; a
+                                    non-empty string enforces that exact
+                                    trailing character/string. Deliberately a
+                                    SEPARATE key from
+                                    ``figure_caption_label_punctuation`` --
+                                    the two are independent publisher rules
+                                    ("no punctuation after the number" vs "no
+                                    punctuation at the end of the caption")
+                                    that happen to co-occur in some style
+                                    guides (JCSHM states both) but are
+                                    logically distinct and independently
+                                    settable.
+      table_caption_terminal_punctuation (str | None): 8e2f4a17 -- same as
+                                    ``figure_caption_terminal_punctuation``
+                                    but for table captions.
       paragraph_indent_method (str): 4d0ca929 -- one of "tab"/"space"/
                                     "none"/"automatic_style"/"unspecified" --
                                     how the publisher indents body
@@ -8753,6 +9352,36 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
                                     convention ("not_fixed" meaning the
                                     publisher's own guidance defers this to
                                     the individual journal).
+      heading_spacing_before_h1_twips / heading_spacing_after_h1_twips /
+      heading_spacing_before_h2_twips / heading_spacing_after_h2_twips /
+      heading_spacing_before_h3_twips / heading_spacing_after_h3_twips
+                                    (int>=0 | None): df716454 -- the
+                                    <w:spacing w:before>/<w:after> (in
+                                    twips) :func:`audit_heading_style`
+                                    expects on an H1/H2/H3 heading paragraph.
+                                    ``None`` (the default) skips that
+                                    level/edge's check entirely.
+      body_text_font_family (str | None): df716454 -- the font family
+                                    (<w:rFonts w:ascii>) expected on the
+                                    document's body-text paragraph style
+                                    (``Normal``/``BodyText``), checked by
+                                    :func:`audit_cross_document_consistency`.
+      body_text_font_size_pt (int | float | None): df716454 -- same as
+                                    ``body_text_font_family`` but for the
+                                    body-text style's font size in points.
+      abstract_word_count_min / abstract_word_count_max (int>=1 | None):
+                                    docs-intel-jcshm-linter-gap-cleanup-
+                                    20260918 -- the inclusive word-count
+                                    range :func:`audit_manuscript_structure`
+                                    expects for the Abstract section's body
+                                    text. ``None`` (either bound) skips that
+                                    bound's check.
+      keyword_count_min / keyword_count_max (int>=1 | None): docs-intel-
+                                    jcshm-linter-gap-cleanup-20260918 -- same
+                                    as the abstract word-count keys above,
+                                    but for the number of comma/semicolon-
+                                    separated terms on the document's
+                                    "Keywords:" line.
 
     Raises:
       ValueError: an unknown key, or a value of the wrong type/out of range.
@@ -8804,7 +9433,10 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
             "style policy 'heading_terminal_punctuation' must be a string or None"
         )
 
-    for key in ("table_label_column_alignment", "table_data_column_alignment"):
+    for key in (
+        "table_label_column_alignment", "table_data_column_alignment",
+        "table_alignment",
+    ):
         value = policy[key]
         if value is not None and value not in _VALID_EQUATION_ALIGNMENTS:
             raise ValueError(
@@ -8848,6 +9480,11 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
                 f"{sorted(_VALID_CAPTION_LABEL_PUNCTUATION)}"
             )
 
+    for key in ("figure_caption_terminal_punctuation", "table_caption_terminal_punctuation"):
+        value = policy[key]
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"style policy {key!r} must be a string or None")
+
     if policy["paragraph_indent_method"] not in _VALID_PARAGRAPH_INDENT_METHODS:
         raise ValueError(
             "style policy 'paragraph_indent_method' must be one of "
@@ -8876,6 +9513,52 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
         raise ValueError(
             f"style policy 'citation_style' must be one of {sorted(_VALID_CITATION_STYLES)}"
         )
+
+    # df716454 -- validation for the eight audit_heading_style /
+    # audit_cross_document_consistency keys (see _style_policy_defaults()
+    # and the docstring above).
+    for key in (
+        "heading_spacing_before_h1_twips", "heading_spacing_after_h1_twips",
+        "heading_spacing_before_h2_twips", "heading_spacing_after_h2_twips",
+        "heading_spacing_before_h3_twips", "heading_spacing_after_h3_twips",
+    ):
+        value = policy[key]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(f"style policy {key!r} must be a non-negative int or None")
+
+    body_font_family = policy["body_text_font_family"]
+    if body_font_family is not None and (
+        not isinstance(body_font_family, str) or not body_font_family.strip()
+    ):
+        raise ValueError(
+            "style policy 'body_text_font_family' must be a non-empty string or None"
+        )
+
+    body_font_size = policy["body_text_font_size_pt"]
+    if body_font_size is not None and (
+        not isinstance(body_font_size, (int, float))
+        or isinstance(body_font_size, bool)
+        or body_font_size <= 0
+    ):
+        raise ValueError(
+            "style policy 'body_text_font_size_pt' must be a positive number or None"
+        )
+
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 -- validation for
+    # audit_manuscript_structure's four count-range keys (see
+    # _style_policy_defaults() and the docstring above), same "positive int
+    # or None" shape as the figure_dpi_minimum_* keys validated above.
+    for key in (
+        "abstract_word_count_min", "abstract_word_count_max",
+        "keyword_count_min", "keyword_count_max",
+    ):
+        value = policy[key]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise ValueError(f"style policy {key!r} must be a positive int or None")
 
     return policy
 
@@ -8924,473 +9607,50 @@ def _apply_heading_terminal_punctuation(heading_text: str, policy: dict[str, Any
 # oxford_up, de_gruyter, cell_press, acs, aps, aip, rsc, asce, asme, emerald,
 # peerj, optica, science_aaas, copernicus).
 #
-# PROVENANCE NOTE (important -- read before trusting a value below as
-# "verified per the cited proposal"): both proposals describe the new
-# schema (the fourteen keys added to _style_policy_defaults() /
-# resolve_style_policy() above), the publisher list, and an "evidence
-# basis" section naming one source URL per publisher -- but NEITHER
-# proposal's own body contains the literal per-publisher key/value data or
-# per-key quoted-sentence citations that its own text claims exist (both
-# are "raw"/unpromoted narrative write-ups, not a diff or code block, and
-# the worktree they describe having edited was never merged here). Rather
-# than fabricate specific values under a false appearance of having been
-# lifted from that description, every preset below was independently
-# verified against a live publisher guidelines page on 2026-09-11 during
-# this sprint item's own pass, with its own citation in the comment
-# directly above it -- sometimes the same source the proposal named,
-# sometimes a different page that surfaced the same or a more specific
-# fact. Where this pass could not independently confirm a fact, the
-# corresponding key is left at its "unspecified"/``None`` default rather
-# than guessed -- so a preset below may cover fewer keys than the
-# proposals' prose implies, and per-key values here may differ from
-# whatever the (unrecovered) original implementation actually contained.
+# docs-intel-journal-preset-externalization-20260918 -- the ~540-line dict
+# literal that used to live here (29 entries, one per publisher plus
+# "default", each hand-written with an in-code comment carrying its
+# evidence) has been EXTERNALIZED to journal_style_presets/<key>.json, one
+# file per preset. Each file carries the same override VALUES this dict
+# literal used to hold, plus a structured per-field evidence record (tier,
+# source citation/quote, verified_date, and an optional "open_question"
+# status) that the old comment-only convention could describe but never
+# make machine-readable -- see get_journal_style_preset_provenance below to
+# retrieve that evidence for a given preset. The PROVENANCE NOTE this
+# comment block used to carry (how the 27 non-jcshm presets below were
+# actually sourced, and which ones carry an explicitly-flagged closest-
+# available-official-signal substitution caveat: elsevier/acm in round 1,
+# hindawi/aip in round 2, plus asce/asme flagged for extra scrutiny) now
+# lives in each preset's own meta.status_detail / field-level source.note,
+# next to the facts it qualifies, rather than in one shared comment far
+# from any individual value. See _load_builtin_journal_style_presets above
+# for the loader (fail-closed at import time on a malformed preset file).
 #
-# Caveats the proposals explicitly flagged as closest-available-official-
-# signal substitutions (elsevier and acm in round 1; hindawi and aip in
-# round 2) are preserved as in-code comments on those specific presets
-# regardless of whether this pass's own search corroborated them. Round 2
-# separately flagged asce and asme for extra scrutiny -- not a substitution
-# issue, just direct relevance to the JCSHM thesis domain this whole
-# mechanism originated from -- noted on those two presets as well.
+# NOTE on WHERE the actual `JOURNAL_STYLE_PRESETS = ...` assignment lives:
+# not here. _load_builtin_journal_style_presets() now calls
+# resolve_style_policy() -- and therefore _style_policy_defaults() -- AT
+# IMPORT TIME (fail-closed), and _style_policy_defaults() references
+# _INTERNAL_NOTE_STYLE_DEFAULT / _INTERNAL_NOTE_HIGHLIGHT_COLOR (see that
+# function's own docstring), which are module globals defined much LATER
+# in this file's top-to-bottom execution order. The pre-externalization
+# dict literal never had this problem (it was static data, no function
+# calls), so it could sit here safely; the loader call cannot. The real
+# `JOURNAL_STYLE_PRESETS = _load_builtin_journal_style_presets()` /
+# `_JOURNAL_STYLE_PRESET_LOOKUP = {...}` assignments are placed just after
+# the _INTERNAL_NOTE_* constants below (search for
+# "JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] ="). Every consumer
+# (get_journal_style_preset, get_journal_style_preset_provenance,
+# list_journal_style_presets, save_user_journal_style_preset) only reads
+# these two names from inside a function body, resolved at CALL time, long
+# after the whole module has finished importing -- so this split is
+# invisible to every caller.
 # ---------------------------------------------------------------------------
-JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = {
-    # The built-in resolve_style_policy() defaults, addressable by name so a
-    # caller can request "default" explicitly instead of omitting style
-    # entirely -- useful when a document_profile's journal= comes from
-    # user-facing config where "no opinion" needs its own explicit value.
-    "default": {},
-    # A representative academic-journal convention bundle: centered
-    # figure/table captions, centered display equations with required
-    # trailing punctuation, headings with no terminal punctuation, and a
-    # label-left/data-center table layout.
-    "jcshm": {
-        "caption_centered": True,
-        "equation_alignment": "center",
-        "equation_punctuation_required": True,
-        "equation_punctuation_chars": ".,;",
-        "heading_terminal_punctuation": "",
-        "table_label_column_alignment": "left",
-        "table_data_column_alignment": "center",
-    },
-
-    # -- Round 1 (proposal 3674c0c1) -----------------------------------
-
-    # nature -- Nature Portfolio journals (Springer Nature).
-    # Verified 2026-09-11 against nature.com/nature/for-authors/formatting-
-    # guide and nature.com/nature/for-authors/final-submission: figures "in
-    # RGB color and at 300 dpi or higher resolution" for halftone/
-    # photographic images, with line art at 800-1200 dpi (floor used
-    # below); in-text citations are superscript numerals assigned in order
-    # of first appearance, placed after punctuation. heading_numbering_
-    # visible, emphasis_style, and the caption/SI/indent keys are left
-    # unspecified -- not addressed by the pages checked in this pass.
-    "nature": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 800,
-    },
-    # elsevier -- Elsevier "Your Paper Your Way" general Guide for Authors.
-    # Verified 2026-09-11 against elsevier.com/subject/next/guide-for-
-    # authors and elsevier.com/about/policies-and-standards/author/artwork-
-    # and-media-instructions/artwork-faq: "Use of italic or bold for
-    # emphasis within the text is discouraged"; Supplementary material is
-    # "published exactly as they are received" (as_received); figure DPI
-    # floors 300 (halftone), 1000 (line art), 500 (combination).
-    # CAVEAT (inherited from proposal 3674c0c1, not independently
-    # re-verified in this pass): round-1's own citation for emphasis_style
-    # was Elsevier's "Copyediting Specification for Authors v3.0", a
-    # book-authors document, used as the closest available official signal
-    # rather than a journal-specific guide -- flagged there as an
-    # imperfect substitution. This pass's own search independently found
-    # matching "discouraged" guidance on a general journal-facing guide-
-    # for-authors page, which corroborates but does not fully resolve that
-    # original caveat (a single generic page, not a per-journal check).
-    "elsevier": {
-        "emphasis_style": "discouraged",
-        "si_reformatting_policy": "as_received",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 1000,
-        "figure_dpi_minimum_combination": 500,
-    },
-    # ieee -- IEEE Editorial Style Manual for Authors.
-    # Verified 2026-09-11 against journals.ieeeauthorcenter.ieee.org/wp-
-    # content/uploads/sites/7/IEEE-Editorial-Style-Manual-for-Authors.pdf:
-    # in-text references are numbered in square brackets, reference list
-    # in citation order (not alphabetical); up to four heading levels are
-    # specified (Roman numerals / A. / 1) / a)). Section-heading
-    # enumeration is explicitly "desirable, but not required" per the
-    # manual, so heading_numbering_visible is left unspecified rather than
-    # forced to True -- this is a stated author preference, not a hard
-    # requirement.
-    "ieee": {
-        "citation_style": "numbered_bracket",
-        "heading_levels_max": 4,
-    },
-    # wiley -- Wiley Online Library author guidelines (general policy plus
-    # a representative per-journal figure example).
-    # Verified 2026-09-11 against onlinelibrary.wiley.com author-
-    # guidelines pages: Supporting Information "appears without editing or
-    # typesetting" once posted online (as_received); "references may be
-    # submitted in any style or format, as long as it is consistent
-    # throughout" for most Wiley journals (an explicit defers-to-the-
-    # individual-journal fact, hence not_fixed -- some journal families,
-    # e.g. chemistry/materials science, do have a house numbered style,
-    # but that is the exception this pass found, not the general rule);
-    # bitmap/photographic figures at least 300 dpi. The 600 dpi line-art
-    # floor below is drawn from a single representative journal's guidance
-    # (Annals of the New York Academy of Sciences) rather than a blanket
-    # cross-Wiley figure -- Wiley journals vary their own artwork
-    # instructions per title, so this is representative, not universal.
-    "wiley": {
-        "citation_style": "not_fixed",
-        "si_reformatting_policy": "as_received",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 600,
-    },
-    # acm -- ACM TAPS (The ACM Publishing System) author guide.
-    # Verified 2026-09-11 against acm.org/publications/taps/describing-
-    # figures and homes.cs.washington.edu/~spencer/taps: "the vast majority
-    # of ACM articles use numbered citations and references" (reference
-    # number in brackets), though SIGGRAPH/SIGPLAN-sponsored venues use
-    # author-year instead.
-    # CAVEAT (inherited from proposal 3674c0c1, not independently
-    # re-verified in this pass): round-1 flagged that ACM's own sub-
-    # formats (sigconf vs. the journal format) set opposite defaults for
-    # figure/table caption boldness, so figure_caption_bold and
-    # table_caption_bold are deliberately left unset here rather than
-    # picking one sub-format's default. citation_style below reflects the
-    # numbered-bracket majority convention, not the SIGGRAPH/SIGPLAN
-    # author-year exception -- callers targeting those venues should
-    # override it explicitly.
-    "acm": {
-        "citation_style": "numbered_bracket",
-    },
-    # mdpi -- MDPI author layout style guide.
-    # Verified 2026-09-11 against mdpi.com/authors/layout and mdpi-
-    # res.com/data/mdpi-author-layout-style-guide.pdf: figures are numbered
-    # by order of appearance and cited as numbers in square brackets,
-    # listed numerically; a single blanket figure-resolution floor of 600
-    # dpi is recommended (MDPI does not break this out by art type in its
-    # general guidance, hence figure_dpi_minimum_general rather than a
-    # per-type key).
-    "mdpi": {
-        "citation_style": "numbered_bracket",
-        "figure_dpi_minimum_general": 600,
-    },
-    # plos -- PLOS ONE submission guidelines (representative of the PLOS
-    # family).
-    # Verified 2026-09-11 against journals.plos.org/plosone/s/figures and
-    # journals.plos.org/plosone/s/submission-guidelines: PLOS uses the
-    # ICMJE ("Vancouver") numbered-bracket citation convention; figures
-    # must be 300-600 dpi (floor used below), not broken out by art type
-    # in the general guidance.
-    "plos": {
-        "citation_style": "numbered_bracket",
-        "figure_dpi_minimum_general": 300,
-    },
-    # taylor_francis -- Taylor & Francis Author Services electronic-artwork
-    # guidance.
-    # Verified 2026-09-11 against authorservices.taylorandfrancis.com/
-    # editorial-policies/images-and-figures/ and the Author Services
-    # "Submission of electronic artwork" PDF: photographic images need at
-    # least 300 dpi, "all other types of artwork" (including line art)
-    # need at least 600 dpi at final output size. citation_style is left
-    # unspecified -- the pages checked in this pass covered artwork
-    # submission only and did not state a citation convention (Taylor &
-    # Francis journals are known to vary this per title/subject area).
-    "taylor_francis": {
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 600,
-    },
-    # sage -- SAGE Publications "Preparing your manuscript" guidance.
-    # Verified 2026-09-11 against sagepub.com/journals/information-for-
-    # authors/preparing-your-manuscript and us.sagepub.com preparing-your-
-    # manuscript: figures need at least 300 dpi (blanket, not broken out
-    # by art type); "different SAGE journals use different citation
-    # styles" (Harvard, SBL, Chicago, etc. depending on title) -- an
-    # explicit defers-to-the-individual-journal fact, hence not_fixed.
-    "sage": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_general": 300,
-    },
-
-    # -- Round 2 (proposal 64266f13) -----------------------------------
-
-    # springer -- Springer Nature generic/journal-agnostic manuscript
-    # guidelines (round-2 proposal 64266f13 names this preset
-    # "springer_general"; this codebase uses the shorter "springer" key
-    # per this sprint item's own naming instructions).
-    # Verified 2026-09-11 against springernature.com/gp/authors manuscript
-    # guidelines and link.springer.com submission-guidelines pages: figure
-    # DPI floors of 300 (halftone), 800 (line art, preferably 1200), 600
-    # (combination); "no more than three levels of displayed headings" for
-    # journals; citations may be author-date ("Harvard system") or
-    # numbered, depending on the journal -- an explicit defers-to-the-
-    # individual-journal fact, hence not_fixed.
-    "springer": {
-        "citation_style": "not_fixed",
-        "heading_levels_max": 3,
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 800,
-        "figure_dpi_minimum_combination": 600,
-    },
-    # frontiers -- Frontiers author guidelines.
-    # Verified 2026-09-11 against frontiersin.org/guidelines/author-
-    # guidelines: all images need 300 dpi at final size (blanket); journals
-    # use either Harvard (author-date) or Vancouver (numbered) style
-    # depending on the journal -- an explicit defers-to-the-individual-
-    # journal fact, hence not_fixed.
-    "frontiers": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_general": 300,
-    },
-    # hindawi -- Hindawi journal guidelines.
-    # Verified 2026-09-11 directly against live Hindawi journal guideline
-    # pages (hindawi.com/journals/mis/guidelines/,
-    # hindawi.com/journals/cmi/guidelines/): bitmap figures need at least
-    # 300 dpi (blanket, "unless intentionally lower for scientific
-    # reasons"); references are numbered consecutively by order of first
-    # citation, cited in text via numbers in square brackets.
-    # CAVEAT (inherited from proposal 64266f13, not independently
-    # re-verified beyond the two journal pages checked): round-2 flagged
-    # that Hindawi's own guidance page can be silent on formatting
-    # specifics it fills in from a secondary signal -- Hindawi's CTAN
-    # LaTeX template -- rather than the guidelines page alone. This pass's
-    # search reached the guidelines pages directly (not the LaTeX
-    # template), which corroborates the DPI/citation facts above but did
-    # not itself need the template as a secondary signal for those two
-    # facts specifically.
-    "hindawi": {
-        "citation_style": "numbered_bracket",
-        "figure_dpi_minimum_general": 300,
-    },
-    # cambridge_up -- Cambridge University Press journals (general policy
-    # plus a representative per-journal example).
-    # Verified 2026-09-11 against cambridge.org/core/journals/philosophy-
-    # of-science/information/author-guidelines and cambridge.org/core/
-    # journals/language-in-society/information/author-instructions/
-    # preparing-your-materials: images need at least 300 dpi for
-    # submission (1200 dpi for line drawings once accepted); citation
-    # style varies by journal (author-date for some, e.g. Chicago-style
-    # Philosophy of Science; numeric for others) -- an explicit defers-to-
-    # the-individual-journal fact, hence not_fixed.
-    "cambridge_up": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 1200,
-    },
-    # oxford_up -- Oxford University Press journals, via Monthly Notices of
-    # the Royal Astronomical Society (MNRAS) Instructions to Authors as the
-    # representative example (matching proposal 64266f13's own sourcing
-    # choice).
-    # Verified 2026-09-11 against academic.oup.com/mnras/pages/
-    # General_Instructions: MNRAS uses the Harvard author-(year) citation
-    # style, with an alphabetically ordered reference list. Figure DPI is
-    # left unspecified -- the instructions page found in this pass covered
-    # numbering/citation conventions but not a specific resolution floor.
-    "oxford_up": {
-        "citation_style": "author_date",
-    },
-    # de_gruyter -- De Gruyter author/style-sheet guidance (De Gruyter
-    # publishes many distinct journal families -- Mouton, STEM, law, etc.
-    # -- each with its own style sheet, so the figures below are a
-    # conservative floor rather than a single blanket fact).
-    # Verified 2026-09-11 against degruyterbrill.com Instructions-for-
-    # Authors (Discrete Mathematics and Applications) and De Gruyter
-    # Mouton journal style-sheet PDFs: figure resolution requirements vary
-    # widely by imprint (300-1200 dpi depending on figure type and journal
-    # family); the STEM guidance's own blanket floor of 300 dpi is used
-    # below as the most conservative cross-imprint figure. Citation style
-    # also varies by publication (Vancouver preferred, Harvard or Chicago
-    # author-date acceptable for others) -- hence not_fixed.
-    "de_gruyter": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_general": 300,
-    },
-    # cell_press -- Cell Press (Elsevier-owned but editorially distinct --
-    # deliberately a separate preset from "elsevier").
-    # Verified 2026-09-11 against cell.com/information-for-authors/figure-
-    # guidelines: figure DPI floors of 300 (color/grayscale halftone) and
-    # 1000 (line art); citation style varies by title within Cell Press --
-    # Cell itself uses numbered superscript citations, while Cell Reports
-    # uses an author-date style -- an explicit cross-title inconsistency,
-    # hence not_fixed rather than picking one flagship title's convention.
-    "cell_press": {
-        "citation_style": "not_fixed",
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 1000,
-    },
-    # acs -- American Chemical Society (ACS Publications) author
-    # guidelines.
-    # Verified 2026-09-11 against researcher-resources.acs.org
-    # publish/author_guidelines pages: pixel-based images need at least
-    # 300 dpi (blanket); references are cited with superscript numbers,
-    # listed numerically by order of first appearance (per The ACS Style
-    # Guide, 3rd ed.).
-    "acs": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_general": 300,
-    },
-    # aps -- American Physical Society (Physical Review family) journals
-    # style guide.
-    # Verified 2026-09-11 against journals.aps.org/authors/style-basics and
-    # journals.aps.org/authors/references-physical-review-physical-review-
-    # letters: most Physical Review journals prefer superscript numbered
-    # citations (Physical Review Letters and a few others use inline
-    # bracketed numerals instead -- callers targeting PRL specifically
-    # should override citation_style to "numbered_bracket"). Figure DPI:
-    # the guide's own explicit number (600 dpi) is stated specifically for
-    # SCANNED images ("make scans with as high a resolution as possible,
-    # preferably 600 dpi or higher"), not as a blanket floor for every
-    # figure-creation method -- used below as figure_dpi_minimum_general
-    # with that caveat, since no separate non-scanned floor was stated.
-    "aps": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_general": 600,
-    },
-    # aip -- AIP Publishing author instructions.
-    # Verified 2026-09-11 against publishing.aip.org/resources/researchers/
-    # author-instructions/ and the annotated AIP Style Manual (Carleton
-    # College mirror): references are numbered in order of appearance,
-    # cited as superscript arabic numerals; figure DPI floors are broken
-    # out by art type -- halftones 264 dpi, line art / combination art 600
-    # dpi.
-    # CAVEAT (inherited from proposal 64266f13, not independently
-    # re-verified in this pass): round-2 noted an unspecified sub-journal
-    # inconsistency for AIP, the way ACM's round-1 preset flagged one for
-    # its own sub-formats. This pass's search reached AIP's general
-    # author-instructions and style-manual pages (not each individual AIP
-    # sub-journal's own guide -- e.g. Journal of Applied Physics vs.
-    # Applied Physics Letters each maintain separate pages), so the
-    # specific sub-journal inconsistency the proposal had in mind was not
-    # independently confirmed or refuted here.
-    "aip": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_halftone": 264,
-        "figure_dpi_minimum_line_art": 600,
-        "figure_dpi_minimum_combination": 600,
-    },
-    # rsc -- Royal Society of Chemistry, RSC Advances author guidelines
-    # (representative RSC journal).
-    # Verified 2026-09-11 against rsc.org/publishing/publish-with-us/
-    # publish-a-journal-article/rsc-advances: figures need at least 600
-    # dpi (TIFF, blanket floor); references use the RSC style -- numbered
-    # sequentially, cited as superscript numbers. emphasis_style and the
-    # caption-punctuation keys are left unspecified -- not addressed by
-    # the page checked in this pass (matching proposal 64266f13's own note
-    # that RSC's source didn't state these and the keys were left unset
-    # rather than guessed).
-    "rsc": {
-        "citation_style": "numbered_superscript",
-        "figure_dpi_minimum_general": 600,
-    },
-    # asce -- American Society of Civil Engineers journal format guide
-    # (directly relevant to the JCSHM thesis domain that originated this
-    # preset mechanism).
-    # Verified 2026-09-11 against the ASCE "Publishing in ASCE Journals: A
-    # Guide for Authors" PDF (peer.berkeley.edu/sites/default/files/
-    # ascejournalformat.pdf -- the same PEER-hosted PDF proposal 64266f13
-    # cited): figures need at least 300 dpi (blanket); in-text citations
-    # use the author-date method (e.g. "Smith 2004", "Smith and Jones
-    # 2004", no comma between author and year).
-    # NOTE (flagged in proposal 64266f13's review section for extra
-    # scrutiny -- not a substitution caveat): ASCE is one of the two
-    # publishers (with asme) called out as directly relevant to the JCSHM
-    # thesis domain this mechanism originated from. This pass's search
-    # corroborated citation style and figure DPI directly from the cited
-    # PDF but did not find emphasis-style or caption-punctuation facts,
-    # which are left unspecified rather than guessed.
-    "asce": {
-        "citation_style": "author_date",
-        "figure_dpi_minimum_general": 300,
-    },
-    # asme -- American Society of Mechanical Engineers journal guidelines
-    # (directly relevant to the JCSHM thesis domain that originated this
-    # preset mechanism).
-    # Verified 2026-09-11 against asme.org/publications-submissions/
-    # journals/information-for-authors/journal-guidelines/writing-a-
-    # research-paper and .../references: references are cited in
-    # numerical order with the numbered citation enclosed in brackets
-    # (bibliographic-entry formatting itself follows Chicago Manual of
-    # Style, but the in-text convention is numbered-bracket). Figure DPI
-    # is left unspecified -- the guidance found states figures "must have
-    # sufficient resolution to ensure text readability" without a specific
-    # numeric floor.
-    # NOTE (flagged in proposal 64266f13's review section for extra
-    # scrutiny -- not a substitution caveat): ASME is the other of the two
-    # publishers (with asce) called out as directly relevant to the JCSHM
-    # thesis domain this mechanism originated from.
-    "asme": {
-        "citation_style": "numbered_bracket",
-    },
-    # emerald -- Emerald Publishing author guidelines.
-    # Verified 2026-09-11 against emerald.com/journals/author-guidance/
-    # 1627/Emerald-Publishing-Author-Guidelines: halftones need 300 dpi;
-    # the majority of Emerald journals use the Harvard reference style
-    # (some use APA instead) -- both Harvard and APA are author-date-
-    # family conventions, so citation_style="author_date" is used here
-    # rather than not_fixed (unlike, e.g., springer/frontiers, where the
-    # alternative styles cross the numbered/author-date boundary).
-    "emerald": {
-        "citation_style": "author_date",
-        "figure_dpi_minimum_halftone": 300,
-    },
-    # peerj -- PeerJ author instructions.
-    # Verified 2026-09-11 against peerj.com/about/author-instructions/:
-    # figures need 300 dpi on resubmission (blanket; vector images have no
-    # minimum since they don't degrade when scaled); PeerJ uses an
-    # author-date citation format with an alphabetical bibliography.
-    "peerj": {
-        "citation_style": "author_date",
-        "figure_dpi_minimum_general": 300,
-    },
-    # optica -- Optica Publishing Group (formerly OSA) journal style guide.
-    # Verified 2026-09-11 against opg.optica.org/submit/style/
-    # style_traditional_journals.cfm: figures need 600 dpi (blanket);
-    # references use a numbered-bracket convention, "[1]" for the first
-    # reference cited, in order of appearance.
-    "optica": {
-        "citation_style": "numbered_bracket",
-        "figure_dpi_minimum_general": 600,
-    },
-    # science_aaas -- Science / Science Advances (AAAS) author guidelines
-    # (round-2 proposal 64266f13 names this preset "aaas_science"; this
-    # codebase uses "science_aaas" per this sprint item's own naming
-    # instructions).
-    # Verified 2026-09-11 against science.org/content/page/instructions-
-    # authors-new-research-articles and .../science-advances-information-
-    # authors: figures need at least 300 dpi for photographs, 600 dpi for
-    # line art; in-text references use numbers, but as ITALIC numerals
-    # inside PARENTHESES (e.g. "(1)", "(2, 3)", "(4-6)"), numbered in
-    # citation order. This does not cleanly match either
-    # "numbered_superscript" (not superscript) or "numbered_bracket" (this
-    # schema's enum means square brackets, not parentheses) -- rather than
-    # force-fit a punctuation-mismatched value, citation_style is left
-    # unspecified here; a caller targeting Science specifically should
-    # supply this convention directly via a style_policy override.
-    "science_aaas": {
-        "figure_dpi_minimum_halftone": 300,
-        "figure_dpi_minimum_line_art": 600,
-    },
-    # copernicus -- Copernicus Publications manuscript-preparation guide.
-    # Verified 2026-09-11 against publications.copernicus.org/for_authors/
-    # manuscript_preparation.html: figures need 300 dpi (blanket); in-text
-    # citations use an author-date format, "(Author, Year)".
-    "copernicus": {
-        "citation_style": "author_date",
-        "figure_dpi_minimum_general": 300,
-    },
-}
-
-# 4d0ca929 -- case-insensitive name -> canonical-key lookup, built once at
-# import time from JOURNAL_STYLE_PRESETS itself (never hand-maintained
-# separately, so it can't drift out of sync with the preset dict above).
-_JOURNAL_STYLE_PRESET_LOOKUP: dict[str, str] = {
-    name.lower(): name for name in JOURNAL_STYLE_PRESETS
-}
 
 
-def get_journal_style_preset(journal: str) -> dict[str, Any]:
+def get_journal_style_preset(
+    journal: str,
+    user_presets_path: str | None = None,
+) -> dict[str, Any]:
     """4544bbe5 -- look up a named publishing-convention style-policy preset.
 
     This is the "shorthand" half of the document-profile surface: instead of
@@ -9398,9 +9658,9 @@ def get_journal_style_preset(journal: str) -> dict[str, Any]:
     convention, they pass a short name here and get back a ready-to-use,
     already-validated policy dict suitable for ``style_policy=`` on
     :func:`insert_figure_block`, :func:`insert_caption`,
-    :func:`audit_equation_style`, :func:`insert_equation_local`,
-    :func:`insert_highlighted_note`, :func:`write_section`, or
-    :func:`insert_table`.
+    :func:`audit_equation_style`, :func:`audit_caption_style`,
+    :func:`insert_equation_local`, :func:`insert_highlighted_note`,
+    :func:`write_section`, or :func:`insert_table`.
 
     The returned dict is the FULLY RESOLVED policy (every key populated,
     unset keys filled from :func:`_style_policy_defaults`) -- not the raw
@@ -9409,21 +9669,132 @@ def get_journal_style_preset(journal: str) -> dict[str, Any]:
 
     4d0ca929 -- ``journal`` is resolved CASE-INSENSITIVELY: ``"Nature"``,
     ``"NATURE"``, and ``"nature"`` all resolve to the same ``"nature"``
-    preset. The lookup itself (:data:`_JOURNAL_STYLE_PRESET_LOOKUP`) is
-    derived from :data:`JOURNAL_STYLE_PRESETS`'s own keys at import time,
-    so it can never list a name :data:`JOURNAL_STYLE_PRESETS` doesn't have.
+    preset. The built-in lookup (:data:`_JOURNAL_STYLE_PRESET_LOOKUP`) is
+    derived from :data:`JOURNAL_STYLE_PRESETS`'s own keys at import time, so
+    it can never list a name :data:`JOURNAL_STYLE_PRESETS` doesn't have.
+
+    8e2f4a17 -- ``user_presets_path``, when given, makes the preset catalog
+    USER-EXTENSIBLE instead of only the hand-maintained built-in dict above.
+    Confirmed gap (workspace proposal cb7bd76e, the same investigation that
+    added :func:`audit_caption_style`): a user preparing a submission for a
+    venue not in :data:`JOURNAL_STYLE_PRESETS` (or who has independently
+    verified a correction to a built-in one) had no way to register their
+    own preset short of editing this module directly. Pass the path to a
+    JSON file written by :func:`save_user_journal_style_preset` (or
+    hand-authored in the same shape: ``{"<name>": {<override dict>}, ...}``)
+    and its entries are merged ON TOP of the built-in catalog -- a user
+    preset with the SAME name as a built-in one (e.g. a user's own verified
+    ``"jcshm"`` override) takes priority for this lookup, without mutating
+    :data:`JOURNAL_STYLE_PRESETS` itself (each call re-reads the file fresh
+    -- no caching, so an edit takes effect on the very next lookup, same
+    "no sidecar can go stale" discipline as :func:`audit_document`). A
+    missing file at ``user_presets_path`` is NOT an error -- it's treated as
+    "no user presets yet", identical to omitting the argument -- but a file
+    that exists and fails to parse as JSON, or whose top-level shape isn't
+    ``{name: {...}}``, DOES raise, since silently ignoring a malformed user
+    file could make a real per-user configuration mistake invisible.
 
     Args:
-      journal: One of the keys in :data:`JOURNAL_STYLE_PRESETS`, in any
-        case (e.g. ``"default"``, ``"jcshm"``, ``"Nature"``, ``"IEEE"``).
+      journal: A preset name -- either a built-in key in
+        :data:`JOURNAL_STYLE_PRESETS` or a name defined in the file at
+        ``user_presets_path`` -- in any case (e.g. ``"default"``,
+        ``"jcshm"``, ``"Nature"``, ``"my_lab_house_style"``).
+      user_presets_path: Optional path to a user-maintained JSON presets
+        file (see :func:`load_user_journal_style_presets`). Presets in this
+        file are merged on top of the built-in catalog and take priority on
+        a name collision.
 
     Returns:
       The resolved style policy dict for ``journal``.
 
     Raises:
-      ValueError: ``journal`` is not a known preset name (case-
-        insensitively), or (should the preset itself ever be malformed)
-        the preset fails :func:`resolve_style_policy` validation.
+      ValueError: ``journal`` is not a known preset name (built-in or
+        user-supplied, case-insensitively), the user presets file exists
+        but is malformed, or (should a preset itself ever be malformed) the
+        preset fails :func:`resolve_style_policy` validation.
+    """
+    user_presets = (
+        load_user_journal_style_presets(user_presets_path)
+        if user_presets_path
+        else {}
+    )
+
+    # 8e2f4a17 -- a user preset sharing a built-in's name (case-insensitive)
+    # AMENDS it (merged on top of the built-in's own override dict) rather
+    # than fully replacing it -- caught by this function's own test suite:
+    # a first implementation here did a flat dict-level replace, which
+    # silently dropped every already-verified built-in fact the user's
+    # override didn't happen to also restate (e.g. saving a table-caption
+    # correction for "jcshm" reverted figure_caption_bold from its verified
+    # True back to the schema default None, since the user's override dict
+    # never mentioned that key at all). A user genuinely starting a same-
+    # named preset over from scratch can still do so -- just include every
+    # key they want in their override dict; this only changes what happens
+    # to keys they DIDN'T mention.
+    builtin_lower_map = {name.lower(): name for name in JOURNAL_STYLE_PRESETS}
+    combined: dict[str, dict[str, Any]] = dict(JOURNAL_STYLE_PRESETS)
+    for user_name, user_overrides in user_presets.items():
+        builtin_canonical = builtin_lower_map.get(user_name.lower())
+        if builtin_canonical is not None:
+            combined[builtin_canonical] = {
+                **JOURNAL_STYLE_PRESETS[builtin_canonical],
+                **user_overrides,
+            }
+        else:
+            combined[user_name] = user_overrides
+
+    lookup = {name.lower(): name for name in combined}
+    canonical = lookup.get(journal.lower())
+    if canonical is None:
+        raise ValueError(
+            f"unknown journal style preset {journal!r}; known presets: "
+            f"{sorted(combined)}"
+        )
+    return resolve_style_policy(combined[canonical])
+
+
+def get_journal_style_preset_provenance(journal: str) -> dict[str, Any]:
+    """docs-intel-journal-preset-externalization-20260918 -- return the full
+    EVIDENCE record backing one built-in journal-style preset: value, tier
+    (1=real official template/stylesheet source; 2=the journal's own live
+    guidelines page; 3=corroboration from real sampled articles;
+    4=generic/unsourced, explicitly needs verification), source citation,
+    and verified_date for every field that preset actually sets -- not just
+    the resolved policy VALUES :func:`get_journal_style_preset` returns.
+
+    Use this to audit how well-sourced a preset is (or isn't) before
+    trusting it for a real submission -- e.g. to find every field still at
+    tier 4 ("needs verification"), or a field explicitly marked
+    ``status: "open_question"`` (see ``"jcshm"``'s ``table_caption_bold``,
+    a genuinely unresolved question, not merely "not yet researched").
+
+    Only covers BUILT-IN presets (:data:`JOURNAL_STYLE_PRESETS`'s own
+    catalog) -- unlike :func:`get_journal_style_preset`, there is no
+    ``user_presets_path`` here: a user-authored preset (via
+    :func:`save_user_journal_style_preset`) is a bare style_policy override
+    dict with no evidence schema of its own to report.
+
+    4d0ca929-style case-insensitive lookup, matching
+    :func:`get_journal_style_preset`'s own convention: ``"Nature"``,
+    ``"NATURE"``, and ``"nature"`` all resolve to the same record.
+
+    Args:
+      journal: A built-in preset name, in any case (e.g. ``"jcshm"``,
+        ``"Nature"``, ``"default"``).
+
+    Returns:
+      ``{"journal": <canonical key>, "meta": {...}, "fields": {...}}`` --
+      ``meta`` and ``fields`` are exactly that preset's
+      ``journal_style_presets/<key>.json`` file content (see
+      :func:`_load_builtin_journal_style_presets`'s docstring for the
+      shape); ``fields`` covers only the keys that preset's file actually
+      set (a key that preset never set is absent here too, same as it is
+      absent from the raw override values behind
+      :data:`JOURNAL_STYLE_PRESETS`).
+
+    Raises:
+      ValueError: ``journal`` is not a known BUILT-IN preset name
+        (case-insensitively).
     """
     canonical = _JOURNAL_STYLE_PRESET_LOOKUP.get(journal.lower())
     if canonical is None:
@@ -9431,7 +9802,230 @@ def get_journal_style_preset(journal: str) -> dict[str, Any]:
             f"unknown journal style preset {journal!r}; known presets: "
             f"{sorted(JOURNAL_STYLE_PRESETS)}"
         )
-    return resolve_style_policy(JOURNAL_STYLE_PRESETS[canonical])
+    record = _JOURNAL_STYLE_PRESET_PROVENANCE[canonical]
+    return {
+        "journal": record["journal"],
+        "meta": record["meta"],
+        "fields": record["fields"],
+    }
+
+
+def load_user_journal_style_presets(path: str) -> dict[str, dict[str, Any]]:
+    """8e2f4a17 -- read a user-maintained journal-style-preset JSON file:
+    ``{"<preset name>": {<style_policy override dict>}, ...}``.
+
+    A missing file returns ``{}`` (treated as "no user presets defined
+    yet", not an error -- so a caller can pass a not-yet-created path
+    unconditionally on a fresh setup). A file that EXISTS but is not valid
+    JSON, or whose top level isn't an object mapping names to override
+    dicts, raises -- a real configuration mistake should never be silently
+    swallowed into "no presets". Each individual preset's override dict is
+    validated through :func:`resolve_style_policy` (the SAME fail-closed
+    path every built-in :data:`JOURNAL_STYLE_PRESETS` entry goes through --
+    there is no separate/weaker validation surface for user presets), so a
+    malformed override in the file raises immediately, naming which preset
+    was bad, rather than accepting garbage that would only surface as a
+    confusing failure later at some unrelated call site.
+
+    Args:
+      path: Path to the JSON file.
+
+    Returns:
+      ``{preset_name: override_dict}`` -- raw override dicts (NOT
+      individually resolved against defaults; :func:`get_journal_style_preset`
+      does that resolution at lookup time), keyed exactly as written in the
+      file (case is preserved here; :func:`get_journal_style_preset` does
+      the case-insensitive matching).
+
+    Raises:
+      ValueError: the file exists but is not valid JSON, its top level is
+        not an object, any value is not an object, any preset's override
+        dict fails :func:`resolve_style_policy` validation, or the file
+        cannot be opened (e.g. ``path`` names a directory, or is
+        unreadable) -- the latter reaches every MCP/HTTP caller through
+        their existing ``except ValueError`` handling instead of escaping
+        as a raw, unhandled OSError.
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"user journal style presets file is not valid JSON: {path}: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"user journal style presets file could not be read: {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"user journal style presets file must contain a JSON object "
+            f"mapping preset names to override dicts: {path}"
+        )
+    for name, override in raw.items():
+        if not isinstance(override, dict):
+            raise ValueError(
+                f"user journal style preset {name!r} in {path} must be a "
+                f"JSON object (style policy override dict), got {type(override).__name__}"
+            )
+        try:
+            resolve_style_policy(override)
+        except ValueError as exc:
+            raise ValueError(f"user journal style preset {name!r} in {path} is invalid: {exc}") from exc
+    return raw
+
+
+def save_user_journal_style_preset(
+    name: str,
+    overrides: dict[str, Any],
+    path: str,
+) -> dict[str, Any]:
+    """8e2f4a17 -- validate and persist ONE user-defined journal-style
+    preset into the JSON file :func:`load_user_journal_style_presets` /
+    :func:`get_journal_style_preset` read from, creating the file (and any
+    missing parent directory) if it doesn't exist yet, or updating just this
+    one named entry (every other existing preset in the file is preserved
+    untouched) if it does.
+
+    Validates ``overrides`` through :func:`resolve_style_policy` BEFORE
+    writing anything -- same fail-closed discipline as every write path in
+    this module (a malformed override never reaches disk as if it were a
+    saved, usable preset).
+
+    ``name`` may shadow a built-in :data:`JOURNAL_STYLE_PRESETS` key (e.g.
+    saving a corrected ``"jcshm"``) -- :func:`get_journal_style_preset`
+    resolves user presets with priority over built-ins by design, so this
+    is the supported way to override one.
+
+    Args:
+      name: The preset name (matched case-insensitively at lookup time by
+        :func:`get_journal_style_preset`; stored here exactly as given).
+      overrides: A style_policy override dict -- the same shape as a
+        :data:`JOURNAL_STYLE_PRESETS` entry (only the keys you want to set;
+        unset keys resolve to the built-in defaults at lookup time via
+        :func:`resolve_style_policy`, exactly like a built-in preset).
+      path: Path to the user presets JSON file (existing or new).
+
+    Returns:
+      ``{status: "ok", name, path, preset_count}`` (``preset_count`` is the
+      total number of presets now in the file, including this one) or
+      ``{"error": <message>}`` when ``overrides`` fails validation.
+    """
+    try:
+        resolve_style_policy(overrides)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    existing: dict[str, dict[str, Any]] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except json.JSONDecodeError:
+            pass  # overwritten below with a well-formed file containing at least this preset
+
+    existing[name] = overrides
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(existing, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+    return {"status": "ok", "name": name, "path": path, "preset_count": len(existing)}
+
+
+def delete_user_journal_style_preset(name: str, path: str) -> dict[str, Any]:
+    """8e2f4a17 -- remove ONE named preset from a user presets JSON file
+    (every other entry is preserved). A no-op (not an error) if the file
+    doesn't exist or doesn't contain ``name`` -- deleting something already
+    absent reaches the same end state either way.
+
+    Args:
+      name: The preset name, matched EXACTLY (case-sensitive) against the
+        file's own keys -- unlike :func:`get_journal_style_preset`'s
+        case-insensitive lookup, this avoids accidentally deleting a
+        differently-cased entry the caller didn't name.
+      path: Path to the user presets JSON file.
+
+    Returns:
+      ``{status: "ok", name, path, deleted: bool, preset_count}`` --
+      ``deleted`` is False when ``name`` wasn't present (file untouched in
+      that case). ``{"error": <message>}`` if the file exists but isn't
+      valid JSON.
+    """
+    if not os.path.exists(path):
+        return {"status": "ok", "name": name, "path": path, "deleted": False, "preset_count": 0}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            existing = json.load(fh)
+    except json.JSONDecodeError as exc:
+        return {"error": f"user journal style presets file is not valid JSON: {path}: {exc}"}
+    if not isinstance(existing, dict):
+        return {"error": f"user journal style presets file must contain a JSON object: {path}"}
+
+    deleted = name in existing
+    if deleted:
+        del existing[name]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+    return {
+        "status": "ok", "name": name, "path": path,
+        "deleted": deleted, "preset_count": len(existing),
+    }
+
+
+def list_journal_style_presets(user_presets_path: str | None = None) -> dict[str, Any]:
+    """8e2f4a17 -- enumerate every preset :func:`get_journal_style_preset`
+    can currently resolve, built-in and user-defined, each tagged with its
+    source and (for a shadowed built-in) whether a user override is active.
+
+    Args:
+      user_presets_path: Optional path to a user presets JSON file (see
+        :func:`load_user_journal_style_presets`). Omit to list only the
+        built-in catalog.
+
+    Returns:
+      ``{presets: [{name, source, shadows_builtin}, ...], builtin_count,
+      user_count}`` where ``source`` is ``"built_in"`` or ``"user"``, and
+      ``shadows_builtin`` is True only for a user preset whose name
+      case-insensitively matches a built-in one (see
+      :func:`get_journal_style_preset`'s priority rule). Sorted by name.
+      ``{"error": <message>}`` if the user presets file exists but is
+      malformed.
+    """
+    try:
+        user_presets = (
+            load_user_journal_style_presets(user_presets_path)
+            if user_presets_path
+            else {}
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    builtin_lower = {n.lower() for n in JOURNAL_STYLE_PRESETS}
+    entries = [
+        {"name": name, "source": "built_in", "shadows_builtin": False}
+        for name in JOURNAL_STYLE_PRESETS
+        if name.lower() not in {n.lower() for n in user_presets}
+    ]
+    entries += [
+        {
+            "name": name,
+            "source": "user",
+            "shadows_builtin": name.lower() in builtin_lower,
+        }
+        for name in user_presets
+    ]
+    entries.sort(key=lambda e: e["name"].lower())
+    return {
+        "presets": entries,
+        "builtin_count": len(JOURNAL_STYLE_PRESETS),
+        "user_count": len(user_presets),
+    }
 
 
 def _paragraph_alignment(para_elem: ET.Element) -> str | None:
@@ -9517,7 +10111,7 @@ def audit_equation_style(
        positions produce). Its paragraph-level ``w:jc`` (missing == "left")
        is compared against ``style_policy["equation_alignment"]``. Inline
        equations mixed into running prose, and table-numbered equations
-       (whose 2-column layout has its own alignment conventions), are
+       (whose row layout has its own alignment conventions), are
        intentionally excluded -- neither has one well-defined "expected"
        paragraph alignment.
 
@@ -9535,9 +10129,13 @@ def audit_equation_style(
        :func:`parse_docx_equations_local` already detects), numbers are
        compared whitespace-normalized for exact duplicates, and each number's
        LEADING integer (``"2a"`` -> ``2``) is checked for a contiguous
-       1..max sequence. Non-numeric labels (``"(A.1)"``, ``"(eq3)"``) still
-       participate in duplicate detection but are excluded from gap
-       detection (no well-defined "next integer").
+       sequence spanning the OBSERVED min..max range -- never assumed to
+       start at 1, since a document's numbering may legitimately continue a
+       companion document's own sequence (see the resolution note inline at
+       the ``expected_range`` computation below). Non-numeric labels
+       (``"(A.1)"``, ``"(eq3)"``) still participate in duplicate detection
+       but are excluded from gap detection (no well-defined "next
+       integer").
 
     Args:
       docx_path:     Absolute path to the .docx file. Read-only -- this
@@ -9616,6 +10214,8 @@ def audit_equation_style(
         if preceding:
             continue  # inline equation mixed with prose -- no alignment/punctuation check
 
+        trailing_text = _trailing_text_after_omath(para_elem, omath_el)
+
         actual_alignment = _paragraph_alignment(para_elem) or "left"
         expected_alignment = policy["equation_alignment"]
         if actual_alignment != expected_alignment:
@@ -9628,8 +10228,7 @@ def audit_equation_style(
             })
 
         if policy["equation_punctuation_required"]:
-            trailing = _trailing_text_after_omath(para_elem, omath_el)
-            stripped = trailing.rstrip()
+            stripped = trailing_text.rstrip()
             if not stripped:
                 findings.append({
                     "type": "missing_trailing_punctuation",
@@ -9642,7 +10241,7 @@ def audit_equation_style(
                     "type": "incorrect_trailing_punctuation",
                     "para_id": eq["para_id"],
                     "ordinal": eq["ordinal"],
-                    "actual_trailing_text": trailing,
+                    "actual_trailing_text": trailing_text,
                     "actual_char": stripped[-1],
                     "expected_punctuation_chars": policy["equation_punctuation_chars"],
                 })
@@ -9667,7 +10266,17 @@ def audit_equation_style(
         if v is not None
     })
     if leading_ints:
-        expected_range = set(range(1, leading_ints[-1] + 1))
+        # df716454 -- the expected range is scoped to the OBSERVED numbers
+        # (leading_ints[0]..leading_ints[-1]), never hardcoded to start at
+        # 1. A document's equation numbering may legitimately continue a
+        # companion document's own sequence (e.g. an SI running 39-94 right
+        # after its manuscript's 1-38) -- that is undetectable from a
+        # single document and must never be flagged as 38 missing numbers.
+        # A genuine gap INSIDE the observed range (39,40,41, then a jump to
+        # 44 -- 42/43 missing) is still flagged normally. When numbering
+        # starts at 1 (the common case) this is identical to the prior
+        # hardcoded-1 behavior.
+        expected_range = set(range(leading_ints[0], leading_ints[-1] + 1))
         for missing in sorted(expected_range - set(leading_ints)):
             findings.append({"type": "equation_number_gap", "missing_number": missing})
 
@@ -9678,6 +10287,1491 @@ def audit_equation_style(
     return {
         "docx_path": docx_path,
         "equation_count": len(equations),
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8e2f4a17 -- audit_caption_style(): closes a real, confirmed dead-schema gap.
+# figure_caption_bold / table_caption_bold / figure_caption_label_punctuation
+# / table_caption_label_punctuation have existed in resolve_style_policy()
+# and JOURNAL_STYLE_PRESETS since 4d0ca929, but NOTHING in this module ever
+# read them back against a real document -- a fully-populated preset would
+# still have caught nothing. Discovered 2026-09-14 preparing a real JCSHM
+# submission: the manuscript had 23 caption-punctuation violations (a
+# trailing/label period JCSHM's own guidelines explicitly forbid) that no
+# prior audit pass caught, because no audit pass ever checked. This function
+# is the missing consumer, modeled directly on audit_equation_style's own
+# shape (same style_policy contract, same skip-when-unset gating, same
+# structured-findings-never-free-text return shape).
+# ---------------------------------------------------------------------------
+
+def _is_caption_style(style: str | None) -> bool:
+    """True if ``style`` names a caption-role paragraph style: Word's
+    built-in "Caption", or any custom/renamed style whose name contains
+    "caption" (case-insensitive) -- tolerant of localized or hand-renamed
+    style names, the same way :func:`_is_heading` tolerates "Heading 1" vs
+    "heading1" vs a custom "H1" is deliberately NOT matched (a heading style
+    must literally start with "heading"; a caption style must literally
+    contain "caption") since unlike headings, caption styles are commonly
+    given fully custom names in real documents (e.g. "FigCaption",
+    "SI Caption") that still contain the word itself.
+    """
+    return bool(style) and "caption" in str(style).lower()
+
+
+# Matches a caption label at the start of a caption paragraph's text: "Fig."/
+# "Figure"/"Table", optional space, a number (allowing an "S" prefix for
+# Supplementary Information numbering like "S56", and a trailing letter for
+# sub-parts like "12a"), then captures whatever single punctuation character
+# (period or colon) immediately follows -- or none. Deliberately does NOT
+# require the SEQ-field machinery _is_figure_caption/_is_table_caption rely
+# on elsewhere in this module: a document produced or hand-edited outside
+# Word's "Insert Caption" feature (e.g. built via raw-XML splicing, where SEQ
+# fields are fragile to keep in sync -- exactly how the JCSHM document this
+# function was written against was produced) numbers its captions with a
+# plain bold "Fig. N" text run instead, and would be invisible to a
+# SEQ-field-only detector.
+_CAPTION_LABEL_RE = re.compile(
+    r"^(Fig(?:ure)?\.?|Table)\s*(S?\d+[A-Za-z]?)\s*([.:]?)",
+    re.IGNORECASE,
+)
+
+
+def _run_is_bold(r: ET.Element) -> bool:
+    """True if run ``r`` has ``<w:rPr><w:b/></w:rPr>`` (or ``<w:b w:val="true"/>``
+    /``"1"``) -- i.e. explicit direct bold formatting. Does NOT resolve
+    inherited boldness from the paragraph's style definition (checking that
+    would require walking styles.xml's inheritance chain, out of scope for
+    this direct-formatting check) -- a caption whose boldness comes only from
+    its style, not a direct run property, reads as ``False`` here. In
+    practice every caption convention seen in this codebase's own documents
+    applies bold as a direct run property on the label runs specifically
+    (never via the style), so this is not a practical limitation for the
+    documents this function was built against, but is a real one worth
+    knowing about for a style-driven document this hasn't been tested on.
+    """
+    rpr = r.find(_q(_W, "rPr"))
+    if rpr is None:
+        return False
+    b = rpr.find(_q(_W, "b"))
+    if b is None:
+        return False
+    val = b.get(_q(_W, "val"))
+    return val not in ("0", "false", "none")
+
+
+def audit_caption_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """8e2f4a17 -- audit every figure/table caption's LABEL formatting
+    (boldness of the "Fig. N"/"Table N" label, and the punctuation
+    immediately following the number) against
+    ``style_policy["figure_caption_bold"]`` / ``["table_caption_bold"]`` /
+    ``["figure_caption_label_punctuation"]`` / ``["table_caption_label_punctuation"]``.
+
+    Caption detection is TEXT-and-STYLE based (:func:`_is_caption_style` +
+    :data:`_CAPTION_LABEL_RE`), not SEQ-field based like
+    :func:`_is_figure_caption`/:func:`_is_table_caption` elsewhere in this
+    module -- see :func:`_is_caption_style`'s docstring for why. A paragraph
+    is treated as a caption when BOTH: its paragraph style name contains
+    "caption", AND its text (all ``<w:t>`` runs concatenated) begins with a
+    recognized "Fig."/"Figure"/"Table" label pattern. A "Caption"-styled
+    paragraph whose text doesn't match the label pattern (e.g. a stray blank
+    caption-styled paragraph) is silently skipped, not flagged -- this
+    function only checks captions it can positively identify, never guesses.
+
+    Two finding categories, each individually gated on its own policy key
+    being set to a non-"leave unchecked" value (``None``/"unspecified" means
+    "no verified rule for this key" -- skip that check entirely, exactly
+    like :func:`audit_equation_style`'s own ``equation_punctuation_required``
+    gate):
+
+      * ``caption_label_not_bold`` / ``caption_label_unexpectedly_bold`` --
+        the label text's runs are not ALL bold (or, symmetrically, ARE bold
+        when the policy expects non-bold), gated on
+        ``figure_caption_bold``/``table_caption_bold`` being non-``None``.
+        Only checks DIRECT run-level bold (see :func:`_run_is_bold`); does
+        not resolve style-inherited boldness.
+      * ``caption_label_punctuation_mismatch`` -- the character immediately
+        after the number doesn't match the expected
+        "period"/"colon"/"none", gated on
+        ``figure_caption_label_punctuation``/``table_caption_label_punctuation``
+        being something other than "unspecified".
+      * ``caption_terminal_punctuation_mismatch`` -- the LAST character of
+        the caption's full text doesn't match
+        ``figure_caption_terminal_punctuation``/``table_caption_terminal_punctuation``
+        (``None`` skips this check; ``""`` enforces "no trailing punctuation
+        at all"). Independent of the label-punctuation check above -- a
+        publisher can and does forbid both separately (JCSHM: no punctuation
+        after the number AND no punctuation ending the caption).
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style policy
+                     via :func:`resolve_style_policy`. Pass
+                     ``get_journal_style_preset("jcshm")`` (or any other
+                     preset name) directly, or a hand-written override dict.
+
+    Returns:
+      ``{docx_path, caption_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the file
+      cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+    w_r = _q(_W, "r")
+
+    # Reuse the SAME native>synth>positional three-tier id scheme
+    # document_content_tree / _find_para_by_id use (see _find_para_by_id's
+    # docstring), rather than inventing a caption-local one -- otherwise the
+    # para_id emitted here never matches the para_id build_document_review's
+    # `records` carry for the same paragraph (most real captions have a
+    # synth id, not a native w14:paraId), and the locator step downstream
+    # reports a spurious "not_found" for an otherwise-correct finding.
+    from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+
+    synth_map = _build_synth_id_map(body)
+
+    findings: list[dict[str, Any]] = []
+    caption_count = 0
+    punct_name_by_char = {".": "period", ":": "colon", "": "none"}
+
+    for index, p in enumerate(body):
+        if p.tag != w_p:
+            continue
+        ppr = p.find(w_pPr)
+        style: str | None = None
+        if ppr is not None:
+            pstyle = ppr.find(w_pStyle)
+            if pstyle is not None:
+                style = pstyle.get(w_val)
+        if not _is_caption_style(style):
+            continue
+
+        text = "".join(t.text or "" for t in p.iter(w_t))
+        m = _CAPTION_LABEL_RE.match(text.strip())
+        if not m:
+            continue
+
+        caption_count += 1
+        kind = "figure" if m.group(1).lower().startswith("fig") else "table"
+        # rstrip: when there's no label punctuation, _CAPTION_LABEL_RE's
+        # trailing \s* consumes the separator space before the caption's
+        # description text into group(0) (e.g. "Fig. 1 " for "Fig. 1
+        # Description..."). That space is not semantically part of the bold
+        # label -- it's the boundary between the bold label run and the
+        # normal-weight description run -- so it must NOT count toward
+        # label_len below, or the description's first (correctly non-bold)
+        # run gets blamed for "un-bolding" a single boundary space,
+        # producing a false caption_label_not_bold finding on every
+        # correctly-formatted caption in the document (caught exactly this
+        # way testing against the real JCSHM manuscript/SI: 17 and 71 false
+        # positives respectively before this rstrip was added).
+        label_text = m.group(0).rstrip()
+        punct_char = m.group(3)
+        para_id = p.get(_q(_W14, "paraId")) or synth_map.get(id(p)) or f"p{index}"
+
+        bold_key = "figure_caption_bold" if kind == "figure" else "table_caption_bold"
+        expected_bold = policy[bold_key]
+        if expected_bold is not None:
+            label_len = len(label_text)
+            covered = 0
+            all_bold = True
+            for r in p.findall(w_r):
+                rt = "".join(t.text or "" for t in r.findall(w_t))
+                if not rt:
+                    continue
+                take = min(len(rt), max(0, label_len - covered))
+                if take <= 0:
+                    break
+                if not _run_is_bold(r):
+                    all_bold = False
+                covered += take
+            actual_bold = all_bold and covered >= label_len
+            if actual_bold != expected_bold:
+                findings.append({
+                    "type": "caption_label_not_bold" if expected_bold else "caption_label_unexpectedly_bold",
+                    "para_id": para_id,
+                    "index": index,
+                    "kind": kind,
+                    "label_text": label_text,
+                    "expected_bold": expected_bold,
+                    "actual_bold": actual_bold,
+                })
+
+        punct_key = (
+            "figure_caption_label_punctuation" if kind == "figure"
+            else "table_caption_label_punctuation"
+        )
+        expected_punct = policy[punct_key]
+        if expected_punct != "unspecified":
+            actual_punct = punct_name_by_char.get(punct_char, "none")
+            if actual_punct != expected_punct:
+                findings.append({
+                    "type": "caption_label_punctuation_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "kind": kind,
+                    "label_text": label_text,
+                    "expected_punctuation": expected_punct,
+                    "actual_punctuation": actual_punct,
+                })
+
+        # 8e2f4a17 -- SEPARATE from the label-punctuation check above: this
+        # checks the END of the caption's full text (e.g. the "." in "...for
+        # Each Comparison Method."), not the number label. A publisher can
+        # (and JCSHM does) forbid both independently -- see
+        # figure_caption_terminal_punctuation's docstring in
+        # resolve_style_policy for why these are two keys, not one.
+        term_key = (
+            "figure_caption_terminal_punctuation" if kind == "figure"
+            else "table_caption_terminal_punctuation"
+        )
+        expected_terminal = policy[term_key]
+        if expected_terminal is not None:
+            full_text = text.strip()
+            last_char = full_text[-1] if full_text else ""
+            actual_terminal = last_char if last_char in _HEADING_TERMINAL_PUNCT_CHARS else ""
+            if actual_terminal != expected_terminal:
+                findings.append({
+                    "type": "caption_terminal_punctuation_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "kind": kind,
+                    "caption_text": full_text[-80:],
+                    "expected_terminal_punctuation": expected_terminal,
+                    "actual_terminal_punctuation": actual_terminal,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "caption_count": caption_count,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+def audit_table_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """9c1a3fd2 -- audit every real, CAPTIONED content table (a Caption-
+    styled "Table N"/"Table SN" paragraph immediately followed -- possibly
+    after a run of blank spacer paragraphs -- by a <w:tbl>) for three
+    structural/style defects a real JCSHM manuscript+SI pair turned out to
+    have at real scale, none caught by any existing audit before this one.
+
+    Deliberately scoped to CAPTIONED tables only, via the same
+    :func:`_is_caption_style` + :data:`_CAPTION_LABEL_RE` text-and-style
+    detection :func:`audit_caption_style` uses -- NOT every ``<w:tbl>`` in
+    the document. A real document's table COUNT is dominated by
+    un-captioned equation-numbering layout tables (a JCSHM manuscript with
+    5 real content tables had 42 ``<w:tbl>`` elements total; the other 37
+    were equation rows -- see :func:`_match_table_numbered_row`), which
+    have entirely different, already-correct-by-construction formatting
+    needs and would swamp/misrepresent a caption-scoped audit if included.
+
+    Three finding types, in document order:
+
+      * ``table_misaligned`` -- the table's own ``<w:tblPr><w:jc>``
+        (missing == effectively "left", Word's own default) doesn't match
+        ``style_policy["table_alignment"]``. Gated on that key being
+        non-``None`` (a verified fact about ONE specific alignment), the
+        same "unverified means don't guess" discipline as every other
+        style-policy-gated check in this module.
+      * ``table_header_not_repeating`` -- the table's first row lacks
+        ``<w:tblHeader/>``, so it will NOT repeat at the top of a
+        page-break continuation (Word's "repeat header rows" feature).
+        Unconditional (not style-policy-gated) -- a structural correctness
+        property every real multi-row table wants regardless of journal,
+        not a style preference, mirroring :func:`audit_equation_style`'s
+        own unconditional ``equation_number_gap``/``duplicate_equation_number``
+        checks.
+      * ``blank_line_before_table`` -- one or more blank paragraphs sit
+        between the caption and the table it captions. Also unconditional:
+        the Caption style already carries its own non-zero spacing-after
+        in every real document checked, so a manual blank paragraph on top
+        of that is redundant double-spacing, not a style choice -- found
+        in 32/32 SI tables (0/5 manuscript tables) in the same real
+        document pair this function was built against.
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style
+                     policy via :func:`resolve_style_policy`. Pass
+                     ``get_journal_style_preset("jcshm")`` (or any other
+                     preset name) directly, or a hand-written override
+                     dict.
+
+    Returns:
+      ``{docx_path, table_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the
+      file cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_tbl = _q(_W, "tbl")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+    w_tr = _q(_W, "tr")
+    w_trPr = _q(_W, "trPr")
+    w_tblHeader = _q(_W, "tblHeader")
+    w_tblPr = _q(_W, "tblPr")
+    w_jc = _q(_W, "jc")
+
+    children = list(body)
+
+    def _para_text(p: ET.Element) -> str:
+        return "".join(t.text or "" for t in p.iter(w_t))
+
+    def _is_blank_p(el: ET.Element) -> bool:
+        return el.tag == w_p and not _para_text(el).strip()
+
+    findings: list[dict[str, Any]] = []
+    table_count = 0
+
+    for index, el in enumerate(children):
+        if el.tag != w_p:
+            continue
+        ppr = el.find(w_pPr)
+        style: str | None = None
+        if ppr is not None:
+            pstyle = ppr.find(w_pStyle)
+            if pstyle is not None:
+                style = pstyle.get(w_val)
+        if not _is_caption_style(style):
+            continue
+        text = _para_text(el).strip()
+        m = _CAPTION_LABEL_RE.match(text)
+        if not m or not m.group(1).lower().startswith("table"):
+            continue
+
+        # Find the table this caption belongs to: skip any run of blank
+        # spacer paragraphs immediately after the caption, then require a
+        # <w:tbl> -- a caption not immediately (module blanks) followed by
+        # a table isn't this audit's business (e.g. a table referenced only
+        # in body prose, or one this scan's simple adjacency rule can't
+        # safely attribute).
+        j = index + 1
+        blanks_skipped = 0
+        while j < len(children) and _is_blank_p(children[j]):
+            blanks_skipped += 1
+            j += 1
+        if j >= len(children) or children[j].tag != w_tbl:
+            continue
+        tbl = children[j]
+        table_count += 1
+        para_id = el.get(_q(_W14, "paraId")) or f"p{index}"
+
+        if blanks_skipped > 0:
+            findings.append({
+                "type": "blank_line_before_table",
+                "para_id": para_id,
+                "index": index,
+                "blank_paragraph_count": blanks_skipped,
+            })
+
+        first_tr = tbl.find(w_tr)
+        has_header = False
+        if first_tr is not None:
+            trpr = first_tr.find(w_trPr)
+            has_header = trpr is not None and trpr.find(w_tblHeader) is not None
+        if first_tr is not None and not has_header:
+            findings.append({
+                "type": "table_header_not_repeating",
+                "para_id": para_id,
+                "index": index,
+            })
+
+        expected_alignment = policy["table_alignment"]
+        if expected_alignment is not None:
+            tblpr = tbl.find(w_tblPr)
+            jc = tblpr.find(w_jc) if tblpr is not None else None
+            actual_alignment = jc.get(w_val) if jc is not None else None
+            if actual_alignment != expected_alignment:
+                findings.append({
+                    "type": "table_misaligned",
+                    "para_id": para_id,
+                    "index": index,
+                    "expected_alignment": expected_alignment,
+                    "actual_alignment": actual_alignment,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "table_count": table_count,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+def audit_heading_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """df716454 -- audit every heading paragraph (levels 1-3, via
+    :func:`_is_heading` + :func:`_heading_level`) for two families of
+    publisher-style defects, neither caught by any existing audit before
+    this one:
+
+      * ``heading_spacing_before_mismatch`` / ``heading_spacing_after_mismatch``
+        -- the heading paragraph's own ``<w:pPr><w:spacing w:before/w:after>``
+        (missing == unset, Word's own default) doesn't match
+        ``style_policy["heading_spacing_before_h{level}_twips"]`` /
+        ``["heading_spacing_after_h{level}_twips"]``. Gated per-key/per-level
+        (``None`` == "no verified rule for this level/edge -- don't guess"),
+        same discipline as every other style-policy-gated check in this
+        module. Only checked for levels 1-3 -- no policy keys exist for
+        H4+ or for H0/title (title-style spacing is a document-wide STYLE
+        DEFINITION property, checked separately by
+        :func:`audit_cross_document_consistency`, not a per-paragraph one).
+      * ``heading_terminal_punctuation_mismatch`` -- the READ-ONLY
+        counterpart to :func:`_apply_heading_terminal_punctuation`, which is
+        write-time-only (only fires when :func:`write_section` authors a NEW
+        heading -- an existing document's already-wrong headings were never
+        flagged before this). Reuses :func:`_apply_heading_terminal_punctuation`
+        itself rather than reimplementing its
+        :data:`_HEADING_TERMINAL_PUNCT_CHARS` stripping rule a second time:
+        a heading's current text is fed through the SAME normalization
+        :func:`write_section` would apply, and a finding is raised iff that
+        would actually change the text. Gated on
+        ``style_policy["heading_terminal_punctuation"]`` being non-``None``.
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style
+                     policy via :func:`resolve_style_policy`. Pass
+                     ``get_journal_style_preset("jcshm")`` (or any other
+                     preset name) directly, or a hand-written override
+                     dict.
+
+    Returns:
+      ``{docx_path, heading_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the file
+      cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+    w_spacing = _q(_W, "spacing")
+    w_before = _q(_W, "before")
+    w_after = _q(_W, "after")
+
+    def _twips_attr(value: str | None) -> int | None:
+        if value is None:
+            return None
+        stripped = value.lstrip("-")
+        return int(value) if stripped.isdigit() else None
+
+    findings: list[dict[str, Any]] = []
+    heading_count = 0
+
+    # df716454 -- parsed ONCE per document (not per heading) so that a
+    # heading with no direct <w:pPr>/<w:spacing> override can still resolve
+    # its EFFECTIVE spacing by cascading up its named style's w:basedOn
+    # chain, instead of the actual value being incorrectly treated as
+    # None/"unset" just because it lives in the style definition rather
+    # than as a direct per-paragraph override. See
+    # _effective_spacing_from_chain for the cascade-resolution rule.
+    styles_chain = _parse_styles_xml_chain(_raw)
+
+    for index, p in enumerate(body):
+        if p.tag != w_p:
+            continue
+        ppr = p.find(w_pPr)
+        style: str | None = None
+        if ppr is not None:
+            pstyle = ppr.find(w_pStyle)
+            if pstyle is not None:
+                style = pstyle.get(w_val)
+        if not _is_heading(style):
+            continue
+
+        heading_count += 1
+        level = _heading_level(style)
+        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        text = "".join(t.text or "" for t in p.iter(w_t))
+
+        if 1 <= level <= 3:
+            spacing = ppr.find(w_spacing) if ppr is not None else None
+            direct_before = _twips_attr(spacing.get(w_before) if spacing is not None else None)
+            direct_after = _twips_attr(spacing.get(w_after) if spacing is not None else None)
+            # A direct per-paragraph override always wins; only fall back to
+            # the cascaded style-chain value for whichever edge (before/
+            # after) has NO direct override of its own -- each edge
+            # resolves independently, matching how Word itself cascades
+            # w:before and w:after as separate properties.
+            cascaded_before = cascaded_after = None
+            if direct_before is None or direct_after is None:
+                cascaded_before, cascaded_after = _effective_spacing_from_chain(
+                    styles_chain, style,
+                )
+            actual_before = direct_before if direct_before is not None else cascaded_before
+            actual_after = direct_after if direct_after is not None else cascaded_after
+
+            expected_before = policy[f"heading_spacing_before_h{level}_twips"]
+            if expected_before is not None and actual_before != expected_before:
+                findings.append({
+                    "type": "heading_spacing_before_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "level": level,
+                    "expected_spacing_before_twips": expected_before,
+                    "actual_spacing_before_twips": actual_before,
+                })
+
+            expected_after = policy[f"heading_spacing_after_h{level}_twips"]
+            if expected_after is not None and actual_after != expected_after:
+                findings.append({
+                    "type": "heading_spacing_after_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "level": level,
+                    "expected_spacing_after_twips": expected_after,
+                    "actual_spacing_after_twips": actual_after,
+                })
+
+        expected_terminal = policy["heading_terminal_punctuation"]
+        if expected_terminal is not None:
+            normalized = _apply_heading_terminal_punctuation(text, policy)
+            if normalized != text:
+                findings.append({
+                    "type": "heading_terminal_punctuation_mismatch",
+                    "para_id": para_id,
+                    "index": index,
+                    "level": level,
+                    "heading_text": text,
+                    "expected_heading_text": normalized,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "heading_count": heading_count,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+def _parse_styles_xml_chain(raw: bytes) -> dict[str, dict[str, Any]] | None:
+    """df716454 -- parse ``word/styles.xml`` ONCE into a reusable
+    ``{style_id: {"based_on": <style_id str | None>,
+    "spacing_before_twips": <int | None>,
+    "spacing_after_twips": <int | None>}}`` map, plus a synthetic ``""``
+    (empty-string) key holding ``<w:docDefaults>``'s own paragraph spacing --
+    Word's final fallback when neither a paragraph nor any style in its
+    ``w:basedOn`` chain sets an edge.
+
+    Backing primitive for :func:`_effective_spacing_from_chain`, which walks
+    the ``based_on`` links this returns to resolve one style's EFFECTIVE
+    (cascaded) spacing. Kept separate from :func:`_style_definition_facts`
+    (which reads one style's OWN direct definition, for
+    :func:`audit_cross_document_consistency`'s different
+    diff-two-documents purpose) because chain resolution needs the
+    ``w:basedOn`` link that helper never reads, and because parsing once per
+    document -- not once per heading paragraph -- matters for a document
+    with many headings.
+
+    Returns ``None`` when ``word/styles.xml`` is absent from the package or
+    malformed -- callers must never guess a cascaded value for a document
+    they can't positively read, mirroring every other "unverified means
+    don't check" gate in this module.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            if "word/styles.xml" not in zf.namelist():
+                return None
+            data = zf.read("word/styles.xml")
+    except zipfile.BadZipFile:
+        return None
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return None
+
+    w_style = _q(_W, "style")
+    w_styleId_attr = _q(_W, "styleId")
+    w_basedOn = _q(_W, "basedOn")
+    w_pPr = _q(_W, "pPr")
+    w_spacing = _q(_W, "spacing")
+    w_before = _q(_W, "before")
+    w_after = _q(_W, "after")
+    w_val = _q(_W, "val")
+    w_docDefaults = _q(_W, "docDefaults")
+    w_pPrDefault = _q(_W, "pPrDefault")
+
+    def _spacing_from_ppr(ppr: ET.Element | None) -> tuple[int | None, int | None]:
+        if ppr is None:
+            return None, None
+        spacing = ppr.find(w_spacing)
+        if spacing is None:
+            return None, None
+        before_raw = spacing.get(w_before)
+        after_raw = spacing.get(w_after)
+        before = (
+            int(before_raw)
+            if before_raw is not None and before_raw.lstrip("-").isdigit()
+            else None
+        )
+        after = (
+            int(after_raw)
+            if after_raw is not None and after_raw.lstrip("-").isdigit()
+            else None
+        )
+        return before, after
+
+    chain: dict[str, dict[str, Any]] = {}
+    for style in root.iter(w_style):
+        style_id = style.get(w_styleId_attr)
+        if not style_id:
+            continue
+        based_on_el = style.find(w_basedOn)
+        based_on = based_on_el.get(w_val) if based_on_el is not None else None
+        before, after = _spacing_from_ppr(style.find(w_pPr))
+        chain[style_id] = {
+            "based_on": based_on,
+            "spacing_before_twips": before,
+            "spacing_after_twips": after,
+        }
+
+    doc_defaults_before = doc_defaults_after = None
+    doc_defaults_el = root.find(w_docDefaults)
+    if doc_defaults_el is not None:
+        ppr_default_el = doc_defaults_el.find(w_pPrDefault)
+        if ppr_default_el is not None:
+            doc_defaults_before, doc_defaults_after = _spacing_from_ppr(
+                ppr_default_el.find(w_pPr)
+            )
+    chain[""] = {
+        "based_on": None,
+        "spacing_before_twips": doc_defaults_before,
+        "spacing_after_twips": doc_defaults_after,
+    }
+    return chain
+
+
+def _effective_spacing_from_chain(
+    chain: dict[str, dict[str, Any]] | None,
+    style_id: str | None,
+    max_depth: int = 20,
+) -> tuple[int | None, int | None]:
+    """df716454 -- resolve ``style_id``'s EFFECTIVE (cascaded) paragraph
+    ``w:spacing`` before/after, walking ``chain`` (from
+    :func:`_parse_styles_xml_chain`) up ``w:basedOn`` links. Each edge
+    (before / after) is resolved INDEPENDENTLY -- Word cascades each one up
+    its own nearest ancestor that sets it, not as a single all-or-nothing
+    unit, so a style that sets only ``w:before`` still lets ``w:after``
+    keep walking past it. Falls back to the chain's ``""`` (docDefaults)
+    entry when neither ``style_id`` nor any ancestor sets an edge.
+
+    Returns ``(None, None)`` when ``chain`` is ``None`` (no readable
+    ``word/styles.xml``) or ``style_id`` is falsy -- "unverified means don't
+    guess", the same contract as :func:`_style_definition_facts`.
+    ``max_depth`` guards against a malformed/cyclic ``w:basedOn`` chain
+    (an authoring bug in the document, not something this resolver should
+    hang on) rather than being a normally-reached limit.
+    """
+    if not chain or not style_id:
+        return None, None
+
+    before = after = None
+    seen: set[str] = set()
+    current: str | None = style_id
+    depth = 0
+    while current and current not in seen and depth < max_depth:
+        seen.add(current)
+        entry = chain.get(current)
+        if entry is None:
+            break
+        if before is None:
+            before = entry["spacing_before_twips"]
+        if after is None:
+            after = entry["spacing_after_twips"]
+        if before is not None and after is not None:
+            return before, after
+        current = entry["based_on"]
+        depth += 1
+
+    doc_defaults = chain.get("")
+    if doc_defaults is not None:
+        if before is None:
+            before = doc_defaults["spacing_before_twips"]
+        if after is None:
+            after = doc_defaults["spacing_after_twips"]
+    return before, after
+
+
+def _style_definition_facts(raw: bytes, style_id_or_name: str) -> dict[str, Any] | None:
+    """df716454 -- read ``word/styles.xml`` and return a compact fact-set for
+    ONE named/keyed paragraph or character style definition: ``{style_id,
+    style_name, spacing_before_twips, spacing_after_twips, font_family,
+    font_size_pt}``.
+
+    Matches by ``w:styleId`` first (exact, case-insensitive), then by
+    ``<w:name w:val=...>`` (case-insensitive substring) as a fallback -- the
+    same two-tier "exact id, then tolerant name" approach
+    :func:`_is_caption_style`/:func:`_is_heading` use for style-name
+    tolerance elsewhere in this module. Returns ``None`` when no style in
+    ``word/styles.xml`` matches, or ``word/styles.xml`` itself is
+    absent/malformed/missing from the package -- callers must never guess a
+    fact for a style they can't positively find, mirroring every other
+    "unverified means don't check" gate in this module.
+
+    Backing helper for :func:`audit_cross_document_consistency`; not an MCP
+    tool itself (private, matching :func:`_docx_style_count`'s own
+    not-a-tool styles.xml reader right above it in this module).
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            if "word/styles.xml" not in zf.namelist():
+                return None
+            data = zf.read("word/styles.xml")
+    except zipfile.BadZipFile:
+        return None
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return None
+
+    w_style = _q(_W, "style")
+    w_styleId_attr = _q(_W, "styleId")
+    w_name = _q(_W, "name")
+    w_val = _q(_W, "val")
+    w_pPr = _q(_W, "pPr")
+    w_rPr = _q(_W, "rPr")
+    w_spacing = _q(_W, "spacing")
+    w_before = _q(_W, "before")
+    w_after = _q(_W, "after")
+    w_rFonts = _q(_W, "rFonts")
+    w_ascii = _q(_W, "ascii")
+    w_sz = _q(_W, "sz")
+
+    target = style_id_or_name.strip().lower()
+    match: ET.Element | None = None
+    for style in root.iter(w_style):
+        style_id = style.get(w_styleId_attr) or ""
+        if style_id.strip().lower() == target:
+            match = style
+            break
+    if match is None:
+        for style in root.iter(w_style):
+            name_el = style.find(w_name)
+            name_val = (name_el.get(w_val) if name_el is not None else None) or ""
+            if target and target in name_val.strip().lower():
+                match = style
+                break
+    if match is None:
+        return None
+
+    style_id = match.get(w_styleId_attr)
+    name_el = match.find(w_name)
+    style_name = name_el.get(w_val) if name_el is not None else None
+
+    spacing_before = spacing_after = None
+    ppr = match.find(w_pPr)
+    if ppr is not None:
+        spacing = ppr.find(w_spacing)
+        if spacing is not None:
+            before_raw = spacing.get(w_before)
+            after_raw = spacing.get(w_after)
+            if before_raw is not None and before_raw.lstrip("-").isdigit():
+                spacing_before = int(before_raw)
+            if after_raw is not None and after_raw.lstrip("-").isdigit():
+                spacing_after = int(after_raw)
+
+    font_family = font_size_pt = None
+    rpr = match.find(w_rPr)
+    if rpr is not None:
+        rfonts = rpr.find(w_rFonts)
+        if rfonts is not None:
+            font_family = rfonts.get(w_ascii)
+        sz = rpr.find(w_sz)
+        if sz is not None:
+            sz_raw = sz.get(w_val)
+            if sz_raw is not None and sz_raw.isdigit():
+                font_size_pt = int(sz_raw) / 2
+
+    return {
+        "style_id": style_id,
+        "style_name": style_name,
+        "spacing_before_twips": spacing_before,
+        "spacing_after_twips": spacing_after,
+        "font_family": font_family,
+        "font_size_pt": font_size_pt,
+    }
+
+
+def _resolve_style_facts_by_candidates(
+    raw: bytes, candidates: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """df716454 -- try each of ``candidates`` (style id or name) in turn via
+    :func:`_style_definition_facts`, returning the first match. Real
+    documents name the same conceptual style differently (``"Normal"`` vs a
+    custom ``"BodyText"``), so callers pass every plausible id/name rather
+    than assuming one.
+    """
+    for candidate in candidates:
+        facts = _style_definition_facts(raw, candidate)
+        if facts is not None:
+            return facts
+    return None
+
+
+#: df716454 -- style-id/name candidates for the document's body-text style,
+#: shared between _CROSS_DOC_STYLE_TARGETS below and the direct
+#: policy-comparison loop in audit_cross_document_consistency.
+_BODY_TEXT_STYLE_CANDIDATES: tuple[str, ...] = ("Normal", "BodyText")
+
+#: df716454 -- the fixed set of style-definition facts
+#: audit_cross_document_consistency diffs between two documents. Each entry
+#: names the style-id/name candidates to try (see
+#: _resolve_style_facts_by_candidates) and which _style_definition_facts
+#: fields are meaningful to compare for that style (spacing for
+#: title/figure-image styles -- layout facts; font family/size for the
+#: body-text style -- typography facts).
+_CROSS_DOC_STYLE_TARGETS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "title_style",
+        "candidates": ("Heading0", "Title"),
+        "compare_fields": ("spacing_before_twips", "spacing_after_twips"),
+    },
+    {
+        "key": "body_text_style",
+        "candidates": _BODY_TEXT_STYLE_CANDIDATES,
+        "compare_fields": ("font_family", "font_size_pt"),
+    },
+    {
+        "key": "figure_image_style",
+        "candidates": ("FigureImage",),
+        "compare_fields": ("spacing_before_twips", "spacing_after_twips"),
+    },
+)
+
+
+def audit_cross_document_consistency(
+    manuscript_path: str,
+    si_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """df716454 -- diff specific STYLE-DEFINITION values (``word/styles.xml``,
+    not paragraph instances) between a manuscript and its Supplementary
+    Information companion document, and separately check the body-text
+    style's font against the resolved ``style_policy``.
+
+    Genuinely new SHAPE versus every other ``audit_*`` function in this
+    module: those each take exactly one ``docx_path`` and are read-only over
+    ONE document's paragraph/table content. This one takes TWO paths and
+    compares STYLE DEFINITIONS, not paragraph instances -- there is
+    therefore no natural ``para_id`` to attach to a finding, and no locator
+    to resolve: :func:`build_document_review`'s own locator-resolution loop
+    (``_resolve_anchor_query``) operates against ONE parsed document at a
+    time, and a style definition isn't anchored to any single paragraph
+    anyway (many paragraphs across a document can share one style). This
+    function's return still matches the same finding-report SHAPE every
+    other audit uses (``findings`` / ``finding_count`` / ``findings_by_type``
+    / ``policy``) so a caller can compose it the same way, but each finding
+    carries either ``document`` (which of the two files: ``"manuscript"`` or
+    ``"si"``) for a policy-comparison finding, or both
+    ``manuscript_style_id``/``si_style_id`` for a cross-document mismatch --
+    never a fabricated ``para_id``/``locator``.
+
+    Two finding families:
+
+      * ``cross_document_style_mismatch`` -- for each of three fixed style
+        targets (title/``Heading0`` spacing, body-text font, ``FigureImage``
+        spacing -- see :data:`_CROSS_DOC_STYLE_TARGETS`), when the SAME
+        conceptual style is found (by id or name, tolerant of renaming) in
+        BOTH documents, its relevant fields are compared; a difference is a
+        finding. A style found in only one document (or neither) is silently
+        skipped for that target -- this function only compares facts it can
+        positively find in both files, never guesses.
+      * ``body_text_font_family_mismatch`` / ``body_text_font_size_mismatch``
+        -- the body-text style's font, checked INDEPENDENTLY against
+        ``style_policy["body_text_font_family"]``/``["body_text_font_size_pt"]``
+        in EACH document separately (not just against each other) --
+        catches the real motivating case this function was built for: a
+        real JCSHM SI whose ``BodyText``/``Normal`` style was 12pt against
+        JCSHM's own stated "10-point Times Roman" guideline, a mismatch
+        that would NOT necessarily show up as a manuscript-vs-SI diff if
+        the manuscript itself happened to also be wrong. Gated on the
+        corresponding policy key being non-``None``/``"unspecified"``, same
+        discipline as every other style-policy-gated check in this module.
+
+    Args:
+      manuscript_path: Absolute path to the manuscript .docx. Read-only.
+      si_path:          Absolute path to the Supplementary Information
+                        .docx. Read-only.
+      style_policy:     Optional overrides merged onto the default style
+                        policy via :func:`resolve_style_policy`. Pass
+                        ``get_journal_style_preset("jcshm")`` directly, or a
+                        hand-written override dict.
+
+    Returns:
+      ``{manuscript_path, si_path, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when either
+      file cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        with open(manuscript_path, "rb") as handle:
+            manuscript_raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    try:
+        with open(si_path, "rb") as handle:
+            si_raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    findings: list[dict[str, Any]] = []
+
+    for target in _CROSS_DOC_STYLE_TARGETS:
+        manuscript_facts = _resolve_style_facts_by_candidates(manuscript_raw, target["candidates"])
+        si_facts = _resolve_style_facts_by_candidates(si_raw, target["candidates"])
+        if manuscript_facts is None or si_facts is None:
+            continue
+        for field in target["compare_fields"]:
+            manuscript_value = manuscript_facts.get(field)
+            si_value = si_facts.get(field)
+            if manuscript_value is None or si_value is None:
+                continue
+            if manuscript_value != si_value:
+                findings.append({
+                    "type": "cross_document_style_mismatch",
+                    "style_key": target["key"],
+                    "field": field,
+                    "manuscript_style_id": manuscript_facts.get("style_id"),
+                    "si_style_id": si_facts.get("style_id"),
+                    "manuscript_value": manuscript_value,
+                    "si_value": si_value,
+                })
+
+    expected_family = policy["body_text_font_family"]
+    expected_size = policy["body_text_font_size_pt"]
+    if expected_family is not None or expected_size is not None:
+        for label, raw in (("manuscript", manuscript_raw), ("si", si_raw)):
+            facts = _resolve_style_facts_by_candidates(raw, _BODY_TEXT_STYLE_CANDIDATES)
+            if facts is None:
+                continue
+            actual_family = facts.get("font_family")
+            if expected_family is not None and actual_family is not None and actual_family != expected_family:
+                findings.append({
+                    "type": "body_text_font_family_mismatch",
+                    "document": label,
+                    "style_id": facts.get("style_id"),
+                    "expected_font_family": expected_family,
+                    "actual_font_family": actual_family,
+                })
+            actual_size = facts.get("font_size_pt")
+            if expected_size is not None and actual_size is not None and actual_size != expected_size:
+                findings.append({
+                    "type": "body_text_font_size_mismatch",
+                    "document": label,
+                    "style_id": facts.get("style_id"),
+                    "expected_font_size_pt": expected_size,
+                    "actual_font_size_pt": actual_size,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "manuscript_path": manuscript_path,
+        "si_path": si_path,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+def audit_manuscript_structure(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """docs-intel-jcshm-linter-gap-cleanup-20260918 -- audit the manuscript's
+    Abstract word count and Keywords count against
+    ``style_policy["abstract_word_count_min"/"_max"]`` /
+    ``["keyword_count_min"/"_max"]``. Neither fact was checked by any
+    tooling in this module before this: JCSHM's own live submission
+    guidelines state both as explicit, numeric, unambiguous rules (Abstract
+    150-250 words, 4-6 Keywords) that this project's own manuscript was
+    never automatically verified against.
+
+    Section location is TEXT-pattern based, the same general discipline
+    :func:`document_outline`/:func:`_assign_section_types` use for
+    front-matter classification, but with its OWN dedicated pattern
+    (:data:`_ABSTRACT_HEADING_ONLY_RE`) rather than the broader
+    :data:`_ABSTRACT_RE` those functions use -- an "Abstract" heading here
+    is any heading paragraph (:func:`_is_heading`) whose text matches
+    :data:`_ABSTRACT_HEADING_ONLY_RE` (deliberately narrower than
+    :data:`_ABSTRACT_RE`, which also matches "Summary"/"Preface"/
+    "Acknowledgements"/etc. for the DIFFERENT purpose of front-matter
+    region classification -- reusing it here would have this function treat
+    an early "Acknowledgements" or "Summary" heading in a document with no
+    literal "Abstract" heading as if it WERE the Abstract, checking its word
+    count against the same 150-250 rule; see :data:`_ABSTRACT_HEADING_ONLY_RE`'s
+    own comment). The Abstract's body is every non-heading paragraph
+    between that heading and the next heading (any level) OR a recognised
+    "Keywords" line, whichever comes first. JCSHM's own convention puts the
+    Keywords line immediately after the Abstract body, inside the same
+    section (no heading of its own) -- so it is located the same
+    text-pattern way (:data:`_KEYWORDS_LABEL_RE`), not assumed to be a
+    heading either.
+
+    Two independently-gated finding types (``None`` bound == "no verified
+    rule for that bound -- don't check it"), each only raised when the
+    corresponding section was actually found (a document with no locatable
+    Abstract heading, or no locatable Keywords line, produces NO finding for
+    that half -- this function never guesses a count for something it could
+    not find, matching every other check in this module):
+
+      * ``abstract_word_count_out_of_range`` -- the Abstract body's
+        whitespace-split word count falls outside
+        ``[abstract_word_count_min, abstract_word_count_max]`` (either bound
+        may be ``None`` to leave that side unchecked).
+      * ``keyword_count_out_of_range`` -- the number of comma/semicolon-
+        separated terms on the Keywords line falls outside
+        ``[keyword_count_min, keyword_count_max]``.
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style
+                     policy via :func:`resolve_style_policy`. Pass
+                     ``get_journal_style_preset("jcshm")`` (or any other
+                     preset name) directly, or a hand-written override
+                     dict.
+
+    Returns:
+      ``{docx_path, abstract_word_count, keyword_count, findings,
+      finding_count, findings_by_type, policy}`` (either count is ``None``
+      when its section could not be located) or ``{"error": <message>}``
+      when the file cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_pPr = _q(_W, "pPr")
+    w_pStyle = _q(_W, "pStyle")
+    w_val = _q(_W, "val")
+    w_t = _q(_W, "t")
+
+    paragraphs: list[tuple[str | None, str, str]] = []  # (style, text, para_id)
+    for index, p in enumerate(body):
+        if p.tag != w_p:
+            continue
+        ppr = p.find(w_pPr)
+        style: str | None = None
+        if ppr is not None:
+            pstyle = ppr.find(w_pStyle)
+            if pstyle is not None:
+                style = pstyle.get(w_val)
+        text = "".join(t.text or "" for t in p.iter(w_t))
+        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        paragraphs.append((style, text, para_id))
+
+    findings: list[dict[str, Any]] = []
+    abstract_word_count: int | None = None
+    keyword_count: int | None = None
+
+    abstract_heading_idx = next(
+        (
+            idx for idx, (style, text, _pid) in enumerate(paragraphs)
+            if _is_heading(style) and _ABSTRACT_HEADING_ONLY_RE.match(text.strip())
+        ),
+        None,
+    )
+
+    if abstract_heading_idx is not None:
+        abstract_para_id = paragraphs[abstract_heading_idx][2]
+        body_parts: list[str] = []
+        keywords_text: str | None = None
+        keywords_para_id: str | None = None
+
+        for style, text, para_id in paragraphs[abstract_heading_idx + 1:]:
+            if _is_heading(style):
+                break
+            stripped = text.strip()
+            km = _KEYWORDS_LABEL_RE.match(stripped)
+            if km:
+                keywords_text = stripped[km.end():]
+                keywords_para_id = para_id
+                break
+            body_parts.append(text)
+
+        abstract_full_text = " ".join(body_parts)
+        abstract_word_count = len(abstract_full_text.split())
+
+        min_words = policy["abstract_word_count_min"]
+        max_words = policy["abstract_word_count_max"]
+        if (min_words is not None and abstract_word_count < min_words) or (
+            max_words is not None and abstract_word_count > max_words
+        ):
+            findings.append({
+                "type": "abstract_word_count_out_of_range",
+                "para_id": abstract_para_id,
+                "actual_word_count": abstract_word_count,
+                "expected_min": min_words,
+                "expected_max": max_words,
+            })
+
+        if keywords_text is not None:
+            keyword_count = len([
+                term for term in re.split(r"[,;]", keywords_text) if term.strip()
+            ])
+            min_kw = policy["keyword_count_min"]
+            max_kw = policy["keyword_count_max"]
+            if (min_kw is not None and keyword_count < min_kw) or (
+                max_kw is not None and keyword_count > max_kw
+            ):
+                findings.append({
+                    "type": "keyword_count_out_of_range",
+                    "para_id": keywords_para_id,
+                    "actual_keyword_count": keyword_count,
+                    "expected_min": min_kw,
+                    "expected_max": max_kw,
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "abstract_word_count": abstract_word_count,
+        "keyword_count": keyword_count,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+# docs-intel-jcshm-linter-gap-cleanup-20260918 -- constants for
+# audit_reference_consistency below. JCSHM's numbered_bracket in-text
+# citation convention: "[7]", "[3, 5]", "[3-7]" (comma-separated list
+# and/or hyphen/en-dash/em-dash range, all inside one bracket pair).
+_INTEXT_CITATION_RE = re.compile(r"\[(\d+(?:\s*[-–—,]\s*\d+)*)\]")
+_CITATION_RANGE_SEP_RE = re.compile(r"[-–—]")
+# A reference-list entry's own literal printed number, when the document's
+# text carries one (JCSHM's numbered_bracket convention applies to the list
+# itself, not just in-text markers) -- e.g. "[12] Smith, J. et al. ...".
+_BIB_ENTRY_NUMBER_RE = re.compile(r"^\s*\[(\d+)\]")
+
+
+def _expand_citation_numbers(group_text: str) -> set[int]:
+    """Expand one in-text citation's bracket contents (e.g. ``"3, 5"`` or
+    ``"3-7"`` or ``"12"``) into the individual reference numbers it denotes.
+    Used only by :func:`audit_reference_consistency` -- not a general-
+    purpose citation parser, specific to JCSHM's numbered_bracket
+    convention."""
+    numbers: set[int] = set()
+    for part in group_text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bounds = _CITATION_RANGE_SEP_RE.split(part)
+        if len(bounds) == 2 and bounds[0].strip().isdigit() and bounds[1].strip().isdigit():
+            lo, hi = int(bounds[0]), int(bounds[1])
+            if lo <= hi:
+                numbers.update(range(lo, hi + 1))
+        elif part.isdigit():
+            numbers.add(int(part))
+    return numbers
+
+
+def audit_reference_consistency(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """docs-intel-jcshm-linter-gap-cleanup-20260918 -- audit reference-list
+    <-> in-text-citation consistency for JCSHM's numbered_bracket citation
+    style: every in-text numbered citation (e.g. "[7]", "[3, 5]", "[3-7]")
+    has a matching reference-list entry, every reference-list entry is
+    cited somewhere in the body, and the reference list's own printed
+    numbering is sequential 1..N with no gaps or duplicates. This session's
+    own manual pre-submission QA pass found a real problem here that no
+    automated check existed for before this.
+
+    Deliberately NOT built on top of :func:`sync_bibliography` (that
+    function reconciles CSL_CITATION complex-field / Zotero author-date
+    citations only -- a different mechanism from JCSHM's plain numbered-
+    bracket in-text markers) or :func:`find_references_to`/
+    :data:`_LITERAL_REF_ALIASES` (those cover Figure/Table/Equation
+    cross-references, not bibliography citations) -- neither mechanism
+    applies to this domain, confirmed by direct inspection before writing
+    this function. Reuses :func:`_find_references_heading` +
+    :func:`_bibliography_entries_range` to locate the reference list itself,
+    the same way :func:`insert_bibliography_entry` already does.
+
+    Does NOT check citation first-appearance order (real published JCSHM
+    articles are genuinely mixed on that convention per this session's own
+    sampling) -- only the four structural facts below, all UNCONDITIONAL
+    (not style-policy-gated): a document either has a numbered reference
+    list that is internally consistent, or it has real, specific defects,
+    independent of any publisher style preference.
+
+      * ``reference_list_number_gap`` -- some integer between 1 and the
+        highest printed reference number has no corresponding entry.
+      * ``reference_list_duplicate_number`` -- the same printed reference
+        number appears on more than one entry.
+      * ``citation_missing_reference_entry`` -- an in-text citation number
+        has no reference-list entry with that number.
+      * ``reference_entry_never_cited`` -- a reference-list entry's number
+        is never cited anywhere in the body.
+
+    A reference-list entry's "printed number" is read from its own text
+    when it opens with a literal ``[N]`` marker (:data:`_BIB_ENTRY_NUMBER_RE`
+    -- JCSHM's numbered_bracket convention applied to the list itself, not
+    just in-text); an entry with no such literal marker (e.g. a Word
+    auto-numbered list with no cached literal digits in the XML) falls back
+    to its 1-based position among the list's non-empty entries --
+    positional numbering is trivially sequential by construction, so this
+    fallback can never itself manufacture a gap/duplicate finding; only the
+    cross-citation checks still meaningfully apply in that case.
+
+    A References/Bibliography heading that IS located but has ZERO
+    parseable entries after it (e.g. a heading immediately followed by the
+    next section, or by only blank paragraphs) still runs the two
+    cross-citation checks -- every in-text citation number then has no
+    matching entry by construction, which is itself flagged via
+    ``citation_missing_reference_entry`` rather than silently producing no
+    findings. Only the gap/duplicate checks are skipped in that case (they
+    are not meaningful with zero entries). A document with NO
+    References/Bibliography heading located AT ALL is the one case that
+    produces no findings whatsoever -- see the "no heading found" bullet
+    above.
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style
+                     policy via :func:`resolve_style_policy` (accepted for
+                     signature consistency with every other audit_*
+                     function in this module; no policy key currently gates
+                     any check here -- see the docstring above, these are
+                     structural facts, not style preferences).
+
+    Returns:
+      ``{docx_path, reference_count, citation_count, findings,
+      finding_count, findings_by_type, policy}`` or ``{"error": <message>}``
+      when the file cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_t = _q(_W, "t")
+
+    body_children = list(body)
+    heading_result = _find_references_heading(body)
+
+    ref_heading_idx: int | None = None
+    bib_start: int | None = None
+    bib_end: int | None = None
+    if heading_result is not None:
+        ref_heading_idx, _heading_el = heading_result
+        bib_start, bib_end = _bibliography_entries_range(body, ref_heading_idx)
+
+    cited_numbers: set[int] = set()
+    citation_first_para_id: dict[int, str] = {}
+
+    for index, p in enumerate(body_children):
+        if p.tag != w_p:
+            continue
+        if ref_heading_idx is not None and index == ref_heading_idx:
+            continue
+        if bib_start is not None and bib_start <= index < bib_end:
+            continue
+        text = "".join(t.text or "" for t in p.iter(w_t))
+        if "[" not in text:
+            continue
+        para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+        for m in _INTEXT_CITATION_RE.finditer(text):
+            for number in _expand_citation_numbers(m.group(1)):
+                cited_numbers.add(number)
+                citation_first_para_id.setdefault(number, para_id)
+
+    entry_count = 0
+    reference_numbers: dict[int, str] = {}
+    duplicate_numbers: set[int] = set()
+    if bib_start is not None:
+        for index in range(bib_start, bib_end):
+            p = body_children[index]
+            if p.tag != w_p:
+                continue
+            text = "".join(t.text or "" for t in p.iter(w_t)).strip()
+            if not text:
+                continue
+            entry_count += 1
+            para_id = p.get(_q(_W14, "paraId")) or f"p{index}"
+            m = _BIB_ENTRY_NUMBER_RE.match(text)
+            number = int(m.group(1)) if m else entry_count
+            if number in reference_numbers:
+                duplicate_numbers.add(number)
+            else:
+                reference_numbers[number] = para_id
+
+    findings: list[dict[str, Any]] = []
+
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 code-review fix -- the
+    # cross-citation checks (citation_missing_reference_entry /
+    # reference_entry_never_cited) must run whenever a References/
+    # Bibliography heading was actually LOCATED (bib_start is not None),
+    # even if it turned out to contain zero parseable entries: that is
+    # itself a real defect (every in-text citation is then "missing"), not
+    # a reason to stay silent. Only the gap/duplicate checks genuinely
+    # require at least one numbered entry (``highest = max(reference_numbers)``
+    # would raise ValueError on an empty dict). Originally all four loops
+    # were nested under ``if reference_numbers:``, which -- confirmed by
+    # direct repro during this session's own review -- silently produced
+    # ZERO findings for a document with real in-text citations but an
+    # empty/heading-only reference list, exactly the "reports clean while a
+    # real defect exists" failure mode this whole cleanup exists to close.
+    # A document with NO References/Bibliography heading at all
+    # (``bib_start is None``) still deliberately produces no findings --
+    # "can't check consistency against a list that doesn't exist" -- see
+    # this function's own docstring and
+    # test_no_references_heading_found_produces_no_findings.
+    if bib_start is not None:
+        if reference_numbers:
+            highest = max(reference_numbers)
+            for missing in sorted(set(range(1, highest + 1)) - set(reference_numbers)):
+                findings.append({
+                    "type": "reference_list_number_gap",
+                    "para_id": None,
+                    "missing_number": missing,
+                })
+            for dup in sorted(duplicate_numbers):
+                findings.append({
+                    "type": "reference_list_duplicate_number",
+                    "para_id": reference_numbers[dup],
+                    "duplicate_number": dup,
+                })
+        for missing_entry in sorted(cited_numbers - set(reference_numbers)):
+            findings.append({
+                "type": "citation_missing_reference_entry",
+                "para_id": citation_first_para_id.get(missing_entry),
+                "citation_number": missing_entry,
+            })
+        for uncited in sorted(set(reference_numbers) - cited_numbers):
+            findings.append({
+                "type": "reference_entry_never_cited",
+                "para_id": reference_numbers[uncited],
+                "reference_number": uncited,
+            })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "reference_count": entry_count,
+        "citation_count": len(cited_numbers),
         "findings": findings,
         "finding_count": len(findings),
         "findings_by_type": findings_by_type,
@@ -12348,6 +14442,29 @@ _INTERNAL_NOTE_STYLE_DEFAULT = "MeridianInternalNote"
 _INTERNAL_NOTE_HIGHLIGHT_COLOR = "yellow"
 _INTERNAL_NOTE_BOOKMARK_PREFIX = "_MNote"
 _INTERNAL_NOTE_BOOKMARK_RE = re.compile(r"^_MNote(\d+)$")
+
+# docs-intel-journal-preset-externalization-20260918 -- built-in
+# journal-style-preset catalog (see _load_builtin_journal_style_presets and
+# the PROVENANCE comment above get_journal_style_preset, near the top of the
+# journal-style-preset section of this module, for the full picture). This
+# assignment deliberately lives HERE -- after _INTERNAL_NOTE_STYLE_DEFAULT /
+# _INTERNAL_NOTE_HIGHLIGHT_COLOR just above -- rather than up near
+# get_journal_style_preset itself: _load_builtin_journal_style_presets() now
+# calls resolve_style_policy() (and therefore _style_policy_defaults(),
+# which references those two constants) AT IMPORT TIME, fail-closed, so this
+# statement must execute at a point in the module's top-to-bottom load order
+# where they already exist as module globals. Every real caller reads
+# JOURNAL_STYLE_PRESETS / _JOURNAL_STYLE_PRESET_LOOKUP from inside a
+# function body (resolved at CALL time, long after the whole module has
+# finished importing), so this placement is invisible to all of them.
+JOURNAL_STYLE_PRESETS: dict[str, dict[str, Any]] = _load_builtin_journal_style_presets()
+
+# 4d0ca929 -- case-insensitive name -> canonical-key lookup, built once at
+# import time from JOURNAL_STYLE_PRESETS itself (never hand-maintained
+# separately, so it can't drift out of sync with the preset dict above).
+_JOURNAL_STYLE_PRESET_LOOKUP: dict[str, str] = {
+    name.lower(): name for name in JOURNAL_STYLE_PRESETS
+}
 
 # 563118d4 -- stale-note detection patterns. Deliberately broad: false
 # positives (flagging real prose that happens to contain "TBD") are cheap for
@@ -16086,6 +18203,12 @@ def insert_table(
                          on every column after column 0 ("data columns").
                          Both default to ``None`` (no ``w:jc`` added at all
                          -- byte-identical to pre-4544bbe5 behavior).
+                         9c1a3fd2 -- ``table_alignment`` sets the TABLE's own
+                         ``<w:tblPr><w:jc>`` (its position on the page --
+                         left/center/right/both), distinct from the two
+                         per-column keys above. Also defaults to ``None``
+                         (no ``w:jc`` at the table level -- Word's own
+                         default, left-aligned).
 
     Returns:
         ``{status, table_index, row_count, col_count, anchor_para_id,
@@ -16155,6 +18278,19 @@ def insert_table(
     ET.SubElement(tblPr, _q(_W, "tblStyle")).set(_q(_W, "val"), "TableGrid")
     ET.SubElement(tblPr, _q(_W, "tblW")).set(_q(_W, "w"), "0")
     tblPr.find(_q(_W, "tblW")).set(_q(_W, "type"), "auto")
+    # 9c1a3fd2 -- table_alignment must be added HERE, right after tblW and
+    # before tblGrid/rows are even built, not appended later: CT_TblPrBase
+    # requires w:jc to immediately follow w:tblW (before tblCellSpacing/
+    # tblInd/tblBorders/...). A real manuscript+SI pair caught this the hard
+    # way -- a first attempt at adding table centering (in a one-off script,
+    # not this function) inserted <w:jc> as tblPr's FIRST child instead,
+    # which Word's COM object model happened to tolerate on read, but is a
+    # real, avoidable schema violation; this function has never had this bug
+    # (it never wrote w:jc into tblPr at all before 9c1a3fd2), so get the
+    # position right from the start rather than bolt it on wrong and rely on
+    # readers being lenient.
+    if policy["table_alignment"] is not None:
+        ET.SubElement(tblPr, _q(_W, "jc")).set(_q(_W, "val"), policy["table_alignment"])
     tblGrid = ET.SubElement(tbl, _W_TBLGRID)
     for _ in range(cols):
         ET.SubElement(tblGrid, _W_GRIDCOL).set(_q(_W, "w"), str(col_width))
@@ -18304,12 +20440,15 @@ def search_document_xml(
     return results
 
 
-def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) -> bool:
-    run_text = _search_element_text(run)
-    if not run_text:
-        return False
-    if not any(re.search(re.escape(term), run_text, re.IGNORECASE) for term in terms):
-        return False
+def _set_run_highlight(run: ET.Element, color: str) -> None:
+    """Apply native ``<w:highlight w:val="color"/>`` to a single run's ``w:rPr``,
+    creating ``w:rPr`` first if the run doesn't already have one.
+
+    Extracted from :func:`_highlight_run_if_matching` so
+    :func:`_highlight_paragraph_runs` (an unconditional, whole-paragraph
+    variant used by :func:`flag_for_review`) shares the exact same
+    rPr/highlight-element construction instead of a second copy.
+    """
     r_pr = run.find(_q(_W, "rPr"))
     if r_pr is None:
         r_pr = ET.Element(_q(_W, "rPr"))
@@ -18318,7 +20457,34 @@ def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) ->
     if highlight is None:
         highlight = ET.SubElement(r_pr, _q(_W, "highlight"))
     highlight.set(_q(_W, "val"), color)
+
+
+def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) -> bool:
+    run_text = _search_element_text(run)
+    if not run_text:
+        return False
+    if not any(re.search(re.escape(term), run_text, re.IGNORECASE) for term in terms):
+        return False
+    _set_run_highlight(run, color)
     return True
+
+
+def _highlight_paragraph_runs(paragraph: ET.Element, color: str) -> int:
+    """Apply native ``<w:highlight>`` to EVERY run inside ``paragraph``,
+    unconditionally (no text-matching gate) -- the whole-paragraph-anchor
+    granularity :func:`flag_for_review` needs, mirroring the whole-paragraph
+    granularity :func:`insert_word_comment` already uses for its
+    ``commentRangeStart``/``commentRangeEnd`` markers.
+
+    Returns the number of runs highlighted (0 for an empty paragraph --
+    not an error; a caller may legitimately flag an empty placeholder
+    paragraph for review).
+    """
+    count = 0
+    for run in paragraph.iter(_q(_W, "r")):
+        _set_run_highlight(run, color)
+        count += 1
+    return count
 
 
 def highlight_document_matches(
@@ -18450,49 +20616,35 @@ def _next_word_comment_id(document_root: ET.Element, comments_root: ET.Element |
     return max(ids, default=-1) + 1
 
 
-def insert_word_comment(
-    docx_path: str,
+def _stage_word_comment(
+    raw: bytes,
+    root: ET.Element,
+    paragraph: ET.Element,
     text: str,
-    anchor_para_id: str,
-    author: str = "Meridian",
-    initials: str = "M",
-    allow_degraded_render: bool = False,
-    degraded_render_reason: str | None = None,
-) -> dict[str, Any]:
-    """Insert a real Word comment anchored to an existing paragraph.
+    author: str,
+    initials: str,
+) -> tuple[dict[str, bytes], int]:
+    """Build the ``updated_parts`` staging dict for ONE native Word comment
+    anchored to ``paragraph`` (already resolved by the caller), plus the
+    freshly-minted comment id.
 
-    ddd79188 follow-up -- once the comment parts are staged, verified
-    (ZIP/XML/relationship/media integrity via
-    :func:`_save_docx_with_new_parts_stdlib`), and promoted, a real Word/COM
-    (or LibreOffice) render-capability check also runs against the
-    just-written file (:func:`_enforce_render_verification`), mirroring the
-    same gate :func:`insert_figure_block` / :func:`merge_draft_into_canonical`
-    already enforce. ``allow_degraded_render`` / ``degraded_render_reason``
-    are the same audited opt-in those functions expose for the "no render
-    backend available in this environment" case.
+    Extracted verbatim out of :func:`insert_word_comment` (5bab074/W2-C, no
+    behavior change) so both it and :func:`flag_for_review` mint comment
+    ids, create-or-extend ``word/comments.xml``, and wire the
+    ``document.xml.rels`` relationship + ``[Content_Types].xml`` override
+    through the exact same code path, instead of a second, drift-prone copy
+    of this plumbing.
+
+    Mutates ``root``/``paragraph`` IN PLACE (splices in
+    ``commentRangeStart``/``commentRangeEnd``/``commentReference`` around
+    the paragraph's existing content) but does NOT write anything to disk --
+    the caller stages the returned ``updated_parts`` via
+    :func:`_save_docx_with_new_parts_stdlib` itself. This lets a caller that
+    also needs to mutate ``word/document.xml`` further before writing (e.g.
+    :func:`flag_for_review` applying a run highlight to the SAME paragraph)
+    fold every edit into ONE single-part write/verify/promote instead of two
+    separate ones.
     """
-    if not text or not str(text).strip():
-        return {"error": "text must be a non-empty string"}
-    if not author or not str(author).strip():
-        return {"error": "author must be a non-empty string"}
-    if allow_degraded_render and not (
-        degraded_render_reason and str(degraded_render_reason).strip()
-    ):
-        return {
-            "error": (
-                "degraded_render_reason is required and must be non-empty "
-                "when allow_degraded_render=True -- an audited degrade with "
-                "no stated reason is not auditable and is refused"
-            )
-        }
-    try:
-        raw, root = _load_docx_xml_stdlib(docx_path)
-    except (OSError, ValueError) as exc:
-        return {"error": str(exc)}
-    found = _find_para_by_id(root, anchor_para_id)
-    if found is None:
-        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
-    _body, paragraph, _child_index = found
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         comments_part = "word/comments.xml"
         try:
@@ -18592,6 +20744,59 @@ def insert_word_comment(
             b'<?xml version="1.0" encoding="UTF-8"?>\n'
             + ET.tostring(content_types_root, encoding="utf-8")
         )
+    return updated_parts, comment_id
+
+
+def insert_word_comment(
+    docx_path: str,
+    text: str,
+    anchor_para_id: str,
+    author: str = "Meridian",
+    initials: str = "M",
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """Insert a real Word comment anchored to an existing paragraph.
+
+    ddd79188 follow-up -- once the comment parts are staged, verified
+    (ZIP/XML/relationship/media integrity via
+    :func:`_save_docx_with_new_parts_stdlib`), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file (:func:`_enforce_render_verification`), mirroring the
+    same gate :func:`insert_figure_block` / :func:`merge_draft_into_canonical`
+    already enforce. ``allow_degraded_render`` / ``degraded_render_reason``
+    are the same audited opt-in those functions expose for the "no render
+    backend available in this environment" case.
+
+    The actual comment-part plumbing (id allocation, comments.xml
+    create-or-extend, rels/content-types wiring) lives in
+    :func:`_stage_word_comment`, shared with :func:`flag_for_review`.
+    """
+    if not text or not str(text).strip():
+        return {"error": "text must be a non-empty string"}
+    if not author or not str(author).strip():
+        return {"error": "author must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}
+    found = _find_para_by_id(root, anchor_para_id)
+    if found is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _body, paragraph, _child_index = found
+
+    updated_parts, comment_id = _stage_word_comment(raw, root, paragraph, text, author, initials)
+
     with _docx_promotion_lock(docx_path):
         try:
             _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
@@ -19006,6 +21211,37 @@ def _equation_pseudo_record(eq: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# 3f9a1c72 -- caption_label loose-prefix fallback for captions NOT tracked
+# by a real Word SEQ field. The strict caption_label match above (via
+# r["caption_label"], populated only for element_kind figure_caption/
+# table_caption -- see _is_figure_caption/_is_table_caption) requires an
+# actual "SEQ Figure"/"SEQ Table" field instruction in the paragraph. Many
+# real documents' Supplementary Information figures/tables are numbered on
+# a SEPARATE, manually-typed track ("Fig. S47", "Table S3") rather than
+# Word's own auto-numbering SEQ field -- those paragraphs have NO
+# caption_label at all in this scheme and were previously unreachable via
+# caption_label queries, forcing callers back to raw text search (or a
+# hand-rolled script) to find them. This normalizes whitespace/periods/
+# colons on both sides so "Fig. S47", "Fig S47", "FIG.S47:" all match the
+# same paragraph, but still requires the query to be a PREFIX of the
+# paragraph's own text (not merely present anywhere in it) -- matching the
+# "this caption's own leading label says exactly this" semantic
+# caption_label is meant to express, not a generic substring search wearing
+# a caption_label costume.
+_CAPTION_LABEL_NORMALIZE_RE = re.compile(r"[\s.:]+")
+
+
+def _normalize_caption_label_text(text: str) -> str:
+    return _CAPTION_LABEL_NORMALIZE_RE.sub(" ", (text or "").strip()).strip().casefold()
+
+
+def _leading_caption_label_matches(record_text: str, query_label: str) -> bool:
+    query_norm = _normalize_caption_label_text(query_label)
+    if not query_norm:
+        return False
+    return _normalize_caption_label_text(record_text).startswith(query_norm)
+
+
 def _resolve_anchor_query(
     records: list[dict[str, Any]],
     equations: list[dict[str, Any]],
@@ -19121,6 +21357,22 @@ def _resolve_anchor_query(
             parsed_candidate = _parse_caption_label(r["caption_label"])
             if parsed_query and parsed_candidate and parsed_query == parsed_candidate:
                 caption_candidates.append(r)
+        if not caption_candidates:
+            # 3f9a1c72 -- no real SEQ-field caption matched; fall back to a
+            # loose "this paragraph's own leading text starts with the
+            # query label" match (see _leading_caption_label_matches) so a
+            # manually-typed SI caption like "Fig. S47: ..." -- which never
+            # gets a caption_label from the strict SEQ-field path at all --
+            # is still reachable via caption_label instead of forcing a
+            # caller back to raw text search. Scoped to paragraph/caption
+            # element kinds only (never headings/tables/equations), so this
+            # stays a caption-shaped fallback rather than a generic text
+            # search under a different name.
+            caption_candidates = [
+                r for r in scope
+                if r.get("element_kind") in ("paragraph", "figure_caption", "table_caption")
+                and _leading_caption_label_matches(r.get("text") or "", str(caption_label_query))
+            ]
         if not caption_candidates:
             return _not_found_anchor_result(
                 f"no caption matched {caption_label_query!r}",
@@ -19283,6 +21535,468 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
     }
 
 
+def find_caption_paragraph(document_path: str, label: str) -> dict[str, Any]:
+    """3f9a1c72 -- named, discoverable entry point for "find the paragraph
+    whose caption label says exactly this" -- a pure, read-only delegation
+    to ``locate_anchor(document_path, {"caption_label": label})``.
+
+    Exists so a caller (or a future session under time pressure) reaches
+    for a real, obviously-named function instead of re-deriving caption
+    lookup from scratch with a hand-rolled document.xml string search --
+    the exact pattern that repeatedly produced throwaway scripts before
+    this item. Resolves BOTH real Word-numbered captions ("Figure 3",
+    "Table 2" -- via ``r"^\\s*(figure|table)\\s+(.+?)\\s*$"``-style SEQ-field
+    matching) AND manually-typed labels that never got a real ``SEQ``
+    field at all (e.g. Supplementary Information captions like "Fig. S47",
+    "Table S3" -- via :func:`_leading_caption_label_matches`'s loose,
+    prefix-anchored fallback, engaged only when no real SEQ-field caption
+    matches). See :func:`locate_anchor`'s own module-level query-key
+    contract comment for the full resolved-anchor result shape.
+
+    Args:
+      document_path: Document to search. Never opened for writing.
+      label:          The caption label to find, e.g. "Figure 3", "Table 2",
+                       "Fig. S47", "Table S3". Matched against the SAME
+                       normalization ``_parse_caption_label`` /
+                       :func:`_leading_caption_label_matches` already use
+                       (case-insensitive; punctuation/whitespace-insensitive
+                       for the fallback path).
+
+    Returns the SAME shape :func:`locate_anchor` returns: ``{status:
+    "resolved", target_para_id, element_type, ...}`` on a unique match,
+    ``{status: "ambiguous", candidates, ...}`` when more than one caption's
+    leading text matches the query, or ``{status: "not_found", ...}`` /
+    ``{"error": ...}``.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return {"error": "label must be a non-empty string"}
+    return locate_anchor(document_path, {"caption_label": label})
+
+
+# ---------------------------------------------------------------------------
+# 7c3e4b9a -- flag_for_review: the recurring "flag this spot for a human to
+# look at" pattern several editing sessions had to hand-roll every time as a
+# throwaway raw-zip script (open the .docx, string-replace inside
+# word/document.xml, create word/comments.xml from scratch by hand when the
+# document had none yet, re-zip, and hope nothing else broke) instead of
+# using a real, tested, reusable meridian-docs tool. This is that tool.
+#
+# ONE call does what previously took three: resolve an anchor (a raw
+# w14:paraId/synth id, OR a locate_anchor-style {section_path/section_text/
+# caption_label/text/...} query so a caller can flag "the paragraph
+# containing this phrase" without a separate lookup step), apply a native
+# <w:highlight> to every run in that paragraph, AND attach a real Word
+# comment explaining what needs attention -- anchored to that SAME
+# paragraph, in ONE atomic write.
+#
+# Deliberately reuses, rather than reimplements:
+#   - locate_anchor's own query resolution (the exact same read-only
+#     resolver plan_batch_transform/build_prose_edit_packet already build
+#     on) for the dict-query anchor form;
+#   - _stage_word_comment (the comment-id-allocation/comments.xml-create-or-
+#     extend/rels/content-types plumbing factored out of insert_word_comment
+#     itself, 5bab074/W2-C) for the comment half -- so a document with ZERO
+#     pre-existing comments and one that already has some are both handled
+#     by the exact same, already-covered code path, not a new copy of it;
+#   - _highlight_paragraph_runs (built on the same _set_run_highlight
+#     primitive highlight_document_matches uses) for the highlight half;
+#   - _save_docx_with_new_parts_stdlib + _docx_promotion_lock +
+#     _enforce_render_verification for the write itself -- the same staged
+#     verify-then-promote transaction, structural (ZIP/XML/relationship)
+#     integrity gate, and real Word/COM-or-LibreOffice render-capability
+#     check every other multi-part writer in this module already goes
+#     through. No fresh, unverified ElementTree round-trip.
+# ---------------------------------------------------------------------------
+
+
+def _verify_flag_write(
+    docx_path: str,
+    *,
+    comment_id: int,
+    expected_text: str,
+    anchor_para_id: str,
+    highlight_color: str,
+    expect_highlight: bool,
+) -> dict[str, Any] | None:
+    """Post-write verification for :func:`flag_for_review`, mirroring
+    :func:`_verify_note_write`'s "re-read fresh from disk, never trust the
+    in-memory tree that was just serialized" discipline.
+
+    Confirms, independently of the write path that produced them:
+
+      1. the target paragraph (re-resolved by ``anchor_para_id`` -- body
+         positions can shift, ids don't) carries a run with
+         ``<w:highlight w:val=highlight_color>`` whenever ``expect_highlight``
+         is True (the paragraph had at least one run to highlight at write
+         time);
+      2. that SAME paragraph -- not merely somewhere in the document --
+         carries a ``commentRangeStart``/``commentRangeEnd``/
+         ``commentReference`` trio for ``comment_id``;
+      3. ``word/comments.xml`` has a ``<w:comment w:id=comment_id>`` whose
+         text matches ``expected_text`` exactly.
+
+    Returns ``None`` when every check passes, or an ``{"error": ...}`` dict
+    on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    found = _find_para_by_id(root2, anchor_para_id)
+    if found is None:
+        return {
+            "error": (
+                "post-write verification failed: anchor paragraph "
+                f"{anchor_para_id!r} was not found in {docx_path} after "
+                "the write"
+            )
+        }
+    _body2, paragraph2, _idx2 = found
+    w_id = _q(_W, "id")
+    comment_id_str = str(comment_id)
+
+    if expect_highlight:
+        has_highlight = any(
+            highlight.get(_q(_W, "val")) == highlight_color
+            for run in paragraph2.iter(_q(_W, "r"))
+            for highlight in run.iter(_q(_W, "highlight"))
+        )
+        if not has_highlight:
+            return {
+                "error": (
+                    "post-write verification failed: no run in the anchor "
+                    f"paragraph ({anchor_para_id!r}) carries "
+                    f"<w:highlight w:val={highlight_color!r}> in "
+                    f"{docx_path} after the write"
+                )
+            }
+
+    has_start = any(
+        el.get(w_id) == comment_id_str
+        for el in paragraph2.iter(_q(_W, "commentRangeStart"))
+    )
+    has_end = any(
+        el.get(w_id) == comment_id_str
+        for el in paragraph2.iter(_q(_W, "commentRangeEnd"))
+    )
+    has_ref = any(
+        el.get(w_id) == comment_id_str
+        for el in paragraph2.iter(_q(_W, "commentReference"))
+    )
+    if not (has_start and has_end and has_ref):
+        return {
+            "error": (
+                "post-write verification failed: comment range markers for "
+                f"comment_id {comment_id} were not found anchored to "
+                f"paragraph {anchor_para_id!r} in {docx_path} after the "
+                "write"
+            )
+        }
+
+    try:
+        with zipfile.ZipFile(docx_path) as archive:
+            comments_part = "word/comments.xml"
+            try:
+                rels_root = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+                for relation in rels_root.findall(_q(_REL_NS, "Relationship")):
+                    if relation.get("Type") == _COMMENTS_REL_TYPE:
+                        target = relation.get("Target", "comments.xml").lstrip("/")
+                        comments_part = (
+                            target if target.startswith("word/") else f"word/{target}"
+                        )
+                        break
+            except (KeyError, ET.ParseError):
+                pass
+            comments_root = ET.fromstring(archive.read(comments_part))
+    except (OSError, KeyError, ET.ParseError, zipfile.BadZipFile) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read the "
+                f"comments part of {docx_path} after writing it: {exc}"
+            )
+        }
+
+    comment_el = next(
+        (
+            c for c in comments_root.findall(_q(_W, "comment"))
+            if c.get(w_id) == comment_id_str
+        ),
+        None,
+    )
+    if comment_el is None:
+        return {
+            "error": (
+                f"post-write verification failed: comment id {comment_id} "
+                f"not found in {docx_path}'s comments part after the write"
+            )
+        }
+    actual_text = "".join(t.text or "" for t in comment_el.iter(_q(_W, "t")))
+    if actual_text != expected_text:
+        return {
+            "error": (
+                "post-write verification failed: comment text mismatch "
+                f"(comment_id {comment_id}) (expected {expected_text!r}, "
+                f"got {actual_text!r})"
+            )
+        }
+    return None
+
+
+def flag_for_review(
+    docx_path: str,
+    anchor: str | dict[str, Any],
+    note: str,
+    highlight_color: str = "yellow",
+    author: str = "Meridian",
+    initials: str = "M",
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """7c3e4b9a -- flag a location in a .docx for human review: a native
+    ``<w:highlight>`` on every run of the anchored paragraph PLUS a real
+    Word comment explaining what needs attention, anchored to that same
+    paragraph, in ONE atomic write. See the module comment above this
+    function for the full "why this exists" writeup.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor:           Either a raw paragraph id (``str`` -- a native
+                        ``w14:paraId``, the ``sp<hash>`` synth id, or the
+                        legacy ``p{N}`` form -- same three schemes
+                        :func:`_find_para_by_id` already resolves), OR a
+                        ``dict`` :func:`locate_anchor`-style query (e.g.
+                        ``{"text": "..."}``, ``{"section_path": "3.2.4",
+                        "text": "..."}``, ``{"caption_label": "Figure 3"}``)
+                        resolved via a fresh, read-only :func:`locate_anchor`
+                        call before anything is written. A query that
+                        resolves ambiguously, to nothing, or to a table/
+                        table-cell element (paragraph-only tool) is refused
+                        with the full locator detail attached -- never
+                        guessed.
+      note:             The comment's text (must be non-empty).
+      highlight_color:  A native ``<w:highlight w:val="...">`` value --
+                        validated against the same
+                        :data:`_VALID_HIGHLIGHT_COLORS` allow-list
+                        :func:`resolve_style_policy` already enforces for
+                        ``note_highlight_color``. Default ``"yellow"``.
+      author, initials: Recorded on the Word comment, same as
+                        :func:`insert_word_comment`.
+      index_db_path:    If supplied, the sidecar's cached mtime is
+                        invalidated and the flag is recorded into the same
+                        ``docx_internal_notes`` table
+                        :func:`insert_highlighted_note`'s ``mode="comment"``
+                        path uses (so :func:`list_internal_notes` surfaces
+                        it too), under note id ``_MComment<comment_id>``.
+      allow_degraded_render / degraded_render_reason: the same audited
+                        opt-in :func:`insert_figure_block` /
+                        :func:`insert_word_comment` expose for "no render
+                        backend available in this environment" -- required
+                        together; see :func:`_enforce_render_verification`
+                        for the full three-state contract.
+
+    Returns ``{status: "flagged", comment_id, note_id, text, anchor_para_id,
+    element_type, section_path, highlighted_run_count, highlight_color,
+    author, initials, docx_path, source_fingerprint?, render_status,
+    render_verified, ...}`` on success, or ``{"error": <message>, ...}`` on
+    any validation, resolution, write, or verification failure -- the file
+    is left untouched on a validation/resolution failure, and either
+    correctly written or safely restored (see
+    :func:`_safe_restore_after_verification_failure`) on a write/
+    verification failure.
+    """
+    if not note or not str(note).strip():
+        return {"error": "note must be a non-empty string"}
+    if highlight_color not in _VALID_HIGHLIGHT_COLORS:
+        return {
+            "error": (
+                "highlight_color must be one of "
+                f"{sorted(_VALID_HIGHLIGHT_COLORS)}, got {highlight_color!r}"
+            )
+        }
+    if not author or not str(author).strip():
+        return {"error": "author must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    expected_source_fingerprint: str | None = None
+    element_type: str | None = None
+    section_path: str | None = None
+
+    if isinstance(anchor, str):
+        if not anchor.strip():
+            return {"error": "anchor must be a non-empty para_id string, or a query dict"}
+        anchor_para_id = anchor
+    elif isinstance(anchor, dict):
+        if not anchor:
+            return {"error": "anchor query dict must be non-empty"}
+        located = locate_anchor(docx_path, anchor)
+        if located.get("error"):
+            return {"error": f"anchor resolution failed: {located['error']}"}
+        status = located.get("status")
+        if status != "resolved":
+            return {
+                "error": (
+                    f"anchor query did not resolve to exactly one location "
+                    f"(status={status!r}) -- narrow the query and retry"
+                ),
+                "locate_result": located,
+            }
+        if located.get("element_type") in ("table", "table_cell"):
+            return {
+                "error": (
+                    "anchor resolved to a "
+                    f"{located['element_type']!r} element (para_id "
+                    f"{located.get('target_para_id')!r}) -- flag_for_review "
+                    "only supports paragraph/heading/caption anchors, not "
+                    "table or table-cell targets"
+                ),
+                "locate_result": located,
+            }
+        anchor_para_id = located["target_para_id"]
+        expected_source_fingerprint = located.get("source_fingerprint")
+        element_type = located.get("element_type")
+        section_path = located.get("section_path")
+    else:
+        return {"error": f"anchor must be a str para_id or a query dict, got {type(anchor).__name__}"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if expected_source_fingerprint is not None:
+        current_fingerprint = _source_fingerprint(raw)
+        if current_fingerprint != expected_source_fingerprint:
+            return {
+                "error": (
+                    f"{docx_path} changed between anchor resolution and "
+                    "this write -- refusing to flag a possibly-stale "
+                    "location; re-resolve the anchor and retry"
+                ),
+                "expected_source_fingerprint": expected_source_fingerprint,
+                "source_fingerprint": current_fingerprint,
+            }
+
+    found = _find_para_by_id(root, anchor_para_id)
+    if found is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _body, paragraph, _child_index = found
+
+    note_clean = str(note).strip()
+    highlighted_run_count = _highlight_paragraph_runs(paragraph, highlight_color)
+
+    updated_parts, comment_id = _stage_word_comment(
+        raw, root, paragraph, note_clean, author, initials
+    )
+    note_id = f"_MComment{comment_id}"
+
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+
+        verify_error = _verify_flag_write(
+            docx_path,
+            comment_id=comment_id,
+            expected_text=note_clean,
+            anchor_para_id=anchor_para_id,
+            highlight_color=highlight_color,
+            expect_highlight=highlighted_run_count > 0,
+        )
+        if verify_error is not None:
+            # 5988a5bb-style CAS safety -- see insert_highlighted_note's own
+            # identical guard for the full rationale: never blindly restore
+            # over a different, already-promoted concurrent writer's work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["comment_id"] = comment_id
+            verify_error["note_id"] = note_id
+            verify_error["anchor_para_id"] = anchor_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["comment_id"] = comment_id
+            render_error["note_id"] = note_id
+            render_error["anchor_para_id"] = anchor_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    if index_db_path and os.path.exists(index_db_path):
+        _upsert_sidecar_note(index_db_path, note_id, note_clean, anchor_para_id)
+
+    result = {
+        "status": "flagged",
+        "comment_id": comment_id,
+        "note_id": note_id,
+        "text": note_clean,
+        "anchor_para_id": anchor_para_id,
+        "highlighted_run_count": highlighted_run_count,
+        "highlight_color": highlight_color,
+        "author": str(author).strip(),
+        "initials": str(initials or "").strip()[:9],
+        "docx_path": docx_path,
+        **render_info,
+    }
+    if element_type is not None:
+        result["element_type"] = element_type
+    if section_path is not None:
+        result["section_path"] = section_path
+    if expected_source_fingerprint is not None:
+        result["source_fingerprint"] = expected_source_fingerprint
+    return result
+
+
 # ---------------------------------------------------------------------------
 # b67ec6b5 -- non-mutating DOCX review: aggregate existing read-only finding
 # primitives into ONE grouped, locator-enriched result for the dashboard
@@ -19294,13 +22008,27 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
 #: Fixed category set the dashboard groups findings by. Always present in
 #: ``findings_by_category`` (count 0 when nothing was found/checked) so a
 #: caller can render a stable set of section headers rather than guessing
-#: which categories exist for a given document profile -- "structure",
-#: "section_page", and "ownership" have no v1 detector yet (framework-
-#: agnostic first version -- see the sprint item notes) and always report 0
-#: until a future item adds one.
+#: which categories exist for a given document profile -- "ownership" has
+#: no v1 detector yet (framework-agnostic first version -- see the sprint
+#: item notes) and always reports 0 until a future item adds one.
+#: "structure" (9c1a3fd2) is populated by :func:`audit_table_style`'s
+#: findings, wired into :func:`build_document_review` below.
+#:
+#: docs-intel-jcshm-linter-gap-cleanup-20260918 -- "section_page" is no
+#: longer a permanent 0: it is now populated by
+#: :func:`audit_manuscript_structure`'s Abstract-word-count/Keywords-count
+#: findings -- the closest existing category name-fit for manuscript
+#: front-matter structural requirements; there was no better-fitting
+#: existing category, and this finally gives "section_page" real content
+#: rather than adding yet another near-duplicate one. "citation" is a NEW
+#: category (not one of the original seven), added the same session, for
+#: :func:`audit_reference_consistency`'s reference-list<->in-text-citation
+#: findings -- deliberately its own category rather than folded into
+#: "caption"/"structure"/"section_page", none of which are really about
+#: bibliography integrity.
 REVIEW_CATEGORIES: tuple[str, ...] = (
     "structure", "equation", "caption", "section_page", "ownership",
-    "provenance", "render_integrity",
+    "provenance", "render_integrity", "citation",
 )
 
 
@@ -19315,7 +22043,33 @@ def _legacy_plaintext_caption_findings(
     exact text pattern :func:`retrofit_plaintext_captions` migrates. Never
     mutates the document; only reports what that primitive WOULD convert, so
     "mixed native/legacy captions" is visible without running the write.
+
+    docs-intel-jcshm-linter-gap-cleanup-20260918 -- whole-document gate: a
+    document that carries ZERO native (SEQ-field) figure_caption/
+    table_caption records at all is not a "some captions got missed"
+    situation -- it is a document whose own deliberate convention is plain
+    literal caption numbers, never SEQ fields, anywhere. Flagging every one
+    of those captions as a "legacy" migration candidate is a pure false
+    positive in that case (confirmed on this project's own real manuscript/
+    SI: the same 5 plaintext-caption findings fired, harmlessly, on every
+    single build_document_review pass all project, and were manually
+    re-verified as a non-issue 3+ separate times -- wasted verification
+    effort every time, never a real defect). There is no reliable PER-
+    CAPTION signal that distinguishes "this document's house style" from "a
+    caption that was supposed to get a SEQ field and didn't" -- only a
+    document-level one: if this document has ANY native caption elsewhere, a
+    plaintext one nearby genuinely looks like a missed migration and this
+    function's findings still fire exactly as before; if it has NONE, every
+    "Figure N"/"Table N" paragraph in it is presumed to be the document's
+    own house style and nothing is flagged.
     """
+    has_native_caption = any(
+        record.get("element_kind") in ("figure_caption", "table_caption")
+        for record in records
+    )
+    if not has_native_caption:
+        return []
+
     out: list[dict[str, Any]] = []
     for record in records:
         if record.get("element_kind") != "paragraph":
@@ -19343,6 +22097,24 @@ def _review_finding_severity(category: str, finding_type: str) -> str:
         "duplicate_equation_number", "equation_number_gap",
     ):
         return "error"
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 -- reference-list
+    # numbering-integrity findings get the same "error" treatment as the
+    # equation numbering-integrity findings just above (a genuinely broken
+    # numbering scheme, not a style preference); the cross-citation checks
+    # (citation_missing_reference_entry / reference_entry_never_cited) fall
+    # through to the default "warning" below -- real, but editorial rather
+    # than a broken invariant. Abstract/Keywords count violations are
+    # "error" too: JCSHM's 150-250/4-6 are explicit numeric submission
+    # requirements, the same status as the equation checks above, not a
+    # soft style preference.
+    if category == "citation" and finding_type in (
+        "reference_list_number_gap", "reference_list_duplicate_number",
+    ):
+        return "error"
+    if category == "section_page" and finding_type in (
+        "abstract_word_count_out_of_range", "keyword_count_out_of_range",
+    ):
+        return "error"
     if category == "render_integrity":
         return "error"
     if category == "provenance":
@@ -19366,10 +22138,18 @@ def build_document_review(
 
     * ``equation``   -- :func:`audit_equation_style` findings (alignment,
                         trailing punctuation, numbering).
-    * ``caption``     -- :func:`_legacy_plaintext_caption_findings` (a
-                        plain-text "Figure N"/"Table N" paragraph with no SEQ
-                        field -- what :func:`retrofit_plaintext_captions`
-                        would convert, reported without mutating).
+    * ``caption``     -- TWO independent sources, both reported: (1)
+                        :func:`audit_caption_style` (9c1a3fd2) -- publisher
+                        style-policy findings for captions that already have
+                        a Caption-styled paragraph (label bold/punctuation,
+                        terminal punctuation), gated per-key on
+                        ``style_policy`` the same way the equation findings
+                        above are, so it's a no-op when ``style_policy`` is
+                        omitted; and (2) :func:`_legacy_plaintext_caption_findings`
+                        (a plain-text "Figure N"/"Table N" paragraph with no
+                        SEQ field and no Caption style at all -- what
+                        :func:`retrofit_plaintext_captions` would convert,
+                        reported without mutating).
     * ``provenance``  -- :func:`scan_stale_notes` findings (placeholder/TODO
                         text that may now be outdated).
     * ``render_integrity`` -- :func:`render_gate.check_render_capability`,
@@ -19379,8 +22159,30 @@ def build_document_review(
                         finding, "rendered"/"unavailable-with-reason" do
                         not -- mirrors ``docx_integrity_gate``'s "can't
                         confirm never manufactures a finding" rule).
-    * ``structure`` / ``section_page`` / ``ownership`` -- reserved, always 0
-                        in this first version (see :data:`REVIEW_CATEGORIES`).
+    * ``structure``   -- :func:`audit_table_style` (9c1a3fd2) findings:
+                        table misalignment (gated on
+                        ``style_policy["table_alignment"]``), missing
+                        header-row-repeat, and a redundant blank paragraph
+                        between a table's caption and the table itself.
+                        ALSO (df716454) :func:`audit_heading_style`
+                        findings: per-level H1/H2/H3 heading spacing
+                        (gated on the corresponding
+                        ``heading_spacing_before/after_h{level}_twips``
+                        key) and the read-only
+                        ``heading_terminal_punctuation_mismatch`` finding
+                        (gated on ``style_policy["heading_terminal_punctuation"]``).
+    * ``section_page`` -- (docs-intel-jcshm-linter-gap-cleanup-20260918)
+                        :func:`audit_manuscript_structure` findings:
+                        Abstract word count / Keywords count outside the
+                        configured range, gated on
+                        ``style_policy["abstract_word_count_min"/"_max"]``
+                        / ``["keyword_count_min"/"_max"]``.
+    * ``citation``      -- (docs-intel-jcshm-linter-gap-cleanup-20260918)
+                        :func:`audit_reference_consistency` findings:
+                        reference-list<->in-text-citation consistency.
+                        Unconditional, not style-policy-gated.
+    * ``ownership``     -- reserved, always 0 in this first version (see
+                        :data:`REVIEW_CATEGORIES`).
 
     Every finding with a ``para_id`` is enriched with a ``locator`` --
     resolved via :func:`_resolve_anchor_query` (the SAME function
@@ -19445,6 +22247,32 @@ def build_document_review(
                 "detail": f,
             })
 
+    # 9c1a3fd2 -- publisher-style caption findings (bold/label-punctuation/
+    # terminal-punctuation), gated the SAME way as eq_audit above: every key
+    # audit_caption_style checks defaults to None/"unspecified" (no verified
+    # rule -- skip), so passing no style_policy (the pre-9c1a3fd2 behavior)
+    # yields zero findings from this call, identical to before it existed.
+    # This was the missing consumer of build_document_review's own
+    # style_policy parameter for captions -- style_policy already reached
+    # audit_equation_style above, but never audit_caption_style, despite the
+    # sprint item (b3fa6019) that built audit_caption_style specifically to
+    # close the "verified journal facts never reach an enforcement path"
+    # gap. Runs ALONGSIDE (not instead of) _legacy_plaintext_caption_findings
+    # below -- that one detects an un-SEQ-tagged "Figure N" paragraph that
+    # never got a caption style at all; this one checks the FORMATTING of a
+    # caption that already has one. Both are real, independent "caption"
+    # category findings on the same document.
+    style_caption_audit = audit_caption_style(docx_path, style_policy)
+    if isinstance(style_caption_audit, dict) and not style_caption_audit.get("error"):
+        for f in style_caption_audit.get("findings", []):
+            findings.append({
+                "category": "caption",
+                "severity": _review_finding_severity("caption", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
     for f in _legacy_plaintext_caption_findings(records):
         findings.append({
             "category": "caption",
@@ -19453,6 +22281,68 @@ def build_document_review(
             "para_id": f.get("para_id"),
             "detail": f,
         })
+
+    # 9c1a3fd2 -- structure findings (table misalignment/header-repeat/
+    # blank-line-before-table), the first REVIEW_CATEGORIES entry to move
+    # off its "always 0, reserved" placeholder. Gated the same way as the
+    # caption/equation style audits above: audit_table_style's own
+    # table_alignment check is opt-in on style_policy, while its header-
+    # repeat and blank-line checks are unconditional structural facts, not
+    # style preferences -- see audit_table_style's docstring.
+    table_style_audit = audit_table_style(docx_path, style_policy)
+    if isinstance(table_style_audit, dict) and not table_style_audit.get("error"):
+        for f in table_style_audit.get("findings", []):
+            findings.append({
+                "category": "structure",
+                "severity": _review_finding_severity("structure", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    # df716454 -- heading-spacing (per-level H1/H2/H3) and read-only
+    # heading-terminal-punctuation findings, same "structure" category and
+    # gating discipline as the table-style findings just above.
+    heading_style_audit = audit_heading_style(docx_path, style_policy)
+    if isinstance(heading_style_audit, dict) and not heading_style_audit.get("error"):
+        for f in heading_style_audit.get("findings", []):
+            findings.append({
+                "category": "structure",
+                "severity": _review_finding_severity("structure", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 -- Abstract word count /
+    # Keywords count findings. Same wiring pattern as every audit_* call
+    # above; see REVIEW_CATEGORIES's own comment for why these land in
+    # "section_page" specifically.
+    manuscript_structure_audit = audit_manuscript_structure(docx_path, style_policy)
+    if isinstance(manuscript_structure_audit, dict) and not manuscript_structure_audit.get("error"):
+        for f in manuscript_structure_audit.get("findings", []):
+            findings.append({
+                "category": "section_page",
+                "severity": _review_finding_severity("section_page", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    # docs-intel-jcshm-linter-gap-cleanup-20260918 -- reference-list <->
+    # in-text-citation consistency findings, own "citation" category (see
+    # REVIEW_CATEGORIES's own comment for why). Unconditional (not gated on
+    # style_policy) -- see audit_reference_consistency's own docstring.
+    reference_audit = audit_reference_consistency(docx_path, style_policy)
+    if isinstance(reference_audit, dict) and not reference_audit.get("error"):
+        for f in reference_audit.get("findings", []):
+            findings.append({
+                "category": "citation",
+                "severity": _review_finding_severity("citation", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
 
     stale_notes = scan_stale_notes(docx_path)
     if isinstance(stale_notes, dict) and not stale_notes.get("error"):
@@ -22646,8 +25536,8 @@ _EQ_SHAPE_PURE_INT = re.compile(r"^\(\s*(\d+)[a-zA-Z]?\s*\)$")
 def _classify_equation_number_shape(number_text: "str | None") -> "dict[str, Any] | None":
     """Classify one equation-number LABEL's SHAPE for numbering-scope
     tracking -- distinct from :func:`_leading_equation_number`'s single
-    leading integer (used for flat 1..N gap detection): a document may
-    legitimately use more than one numbering CONVENTION at once (flat
+    leading integer (used for flat observed-min..max gap detection): a
+    document may legitimately use more than one numbering CONVENTION at once (flat
     ``(1)``, sectioned ``(2.3)``, appendix ``(A.1)``) and mixing them is a
     scope-ambiguity SIGNAL, not automatically an error.
 
@@ -22986,29 +25876,38 @@ def audit_equation_integrity(source: "str | bytes | bytearray") -> "dict[str, An
         elif child.tag == w_tbl:
             for tr in child.findall(f".//{w_tr}"):
                 cells = tr.findall(w_tc)
-                if len(cells) < 2:
+                # 9c1a3fd2 -- was hardcoded cells[0]=equation/cells[1]=number,
+                # which misses a leading empty indent/spacer cell (a real,
+                # common template shape -- see _match_table_numbered_row's
+                # docstring). anchor_cell is None only for "not a numbered
+                # row at all" (skip, ordinary content table); a genuinely
+                # numbered-but-empty row still gets an anchor_cell (a
+                # best-guess position) so EQUATION_FINDING_MISSING_OMML can
+                # report a real location instead of falling back to a
+                # generic tbl{idx} anchor for every case.
+                eq_cell, number_text, has_omath = _match_table_numbered_row(cells)
+                if eq_cell is None:
                     continue
-                number_text = _cell_text(cells[1]).strip()
-                if not _EQ_NUMBER_RE.match(number_text):
-                    continue
-                cell0_para = cells[0].find(w_p)
+                cell0_para = eq_cell.find(w_p)
                 anchor = (
                     (cell0_para.get(w14_para_id) if cell0_para is not None else None)
                     or f"tbl{body_child_idx}"
                 )
-                if not _cell_has_omath(cells[0]):
+                if not has_omath:
                     findings.append({
                         "type": EQUATION_FINDING_MISSING_OMML,
                         "anchor": anchor,
                         "pattern": "table-numbered",
                         "section_path": section_path,
                         "number": number_text,
-                        "plain_text": _cell_text(cells[0]).strip(),
+                        "plain_text": " ".join(
+                            _cell_text(c).strip() for c in cells[:-1]
+                        ).strip(),
                     })
                     continue
 
-                row_prose = "".join(_cell_text(c) for i, c in enumerate(cells) if i != 0)
-                omaths = cells[0].findall(f".//{m_omath}")
+                row_prose = "".join(_cell_text(c) for c in cells if c is not eq_cell)
+                omaths = eq_cell.findall(f".//{m_omath}")
                 for omath_el in omaths:
                     _record_equation(
                         anchor=anchor, pattern="table-numbered", section_path=section_path,
@@ -23065,7 +25964,15 @@ def audit_equation_integrity(source: "str | bytes | bytearray") -> "dict[str, An
         if value is not None
     })
     if flat_shape_numbers:
-        expected_range = set(range(1, flat_shape_numbers[-1] + 1))
+        # df716454 -- same fix as audit_equation_style's own gap check:
+        # scope the expected range to the OBSERVED numbers
+        # (flat_shape_numbers[0]..flat_shape_numbers[-1]) instead of
+        # hardcoding a start of 1, so a document whose numbering legitimately
+        # continues a companion document's sequence (e.g. an SI starting at
+        # 39) isn't flagged with dozens of false "missing" numbers below its
+        # true starting point. A genuine gap inside the observed range is
+        # still flagged normally.
+        expected_range = set(range(flat_shape_numbers[0], flat_shape_numbers[-1] + 1))
         for missing in sorted(expected_range - set(flat_shape_numbers)):
             findings.append({
                 "type": EQUATION_FINDING_NUMBER_GAP,

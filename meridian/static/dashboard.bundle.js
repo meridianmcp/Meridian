@@ -7501,6 +7501,27 @@ ${n2.tags || ""}`.toLowerCase();
     warning: "var(--warning, #d29922)",
     info: "var(--muted)"
   };
+  function journalPresetOptionsHtml(presets, selected = "") {
+    const opts = (presets || []).slice().sort((a3, b2) => a3.name.localeCompare(b2.name));
+    let html = `<option value=""${selected ? "" : " selected"}>No journal check</option>`;
+    for (const p3 of opts) {
+      const label = p3.source === "user" && p3.shadows_builtin ? `${p3.name} (custom)` : p3.name;
+      const sel = p3.name === selected ? " selected" : "";
+      html += `<option value="${escapeHtml(p3.name)}"${sel}>${escapeHtml(label)}</option>`;
+    }
+    return html;
+  }
+  function journalPresetSelectHtml2(did, presets) {
+    return `<select class="doc-review-journal-select" data-did="${escapeHtml(did)}" title="Check against a journal's verified style rules" style="font-size:9px;padding:1px 4px;max-width:140px">${journalPresetOptionsHtml(presets)}</select>`;
+  }
+  async function fetchJournalStylePresets2() {
+    try {
+      const result = await api("/journal-style-presets");
+      return result && Array.isArray(result.presets) ? result.presets : [];
+    } catch (_e) {
+      return [];
+    }
+  }
   var MAX_PREVIEW_CHARS = 140;
   function truncatePreview(text, max = MAX_PREVIEW_CHARS) {
     const s3 = String(text || "");
@@ -7693,18 +7714,26 @@ ${n2.tags || ""}`.toLowerCase();
       });
     });
   }
-  async function loadDocumentReview(projectId, filePath, targetId, expectedFingerprint) {
+  async function loadDocumentReview(projectId, filePath, targetId, expectedFingerprint, journal) {
     const target = document.getElementById(targetId);
     if (!target) return;
     target.innerHTML = '<span style="font-size:9px;color:var(--muted)">loading review\u2026</span>';
     try {
       let url = `/projects/${projectId}/document-review?path=${encodeURIComponent(filePath)}`;
       if (expectedFingerprint) url += `&expected_source_fingerprint=${encodeURIComponent(expectedFingerprint)}`;
+      if (journal) url += `&journal=${encodeURIComponent(journal)}`;
       const review = await api(url);
       renderDocumentReview(review, targetId);
     } catch (e3) {
       target.innerHTML = `<span style="font-size:9px;color:var(--error)">Review failed: ${escapeHtml(String(e3))}</span>`;
     }
+  }
+  function _selectedJournalFor(root, did) {
+    let value = "";
+    root.querySelectorAll(".doc-review-journal-select").forEach((el2) => {
+      if (el2.getAttribute("data-did") === did) value = el2.value || "";
+    });
+    return value;
   }
   function wireDocumentReviewButtons2(projectId, root = document) {
     root.querySelectorAll(".doc-review-btn").forEach((btn) => {
@@ -7712,18 +7741,21 @@ ${n2.tags || ""}`.toLowerCase();
         const fp = btn.getAttribute("data-fp") || "";
         const did = btn.getAttribute("data-did") || "";
         const targetId = `doc-review-${did}`;
-        await loadDocumentReview(projectId, fp, targetId);
+        const journal = _selectedJournalFor(root, did);
+        await loadDocumentReview(projectId, fp, targetId, null, journal);
       });
     });
-    root.querySelectorAll(".review-recheck-btn").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const targetId = btn.getAttribute("data-target") || "";
-        const target = document.getElementById(targetId);
-        const fp = target ? target.getAttribute("data-fp") || "" : "";
-        if (!fp) return;
-        const prevFingerprint = _reviewFingerprints.get(targetId) || null;
-        await loadDocumentReview(projectId, fp, targetId, prevFingerprint);
-      });
+    root.addEventListener("click", async (e3) => {
+      const btn = e3.target && e3.target.closest && e3.target.closest(".review-recheck-btn");
+      if (!btn || !root.contains(btn)) return;
+      const targetId = btn.getAttribute("data-target") || "";
+      const target = document.getElementById(targetId);
+      const fp = target ? target.getAttribute("data-fp") || "" : "";
+      if (!fp) return;
+      const did = targetId.startsWith("doc-review-") ? targetId.slice("doc-review-".length) : "";
+      const journal = _selectedJournalFor(root, did);
+      const prevFingerprint = _reviewFingerprints.get(targetId) || null;
+      await loadDocumentReview(projectId, fp, targetId, prevFingerprint, journal);
     });
   }
   try {
@@ -7736,7 +7768,10 @@ ${n2.tags || ""}`.toLowerCase();
       isReviewError,
       renderDocumentReview,
       loadDocumentReview,
-      wireDocumentReviewButtons: wireDocumentReviewButtons2
+      wireDocumentReviewButtons: wireDocumentReviewButtons2,
+      journalPresetOptionsHtml,
+      journalPresetSelectHtml: journalPresetSelectHtml2,
+      fetchJournalStylePresets: fetchJournalStylePresets2
     });
   } catch (e3) {
   }
@@ -8515,8 +8550,8 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
   function L(n2, l3, u4, t3, i3, r3, o3, e3, f4, c3, a3) {
-    var s3, h3, p3, v3, y3, _2, g2 = t3 && t3.__k || w, m3 = l3.length;
-    for (f4 = T(u4, l3, g2, f4, m3), s3 = 0; s3 < m3; s3++) null != (p3 = u4.__k[s3]) && (h3 = -1 != p3.__i && g2[p3.__i] || d, p3.__i = s3, _2 = q(n2, p3, h3, i3, r3, o3, e3, f4, c3, a3), v3 = p3.__e, p3.ref && h3.ref != p3.ref && (h3.ref && J(h3.ref, null, p3), a3.push(p3.ref, p3.__c || v3, p3)), null == y3 && null != v3 && (y3 = v3), 4 & p3.__u ? (f4 = j(p3, f4, n2), h3.__e && (h3.__e = null)) : "function" == typeof p3.type && void 0 !== _2 ? f4 = _2 : v3 && (f4 = v3.nextSibling), p3.__u &= -7);
+    var s3, h3, p3, v3, y3, _2, g2, m3 = t3 && t3.__k || w, b2 = l3.length;
+    for (f4 = T(u4, l3, m3, f4, b2), s3 = 0; s3 < b2; s3++) null != (p3 = u4.__k[s3]) && (h3 = -1 != p3.__i && m3[p3.__i] || d, p3.__i = s3, _2 = q(n2, p3, h3, i3, r3, o3, e3, f4, c3, a3), v3 = p3.__e, p3.ref && h3.ref != p3.ref && (h3.ref && J(h3.ref, null, p3), a3.push(p3.ref, p3.__c || v3, p3)), null == y3 && null != v3 && (y3 = v3), (g2 = !!(4 & p3.__u)) || h3.__k === p3.__k ? (f4 = j(p3, f4, n2, g2), g2 && h3.__e && (h3.__e = null)) : "function" == typeof p3.type && void 0 !== _2 ? f4 = _2 : v3 && (f4 = v3.nextSibling), p3.__u &= -7);
     return u4.__e = y3, f4;
   }
   function T(n2, l3, u4, t3, i3) {
@@ -8525,13 +8560,13 @@ ${n2.tags || ""}`.toLowerCase();
     if (s3) for (r3 = 0; r3 < a3; r3++) null != (e3 = u4[r3]) && 0 == (2 & e3.__u) && (e3.__e == t3 && (t3 = $(e3)), K(e3, e3));
     return t3;
   }
-  function j(n2, l3, u4) {
-    var t3, i3;
+  function j(n2, l3, u4, t3) {
+    var i3, r3;
     if ("function" == typeof n2.type) {
-      for (t3 = n2.__k, i3 = 0; t3 && i3 < t3.length; i3++) t3[i3] && (t3[i3].__ = n2, l3 = j(t3[i3], l3, u4));
+      for (i3 = n2.__k, r3 = 0; i3 && r3 < i3.length; r3++) i3[r3] && (i3[r3].__ = n2, l3 = j(i3[r3], l3, u4, t3));
       return l3;
     }
-    n2.__e != l3 && (l3 && n2.type && !l3.parentNode && (l3 = $(n2)), l3 = u4.insertBefore(n2.__e, l3 || null));
+    n2.__e != l3 && (t3 && (l3 && n2.type && !l3.parentNode && (l3 = $(n2)), u4.insertBefore(n2.__e, l3 || null)), l3 = n2.__e);
     do {
       l3 = l3 && l3.nextSibling;
     } while (null != l3 && 8 == l3.nodeType);
@@ -8577,37 +8612,39 @@ ${n2.tags || ""}`.toLowerCase();
     };
   }
   function q(n2, u4, t3, i3, r3, o3, e3, f4, c3, a3) {
-    var s3, h3, p3, v3, y3, d3, _2, k3, x2, M, I2, P2, A3, H2, T3, j3, F = u4.type;
+    var s3, h3, p3, v3, y3, d3, _2, k3, x2, M, $2, I2, P2, A3, H2, T3, j3 = u4.type;
     if (void 0 !== u4.constructor) return null;
     128 & t3.__u && (c3 = !!(32 & t3.__u), o3 = [f4 = u4.__e = t3.__e]), (s3 = l.__b) && s3(u4);
-    n: if ("function" == typeof F) {
+    n: if ("function" == typeof j3) {
       h3 = e3.length;
       try {
-        if (x2 = u4.props, M = F.prototype && F.prototype.render, I2 = (s3 = F.contextType) && i3[s3.__c], P2 = s3 ? I2 ? I2.props.value : s3.__ : i3, t3.__c ? k3 = (p3 = u4.__c = t3.__c).__ = p3.__E : (M ? u4.__c = p3 = new F(x2, P2) : (u4.__c = p3 = new C(x2, P2), p3.constructor = F, p3.render = Q), I2 && I2.sub(p3), p3.state || (p3.state = {}), p3.__n = i3, v3 = p3.__d = true, p3.__h = [], p3._sb = []), M && null == p3.__s && (p3.__s = p3.state), M && null != F.getDerivedStateFromProps && (p3.__s == p3.state && (p3.__s = m({}, p3.__s)), m(p3.__s, F.getDerivedStateFromProps(x2, p3.__s))), y3 = p3.props, d3 = p3.state, p3.__v = u4, v3) M && null == F.getDerivedStateFromProps && null != p3.componentWillMount && p3.componentWillMount(), M && null != p3.componentDidMount && p3.__h.push(p3.componentDidMount);
+        if (x2 = u4.props, M = j3.prototype && j3.prototype.render, $2 = (s3 = j3.contextType) && i3[s3.__c], I2 = s3 ? $2 ? $2.props.value : s3.__ : i3, t3.__c ? k3 = (p3 = u4.__c = t3.__c).__ = p3.__E : (M ? u4.__c = p3 = new j3(x2, I2) : (u4.__c = p3 = new C(x2, I2), p3.constructor = j3, p3.render = Q), $2 && $2.sub(p3), p3.state || (p3.state = {}), p3.__n = i3, v3 = p3.__d = true, p3.__h = [], p3._sb = []), M && null == p3.__s && (p3.__s = p3.state), M && null != j3.getDerivedStateFromProps && (p3.__s == p3.state && (p3.__s = m({}, p3.__s)), m(p3.__s, j3.getDerivedStateFromProps(x2, p3.__s))), y3 = p3.props, d3 = p3.state, p3.__v = u4, v3) M && null == j3.getDerivedStateFromProps && null != p3.componentWillMount && p3.componentWillMount(), M && null != p3.componentDidMount && p3.__h.push(p3.componentDidMount);
         else {
-          if (M && null == F.getDerivedStateFromProps && x2 !== y3 && null != p3.componentWillReceiveProps && p3.componentWillReceiveProps(x2, P2), u4.__v == t3.__v || !p3.__e && null != p3.shouldComponentUpdate && false === p3.shouldComponentUpdate(x2, p3.__s, P2)) {
+          if (M && null == j3.getDerivedStateFromProps && x2 !== y3 && null != p3.componentWillReceiveProps && p3.componentWillReceiveProps(x2, I2), u4.__v == t3.__v || !p3.__e && null != p3.shouldComponentUpdate && false === p3.shouldComponentUpdate(x2, p3.__s, I2)) {
             u4.__v != t3.__v && (p3.props = x2, p3.state = p3.__s, p3.__d = false), u4.__e = t3.__e, u4.__k = t3.__k, u4.__k.some(function(n3) {
               n3 && (n3.__ = u4);
-            }), w.push.apply(p3.__h, p3._sb), p3._sb = [], p3.__h.length && e3.push(p3), f4 = $(t3);
+            }), w.push.apply(p3.__h, p3._sb), p3._sb = [], p3.__h.length && e3.push(p3);
             break n;
           }
-          null != p3.componentWillUpdate && p3.componentWillUpdate(x2, p3.__s, P2), M && null != p3.componentDidUpdate && p3.__h.push(function() {
+          null != p3.componentWillUpdate && p3.componentWillUpdate(x2, p3.__s, I2), M && null != p3.componentDidUpdate && p3.__h.push(function() {
             p3.componentDidUpdate(y3, d3, _2);
           });
         }
-        if (p3.context = P2, p3.props = x2, p3.__P = n2, p3.__e = false, A3 = l.__r, H2 = 0, M) p3.state = p3.__s, p3.__d = false, A3 && A3(u4), s3 = p3.render(p3.props, p3.state, p3.context), w.push.apply(p3.__h, p3._sb), p3._sb = [];
+        if (p3.context = I2, p3.props = x2, p3.__P = n2, p3.__e = false, P2 = l.__r, A3 = 0, M) p3.state = p3.__s, p3.__d = false, P2 && P2(u4), s3 = p3.render(p3.props, p3.state, p3.context), w.push.apply(p3.__h, p3._sb), p3._sb = [];
         else do {
-          p3.__d = false, A3 && A3(u4), s3 = p3.render(p3.props, p3.state, p3.context), p3.state = p3.__s;
-        } while (p3.__d && ++H2 < 25);
-        p3.state = p3.__s, null != p3.getChildContext && (i3 = m(m({}, i3), p3.getChildContext())), M && !v3 && null != p3.getSnapshotBeforeUpdate && (_2 = p3.getSnapshotBeforeUpdate(y3, d3)), T3 = null != s3 && s3.type === S && null == s3.key ? E(s3.props.children) : s3, f4 = L(n2, g(T3) ? T3 : [T3], u4, t3, i3, r3, o3, e3, f4, c3, a3), p3.base = u4.__e, u4.__u &= -161, p3.__h.length && e3.push(p3), k3 && (p3.__E = p3.__ = null);
+          p3.__d = false, P2 && P2(u4), s3 = p3.render(p3.props, p3.state, p3.context), p3.state = p3.__s;
+        } while (p3.__d && ++A3 < 25);
+        p3.state = p3.__s, null != p3.getChildContext && (i3 = m(m({}, i3), p3.getChildContext())), M && !v3 && null != p3.getSnapshotBeforeUpdate && (_2 = p3.getSnapshotBeforeUpdate(y3, d3)), H2 = null != s3 && s3.type === S && null == s3.key ? E(s3.props.children) : s3, f4 = L(n2, g(H2) ? H2 : [H2], u4, t3, i3, r3, o3, e3, f4, c3, a3), p3.base = u4.__e, u4.__u &= -161, p3.__h.length && e3.push(p3), k3 && (p3.__E = p3.__ = null);
       } catch (n3) {
-        if (e3.length = h3, u4.__v = null, c3 || null != o3) {
-          if (n3.then) {
-            for (u4.__u |= c3 ? 160 : 128; f4 && 8 == f4.nodeType && f4.nextSibling; ) f4 = f4.nextSibling;
-            null != o3 && (o3[o3.indexOf(f4)] = null), u4.__e = f4;
-          } else if (null != o3) for (j3 = o3.length; j3--; ) b(o3[j3]);
-        } else u4.__e = t3.__e;
-        null == u4.__k && (u4.__k = t3.__k || []), n3.then || B(u4), l.__e(n3, u4, t3);
+        if (e3.length = h3, u4.__v = null, c3 || null != o3) if (n3.then) {
+          for (u4.__u |= c3 ? 160 : 128; f4 && 8 == f4.nodeType && f4.nextSibling; ) f4 = f4.nextSibling;
+          null != o3 && (o3[o3.indexOf(f4)] = null), u4.__e = f4;
+        } else {
+          if (null != o3) for (T3 = o3.length; T3--; ) b(o3[T3]);
+          B(u4);
+        }
+        else u4.__e = t3.__e, !u4.__k && t3.__k && (u4.__k = t3.__k), n3.then || B(u4);
+        l.__e(n3, u4, t3);
       }
     } else null == o3 && u4.__v == t3.__v ? (u4.__k = t3.__k, u4.__e = t3.__e) : f4 = u4.__e = G(t3.__e, u4, t3, i3, r3, o3, e3, c3, a3);
     return (s3 = l.diffed) && s3(u4), 128 & u4.__u ? void 0 : f4;
@@ -8788,7 +8825,7 @@ ${n2.tags || ""}`.toLowerCase();
     var i3 = (r2 = n2.__c).__H;
     i3 && (u2 === r2 ? (i3.__h = [], r2.__h = [], i3.__.some(function(n3) {
       n3.__N && (n3.__ = n3.__N), n3.u = n3.__N = void 0;
-    })) : (i3.__h.some(z2), i3.__h.some(B2), i3.__h = [], t2 = 0)), u2 = r2;
+    })) : (i3.__h.length && j2(), t2 = 0)), u2 = r2;
   }, c2.diffed = function(n2) {
     v2 && v2(n2);
     var t3 = n2.__c;
@@ -14700,6 +14737,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     } catch (_2) {
       peeks = [];
     }
+    const journalPresets = await fetchJournalStylePresets();
     const _srcBadge = (src) => {
       const s3 = String(src || "local").toLowerCase();
       const label = s3.includes("onedrive") ? "OneDrive" : s3.includes("gdrive") || s3.includes("google") ? "GDrive" : src || "local";
@@ -14731,7 +14769,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t3) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(String(t3))}</span>`).join("")}</div>` : ""}
         ${fp ? `<div style="margin-top:6px;display:flex;gap:6px">
               <button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button>
-              ${String(fp).toLowerCase().endsWith(".docx") ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>` : ""}
+              ${String(fp).toLowerCase().endsWith(".docx") ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>
+                   ${journalPresetSelectHtml(did, journalPresets)}` : ""}
             </div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div><div id="doc-review-${escapeHtml(did)}" data-fp="${escapeHtml(String(fp))}" style="margin-top:6px"></div>` : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path \u2014 structure view unavailable.</div>'}
       </div>`;
       }

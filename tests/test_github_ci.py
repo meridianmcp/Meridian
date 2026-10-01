@@ -113,7 +113,8 @@ async def test_complete_sprint_item_flags_failing_ci(db, monkeypatch):
     res = await srv._dispatch_mcp_tool(
         "complete_sprint_item",
         {"project_id": p["id"], "item_id": item["id"],
-         "notes": "done; committed abc1234 to main", "override_ci": True},
+         "notes": "done; committed abc1234 to main", "override_ci": True,
+         "override_reason": "CI failure is an unrelated flaky job"},
         db, "/tmp")
     assert res["status"] == "done"
     assert res["ci_verification"]["state"] == "failure"
