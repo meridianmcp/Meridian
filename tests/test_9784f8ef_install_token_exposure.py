@@ -355,12 +355,28 @@ def test_write_private_file_does_not_write_if_existing_posix_file_cannot_be_hard
     assert target.read_text(encoding="utf-8") == "previous contents"
 
 
-def test_curl_header_config_warns_but_still_writes_when_hardening_fails(tmp_path, monkeypatch, capsys):
+def test_write_private_file_does_not_write_token_when_windows_acl_fails(
+    tmp_path, monkeypatch,
+):
+    mod = _load_connect()
+    target = tmp_path / "hook_auth.conf"
+    monkeypatch.setattr(
+        mod, "platform", types.SimpleNamespace(system=lambda: "Windows"),
+    )
+    monkeypatch.setattr(mod, "_restrict_to_owner", lambda path: False)
+
+    assert mod._write_private_file(target, f"secret {_FAKE}") is False
+    assert target.read_text(encoding="utf-8") == ""
+
+
+def test_curl_header_config_fails_closed_when_hardening_fails(
+    tmp_path, monkeypatch, capsys,
+):
     mod = _load_connect()
     monkeypatch.setattr(mod.Path, "home", staticmethod(lambda: tmp_path))
-    monkeypatch.setattr(mod, "_restrict_to_owner", lambda p: False)
+    monkeypatch.setattr(mod, "_write_private_file", lambda path, text: False)
     cfg = mod._write_curl_header_config(_FAKE)
-    assert cfg and Path(cfg).read_text(encoding="utf-8").startswith('header = "Authorization: Bearer ')
+    assert cfg == ""
     err = capsys.readouterr().err
     assert "WARNING" in err and "hook_auth.conf" in err
     assert _FAKE not in err, "the warning must never echo the token"

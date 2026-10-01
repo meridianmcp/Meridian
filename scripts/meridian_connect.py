@@ -134,16 +134,18 @@ def _write_private_file(path, text: str) -> bool:
     New POSIX files are created with mode 0600. An existing file is restricted
     to the current user BEFORE it is opened and truncated; if that restriction
     fails, it is left unchanged and the secret is not written. On Windows the
-    empty-file/ACL/write sequence gives the same ordering. Returns whether
-    owner-only permissions were applied; raises OSError only when the write
-    itself fails.
+    empty-file/ACL/write sequence gives the same ordering; if ACL hardening
+    fails, the token is not written. Returns whether owner-only permissions
+    were applied; raises OSError only when the write itself fails.
     """
     path = Path(path)
     if platform.system() == "Windows":
         path.write_text("", encoding="utf-8")
         hardened = _restrict_to_owner(path)
+        if not hardened:
+            return False
         path.write_text(text, encoding="utf-8")
-        return hardened
+        return True
 
     if path.exists():
         # os.open(..., mode=0o600) does not change permissions on an existing
@@ -177,8 +179,8 @@ def _write_curl_header_config(token: str) -> str:
 
     9784f8ef — the file is owner-only on every platform (icacls on Windows,
     where the previous chmod was a silent no-op). If hardening could not be
-    applied the file is still written (auth would otherwise silently vanish
-    from the hooks) but a warning naming the path is printed to stderr.
+    applied, do not return a config path or write the token; warn so the user
+    can fix permissions before retrying.
     """
     if not token:
         return ""
@@ -201,6 +203,7 @@ def _write_curl_header_config(token: str) -> str:
             "check its permissions (it holds your Meridian token).",
             file=sys.stderr,
         )
+        return ""
     return str(cfg_path)
 
 
