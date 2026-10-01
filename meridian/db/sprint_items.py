@@ -7106,9 +7106,11 @@ async def add_sprint_item_pointer(
             sprint_item_id, project_id,
         ),
     )
+    # Close SQLite's write transaction even when the ownership predicate
+    # matched no rows; Postgres production connections autocommit here.
+    await db.commit()
     if cur.rowcount != 1:
         raise ValueError("sprint item not found in project")
-    await db.commit()
     async with db.execute(
         "SELECT * FROM sprint_item_pointers WHERE id = ?", (pid,)
     ) as cur:
