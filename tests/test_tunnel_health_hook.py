@@ -51,8 +51,13 @@ def test_settings_adds_health_hook_without_changing_compact_hook():
     )
     assert any(
         "tunnel_health_check.ps1" in json.dumps(entry.get("hooks", []))
+        and entry.get("matcher") == "startup|resume|clear|compact"
         and entry["hooks"][0].get("timeout") == 3
         for entry in session_start
+    )
+    assert not any(
+        "tunnel_health_check.ps1" in json.dumps(entry.get("hooks", []))
+        for entry in settings["hooks"].get("SubagentStart", [])
     )
 
 

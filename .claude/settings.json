@@ -119,6 +119,17 @@
                         "timeout": 10
                     }
                 ]
+            },
+            {
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "shell": "powershell",
+                        "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\tunnel_health_check.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "timeout": 3
+                    }
+                ]
             }
         ],
         "SubagentStart": [
@@ -130,16 +141,6 @@
                         "shell": "powershell",
                         "command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\meridian_guard_brief.ps1\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 10
-                    }
-                ]
-            },
-            {
-                "hooks": [
-                    {
-                        "type": "command",
-                        "shell": "powershell",
-                        "command": "& \"$CLAUDE_PROJECT_DIR\\.claude\\hooks\\tunnel_health_check.ps1\"",
-                        "timeout": 3
                     }
                 ]
             }

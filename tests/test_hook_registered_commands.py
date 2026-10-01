@@ -320,6 +320,10 @@ CASES: dict[str, list[tuple[str, dict[str, Any], dict[str, str], int, Any, str |
                                            "agent_type": "general-purpose"}, {}, 0,
          _json_envelope("SubagentStart", "static fallback"), None),
     ],
+    "tunnel_health_check": [
+        ("startup_is_fail_open", {"session_id": "registered-cmd-test", "hook_event_name": "SessionStart",
+                                   "source": "startup"}, {}, 0, _empty_or_json, None),
+    ],
 }
 
 
