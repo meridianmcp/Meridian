@@ -2377,7 +2377,8 @@ async def test_goal_compliance_cross_session_completion_reattributes(db):
     it = await db_module.add_sprint_item(db, p["id"], "v1", "handed-off item")
     await db_module.claim_sprint_item(db, p["id"], it["id"], actor=a)
     await db_module.complete_sprint_item(
-        db, p["id"], it["id"], actor=b, force_foreign_claim=True
+        db, p["id"], it["id"], actor=b, force_foreign_claim=True,
+        override_reason="coordinator hand-off: completer finalises the claimer's item",
     )
     ma = await db_module.compute_session_goal_compliance(db, p["id"], a)
     mb = await db_module.compute_session_goal_compliance(db, p["id"], b)

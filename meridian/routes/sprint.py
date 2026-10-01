@@ -351,6 +351,8 @@ async def complete_sprint_item_endpoint(
     different, conflicting terminal status won a real race, which still
     reports 409 exactly as before.
     """
+    from ..db.sprint_items import SprintItemArtifactPointerRequired  # noqa: PLC0415
+
     db = await _db(request)
     _correlation_id = str((body or {}).get("correlation_id") or uuid.uuid4().hex)
     try:
@@ -358,6 +360,19 @@ async def complete_sprint_item_endpoint(
             db, project_id, item_id,
             task_id=(body or {}).get("task_id"),
             correlation_id=_correlation_id,
+        )
+    except SprintItemArtifactPointerRequired as exc:
+        # 275a8631 — an item that opted into artifact-pointer enforcement has
+        # no exact output pointer on file. A clean 409 (not a 500) naming the
+        # remediation; the override path is the MCP tool's human-approved flow.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "ARTIFACT_POINTER_REQUIRED",
+                "message": str(exc),
+                "item_id": item_id,
+                "correlation_id": _correlation_id,
+            },
         )
     except db_module.SprintItemStatusRace as exc:
         raise HTTPException(

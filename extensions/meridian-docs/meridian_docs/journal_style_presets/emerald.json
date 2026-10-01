@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "journal": "emerald",
+    "display_name": "Emerald Publishing journals",
+    "publisher": "Emerald Publishing",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "author_date",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "emerald.com/journals/author-guidance/1627/Emerald-Publishing-Author-Guidelines",
+        "note": "the majority of Emerald journals use the Harvard reference style (some use APA instead) -- both Harvard and APA are author-date-family conventions, so citation_style='author_date' is used here rather than not_fixed (unlike, e.g., springer/frontiers, where the alternative styles cross the numbered/author-date boundary)."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "emerald.com/journals/author-guidance/1627/Emerald-Publishing-Author-Guidelines",
+        "note": "halftones need 300 dpi."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

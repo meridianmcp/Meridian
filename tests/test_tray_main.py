@@ -666,6 +666,67 @@ def test_run_tray_does_not_auto_open_when_server_fails_to_start(monkeypatch):
     assert opened == []
 
 
+def test_run_tray_does_not_auto_open_on_cold_start_timeout(monkeypatch):
+    """Regression test for 2026-09-28 review finding #14/#18: start() can
+    report a non-ready state via a NORMAL RETURN (RunnerStatus with
+    local_mcp.state == COLD_START_TIMEOUT/FAILED), not just by raising --
+    the previous code discarded start()'s return value entirely and always
+    opened the browser. This is the case test_run_tray_does_not_auto_open_
+    when_server_fails_to_start (a raising start()) does NOT cover."""
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.COLD_START_TIMEOUT)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+    dialog_calls = []
+    monkeypatch.setattr(
+        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+    )
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0  # the tray icon still starts -- this is a degrade, not a crash
+    assert opened == []
+    assert dialog_calls  # the human gets told, instead of a silently dead browser tab
+
+
+def test_run_tray_does_not_auto_open_when_attaching_to_unhealthy_existing_run(monkeypatch):
+    """Regression test for finding #15: 'already running' means the prior
+    record's pid is alive, not that the server is healthy -- attaching must
+    re-check status() before opening a browser."""
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.side_effect = tray_main.RunnerAlreadyRunningError(
+        "meridian-tray", mock.MagicMock()
+    )
+    fake_runner.status.return_value = _fake_status(tray_main.LocalMcpState.FAILED)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0
+    assert opened == []
+
+
+def test_run_tray_opens_dashboard_when_local_mcp_not_configured(monkeypatch):
+    """A health_probe-less runner (local_mcp state NOT_CONFIGURED, never
+    READY) must still auto-open -- there's nothing to have timed out."""
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.NOT_CONFIGURED)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+
+    rc = tray_main._run_tray()
+
+    assert rc == 0
+    assert opened == [tray_main._dashboard_url()]
+
+
 # ---------------------------------------------------------------------------
 # Pre-ship validation checklist (507e55de) -- real-artifact consistency
 # checks between meridian-tray.spec, meridian/static/meridian-tray.ico, and

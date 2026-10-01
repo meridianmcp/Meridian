@@ -54,7 +54,15 @@ platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
 
 [dependencies]
 python = ">=3.11,<3.13"
-fastapi = ">=0.115"
+# Upper bound added 2026-09-28: an unbounded >=0.115 let a fresh `pixi lock`
+# float to fastapi 0.141.1 (conda-forge), which broke include_router() --
+# verified in isolation: a router with 91 routes added exactly 1 route to a
+# fresh FastAPI() app. Neither this branch nor origin/dev was ever tested
+# against anything past 0.137.1 (both independently locked 0.136.1/0.137.1
+# across platforms). On this branch, FastAPI 0.137.1 and 0.137.2 both make
+# app.routes omit registered tunnel routes; the origin/dev lock at 0.136.1
+# passes that same route-registration test. Hold to the known-good 0.136 line.
+fastapi = ">=0.115,<0.137"
 uvicorn = ">=0.30"
 aiosqlite = ">=0.20"
 pydantic = ">=2.0,<3"
@@ -143,7 +151,10 @@ psutil = ">=5.9"
 # falling back to the (also-correct, but untested-by-default) missing-
 # dependency degrade path.
 pypdf = ">=4.0"
-mcp = ">=1.0"
+# mcp 2.x removed the Server.list_prompts() decorator that meridian/mcp/stdio_handler.py
+# uses (found 2026-09-29 when a from-scratch `pixi lock` floated it to 2.2.0). Stay on 1.x
+# until stdio_handler is ported to the 2.x server API.
+mcp = ">=1.0,<2"
 anthropic = ">=0.40"
 python-dotenv = ">=1.0"
 psycopg = {version = ">=3.1", extras = ["binary"]}
@@ -207,16 +218,19 @@ Pillow = ">=10.0"
 model2vec = ">=0.3"
 psutil = ">=5.9"
 
+[feature.docs.pypi-dependencies]
+meridian-docs-mcp = { path = "extensions/meridian-docs", editable = true }
+
 # da8fbeec -- extensions/meridian-deep-research wraps langchain-ai/
 # open_deep_research (exact-pinned open-deep-research==0.0.16 in that
 # package's own pyproject.toml) as Meridian's deep-research MCP tool. OPT-IN
-# feature, mirroring the (as yet unmerged-to-dev) meridian-docs-mcp
-# [feature.docs.pypi-dependencies] editable-path pattern -- NOT
-# meridian-outputs' default-env mirroring above. open_deep_research pulls in
-# ~30 transitive dependencies (LangGraph, langchain-openai/-anthropic/
-# -community, the optional Azure/AWS/GCP provider SDKs, pandas, ipykernel,
-# ...); nobody running a plain `pixi run` should pay that install cost by
-# default just to get the rest of Meridian working.
+# feature, mirroring the meridian-docs-mcp [feature.docs.pypi-dependencies]
+# editable-path pattern above -- NOT meridian-outputs' default-env mirroring.
+# open_deep_research pulls in ~30 transitive dependencies (LangGraph,
+# langchain-openai/-anthropic/-community, the optional Azure/AWS/GCP
+# provider SDKs, pandas, ipykernel, ...); nobody running a plain
+# `pixi run` should pay that install cost by default just to get the rest
+# of Meridian working.
 [feature.deep_research.dependencies]
 python = ">=3.11,<3.13"
 
@@ -226,6 +240,7 @@ meridian-deep-research-mcp = { path = "extensions/meridian-deep-research", edita
 [environments]
 dev = { features = ["dev"], solve-group = "default" }
 semantic = { features = ["semantic"], solve-group = "default" }
+docs = { features = ["docs"], solve-group = "default" }
 deep-research = { features = ["deep_research"], no-default-feature = true, solve-group = "deep-research" }
 
 [tasks]

@@ -229,6 +229,15 @@ async def generate_handoff_endpoint(
     _checkpoint = bool(body.get("checkpoint"))
     _strict_continuation = bool(body.get("strict_continuation"))
     _continuation_status: dict[str, Any] = {}
+    # 0527f636 — same transport-parity threading as the MCP HTTP/stdio
+    # dispatchers: optional receiver address for the persisted pending_goal.
+    # Validated here so a malformed address is a clean 422 (not a generic
+    # 500) and is never silently dropped to an unaddressed handoff.
+    _pending_goal_receiver = body.get("receiver")
+    try:
+        db_module.normalize_pending_goal_receiver(_pending_goal_receiver)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     skip_summary = not os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
@@ -250,6 +259,7 @@ async def generate_handoff_endpoint(
                 checkpoint=_checkpoint,
                 strict_continuation=_strict_continuation,
                 continuation_status=_continuation_status,
+                pending_goal_receiver=_pending_goal_receiver,
             ),
             timeout=90.0,
         )

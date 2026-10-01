@@ -28,6 +28,7 @@ import aiosqlite
 
 from meridian import capability_manifest as _capability_manifest
 from meridian import capability_profile as _capability_profile
+from meridian.finding_identity import finding_identity as _finding_identity
 
 _log = logging.getLogger(__name__)
 
@@ -1171,6 +1172,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     # sprint_items.coarse_lock_files: whole-file locks a claim owns on behalf
     # of its symbol: declarations (so a symbol release frees only those).
     await _migrate_sprint_item_coarse_lock_files(db)
+    # fe0b0331 -- findings written before 'finding' joined add_project_note's
+    # kind allow-list were stored with note_kind NULL; backfill them.
+    await _migrate_backfill_finding_note_kind(db)
     return db
 
 
@@ -1380,7 +1384,15 @@ async def set_agent_instructions(
 async def get_project_by_name(
     db: aiosqlite.Connection, name: str
 ) -> dict[str, Any] | None:
-    """Look up a project by name using exact, then fuzzy case-insensitive match."""
+    """Look up a project by name: exact match, then case-insensitive EXACT match.
+
+    This is deliberately NOT a substring/partial match ("Kensington" does not
+    find "Kensington Park"): the resolver in ``mcp/handler.py`` uses this to
+    turn a caller-supplied ``project_name`` into a project id, where a partial
+    match could silently retarget a write. Returns ``None`` when neither pass
+    matches. (The HTTP route ``GET /projects/by-name/{name}`` layers its own
+    case-insensitive substring fallback on top of this function.)
+    """
     async with db.execute(
         "SELECT p.*, gs.goal_sprint AS sprint "
         "FROM projects p "
@@ -10487,6 +10499,11 @@ async def _unique_proposal_nickname(
         nickname = f"{base}-{n}"
 
 
+# The closed ``project_notes.note_kind`` vocabulary (NULL == 'wiki' to readers).
+# 'finding' is the kind save_finding writes (fe0b0331).
+_PROJECT_NOTE_KINDS = ("wiki", "insight", "reference", "code", "document", "finding")
+
+
 async def add_project_note(
     db: aiosqlite.Connection,
     project_id: str,
@@ -10502,8 +10519,13 @@ async def add_project_note(
     """Insert a project_notes row. tags is comma-separated free-form.
 
     ``kind`` is the note taxonomy (wiki | insight | reference | code |
-    document); NULL is treated as 'wiki' by readers. Unknown values are coerced
-    to NULL so the column stays a closed vocabulary.
+    document | finding); NULL is treated as 'wiki' by readers. Unknown values
+    are coerced to NULL so the column stays a closed vocabulary.
+
+    fe0b0331 — ``'finding'`` is the kind :func:`save_finding` writes. It was
+    missing from this allow-list, so every finding note was silently coerced to
+    NULL (and read back as 'wiki'). ``_migrate_backfill_finding_note_kind``
+    repairs the rows written before the fix.
 
     e3f150d0 — ``source`` records where a note was ingested from (a URL or file
     path), set by ``ingest_document`` for ``kind='document'`` notes. Nullable;
@@ -10525,7 +10547,7 @@ async def add_project_note(
     6fb48898 — a short memorable ``nickname`` (1-2 words) is also generated and
     stored, unique per project, using the same algorithm as sprint_items.nickname.
     """
-    if kind not in ("wiki", "insight", "reference", "code", "document"):
+    if kind not in _PROJECT_NOTE_KINDS:
         kind = None
     if priority not in ("high", "normal", "low"):
         priority = "normal"
@@ -10564,11 +10586,32 @@ async def add_project_note(
 
 
 async def get_project_note(
-    db: aiosqlite.Connection, note_id: str
+    db: aiosqlite.Connection,
+    note_id: str,
+    *,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
-    async with db.execute(
-        "SELECT * FROM project_notes WHERE id = ?", (note_id,)
-    ) as cur:
+    """Fetch one project note by its id.
+
+    6f7ce9d6 — ``project_id`` (keyword-only, optional) scopes the lookup to a
+    single project: when supplied, the row is matched ONLY if it belongs to that
+    project (``WHERE id = ? AND project_id = ?``), so a note id that exists in a
+    DIFFERENT project comes back as ``None`` — indistinguishable from a
+    nonexistent id, never leaking whether (or what) the foreign row is. Every
+    caller that resolves an id on behalf of a project-scoped request (the
+    sprint-item pointer ``finding_id`` resolver) MUST pass it. Omitting it
+    (``None``) keeps the legacy bare-id behaviour for the internal callers that
+    have just written or already own the row (``add_project_note``'s read-back,
+    ``update_project_note``, ...). An empty-string ``project_id`` is a scoped
+    lookup that matches nothing (fails closed), never an unscoped one.
+    """
+    if project_id is None:
+        sql = "SELECT * FROM project_notes WHERE id = ?"
+        params: tuple[Any, ...] = (note_id,)
+    else:
+        sql = "SELECT * FROM project_notes WHERE id = ? AND project_id = ?"
+        params = (note_id, project_id)
+    async with db.execute(sql, params) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
 
@@ -11131,9 +11174,191 @@ async def pop_queued_session(
 # defer to any direct /goal instruction they received in chat.
 PENDING_GOAL_STALE_HOURS: int = 24
 
+# 0527f636 — receiver binding for the read-once pending_goal slot.
+#
+# Root cause being closed: ``projects.pending_goal`` is ONE slot per project
+# and every ``start_session`` used to pop it, so with parallel sessions (a
+# sibling executor, an independent verifier subagent, a resumed session, ...)
+# whichever session called ``start_session`` first silently consumed a
+# handoff that was written for a DIFFERENT session, leaving the intended
+# receiver with nothing.
+#
+# Fix: a handoff may be ADDRESSED to its intended receiver at
+# ``generate_handoff`` time (any subset of ``session_name`` / ``role`` /
+# ``worktree``).  An addressed goal is only delivered -- and only cleared --
+# when the claiming ``start_session`` matches EVERY field of the address; a
+# non-matching sibling neither receives nor consumes it (the stored handoff
+# stays readable through the idempotent ``load_handoff``).  An UNADDRESSED
+# handoff (the default: every pre-existing caller) behaves exactly as before.
+#
+# Storage deliberately needs NO schema change (no migration on either the
+# SQLite or the Postgres path): the address rides in the SAME
+# ``projects.pending_goal`` cell as a single-line, server-authored header
+# ahead of the goal body, so body + address are always written and cleared
+# by ONE atomic UPDATE and can never drift apart.  Every reader of that cell
+# goes through the helpers below (``get_pending_goal`` /
+# ``pop_pending_goal`` / ``pop_pending_goal_with_meta`` /
+# ``get_pending_goal_receiver``), which strip the header, so no consumer ever
+# sees it mixed into a goal body -- and the body (which the goal_token's
+# body-hash covers) is stored byte-for-byte untouched.
+PENDING_GOAL_RECEIVER_FIELDS: tuple[str, ...] = ("session_name", "role", "worktree")
+_PENDING_GOAL_ENVELOPE_PREFIX = "<!--meridian:pending-goal-receiver:v1 "
+_PENDING_GOAL_ENVELOPE_SUFFIX = "-->"
+_PENDING_GOAL_RECEIVER_MAX_LEN = 512
+
+
+def normalize_pending_goal_receiver(
+    receiver: object,
+) -> dict[str, str] | None:
+    """0527f636 -- validate + canonicalise a handoff receiver address.
+
+    ``receiver`` is ``None``/empty (-> ``None``, i.e. an UNADDRESSED handoff,
+    today's behaviour) or a mapping with any subset of ``session_name`` /
+    ``role`` / ``worktree`` (non-empty strings; whitespace-stripped).  Fields
+    that are ``None``/blank are dropped.  A mapping whose every field is
+    blank also normalises to ``None``.
+
+    Fails LOUDLY (``ValueError``) on anything that would otherwise silently
+    degrade an addressed handoff into an unaddressed one -- a non-mapping
+    value, an unknown key (e.g. the typo ``session`` for ``session_name``),
+    a non-string field, or an over-long value -- so a caller who asked for
+    receiver protection can never think they have it when they do not.
+    """
+    if receiver is None:
+        return None
+    if not isinstance(receiver, dict):
+        raise ValueError(
+            "receiver must be an object with any of: "
+            + ", ".join(PENDING_GOAL_RECEIVER_FIELDS)
+        )
+    unknown = sorted(str(k) for k in receiver if k not in PENDING_GOAL_RECEIVER_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"receiver has unknown field(s) {unknown}; allowed: "
+            + ", ".join(PENDING_GOAL_RECEIVER_FIELDS)
+        )
+    out: dict[str, str] = {}
+    for key in PENDING_GOAL_RECEIVER_FIELDS:
+        val = receiver.get(key)
+        if val is None:
+            continue
+        if not isinstance(val, str):
+            raise ValueError(f"receiver.{key} must be a string")
+        val = val.strip()
+        if not val:
+            continue
+        if len(val) > _PENDING_GOAL_RECEIVER_MAX_LEN:
+            raise ValueError(
+                f"receiver.{key} is longer than {_PENDING_GOAL_RECEIVER_MAX_LEN} characters"
+            )
+        out[key] = val
+    return out or None
+
+
+def _encode_pending_goal(goal: str, receiver: dict[str, str] | None) -> str:
+    """Serialise ``goal`` (+ optional receiver address) into the stored cell.
+
+    Unaddressed goals are stored EXACTLY as before (the bare body).  A body
+    that itself happens to start with the header prefix is given an explicit
+    empty header so :func:`_decode_pending_goal` round-trips it unchanged.
+    """
+    if not receiver and not goal.startswith(_PENDING_GOAL_ENVELOPE_PREFIX):
+        return goal
+    header = json.dumps(receiver or {}, sort_keys=True, ensure_ascii=True)
+    return (
+        f"{_PENDING_GOAL_ENVELOPE_PREFIX}{header}{_PENDING_GOAL_ENVELOPE_SUFFIX}\n{goal}"
+    )
+
+
+def _decode_pending_goal(raw: str | None) -> tuple[str | None, dict[str, str] | None]:
+    """Inverse of :func:`_encode_pending_goal` -> ``(goal, receiver)``.
+
+    A cell without the header (every legacy / unaddressed row) decodes to
+    ``(raw, None)``.  A well-formed header whose JSON payload is unusable is
+    still stripped from the goal (never leaked into a delivered body) and
+    decodes as unaddressed; a cell whose header line is structurally broken
+    (no newline / no closing marker) is returned whole as an unaddressed
+    body.  The server only ever writes well-formed headers, so both are
+    defensive paths, not expected states.
+    """
+    if not raw:
+        return (raw or None), None
+    if not raw.startswith(_PENDING_GOAL_ENVELOPE_PREFIX):
+        return raw, None
+    header_line, sep, body = raw.partition("\n")
+    if not sep or not header_line.endswith(_PENDING_GOAL_ENVELOPE_SUFFIX):
+        return raw, None
+    payload = header_line[
+        len(_PENDING_GOAL_ENVELOPE_PREFIX): -len(_PENDING_GOAL_ENVELOPE_SUFFIX)
+    ]
+    receiver: dict[str, str] | None = None
+    try:
+        receiver = normalize_pending_goal_receiver(json.loads(payload))
+    except (ValueError, TypeError):
+        receiver = None
+    return (body or None), receiver
+
+
+def _normalize_receiver_path(path: str) -> str:
+    """Slash-normalise a worktree path for comparison (drive-letter paths are
+    compared case-insensitively, POSIX paths case-sensitively)."""
+    norm = path.strip().replace("\\", "/")
+    while "//" in norm:
+        norm = norm.replace("//", "/")
+    norm = norm.rstrip("/") or norm
+    if re.match(r"^[A-Za-z]:(/|$)", norm):
+        norm = norm.casefold()
+    return norm
+
+
+def pending_goal_receiver_mismatches(
+    receiver: dict[str, str] | None,
+    claimant: dict[str, Any] | None,
+) -> list[str]:
+    """0527f636 -- which fields of ``receiver`` the ``claimant`` fails to match.
+
+    An empty list means the claimant IS the intended receiver (also the case
+    for an unaddressed goal, ``receiver`` falsy).  ``claimant`` carries the
+    calling ``start_session``'s ``session_name`` / ``role`` / ``cwd``; a field
+    the receiver constrains but the claimant did not supply counts as a
+    mismatch (fail-closed: an unverifiable claimant never consumes an
+    addressed goal).  ``session_name``/``role`` compare case-insensitively;
+    ``worktree`` matches when the claimant's ``cwd`` IS that worktree or lies
+    inside it.
+    """
+    if not receiver:
+        return []
+    claimant = claimant or {}
+    bad: list[str] = []
+    want_name = receiver.get("session_name")
+    if want_name:
+        got = str(claimant.get("session_name") or "").strip()
+        if not got or got.casefold() != want_name.casefold():
+            bad.append("session_name")
+    want_role = receiver.get("role")
+    if want_role:
+        got = str(claimant.get("role") or "").strip()
+        if not got or got.casefold() != want_role.casefold():
+            bad.append("role")
+    want_tree = receiver.get("worktree")
+    if want_tree:
+        got = str(claimant.get("cwd") or "").strip()
+        if not got:
+            bad.append("worktree")
+        else:
+            tree = _normalize_receiver_path(want_tree)
+            here = _normalize_receiver_path(got)
+            if here != tree and not here.startswith(tree.rstrip("/") + "/"):
+                bad.append("worktree")
+    return bad
+
 
 async def set_pending_goal(
-    db: aiosqlite.Connection, project_id: str, goal: str | None
+    db: aiosqlite.Connection,
+    project_id: str,
+    goal: str | None,
+    *,
+    receiver: dict[str, str] | None = None,
 ) -> None:
     """Persist the handoff /goal so the next start_session can surface it through
     a trusted MCP tool result (keyed on project_id) instead of a copy-pasted,
@@ -11141,29 +11366,84 @@ async def set_pending_goal(
 
     590dcdd5: also writes pending_goal_at (UTC ISO-8601) so pop_pending_goal_with_meta
     can expose the goal's age and flag it as possibly-stale when it is older than
-    PENDING_GOAL_STALE_HOURS hours."""
+    PENDING_GOAL_STALE_HOURS hours.
+
+    0527f636: optional ``receiver`` (see :func:`normalize_pending_goal_receiver`)
+    addresses the goal to its intended receiving session so a sibling
+    ``start_session`` cannot consume it.  ``None`` (the default) is an
+    unaddressed goal -- exactly the pre-existing behaviour.  Body and address
+    are written by one UPDATE, so they can never disagree; a later
+    ``set_pending_goal`` (a fresh or amended handoff) replaces both."""
     now_iso: str | None = (
         _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ") if goal else None
     )
+    stored: str | None = (
+        _encode_pending_goal(goal, normalize_pending_goal_receiver(receiver))
+        if goal else None
+    )
     await db.execute(
         "UPDATE projects SET pending_goal = ?, pending_goal_at = ? WHERE id = ?",
-        ((goal or None), now_iso, project_id),
+        (stored, now_iso, project_id),
     )
     await db.commit()
+
+
+async def _read_pending_goal_cell(
+    db: aiosqlite.Connection, project_id: str
+) -> tuple[str | None, str | None]:
+    """Raw ``(pending_goal, pending_goal_at)`` cell values (header included)."""
+    async with db.execute(
+        "SELECT pending_goal, pending_goal_at FROM projects WHERE id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None, None
+    if isinstance(row, dict):
+        return row.get("pending_goal") or None, row.get("pending_goal_at")
+    return (row[0] or None), (row[1] if len(row) > 1 else None)
 
 
 async def get_pending_goal(
     db: aiosqlite.Connection, project_id: str
 ) -> str | None:
-    """Return the stored handoff /goal, or None when nothing is pending."""
+    """Return the stored handoff /goal body, or None when nothing is pending.
+
+    0527f636: the receiver-address header (if any) is stripped -- callers only
+    ever see the goal body; use :func:`get_pending_goal_receiver` for the
+    address."""
+    raw, _ = await _read_pending_goal_cell(db, project_id)
+    return _decode_pending_goal(raw)[0]
+
+
+async def get_pending_goal_receiver(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, str] | None:
+    """0527f636 -- the receiver address of the pending /goal, or None when
+    nothing is pending or the pending goal is unaddressed.  Read-only."""
+    raw, _ = await _read_pending_goal_cell(db, project_id)
+    goal, receiver = _decode_pending_goal(raw)
+    return receiver if goal else None
+
+
+async def _clear_pending_goal_if_unchanged(
+    db: aiosqlite.Connection, project_id: str, raw: str
+) -> bool:
+    """Atomically clear the pending_goal cell iff it still holds ``raw``.
+
+    Compare-and-clear, so two ``start_session`` calls racing on the same slot
+    cannot BOTH be handed the goal: exactly one UPDATE matches a row.  Returns
+    True when this call cleared it (i.e. won the delivery).  When the driver
+    reports no usable rowcount the call is treated as the winner (the legacy,
+    unconditional behaviour)."""
     async with db.execute(
-        "SELECT pending_goal FROM projects WHERE id = ?", (project_id,)
+        "UPDATE projects SET pending_goal = NULL, pending_goal_at = NULL"
+        " WHERE id = ? AND pending_goal = ?",
+        (project_id, raw),
     ) as cur:
-        row = await cur.fetchone()
-    if row is None:
-        return None
-    val = row["pending_goal"] if isinstance(row, dict) else row[0]
-    return val or None
+        rowcount = cur.rowcount
+    await db.commit()
+    return rowcount is None or rowcount < 0 or rowcount > 0
 
 
 async def pop_pending_goal(
@@ -11171,9 +11451,16 @@ async def pop_pending_goal(
 ) -> str | None:
     """Return the pending /goal and clear it (read-once) so start_session
     surfaces it exactly once and a stale goal never resurfaces in a later
-    session."""
-    goal = await get_pending_goal(db, project_id)
-    if goal:
+    session.
+
+    0527f636: this is the UNCONDITIONAL, administrative pop (e.g. a handoff
+    correction discarding the superseded goal): it clears the slot regardless
+    of any receiver address and returns just the goal body.  Delivery to a
+    claiming session goes through :func:`pop_pending_goal_with_meta`, which
+    honours the address."""
+    raw, _ = await _read_pending_goal_cell(db, project_id)
+    goal, _receiver = _decode_pending_goal(raw)
+    if raw:
         await db.execute(
             "UPDATE projects SET pending_goal = NULL, pending_goal_at = NULL"
             " WHERE id = ?",
@@ -11184,33 +11471,41 @@ async def pop_pending_goal(
 
 
 async def pop_pending_goal_with_meta(
-    db: aiosqlite.Connection, project_id: str
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    claimant: dict[str, Any] | None = None,
 ) -> dict[str, object] | None:
     """590dcdd5 — read-once pop with staleness metadata.
 
-    Returns a dict ``{"goal": str, "age_hours": float, "stale": bool}`` when a
-    pending_goal exists, or ``None`` when nothing is pending.
+    Returns a dict ``{"goal": str, "age_hours": float, "stale": bool,
+    "receiver": dict | None}`` when a pending_goal is DELIVERED to the caller,
+    or ``None`` when nothing was delivered.
 
     ``stale`` is ``True`` when the goal is older than PENDING_GOAL_STALE_HOURS.
     Executors SHOULD treat a stale pending_goal as advisory only and defer to
     any direct /goal instruction received in chat, because the human may have
     started the session with a completely different intent since the handoff was
     written.  The goal is still cleared read-once regardless of staleness.
+
+    0527f636 — ``None`` covers three cases, none of which consumes anything
+    the caller was not entitled to: (1) nothing pending; (2) the goal is
+    ADDRESSED to a receiver (see :func:`set_pending_goal`) that ``claimant``
+    (the calling start_session's ``session_name`` / ``role`` / ``cwd``) does
+    not match -- the goal is left in place for its real receiver and stays
+    readable through ``load_handoff``; a call that supplies no ``claimant``
+    at all can never consume an addressed goal; (3) another concurrent call
+    won the compare-and-clear race for the same goal.  An UNADDRESSED goal
+    is delivered to any caller, exactly as before.
     """
-    async with db.execute(
-        "SELECT pending_goal, pending_goal_at FROM projects WHERE id = ?",
-        (project_id,),
-    ) as cur:
-        row = await cur.fetchone()
-    if row is None:
+    raw, raw_at = await _read_pending_goal_cell(db, project_id)
+    if not raw:
         return None
-    if isinstance(row, dict):
-        raw_goal = row.get("pending_goal")
-        raw_at = row.get("pending_goal_at")
-    else:
-        raw_goal = row[0]
-        raw_at = row[1] if len(row) > 1 else None
+    raw_goal, receiver = _decode_pending_goal(raw)
     if not raw_goal:
+        return None
+    if receiver and pending_goal_receiver_mismatches(receiver, claimant):
+        # Addressed to someone else: neither deliver nor clear.
         return None
     # Compute age in hours; treat missing/malformed timestamp as 0 (unknown age).
     age_hours: float = 0.0
@@ -11223,14 +11518,16 @@ async def pop_pending_goal_with_meta(
         except (ValueError, TypeError):
             age_hours = 0.0
     stale = age_hours >= PENDING_GOAL_STALE_HOURS
-    # Clear read-once regardless of staleness.
-    await db.execute(
-        "UPDATE projects SET pending_goal = NULL, pending_goal_at = NULL"
-        " WHERE id = ?",
-        (project_id,),
-    )
-    await db.commit()
-    return {"goal": raw_goal, "age_hours": round(age_hours, 2), "stale": stale}
+    # Clear read-once regardless of staleness -- but only if THIS call still
+    # owns the slot (compare-and-clear), so a racing sibling cannot also get it.
+    if not await _clear_pending_goal_if_unchanged(db, project_id, raw):
+        return None
+    return {
+        "goal": raw_goal,
+        "age_hours": round(age_hours, 2),
+        "stale": stale,
+        "receiver": receiver,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -12405,6 +12702,54 @@ async def validate_assumption(
 _FINDING_SOURCE_TYPES = ("web", "arxiv", "code", "conversation")
 
 
+def _is_finding_note(row: dict[str, Any]) -> bool:
+    """True for a finding note: ``note_kind='finding'`` or a ``finding`` tag token.
+
+    The tag test covers findings written before fe0b0331 (whose kind was
+    coerced to NULL) on a database the backfill migration has not reached.
+    """
+    if (row.get("note_kind") or "") == "finding":
+        return True
+    return "finding" in {
+        t.strip().lower() for t in (row.get("tags") or "").split(",") if t.strip()
+    }
+
+
+async def find_existing_finding(
+    db: aiosqlite.Connection, project_id: str, source: str | None
+) -> dict[str, Any] | None:
+    """fe0b0331 — the OLDEST finding note in ``project_id`` whose ``source``
+    resolves to the same canonical identity as ``source``, or ``None``.
+
+    Identity is :func:`meridian.finding_identity.finding_identity` (case-folded
+    DOI, arXiv id without version, PMID, else a normalised URL). A ``source``
+    with no identity (empty / free text) never matches anything. Scoped to ONE
+    project: the same paper in two projects is not a duplicate. Returns the
+    full note row.
+    """
+    identity = _finding_identity(source)
+    if identity is None:
+        return None
+    # Cheap SQL prefilter (kind or a 'finding' tag substring; the exact tag-token
+    # test is done in Python), no bodies fetched. The identity comparison itself
+    # can't be expressed in SQL, so it runs over the project's finding sources.
+    async with db.execute(
+        "SELECT id, source, tags, note_kind FROM project_notes "
+        "WHERE project_id = ? AND source IS NOT NULL AND source <> '' "
+        "AND (note_kind = 'finding' OR tags LIKE ?) "
+        "ORDER BY created_at ASC, id ASC",
+        (project_id, "%finding%"),
+    ) as cur:
+        rows = await cur.fetchall()
+    for raw in rows:
+        row = _row_to_dict(raw)
+        if row is None or not _is_finding_note(row):
+            continue
+        if _finding_identity(row.get("source")) == identity:
+            return await get_project_note(db, row["id"])
+    return None
+
+
 async def save_finding(
     db: aiosqlite.Connection,
     project_id: str,
@@ -12413,6 +12758,7 @@ async def save_finding(
     source_url: str | None = None,
     source_type: str = "web",
     decision_id: str | None = None,
+    force_new: bool = False,
 ) -> dict[str, Any]:
     """Persist a finding as an addressable ``kind='finding'`` note with provenance.
 
@@ -12421,8 +12767,20 @@ async def save_finding(
     ``decision_id`` is given — is also tagged ``decision:<id>`` to link it to that
     pinned decision. The note title is derived from the first line of ``summary``.
 
-    Returns ``{note, source_type, decision_id}``. Raises ValueError if
-    ``decision_id`` is given but no such decision exists.
+    fe0b0331 — in-project dedupe. When ``project_id`` already holds a finding
+    whose ``source_url`` has the same canonical identity (see
+    :func:`find_existing_finding`), NO copy is created: the result is the SOFT
+    ``{note: <existing>, existing_note_id, duplicate: True, identifier, message,
+    source_type, decision_id}`` -- not an error, and ``note`` is the existing row
+    so callers that read ``result["note"]["id"]`` keep working. A ``decision_id``
+    given with the duplicate is still honoured by adding its ``decision:<id>`` tag
+    to the existing note. ``force_new=True`` skips the check and always creates
+    the note (the escape hatch). The existing duplicates already in a project are
+    left alone -- never deleted.
+
+    Returns ``{note, source_type, decision_id}`` (plus the duplicate keys above
+    on a duplicate). Raises ValueError if ``decision_id`` is given but no such
+    decision exists.
     """
     st = (source_type or "web").strip().lower()
     if st not in _FINDING_SOURCE_TYPES:
@@ -12438,6 +12796,32 @@ async def save_finding(
             raise ValueError("decision not found")
         tags = f"{tags},decision:{decision_id}"
         linked = decision_id
+    if not force_new:
+        existing = await find_existing_finding(db, project_id, source_url)
+        if existing is not None:
+            note = existing
+            if linked:
+                link_tag = f"decision:{linked}"
+                have = (existing.get("tags") or "").strip(",")
+                if link_tag not in {t.strip() for t in have.split(",")}:
+                    updated = await update_project_note(
+                        db, existing["id"],
+                        tags=f"{have},{link_tag}" if have else link_tag,
+                    )
+                    note = updated or existing
+            return {
+                "note": note,
+                "source_type": st,
+                "decision_id": linked,
+                "existing_note_id": existing["id"],
+                "duplicate": True,
+                "identifier": _finding_identity(source_url),
+                "message": (
+                    "A finding for this source already exists in this project; "
+                    "nothing was created. Pass force_new=true to save a separate "
+                    "copy anyway."
+                ),
+            }
     note = await add_project_note(
         db, project_id, title, summary, tags,
         kind="finding", source=source_url,

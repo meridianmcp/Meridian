@@ -75,10 +75,16 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "register_docx_derivative": 'register_docx_derivative(project_id="abc-123", session_id="sess-1", source_path="thesis/chapter1.docx", derivative_path="exports/chapter1.pdf", source_content_hash="a1b2c3...", generating_tool="pandoc 3.1")',
     "verify_docx_diff": 'verify_docx_diff(project_id="abc-123", derivative_id="deriv-uuid", current_source_content_hash="a1b2c3...")',
     "promote_docx_candidate": 'promote_docx_candidate(project_id="abc-123", session_id="sess-1", derivative_id="deriv-uuid")',
+    "create_paper_contract": 'create_paper_contract(project_id="abc-123", paper_key="main-paper", title="DNABERT-2 error correction")',
+    "get_paper_contract": 'get_paper_contract(project_id="abc-123", paper_key="main-paper")',
+    "create_paper_contract_revision": 'create_paper_contract_revision(project_id="abc-123", contract_id="contract-uuid", content={"working_title": "DNABERT-2 error correction", "target_venue": "PLOS Computational Biology", "style_guide": "Figure diagrams: navy for chrome, blue for repeated main-path blocks, amber for one-off ops, gray for passive/masked, teal for final output."}, change_summary="Add figure color-convention section to style guide")',
+    "list_paper_contract_revisions": 'list_paper_contract_revisions(project_id="abc-123", contract_id="contract-uuid")',
+    "approve_paper_contract_revision": 'approve_paper_contract_revision(project_id="abc-123", revision_id="revision-uuid", approved_by_human_id="adam")',
+    "get_current_paper_contract_content": 'get_current_paper_contract_content(project_id="abc-123", paper_key="main-paper")',
     "add_sprint_item_pointer": 'add_sprint_item_pointer(project_id="abc-123", sprint_item_id="item-uuid", source_type="code", targets=[{"uri": "meridian/server.py", "selector": {"type": "symbol", "qualified_name": "meridian.server.mcp_tools_doc"}}], label="the tool-doc generator")',
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
-    "delete_sprint_item_pointer": 'delete_sprint_item_pointer(pointer_id="pointer-uuid")',
+    "delete_sprint_item_pointer": 'delete_sprint_item_pointer(project_id="abc-123", pointer_id="pointer-uuid")',
     "relocate_sprint_item_pointer": 'relocate_sprint_item_pointer(project_id="abc-123", pointer_id="pointer-uuid", targets=[{"uri": "src/chapter1.tex", "selector": {"type": "range", "start_line": 1, "end_line": 40}, "repo_root": "/home/alice/thesis-repo"}])',
     "execute_batch": 'execute_batch(project_id="abc-123", operation="sprint_items", entries=[{"title": "Add rate limiting", "correlation_key": "a"}, {"title": "Add retry backoff", "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-05-batch-1")',
     "batch_read": 'batch_read(project_id="abc-123", requests=[{"request_id": "items", "adapter": "sprint_board", "operation": "get_sprint_items", "args": {"status": "pending"}}, {"request_id": "ptrs", "adapter": "sprint_board", "operation": "get_sprint_item_pointers", "args": {"sprint_item_id": "item-uuid"}, "depends_on": ["items"]}])',
@@ -122,7 +128,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "export_ai_log_artifacts": 'export_ai_log_artifacts(project_id="abc-123", content_hashes=["sha256:..."])',
     "purge_ai_log": 'purge_ai_log(project_id="abc-123", cutoff="2025-01-01T00:00:00Z")',
     "search_ai_log": 'search_ai_log(project_id="abc-123", correlation_id="run-42", event_type="tool.invoked", limit=50)',
-    "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
+    "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_run_id="<verification_run_id returned by run_verification>")',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
@@ -265,18 +271,32 @@ _PLANNED_OUTPUT_SCHEMA: dict[str, Any] = {
 _ARTIFACT_POLICY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": (
-        "2f9cb288 — per-item override of how strictly a missing/wrong artifact "
-        "output pointer is enforced. Absent (omit, or on update_sprint_item pass "
-        "null to clear) falls back to the project default: artifact_pointer_check="
-        "'warn', every guard flag false — never a silent 'off', never a silent "
-        "'strict'. See meridian.artifact_declaration.effective_artifact_policy."
+        "2f9cb288 / 275a8631 — per-item, OPT-IN override of how strictly a "
+        "missing/wrong artifact output pointer is enforced. Absent (omit, or on "
+        "update_sprint_item pass null to clear) falls back to the project default: "
+        "artifact_pointer_check='warn', every guard flag false — never a silent "
+        "'off', never a silent 'strict'; an item that declares no policy is never "
+        "blocked. ENFORCEMENT (275a8631): complete_sprint_item refuses (error "
+        "ARTIFACT_POINTER_REQUIRED) a figure/table item under 'strict' or a "
+        "require_exact_* flag that has no EXACT output pointer — a planned_output "
+        "target, a sprint_item_pointer, or a file: touches_resources entry whose uri "
+        "is a concrete figure file (.png/.jpg/.jpeg/.gif/.svg/.webp/.tif/.tiff/.eps/"
+        ".bmp) or table file (.csv/.tsv/.xlsx/.xls); a bare .docx, a directory or a "
+        "generic mcp_tool:/db:/route: reference does not count. Whether an item is "
+        "figure/table work is the classifier's verdict (declared artifact_kind, else "
+        "title/notes/pointer evidence) — a policy flag can never talk an item out of "
+        "it. The only way past the block is a human-approved override "
+        "(override_artifact_pointer + override_reason + override_hitl_id on "
+        "complete_sprint_item). See meridian.artifact_declaration."
+        "effective_artifact_policy and meridian.db.sprint_items."
+        "evaluate_artifact_pointer_gate."
     ),
     "properties": {
         "artifact_pointer_check": {"type": "string", "enum": ["off", "warn", "strict"],
-            "description": "off = no enforcement; warn = surface but don't block (default); strict = block completion without a valid planned_output pointer."},
-        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, a figure-kind item must declare an exact planned_output pointer (default false)."},
-        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, a table-kind item must declare an exact planned_output pointer (default false)."},
-        "allow_document_only_override": {"type": "boolean", "description": "When true, a document_only-kind item may override/bypass the pointer check (default false)."},
+            "description": "off = no enforcement of any kind (also switches off the require_exact_* flags); warn = surface the finding in handoffs but never block (default); strict = the handoff marks the item non-executable AND complete_sprint_item refuses it (ARTIFACT_POINTER_REQUIRED) while it is figure/table work with no exact output pointer. Items that are not figure/table work (document_only, caption/equation/code-only, no signal) are unaffected."},
+        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a figure-kind item that has no exact figure-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). Default false."},
+        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a table-kind item that has no exact table-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). Default false."},
+        "allow_document_only_override": {"type": "boolean", "description": "Reserved — currently NOT consulted by any enforcement path (a figure/table item can never self-declare its way out of the pointer check, and a document_only-kind item is never pointer-checked in the first place). Stored and echoed only. Default false."},
     },
 }
 
@@ -364,8 +384,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "get_project_by_name", "description":
         "Read-only: Find a project by name — look up, search, or resolve a project's project_id "
-        "from its name (case-insensitive substring match). Use when the user names a project but "
-        "you need its id. Returns the first hit with id, name, and sprint.",
+        "from its name (exact match, then case-insensitive exact match; not a substring search). "
+        "Use when the user names a project but you need its id. Returns the match with id, name, "
+        "and sprint.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}},
          "required": ["name"]}},
@@ -500,14 +521,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."},
          "checkpoint": {"type": "boolean", "description": "(ecc8b280) Mark THIS call as a mid-run progress report rather than a final, session-ending handoff. Applies to full/delta modes only. A checkpoint=true call is never refused by strict_continuation below, regardless of how much actionable work remains — it changes nothing about what gets rendered, only whether the continuation gate can engage."},
          "strict_continuation": {"type": "boolean", "description": "(ecc8b280) Opt-in, off by default — mirrors strict_evidence's shape. When true and checkpoint is not set, refuses to render/persist this handoff (full/delta modes only) if actionable pending/in_progress items remain on the live board with no recorded blocker_kind while execution_mode=autonomous, returning {error: HANDOFF_CONTINUATION_BLOCKED, continuation_status, message} instead. Leave false/omitted for today's behavior (continuation_status is still always returned either way)."},
-         "emit_manifest": {"type": "boolean", "description": "(acf6f51a) Opt-in, off by default. mode='goal' only (for now): when true, embeds a canonical <handoff_manifest> XML block — schema_version, board_revision (a deterministic digest of every item's id/status/depends_on), project/tenant origin identity, generated_at, the selected/closure item ids, the full item id/status/depends_on/resources list, and the wave plan — into the rendered /goal text BEFORE the goal token is minted, so verify_handoff_token's existing body_hash check also covers the manifest; no separate verification path. A receiver re-fetches the live board and compares against board_revision (see handoff.verify_board_revision) to detect drift before acting. Other modes are unaffected by this flag for now."}},
+         "emit_manifest": {"type": "boolean", "description": "(acf6f51a) Opt-in, off by default. mode='goal' only (for now): when true, embeds a canonical <handoff_manifest> XML block — schema_version, board_revision (a deterministic digest of every item's id/status/depends_on), project/tenant origin identity, generated_at, the selected/closure item ids, the full item id/status/depends_on/resources list, and the wave plan — into the rendered /goal text BEFORE the goal token is minted, so verify_handoff_token's existing body_hash check also covers the manifest; no separate verification path. A receiver re-fetches the live board and compares against board_revision (see handoff.verify_board_revision) to detect drift before acting. Other modes are unaffected by this flag for now."},
+         "receiver": {"type": "object", "properties": {"session_name": {"type": "string", "description": "Name the receiving session registers under via start_session(session_name=...). Case-insensitive exact match."}, "role": {"type": "string", "description": "Role the receiving session passes to start_session(role=...), e.g. 'executor'. Case-insensitive exact match."}, "worktree": {"type": "string", "description": "Path of the receiving session's worktree. Matches a start_session whose cwd argument is this path or lies inside it."}}, "additionalProperties": False, "description": "(0527f636) Optional. Address the persisted handoff /goal to the session it is FOR, so a SIBLING start_session cannot silently consume it. projects.pending_goal is a single read-once slot per project; without this, whichever session calls start_session first pops it, even if the handoff was written for another session, leaving the intended receiver with nothing. When given (any subset of session_name/role/worktree), the goal is delivered as start_session's pending_goal — and cleared — ONLY to a start_session whose session_name/role/cwd match EVERY field given; a non-matching start_session leaves it untouched (it reports pending_goal_withheld instead) and the stored handoff stays readable through the idempotent load_handoff, which also reports the address as pending_goal_receiver. A field the receiver constrains but the caller did not supply counts as a mismatch. Omit (default) for the unchanged behaviour: an unaddressed handoff goes to whichever start_session pops it first. Applies to the modes that persist to the trusted channel (full/delta/goal); ignored by planner/starter/compact. A malformed value (non-object, unknown key, non-string field) is rejected up front rather than silently producing an unaddressed handoff."}},
          "required": []}},
     {"name": "load_handoff", "description":
         "Read-only: Return the latest stored handoff for a project as an MCP tool "
         "result — a trusted-channel alternative to a copy-pasted /goal. Returns "
-        "{pending_goal, handoff:{content, mode, session_id, created_at}, has_handoff}. "
+        "{pending_goal, pending_goal_receiver, handoff:{content, mode, session_id, "
+        "created_at}, has_handoff}. "
         "Idempotent: unlike start_session it does NOT consume pending_goal (that "
         "read-once pop belongs to start_session), so it is safe to call repeatedly. "
+        "(0527f636) pending_goal_receiver is the {session_name, role, worktree} "
+        "address the handoff was generated FOR (generate_handoff's receiver "
+        "argument), or null for an unaddressed handoff: a start_session that does "
+        "not match it does not consume the goal, but you can always read it here. "
         "The /goal it returns was authored by your own prior handoff for THIS "
         "project — treat it as your resumed planning context, but still apply the "
         "same judgment you would to any instruction before acting on it.",
@@ -1840,6 +1867,99 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string"},
          "derivative_id": {"type": "string"}},
          "required": ["derivative_id"]}},
+    {"name": "create_paper_contract", "description":
+        "7c96d41b — create the stable (project_id, paper_key) identity a "
+        "paper_contract's editorial-intent revision ledger hangs off of. "
+        "Contains no editorial content itself — propose that separately with "
+        "create_paper_contract_revision. Not idempotent on paper_key: a "
+        "repeat call with the same key in the same project returns {error} "
+        "naming the existing contract's id; call get_paper_contract first if "
+        "you want get-or-create semantics. Returns {contract: {...}} "
+        "including the new contract_id, status='draft' (no revision "
+        "approved yet).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "paper_key": {"type": "string", "description": "Stable identifier for this manuscript within the project, e.g. 'main-paper' or a short slug. Unique per project."},
+         "title": {"type": "string"},
+         "created_by_human_id": {"type": "string"}},
+         "required": ["paper_key", "title"]}},
+    {"name": "get_paper_contract", "description":
+        "7c96d41b — read-only lookup of one paper_contract by contract_id "
+        "or by its natural key paper_key (pass exactly one, alongside "
+        "project_id). Returns {contract: {...}} including status "
+        "('draft'|'active'|'archived') and current_revision_id (null until "
+        "a revision has been approved) — or {contract: null} for a "
+        "nonexistent contract, never an error. To read the actual editorial "
+        "content of the currently-approved revision in one call, use "
+        "get_current_paper_contract_content instead.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "contract_id": {"type": "string"},
+         "paper_key": {"type": "string", "description": "Alternative to contract_id — the stable key passed to create_paper_contract. Exactly one of contract_id/paper_key is required."}},
+         "required": []}},
+    {"name": "create_paper_contract_revision", "description":
+        "7c96d41b — propose a new PENDING revision of a paper_contract's "
+        "editorial-intent content: working_title, target_venue, audience, "
+        "thesis, scope_in/scope_out, required_sections, style_guide "
+        "(free-text — figure/prose conventions, tone, whatever this "
+        "manuscript needs), citation_style, word_limit, constraints. This is "
+        "the proposal step only — a freshly created revision is NEVER "
+        "binding (an editorial session must not assume it) until a human "
+        "explicitly calls approve_paper_contract_revision, even when this "
+        "tool itself is called from an AI drafting session. Returns "
+        "{revision: {...}} including the new revision_id and "
+        "approval_status='pending'.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "contract_id": {"type": "string"},
+         "content": {"type": "object", "description": "The proposed PaperContractContent payload as a plain object — any subset of working_title, target_venue, audience, thesis, scope_in, scope_out, required_sections, style_guide, citation_style, word_limit, constraints. Must be non-empty."},
+         "change_summary": {"type": "string", "description": "Short human-readable note on what changed and why, for the revision history."},
+         "created_by": {"type": "string"}},
+         "required": ["contract_id", "content"]}},
+    {"name": "list_paper_contract_revisions", "description":
+        "7c96d41b — read-only: every revision in one contract's ledger, "
+        "oldest first, including pending/approved/rejected alike — the full "
+        "editorial history. Each entry's approval_status and (for approved "
+        "ones) approved_by_human_id/approved_at show who made what binding "
+        "and when. Returns {revisions: [...]}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "contract_id": {"type": "string"}},
+         "required": ["contract_id"]}},
+    {"name": "approve_paper_contract_revision", "description":
+        "7c96d41b — the human-approval gate: pin revision_id as its "
+        "contract's binding current_revision_id, the one snapshot an "
+        "editorial session should treat as authoritative from now on. "
+        "Requires a non-empty approved_by_human_id — an unattributed "
+        "approval would defeat the point of the gate, so only call this "
+        "with a real human identity/name that actually signed off (e.g. in "
+        "chat), never a placeholder. Supersedes the contract's previously-"
+        "approved revision, if any, and flips the contract's status to "
+        "'active'. Idempotent when the revision is already approved "
+        "(no-op success); rejects {error} when the revision is 'rejected' "
+        "(a dead end — propose a new revision instead of trying to revive "
+        "one). Returns {revision: {...}}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "revision_id": {"type": "string"},
+         "approved_by_human_id": {"type": "string", "description": "The real human who approved this revision — required, never a placeholder or an AI session's own identity."}},
+         "required": ["revision_id", "approved_by_human_id"]}},
+    {"name": "get_current_paper_contract_content", "description":
+        "7c96d41b — read-only convenience: resolve straight to the content "
+        "of a paper_contract's CURRENTLY APPROVED revision in one call, by "
+        "contract_id or paper_key, instead of chaining get_paper_contract -> "
+        "read current_revision_id -> fetch that revision by hand. Returns "
+        "{contract, revision, content}, where content is the plain "
+        "editorial-intent object (working_title, style_guide, scope_in/out, "
+        "etc.) — or content: null (never an error) when the contract "
+        "doesn't exist yet, or exists but has never had a revision approved "
+        "(status still 'draft'). This is the one call an editorial session "
+        "most wants: 'what is this paper actually allowed to be right now.'",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "contract_id": {"type": "string"},
+         "paper_key": {"type": "string", "description": "Alternative to contract_id. Exactly one of contract_id/paper_key is required."}},
+         "required": []}},
     {"name": "prospect_symbol", "description":
         "2ce5bc76 — ROBUST symbol prospecting with a three-rung fallback chain: "
         "tries codebase__search_graph FIRST (fast, graph-indexed); when it returns "
@@ -2047,8 +2167,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "place instead — preserving its id/created_at, and without the data-loss/"
         "visibility window a delete-then-re-add pair has — use "
         "relocate_sprint_item_pointer (W1-J); reserve this tool for when you actually "
-        "want the pointer gone.",
+        "want the pointer gone. project_id (or project_name) is required (6f7ce9d6) "
+        "and is enforced in the delete itself: a pointer id that belongs to a "
+        "DIFFERENT project deletes nothing and is reported exactly like a "
+        "nonexistent one ({deleted:false}) — never distinguished.",
      "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "pointer_id": {"type": "string", "description": "The id of the pointer to delete."}},
          "required": ["pointer_id"]}},
     {"name": "relocate_sprint_item_pointer", "description":
@@ -2252,25 +2377,36 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "built-in web search, the arXiv MCP, Serena, a teammate). Decoupled from "
         "search so capture survives regardless of how you found it. The summary's "
         "first line becomes the note title; the note is tagged 'finding' + the "
-        "source_type. Optionally links to a pinned decision. Returns the note.",
+        "source_type. Optionally links to a pinned decision. Returns the note. "
+        "In-project dedupe: if this project already has a finding for the same "
+        "source (case-folded DOI, arXiv id without version, PMID, or normalised "
+        "URL) nothing is created and the result carries existing_note_id (a soft "
+        "result, not an error); pass force_new=true to save a separate copy.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "summary": {"type": "string", "description": "The finding text (markdown). Its first line becomes the note title."},
          "source_url": {"type": "string", "description": "Provenance URL/path stored on the note."},
          "source_type": {"type": "string", "enum": ["web", "arxiv", "code", "conversation"], "description": "Where the finding came from. Default web; unknown values fall back to web."},
-         "decision_id": {"type": "string", "description": "Optional pinned-decision id to link this finding to (tagged decision:<id>)."}},
+         "decision_id": {"type": "string", "description": "Optional pinned-decision id to link this finding to (tagged decision:<id>)."},
+         "force_new": {"type": "boolean", "description": "Default false. true skips the in-project duplicate check and always creates a new finding note."}},
          "required": ["summary"]}},
     {"name": "capture_research_finding", "description":
         "Inline capture for web/paper research during planning: save a finding "
         "from a URL as an addressable note with the source link, optionally linked "
         "to a decision. A research-shaped wrapper over save_finding — arXiv URLs "
         "are tagged source_type=arxiv automatically, everything else as web. Turns "
-        "web-search results into durable Meridian artifacts instead of evaporating.",
+        "web-search results into durable Meridian artifacts instead of evaporating. "
+        "In-project dedupe: if this project already has a finding for the same "
+        "paper/page (case-folded DOI, arXiv id without version, PMID, or "
+        "normalised URL) nothing is created and the result carries "
+        "existing_note_id (a soft result, not an error); pass force_new=true to "
+        "save a separate copy.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "url": {"type": "string", "description": "Source URL of the web page or paper."},
          "summary": {"type": "string", "description": "Your summary of the finding (markdown)."},
-         "related_decision_id": {"type": "string", "description": "Optional pinned-decision id to link the finding to."}},
+         "related_decision_id": {"type": "string", "description": "Optional pinned-decision id to link the finding to."},
+         "force_new": {"type": "boolean", "description": "Default false. true skips the in-project duplicate check and always creates a new finding note."}},
          "required": ["url", "summary"]}},
     {"name": "get_notes", "description":
         "Read-only: List project notes (newest first), LIGHTWEIGHT by default — "
@@ -2894,7 +3030,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "wave": {"type": "string",
                   "description": "58a45b92 — set/clear the stored wave label (e.g. 'wave-1') for enforced parallel-batch grouping. Hand-override of what assign_sprint_waves computes. Pass an empty string to CLEAR (unassigned); omit to leave unchanged."},
          "prospect_bypass": {"type": "boolean",
-                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. Set false to re-enable the structural gate. Omit to leave unchanged. Executor sessions must NOT set this field."},
+                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. 0ff5e59f — setting it true is an AUDITED override: it requires a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise) and writes an action_audit_log row. Set false to re-enable the structural gate (no reason needed). Omit to leave unchanged. Executor sessions must NOT set this field."},
+         "override_reason": {"type": "string", "description": "0ff5e59f — REQUIRED with prospect_bypass=true: why this item may be claimed without prospecting evidence. Recorded to action_audit_log (who/when/why)."},
          "depends_on": {"type": "string",
                         "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
          "require_verification": {"type": "boolean",
@@ -2918,9 +3055,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "or a task_id, or completion is refused (EVIDENCE_REQUIRED). If the item is "
         "flagged require_verification (e2e1b682), completion is refused "
         "(VERIFICATION_REQUIRED) unless an independent PASS is on file: pass "
-        "verifier_session_id (a DIFFERENT session id from actor — a fresh, no-memory "
-        "subsession that inspected the change with read-only tools) and "
-        "verification_verdict='pass' to file and check the verdict in this same call. "
+        "verifier_session_id (a DIFFERENT, REAL session of this project — the fresh, "
+        "no-memory subsession's own start_session id; an unregistered/made-up id, another "
+        "project's session, the completing actor, or the claim holder is refused, 0ff5e59f) "
+        "and verification_verdict='pass' to file and check the verdict in this same call. "
         "fdaa5b55 — if the item has a linked GitHub issue, the response carries a "
         "github_issue_action field: issues Meridian itself created (github_issue_source="
         "'meridian_auto') are commented on and auto-closed; any other issue (manual/legacy) "
@@ -2949,7 +3087,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "is availability_policy='required' and code-intel itself is unavailable. Pass "
         "override_code_intel_receipt=true with a non-empty override_reason to acknowledge and "
         "complete anyway (audited). 'optional'/'degraded_ok' policies never block — they degrade "
-        "with a code_intel_receipt_warning on the returned item instead.",
+        "with a code_intel_receipt_warning on the returned item instead. "
+        "275a8631 — ARTIFACT-POINTER gate (OPT-IN per item): if the item's policy "
+        "(update_sprint_item policy=...) sets artifact_pointer_check='strict' or "
+        "require_exact_figure/table_output_pointer, completion is refused "
+        "(ARTIFACT_POINTER_REQUIRED, with an artifact_pointer detail block) while the item "
+        "is figure/table work with no exact output pointer on file. Items with no such "
+        "policy are unaffected. The only way past it is a HUMAN-approved override: pass "
+        "override_artifact_pointer=true + override_reason; the first call files a "
+        "require_human gate-override HITL (it cannot be auto-answered) and returns "
+        "HUMAN_APPROVAL_REQUIRED with its id; after a human answers Yes, retry with "
+        "override_hitl_id. The approval is single-use, bound to this item, and audited.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -2957,13 +3105,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "notes": {"type": "string", "description": "Evidence for the completion (what shipped / how it was verified). Persisted on the item; satisfies the required_notes gate."},
          "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id). Checked against the item's claim owner (8693b6a8) — a mismatch on a live, non-stale claim is refused unless force_foreign_claim=true."},
          "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."},
-         "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must differ from actor/session_id or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
+         "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must be a REAL session of this project (0ff5e59f: the id the verifier's own start_session returned) that differs from actor/session_id and from the claim holder, or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
          "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
          "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."},
-         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit override, never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit, AUDITED override (0ff5e59f): it must be paired with a non-empty override_reason in the SAME call or the completion is refused (CLAIM_MISMATCH), and an action_audit_log row is written. Never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "override_artifact_pointer": {"type": "boolean", "description": "275a8631 — request the HUMAN-approved override of an ARTIFACT_POINTER_REQUIRED rejection. Requires override_reason. The first call files a require_human gate-override HITL and returns HUMAN_APPROVAL_REQUIRED + hitl_id; after a human answers Yes, retry with override_hitl_id. Ignored when the gate does not block this item."},
+         "override_hitl_id": {"type": "string", "description": "275a8631 — id of the answered (Yes) gate-override HITL a human approved for THIS item's artifact-pointer override. Single-use; bound to this item."},
+         "override_ci": {"type": "boolean", "description": "427b7902 — explicit override of a CI_FAILING rejection (GitHub Actions is genuinely failing for the commit named in the notes). 0ff5e59f — must be paired with a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise); audited to action_audit_log."},
          "strict_evidence": {"type": "boolean", "description": "5fe3502e — opt in to the STRICT, fail-closed evidence gate for THIS call only (see meridian.sprint_evidence_guard). Omit/false preserves the exact pre-existing advisory-only behavior. Equivalent, persistent alternative: update_sprint_item(require_strict_evidence=true)."},
          "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit, audited override of a STRICT_EVIDENCE_BLOCKED rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Never inferred; omit/false for normal strict behavior."},
-         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside override_strict_evidence=true (or a8c0f3b7's override_code_intel_receipt=true): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
+         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside ANY override flag (override_strict_evidence, override_code_intel_receipt, override_test_run_receipt, override_ci, force_foreign_claim, override_artifact_pointer): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
          "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit, audited override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Only relevant for a project that declared the 'code_intel_prospecting' capability."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
@@ -3155,13 +3306,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "complete_wave_gate", "description":
         "d2430713 — EXECUTOR GATE: call this AFTER you have actually run a wave's gate "
         "action list (push, deploy, wait, run_verification) to unblock the next wave's "
-        "sprint items. You MUST pass the REAL structured result from run_verification as "
-        "verification_payload — the server validates it (status=='ok', exit_code==0). "
-        "A self-report ('I think it passed') or a fabricated payload is rejected with a "
-        "clear error. On success, writes a wave_gate_results row and returns "
-        "{gate_completed, wave_label, next_wave_label, next_wave_item_count, "
-        "next_wave_item_ids, gate_id}. Each wave gate may only be completed once "
-        "(duplicate calls return an error). Security note: this is a deploy-adjacent "
+        "sprint items. 0ff5e59f — pass verification_run_id: the id that run_verification "
+        "returns for the real, server-recorded test run. The RECORDED run's own "
+        "status/exit_code decide the unlock (status=='ok', exit_code==0, same project, "
+        "completed, and not already spent on another gate) — nothing you type is "
+        "consulted. A hand-typed verification_payload is a self-report and is REFUSED "
+        "(WaveGateUnboundPayload); the only escape hatch is a HUMAN's decision: pass "
+        "override_unbound_payload=true with override_reason, which files a require_human "
+        "gate-override HITL (it cannot be auto-answered) and returns "
+        "HUMAN_APPROVAL_REQUIRED + hitl_id; after a human answers Yes, retry with "
+        "override_hitl_id. The approval is single-use, bound to this wave gate, and the "
+        "override is audited to action_audit_log. On success, writes a wave_gate_results "
+        "row and returns {gate_completed, wave_label, next_wave_label, "
+        "next_wave_item_count, next_wave_item_ids, gate_id, evidence_source}. Each wave "
+        "gate may only be completed once (duplicate calls return an error). Security "
+        "note: this is a deploy-adjacent "
         "gate — only actual run_verification output satisfies it. ed8e4524 — SCOPED "
         "TO SPRINT VERSION: pass version (or session_id to auto-resolve the calling "
         "session's scope) so two different sprint versions that happen to share the "
@@ -3172,11 +3331,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "wave_label": {"type": "string", "description": "The wave whose gate is being completed, e.g. 'wave-1'. Must match the wave field on sprint_items that were just executed."},
-         "verification_payload": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Any other value (non-zero exit, error, not_configured, not_connected) is rejected. Do NOT fabricate or self-report — the server validates the payload."},
+         "verification_run_id": {"type": "string", "description": "0ff5e59f — the verification_run_id returned by run_verification. The stored run's recorded status/exit_code decide the unlock. Required unless a human-approved override is used."},
+         "verification_payload": {"type": "object", "description": "A hand-typed result dict. IGNORED when verification_run_id is given; on its own it is a self-report and is refused unless carried by override_unbound_payload=true + override_reason + a human-answered override_hitl_id (it must still have status='ok' and exit_code=0). Do NOT fabricate or self-report."},
+         "override_unbound_payload": {"type": "boolean", "description": "0ff5e59f — request the human-approved escape hatch for a verification_payload that is not backed by a recorded run (e.g. the tunnel is down). Requires override_reason. The first call files a require_human gate-override HITL and returns HUMAN_APPROVAL_REQUIRED with its id."},
+         "override_reason": {"type": "string", "description": "0ff5e59f — REQUIRED with override_unbound_payload=true: why a human should let this gate open without a recorded run. Recorded to action_audit_log."},
+         "override_hitl_id": {"type": "string", "description": "0ff5e59f — id of the answered (Yes) gate-override HITL a human approved for this wave gate. Single-use; bound to this wave label/version."},
          "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."},
          "version": {"type": "string", "description": "ed8e4524 — Optional sprint-version bucket this gate belongs to (e.g. 'v0.2.6'). Wins over session_id's resolved scope. Omit (and omit session_id) for the legacy project-wide gate behavior."},
          "session_id": {"type": "string", "description": "ed8e4524 — Optional: resolve the version scope from this session's own sprint_version (same helper handoff._resolve_session_sprint_version uses for checkpoint) when version is not given explicitly."}},
-         "required": ["wave_label", "verification_payload"]}},
+         "required": ["wave_label"]}},
     {"name": "start_wave_run", "description":
         "2a654cb0 — DURABLE WAVE STATE: open a wave run before dispatching a parallel "
         "wave. Returns an immutable wave_run_id pinned to the canonical expanded board "
@@ -4398,7 +4561,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "description":
         "0e973e52 — run the project's stored test_cmd on YOUR local machine via the "
         "tunnel and return a REAL, structured result — not self-reported. "
-        "Fields: {exit_code, passed, failed, stdout_tail, stderr_tail, status, timed_out}. "
+        "Fields: {exit_code, passed, failed, stdout_tail, stderr_tail, status, timed_out, "
+        "verification_run_id}. Pass verification_run_id to complete_wave_gate — the "
+        "server-recorded run, not a hand-typed result, is what unlocks a wave gate "
+        "(0ff5e59f). "
         "Returns {status: 'not_configured'} (never an error) when no test_cmd is set; "
         "call set_executor_config(test_cmd='pixi run test') first. "
         "Requires an active `meridian --tunnel`; the hosted server has no access to "
@@ -4555,6 +4721,9 @@ _READ_ONLY_TOOLS = {
     "preview_proposal_promotion",
     # ff1843dc — proposal lineage read-only queries.
     "get_proposal_lineage", "compare_proposal_versions",
+    # 7c96d41b — paper_contract read-only queries.
+    "get_paper_contract", "list_paper_contract_revisions",
+    "get_current_paper_contract_content",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "relocate_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
@@ -4803,6 +4972,17 @@ _TOOL_CATEGORY: dict[str, str] = {
     "register_docx_derivative":       "docx",
     "verify_docx_diff":               "docx",
     "promote_docx_candidate":         "docx",
+    # 7c96d41b — paper_contract editorial-intent tooling: "research" (not a
+    # new category) since "paper" is already a _KEYWORD_CATEGORY_AFFINITY
+    # trigger for "research", and these tools are about a manuscript's
+    # editorial scope/style, the same planning-level concern as the rest of
+    # the research category rather than docx's file-level provenance.
+    "create_paper_contract":               "research",
+    "get_paper_contract":                  "research",
+    "create_paper_contract_revision":      "research",
+    "list_paper_contract_revisions":       "research",
+    "approve_paper_contract_revision":     "research",
+    "get_current_paper_contract_content":  "research",
     # file locking
     "claim_file":               "file-locking",
     "release_file":             "file-locking",
@@ -4916,6 +5096,17 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "register_docx_derivative":  "executor",
     "verify_docx_diff":          "both",
     "promote_docx_candidate":    "both",
+    # 7c96d41b — paper_contract: setting/proposing editorial intent is a
+    # planning-boundary act (mirrors set_goal/create_project immediately
+    # below), but content is "very plausibly from an AI drafting session"
+    # per the module's own docstring, and reads are useful to either role —
+    # "both" throughout, same as verify/promote_docx_candidate above.
+    "create_paper_contract":               "both",
+    "get_paper_contract":                  "both",
+    "create_paper_contract_revision":      "both",
+    "list_paper_contract_revisions":       "both",
+    "approve_paper_contract_revision":     "both",
+    "get_current_paper_contract_content":  "both",
     "annotate_outputs":          "executor",
     "log_task":                  "executor",
     "generate_handoff":          "executor",
@@ -5377,6 +5568,14 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "register_docx_derivative":   "maintenance-only",
     "verify_docx_diff":           "maintenance-only",
     "promote_docx_candidate":     "maintenance-only",
+    # 7c96d41b — paper_contract: a planning-boundary tool family, same tier
+    # as set_goal/set_north_star/create_project above.
+    "create_paper_contract":               "maintenance-only",
+    "get_paper_contract":                  "maintenance-only",
+    "create_paper_contract_revision":      "maintenance-only",
+    "list_paper_contract_revisions":       "maintenance-only",
+    "approve_paper_contract_revision":     "maintenance-only",
+    "get_current_paper_contract_content":  "maintenance-only",
     # workspace management (cross-project admin)
     "add_workspace_note":              "maintenance-only",
     "get_workspace_notes":             "maintenance-only",
@@ -5501,6 +5700,12 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "register_docx_derivative": "Register Docx Derivative",
     "verify_docx_diff": "Verify Docx Diff",
     "promote_docx_candidate": "Promote Docx Candidate",
+    "create_paper_contract": "Create Paper Contract",
+    "get_paper_contract": "Get Paper Contract",
+    "create_paper_contract_revision": "Create Paper Contract Revision",
+    "list_paper_contract_revisions": "List Paper Contract Revisions",
+    "approve_paper_contract_revision": "Approve Paper Contract Revision",
+    "get_current_paper_contract_content": "Get Current Paper Contract Content",
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }

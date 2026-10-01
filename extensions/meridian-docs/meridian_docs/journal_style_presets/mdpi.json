@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "journal": "mdpi",
+    "display_name": "MDPI journals (general author layout style guide)",
+    "publisher": "MDPI",
+    "status": "populated",
+    "status_detail": "Round 1 (workspace proposal 3674c0c1) migration. Verified 2026-09-11 against mdpi.com/authors/layout and mdpi-res.com/data/mdpi-author-layout-style-guide.pdf.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_bracket",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "mdpi.com/authors/layout and mdpi-res.com/data/mdpi-author-layout-style-guide.pdf",
+        "note": "Figures are numbered by order of appearance and cited as numbers in square brackets, listed numerically."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "mdpi.com/authors/layout and mdpi-res.com/data/mdpi-author-layout-style-guide.pdf",
+        "note": "A single blanket figure-resolution floor of 600 dpi is recommended -- MDPI does not break this out by art type in its general guidance, hence figure_dpi_minimum_general rather than a per-type key."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

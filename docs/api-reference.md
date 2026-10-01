@@ -900,6 +900,13 @@ No auth required.
 | `POST` | `/hooks/stop` | Claude Code / Codex Stop hook |
 
 
+### `/journal-style-presets`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/journal-style-presets` | 9c1a3fd2 -- catalog for the journal-preset picker on the document |
+
+
 ### `/mcp`
 
 | Method | Path | Description |

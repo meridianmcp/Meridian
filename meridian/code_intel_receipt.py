@@ -185,24 +185,36 @@ def resolve_receipt_project_id(args: "dict[str, Any] | None") -> "str | None":
     ``routes/tunnel.py``'s ``_CODE_INTEL_PROJECT_TOOLS`` error enrichment) --
     a different identifier from Meridian's own project UUID, so a tool call's
     own ``project_id``/``project`` argument cannot be trusted as Meridian's
-    id. Prefers the self-hosted default-project convention
-    (``toml_config.get_default_project_id()`` -- the same resolution
-    ``start_session`` already falls back to, AGENTS.md's "Auto-scoping to a
-    single project"), since that genuinely IS Meridian's id; falls back to a
-    UUID-shaped ``project_id`` passed directly on the call (covers a caller
-    that happens to pass the real Meridian id) only when no default is
-    configured. Returns ``None`` when neither resolves -- callers must treat
-    that as "cannot attribute this receipt", not silently guess.
+    id UNLESS it is UUID-shaped -- a repo-path slug never matches the UUID
+    shape, so the UUID-shape check is what tells the two identifiers apart.
+
+    Precedence (3f47cc6e -- an EXPLICIT id beats an implicit default, the
+    same rule ``start_session`` applies to ``project_id`` vs the
+    default-project fallback, AGENTS.md's "Auto-scoping to a single
+    project"):
+
+    1. a UUID-shaped ``project_id`` passed directly on the call (a caller
+       that passes the real Meridian id, e.g. a native ``prospect_symbol``
+       call in a multi-project workspace) -- previously the configured
+       default was returned first, mis-attributing such a receipt to the
+       default project whenever a default was configured;
+    2. otherwise the self-hosted default-project convention
+       (``toml_config.get_default_project_id()``), since that genuinely IS
+       Meridian's id -- the only attribution available to a tunnel-forwarded
+       third-party tool call that carries only a repo-path slug.
+
+    Returns ``None`` when neither resolves -- callers must treat that as
+    "cannot attribute this receipt", not silently guess.
     """
     from . import toml_config as _toml_config  # noqa: PLC0415
 
-    default_pid = _toml_config.get_default_project_id()
-    if default_pid:
-        return default_pid
     if isinstance(args, dict):
         pid = str(args.get("project_id") or "").strip()
         if _UUID_RE.match(pid):
             return pid
+    default_pid = _toml_config.get_default_project_id()
+    if default_pid:
+        return default_pid
     return None
 
 

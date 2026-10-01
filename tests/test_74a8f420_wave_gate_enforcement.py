@@ -28,14 +28,15 @@ async def _project(db, name: str = "wave-gate-enforce"):
     return proj["id"]
 
 
-_GOOD_PAYLOAD = {
-    "status": "ok",
-    "exit_code": 0,
-    "passed": 10,
-    "failed": 0,
-    "stdout_tail": "10 passed",
-    "stderr_tail": "",
-}
+async def _ok_run(db, pid):
+    """0ff5e59f — a genuine, server-recorded run_verification run. complete_wave_gate
+    is bound to this stored record; a hand-typed result dict no longer unlocks a gate."""
+    run = await db_module.create_verification_run(db, pid, "pixi run test")
+    done = await db_module.complete_verification_run(
+        db, run["id"], status="ok", exit_code=0, passed=10, failed=0,
+        stdout_tail="10 passed",
+    )
+    return done["id"]
 
 _PIPELINE = [
     {"type": "push_dev"},
@@ -99,7 +100,9 @@ async def test_configure_wave_gate_creates_and_upserts(db):
 async def test_configure_wave_gate_immutable_once_passed(db):
     pid = (await db_module.create_project(db, name="cfg-immutable"))["id"]
     await db_module.configure_wave_gate(db, pid, "wave-1", _PIPELINE)
-    await db_module.complete_wave_gate(db, pid, "wave-1", _GOOD_PAYLOAD)
+    await db_module.complete_wave_gate(
+        db, pid, "wave-1", verification_run_id=await _ok_run(db, pid),
+    )
 
     with pytest.raises(ValueError, match="already completed"):
         await db_module.configure_wave_gate(db, pid, "wave-1", _PIPELINE)
@@ -146,7 +149,9 @@ async def test_claim_unblocked_after_gate_completes(db):
     blocked = await db_module.claim_sprint_item(db, pid, item["id"])
     assert blocked.get("blocked") is True
 
-    await db_module.complete_wave_gate(db, pid, "wave-1", _GOOD_PAYLOAD)
+    await db_module.complete_wave_gate(
+        db, pid, "wave-1", verification_run_id=await _ok_run(db, pid),
+    )
 
     claimed = await db_module.claim_sprint_item(db, pid, item["id"])
     assert claimed.get("status") == "in_progress"

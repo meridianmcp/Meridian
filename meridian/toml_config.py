@@ -284,6 +284,13 @@ def get_default_project_id() -> str | None:
     Returns the id string when found and non-empty, else None (caller decides
     whether to surface an error or allow explicit override).
 
+    Both sources are read in THIS process (the Meridian server's own
+    environment / working directory). That makes the default a self-hosted
+    feature: an ``env`` block on a client-side ``mcp-remote`` launcher is
+    passed to the client process only and is never forwarded to the hosted
+    server, and the hosted image excludes ``meridian.toml`` (``.dockerignore``).
+    On the hosted tier pass ``project_id`` explicitly on each call.
+
     Consumed by :func:`handle_start_session` as a last-resort fallback when
     neither ``project_id`` nor ``project_name`` are supplied by the caller.
     """

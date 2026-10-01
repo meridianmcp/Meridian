@@ -82,6 +82,7 @@ async def test_force_foreign_claim_overrides_refusal(db):
         db, p["id"], item["id"],
         actor="a-different-live-session",
         force_foreign_claim=True,
+        override_reason="coordinator finishing a hand-off on purpose",
     )
     assert done["status"] == "done"
 
@@ -169,6 +170,7 @@ async def test_unrecognised_actor_string_is_not_treated_as_dead(db):
         db, p["id"], item["id"],
         actor="a-different-session",
         force_foreign_claim=True,
+        override_reason="owner session is gone; finishing its work",
     )
     assert done["status"] == "done"
 

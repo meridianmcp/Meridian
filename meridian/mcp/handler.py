@@ -3337,6 +3337,13 @@ async def _handle_task_tools(
         # acf6f51a — opt-in, off by default; see generate_handoff's own
         # emit_manifest docstring. Currently only mode="goal" acts on this.
         _emit_manifest = bool(args.get("emit_manifest"))
+        # 0527f636 — optional receiver address for the persisted pending_goal
+        # (session_name/role/worktree). Passed through RAW: generate_handoff
+        # validates it up front (a malformed address raises before anything is
+        # rendered or persisted) so it can never silently degrade to an
+        # unaddressed, sibling-stealable handoff. Absent -> None -> today's
+        # behaviour. See generate_handoff's own pending_goal_receiver docstring.
+        _pending_goal_receiver = args.get("receiver")
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -3362,6 +3369,7 @@ async def _handle_task_tools(
                     strict_continuation=_strict_continuation,
                     continuation_status=_continuation_status,
                     emit_manifest=_emit_manifest,
+                    pending_goal_receiver=_pending_goal_receiver,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -3789,6 +3797,14 @@ async def _handle_task_tools(
             _pending = await db_module.get_pending_goal(db, _pid)
         except Exception:  # noqa: BLE001
             _pending = None
+        # 0527f636 — the {session_name, role, worktree} address the pending
+        # goal was generated FOR (None: unaddressed, or nothing pending).
+        # Read-only, best-effort, purely additive to the response.
+        _pending_receiver = None
+        try:
+            _pending_receiver = await db_module.get_pending_goal_receiver(db, _pid)
+        except Exception:  # noqa: BLE001
+            _pending_receiver = None
         # 3af86d28 — surface the latest corrective handoff (any status)
         # directly, so a receiving executor never has to reconstruct a
         # correction from narrative notes. None when the project has no
@@ -3802,6 +3818,7 @@ async def _handle_task_tools(
             _correction = None
         return {
             "pending_goal": _pending,
+            "pending_goal_receiver": _pending_receiver,
             # 22f2604d — explicit, machine-readable trust marker (requirement
             # 4): load_handoff always returns the exact stored,
             # project-scoped payload straight from this project's own DB
@@ -6956,6 +6973,43 @@ async def _handle_docx_derivative_tools(
     return _MISS
 
 
+async def _handle_paper_contract_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: 7c96d41b paper_contract editorial-intent tooling --
+    create_paper_contract, get_paper_contract, create_paper_contract_revision,
+    list_paper_contract_revisions, approve_paper_contract_revision,
+    get_current_paper_contract_content. A new sibling dispatch group (own
+    module, own group function), matching _handle_docx_derivative_tools'
+    precedent immediately above rather than growing an existing group --
+    see meridian/mcp/handlers/paper_contract_tools.py's module docstring."""
+    from .handlers.paper_contract_tools import (  # noqa: PLC0415
+        handle_create_paper_contract,
+        handle_get_paper_contract,
+        handle_create_paper_contract_revision,
+        handle_list_paper_contract_revisions,
+        handle_approve_paper_contract_revision,
+        handle_get_current_paper_contract_content,
+    )
+
+    _standard_dispatch: dict[str, Any] = {
+        "create_paper_contract": handle_create_paper_contract,
+        "get_paper_contract": handle_get_paper_contract,
+        "create_paper_contract_revision": handle_create_paper_contract_revision,
+        "list_paper_contract_revisions": handle_list_paper_contract_revisions,
+        "approve_paper_contract_revision": handle_approve_paper_contract_revision,
+        "get_current_paper_contract_content": handle_get_current_paper_contract_content,
+    }
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+    return _MISS
+
+
 # a2a027cf — bounded dispatch-level budget for complete_sprint_item,
 # comfortably under the ~60s client-side timeouts observed in the field
 # (HTTP, stdio, and connector/mcp-remote transports all funnel through this
@@ -7145,6 +7199,89 @@ async def _complete_sprint_item_timeout_response(
     }
 
 
+_PROJECT_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+
+async def _resolve_project_reference(
+    db: Any,
+    args: dict[str, Any],
+    scoped_project_ids: "list[str] | None" = None,
+) -> dict[str, Any]:
+    """Settle ``project_id`` / ``project_name`` in a tools/call ``args`` dict.
+
+    b6ab6e83 — ``project_name`` is accepted as an alternative to
+    ``project_id``, and a non-UUID ``project_id`` is resolved as a
+    human-readable name. 3f47cc6e — precedence rules, so a name can never
+    silently retarget a call that also names a project by id:
+
+    * lone ``project_id`` (UUID): passed through untouched;
+    * lone ``project_name`` (or a non-UUID ``project_id``): resolved by name;
+      a ``project_name`` that resolves to nothing raises ``ValueError``;
+    * explicit UUID ``project_id`` + a name that does NOT resolve: the id is
+      kept (the schema text promises "project_id wins if both are given");
+    * explicit UUID ``project_id`` + a name that resolves to the SAME
+      project: fine, ``project_id`` is normalised to the stored id;
+    * explicit UUID ``project_id`` + a name that resolves to a DIFFERENT
+      project: rejected with a clear ``ValueError`` rather than silently
+      running against the name's project. Rename and merge free old names
+      (a merge renames the source to ``[merged] <name>``), so a stale
+      ``project_name`` can otherwise retarget a call that carried the right
+      id. The same rule applies when a non-UUID ``project_id`` (treated as a
+      name) and ``project_name`` resolve to different projects.
+
+    ``scoped_project_ids`` keeps the out-of-scope error opaque: if a
+    name-resolved project is outside the caller's scope, the ordinary
+    "project is outside your access scope" error is raised BEFORE any
+    conflict error, so a conflict message can never confirm that a name
+    resolves to a project the caller may not see.
+    """
+    _pid_raw = args.get("project_id") or ""
+    _pname_raw = args.get("project_name") or ""
+    _is_uuid = bool(_PROJECT_UUID_RE.match(_pid_raw))
+    _explicit_id = _pid_raw if _is_uuid else ""
+    # (label, value) pairs that must be looked up as project NAMES.
+    _name_refs: list[tuple[str, str]] = []
+    if _pname_raw:
+        _name_refs.append(("project_name", _pname_raw))
+    if _pid_raw and not _is_uuid:
+        _name_refs.append(("project_id (resolved as a name)", _pid_raw))
+    if not _name_refs:
+        return args
+
+    _resolved: list[tuple[str, str, str]] = []  # (label, value, resolved id)
+    for _label, _ref in _name_refs:
+        _proj = await db_module.get_project_by_name(db, _ref)
+        if _proj:
+            _resolved.append((_label, _ref, str(_proj["id"])))
+
+    if not _resolved:
+        if _pname_raw and not _pid_raw:
+            raise ValueError(f"no project found matching name '{_pname_raw}'")
+        # Unresolvable name(s) next to a project_id: keep the id as given.
+        return args
+
+    _distinct_ids = {rid.lower() for _l, _v, rid in _resolved}
+    if _explicit_id:
+        _distinct_ids.add(_explicit_id.lower())
+    if len(_distinct_ids) > 1:
+        if scoped_project_ids is not None and any(
+            rid not in scoped_project_ids for _l, _v, rid in _resolved
+        ):
+            raise ValueError("project is outside your access scope")
+        _refs = [f"project_id={_explicit_id!r}"] if _explicit_id else []
+        _refs += [f"{_l}={_v!r} -> project {rid}" for _l, _v, rid in _resolved]
+        raise ValueError(
+            "project_id and project_name refer to different projects ("
+            + "; ".join(_refs)
+            + "). Pass only one of them, or make them refer to the same "
+            "project -- a project_name can go stale after a project rename "
+            "or merge."
+        )
+    return {**args, "project_id": _resolved[0][2]}
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -7156,20 +7293,21 @@ async def _dispatch_mcp_tool(
     """Route a tools/call to the appropriate db_module function.
 
     ``scoped_project_ids`` (a9c041d7) — defense-in-depth re-check of the
-    project-scope gate, run AFTER the project_name/non-UUID resolver below has
-    settled on a final ``project_id``. The pre-dispatch gate in
-    ``_handle_mcp_request`` only inspects the caller-supplied ``project_id``
-    (falling back to resolving ``project_name`` itself when ``project_id`` is
-    absent); it never re-runs once this resolver's own name lookup overrides
-    ``args["project_id"]``. That left a bypass: a scoped caller supplying an
-    in-scope ``project_id`` alongside an out-of-scope ``project_name`` sailed
-    through the pre-check gate (which saw the in-scope id and stopped there),
-    then had this resolver silently swap in the out-of-scope project — since
-    ``project_name`` wins over a UUID ``project_id`` whenever both are present
-    (see ``_lookup`` below). Re-checking here, against the actually-resolved
-    id, closes that gap regardless of which of the three resolution paths
-    (plain UUID passthrough, non-UUID project_id-as-name, or project_name
-    override) produced it.
+    project-scope gate, run AFTER the project_name/non-UUID resolver
+    (:func:`_resolve_project_reference`) has settled on a final
+    ``project_id``. The pre-dispatch gate in ``_handle_mcp_request`` only
+    inspects the caller-supplied ``project_id`` (falling back to resolving
+    ``project_name`` itself when ``project_id`` is absent); it never re-runs
+    once the resolver's own name lookup sets ``args["project_id"]``. That
+    left a bypass: a scoped caller supplying an in-scope ``project_id``
+    alongside an out-of-scope ``project_name`` sailed through the pre-check
+    gate (which saw the in-scope id and stopped there), then had the resolver
+    silently swap in the out-of-scope project (before 3f47cc6e, a resolvable
+    ``project_name`` beat a UUID ``project_id``). Re-checking here, against
+    the actually-resolved id, closes that gap regardless of which resolution
+    path (plain UUID passthrough, non-UUID project_id-as-name, or
+    project_name) produced it. Since 3f47cc6e a conflicting id/name pair is
+    additionally rejected inside the resolver itself.
     """
     # Tenant scope for the workspace layer (notes/decisions/settings). None for
     # self-host / unauthenticated; the db functions then skip isolation.
@@ -7184,21 +7322,11 @@ async def _dispatch_mcp_tool(
     _capture_correlation_id = uuid.uuid4().hex
     # b6ab6e83 — project_name resolver: accept project_name as alternative to
     # project_id, and resolve non-UUID project_id values as human-readable names.
-    _pid_raw = args.get("project_id", "")
-    _pname_raw = args.get("project_name", "")
-    _is_uuid = bool(re.match(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        _pid_raw, re.I,
-    ))
-    if _pname_raw or (_pid_raw and not _is_uuid):
-        _lookup = _pname_raw or _pid_raw
-        _resolved_proj = await db_module.get_project_by_name(db, _lookup)
-        if _resolved_proj:
-            args = {**args, "project_id": _resolved_proj["id"]}
-        elif _pname_raw and not _pid_raw:
-            raise ValueError(f"no project found matching name '{_lookup}'")
+    # 3f47cc6e — an explicit project_id is never silently overridden by a
+    # project_name that resolves elsewhere: that conflict is rejected.
+    args = await _resolve_project_reference(db, args, scoped_project_ids)
     # a9c041d7 — re-check tenant scope against the FINAL resolved project_id,
-    # after the resolver above may have overridden it via project_name (or a
+    # after the resolver above may have set it via project_name (or a
     # non-UUID project_id-as-name lookup). The pre-dispatch gate in
     # _handle_mcp_request only ever sees the caller's raw args, so a combined
     # {project_id: <in-scope>, project_name: <out-of-scope>} payload could pass
@@ -7224,6 +7352,7 @@ async def _dispatch_mcp_tool(
         _handle_code_index_tools,
         _handle_experiment_tools,
         _handle_docx_derivative_tools,
+        _handle_paper_contract_tools,
     )
     # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
     # Repeated live reports: an MCP client (HTTP/stdio/connector — this

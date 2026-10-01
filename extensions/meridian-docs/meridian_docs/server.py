@@ -311,10 +311,40 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
 
 
 @mcp.tool()
+def find_caption_paragraph(document_path: str, label: str) -> dict[str, Any]:
+    """3f9a1c72 — Find the paragraph whose caption label says exactly
+    `label` (e.g. "Figure 3", "Table 2", "Fig. S47", "Table S3"). A pure,
+    read-only delegation to locate_anchor(document_path, {"caption_label":
+    label}) under a discoverable name, so a caller reaches for a real
+    function instead of re-deriving caption lookup with a hand-rolled
+    document.xml string search.
+
+    Resolves BOTH real Word-numbered captions (tracked by an actual "SEQ
+    Figure"/"SEQ Table" field) AND manually-typed labels that never got a
+    real SEQ field at all — e.g. Supplementary Information captions like
+    "Fig. S47" — via a loose, prefix-anchored fallback match against the
+    paragraph's own leading text (punctuation/whitespace-insensitive),
+    engaged only when no real SEQ-field caption matches.
+
+    Args:
+      document_path: Document to search. Never opened for writing.
+      label:          The caption label to find.
+
+    Returns the same shape locate_anchor returns: {status: "resolved",
+    target_para_id, element_type, ...} on a unique match, {status:
+    "ambiguous", candidates, ...}, {status: "not_found", ...}, or
+    {"error": ...}.
+    """
+    return docs_intel.find_caption_paragraph(document_path=document_path, label=label)
+
+
+@mcp.tool()
 def get_document_review(
     docx_path: str,
     expected_source_fingerprint: str | None = None,
     include_render_check: bool = False,
+    journal: str | None = None,
+    user_presets_path: str | None = None,
 ) -> dict[str, Any]:
     """b67ec6b5 -- non-mutating DOCX review: findings grouped by category
     (structure/equation/caption/section_page/ownership/provenance/
@@ -324,21 +354,53 @@ def get_document_review(
     alone.
 
     Composes existing read-only primitives (audit_equation_style,
+    audit_caption_style, audit_table_style, audit_heading_style (df716454),
     scan_stale_notes, a read-only legacy-plaintext-caption detector, and
     optionally check_render_capability) rather than re-deriving detection or
-    anchor-resolution logic. Pass expected_source_fingerprint (a value
-    previously returned as source_fingerprint) to detect the document having
-    changed since a stashed review -- a mismatch returns
-    ``{"status": "stale", ...}`` with empty findings instead of resolving
-    against what may now be the wrong document. include_render_check opts
-    into a live render-capability probe (slow/backend-dependent -- never run
-    implicitly); only a "failed" render status becomes a finding. See
-    :func:`meridian_docs.docs_intel.build_document_review` for the full
-    contract. No DOCX writes -- read-only in every code path.
+    anchor-resolution logic. Pass
+    expected_source_fingerprint (a value previously returned as
+    source_fingerprint) to detect the document having changed since a
+    stashed review -- a mismatch returns ``{"status": "stale", ...}`` with
+    empty findings instead of resolving against what may now be the wrong
+    document. include_render_check opts into a live render-capability probe
+    (slow/backend-dependent -- never run implicitly); only a "failed" render
+    status becomes a finding.
+
+    9c1a3fd2 -- pass ``journal`` (any name get_journal_style_preset resolves,
+    e.g. "jcshm") to also run the equation-, caption-, and table-style
+    checks against that journal's verified formatting rules -- omit it and
+    this tool behaves exactly as before (no style_policy, so
+    audit_equation_style/audit_caption_style/audit_table_style contribute
+    zero style-gated findings; audit_table_style's header-repeat and
+    blank-line checks still run unconditionally). ``user_presets_path``
+    extends the lookup to a user-saved preset (see
+    save_user_journal_style_preset); it is ignored unless ``journal`` is
+    also given. Raises via a structured ``{"error": ...}`` result (never a
+    exception escaping this tool) when ``journal`` doesn't resolve to a
+    known preset. See :func:`meridian_docs.docs_intel.build_document_review`
+    for the full contract. No DOCX writes -- read-only in every code path.
     """
+    style_policy = None
+    # 9c1a3fd2 review fix -- normalize journal the SAME way
+    # meridian/routes/notes.py's document_review_endpoint does
+    # (journal_name = (journal or "").strip() or None). Before this fix,
+    # journal="" here fell into the `is not None` branch and failed the
+    # whole call with an "unknown journal style preset ''" error, while the
+    # HTTP route silently treated "" as "no journal" and returned a normal
+    # review -- the two duplicated resolution paths diverged on the exact
+    # same input. Caught by an adversarial review pass.
+    journal_name = (journal or "").strip() or None
+    if journal_name is not None:
+        try:
+            style_policy = docs_intel.get_journal_style_preset(
+                journal_name, user_presets_path=user_presets_path
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
     return docs_intel.build_document_review(
         docx_path,
         expected_source_fingerprint=expected_source_fingerprint,
+        style_policy=style_policy,
         include_render_check=include_render_check,
     )
 
@@ -948,6 +1010,54 @@ def find_image_paragraph(
     return docs_intel.find_image_paragraph(
         docx_path=docx_path,
         figure_index=figure_index,
+    )
+
+
+@mcp.tool()
+def extract_paragraph_images(
+    docx_path: str,
+    anchor: str | dict[str, Any],
+    out_dir: str | None = None,
+) -> dict[str, Any]:
+    """b2e6a7d0 — Extract EVERY image embedded in one paragraph to real
+    files on disk, with basic metadata, so the resulting paths can be
+    handed straight to an image-capable Read instead of hand-rolling a
+    disposable zip/blip/rId-resolution script every time a figure needs to
+    actually be looked at.
+
+    Blip-complete by construction: walks every <w:drawing> in the anchored
+    paragraph and every <a:blip> within each — never just the first blip in
+    the paragraph. (A prior hand-rolled audit script in this project had
+    exactly that "first blip only" bug and produced 18 false-positive
+    findings before a cross-check caught it — this tool is built so that
+    bug class cannot recur here.)
+
+    Args:
+      docx_path: Absolute path to the .docx file. Never mutated.
+      anchor:     Either a raw paragraph id (str — w14:paraId, sp<hash>
+                 synth id, or legacy p{N}), OR a locate_anchor-style query
+                 dict (e.g. {"text": "..."}, {"caption_label": "Figure 3"})
+                 resolved read-only first. A query resolving ambiguously,
+                 to nothing, or to a table/table-cell target is refused
+                 with the full locator detail attached. Only images inside
+                 THIS one paragraph are returned — a multi-paragraph
+                 composite (side-by-side images sharing one caption) needs
+                 one call per member paragraph.
+      out_dir:    Directory to write extracted image files into (created if
+                 missing). Defaults to a fresh tempfile.mkdtemp directory.
+
+    Returns {status: "extracted"|"no_images", anchor_para_id, image_count,
+    images: [{blip_index, relationship_id, media_part, extracted_path,
+    file_size_bytes, pixel_width?, pixel_height?, displayed_extent_emu?,
+    displayed_extent_inches?}], out_dir, docx_path} — one bad image
+    reference carries its own {"error": ...} instead of aborting the whole
+    call. Top-level {"error": <message>} only for validation, anchor-
+    resolution, or whole-file failure.
+    """
+    return docs_intel.extract_paragraph_images(
+        docx_path=docx_path,
+        anchor=anchor,
+        out_dir=out_dir,
     )
 
 
@@ -1697,6 +1807,262 @@ def audit_equation_style(
 
 
 @mcp.tool()
+def audit_caption_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """8e2f4a17 — Audit every figure/table caption's LABEL formatting
+    (boldness, punctuation immediately after the number) against a
+    style_policy/journal preset; returns structured findings, not free text.
+
+    Closes a real gap: figure_caption_bold / table_caption_bold /
+    figure_caption_label_punctuation / table_caption_label_punctuation have
+    existed on resolve_style_policy() and every JOURNAL_STYLE_PRESETS entry
+    since 4d0ca929, but nothing ever read them back against a document —
+    this is that missing consumer. Caption detection is text-and-style based
+    (paragraph style name contains "caption" AND the text starts with a
+    "Fig."/"Table" label), not SEQ-field based, so it also works on
+    documents where figures/tables are numbered with a plain bold text run
+    instead of Word's automatic caption field (common in a heavily
+    hand-edited or raw-XML-spliced document).
+
+    Three finding types, each skipped entirely when the corresponding policy
+    key is unset (None / "unspecified" — no verified rule, don't guess):
+      caption_label_not_bold /
+      caption_label_unexpectedly_bold          — the "Fig. N"/"Table N"
+        label's runs aren't (aren't NOT) all bold, per
+        figure_caption_bold/table_caption_bold.
+      caption_label_punctuation_mismatch       — the character right after
+        the number isn't the expected period/colon/none, per
+        figure_caption_label_punctuation/table_caption_label_punctuation.
+      caption_terminal_punctuation_mismatch    — the LAST character of the
+        caption's full text isn't what's expected, per
+        figure_caption_terminal_punctuation/table_caption_terminal_punctuation
+        (independent of the label check above — a publisher can forbid both
+        separately, e.g. JCSHM forbids punctuation after the number AND at
+        the end of the caption).
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides, or pass
+                     get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {docx_path, caption_count, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_caption_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
+def audit_table_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """9c1a3fd2 — Audit every real, CAPTIONED content table (a Caption-
+    styled "Table N"/"Table SN" paragraph immediately followed, possibly
+    after blank spacer paragraphs, by a table) for three structural/style
+    defects: misalignment, a missing page-break header-row-repeat, and a
+    redundant blank paragraph between the caption and its table.
+
+    Deliberately scoped to CAPTIONED tables only (same text-and-style
+    detection audit_caption_style uses), not every table in the document —
+    a real document's table count is usually dominated by un-captioned
+    equation-numbering layout tables, which have different formatting
+    needs entirely and would swamp this audit if included.
+
+    Three finding types, each skipped/unconditional as noted:
+      table_misaligned              — the table's own alignment doesn't
+        match style_policy["table_alignment"]. Skipped entirely when that
+        key is unset (None — no verified rule, don't guess).
+      table_header_not_repeating    — the table's first row doesn't repeat
+        at the top of a page-break continuation. Unconditional: a
+        structural correctness property, not a style preference.
+      blank_line_before_table       — one or more blank paragraphs sit
+        between the caption and the table it captions. Also unconditional
+        — redundant double-spacing on top of the Caption style's own
+        spacing-after, not a style choice.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides, or pass
+                     get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {docx_path, table_count, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_table_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
+def audit_heading_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """df716454 — Audit every H1/H2/H3 heading for per-level spacing
+    (before/after, in twips) against a style_policy/journal preset, AND
+    flag existing headings that already violate
+    style_policy["heading_terminal_punctuation"] — the read-only
+    counterpart to _apply_heading_terminal_punctuation, which only fires
+    when NEW heading content is authored via write_section.
+
+    Three finding types, each skipped entirely when the corresponding
+    policy key is unset (None — no verified rule, don't guess):
+      heading_spacing_before_mismatch /
+      heading_spacing_after_mismatch   — a heading paragraph's own
+        <w:spacing w:before/w:after> doesn't match
+        style_policy["heading_spacing_before_h{level}_twips"] /
+        ["heading_spacing_after_h{level}_twips"] (level 1-3 only).
+      heading_terminal_punctuation_mismatch — the heading's current text
+        would change under _apply_heading_terminal_punctuation's own
+        normalization rule (i.e. it already violates the policy).
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides, or pass
+                     get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {docx_path, heading_count, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_heading_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
+def audit_cross_document_consistency(
+    manuscript_path: str,
+    si_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """df716454 — Diff specific style-DEFINITION values (word/styles.xml,
+    not paragraph instances) between a manuscript and its Supplementary
+    Information companion, and separately check the body-text style's font
+    against a style_policy/journal preset in each document.
+
+    Genuinely new shape versus every other audit_* tool: takes TWO docx
+    paths instead of one. Findings carry a "document" tag ("manuscript"/
+    "si") or both "manuscript_style_id"/"si_style_id" instead of a
+    para_id/locator — a style definition isn't anchored to one paragraph.
+
+    Two finding families, each skipped when the relevant style can't be
+    positively found in the document(s) being compared:
+      cross_document_style_mismatch     — the SAME conceptual style
+        (title/Heading0 spacing, body-text font, FigureImage spacing)
+        differs between the manuscript and the SI.
+      body_text_font_family_mismatch /
+      body_text_font_size_mismatch      — the body-text (Normal/BodyText)
+        style's font doesn't match style_policy["body_text_font_family"]/
+        ["body_text_font_size_pt"], checked independently in EACH document
+        (catches a real JCSHM SI found with 12pt body text against the
+        journal's own stated "10-point Times Roman" guideline).
+
+    Args:
+      manuscript_path: Absolute path to the manuscript .docx (read-only).
+      si_path:          Absolute path to the SI .docx (read-only).
+      style_policy:     Optional style policy overrides, or pass
+                        get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {manuscript_path, si_path, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_cross_document_consistency(
+        manuscript_path=manuscript_path,
+        si_path=si_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
+def audit_manuscript_structure(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """docs-intel-jcshm-linter-gap-cleanup-20260918 — Audit the manuscript's
+    Abstract word count and Keywords count against
+    style_policy["abstract_word_count_min"/"_max"] /
+    ["keyword_count_min"/"_max"]. Neither fact was checked by any tooling
+    before this; JCSHM's own live submission guidelines state both as
+    explicit numeric rules (Abstract 150-250 words, 4-6 Keywords).
+
+    Section location is TEXT-pattern based (the Abstract heading is any
+    heading paragraph whose text matches the same _ABSTRACT_RE
+    document_outline already uses; the Keywords line is any paragraph
+    matching a "Keywords:"/"Key words:" label immediately after the
+    Abstract body) — not tied to any particular heading style name.
+
+    Two finding types, each skipped entirely when its policy bound(s) are
+    unset (None — no verified rule) or its section could not be located:
+      abstract_word_count_out_of_range — the Abstract body's word count
+        falls outside [abstract_word_count_min, abstract_word_count_max].
+      keyword_count_out_of_range — the Keywords line's comma/semicolon-
+        separated term count falls outside [keyword_count_min,
+        keyword_count_max].
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides, or pass
+                     get_journal_style_preset(<name>) directly.
+
+    Returns:
+      {docx_path, abstract_word_count, keyword_count, findings,
+      finding_count, findings_by_type, policy} or {error: <message>}.
+    """
+    return docs_intel.audit_manuscript_structure(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
+def audit_reference_consistency(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """docs-intel-jcshm-linter-gap-cleanup-20260918 — Audit reference-list
+    <-> in-text-citation consistency for JCSHM's numbered_bracket citation
+    style: every in-text numbered citation ("[7]", "[3, 5]", "[3-7]") has a
+    matching reference-list entry, every reference-list entry is cited
+    somewhere, and the reference list's own printed numbering is
+    sequential 1..N with no gaps or duplicates. Does NOT check citation
+    first-appearance order (real published JCSHM articles are genuinely
+    mixed on that convention) — that stays an editorial judgment call.
+
+    Four finding types, all UNCONDITIONAL (not style-policy-gated —
+    structural correctness, not a style preference):
+      reference_list_number_gap        — a missing integer in 1..highest.
+      reference_list_duplicate_number  — the same printed number reused.
+      citation_missing_reference_entry — a cited number with no entry.
+      reference_entry_never_cited      — an entry never cited in the body.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides (accepted for
+                     signature consistency with every other audit_* tool;
+                     no key currently gates any check here).
+
+    Returns:
+      {docx_path, reference_count, citation_count, findings, finding_count,
+      findings_by_type, policy} or {error: <message>}.
+    """
+    return docs_intel.audit_reference_consistency(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
 def audit_equation_contract(
     docx_path: str,
     project_id: str | None = None,
@@ -1748,7 +2114,10 @@ def audit_equation_contract(
 
 
 @mcp.tool()
-def get_journal_style_preset(journal: str) -> dict[str, Any]:
+def get_journal_style_preset(
+    journal: str,
+    user_presets_path: str | None = None,
+) -> dict[str, Any]:
     """4544bbe5 — Look up a named publishing-convention style-policy preset
     (a "document profile" shorthand) instead of hand-writing a full
     style_policy override dict.
@@ -1756,23 +2125,147 @@ def get_journal_style_preset(journal: str) -> dict[str, Any]:
     The returned dict is the FULLY RESOLVED policy (every
     resolve_style_policy key populated), ready to pass straight through as
     style_policy= to insert_figure_block, insert_caption,
-    audit_equation_style, insert_equation, insert_highlighted_note,
-    write_section, or insert_table.
+    audit_equation_style, audit_caption_style, audit_table_style,
+    audit_heading_style, audit_cross_document_consistency, insert_equation,
+    insert_highlighted_note, write_section, or insert_table.
+
+    8e2f4a17 — journal is no longer limited to the ~29 built-in presets.
+    Pass user_presets_path to also resolve names saved via
+    save_user_journal_style_preset (or hand-authored in the same JSON
+    shape). A user preset sharing a built-in's name AMENDS it (merged on
+    top, not a full replace) — see save_user_journal_style_preset and
+    list_journal_style_presets for the rest of this CRUD surface.
 
     Args:
-      journal: Preset name — currently "default" (built-in defaults, named
-        for explicit selection) or "jcshm" (a representative academic-
-        journal convention: centered captions/equations, no terminal
-        punctuation on headings, label-left/data-center table columns).
+      journal: Preset name — a built-in (see list_journal_style_presets
+        with no user_presets_path for the full catalog: default, jcshm, and
+        ~28 more publisher presets covering Nature/Elsevier/IEEE/Wiley/ACM/
+        MDPI/PLOS/Springer/etc.) or, when user_presets_path is given, a
+        name defined in that file.
+      user_presets_path: Optional path to a user-maintained JSON presets
+        file. Omit to resolve only against the built-in catalog.
 
     Returns:
       The resolved style policy dict for journal, or {error: <message>} if
-      journal names no known preset.
+      journal names no known preset (built-in or user-supplied) or the user
+      presets file is malformed.
     """
     try:
-        return docs_intel.get_journal_style_preset(journal)
+        return docs_intel.get_journal_style_preset(journal, user_presets_path=user_presets_path)
     except ValueError as exc:
         return {"error": str(exc)}
+
+
+@mcp.tool()
+def get_journal_style_preset_provenance(journal: str) -> dict[str, Any]:
+    """docs-intel-journal-preset-externalization-20260918 — Return the full
+    EVIDENCE record backing one built-in journal-style preset: value, tier
+    (1=real official template/stylesheet source; 2=the journal's own live
+    guidelines page; 3=corroboration from real sampled articles;
+    4=generic/unsourced, explicitly needs verification), source citation,
+    and verified_date for every field that preset actually sets — not just
+    the resolved policy VALUES get_journal_style_preset returns.
+
+    Use this to audit how well-sourced a preset is before trusting it for a
+    real submission — e.g. to find every field still at tier 4 ("needs
+    verification"), or a field explicitly marked status: "open_question"
+    (see "jcshm"'s table_caption_bold, a genuinely unresolved question, not
+    merely "not yet researched").
+
+    Only covers BUILT-IN presets — unlike get_journal_style_preset, there is
+    no user_presets_path here: a user-authored preset (via
+    save_user_journal_style_preset) is a bare style_policy override dict
+    with no evidence schema of its own to report.
+
+    journal is resolved case-insensitively, matching get_journal_style_preset.
+
+    Args:
+      journal: A built-in preset name, in any case (e.g. "jcshm", "Nature",
+        "default").
+
+    Returns:
+      {"journal": <canonical key>, "meta": {...}, "fields": {...}} or
+      {"error": <message>} if journal names no known built-in preset.
+    """
+    try:
+        return docs_intel.get_journal_style_preset_provenance(journal)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+def list_journal_style_presets(user_presets_path: str | None = None) -> dict[str, Any]:
+    """8e2f4a17 — Enumerate every journal-style preset get_journal_style_preset
+    can currently resolve: the ~29 built-ins, plus (when user_presets_path
+    is given) every preset defined in that user's JSON file, each tagged
+    with its source and whether it shadows a built-in of the same name.
+
+    Args:
+      user_presets_path: Optional path to a user presets JSON file. Omit to
+        list only the built-in catalog.
+
+    Returns:
+      {presets: [{name, source, shadows_builtin}, ...], builtin_count,
+      user_count} or {error: <message>} if the user presets file exists but
+      is malformed.
+    """
+    return docs_intel.list_journal_style_presets(user_presets_path=user_presets_path)
+
+
+@mcp.tool()
+def save_user_journal_style_preset(
+    name: str,
+    overrides: dict[str, Any],
+    path: str,
+) -> dict[str, Any]:
+    """8e2f4a17 — Validate and persist one user-defined journal-style
+    preset into a JSON file, so it becomes resolvable by name via
+    get_journal_style_preset(name, user_presets_path=path) from then on.
+    Creates the file (and any missing parent directory) if needed; updates
+    just this one entry if the file already exists, preserving every other
+    preset already in it.
+
+    overrides is validated through the same resolve_style_policy path every
+    built-in preset goes through — a malformed override is rejected before
+    anything is written, never silently saved as a broken preset.
+
+    name may match a built-in preset's name — get_journal_style_preset then
+    AMENDS the built-in (merges this override dict on top of it) rather
+    than replacing it outright, so saving e.g. a table-caption correction
+    for "jcshm" doesn't drop that preset's already-verified figure-caption
+    facts.
+
+    Args:
+      name:      The preset name (case-insensitive at lookup time; stored
+                 exactly as given).
+      overrides: A style_policy override dict — only the keys you want to
+                 set; see resolve_style_policy's docstring for the full key
+                 catalog and valid values for each.
+      path:      Path to the user presets JSON file (existing or new).
+
+    Returns:
+      {status: "ok", name, path, preset_count} or {error: <message>} if
+      overrides fails validation.
+    """
+    return docs_intel.save_user_journal_style_preset(name=name, overrides=overrides, path=path)
+
+
+@mcp.tool()
+def delete_user_journal_style_preset(name: str, path: str) -> dict[str, Any]:
+    """8e2f4a17 — Remove one named preset from a user presets JSON file
+    (every other entry preserved). A no-op, not an error, if the file
+    doesn't exist or doesn't contain name.
+
+    Args:
+      name: The preset name, matched EXACTLY (case-sensitive) against the
+        file's own keys.
+      path: Path to the user presets JSON file.
+
+    Returns:
+      {status: "ok", name, path, deleted: bool, preset_count} or
+      {error: <message>} if the file exists but isn't valid JSON.
+    """
+    return docs_intel.delete_user_journal_style_preset(name=name, path=path)
 
 
 @mcp.tool()
@@ -2203,6 +2696,88 @@ def insert_highlighted_note(
         author=author,
         initials=initials,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def flag_for_review(
+    docx_path: str,
+    anchor: str | dict[str, Any],
+    note: str,
+    highlight_color: str = "yellow",
+    author: str = "Meridian",
+    initials: str = "M",
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """7c3e4b9a — Flag a location in a .docx for human review: a native
+    highlight on every run of the anchored paragraph PLUS a real Word
+    comment explaining what needs attention, anchored to that same
+    paragraph, written in ONE atomic operation.
+
+    Replaces the ad-hoc pattern of hand-rolling a raw-zip script every time
+    a document needed a flagged spot for a reviewer: this handles comment-
+    infrastructure creation (word/comments.xml, the [Content_Types].xml
+    override, the document.xml.rels relationship) whether the document has
+    zero pre-existing comments or already has some, safe comment-id
+    allocation either way, the highlight, and post-write structural
+    verification, through the exact same code paths insert_word_comment /
+    highlight_document_matches already use and this module's test suite
+    already covers.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor:           Either a raw paragraph id (str — w14:paraId, the
+                        sp<hash> synth id, or legacy p{N}, same schemes
+                        locate_anchor/insert_word_comment already resolve),
+                        OR a locate_anchor-style query dict (e.g.
+                        {"text": "..."}, {"caption_label": "Figure 3"},
+                        {"section_path": "3.2.4", "text": "..."}) resolved
+                        read-only before anything is written. A query that
+                        resolves ambiguously, to nothing, or to a table/
+                        table-cell target is refused with the full locator
+                        detail attached (locate_result) — never guessed.
+      note:             The comment's text (must be non-empty).
+      highlight_color:  A native <w:highlight w:val="..."> value, validated
+                        against the same allow-list resolve_style_policy
+                        already enforces for note_highlight_color. Default
+                        "yellow".
+      author, initials: Recorded on the Word comment, same as
+                        insert_word_comment.
+      index_db_path:    If supplied, the sidecar is invalidated and the flag
+                        is recorded into the same docx_internal_notes table
+                        insert_highlighted_note's mode="comment" path uses
+                        (note id "_MComment<comment_id>"), so
+                        list_internal_notes surfaces it too.
+      allow_degraded_render / degraded_render_reason: the same audited
+                        opt-in insert_word_comment / insert_figure_block
+                        expose for "no render backend available in this
+                        environment" — required together.
+      session_id: 273df573 — identifies the calling Meridian session to the
+        tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+        meridian/routes/tunnel.py). Not forwarded to docs_intel; has no
+        effect when this tool is invoked outside Meridian's tunnel (e.g.
+        standalone `uvx meridian-docs`).
+
+    Returns {status: "flagged", comment_id, note_id, text, anchor_para_id,
+    highlighted_run_count, highlight_color, author, initials, docx_path,
+    render_status, render_verified, ...} on success, or {"error": <message>,
+    ...} on any validation, resolution, write, or verification failure — the
+    file is left untouched on a validation/resolution failure, and either
+    correctly written or safely restored on a write/verification failure.
+    """
+    return docs_intel.flag_for_review(
+        docx_path=docx_path,
+        anchor=anchor,
+        note=note,
+        highlight_color=highlight_color,
+        author=author,
+        initials=initials,
+        index_db_path=index_db_path,
         allow_degraded_render=allow_degraded_render,
         degraded_render_reason=degraded_render_reason,
     )

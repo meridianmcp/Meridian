@@ -888,7 +888,6 @@ class WindowsJobObjectBackend:
                     api.close_handle(job)
                 except Exception:  # noqa: BLE001
                     pass
-
     def _attempt_graceful_ctrl_break(self, handle: OwnedProcessHandle, grace_seconds: float) -> bool:
         """Best-effort CTRL_BREAK_EVENT graceful-shutdown attempt, bounded
         by *grace_seconds*. Returns True iff the process was CONFIRMED gone

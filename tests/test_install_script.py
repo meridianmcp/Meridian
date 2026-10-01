@@ -89,8 +89,11 @@ def test_install_ps1_uses_device_flow_for_keyless_auth():
 
 def test_install_ps1_injects_device_token_and_skips_when_supplied():
     src = _src()
-    # The minted token is forwarded to the binary as --token.
-    assert "$binaryArgs += @('--token'" in src
+    # 9784f8ef: the minted token reaches the binary through the MERIDIAN_TOKEN env
+    # var of the child process -- NOT as a --token argument, which is visible in
+    # process listings (see tests/test_9784f8ef_install_token_exposure.py).
+    assert "$binaryArgs += @('--token'" not in src
+    assert "$env:MERIDIAN_TOKEN = $childToken" in src
     # Skips the device flow when a token/env is already present or target is local.
     assert "MERIDIAN_TOKEN" in src
     assert "$hasToken" in src

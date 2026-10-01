@@ -159,6 +159,18 @@ def test_pid_is_running_posix_path_dead(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", None)
     monkeypatch.setattr(rt.sys, "platform", "linux")
 
+    class _MissingProcStat:
+        def __init__(self, _path):
+            pass
+
+        def read_text(self, **_kwargs):
+            raise FileNotFoundError("/proc/4321/stat")
+
+    # _pid_is_running probes procfs before os.kill. Stub that probe too so
+    # this test stays deterministic when a real runner process happens to
+    # own PID 4321.
+    monkeypatch.setattr(rt, "Path", _MissingProcStat)
+
     def _fake_kill(pid, sig):
         raise ProcessLookupError()
 
