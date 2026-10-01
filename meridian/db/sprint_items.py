@@ -7051,9 +7051,14 @@ async def add_sprint_item_pointer(
     ``{source_type, targets:[{uri, selector, subSelector?, target_kind?}], label?}``
     shape via :mod:`meridian.pointers` (raising ``ValueError`` on a malformed
     pointer BEFORE any write), serializes ``targets`` to the JSON column, and
-    inserts one ``sprint_item_pointers`` row. ``targets`` is an ARRAY (native
-    multi-file); the composite shape is stored as JSON, NOT per-domain columns.
-    The returned dict is the deserialized pointer (targets back as a list).
+    inserts one ``sprint_item_pointers`` row. The insert is conditional on the
+    sprint item belonging to ``project_id``; keeping that ownership check in
+    the INSERT statement makes the check and association atomic across both
+    SQLite and Postgres. A missing or foreign item raises the same
+    ``ValueError`` so callers cannot use this tool to probe another project's
+    item ids. ``targets`` is an ARRAY (native multi-file); the composite shape
+    is stored as JSON, NOT per-domain columns. The returned dict is the
+    deserialized pointer (targets back as a list).
 
     ``target_kind`` (300a063d) — per-target ``"existing"`` (default) |
     ``"planned_new"``. When a caller EXPLICITLY marks a target
@@ -7090,15 +7095,19 @@ async def add_sprint_item_pointer(
     )
     pid = _new_id()
     targets_json = serialize_targets(normalized["targets"])
-    await db.execute(
+    cur = await db.execute(
         "INSERT INTO sprint_item_pointers "
         "(id, project_id, sprint_item_id, source_type, targets, label) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "SELECT ?, ?, ?, ?, ?, ? "
+        "WHERE EXISTS (SELECT 1 FROM sprint_items WHERE id = ? AND project_id = ?)",
         (
             pid, project_id, sprint_item_id,
             normalized["source_type"], targets_json, label,
+            sprint_item_id, project_id,
         ),
     )
+    if cur.rowcount != 1:
+        raise ValueError("sprint item not found in project")
     await db.commit()
     async with db.execute(
         "SELECT * FROM sprint_item_pointers WHERE id = ?", (pid,)

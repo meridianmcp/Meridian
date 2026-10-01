@@ -82,6 +82,37 @@ async def test_get_project_note_scoped_lookup(db):
 
 
 # ---------------------------------------------------------------------------
+# add_sprint_item_pointer -- the item must belong to the supplied project
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mcp_add_pointer_rejects_foreign_sprint_item(db, tmp_path):
+    """A project-A write cannot attach a pointer to project B's sprint item."""
+    from meridian import server as srv
+
+    a, b = await _two_projects(db)
+    item_b = await db_module.add_sprint_item(db, b["id"], "v1", "B item")
+
+    result = await srv._dispatch_mcp_tool(
+        "add_sprint_item_pointer",
+        {
+            "project_id": a["id"],
+            "sprint_item_id": item_b["id"],
+            "source_type": "code",
+            "targets": [{
+                "uri": "src/private.py",
+                "selector": {"type": "range", "start_line": 1, "end_line": 2},
+            }],
+        },
+        db,
+        str(tmp_path),
+    )
+
+    assert "error" in result
+    assert await db_module.get_sprint_item_pointers(db, item_b["id"]) == []
+
+
+# ---------------------------------------------------------------------------
 # finding_id targets
 # ---------------------------------------------------------------------------
 
