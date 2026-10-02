@@ -3003,8 +3003,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "group, deferred_until (enforced deferral), track, or depends_on (dependency ordering). "
         "Only the fields you pass are changed; omitted fields are left untouched. Pass an empty "
         "string for human_id, group, deferred_until, track, or depends_on to clear it. Returns "
-        "the updated item, or an error if the id is unknown. For TWO OR MORE independent item "
-        "patches, prefer the single execute_batch(operation='item_updates', entries=[...], "
+        "the updated item, or an error if the id is unknown. "
+        "Setting prospect_bypass=true is an override of the prospecting safety gate: it needs a"
+        " non-empty override_reason and a human-approved require_human HITL. The first call"
+        " returns HUMAN_APPROVAL_REQUIRED; after a human answers Yes, retry with override_hitl_id."
+        " For TWO OR MORE independent item patches, prefer the single execute_batch(operation='item_updates', entries=[...], "
         "mode='best_effort' or 'all_or_nothing', idempotency_key='...') call instead of "
         "repeating this tool: it validates and reports each item in input order, supports "
         "per-item correlation_key values, and makes retries idempotent. Use best_effort when "
@@ -3030,14 +3033,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "wave": {"type": "string",
                   "description": "58a45b92 — set/clear the stored wave label (e.g. 'wave-1') for enforced parallel-batch grouping. Hand-override of what assign_sprint_waves computes. Pass an empty string to CLEAR (unassigned); omit to leave unchanged."},
          "prospect_bypass": {"type": "boolean",
-                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. 0ff5e59f — setting it true is an AUDITED override: it requires a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise) and writes an action_audit_log row. Set false to re-enable the structural gate (no reason needed). Omit to leave unchanged. Executor sessions must NOT set this field."},
-         "override_reason": {"type": "string", "description": "0ff5e59f — REQUIRED with prospect_bypass=true: why this item may be claimed without prospecting evidence. Recorded to action_audit_log (who/when/why)."},
+                             "description": "94c26322 — Set true to explicitly allow this item through the prospecting safety gate without code_pointers or confirmed prospect_status. This is the only way to include an unprospected item in a /goal's auto-run claimable batch. 0ff5e59f — this override requires a non-empty override_reason AND human approval via a require_human HITL; after approval, retry with override_hitl_id. Set false to re-enable the structural gate. Omit to leave unchanged."},
+         "override_reason": {"type": "string", "description": "0ff5e59f — required with prospect_bypass=true: why this item may be claimed without prospecting evidence. Recorded to action_audit_log."},
+         "override_hitl_id": {"type": "string", "description": "0ff5e59f — id of the answered Yes gate_override HITL approving this item's prospect_bypass change. Single-use and bound to this item."},
          "depends_on": {"type": "string",
                         "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
          "require_verification": {"type": "boolean",
                              "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."},
          "require_strict_evidence": {"type": "boolean",
-                             "description": "5fe3502e — set true to require STRICT (fail-closed) completion-evidence verification: complete_sprint_item then refuses (STRICT_EVIDENCE_BLOCKED) unless declared evidence is present, resolves to something real on disk/in the DB, isn't stale (predates the current claim), matches the completing session's own worktree, and no file was edited without a claim_file/claim_symbol lock — unless the caller explicitly passes override_strict_evidence=true with a non-empty override_reason (audited). Set false to re-enable ordinary advisory-only evidence checks. Omit to leave unchanged. Equivalent to passing strict_evidence=true on a single complete_sprint_item call, but persists across attempts."},
+                             "description": "5fe3502e — set true to require STRICT (fail-closed) completion-evidence verification: complete_sprint_item then refuses (STRICT_EVIDENCE_BLOCKED) unless declared evidence is present, resolves to something real on disk/in the DB, isn't stale (predates the current claim), matches the completing session's own worktree, and no file was edited without a claim_file/claim_symbol lock — unless the caller passes override_strict_evidence=true, a non-empty override_reason, and human approval for the exact failing-gate bundle. Set false to re-enable ordinary advisory-only evidence checks. Omit to leave unchanged. Equivalent to passing strict_evidence=true on a single complete_sprint_item call, but persists across attempts."},
          "required_tool": {"type": "string",
                   "description": "4d1fb28f — pin (or re-pin) the specific MCP tool/plugin the executor MUST use for this item, rendered as a hard directive in the /goal block — not left to executor habit. Pass an empty string to CLEAR the pin (ordinary executor discretion); omit to leave unchanged."},
          "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA,
@@ -3069,13 +3073,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "claim is stale (claimed 2h+ ago, or the claiming session is dead/closed) — the "
         "exact stale-cleanup pattern of closing items left behind by a dead session keeps "
         "working automatically. For a live, non-stale foreign claim, pass "
-        "force_foreign_claim=true to explicitly acknowledge and complete anyway. "
+        "force_foreign_claim=true to explicitly acknowledge and complete anyway; this is an"
+        " override and needs a human-approved require_human HITL. "
         "5fe3502e — pass strict_evidence=true (or flag the item require_strict_evidence=true "
         "via update_sprint_item) for STRICT, fail-closed evidence verification: completion is "
         "refused (STRICT_EVIDENCE_BLOCKED, with typed evidence_errors codes — EVIDENCE_ABSENT/"
         "EVIDENCE_INVALID/EVIDENCE_STALE/WRONG_WORKTREE/UNCLAIMED_EDIT) unless evidence is "
         "present, verifiable, fresh, from the right worktree, and every modified file was "
-        "claimed. Default (no strict_evidence, no require_strict_evidence) behavior is exactly "
+        "claimed. Overriding a strict-evidence or other failing completion gate requires a"
+        " human-approved require_human HITL bound to the complete set of failing gates; pass"
+        " completion_override_hitl_id after a human answers Yes. Default (no strict_evidence, no require_strict_evidence) behavior is exactly "
         "the pre-existing advisory-only evidence checks — nothing changes unless you opt in. "
         "a8c0f3b7 — CODE-INTEL PROSPECTING RECEIPT gate: opt in at the PROJECT level via "
         "set_capability_manifest(capabilities=[{id:'code_intel_prospecting', ...}]) — no "
@@ -3085,8 +3092,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "find_symbol/prospect_symbol call happened since the item was claimed (see "
         "meridian.code_intel_receipt) — or refused (CODE_INTEL_UNAVAILABLE) when the capability "
         "is availability_policy='required' and code-intel itself is unavailable. Pass "
-        "override_code_intel_receipt=true with a non-empty override_reason to acknowledge and "
-        "complete anyway (audited). 'optional'/'degraded_ok' policies never block — they degrade "
+        "override_code_intel_receipt=true with a non-empty override_reason and a human-approved"
+        " completion_override_hitl_id to acknowledge and complete anyway (audited)."
+        " 'optional'/'degraded_ok' policies never block — they degrade "
         "with a code_intel_receipt_warning on the returned item instead. "
         "275a8631 — ARTIFACT-POINTER gate (OPT-IN per item): if the item's policy "
         "(update_sprint_item policy=...) sets artifact_pointer_check='strict' or "
@@ -3103,19 +3111,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "item_id": {"type": "string"},
          "task_id": {"type": "string"},
          "notes": {"type": "string", "description": "Evidence for the completion (what shipped / how it was verified). Persisted on the item; satisfies the required_notes gate."},
-         "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id). Checked against the item's claim owner (8693b6a8) — a mismatch on a live, non-stale claim is refused unless force_foreign_claim=true."},
+         "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id). Checked against the item's claim owner (8693b6a8) — a mismatch on a live, non-stale claim is refused unless force_foreign_claim=true with its required reason and human-approved HITL."},
          "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."},
          "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must be a REAL session of this project (0ff5e59f: the id the verifier's own start_session returned) that differs from actor/session_id and from the claim holder, or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
          "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
          "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."},
-         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit, AUDITED override (0ff5e59f): it must be paired with a non-empty override_reason in the SAME call or the completion is refused (CLAIM_MISMATCH), and an action_audit_log row is written. Never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. This human-approved override requires override_reason; the first call returns HUMAN_APPROVAL_REQUIRED, and after a human answers Yes retry with foreign_claim_override_hitl_id. An action_audit_log row records the approval. Never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "foreign_claim_override_hitl_id": {"type": "string", "description": "0ff5e59f — id of the answered Yes require_human HITL for this item's live foreign claim override. Single-use and bound to this item."},
          "override_artifact_pointer": {"type": "boolean", "description": "275a8631 — request the HUMAN-approved override of an ARTIFACT_POINTER_REQUIRED rejection. Requires override_reason. The first call files a require_human gate-override HITL and returns HUMAN_APPROVAL_REQUIRED + hitl_id; after a human answers Yes, retry with override_hitl_id. Ignored when the gate does not block this item."},
          "override_hitl_id": {"type": "string", "description": "275a8631 — id of the answered (Yes) gate-override HITL a human approved for THIS item's artifact-pointer override. Single-use; bound to this item."},
-         "override_ci": {"type": "boolean", "description": "427b7902 — explicit override of a CI_FAILING rejection (GitHub Actions is genuinely failing for the commit named in the notes). 0ff5e59f — must be paired with a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise); audited to action_audit_log."},
+         "completion_override_hitl_id": {"type": "string", "description": "0ff5e59f — id of the answered Yes require_human HITL for the exact set of failing completion gates overridden in this call (for example CI, strict evidence, code-intel, test-run receipt, or strict merge approval). Single-use; the gate bundle and reasons must match the original request."},
+         "override_ci": {"type": "boolean", "description": "427b7902 — explicit override of a CI_FAILING rejection (GitHub Actions is genuinely failing for the commit named in the notes). 0ff5e59f — requires a non-empty override_reason and the human-approved completion_override_hitl_id for the exact set of failing gates."},
          "strict_evidence": {"type": "boolean", "description": "5fe3502e — opt in to the STRICT, fail-closed evidence gate for THIS call only (see meridian.sprint_evidence_guard). Omit/false preserves the exact pre-existing advisory-only behavior. Equivalent, persistent alternative: update_sprint_item(require_strict_evidence=true)."},
-         "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit, audited override of a STRICT_EVIDENCE_BLOCKED rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Never inferred; omit/false for normal strict behavior."},
-         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside ANY override flag (override_strict_evidence, override_code_intel_receipt, override_test_run_receipt, override_ci, force_foreign_claim, override_artifact_pointer): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
-         "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit, audited override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Only relevant for a project that declared the 'code_intel_prospecting' capability."}},
+         "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit override of a STRICT_EVIDENCE_BLOCKED rejection. Requires a non-empty override_reason and a human-approved completion_override_hitl_id for the exact set of failing gates."},
+         "override_test_run_receipt": {"type": "boolean", "description": "e24f2daa — explicit override of a TEST_RUN_RECEIPT_BLOCKED rejection. Requires a non-empty override_reason and a human-approved completion_override_hitl_id for the exact set of failing gates."},
+         "override_merge_approval": {"type": "boolean", "description": "e7548587 — explicit override of the strict merge-approval gate. Requires override_merge_approval_reason and a human-approved completion_override_hitl_id for the exact set of failing gates."},
+         "override_merge_approval_reason": {"type": "string", "description": "Why strict merge approval is being overridden. Recorded to action_audit_log after human approval."},
+         "override_reason": {"type": "string", "description": "Required alongside override_ci, override_strict_evidence, override_code_intel_receipt, override_test_run_receipt, override_artifact_pointer, or force_foreign_claim: why the rejection or live claim is being overridden. Recorded to action_audit_log after human approval."},
+         "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Requires a non-empty override_reason and a human-approved completion_override_hitl_id. Only relevant for projects that declared the 'code_intel_prospecting' capability."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "

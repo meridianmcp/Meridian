@@ -2528,6 +2528,7 @@ async def complete_sprint_item(
     override_reason: str | None = None,
     tenant_id: str | None = None,
     artifact_pointer_override: dict[str, Any] | None = None,
+    foreign_claim_override_hitl_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -2542,11 +2543,12 @@ async def complete_sprint_item(
     (spent and audited BEFORE the transition, like the wave-gate override); the
     returned row then carries ``artifact_pointer_override``.
 
-    0ff5e59f — ``force_foreign_claim`` is now an AUDITED override: when it is
-    what lets a completion through (a live, non-stale claim held by a different
-    actor) it requires a non-empty ``override_reason`` (otherwise
-    :class:`SprintItemClaimMismatch` is raised, exactly as if no force had been
-    passed) and an ``action_audit_log`` row
+    0ff5e59f — ``force_foreign_claim`` is now a human-approved, audited
+    override: when it is what lets a completion through (a live, non-stale
+    claim held by a different actor) it requires a non-empty ``override_reason``
+    and a one-use, require-human HITL bound to this item. A missing approval
+    raises ``GateOverrideError(HUMAN_APPROVAL_REQUIRED)``; invalid approvals
+    fail closed. An ``action_audit_log`` row
     (``sprint_item_foreign_claim_override``: who/when/why, attributed to
     ``tenant_id`` when given) is written BEFORE the status transition — a
     failed audit write aborts the completion. The returned row then carries
@@ -2572,9 +2574,9 @@ async def complete_sprint_item(
       ``closed``/``archived``, or its heartbeat ``last_seen`` has gone cold
       past the same threshold).
     * If neither is true, the caller may still complete by passing
-      ``force_foreign_claim=True`` — an explicit acknowledgement that this is
-      someone else's live, non-stale claim (mirrors the existing
-      ``override_ci`` escape-hatch shape used elsewhere in this module).
+      ``force_foreign_claim=True`` with ``foreign_claim_override_hitl_id`` —
+      an explicit human-approved acknowledgement that this is someone else's
+      live, non-stale claim.
       Otherwise :class:`SprintItemClaimMismatch` is raised.
     * A completing call that supplies no ``actor`` at all cannot be checked
       against anything and is left alone (fail-open), matching every other
@@ -2841,15 +2843,14 @@ async def complete_sprint_item(
                     "held by a different session. If the claiming session is "
                     "dead/abandoned but the claim hasn't crossed the "
                     f"{_CLAIM_OWNERSHIP_STALE_HOURS}h staleness threshold yet, "
-                    "pass force_foreign_claim=true together with a non-empty "
-                    "override_reason to acknowledge and complete anyway "
-                    "(audited)."
+                    "pass force_foreign_claim=true with a non-empty "
+                    "override_reason and a human-approved "
+                    "foreign_claim_override_hitl_id to complete anyway."
                 )
             if not _claim_is_stale and force_foreign_claim:
                 # 0ff5e59f — the force flag is what lets this completion through,
-                # so it is an override: it needs a stated reason and an audit
-                # row, written BEFORE the transition (fail closed — if the audit
-                # cannot be written the completion does not happen).
+                # so a stated reason and a human-approved, item-bound HITL are
+                # required before the audit row or transition.
                 if not (override_reason or "").strip():
                     raise SprintItemClaimMismatch(
                         f"item {item_id} is claimed by actor {_claim_owner!r}, not "
@@ -2859,17 +2860,26 @@ async def complete_sprint_item(
                         "one."
                     )
                 from .. import gate_override as _gate_override  # noqa: PLC0415
+                _foreign_approval = await _gate_override.consume_gate_override_approval(
+                    db, project_id, foreign_claim_override_hitl_id,
+                    gate=_gate_override.FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE,
+                    subject_id=item_id, consumed_by=_completing_actor or None,
+                )
                 _audit_row = await _gate_override.record_override_audit(
                     db, _gate_override.FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE, project_id,
                     subject_id=item_id, actor=_completing_actor or None,
                     reason=override_reason, tenant_id=tenant_id,
-                    extra={"claim_owner": _claim_owner},
+                    extra={
+                        "claim_owner": _claim_owner,
+                        "hitl_id": _foreign_approval["hitl_id"],
+                    },
                 )
                 _foreign_claim_override = {
                     "claim_owner": _claim_owner,
                     "completing_actor": _completing_actor,
                     "reason": (override_reason or "").strip(),
                     "audit_id": (_audit_row or {}).get("id"),
+                    "hitl_id": _foreign_approval["hitl_id"],
                 }
         _mark_phase("ownership_check")
         if item.get("require_verification"):
