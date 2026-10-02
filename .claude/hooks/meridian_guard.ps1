@@ -2451,7 +2451,8 @@ function G10($C) {
 
 function ResearchHost([string]$hostName, [string]$path) {
     $hn = PyLower $hostName
-    if ($hn -ceq 'github.com' -or (EW $hn '.github.com')) { return (SW $path '/search') }
+    if ($hn -ceq 'github.com' -or $hn -ceq 'www.github.com') { return (($path -ceq '/') -or (SW $path '/search')) }
+    if (EW $hn '.github.com') { return (SW $path '/search') }
     if ((Has $path '/blob/') -or (Has $path '/raw/')) { return $false }
     foreach ($h in $script:RESEARCH_HOSTS) { if ($hn -ceq $h -or (EW $hn ('.' + $h))) { return $true } }
     return ($hn -ceq 'pubmed.ncbi.nlm.nih.gov' -or ((EW $hn 'ncbi.nlm.nih.gov') -and (Has (PyLower $path) '/pubmed')))
@@ -2566,7 +2567,8 @@ function ResearchShaped([string]$tool, $ti) {
         $qv = JGet $ti 'query'
         $q = PyLower (PyStr $(if (PyTruthy $qv) { $qv } else { '' }))
         if (Has $q 'bibtex') { return $false }
-        if ((Has $q 'site:arxiv') -or (Has $q 'prior art') -or (Has $q 'papers on') -or $script:RX_ET_AL.IsMatch($q)) { return $true }
+        $githubSite = [regex]::IsMatch($q, '(?<![\w.-])site:(?:www\.)?github\.com(?:[^\w.-]|$)')
+        if ((Has $q 'site:arxiv') -or $githubSite -or (Has $q 'prior art') -or (Has $q 'papers on') -or $script:RX_ET_AL.IsMatch($q)) { return $true }
         $doms = JGet $ti 'allowed_domains'
         if (IsList $doms) {
             foreach ($d in $doms) {
