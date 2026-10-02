@@ -12,10 +12,240 @@
 # release, but was never reachable through this documented install path until now.
 #   & ([scriptblock]::Create((irm https://usemeridian.us/install-windows.ps1))) -Tray
 #
+# The -Tray path also now creates a per-user Start Menu shortcut and registers
+# a Programs-and-Features / Settings > Apps entry (HKCU, no admin required --
+# same no-admin philosophy as the PATH handling below), and a new -Uninstall
+# switch reverses exactly that: removes meridian-tray.exe, the Start Menu
+# shortcut, and the registry entry. It does NOT touch the shared
+# ~/.local/bin directory or the user PATH -- see the "-Uninstall: reverse
+# exactly what the -Tray path installs" comment below for why. Uninstall from
+# Windows Settings works even when the
+# original install ran via `irm | iex` with no local file: the -Tray path
+# saves a runnable copy of this script next to meridian-tray.exe for the
+# registered UninstallString to invoke later.
+#   & ([scriptblock]::Create((irm https://usemeridian.us/install-windows.ps1))) -Uninstall
+#
 param(
-    [switch]$Tray
+    [switch]$Tray,
+    [switch]$Uninstall
 )
 $ErrorActionPreference = "Stop"
+# Captured once, at top level: $PSCommandPath is only populated when this
+# script runs from a saved .ps1 file (-File ...); piped `irm | iex` execution
+# leaves it empty. Passed explicitly into Save-MeridianUninstallerCopy below
+# rather than re-read inside a function, since behavior must not depend on
+# scope-specific automatic-variable resolution.
+$ScriptSelfPath = $PSCommandPath
+
+# ---- GUI installer support: Start Menu shortcut + Add/Remove Programs ------
+# Shared by the -Tray install path (below) and -Uninstall (see the top-level
+# -Uninstall short-circuit further down). Defined at top level, same reason
+# Get-MeridianDeviceToken/Get-MeridianCachedToken are top level in install.ps1
+# (cee295bd bug fix there): must be reachable regardless of which branch runs.
+$MeridianUninstallKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Meridian"
+$MeridianStartMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Meridian.lnk"
+$MeridianTrayInstallerSelfUrl = "https://usemeridian.us/install-windows.ps1"
+
+function New-MeridianStartMenuShortcut {
+    <#
+    .SYNOPSIS
+      Create/refresh a Start Menu shortcut to meridian-tray.exe in the
+      CURRENT USER's Start Menu Programs folder (never the all-users one --
+      matches this script's per-user-only, no-admin philosophy). Uses the
+      standard PowerShell-native WScript.Shell COM object, no extra
+      dependency. Best-effort: a failure here must never abort the install.
+    #>
+    param([Parameter(Mandatory = $true)][string]$TargetPath)
+    try {
+        $startMenuDir = Split-Path $MeridianStartMenuShortcut -Parent
+        if (-not (Test-Path -LiteralPath $startMenuDir)) {
+            New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null
+        }
+        $wshShell = New-Object -ComObject WScript.Shell
+        $shortcut = $wshShell.CreateShortcut($MeridianStartMenuShortcut)
+        $shortcut.TargetPath = $TargetPath
+        $shortcut.WorkingDirectory = Split-Path $TargetPath -Parent
+        $shortcut.IconLocation = "$TargetPath,0"
+        $shortcut.Description = "Meridian -- local server + tray icon"
+        $shortcut.Save()
+        Write-Host "Created Start Menu shortcut: $MeridianStartMenuShortcut"
+        return $true
+    } catch {
+        Write-Warning "Could not create the Start Menu shortcut: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-MeridianStartMenuShortcut {
+    <# Idempotent: safe to call even when the shortcut was never created or
+       was already removed by hand. #>
+    if (Test-Path -LiteralPath $MeridianStartMenuShortcut) {
+        try {
+            Remove-Item -LiteralPath $MeridianStartMenuShortcut -Force -ErrorAction Stop
+            Write-Host "Removed Start Menu shortcut: $MeridianStartMenuShortcut"
+        } catch {
+            Write-Warning "Could not remove the Start Menu shortcut: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "Start Menu shortcut already absent: $MeridianStartMenuShortcut"
+    }
+}
+
+function Save-MeridianUninstallerCopy {
+    <#
+    .SYNOPSIS
+      Persist a runnable copy of THIS script next to meridian-tray.exe so the
+      UninstallString registered in Add/Remove Programs (see
+      Register-MeridianUninstallEntry) has something to invoke later --
+      clicking "Uninstall" in Windows Settings can happen days or weeks after
+      an install that may have run via `irm ... | iex` with no local file at
+      all. Prefers copying the actually-running local file (a -File
+      invocation); falls back to re-downloading a fresh copy from the
+      canonical URL when there is none. Best-effort: returns $null on total
+      failure rather than throwing -- the caller skips registering the
+      Add/Remove Programs entry in that case (a broken UninstallString would
+      be worse than no entry at all).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$DestDir,
+        [string]$LocalSourcePath
+    )
+    $dest = Join-Path $DestDir "install-windows.ps1"
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($LocalSourcePath) -and (Test-Path -LiteralPath $LocalSourcePath)) {
+            Copy-Item -LiteralPath $LocalSourcePath -Destination $dest -Force -ErrorAction Stop
+            return $dest
+        }
+    } catch {
+        # Fall through to the network fallback below.
+    }
+    try {
+        Invoke-WebRequest -Uri $MeridianTrayInstallerSelfUrl -OutFile $dest -UseBasicParsing -ErrorAction Stop
+        if ((Test-Path -LiteralPath $dest) -and ((Get-Item -LiteralPath $dest).Length -gt 0)) {
+            return $dest
+        }
+    } catch {}
+    return $null
+}
+
+function Register-MeridianUninstallEntry {
+    <#
+    .SYNOPSIS
+      Register Meridian under the CURRENT USER's Uninstall key so it shows in
+      Settings > Apps > Installed apps and the classic Control Panel
+      Add-or-Remove-Programs list, without needing an MSI/WiX/Inno Setup
+      packaging pipeline. HKCU (not HKLM) -- no admin rights required, same
+      as every other write this script makes.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ExePath,
+        [Parameter(Mandatory = $true)][string]$InstallDir,
+        [string]$Version,
+        [string]$LocalSourcePath
+    )
+    $uninstallerPath = Save-MeridianUninstallerCopy -DestDir $InstallDir -LocalSourcePath $LocalSourcePath
+    if (-not $uninstallerPath) {
+        Write-Warning "Could not save a runnable uninstaller copy -- skipping Add/Remove Programs registration (a broken entry would be worse than none). You can still remove meridian-tray.exe by hand from $InstallDir."
+        return $false
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $MeridianUninstallKeyPath)) {
+            New-Item -Path $MeridianUninstallKeyPath -Force | Out-Null
+        }
+        $uninstallCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$uninstallerPath`" -Uninstall"
+        $sizeKB = 0
+        try { $sizeKB = [int][math]::Round((Get-Item -LiteralPath $ExePath).Length / 1KB) } catch {}
+        $displayVersion = if ($Version) { $Version -replace '^v', '' } else { "0.0.0" }
+        # Value names/types per Microsoft's documented Uninstall registry key
+        # convention (Settings > Apps reads both HKLM and HKCU under this same
+        # subpath). DisplayName/DisplayVersion/Publisher/UninstallString/
+        # InstallLocation/DisplayIcon/InstallDate are REG_SZ; EstimatedSize/
+        # NoModify/NoRepair are REG_DWORD. NoModify+NoRepair=1 because this is
+        # a script-based install with no Modify/Repair flow to offer --
+        # leaving them unset shows greyed-out buttons that do nothing.
+        $props = @{
+            DisplayName     = "Meridian"
+            DisplayVersion  = $displayVersion
+            Publisher       = "Meridian"
+            UninstallString = $uninstallCmd
+            InstallLocation = $InstallDir
+            DisplayIcon     = "$ExePath,0"
+            EstimatedSize   = $sizeKB
+            NoModify        = 1
+            NoRepair        = 1
+            InstallDate     = (Get-Date -Format "yyyyMMdd")
+        }
+        foreach ($name in $props.Keys) {
+            $value = $props[$name]
+            $valueKind = if ($value -is [int]) { "DWord" } else { "String" }
+            New-ItemProperty -Path $MeridianUninstallKeyPath -Name $name -Value $value -PropertyType $valueKind -Force | Out-Null
+        }
+        Write-Host "Registered Meridian in Add/Remove Programs (Settings > Apps > Installed apps)."
+        return $true
+    } catch {
+        Write-Warning "Could not register the Add/Remove Programs entry: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-MeridianUninstallEntry {
+    <# Idempotent: safe to call even when the entry was never created or was
+       already removed by hand. #>
+    if (Test-Path -LiteralPath $MeridianUninstallKeyPath) {
+        try {
+            Remove-Item -LiteralPath $MeridianUninstallKeyPath -Recurse -Force -ErrorAction Stop
+            Write-Host "Removed Add/Remove Programs entry: $MeridianUninstallKeyPath"
+        } catch {
+            Write-Warning "Could not remove the Add/Remove Programs entry: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "Add/Remove Programs entry already absent: $MeridianUninstallKeyPath"
+    }
+}
+
+# ---- -Uninstall: reverse exactly what the -Tray path installs --------------
+# Short-circuits before -Tray / uv / meridian.exe logic below -- -Uninstall is
+# a standalone action, not a modifier of a normal install run. Every step
+# checks existence first and is independently try/caught, so a partial prior
+# manual removal (or a second -Uninstall run) never errors out partway
+# through -- each piece is removed if present, reported either way.
+#
+# Deliberately does NOT touch ~/.local\bin or the user PATH: that directory
+# is a SHARED per-user bin directory (uv, serena, and other unrelated tools
+# commonly live there too, confirmed on real installs), not something this
+# installer owns exclusively -- unlike install.ps1's dedicated
+# $env:APPDATA\meridian directory, stripping it from PATH here could silently
+# break unrelated tools. Only the meridian-tray.exe file itself is removed.
+if ($Uninstall) {
+    Write-Host "Uninstalling the Meridian tray/GUI app..." -ForegroundColor Cyan
+    $binDir = Join-Path $env:USERPROFILE ".local\bin"
+    $exePath = Join-Path $binDir "meridian-tray.exe"
+    $uninstallerCopy = Join-Path $binDir "install-windows.ps1"
+
+    if (Test-Path -LiteralPath $exePath) {
+        try {
+            Remove-Item -LiteralPath $exePath -Force -ErrorAction Stop
+            Write-Host "Removed $exePath"
+        } catch {
+            Write-Warning "Could not remove $exePath -- it may still be running. Close Meridian (tray icon > Quit) and try again. ($($_.Exception.Message))"
+        }
+    } else {
+        Write-Host "meridian-tray.exe not found at $exePath (already removed)."
+    }
+
+    Remove-MeridianStartMenuShortcut
+    Remove-MeridianUninstallEntry
+
+    if (Test-Path -LiteralPath $uninstallerCopy) {
+        try { Remove-Item -LiteralPath $uninstallerCopy -Force -ErrorAction Stop } catch {}
+    }
+
+    Write-Host ""
+    Write-Host "Meridian tray/GUI app uninstalled." -ForegroundColor Green
+    Write-Host "Note: $binDir was left on your PATH -- it is a shared user bin directory"
+    Write-Host "(other tools may live there too), so it is never removed automatically."
+    exit 0
+}
 
 # ---- f66e8f23: SHA-256 verification of the downloaded binary -----------------
 # release.yml publishes a SHA256SUMS file with every release (one "<hex>  <asset
@@ -161,12 +391,30 @@ if ($Tray) {
     $sizeMB = [math]::Round((Get-Item $dest).Length / 1MB, 1)
     Write-Host "Installed meridian-tray.exe ($sizeMB MB) to $dest"
 
+    # ---- Start Menu shortcut + Add/Remove Programs registration -------------
+    # Wired into the NORMAL (non-uninstall) install path -- runs on every
+    # -Tray install, not as a separate opt-in step. Both are best-effort: a
+    # failure here is warned about but never aborts the install (the binary
+    # is already in place and usable by direct path at that point).
+    $shortcutCreated = New-MeridianStartMenuShortcut -TargetPath $dest
+    $registered = Register-MeridianUninstallEntry -ExePath $dest -InstallDir $binDir `
+        -Version $releaseTag -LocalSourcePath $ScriptSelfPath
+
     Write-Host ""
-    Write-Host "Done. Launch it by double-clicking $dest in File Explorer, or from a"
-    Write-Host "terminal:"
+    Write-Host "Done. Launch it by double-clicking $dest in File Explorer,"
+    if ($shortcutCreated) {
+        Write-Host "from the Start Menu (search for `"Meridian`"), or from a terminal:"
+    } else {
+        Write-Host "or from a terminal:"
+    }
     Write-Host "  & `"$dest`""
     Write-Host "This starts the Meridian server in the background and shows a tray icon"
     Write-Host "(Open Dashboard / Status / View Logs / Restart / Quit)."
+    if ($registered) {
+        Write-Host ""
+        Write-Host "To uninstall: Settings > Apps > Installed apps > Meridian > Uninstall,"
+        Write-Host "or run this installer again with -Uninstall."
+    }
     exit 0
 }
 
