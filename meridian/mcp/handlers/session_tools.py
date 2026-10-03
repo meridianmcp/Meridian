@@ -14,11 +14,15 @@ that state as explicit keyword arguments to keep the import graph acyclic.
 from __future__ import annotations
 
 import asyncio
+import html
 from typing import Any, TYPE_CHECKING
 
 import meridian.server as _server
 from meridian import db as db_module
+from meridian import session_brief as session_brief_module
 from meridian._deps import validate_input_size
+
+_ITEM_RECOVERY_XML_MAX_BYTES = 1800
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1296,7 +1300,29 @@ async def handle_get_session_brief(
     # v2.6 — include session scratch-pad notes at top of brief
     notes_xml = ""
     new_items_xml = ""
+    item_recovery_xml = ""
     if session_id_for_notes:
+        try:
+            recovery = await session_brief_module.get_item_recovery_context(
+                db, project_id, session_id_for_notes
+            )
+            recovery_lines = session_brief_module.build_item_recovery_lines(
+                recovery, max_bytes=1200
+            )
+            opening = '<item_recovery trust="untrusted" source="Meridian sprint board">\n'
+            entries: list[str] = []
+            used = len(opening.encode("utf-8")) + len("\n</item_recovery>\n".encode("utf-8"))
+            for line in recovery_lines:
+                entry = f"  <entry>{html.escape(line, quote=False)}</entry>\n"
+                cost = len(entry.encode("utf-8"))
+                if used + cost > _ITEM_RECOVERY_XML_MAX_BYTES:
+                    break
+                entries.append(entry)
+                used += cost
+            if entries:
+                item_recovery_xml = opening + "".join(entries) + "</item_recovery>\n"
+        except Exception:
+            item_recovery_xml = ""
         try:
             session_notes = await db_module.get_session_notes(db, session_id_for_notes)
             if session_notes:
@@ -1468,6 +1494,7 @@ async def handle_get_session_brief(
             pass
     brief = (
         f'<session_brief project_id="{project_id}" role="{role}">\n'
+        f'{item_recovery_xml}'
         f'{notes_xml}'
         f'{new_items_xml}'
         f'{_progress_xml}'

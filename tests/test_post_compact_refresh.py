@@ -8,6 +8,7 @@ with it.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -188,6 +189,16 @@ def test_registered_hooks_map_host_session_before_auto_checkpoint(tmp_path):
         assert host_session_id not in json.dumps(start_body)
         assert start_body["session_name"].startswith("claude-hook-")
         assert start_body["mode"] == "continue"
+        session_key = hashlib.sha256(host_session_id.encode("utf-8")).hexdigest()[:32]
+        mapping_path = (
+            tmp_path / "Meridian" / "hooks" / "12345678-1234-1234-1234-123456789abc"
+            / f"{session_key}.json"
+        )
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        assert mapping["project_id"] == "12345678-1234-1234-1234-123456789abc"
+        assert mapping["meridian_session_id"] == "meridian-session-123"
+        assert host_session_id not in mapping_path.name
+        assert host_session_id not in mapping_path.read_text(encoding="utf-8")
 
         for _ in range(2):
             submitted = _run_registered_hook(

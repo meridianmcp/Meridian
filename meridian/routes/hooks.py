@@ -254,7 +254,7 @@ _PRIORITY_RANK = {"critical": 0, "urgent": 0, "high": 1, "medium": 2, "normal": 
 
 @router.get("/projects/{project_id}/session-brief")
 async def get_project_session_brief(
-    project_id: str, request: Request, max_chars: int = 2000
+    project_id: str, request: Request, max_chars: int = 2000, session_id: str | None = None
 ) -> dict[str, Any]:
     """55d48d69 -- the optional, UNTRUSTED server section of the SessionStart brief.
 
@@ -265,7 +265,11 @@ async def get_project_session_brief(
     counts and the top pending item titles -- never from execution_policy,
     pending_goal, agent instructions, note bodies or document content, and
     every line that looks like an execution directive is dropped
-    (``session_brief.build_server_section``). ``max_chars`` is clamped to
+    (``session_brief.build_server_section``). When ``session_id`` belongs to
+    this project, the response may add a single item locked by that persisted
+    Meridian session, along with its declared resources, pointers and matching
+    task logs. The host's Claude session id is never accepted here.
+    ``max_chars`` is clamped to
     [100, 4000] rather than rejected so the hook never gets a 422.
 
     Each fact is gathered independently: a failing sub-query just omits that
@@ -276,6 +280,13 @@ async def get_project_session_brief(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     facts: dict[str, Any] = {"project_name": project.get("name")}
+    if session_id:
+        try:
+            facts["active_item"] = await session_brief_module.get_item_recovery_context(
+                db, project_id, session_id
+            )
+        except Exception:  # noqa: BLE001 - optional item context
+            pass
     try:
         goal = await db_module.get_goal(db, project_id)
         if isinstance(goal, dict):
