@@ -708,11 +708,14 @@ def test_run_tray_reports_zotero_setup_errors(monkeypatch, failure, title):
     monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
 
     class ImmediateThread:
-        def __init__(self, *, target, daemon):
+        def __init__(self, *, target, daemon, name=None, args=()):
             self.target = target
+            self.name = name
+            self.args = args
 
         def start(self):
-            self.target()
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
 
     monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
     assert tray_main._run_tray() == 0
@@ -757,6 +760,9 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
 
     monkeypatch.setattr(tray_main, "_show_status_dialog", mock.Mock())
     monkeypatch.setattr(tray_main, "_show_logs_window", mock.Mock())
+    monkeypatch.setattr(tray_main, "_load_tunnel_watchdog_enabled", lambda: True)
+    save_watchdog = mock.Mock()
+    monkeypatch.setattr(tray_main, "_save_tunnel_watchdog_enabled", save_watchdog)
     monkeypatch.setattr(tray_main, "run_zotero_setup_dialog", mock.Mock())
     errors = mock.Mock()
     monkeypatch.setattr(tray_main, "_show_error_dialog", errors)
@@ -769,11 +775,14 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
     fake_runner.restart.side_effect = RuntimeError("restart failed")
 
     class ImmediateThread:
-        def __init__(self, *, target, daemon):
+        def __init__(self, *, target, daemon, name=None, args=()):
             self.target = target
+            self.name = name
+            self.args = args
 
         def start(self):
-            self.target()
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
 
     monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
 
@@ -786,7 +795,8 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
         for label in (
             "Open Dashboard", "Status", "View Logs", "Zotero connection…",
             "Set up a local project…", "Check a local project…",
-            "Catalog local sessions", "Artifact capture commands", "Restart", "Quit",
+            "Catalog local sessions", "Artifact capture commands", "Restart",
+            "Automatic tunnel recovery", "Quit",
         ):
             callbacks[label](fake_icon, None)
         # A second setup-menu invocation covers the user's picker-cancel path.
@@ -800,12 +810,16 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
 
     assert tray_main._run_tray() == 0
 
-    tray_main._show_status_dialog.assert_called_once_with(
-        fake_runner,
-        parent=parent,
-        tunnel_runner=fake_tunnel_runner,
-        hosted_tunnel_status=hosted_status,
+    status_call = tray_main._show_status_dialog.call_args
+    assert status_call.args == (fake_runner,)
+    assert status_call.kwargs["parent"] is parent
+    assert status_call.kwargs["tunnel_runner"] is fake_tunnel_runner
+    assert status_call.kwargs["hosted_tunnel_status"] == hosted_status
+    expected_watchdog_status = (
+        "enabled; waiting for the tunnel to be enabled"
+        if platform == "win32" else "disabled by user"
     )
+    assert status_call.kwargs["watchdog_status"] == expected_watchdog_status
     tray_main._show_logs_window.assert_called_once_with(fake_runner, parent=parent)
     tray_main.run_zotero_setup_dialog.assert_called_once_with(parent=parent)
     assert tray_main._choose_project_root.call_count == 3
@@ -816,6 +830,7 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
         [setup, recovery, artifacts] if platform == "win32" else [recovery, artifacts, setup]
     )
     fake_runner.restart.assert_called_once_with()
+    save_watchdog.assert_called_once_with(False)
     errors.assert_called_once_with("Meridian restart failed", "restart failed", parent=parent)
     fake_runner.stop.assert_called_once_with()
     fake_icon.stop.assert_called_once_with()
@@ -842,11 +857,14 @@ def test_run_tray_exposes_hosted_tunnel_enable_reconnect_disable_and_diagnostics
     monkeypatch.setattr(tray_main.sys, "platform", "win32")
 
     class ImmediateThread:
-        def __init__(self, *, target, daemon):
+        def __init__(self, *, target, daemon, name=None, args=()):
             self.target = target
+            self.name = name
+            self.args = args
 
         def start(self):
-            self.target()
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
 
     monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
 
@@ -876,7 +894,10 @@ def test_run_tray_exposes_hosted_tunnel_enable_reconnect_disable_and_diagnostics
         str(Path("C:/work/project").resolve()),
     ]
     fake_tunnel_runner.start.assert_called_once_with()
-    assert fake_tunnel_runner.restart.call_args_list == [mock.call(), mock.call()]
+    assert fake_tunnel_runner.restart.call_args_list == [
+        mock.call(reason="manual tunnel enable"),
+        mock.call(reason="manual tunnel reconnect"),
+    ]
     fake_tunnel_runner.stop.assert_called_once_with()
     tray_main.webbrowser.open.assert_any_call("https://usemeridian.us/tunnel/diagnostics/tenant-123")
 
@@ -1010,6 +1031,7 @@ def test_run_tray_exposes_local_workstation_tools(monkeypatch):
     labels = [call.args[0] for call in fake_pystray.MenuItem.call_args_list]
     assert "Local workstation tools" in labels
     assert "Set up a local project…" in labels
+    assert "Automatic tunnel recovery" in labels
     assert "Check a local project…" in labels
     assert "Catalog local sessions" in labels
     assert "Artifact capture commands" in labels
@@ -1029,11 +1051,14 @@ def test_local_project_setup_menu_uses_the_selected_root(monkeypatch):
     monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
 
     class ImmediateThread:
-        def __init__(self, *, target, daemon):
+        def __init__(self, *, target, daemon, name=None, args=()):
             self.target = target
+            self.name = name
+            self.args = args
 
         def start(self):
-            self.target()
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
 
     monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
     tray_main._run_tray()
@@ -1061,11 +1086,14 @@ def test_local_tools_launch_check_recovery_and_artifact_commands(monkeypatch):
     monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
 
     class ImmediateThread:
-        def __init__(self, *, target, daemon):
+        def __init__(self, *, target, daemon, name=None, args=()):
             self.target = target
+            self.name = name
+            self.args = args
 
         def start(self):
-            self.target()
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
 
     monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
     tray_main._run_tray()
@@ -1100,11 +1128,14 @@ def test_local_project_menu_reports_picker_errors_without_stopping_tray(monkeypa
     )
 
     class ImmediateThread:
-        def __init__(self, *, target, daemon):
+        def __init__(self, *, target, daemon, name=None, args=()):
             self.target = target
+            self.name = name
+            self.args = args
 
         def start(self):
-            self.target()
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
 
     monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
     assert tray_main._run_tray() == 0
@@ -1713,3 +1744,71 @@ def test_run_tray_opens_dashboard_when_local_mcp_not_configured(monkeypatch):
 
     assert rc == 0
     assert opened == [tray_main._dashboard_url()]
+
+def test_tunnel_watchdog_requires_confirmed_failures_and_exposes_restart_reason():
+    now = [100.0]
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "No active tunnel socket"})
+    runner = mock.Mock()
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    watchdog.arm()
+
+    assert watchdog.tick() is None
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+    reason = watchdog.tick()
+
+    assert reason == "Hosted tunnel diagnostics reported disconnected: No active tunnel socket"
+    runner.restart.assert_called_once_with(reason=reason)
+    assert reason in watchdog.status_text
+
+
+def test_tunnel_watchdog_ignores_indeterminate_health_and_can_be_disabled():
+    probe = mock.Mock(return_value={"state": "unavailable", "detail": "hosted service unavailable"})
+    runner = mock.Mock()
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe)
+    watchdog.arm()
+
+    watchdog.tick()
+    watchdog.tick()
+    assert runner.restart.call_count == 0
+
+    watchdog.set_enabled(False)
+    probe.reset_mock()
+    probe.return_value = {"state": "disconnected", "detail": "no socket"}
+    watchdog.tick()
+    probe.assert_not_called()
+    assert watchdog.status_text == "disabled by user"
+
+
+def test_tunnel_watchdog_caps_restart_attempts_until_manual_rearm():
+    now = [0.0]
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "no active socket"})
+    runner = mock.Mock()
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    watchdog.arm()
+
+    for _ in range(len(tray_main._TUNNEL_WATCHDOG_BACKOFF_SECONDS)):
+        assert watchdog.tick() is None
+        now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+        reason = watchdog.tick()
+        assert reason is not None
+        now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+
+    assert runner.restart.call_count == len(tray_main._TUNNEL_WATCHDOG_BACKOFF_SECONDS)
+    assert watchdog.tick() is None
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+    paused = watchdog.tick()
+    assert paused is not None and "paused" in paused
+    assert runner.restart.call_count == len(tray_main._TUNNEL_WATCHDOG_BACKOFF_SECONDS)
+
+    watchdog.arm(reset_budget=True)
+    assert "paused" not in watchdog.status_text
+
+
+def test_tunnel_watchdog_preference_defaults_on_and_persists(tmp_path):
+    path = tmp_path / "preferences" / "tunnel-watchdog.json"
+
+    assert tray_main._load_tunnel_watchdog_enabled(path) is True
+    tray_main._save_tunnel_watchdog_enabled(False, path)
+    assert tray_main._load_tunnel_watchdog_enabled(path) is False
+    tray_main._save_tunnel_watchdog_enabled(True, path)
+    assert tray_main._load_tunnel_watchdog_enabled(path) is True

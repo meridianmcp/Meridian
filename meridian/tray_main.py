@@ -50,12 +50,14 @@ follow-up, not required for a working v1.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import webbrowser
@@ -81,6 +83,7 @@ from .local_runner import (
     LocalMcpState,
     LocalRunner,
     RunnerAlreadyRunningError,
+    default_state_dir,
 )
 from .zotero_setup import ZoteroSetupError, run_zotero_setup_dialog
 
@@ -93,6 +96,11 @@ _RUN_TUNNEL_FLAG = "--run-tunnel"
 _TUNNEL_CHILD_FLAG = "--_tunnel-child"
 _CONFIGURE_ZOTERO_FLAG = "--configure-zotero"
 _HEALTH_PROBE_TIMEOUT_SECONDS = 1.5
+_TUNNEL_WATCHDOG_INTERVAL_SECONDS = 30.0
+_TUNNEL_WATCHDOG_FAILURE_THRESHOLD = 2
+_TUNNEL_WATCHDOG_BACKOFF_SECONDS = (30.0, 60.0, 120.0)
+_TUNNEL_WATCHDOG_STABLE_RESET_SECONDS = 300.0
+_TUNNEL_WATCHDOG_SETTINGS_FILE = "tunnel-watchdog.json"
 
 
 def _default_port() -> int:
@@ -338,6 +346,206 @@ def _last_log_error(log_text: str) -> str | None:
     return None
 
 
+_TUNNEL_WATCHDOG_SETTINGS_LOCK = threading.Lock()
+
+
+def _tunnel_watchdog_settings_path(path: Path | None = None) -> Path:
+    return path or (default_state_dir() / _TUNNEL_WATCHDOG_SETTINGS_FILE)
+
+
+def _load_tunnel_watchdog_enabled(path: Path | None = None) -> bool:
+    """Load the user's persistent auto-restart preference; default is on."""
+    try:
+        payload = json.loads(_tunnel_watchdog_settings_path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return True
+    value = payload.get("auto_restart") if isinstance(payload, dict) else None
+    return value if isinstance(value, bool) else True
+
+
+def _save_tunnel_watchdog_enabled(enabled: bool, path: Path | None = None) -> None:
+    """Atomically persist the non-secret watchdog preference."""
+    target = _tunnel_watchdog_settings_path(path)
+    with _TUNNEL_WATCHDOG_SETTINGS_LOCK:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = target.with_name(
+            f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps({"auto_restart": bool(enabled)}, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temporary, target)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+class _TunnelWatchdog:
+    """Bounded tray-owned recovery for a tunnel helper the user enabled."""
+
+    def __init__(
+        self,
+        runner: LocalRunner,
+        *,
+        status_probe: Any = _hosted_tunnel_status,
+        enabled: bool = True,
+        clock: Any = time.monotonic,
+    ) -> None:
+        self._runner = runner
+        self._status_probe = status_probe
+        self._clock = clock
+        self._enabled = bool(enabled)
+        self._armed = False
+        self._lock = threading.Lock()
+        self._tick_lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._restart_count = 0
+        self._next_restart_at = 0.0
+        self._healthy_since: float | None = None
+        self._circuit_open = False
+        self._last_restart_reason: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    @property
+    def status_text(self) -> str:
+        with self._lock:
+            if not self._enabled:
+                return "disabled by user"
+            if not self._armed:
+                return "enabled; waiting for the tunnel to be enabled"
+            if self._circuit_open:
+                return self._last_restart_reason or "paused after repeated failures"
+            if self._last_restart_reason:
+                return f"enabled; last restart: {self._last_restart_reason}"
+            return "enabled"
+
+    def set_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            was_enabled = self._enabled
+            self._enabled = bool(enabled)
+            if self._enabled and not was_enabled:
+                self._reset_budget_locked()
+            if not self._enabled:
+                self._consecutive_failures = 0
+                self._healthy_since = None
+
+    def arm(self, *, reset_budget: bool = False) -> None:
+        with self._lock:
+            self._armed = True
+            if reset_budget:
+                self._reset_budget_locked()
+
+    def disarm(self) -> None:
+        with self._lock:
+            self._armed = False
+            self._consecutive_failures = 0
+            self._healthy_since = None
+
+    def _reset_budget_locked(self) -> None:
+        self._consecutive_failures = 0
+        self._restart_count = 0
+        self._next_restart_at = 0.0
+        self._healthy_since = None
+        self._circuit_open = False
+        self._last_restart_reason = None
+
+    def tick(self) -> str | None:
+        """Perform at most one bounded diagnostics request and one restart."""
+        if not self._tick_lock.acquire(blocking=False):
+            return None
+        try:
+            with self._lock:
+                if not self._enabled or not self._armed or self._circuit_open:
+                    return None
+            try:
+                hosted = self._status_probe()
+            except Exception as exc:  # noqa: BLE001 -- a probe failure is not restart evidence
+                with self._lock:
+                    self._consecutive_failures = 0
+                    self._healthy_since = None
+                _logger.warning("tunnel watchdog diagnostics probe failed: %s", type(exc).__name__)
+                return None
+            if not isinstance(hosted, dict):
+                with self._lock:
+                    self._consecutive_failures = 0
+                    self._healthy_since = None
+                return None
+
+            state = str(hosted.get("state") or "unknown").strip().casefold()
+            now = self._clock()
+            with self._lock:
+                if not self._enabled or not self._armed or self._circuit_open:
+                    return None
+                if state == "connected":
+                    self._consecutive_failures = 0
+                    if self._healthy_since is None:
+                        self._healthy_since = now
+                    elif (
+                        self._restart_count
+                        and now - self._healthy_since >= _TUNNEL_WATCHDOG_STABLE_RESET_SECONDS
+                    ):
+                        self._reset_budget_locked()
+                        self._healthy_since = now
+                    return None
+                self._healthy_since = None
+                if state != "disconnected":
+                    # Unknown, auth, and hosted-service errors do not prove
+                    # that restarting this local process can help.
+                    self._consecutive_failures = 0
+                    return None
+
+                self._consecutive_failures += 1
+                if self._consecutive_failures < _TUNNEL_WATCHDOG_FAILURE_THRESHOLD:
+                    return None
+                failure_reason = " ".join(
+                    str(hosted.get("last_error") or hosted.get("detail") or "no active tunnel socket").split()
+                )[:300]
+                if self._restart_count >= len(_TUNNEL_WATCHDOG_BACKOFF_SECONDS):
+                    self._circuit_open = True
+                    self._last_restart_reason = (
+                        "Automatic restarts paused after "
+                        f"{len(_TUNNEL_WATCHDOG_BACKOFF_SECONDS)} attempts; tunnel remains disconnected: "
+                        f"{failure_reason}"
+                    )
+                    return self._last_restart_reason
+                if now < self._next_restart_at:
+                    return None
+
+                reason = f"Hosted tunnel diagnostics reported disconnected: {failure_reason}"
+                attempt = self._restart_count
+                self._restart_count += 1
+                self._consecutive_failures = 0
+                self._next_restart_at = now + _TUNNEL_WATCHDOG_BACKOFF_SECONDS[attempt]
+                self._last_restart_reason = reason
+                try:
+                    self._runner.restart(reason=reason)
+                except Exception as exc:  # noqa: BLE001 -- surface failure but keep the tray/watchdog alive
+                    self._last_restart_reason = (
+                        f"{reason}; local helper restart failed: {type(exc).__name__}: {exc}"
+                    )[:500]
+                    _logger.warning("tunnel watchdog restart failed: %s", type(exc).__name__)
+                else:
+                    _logger.warning("tunnel watchdog restarted local helper: %s", reason)
+                return self._last_restart_reason
+        finally:
+            self._tick_lock.release()
+
+    def run(self, stop_event: threading.Event) -> None:
+        while not stop_event.wait(_TUNNEL_WATCHDOG_INTERVAL_SECONDS):
+            try:
+                self.tick()
+            except Exception:  # noqa: BLE001 -- a watchdog must never kill the tray process
+                _logger.exception("tunnel watchdog iteration failed")
+
+
 def _local_cli_command(*args: str) -> list[str]:
     """Build a command for an existing local-only Meridian maintenance tool.
 
@@ -515,6 +723,7 @@ def _show_status_dialog(
     *,
     tunnel_runner: LocalRunner | None = None,
     hosted_tunnel_status: dict[str, str | None] | None = None,
+    watchdog_status: str | None = None,
 ) -> None:
     import tkinter as tk
     from tkinter import messagebox
@@ -537,8 +746,12 @@ def _show_status_dialog(
             f"Hosted tunnel: {hosted_tunnel_status.get('state') or 'unknown'} -- "
             f"{hosted_tunnel_status.get('detail') or '(no detail)' }",
         ])
+        if tunnel_status.last_restart_reason:
+            lines.append(f"Last restart reason: {tunnel_status.last_restart_reason}")
         last_error = hosted_tunnel_status.get("last_error") or _last_log_error(tunnel_runner.tail_log())
         lines.append(f"Last error: {last_error or '(none recorded)'}")
+        if watchdog_status:
+            lines.append(f"Automatic recovery: {watchdog_status}")
         lines.append("Diagnostics: open Tunnel diagnostics from the tray menu")
     if status.warnings:
         lines.append("")
@@ -640,6 +853,11 @@ def _run_tray() -> int:
     runner = _build_runner()
     tunnel_runner = _build_tunnel_runner()
     tunnel_started_here = False
+    watchdog = _TunnelWatchdog(
+        tunnel_runner,
+        enabled=_load_tunnel_watchdog_enabled(),
+    )
+    watchdog_stop = threading.Event()
 
     # 4e4c3817 follow-up (owner feedback 2026-09-27): a bare tray icon gives
     # zero visible feedback on launch -- a human who just double-clicked this
@@ -720,6 +938,7 @@ def _run_tray() -> int:
                     parent=ui_root,
                     tunnel_runner=tunnel_runner,
                     hosted_tunnel_status=hosted_status,
+                    watchdog_status=watchdog.status_text,
                 )
             )
 
@@ -747,19 +966,24 @@ def _run_tray() -> int:
                 current = tunnel_runner.status()
                 if current.child.state is ChildState.RUNNING:
                     if not reconnect:
+                        tunnel_started_here = True
+                        watchdog.arm(reset_budget=True)
                         return
-                    tunnel_runner.restart()
+                    tunnel_runner.restart(reason="manual tunnel reconnect")
                 elif tunnel_runner.command is None:
                     # A previous run persists its command in LocalRunner's
                     # scope record. restart() recovers that command; with no
                     # previous record it raises ValueError and opens the repo
                     # picker so we never fall back to the home directory.
-                    tunnel_runner.restart()
+                    tunnel_runner.restart(
+                        reason="manual tunnel reconnect" if reconnect else "manual tunnel enable",
+                    )
                 elif reconnect:
-                    tunnel_runner.restart()
+                    tunnel_runner.restart(reason="manual tunnel reconnect")
                 else:
                     tunnel_runner.start()
                 tunnel_started_here = True
+                watchdog.arm(reset_budget=True)
             except RunnerAlreadyRunningError:
                 # A sibling tray already owns the same supervisor scope.
                 return
@@ -792,9 +1016,10 @@ def _run_tray() -> int:
     def _disable_tunnel(icon: "pystray.Icon", item: Any) -> None:
         def _stop() -> None:
             nonlocal tunnel_started_here
+            watchdog.disarm()
+            tunnel_started_here = False
             try:
                 tunnel_runner.stop()
-                tunnel_started_here = False
             except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
                 _dispatch_ui(
                     lambda error=exc: _show_error_dialog(
@@ -803,6 +1028,21 @@ def _run_tray() -> int:
                 )
 
         threading.Thread(target=_stop, daemon=True).start()
+
+    def _toggle_tunnel_watchdog(icon: "pystray.Icon", item: Any) -> None:
+        enabled = not watchdog.enabled
+        try:
+            _save_tunnel_watchdog_enabled(enabled)
+        except OSError as exc:
+            _dispatch_ui(
+                lambda error=exc: _show_error_dialog(
+                    "Tunnel recovery preference not saved",
+                    f"The setting could not be saved: {error}",
+                    parent=ui_root,
+                )
+            )
+            return
+        watchdog.set_enabled(enabled)
 
     def _open_tunnel_diagnostics(icon: "pystray.Icon", item: Any) -> None:
         def _open() -> None:
@@ -882,6 +1122,7 @@ def _run_tray() -> int:
         threading.Thread(target=_do_restart, daemon=True).start()
 
     def _quit(icon: "pystray.Icon", item: Any) -> None:
+        watchdog_stop.set()
         if tunnel_started_here:
             try:
                 tunnel_runner.stop()
@@ -905,6 +1146,11 @@ def _run_tray() -> int:
         pystray.MenuItem("Enable tunnel…", _enable_tunnel),
         pystray.MenuItem("Status", _show_status),
         pystray.MenuItem("Reconnect tunnel", _reconnect_tunnel),
+        pystray.MenuItem(
+            "Automatic tunnel recovery",
+            _toggle_tunnel_watchdog,
+            checked=lambda item: watchdog.enabled,
+        ),
         pystray.MenuItem("Disable tunnel", _disable_tunnel),
         pystray.MenuItem("Open tunnel diagnostics", _open_tunnel_diagnostics),
     )
@@ -923,13 +1169,22 @@ def _run_tray() -> int:
     if darwin_nsapplication is not None:
         icon_options["darwin_nsapplication"] = darwin_nsapplication
     icon = pystray.Icon("meridian-tray", image, "Meridian", menu, **icon_options)
-    if ui_root is None:
-        icon.run()
-    else:
-        try:
+    watchdog_thread = threading.Thread(
+        target=watchdog.run,
+        args=(watchdog_stop,),
+        name="meridian-tunnel-watchdog",
+        daemon=True,
+    )
+    watchdog_thread.start()
+    try:
+        if ui_root is None:
+            icon.run()
+        else:
             icon.run_detached()
             ui_root.mainloop()
-        finally:
+    finally:
+        watchdog_stop.set()
+        if ui_root is not None:
             ui_root.destroy()
     return 0
 

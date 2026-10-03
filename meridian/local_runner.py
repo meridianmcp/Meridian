@@ -597,6 +597,7 @@ class RunnerStatus:
     local_mcp: LocalMcpStatus
     tunnel: TunnelReadinessStatus
     warnings: "tuple[str, ...]" = ()
+    last_restart_reason: "str | None" = None
 
     def as_dict(self) -> "dict[str, Any]":
         return {
@@ -606,6 +607,7 @@ class RunnerStatus:
             "local_mcp": self.local_mcp.as_dict(),
             "tunnel": self.tunnel.as_dict(),
             "warnings": list(self.warnings),
+            "last_restart_reason": self.last_restart_reason,
         }
 
 
@@ -708,6 +710,7 @@ class RunnerRecord:
     local_mcp_state: str = LocalMcpState.NOT_CONFIGURED.value
     local_mcp_detail: str = ""
     local_mcp_checked_at: "float | None" = None
+    last_restart_reason: "str | None" = None
 
     def to_dict(self) -> "dict[str, Any]":
         return dataclasses.asdict(self)
@@ -1514,12 +1517,14 @@ class LocalRunner:
             self._save_record(record)
             return self.status()
 
-    def restart(self) -> RunnerStatus:
+    def restart(self, *, reason: "str | None" = None) -> RunnerStatus:
         """Stop (if running) then respawn, unconditionally -- restart never
         raises :class:`RunnerAlreadyRunningError`, unlike :meth:`start`.
         Recovers the command/cwd from the last persisted record when this
         instance was constructed with ``command=None`` (see
-        :meth:`_resolve_command_for_readonly_op`).
+        :meth:`_resolve_command_for_readonly_op`). Optional *reason* is
+        persisted as the latest restart explanation for status surfaces such
+        as the tray watchdog.
 
         Guarded by ``self._thread_lock`` only (2026-09-28 review finding
         #1b) -- NOT the cross-process scope lock, which exists specifically
@@ -1536,9 +1541,18 @@ class LocalRunner:
             restart_count = (existing.restart_count + 1) if existing is not None else 0
             if existing is not None:
                 self._terminate(existing)
-            return self._start_internal(
+            status = self._start_internal(
                 command=command, cwd=cwd, restart_count=restart_count, force_lease=True,
             )
+            cleaned_reason = " ".join(str(reason or "").split())[:500] or None
+            restarted = self._load_record()
+            if restarted is not None:
+                restarted.last_restart_reason = cleaned_reason
+                self._save_record(restarted)
+        return dataclasses.replace(
+            status,
+            last_restart_reason=cleaned_reason if restarted is not None else None,
+        )
 
     def status(self) -> RunnerStatus:
         """Bounded, read-only status snapshot -- one state-file read plus
@@ -1561,6 +1575,7 @@ class LocalRunner:
             local_mcp=local_mcp,
             tunnel=tunnel,
             warnings=tuple(warnings),
+            last_restart_reason=record.last_restart_reason if record is not None else None,
         )
 
     def _build_child_status(self, record: "RunnerRecord | None") -> ChildProcessStatus:
