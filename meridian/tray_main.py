@@ -87,7 +87,10 @@ from .zotero_setup import ZoteroSetupError, run_zotero_setup_dialog
 _logger = logging.getLogger(__name__)
 
 SCOPE = "meridian-tray"
+TUNNEL_SCOPE = "meridian-tray-tunnel"
 _RUN_SERVER_FLAG = "--run-server"
+_RUN_TUNNEL_FLAG = "--run-tunnel"
+_TUNNEL_CHILD_FLAG = "--_tunnel-child"
 _CONFIGURE_ZOTERO_FLAG = "--configure-zotero"
 _HEALTH_PROBE_TIMEOUT_SECONDS = 1.5
 
@@ -192,6 +195,147 @@ def _server_command() -> "list[str]":
     if getattr(sys, "frozen", False):
         return [sys.executable, _RUN_SERVER_FLAG]
     return [sys.executable, "-m", "meridian"]
+
+
+def _tunnel_command(repo_path: str) -> "list[str]":
+    """Build the supervised tunnel entry point for the selected local repo."""
+    args = ["--repo", str(Path(repo_path).resolve())]
+    if getattr(sys, "frozen", False):
+        return [sys.executable, _RUN_TUNNEL_FLAG, *args]
+    return [sys.executable, "-m", "meridian.tunnel_main", *args]
+
+
+def _tunnel_env() -> "dict[str, str]":
+    """Preserve the user's tunnel credentials and onefile extraction for children."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            env["_MEIPASS2"] = str(meipass)
+    return env
+
+
+def _build_tunnel_runner(repo_path: str | None = None) -> LocalRunner:
+    """Create the tray-owned supervisor, or attach to its persisted scope."""
+    return LocalRunner(
+        scope=TUNNEL_SCOPE,
+        command=_tunnel_command(repo_path) if repo_path else None,
+        cwd=repo_path,
+        env=_tunnel_env(),
+    )
+
+
+def _hosted_tunnel_status() -> dict[str, str | None]:
+    """Read the hosted tunnel's current socket state and latest reported error.
+
+    The server's diagnostics route is the source of truth for a live hosted
+    socket. LocalRunner supervises the tunnel process, but its lifecycle marker
+    is process-local and cannot tell the tray whether that separate process has
+    connected to the hosted service.
+    """
+    import json
+    from urllib.parse import quote
+
+    from .tunnel_client import _read_cached_token, _resolve_base_url, _resolve_token
+
+    base_url = _resolve_base_url()
+    token = _resolve_token() or _read_cached_token(base_url)
+    if not token:
+        return {
+            "state": "not signed in",
+            "detail": "Enable the tunnel to sign in to the hosted service.",
+            "last_error": None,
+            "base_url": base_url,
+            "diagnostics_url": None,
+        }
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def _get_json(path: str) -> dict[str, Any]:
+        request = urllib.request.Request(f"{base_url}{path}", headers=headers)
+        with urllib.request.urlopen(request, timeout=3.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("hosted diagnostics returned an invalid response")
+        return payload
+
+    diagnostics_url = None
+    try:
+        me = _get_json("/me")
+        tenant_id = str(me.get("tenant_id") or "").strip()
+        if not tenant_id:
+            return {
+                "state": "unknown",
+                "detail": "The hosted account response did not include a tenant id.",
+                "last_error": None,
+                "base_url": base_url,
+                "diagnostics_url": None,
+            }
+        diagnostics_url = f"{base_url}/tunnel/diagnostics/{quote(tenant_id, safe='')}"
+        diagnostics = _get_json(f"/tunnel/diagnostics/{quote(tenant_id, safe='')}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            state = "authentication required"
+            detail = "Sign in again from Enable tunnel."
+        elif exc.code == 403:
+            state = "unavailable"
+            detail = "The hosted account cannot read tunnel diagnostics (HTTP 403)."
+        else:
+            state = "unavailable"
+            detail = f"Hosted tunnel diagnostics returned HTTP {exc.code}."
+        return {
+            "state": state,
+            "detail": detail,
+            "last_error": None,
+            "base_url": base_url,
+            "diagnostics_url": diagnostics_url,
+        }
+    except Exception as exc:  # noqa: BLE001 -- status must remain available offline
+        return {
+            "state": "unknown",
+            "detail": f"Could not read hosted tunnel status: {type(exc).__name__}: {exc}",
+            "last_error": None,
+            "base_url": base_url,
+            "diagnostics_url": diagnostics_url,
+        }
+
+    tunnel_process = diagnostics.get("tunnel_process")
+    slots = diagnostics.get("slots")
+    if not isinstance(tunnel_process, dict):
+        tunnel_process = {}
+    if not isinstance(slots, dict):
+        slots = {}
+    active = tunnel_process.get("any_active")
+    if active is None:
+        active = any(
+            isinstance(slot, dict) and slot.get("process_active")
+            for slot in slots.values()
+        )
+    errors = [
+        f"{name}: {slot['last_error']}"
+        for name, slot in slots.items()
+        if isinstance(slot, dict) and slot.get("last_error")
+    ]
+    last_error = "; ".join(errors[:3]) or None
+    if last_error:
+        last_error = last_error[:500]
+    return {
+        "state": "connected" if active else "disconnected",
+        "detail": "Hosted diagnostics report an active tunnel." if active else "No active hosted tunnel socket is reported.",
+        "last_error": last_error,
+        "base_url": base_url,
+        "diagnostics_url": diagnostics_url,
+    }
+
+
+def _last_log_error(log_text: str) -> str | None:
+    """Return the most recent error-like tunnel log line, if one exists."""
+    for line in reversed(log_text.splitlines()):
+        cleaned = line.strip()
+        lowered = cleaned.casefold()
+        if cleaned and any(word in lowered for word in ("error", "failed", "failure", "traceback")):
+            return cleaned[-500:]
+    return None
 
 
 def _local_cli_command(*args: str) -> list[str]:
@@ -365,7 +509,13 @@ def _sweep_stale_runtime_extractions() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _show_status_dialog(runner: LocalRunner, parent: Any | None = None) -> None:
+def _show_status_dialog(
+    runner: LocalRunner,
+    parent: Any | None = None,
+    *,
+    tunnel_runner: LocalRunner | None = None,
+    hosted_tunnel_status: dict[str, str | None] | None = None,
+) -> None:
     import tkinter as tk
     from tkinter import messagebox
 
@@ -376,6 +526,20 @@ def _show_status_dialog(runner: LocalRunner, parent: Any | None = None) -> None:
         f"Uptime: {status.child.uptime_seconds:.0f}s" if status.child.uptime_seconds else "Uptime: -",
         f"Dashboard: {status.local_mcp.state.value} -- {status.local_mcp.detail or '(no detail)'}",
     ]
+    if tunnel_runner is not None:
+        tunnel_status = tunnel_runner.status()
+        tunnel_child = tunnel_status.child
+        tunnel_state = tunnel_child.state.value
+        if hosted_tunnel_status is None:
+            hosted_tunnel_status = _hosted_tunnel_status()
+        lines.extend([
+            f"Tunnel supervisor: {tunnel_state} -- PID {tunnel_child.pid or '-'}",
+            f"Hosted tunnel: {hosted_tunnel_status.get('state') or 'unknown'} -- "
+            f"{hosted_tunnel_status.get('detail') or '(no detail)' }",
+        ])
+        last_error = hosted_tunnel_status.get("last_error") or _last_log_error(tunnel_runner.tail_log())
+        lines.append(f"Last error: {last_error or '(none recorded)'}")
+        lines.append("Diagnostics: open Tunnel diagnostics from the tray menu")
     if status.warnings:
         lines.append("")
         lines.extend(f"Warning: {w}" for w in status.warnings)
@@ -474,6 +638,8 @@ def _run_tray() -> int:
 
     _sweep_stale_runtime_extractions()
     runner = _build_runner()
+    tunnel_runner = _build_tunnel_runner()
+    tunnel_started_here = False
 
     # 4e4c3817 follow-up (owner feedback 2026-09-27): a bare tray icon gives
     # zero visible feedback on launch -- a human who just double-clicked this
@@ -546,7 +712,115 @@ def _run_tray() -> int:
         webbrowser.open(_dashboard_url())
 
     def _show_status(icon: "pystray.Icon", item: Any) -> None:
-        _dispatch_ui(lambda: _show_status_dialog(runner, parent=ui_root))
+        def _collect_and_show() -> None:
+            hosted_status = _hosted_tunnel_status()
+            _dispatch_ui(
+                lambda: _show_status_dialog(
+                    runner,
+                    parent=ui_root,
+                    tunnel_runner=tunnel_runner,
+                    hosted_tunnel_status=hosted_status,
+                )
+            )
+
+        threading.Thread(target=_collect_and_show, daemon=True).start()
+
+    def _choose_and_enable_tunnel() -> None:
+        try:
+            project_root = _choose_project_root(
+                "Choose a local project to share through the Meridian tunnel",
+                parent=ui_root,
+            )
+            if not project_root:
+                return
+            tunnel_runner.command = _tunnel_command(project_root)
+            tunnel_runner.cwd = project_root
+            tunnel_runner.env = _tunnel_env()
+            _start_tunnel_supervisor(reconnect=False)
+        except Exception as exc:  # noqa: BLE001 -- keep the tray available if setup fails
+            _show_error_dialog("Meridian tunnel setup failed", str(exc), parent=ui_root)
+
+    def _start_tunnel_supervisor(*, reconnect: bool) -> None:
+        def _start() -> None:
+            nonlocal tunnel_started_here
+            try:
+                current = tunnel_runner.status()
+                if current.child.state is ChildState.RUNNING:
+                    if not reconnect:
+                        return
+                    tunnel_runner.restart()
+                elif tunnel_runner.command is None:
+                    # A previous run persists its command in LocalRunner's
+                    # scope record. restart() recovers that command; with no
+                    # previous record it raises ValueError and opens the repo
+                    # picker so we never fall back to the home directory.
+                    tunnel_runner.restart()
+                elif reconnect:
+                    tunnel_runner.restart()
+                else:
+                    tunnel_runner.start()
+                tunnel_started_here = True
+            except RunnerAlreadyRunningError:
+                # A sibling tray already owns the same supervisor scope.
+                return
+            except ValueError as exc:
+                if tunnel_runner.command is None:
+                    _dispatch_ui(_choose_and_enable_tunnel)
+                    return
+                _dispatch_ui(
+                    lambda error=exc: _show_error_dialog(
+                        "Meridian tunnel could not start",
+                        str(error),
+                        parent=ui_root,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
+                _dispatch_ui(
+                    lambda error=exc: _show_error_dialog(
+                        "Meridian tunnel could not start", str(error), parent=ui_root,
+                    )
+                )
+
+        threading.Thread(target=_start, daemon=True).start()
+
+    def _enable_tunnel(icon: "pystray.Icon", item: Any) -> None:
+        _start_tunnel_supervisor(reconnect=False)
+
+    def _reconnect_tunnel(icon: "pystray.Icon", item: Any) -> None:
+        _start_tunnel_supervisor(reconnect=True)
+
+    def _disable_tunnel(icon: "pystray.Icon", item: Any) -> None:
+        def _stop() -> None:
+            nonlocal tunnel_started_here
+            try:
+                tunnel_runner.stop()
+                tunnel_started_here = False
+            except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
+                _dispatch_ui(
+                    lambda error=exc: _show_error_dialog(
+                        "Meridian tunnel could not stop", str(error), parent=ui_root,
+                    )
+                )
+
+        threading.Thread(target=_stop, daemon=True).start()
+
+    def _open_tunnel_diagnostics(icon: "pystray.Icon", item: Any) -> None:
+        def _open() -> None:
+            status = _hosted_tunnel_status()
+            url = status.get("diagnostics_url") or status.get("base_url")
+            try:
+                if url:
+                    webbrowser.open(url)
+                else:
+                    raise RuntimeError(status.get("detail") or "no diagnostics URL is available")
+            except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
+                _dispatch_ui(
+                    lambda error=exc: _show_error_dialog(
+                        "Tunnel diagnostics unavailable", str(error), parent=ui_root,
+                    )
+                )
+
+        threading.Thread(target=_open, daemon=True).start()
 
     def _show_logs(icon: "pystray.Icon", item: Any) -> None:
         _dispatch_ui(lambda: _show_logs_window(runner, parent=ui_root))
@@ -608,6 +882,11 @@ def _run_tray() -> int:
         threading.Thread(target=_do_restart, daemon=True).start()
 
     def _quit(icon: "pystray.Icon", item: Any) -> None:
+        if tunnel_started_here:
+            try:
+                tunnel_runner.stop()
+            except Exception:  # noqa: BLE001 -- shutting down must never hang the tray
+                pass
         try:
             runner.stop()
         except Exception:  # noqa: BLE001 -- shutting down must never hang the tray
@@ -622,9 +901,17 @@ def _run_tray() -> int:
         pystray.MenuItem("Catalog local sessions", _catalog_local_sessions),
         pystray.MenuItem("Artifact capture commands", _show_artifact_commands),
     )
+    tunnel_tools = pystray.Menu(
+        pystray.MenuItem("Enable tunnel…", _enable_tunnel),
+        pystray.MenuItem("Status", _show_status),
+        pystray.MenuItem("Reconnect tunnel", _reconnect_tunnel),
+        pystray.MenuItem("Disable tunnel", _disable_tunnel),
+        pystray.MenuItem("Open tunnel diagnostics", _open_tunnel_diagnostics),
+    )
     menu = pystray.Menu(
         pystray.MenuItem("Open Dashboard", _open_dashboard, default=True),
         pystray.MenuItem("Status", _show_status),
+        pystray.MenuItem("Hosted tunnel", tunnel_tools),
         pystray.MenuItem("Local workstation tools", local_tools),
         pystray.MenuItem("Zotero connection…", _configure_zotero),
         pystray.MenuItem("View Logs", _show_logs),
@@ -703,6 +990,17 @@ def _release_windows_tray_lock(handle: Any | None) -> None:
 
 def main(argv: "list[str] | None" = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
+    # A frozen tray build also acts as the tunnel supervisor and its internal
+    # worker. tunnel_main owns restart behavior; these flags only route the
+    # self-relaunches back into that canonical entry point.
+    if argv and argv[0] == _RUN_TUNNEL_FLAG:
+        from .tunnel_main import main as tunnel_main
+
+        return tunnel_main(argv[1:])
+    if argv and argv[0] == _TUNNEL_CHILD_FLAG:
+        from .tunnel_main import main as tunnel_main
+
+        return tunnel_main(argv)
     # The packaged tray executable also exposes offline Meridian maintenance
     # commands such as ``setup``. Route those through the shared CLI dispatcher
     # instead of treating them as tray-only arguments.

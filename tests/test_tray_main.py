@@ -732,6 +732,16 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
     fake_runner = mock.MagicMock()
     fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
     monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    fake_tunnel_runner = mock.MagicMock()
+    monkeypatch.setattr(tray_main, "_build_tunnel_runner", lambda: fake_tunnel_runner)
+    hosted_status = {
+        "state": "disconnected",
+        "detail": "No active hosted tunnel socket is reported.",
+        "last_error": None,
+        "base_url": "https://usemeridian.us",
+        "diagnostics_url": "https://usemeridian.us/tunnel/diagnostics/tenant-123",
+    }
+    monkeypatch.setattr(tray_main, "_hosted_tunnel_status", lambda: hosted_status)
     monkeypatch.setattr(tray_main.webbrowser, "open", mock.Mock())
     monkeypatch.setattr(tray_main.sys, "platform", platform)
 
@@ -790,7 +800,12 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
 
     assert tray_main._run_tray() == 0
 
-    tray_main._show_status_dialog.assert_called_once_with(fake_runner, parent=parent)
+    tray_main._show_status_dialog.assert_called_once_with(
+        fake_runner,
+        parent=parent,
+        tunnel_runner=fake_tunnel_runner,
+        hosted_tunnel_status=hosted_status,
+    )
     tray_main._show_logs_window.assert_called_once_with(fake_runner, parent=parent)
     tray_main.run_zotero_setup_dialog.assert_called_once_with(parent=parent)
     assert tray_main._choose_project_root.call_count == 3
@@ -804,6 +819,94 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
     errors.assert_called_once_with("Meridian restart failed", "restart failed", parent=parent)
     fake_runner.stop.assert_called_once_with()
     fake_icon.stop.assert_called_once_with()
+
+
+def test_run_tray_exposes_hosted_tunnel_enable_reconnect_disable_and_diagnostics(monkeypatch):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    fake_tunnel_runner = mock.MagicMock(command=None)
+    fake_tunnel_runner.status.return_value.child.state = mock.sentinel.not_running
+    fake_tunnel_runner.restart.side_effect = [ValueError("no prior tunnel command"), None]
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main, "_build_tunnel_runner", lambda: fake_tunnel_runner)
+    monkeypatch.setattr(tray_main, "_hosted_tunnel_status", lambda: {
+        "state": "connected",
+        "detail": "active",
+        "last_error": None,
+        "base_url": "https://usemeridian.us",
+        "diagnostics_url": "https://usemeridian.us/tunnel/diagnostics/tenant-123",
+    })
+    monkeypatch.setattr(tray_main, "_choose_project_root", mock.Mock(return_value="C:/work/project"))
+    monkeypatch.setattr(tray_main.webbrowser, "open", mock.Mock())
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+
+    def click_tunnel_actions(*_args):
+        callbacks = {
+            call.args[0]: call.args[1]
+            for call in fake_pystray.MenuItem.call_args_list
+            if isinstance(call.args[0], str)
+        }
+        for label in (
+            "Enable tunnel…", "Reconnect tunnel", "Disable tunnel",
+            "Open tunnel diagnostics", "Quit",
+        ):
+            callbacks[label](fake_icon, None)
+
+    fake_icon.run.side_effect = click_tunnel_actions
+    assert tray_main._run_tray() == 0
+
+    tray_main._choose_project_root.assert_called_once_with(
+        "Choose a local project to share through the Meridian tunnel", parent=None,
+    )
+    assert fake_tunnel_runner.command == [
+        sys.executable,
+        "-m",
+        "meridian.tunnel_main",
+        "--repo",
+        str(Path("C:/work/project").resolve()),
+    ]
+    fake_tunnel_runner.start.assert_called_once_with()
+    assert fake_tunnel_runner.restart.call_args_list == [mock.call(), mock.call()]
+    fake_tunnel_runner.stop.assert_called_once_with()
+    tray_main.webbrowser.open.assert_any_call("https://usemeridian.us/tunnel/diagnostics/tenant-123")
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_tunnel_command_uses_the_supervised_entrypoint(monkeypatch, tmp_path, frozen):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(tray_main.sys, "frozen", frozen, raising=False)
+    command = tray_main._tunnel_command(str(project))
+    prefix = [sys.executable, "--run-tunnel"] if frozen else [
+        sys.executable, "-m", "meridian.tunnel_main",
+    ]
+    assert command == [*prefix, "--repo", str(project.resolve())]
+
+
+@pytest.mark.parametrize(
+    ("argv", "forwarded"),
+    [
+        (["--run-tunnel", "--repo", "C:/work/project"], ["--repo", "C:/work/project"]),
+        (["--_tunnel-child", "--repo", "C:/work/project"], ["--_tunnel-child", "--repo", "C:/work/project"]),
+    ],
+)
+def test_frozen_tunnel_flags_dispatch_to_tunnel_main(monkeypatch, argv, forwarded):
+    from types import SimpleNamespace
+
+    tunnel_main = mock.Mock(return_value=7)
+    monkeypatch.setitem(sys.modules, "meridian.tunnel_main", SimpleNamespace(main=tunnel_main))
+    assert tray_main.main(argv) == 7
+    tunnel_main.assert_called_once_with(forwarded)
 
 
 def test_tk_ui_dispatcher_keeps_rescheduling_after_callback_error():
@@ -1053,11 +1156,82 @@ def test_show_status_dialog_reads_runner_status_without_raising(monkeypatch):
     status.warnings = ()
     runner.status.return_value = status
 
-    tray_main._show_status_dialog(runner)
+    tunnel_runner = mock.MagicMock()
+    tunnel_status = mock.MagicMock()
+    tunnel_status.child.state.value = "running"
+    tunnel_status.child.pid = 5678
+    tunnel_runner.status.return_value = tunnel_status
+    hosted_status = {
+        "state": "connected",
+        "detail": "Hosted diagnostics report an active tunnel.",
+        "last_error": "filesystem: previous proxy error",
+    }
+
+    tray_main._show_status_dialog(
+        runner,
+        tunnel_runner=tunnel_runner,
+        hosted_tunnel_status=hosted_status,
+    )
     assert fake_messagebox.showinfo.called
     title, message = fake_messagebox.showinfo.call_args[0][:2]
     assert "running" in message
     assert "1234" in message
+    assert "Hosted tunnel: connected" in message
+    assert "Tunnel supervisor: running" in message
+    assert "Last error: filesystem: previous proxy error" in message
+
+
+def test_hosted_tunnel_status_uses_the_authenticated_hosted_diagnostics(monkeypatch):
+    import json
+
+    from meridian import tunnel_client
+
+    monkeypatch.setattr(tunnel_client, "_resolve_base_url", lambda: "https://example.test")
+    monkeypatch.setattr(tunnel_client, "_resolve_token", lambda: "test-token")
+    monkeypatch.setattr(tunnel_client, "_read_cached_token", lambda _base_url: None)
+    payloads = iter([
+        {"tenant_id": "tenant-123"},
+        {
+            "tunnel_process": {"any_active": True},
+            "slots": {"filesystem": {"last_error": "proxy start failed"}},
+        },
+    ])
+    requests = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(request)
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(next(payloads)).encode("utf-8")
+        response.__enter__.return_value = response
+        return response
+
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", fake_urlopen)
+    result = tray_main._hosted_tunnel_status()
+
+    assert result["state"] == "connected"
+    assert result["last_error"] == "filesystem: proxy start failed"
+    assert result["diagnostics_url"] == "https://example.test/tunnel/diagnostics/tenant-123"
+    assert [request.full_url for request in requests] == [
+        "https://example.test/me",
+        "https://example.test/tunnel/diagnostics/tenant-123",
+    ]
+    assert all(request.get_header("Authorization") == "Bearer test-token" for request in requests)
+
+
+def test_hosted_tunnel_status_reports_missing_auth_without_network_calls(monkeypatch):
+    from meridian import tunnel_client
+
+    monkeypatch.setattr(tunnel_client, "_resolve_base_url", lambda: "https://example.test")
+    monkeypatch.setattr(tunnel_client, "_resolve_token", lambda: "")
+    monkeypatch.setattr(tunnel_client, "_read_cached_token", lambda _base_url: None)
+    network = mock.Mock(side_effect=AssertionError("must not contact hosted service without a token"))
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", network)
+
+    result = tray_main._hosted_tunnel_status()
+
+    assert result["state"] == "not signed in"
+    assert result["base_url"] == "https://example.test"
+    network.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
