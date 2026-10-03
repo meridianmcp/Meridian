@@ -197,11 +197,11 @@ def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
         return loop
 
 
-_SUBCOMMANDS = ("artifacts", "doctor", "hooks", "memory", "recovery", "setup")
+_SUBCOMMANDS = ("artifacts", "doctor", "hooks", "memory", "recovery", "setup", "zotero")
 
 
 def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
-    """Offline maintenance subcommands (55d48d69), dispatched BEFORE the
+    """Local maintenance subcommands (55d48d69), dispatched BEFORE the
     server/--mcp/--tunnel argparse so none of those flags (or MERIDIAN_HOST /
     MERIDIAN_PORT defaults) are consulted, no port is killed and no server is
     started:
@@ -219,6 +219,8 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
       write a selected-session context pack into host-local application data.
     * ``artifacts configure|capture|restore|export|purge`` -- manage opted-in,
       local-only provider output capture and verification.
+    * ``zotero sync`` -- run one bounded workstation sync of hosted citation
+      markers through authenticated MCP calls; no background loop is started.
 
     Returns the exit code, or ``None`` when ``raw_argv`` is not a subcommand.
     """
@@ -244,6 +246,10 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
         from .artifact_capture import cli_main as _artifact_cli
 
         return _artifact_cli(raw_argv[1:])
+    if raw_argv[0] == "zotero":
+        from .zotero_sync import cli_main as _zotero_cli
+
+        return _zotero_cli(raw_argv[1:])
     from .memory_import import cli_main as _memory_cli
 
     return _memory_cli(raw_argv[1:])

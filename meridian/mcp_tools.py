@@ -1341,6 +1341,36 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally."},
          "max_items": {"type": "integer", "description": "Cap how many unresolved markers to attempt this pass. Omit to attempt all."}},
          "required": []}},
+    {"name": "get_pending_zotero_citations", "description":
+        "Read a bounded, deterministic page of this project's citation markers "
+        "that do not yet have a Zotero edge. Intended for a workstation with "
+        "Zotero Desktop running locally; hosted Meridian does not contact the "
+        "workstation's Zotero API.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "max_items": {"type": "integer", "minimum": 1, "maximum": 500}},
+         "required": ["project_id"]}},
+    {"name": "apply_zotero_citation_edges", "description":
+        "Apply workstation-resolved Zotero items to existing citation markers. "
+        "The hosted handler revalidates every marker id/ref within project_id "
+        "before writing through DocStore. This accepts no attachment bytes, "
+        "local paths, or credentials; attachment provenance stays local.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "selected_collection_keys": {"type": "array", "maxItems": 100,
+             "items": {"type": "string"}},
+         "resolutions": {"type": "array", "maxItems": 500, "items": {
+             "type": "object", "additionalProperties": False,
+             "properties": {
+                 "element_id": {"type": "string"},
+                 "ref": {"type": "string"},
+                 "zotero_key": {"type": "string"},
+                 "doi": {"type": ["string", "null"]},
+                 "title": {"type": ["string", "null"]},
+                 "version": {"type": ["integer", "null"]},
+                 "collection_keys": {"type": "array", "items": {"type": "string"}}},
+             "required": ["element_id", "ref", "zotero_key"]}}},
+         "required": ["project_id", "resolutions"]}},
     {"name": "index_equation", "description":
         "06df6ab3 — index ONE Word equation (OMML) against a document already "
         "stored in the doc-structure store — populated by ingest_document (which "
@@ -4747,6 +4777,7 @@ _READ_ONLY_TOOLS = {
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "list_active_worktrees", "list_worktrees_pending_cleanup",
     "get_citation_edges",
+    "get_pending_zotero_citations",
     "find_similar_equation", "find_symbol_usages",
     "find_similar_figure",
     "find_similar_table",
@@ -4997,6 +5028,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_latex_structure":    "docx",
     "get_citation_edges":     "docx",
     "resolve_citations":      "docx",
+    "get_pending_zotero_citations": "docx",
+    "apply_zotero_citation_edges": "docx",
     "index_equation":         "docx",
     "find_similar_equation":  "docx",
     "insert_equation":        "docx",
@@ -5331,6 +5364,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_latex_structure":       "both",
     "get_citation_edges":        "both",
     "resolve_citations":         "both",
+    "get_pending_zotero_citations": "both",
+    "apply_zotero_citation_edges": "executor",
     "find_similar_equation":     "both",
     "find_symbol_usages":        "both",
     "find_similar_figure":       "both",
@@ -5607,6 +5642,8 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "find_orphaned_docx_staged_files": "maintenance-only",
     "get_citation_edges":         "maintenance-only",
     "resolve_citations":          "maintenance-only",
+    "get_pending_zotero_citations": "maintenance-only",
+    "apply_zotero_citation_edges": "maintenance-only",
     "link_flag_to_section":       "maintenance-only",
     "get_flag_drift":             "maintenance-only",
     # W1-K — derivative-document provenance: docx write-back family, same

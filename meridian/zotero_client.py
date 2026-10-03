@@ -229,6 +229,126 @@ async def _resolve_zotero_key(
     return _normalize_item(body)
 
 
+_ZOTERO_ITEM_KEY_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+
+
+def _valid_zotero_item_key(key: Any) -> bool:
+    return isinstance(key, str) and _ZOTERO_ITEM_KEY_RE.fullmatch(key) is not None
+
+
+async def fetch_zotero_item_details(
+    key: str,
+    *,
+    base_url: str | None = None,
+    client: Any = None,
+) -> dict[str, Any] | None:
+    """Fetch local-only Zotero provenance for one item key.
+
+    This deliberately returns only scalar metadata and collection keys; the
+    local attachment path remains local to the caller and must never be sent
+    to hosted Meridian.
+    """
+    if not _valid_zotero_item_key(key):
+        return None
+    base = _base_url(base_url)
+
+    async def _fetch(c: Any) -> dict[str, Any] | None:
+        body = await _get_json(
+            c,
+            f"{base}/users/{_LOCAL_USER_ID}/items/{key}",
+            {"format": "json"},
+        )
+        if isinstance(body, list):
+            body = body[0] if body else None
+        normalized = _normalize_item(body)
+        if normalized is None or not isinstance(body, dict):
+            return None
+        data = body.get("data")
+        data = data if isinstance(data, dict) else {}
+        collections = data.get("collections")
+        collection_keys = sorted({
+            value.strip().upper()
+            for value in collections
+            if isinstance(value, str) and _valid_zotero_item_key(value.strip())
+        }) if isinstance(collections, list) else []
+        version = body.get("version")
+        return {
+            **normalized,
+            "version": version if isinstance(version, int) and version >= 0 else None,
+            "collection_keys": collection_keys,
+            "parent_key": data.get("parentItem") if _valid_zotero_item_key(data.get("parentItem")) else None,
+            "path": data.get("path") if isinstance(data.get("path"), str) else None,
+            "filename": data.get("filename") if isinstance(data.get("filename"), str) else None,
+            "content_type": data.get("contentType") if isinstance(data.get("contentType"), str) else None,
+        }
+
+    try:
+        if client is not None:
+            return await _fetch(client)
+        import httpx  # noqa: PLC0415 — optional, imported lazily
+
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as owned:
+            return await _fetch(owned)
+    except Exception:  # noqa: BLE001 — provenance is best-effort
+        _log.debug("zotero item metadata lookup failed for key=%s", key, exc_info=True)
+        return None
+
+
+async def list_zotero_item_attachments(
+    parent_key: str,
+    *,
+    base_url: str | None = None,
+    client: Any = None,
+) -> list[dict[str, Any]]:
+    """List local Zotero attachment metadata for one parent item.
+
+    The result contains no file bytes. ``path`` is a workstation-local Zotero
+    path and must only be used locally for integrity registration.
+    """
+    if not _valid_zotero_item_key(parent_key):
+        return []
+    base = _base_url(base_url)
+
+    async def _fetch(c: Any) -> list[dict[str, Any]]:
+        body = await _get_json(
+            c,
+            f"{base}/users/{_LOCAL_USER_ID}/items/{parent_key}/children",
+            {"format": "json", "limit": 100},
+        )
+        if not isinstance(body, list):
+            return []
+        attachments: list[dict[str, Any]] = []
+        for item in body:
+            if not isinstance(item, dict):
+                continue
+            data = item.get("data")
+            data = data if isinstance(data, dict) else {}
+            key = item.get("key") or data.get("key")
+            if data.get("itemType") != "attachment" or not _valid_zotero_item_key(key):
+                continue
+            version = item.get("version")
+            attachments.append({
+                "zotero_key": key,
+                "parent_key": parent_key,
+                "version": version if isinstance(version, int) and version >= 0 else None,
+                "path": data.get("path") if isinstance(data.get("path"), str) else None,
+                "filename": data.get("filename") if isinstance(data.get("filename"), str) else None,
+                "content_type": data.get("contentType") if isinstance(data.get("contentType"), str) else None,
+            })
+        return attachments
+
+    try:
+        if client is not None:
+            return await _fetch(client)
+        import httpx  # noqa: PLC0415 — optional, imported lazily
+
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as owned:
+            return await _fetch(owned)
+    except Exception:  # noqa: BLE001 — attachment metadata is best-effort
+        _log.debug("zotero child item lookup failed for key=%s", parent_key, exc_info=True)
+        return []
+
+
 async def _resolve_doi(
     client: Any, base: str, doi: str
 ) -> dict[str, Any] | None:

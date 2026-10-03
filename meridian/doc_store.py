@@ -2878,7 +2878,7 @@ class DocStructureStore:
     # -- cross-document resolution (opt-in, network) -------------------------
 
     async def _citation_elements_needing_zotero(
-        self, project_id: str
+        self, project_id: str, *, max_items: int | None = None
     ) -> list[dict[str, Any]]:
         """Return this project's ``kind='citation'`` elements with a non-blank
         ``ref`` that do NOT already carry a resolved ``zotero_item`` edge.
@@ -2903,7 +2903,11 @@ class DocStructureStore:
             ") "
             "ORDER BY e.document_id ASC, e.ordinal ASC, e.id ASC"
         )
-        async with self._db.execute(sql, (project_id,)) as cur:
+        params: tuple[Any, ...] = (project_id,)
+        if isinstance(max_items, int) and not isinstance(max_items, bool) and max_items >= 0:
+            sql += " LIMIT ?"
+            params += (max_items,)
+        async with self._db.execute(sql, params) as cur:
             rows = await cur.fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -2916,6 +2920,21 @@ class DocStructureStore:
                 }
             )
         return out
+
+    async def get_pending_zotero_citations(
+        self, project_id: str, *, max_items: int = 100
+    ) -> dict[str, Any]:
+        """Return a bounded, deterministic page of unresolved citation markers."""
+        if not isinstance(max_items, int) or isinstance(max_items, bool) or max_items < 1:
+            raise ValueError("max_items must be a positive integer")
+        pending = await self._citation_elements_needing_zotero(
+            project_id, max_items=max_items + 1,
+        )
+        return {
+            "markers": pending[:max_items],
+            "has_more": len(pending) > max_items,
+            "max_items": max_items,
+        }
 
     async def _find_document_for_doi(
         self, project_id: str, doi: str, title: str | None
@@ -3010,9 +3029,9 @@ class DocStructureStore:
 
         Returns ``{"resolved", "unresolved", "cross_doc_linked"}`` counts.
         """
-        pending = await self._citation_elements_needing_zotero(project_id)
-        if isinstance(max_items, int) and max_items >= 0:
-            pending = pending[:max_items]
+        pending = await self._citation_elements_needing_zotero(
+            project_id, max_items=max_items,
+        )
 
         resolved = 0
         unresolved = 0
@@ -3073,6 +3092,160 @@ class DocStructureStore:
             "resolved": resolved,
             "unresolved": unresolved,
             "cross_doc_linked": cross_doc_linked,
+        }
+
+    async def apply_resolved_zotero_edges(
+        self,
+        project_id: str,
+        resolutions: list[dict[str, Any]],
+        *,
+        max_items: int = 500,
+    ) -> dict[str, int]:
+        """Apply local workstation resolutions to this project's markers.
+
+        Every result is rebound to a citation marker in ``project_id`` and its
+        exact current ``ref`` before a ``doc_edges`` row is written. The
+        workstation never receives a database handle; hosted callers provide
+        only the marker id/ref and normalized Zotero item identity.
+        """
+        if not isinstance(resolutions, list) or len(resolutions) > max_items:
+            raise ValueError(f"resolutions must contain at most {max_items} items")
+        if not resolutions:
+            return {
+                "applied": 0,
+                "cross_doc_linked": 0,
+                "stale": 0,
+                "already_resolved": 0,
+                "rejected": 0,
+            }
+
+        ids = list(dict.fromkeys(
+            value.get("element_id")
+            for value in resolutions
+            if isinstance(value, dict)
+            and isinstance(value.get("element_id"), str)
+            and value["element_id"].strip()
+        ))
+        if not ids:
+            return {
+                "applied": 0,
+                "cross_doc_linked": 0,
+                "stale": 0,
+                "already_resolved": 0,
+                "rejected": len(resolutions),
+            }
+
+        placeholders = ", ".join("?" for _ in ids)
+        marker_sql = (
+            "SELECT e.id AS id, e.ref AS ref "
+            "FROM doc_elements e "
+            "JOIN doc_documents d ON d.id = e.document_id "
+            f"WHERE d.project_id = ? AND e.kind = 'citation' AND e.id IN ({placeholders})"
+        )
+        async with self._db.execute(marker_sql, (project_id, *ids)) as cur:
+            marker_rows = await cur.fetchall()
+        markers = {
+            _row_get(row, "id"): _row_get(row, "ref")
+            for row in marker_rows
+        }
+
+        edge_sql = (
+            "SELECT source_element_id FROM doc_edges "
+            "WHERE project_id = ? AND target_kind = 'zotero_item' "
+            f"AND source_element_id IN ({placeholders})"
+        )
+        async with self._db.execute(edge_sql, (project_id, *ids)) as cur:
+            edge_rows = await cur.fetchall()
+        already_linked = {
+            _row_get(row, "source_element_id") for row in edge_rows
+        }
+
+        applied = cross_doc_linked = stale = already_resolved = rejected = 0
+        seen: set[str] = set()
+        for result in resolutions:
+            if not isinstance(result, dict):
+                rejected += 1
+                continue
+            element_id = result.get("element_id")
+            ref = result.get("ref")
+            key = result.get("zotero_key")
+            if (
+                not isinstance(element_id, str)
+                or not element_id.strip()
+                or element_id in seen
+                or not isinstance(ref, str)
+                or len(ref) > 500
+                or not isinstance(key, str)
+                or len(key) != 8
+                or not key.isalnum()
+            ):
+                rejected += 1
+                continue
+            seen.add(element_id)
+            current_ref = markers.get(element_id)
+            if current_ref is None or current_ref != ref:
+                stale += 1
+                continue
+            if element_id in already_linked:
+                already_resolved += 1
+                continue
+
+            doi_value = result.get("doi")
+            doi = doi_value.strip() if isinstance(doi_value, str) else ""
+            if len(doi) > 500 or (doi and not all(char.isprintable() for char in doi)):
+                rejected += 1
+                continue
+            doi = doi or None
+            title_value = result.get("title")
+            title = title_value.strip() if isinstance(title_value, str) else None
+            if title is not None and (len(title) > 1000 or not all(char.isprintable() for char in title)):
+                rejected += 1
+                continue
+            target_ref = doi if doi else f"zotero:{key}"
+            target_document_id: str | None = None
+            if doi:
+                target_document_id = await self._find_document_for_doi(
+                    project_id, doi, title
+                )
+            now = _now_iso()
+            try:
+                await self._db.execute(
+                    "INSERT INTO doc_edges "
+                    "(id, project_id, source_element_id, edge_kind, target_kind, "
+                    "target_ref, target_element_id, target_document_id, "
+                    "resolved_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        uuid.uuid4().hex,
+                        project_id,
+                        element_id,
+                        "cites",
+                        "zotero_item",
+                        target_ref,
+                        None,
+                        target_document_id,
+                        now,
+                        now,
+                    ),
+                )
+                await self._db.commit()
+            except Exception:  # noqa: BLE001 — one marker must not abort a batch
+                _log.debug(
+                    "local Zotero edge write failed for element=%s", element_id,
+                    exc_info=True,
+                )
+                rejected += 1
+                continue
+            applied += 1
+            if target_document_id is not None:
+                cross_doc_linked += 1
+
+        return {
+            "applied": applied,
+            "cross_doc_linked": cross_doc_linked,
+            "stale": stale,
+            "already_resolved": already_resolved,
+            "rejected": rejected,
         }
 
     # -- read ----------------------------------------------------------------

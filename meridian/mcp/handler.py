@@ -7285,6 +7285,29 @@ async def _resolve_project_reference(
     return {**args, "project_id": _resolved[0][2]}
 
 
+async def _handle_zotero_sync(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch workstation-originated Zotero citation sync tools."""
+    from .handlers.zotero_sync import (  # noqa: PLC0415
+        handle_apply_zotero_citation_edges,
+        handle_get_pending_zotero_citations,
+    )
+
+    handler = {
+        "get_pending_zotero_citations": handle_get_pending_zotero_citations,
+        "apply_zotero_citation_edges": handle_apply_zotero_citation_edges,
+    }.get(name)
+    if handler is None:
+        return _MISS
+    return await handler(args, db, data_dir, tenant, _mcp_tenant_id)
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -7344,6 +7367,7 @@ async def _dispatch_mcp_tool(
         _handle_project_tools,
         _handle_task_tools,
         _handle_notes_decisions,
+        _handle_zotero_sync,
         _handle_hitl_tools,
         _handle_session_tools,
         _handle_sprint_tools,
