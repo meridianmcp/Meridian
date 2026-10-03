@@ -511,17 +511,22 @@ def test_get_tunnel_filesystem_roots_no_tenant_returns_empty(monkeypatch):
     }
 
 
-def test_fetch_filesystem_roots_parses_new_fields(monkeypatch):
-    """b970fe07 — the client fetch returns the 4-tuple, parsing/sanitising the
-    two new fields from the route JSON."""
+def test_fetch_filesystem_roots_parses_new_fields(monkeypatch, tmp_path):
+    """Remote root aliases collapse to one canonical identity for all slots."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    alias = alias_parent / ".." / "repo"
+
     class _FakeResp:
         status_code = 200
         def json(self):
             return {
-                "filesystem_roots": ["/a", " ", 5],
-                "known_repo_paths": ["/repo"],
-                "serena_repo_path": "  /serena  ",
-                "codebase_code_dirs": ["/c1", "", "/c2 "],
+                "filesystem_roots": [str(alias), str(root), " ", 5],
+                "known_repo_paths": [str(root)],
+                "serena_repo_path": f"  {alias}  ",
+                "codebase_code_dirs": [str(alias), "", str(root)],
             }
 
     class _FakeClient:
@@ -535,10 +540,13 @@ def test_fetch_filesystem_roots_parses_new_fields(monkeypatch):
     fs, known, serena, code = asyncio.run(
         tc._fetch_filesystem_roots("https://x", "sk_tok")
     )
-    assert fs == ["/a"]
-    assert known == ["/repo"]
-    assert serena == "/serena"
-    assert code == ["/c1", "/c2"]
+    canonical = tc.os.path.normcase(
+        tc.os.path.realpath(tc.os.path.abspath(str(root)))
+    )
+    assert fs == [canonical]
+    assert known == [canonical]
+    assert serena == canonical
+    assert code == [canonical]
 
 
 def test_fetch_filesystem_roots_defaults_on_error(monkeypatch):

@@ -1,4 +1,4 @@
-﻿"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
+"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
 
 from __future__ import annotations
 
@@ -12278,25 +12278,61 @@ def test_delete_pinned_decision_http(client):
 
 
 def test_hooks_session_start_and_stop(client):
-    """POST /hooks/session-start returns hookSpecificOutput; /hooks/stop returns ok."""
+    """The host hook receives Meridian's id separately from its own session id."""
     project = client.post("/projects", json={"name": "v29-hooks-test"}).json()
     r = client.post("/hooks/session-start", json={"project_id": project["id"]})
     assert r.status_code == 200
     body = r.json()
     assert "hookSpecificOutput" in body
-    assert "hookEventName" in body["hookSpecificOutput"]
     assert body["hookSpecificOutput"]["hookEventName"] == "SessionStart"
     assert project["name"] in body["hookSpecificOutput"]["additionalContext"]
-    # Stop hook — uses session_id from start result
-    additional = body["hookSpecificOutput"]["additionalContext"]
-    session_id = None
-    for line in additional.splitlines():
-        if line.startswith("SESSION ID:"):
-            session_id = line.split(":", 1)[1].strip()
-            break
-    r = client.post("/hooks/stop", json={"project_id": project["id"], "session_id": session_id})
+    meridian_session_id = body["meridian_session_id"]
+    assert meridian_session_id
+    assert f"SESSION ID: {meridian_session_id}" in body["hookSpecificOutput"]["additionalContext"]
+    r = client.post(
+        "/hooks/stop",
+        json={"project_id": project["id"], "session_id": meridian_session_id},
+    )
     assert r.status_code == 200
     assert r.json()["ok"] is True
+
+
+def test_compact_hook_loads_persisted_handoff_without_consuming_it(client):
+    project = client.post("/projects", json={"name": "compact-handoff-test"}).json()
+    started = client.post(
+        "/hooks/session-start",
+        json={
+            "project_id": project["id"],
+            "session_name": "claude-hook-compact-handoff-test",
+            "source": "startup",
+            "mode": "continue",
+        },
+    )
+    assert started.status_code == 200
+    meridian_session_id = started.json()["meridian_session_id"]
+    assert meridian_session_id
+
+    generated = client.post(
+        f"/projects/{project['id']}/handoff",
+        json={"mode": "full", "session_id": meridian_session_id},
+    )
+    assert generated.status_code == 200
+    assert generated.json().get("content")
+
+    body = {
+        "project_id": project["id"],
+        "session_name": "claude-hook-compact-handoff-test",
+        "source": "compact",
+        "mode": "continue",
+    }
+    first = client.post("/hooks/session-start", json=body)
+    second = client.post("/hooks/session-start", json=body)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["meridian_session_id"] == meridian_session_id
+    assert second.json()["meridian_session_id"] == meridian_session_id
+    for response in (first, second):
+        context = response.json()["hookSpecificOutput"]["additionalContext"]
+        assert "[Meridian load_handoff: stored project handoff follows." in context
 
 
 def _session_id_from_start(start_json: dict) -> str | None:

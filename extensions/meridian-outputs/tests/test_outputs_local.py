@@ -8433,6 +8433,95 @@ def test_run_ripgrep_returns_none_when_binary_missing(tmp_path: Path, monkeypatc
     ) is None
 
 
+
+class TestCanonicalScopeIdentity:
+    def test_convergence_snapshot_includes_canonical_root_scope(self, tmp_path):
+        from meridian_outputs import outputs_local
+
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        index = outputs_local.OutputsFtsIndex(str(outputs_dir))
+        try:
+            state = index.get_convergence_state()
+            expected_root = str(outputs_dir.resolve()).casefold()
+            assert state.canonical_root.casefold() == expected_root
+            assert state.canonical_scope.casefold() == expected_root
+            assert state.scope_id == f"outputs:{state.canonical_root}::{state.canonical_scope}"
+        finally:
+            index.close()
+
+    def test_subtree_alias_resolves_to_the_canonical_scope(self, tmp_path):
+        from meridian_outputs import outputs_local
+
+        root = tmp_path / "outputs"
+        subtree = root / "group"
+        alias_parent = root / "alias"
+        subtree.mkdir(parents=True)
+        alias_parent.mkdir()
+        alias_path = alias_parent / ".." / "group"
+
+        index = outputs_local.get_subtree_index(str(root), str(alias_path))
+        try:
+            state = index.get_convergence_state()
+            assert state.canonical_root.casefold() == str(subtree.resolve()).casefold()
+            assert state.canonical_scope.casefold() == state.canonical_root.casefold()
+            assert state.scope_id.startswith("outputs:")
+        finally:
+            index.close()
+
+    def test_realpath_alias_reuses_canonical_cached_index(self, monkeypatch, tmp_path):
+        import os
+        from meridian_outputs import outputs_local
+
+        root = tmp_path / "outputs"
+        subtree = root / "group"
+        alias = root / "alias"
+        subtree.mkdir(parents=True)
+        alias.mkdir()
+        actual_realpath = os.path.realpath
+        alias_abs = os.path.abspath(str(alias))
+        target_abs = actual_realpath(str(subtree))
+
+        def resolve_alias(path):
+            if os.path.abspath(str(path)) == alias_abs:
+                return target_abs
+            return actual_realpath(path)
+
+        monkeypatch.setattr(outputs_local.os.path, "realpath", resolve_alias)
+        direct = outputs_local.get_subtree_index(str(root), str(subtree))
+        via_alias = outputs_local.get_subtree_index(str(root), str(alias))
+        try:
+            assert via_alias is direct
+            state = via_alias.get_convergence_state()
+            assert state.canonical_root.casefold() == target_abs.casefold()
+            assert state.scope_id.startswith("outputs:")
+        finally:
+            direct.close()
+
+    def test_symlink_subtree_alias_reuses_canonical_index(self, tmp_path):
+        import pytest
+        from meridian_outputs import outputs_local
+
+        root = tmp_path / "outputs"
+        subtree = root / "group"
+        subtree.mkdir(parents=True)
+        alias = root / "alias"
+        try:
+            alias.symlink_to(subtree, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+
+        direct = outputs_local.get_subtree_index(str(root), str(subtree))
+        via_alias = outputs_local.get_subtree_index(str(root), str(alias))
+        try:
+            assert via_alias is direct
+            state = via_alias.get_convergence_state()
+            assert state.canonical_root.casefold() == str(subtree.resolve()).casefold()
+            assert state.scope_id.startswith("outputs:")
+        finally:
+            direct.close()
+
+
 class TestSearchLogs:
     """Module-level API -- what server.py's search_logs MCP tool calls."""
 

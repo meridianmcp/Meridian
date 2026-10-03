@@ -61,13 +61,19 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import re
+import shutil
 import sys
 import time
+import tomllib
+import urllib.error
+import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 # Re-exported, not re-defined: this module's reports use the EXACT same
 # {name, severity, detail} / {scope, generated_at, healthy, checks} shape
@@ -90,6 +96,8 @@ __all__ = [
     "find_duplicate_registrations",
     "check_mcp_tool_manifest_tax",
     "run_doctor_checks",
+    "diagnose",
+    "cli_main",
 ]
 
 # ---------------------------------------------------------------------------
@@ -495,6 +503,387 @@ def run_doctor_checks(
     else:
         checks = check_mcp_tool_manifest_tax(mcp_manifest_snapshot, clock=clock).checks
     return DoctorReport(scope="meridian-doctor", generated_at=clock(), checks=checks)
+
+
+# ---------------------------------------------------------------------------
+# Local setup/runtime doctor -- ``meridian doctor``
+# ---------------------------------------------------------------------------
+
+
+def _setup_check(name: str, severity: str, detail: str) -> DoctorCheck:
+    return DoctorCheck(name=name, severity=severity, detail=detail)
+
+
+def _setup_config_path(repo: Path, host: str) -> tuple[Path, str]:
+    if host == "claude-code":
+        return repo / ".mcp.json", "json"
+    if host == "codex":
+        return repo / ".codex" / "config.toml", "toml"
+    if host == "cursor":
+        return repo / ".cursor" / "mcp.json", "json"
+    return _setup_bundle()._desktop_config_path(), "json"
+
+
+def _setup_bundle():
+    # Lazy import keeps the original standalone manifest-snapshot doctor
+    # independent of setup dependencies unless the new CLI is invoked.
+    from . import setup_bundle
+
+    return setup_bundle
+
+
+def _setup_read_config(path: Path, kind: str) -> dict[str, Any]:
+    raw = path.read_text(encoding="utf-8-sig")
+    value = json.loads(raw) if kind == "json" else tomllib.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("the root value must be an object/table")
+    return value
+
+
+def _setup_server_map(config: dict[str, Any], host: str) -> dict[str, Any]:
+    key = "mcp_servers" if host == "codex" else "mcpServers"
+    servers = config.get(key, {})
+    if not isinstance(servers, dict):
+        raise ValueError(f"{key} must be an object/table")
+    return servers
+
+
+def _setup_runtimes(entry: dict[str, Any]) -> set[str]:
+    values: list[str] = []
+    command = entry.get("command")
+    args = entry.get("args", [])
+    if isinstance(command, str):
+        values.append(command.lower())
+    if isinstance(args, list):
+        values.extend(arg.lower() for arg in args if isinstance(arg, str))
+    runtimes: set[str] = set()
+    for runtime in ("npx", "uvx", "meridian"):
+        if any(
+            value == runtime
+            or value.endswith("/" + runtime)
+            or value.endswith("\\" + runtime)
+            for value in values
+        ):
+            runtimes.add(runtime)
+    return runtimes
+
+
+def _setup_endpoint(entry: dict[str, Any]) -> str | None:
+    value = entry.get("url")
+    if isinstance(value, str) and value.startswith(("https://", "http://")):
+        return value
+    args = entry.get("args", [])
+    if isinstance(args, list):
+        for arg in args:
+            if isinstance(arg, str) and arg.startswith(("https://", "http://")):
+                return arg
+    return None
+
+
+class _SetupNoRedirect(urllib.request.HTTPRedirectHandler):
+    """Prevent forwarding the bearer token to a redirected host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _setup_request_status(request: urllib.request.Request, timeout: float) -> int:
+    opener = urllib.request.build_opener(_SetupNoRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+
+
+def _setup_health_url(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/mcp"):
+        path = path[:-4]
+    return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/health", "", ""))
+
+
+def _setup_hosted_checks(endpoint: str, timeout: float, no_network: bool) -> list[DoctorCheck]:
+    if no_network:
+        return [_setup_check("hosted_meridian.network", "warn", "Network checks skipped by --no-network.")]
+    health_url = _setup_health_url(endpoint)
+    try:
+        health_status = _setup_request_status(urllib.request.Request(health_url), timeout)
+    except (OSError, TimeoutError, urllib.error.URLError) as exc:
+        reason = "timed out" if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower() else "could not connect"
+        return [_setup_check(
+            "hosted_meridian.health", "fail",
+            f"{reason} at {health_url}; check connectivity and the configured Meridian URL.",
+        )]
+    if health_status != 200:
+        return [_setup_check(
+            "hosted_meridian.health", "fail",
+            f"HTTP {health_status} from {health_url}; check the configured Meridian URL and service status.",
+        )]
+
+    checks = [_setup_check("hosted_meridian.health", "ok", f"HTTP 200 from {health_url}.")]
+    token = os.environ.get("BEARER_TOKEN")
+    if not token:
+        checks.append(_setup_check(
+            "hosted_meridian.auth", "warn",
+            "BEARER_TOKEN is not set in this process, so auth was not tested. Set it in the MCP host environment and restart that host.",
+        ))
+        return checks
+    payload = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "meridian-doctor", "version": "1"},
+        },
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint, data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+        method="POST",
+    )
+    try:
+        status = _setup_request_status(request, timeout)
+    except (OSError, TimeoutError, urllib.error.URLError) as exc:
+        reason = "timed out" if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower() else "could not connect"
+        checks.append(_setup_check(
+            "hosted_meridian.auth", "fail",
+            f"MCP initialize {reason}; confirm the service and host network are available.",
+        ))
+    else:
+        if status in (200, 202):
+            checks.append(_setup_check(
+                "hosted_meridian.auth", "ok",
+                f"MCP initialize accepted (HTTP {status}); token value was not displayed.",
+            ))
+        elif status in (401, 403):
+            checks.append(_setup_check(
+                "hosted_meridian.auth", "fail",
+                f"MCP initialize returned HTTP {status}; refresh the host's BEARER_TOKEN and restart it.",
+            ))
+        else:
+            checks.append(_setup_check(
+                "hosted_meridian.auth", "fail",
+                f"MCP initialize returned HTTP {status}; verify the configured MCP endpoint.",
+            ))
+    return checks
+
+
+def diagnose(
+    repos: list[Path],
+    hosts: list[str],
+    *,
+    timeout: float = 3.0,
+    no_network: bool = False,
+    tunnel_port: int = 8808,
+    clock: Callable[[], float] = time.time,
+) -> DoctorReport:
+    """Check configured hosts, their repo routing, launch runtimes and tunnel.
+
+    Configuration is only read. Hosted Meridian gets a bounded ``/health``
+    request and, when ``BEARER_TOKEN`` is present, one authenticated MCP
+    initialize request. Helper packages and Codebase Memory index freshness
+    cannot be confirmed without launching those child servers, so the report
+    states that limit directly instead of changing package caches or indexes.
+    """
+    setup_bundle = _setup_bundle()
+    checks: list[DoctorCheck] = []
+    desktop_config: dict[str, Any] | None = None
+    desktop_error: str | None = None
+    desktop_path = setup_bundle._desktop_config_path()
+    missing_runtimes: set[str] = set()
+    hosted_endpoints: set[str] = set()
+    for repo in repos:
+        if not repo.is_dir():
+            checks.append(_setup_check(f"repo.{repo}", "fail", "Repository directory does not exist."))
+            continue
+        checks.append(_setup_check(f"repo.{repo}", "ok", "Repository directory exists."))
+        for host in hosts:
+            path, kind = _setup_config_path(repo, host)
+            if host == "claude-desktop":
+                if desktop_config is None and desktop_error is None:
+                    if not path.exists():
+                        desktop_config = {}
+                    else:
+                        try:
+                            desktop_config = _setup_read_config(path, kind)
+                        except (OSError, UnicodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+                            desktop_error = str(exc)
+                if desktop_error:
+                    checks.append(_setup_check(
+                        f"{host}.{repo}", "fail",
+                        f"Cannot parse {path}: {desktop_error}. Fix the file or back it up and rerun meridian setup --repo \"{repo}\" --host {host}.",
+                    ))
+                    continue
+                config = desktop_config or {}
+            else:
+                if not path.exists():
+                    checks.append(_setup_check(
+                        f"{host}.{repo}", "warn",
+                        f"No config at {path}. Configure with: meridian setup --repo \"{repo}\" --host {host}",
+                    ))
+                    continue
+                try:
+                    config = _setup_read_config(path, kind)
+                except (OSError, UnicodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+                    checks.append(_setup_check(
+                        f"{host}.{repo}", "fail",
+                        f"Cannot parse {path}: {exc}. Fix the file or back it up and rerun meridian setup --repo \"{repo}\" --host {host}.",
+                    ))
+                    continue
+            try:
+                servers = _setup_server_map(config, host)
+            except ValueError as exc:
+                checks.append(_setup_check(
+                    f"{host}.{repo}", "fail",
+                    f"{path}: {exc}. Fix the MCP server table, then rerun meridian setup --repo \"{repo}\" --host {host}.",
+                ))
+                continue
+            configured = 0
+            for tool in setup_bundle.TOOLS:
+                name = setup_bundle._server_name(tool, repo)
+                entry = servers.get(name)
+                check_name = f"{host}.{repo}.{tool}"
+                if entry is None:
+                    checks.append(_setup_check(
+                        check_name, "warn",
+                        f"Missing managed server in {path}. Configure with: meridian setup --repo \"{repo}\" --host {host}",
+                    ))
+                    continue
+                if not isinstance(entry, dict):
+                    checks.append(_setup_check(
+                        check_name, "fail",
+                        f"Server entry in {path} must be an object/table; rerun meridian setup --repo \"{repo}\" --host {host}.",
+                    ))
+                    continue
+                configured += 1
+                if not isinstance(entry.get("url"), str) and not isinstance(entry.get("command"), str):
+                    checks.append(_setup_check(
+                        check_name, "fail",
+                        "Entry has neither a command nor URL; rerun meridian setup for this host.",
+                    ))
+                    continue
+                route_ok = True
+                expected_root = os.path.normcase(str(repo.resolve()))
+                cwd = entry.get("cwd")
+                if cwd is not None and (
+                    not isinstance(cwd, str)
+                    or os.path.normcase(str(Path(cwd).expanduser().resolve())) != expected_root
+                ):
+                    checks.append(_setup_check(
+                        check_name, "fail",
+                        f"cwd does not route to {repo}; rerun meridian setup --repo \"{repo}\" --host {host}.",
+                    ))
+                    route_ok = False
+                if tool == "serena":
+                    args = entry.get("args", [])
+                    try:
+                        project_arg = args[args.index("--project") + 1]
+                    except (AttributeError, IndexError, TypeError, ValueError):
+                        project_arg = None
+                    if (
+                        not isinstance(project_arg, str)
+                        or os.path.normcase(str(Path(project_arg).expanduser().resolve())) != expected_root
+                    ):
+                        checks.append(_setup_check(
+                            check_name, "fail",
+                            f"Serena --project does not route to {repo}; rerun meridian setup --repo \"{repo}\" --host {host}.",
+                        ))
+                        route_ok = False
+                if route_ok:
+                    checks.append(_setup_check(check_name, "ok", f"Managed entry is configured for {repo}."))
+                missing_runtimes.update(
+                    runtime for runtime in _setup_runtimes(entry) if shutil.which(runtime) is None
+                )
+                if tool in {"docs", "outputs", "latex"}:
+                    package = {
+                        "docs": "meridian-docs-mcp",
+                        "outputs": "meridian-outputs",
+                        "latex": "@meridianmcp/mcp",
+                    }[tool]
+                    checks.append(_setup_check(
+                        f"{check_name}.package", "warn",
+                        f"Configured to start {package} on demand. Package resolution is not tested without launching the MCP server; start this host and inspect its MCP startup log if the helper is unavailable.",
+                    ))
+                if tool == "meridian":
+                    endpoint = _setup_endpoint(entry)
+                    if endpoint:
+                        hosted_endpoints.add(endpoint)
+            if configured == len(setup_bundle.TOOLS):
+                checks.append(_setup_check(
+                    f"{host}.{repo}.bundle", "ok",
+                    f"All {configured} managed server entries are present.",
+                ))
+            if servers.get(setup_bundle._server_name("codebase_memory", repo)) is not None:
+                checks.append(_setup_check(
+                    f"{host}.{repo}.codebase_memory_index", "warn",
+                    "Config cannot prove index freshness. Start this host and run search_graph for the repository; refresh its index if results are stale.",
+                ))
+    for runtime in sorted(missing_runtimes):
+        fix = {
+            "npx": "Install Node.js (which provides npx), then restart the MCP host.",
+            "uvx": "Install uv so uvx is available, then restart the MCP host.",
+            "meridian": "Install Meridian or rerun meridian setup in self-hosted mode.",
+        }[runtime]
+        checks.append(_setup_check(
+            f"runtime.{runtime}", "fail",
+            f"Executable was not found on PATH. {fix}",
+        ))
+    for endpoint in sorted(hosted_endpoints):
+        checks.extend(_setup_hosted_checks(endpoint, timeout, no_network))
+    try:
+        from .local_runner import LocalRunner
+
+        local = LocalRunner(
+            scope=f"meridian-tunnel-client-{tunnel_port}",
+            command=None,
+            tunnel_label="tunnel-client",
+        ).doctor()
+        checks.extend(
+            _setup_check(f"local.{check.name}", check.severity, check.detail)
+            for check in local.checks
+        )
+    except Exception as exc:  # report runner failures rather than crashing the CLI
+        checks.append(_setup_check(
+            "local_runner", "fail",
+            f"Local runtime diagnostics failed ({type(exc).__name__}). Check the Meridian installation and state directory.",
+        ))
+    return DoctorReport(scope="meridian-setup", generated_at=clock(), checks=tuple(checks))
+
+
+def cli_main(argv: Sequence[str] | None = None) -> int:
+    """Entry point for ``meridian doctor``; does not repair host configs."""
+    setup_bundle = _setup_bundle()
+    parser = argparse.ArgumentParser(
+        prog="meridian doctor",
+        description="Diagnose MCP setup and local runtime health without changing configuration.",
+    )
+    parser.add_argument("--repo", action="append", help="Repository root to inspect (repeatable; defaults to the current directory).")
+    parser.add_argument("--host", action="append", choices=setup_bundle.HOSTS, help="MCP host to inspect (repeatable; defaults to all supported hosts).")
+    parser.add_argument("--json", action="store_true", help="Print a machine-readable JSON report.")
+    parser.add_argument("--no-network", action="store_true", help="Skip hosted Meridian health and authentication requests.")
+    parser.add_argument("--timeout", type=float, default=3.0, help="Per-request timeout in seconds (0.1-30; default 3).")
+    parser.add_argument("--tunnel-port", type=int, default=8808, help="Local MCP proxy port used by the tunnel runtime check.")
+    args = parser.parse_args(argv)
+    if not 0.1 <= args.timeout <= 30:
+        parser.error("--timeout must be between 0.1 and 30 seconds")
+    repos = [Path(raw).expanduser().resolve() for raw in args.repo] if args.repo else [Path.cwd().resolve()]
+    hosts = args.host or list(setup_bundle.HOSTS)
+    report = diagnose(
+        repos, hosts, timeout=args.timeout, no_network=args.no_network,
+        tunnel_port=args.tunnel_port,
+    )
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(f"Meridian doctor: {'healthy' if report.healthy else 'issues found'}")
+        for check in report.checks:
+            print(f"[{check.severity.upper()}] {check.name}: {check.detail}")
+    return 0 if report.healthy else 1
 
 
 # ---------------------------------------------------------------------------

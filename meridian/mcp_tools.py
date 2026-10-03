@@ -278,8 +278,10 @@ _ARTIFACT_POLICY_SCHEMA: dict[str, Any] = {
         "'off', never a silent 'strict'; an item that declares no policy is never "
         "blocked. ENFORCEMENT (275a8631): complete_sprint_item refuses (error "
         "ARTIFACT_POINTER_REQUIRED) a figure/table item under 'strict' or a "
-        "require_exact_* flag that has no EXACT output pointer — a planned_output "
-        "target, a sprint_item_pointer, or a file: touches_resources entry whose uri "
+        "require_exact_* flag that has no MATERIALIZED exact output pointer — a "
+        "planned_output or sprint_item_pointer target counts only when target_kind "
+        "is not 'planned_new' (planned_new stays useful during planning but never "
+        "satisfies completion), or a file: touches_resources entry whose uri "
         "is a concrete figure file (.png/.jpg/.jpeg/.gif/.svg/.webp/.tif/.tiff/.eps/"
         ".bmp) or table file (.csv/.tsv/.xlsx/.xls); a bare .docx, a directory or a "
         "generic mcp_tool:/db:/route: reference does not count. Whether an item is "
@@ -293,9 +295,9 @@ _ARTIFACT_POLICY_SCHEMA: dict[str, Any] = {
     ),
     "properties": {
         "artifact_pointer_check": {"type": "string", "enum": ["off", "warn", "strict"],
-            "description": "off = no enforcement of any kind (also switches off the require_exact_* flags); warn = surface the finding in handoffs but never block (default); strict = the handoff marks the item non-executable AND complete_sprint_item refuses it (ARTIFACT_POINTER_REQUIRED) while it is figure/table work with no exact output pointer. Items that are not figure/table work (document_only, caption/equation/code-only, no signal) are unaffected."},
-        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a figure-kind item that has no exact figure-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). Default false."},
-        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a table-kind item that has no exact table-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). Default false."},
+            "description": "off = no enforcement of any kind (also switches off the require_exact_* flags); warn = surface the finding in handoffs but never block (default); strict = the handoff marks the item non-executable AND complete_sprint_item refuses it (ARTIFACT_POINTER_REQUIRED) while it is figure/table work with no exact, materialized output pointer. target_kind='planned_new' stays useful for planning but never satisfies completion. Items that are not figure/table work (document_only, caption/equation/code-only, no signal) are unaffected."},
+        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a figure-kind item that has no exact, materialized figure-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). target_kind='planned_new' is planning-only. Default false."},
+        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a table-kind item that has no exact, materialized table-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). target_kind='planned_new' is planning-only. Default false."},
         "allow_document_only_override": {"type": "boolean", "description": "Reserved — currently NOT consulted by any enforcement path (a figure/table item can never self-declare its way out of the pointer check, and a document_only-kind item is never pointer-checked in the first place). Stored and echoed only. Default false."},
     },
 }
@@ -982,8 +984,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."}},
+         "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."},
+         "milestone_trigger": {"type": "string", "enum": ["manual_requested", "goal_scope_changed", "decision_committed", "sprint_item_completed", "provider_session_unavailable", "artifact_captured", "recovery_verified", "release_preparation"], "description": "Optional material transition that appends a deep, immutable project-state milestone. Omit for a routine checkpoint."},
+         "risk_signals": {"type": "array", "items": {"type": "string", "enum": ["provider_unavailable", "dirty_worktree", "artifact_integrity_uncertain", "artifact_hash_mismatch", "stale_source", "missing_source", "cross_project_ambiguity", "unexpected_active_claims", "large_uncommitted_change"]}, "description": "Optional bounded risk signals; a deep milestone is appended when their score reaches the adaptive threshold."},
+         "artifact_manifest": {"type": "object", "properties": {"status": {"type": "string", "enum": ["available", "not_configured", "degraded", "unavailable"]}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "occurrence_count": {"type": "integer", "minimum": 0}}, "additionalProperties": False, "description": "Optional local-client receipt for the artifact manifest; the hosted server records it as client-reported and does not claim to verify workstation-local bytes."}},
          "required": ["session_id"]}},
+    {"name": "get_project_state_milestones", "description":
+        "Read project-scoped, append-only recovery milestones and their content-hash status. "
+        "Milestones contain compact state and pointers only; provider transcripts and artifact bytes stay in their local stores. "
+        "Pass before_sequence for older records. A pointer is resolved only in the owning project and only when its stored hash verifies.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+         "before_sequence": {"type": "integer", "minimum": 1}},
+         "required": ["project_id"]}},
     {"name": "register_external_job", "description":
         "Create or reaffirm a project-scoped record for long-running external work "
         "such as RunPod, SSH, Slurm, or CI. Meridian records the opaque external "
@@ -1106,8 +1120,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "transport": {"type": "string", "enum": ["stdio", "remote_control", "cloud_environment", "tunnel", "unknown"]},
          "client_type": {"type": "string", "description": "e.g. claude-code, claude-desktop, cursor, other."},
          "lifecycle_status": {"type": "string", "enum": ["active", "idle", "ended", "crashed", "unknown"]},
-         "local_identity": {"type": "object", "description": "HOST-LOCAL ONLY, never persisted hosted-side: local_session_id, bridge_id, environment_id, argv, local_transcript_path. Used only to compute a resume recipe and to refresh the host-local snapshot."},
-         "local_ref_id": {"type": "string", "description": "Optional stable opaque token correlating this hosted row to the host-local snapshot entry; generated if omitted."},
+         "local_identity": {"type": "object", "description": "Self-hosted only. A hosted call rejects this field; a caller-local PreToolUse hook must persist it on this workstation and remove it before the hosted request."},
+         "local_ref_id": {"type": "string", "description": "Optional opaque client-local reference. Hosted callers should let the local recovery hook generate it."},
+         "verified_resumable": {"type": "boolean", "description": "Non-identifying caller-local status hint. Hosted Meridian stores the boolean only; it cannot verify the provider identity behind it."},
          "last_checkpoint_ref": {"type": "string", "description": "An id/label for the last checkpoint — never content."},
          "last_handoff_ref": {"type": "string", "description": "An id/label for the last handoff — never content."},
          "sprint_version": {"type": "string"},
@@ -2049,6 +2064,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "build/output artifact's manifest URI plus an optional fingerprint and a link to "
         "the producing run/sprint-item/provenance record. Resolving it (local files only "
         "by default) hashes the manifest file to report its current fingerprint.\n"
+        "• provider_conversation — {\"type\":\"provider_conversation\", "
+        "\"provider\":\"claude.ai\"|\"codex\"|\"chatgpt\", "
+        "\"conversation_id\":str, \"transcript_hash\"?:sha256} — a provider-native "
+        "conversation id; an optional range subSelector requires transcript_hash.\n"
+        "• provider_artifact — {\"type\":\"provider_artifact\", "
+        "\"provider\":\"claude.ai\"|\"codex\"|\"chatgpt\", "
+        "\"conversation_id\":str, \"artifact_id\":str, \"content_hash\"?:sha256} — "
+        "a provider artifact id; an optional range subSelector requires content_hash. "
+        "These are identity-only references: no transcript or artifact bytes are uploaded "
+        "or fetched by resolving them.\n"
         "An optional selector.subSelector nests finer granularity (W3C hasSubSelector) — "
         "e.g. {\"type\":\"symbol\", \"qualified_name\":\"a.b.f\", \"subSelector\": "
         "{\"type\":\"range\", \"start_line\":3, \"end_line\":4}} = 'these lines, within "
@@ -2103,7 +2128,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
              "(>=1 required), path?}; remote_fs {\"type\":\"remote_fs\", host_id, "
              "filesystem_slot, path, lease_id?, session_id?, snapshot_id?}; artifact "
              "{\"type\":\"artifact\", manifest_uri, fingerprint?, run_id?, item_id?, "
-             "provenance_id?} (62640241 for the last five). An optional subSelector is "
+             "provenance_id?} (62640241); provider_conversation {provider, conversation_id, "
+             "transcript_hash?}; provider_artifact {provider, conversation_id, artifact_id, "
+             "content_hash?}. Provider references accept only IDs, hashes, and range "
+             "subSelectors; resolution is identity-only and never fetches or stores chat "
+             "content. An optional subSelector is "
              "itself a full selector and MUST carry its own \"type\". target_kind is "
              "\"existing\" (default; explicit \"existing\" is verified against the real "
              "filesystem) or \"planned_new\" (a file not created yet — exempt from that "
@@ -3598,6 +3627,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "published, url, pdf_url, ...}]} plus a per-source id — arxiv_id, openalex_id "
         "(+doi), s2_id (+doi, citation_count, tldr), pmid (+doi), doi (crossref: +venue, "
         "issn, publisher, type, citation_count), or core_id (+doi, venue, has_full_text). "
+        "When OpenAlex answers directly or the arXiv search falls back to OpenAlex, the "
+        "result also includes openalex_query_stage ('phrase_and', 'and', or 'loose') for "
+        "the last successful relevance-relaxation stage. "
         "An unknown source returns {error}.",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "Search terms (matches title / abstract / authors)."},
@@ -3637,16 +3669,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "zotero_search", "description":
         "Search a Zotero library — sibling to paper_search/social_search/github_search, "
         "but over YOUR OWN saved references rather than a public corpus. A public "
-        "GROUP library needs no credential; a private USER library needs a Zotero API "
-        "key (pass api_key, or set the ZOTERO_API_KEY env var server-side — Meridian "
-        "has no per-tenant bring-your-own-key storage yet, so this is config, not a "
-        "per-call secret). Returns {query, count, results:[{title, authors, summary, "
+        "GROUP library needs no credential; a private USER library must be searched "
+        "through the locally configured Zotero MCP connection so its API key stays "
+        "on the workstation. Returns {query, count, results:[{title, authors, summary, "
         "published, url, zotero_key, item_type, tags, ...}]}.",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "Search terms (matches title/creator/year by default, or full text — see qmode)."},
          "library_type": {"type": "string", "enum": ["user", "group"], "description": "'user' (default; a personal library) or 'group' (a shared, possibly-public library)."},
          "library_id": {"type": "string", "description": "The numeric Zotero userID or groupID to search. Required."},
-         "api_key": {"type": "string", "description": "Optional Zotero API key for a private library; falls back to the ZOTERO_API_KEY env var, then to no auth (fine for a public group library)."},
          "limit": {"type": "integer", "description": "Max results to return (default 10, max 50)."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance = Zotero's own ordering; 'date' = most recently added first)."}},
          "required": ["query", "library_id"]}},
@@ -4696,6 +4726,7 @@ _READ_ONLY_TOOLS = {
     "get_external_job", "list_external_jobs",
     "list_remote_tasks",
     "list_resumable_sessions", "get_session_recovery",
+    "get_project_state_milestones",
     "get_research_run", "list_research_runs",
     "get_experiment", "list_experiments", "get_experiment_run", "list_experiment_runs",
     "get_experiment_events",
@@ -4814,6 +4845,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "register_session_recovery": "session",
     "list_resumable_sessions":   "session",
     "get_session_recovery":      "session",
+    "get_project_state_milestones": "session",
     "start_research_run":       "research",
     "complete_research_run":    "research",
     "get_research_run":         "research",
@@ -5136,6 +5168,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "register_session_recovery":  "both",
     "list_resumable_sessions":    "both",
     "get_session_recovery":       "both",
+    "get_project_state_milestones": "both",
     "start_research_run":         "both",
     "complete_research_run":      "both",
     "get_research_run":           "both",
@@ -5997,6 +6030,24 @@ def _select_active_tool_set(
         "keyword_signals": keyword_signals,
         "mode": "deterministic",
     }
+
+
+# The code index's wide-root override is deliberately opt-in. Keep the MCP
+# schema in sync with the local wrapper without duplicating its static tool list.
+for _tool in _MCP_TOOLS_LIST:
+    if _tool.get("name") == "search_code_semantic":
+        _tool["inputSchema"]["properties"]["allow_broad_root"] = {
+            "type": "boolean",
+            "description": (
+                "Default false: refuse broad non-project roots. Set true only "
+                "when you intentionally need a bounded scan outside a project "
+                "checkout. The response includes canonical root/scope and "
+                "partial-scan status."
+            ),
+        }
+        break
+else:
+    raise RuntimeError("search_code_semantic MCP schema is missing")
 
 
 # ---------------------------------------------------------------------------

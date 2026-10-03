@@ -35,13 +35,13 @@ _STRICT = {"artifact_pointer_check": "strict"}
 _YES = "Yes — approve this override"
 
 
-def _planned(uri="outputs/figures/error_rate.png"):
+def _planned(uri="outputs/figures/error_rate.png", *, target_kind="planned_new"):
     return {
         "source_type": "code",
         "targets": [{
             "uri": uri,
             "selector": {"type": "range", "start_line": 1, "end_line": 1},
-            "target_kind": "planned_new",
+            "target_kind": target_kind,
         }],
         "label": "the output",
     }
@@ -89,11 +89,37 @@ async def test_strict_figure_item_without_a_pointer_is_refused(db):
 
 
 @pytest.mark.asyncio
-async def test_strict_figure_item_with_a_valid_planned_output_completes(db):
+async def test_planned_new_output_remains_discoverable_but_cannot_complete(db):
     pid = await _project(db, "strict-planned")
     item = await _claimed(
         db, pid, "Plot the error-rate curve",
         artifact_kind="figure", artifact_policy=_STRICT, planned_output=_planned(),
+    )
+    from meridian.pointers import evaluate_artifact_pointer_policy
+
+    planning_verdict = evaluate_artifact_pointer_policy(item)
+    assert planning_verdict["ready"] is True
+    assert planning_verdict["warning_code"] is None
+    with pytest.raises(si_mod.SprintItemArtifactPointerRequired) as exc:
+        await db_module.complete_sprint_item(db, pid, item["id"], actor="exec")
+    assert exc.value.verdict["warning_code"] == "missing_pointer"
+    assert "planned_new" in str(exc.value)
+    assert await _status(db, item["id"]) == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_strict_figure_item_with_existing_planned_output_completes(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "outputs" / "figures" / "error_rate.png"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"figure")
+    pid = await _project(db, "strict-existing")
+    item = await _claimed(
+        db, pid, "Plot the error-rate curve",
+        artifact_kind="figure", artifact_policy=_STRICT,
+        planned_output=_planned(target_kind="existing"),
     )
     done = await db_module.complete_sprint_item(db, pid, item["id"], actor="exec")
     assert done["status"] == "done"
@@ -101,7 +127,13 @@ async def test_strict_figure_item_with_a_valid_planned_output_completes(db):
 
 
 @pytest.mark.asyncio
-async def test_a_stored_sprint_item_pointer_also_satisfies_strict(db):
+async def test_a_stored_existing_sprint_item_pointer_also_satisfies_strict(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "outputs" / "figures" / "error_rate.png"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"figure")
     pid = await _project(db, "strict-stored")
     item = await _claimed(
         db, pid, "Plot the error-rate curve",
@@ -111,7 +143,7 @@ async def test_a_stored_sprint_item_pointer_also_satisfies_strict(db):
         await db_module.complete_sprint_item(db, pid, item["id"], actor="exec")
     await db_module.add_sprint_item_pointer(
         db, pid, item["id"], "code",
-        [{"uri": "outputs/figures/error_rate.png", "target_kind": "planned_new",
+        [{"uri": "outputs/figures/error_rate.png", "target_kind": "existing",
           "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
     )
     assert (await db_module.complete_sprint_item(
@@ -119,16 +151,42 @@ async def test_a_stored_sprint_item_pointer_also_satisfies_strict(db):
     ))["status"] == "done"
 
 
+@pytest.mark.asyncio
+async def test_stored_planned_new_pointer_does_not_satisfy_exact_figure_flag(db):
+    pid = await _project(db, "required-figure-planned-new")
+    item = await _claimed(
+        db, pid, "Plot the planned curve", artifact_kind="figure",
+        artifact_policy={"require_exact_figure_output_pointer": True},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, pid, item["id"], "code", _planned()["targets"],
+    )
+    with pytest.raises(si_mod.SprintItemArtifactPointerRequired) as exc:
+        await db_module.complete_sprint_item(db, pid, item["id"], actor="exec")
+    assert exc.value.verdict["triggers"] == ["require_exact_figure_output_pointer"]
+    assert await _status(db, item["id"]) == "in_progress"
+
+
 @pytest.mark.parametrize("uri,code", [
     ("paper/draft.docx", "insufficient_pointer_bare_docx"),
     ("outputs/figures", "insufficient_pointer_directory"),
 ])
 @pytest.mark.asyncio
-async def test_a_bare_docx_or_directory_is_not_an_exact_pointer(db, uri, code):
+async def test_a_bare_docx_or_directory_is_not_an_exact_pointer(
+    db, uri, code, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    weak_path = tmp_path / uri
+    if uri.endswith(".docx"):
+        weak_path.parent.mkdir(parents=True)
+        weak_path.write_bytes(b"docx")
+    else:
+        weak_path.mkdir(parents=True)
     pid = await _project(db, f"strict-weak-{code}")
     item = await _claimed(
         db, pid, "Plot the error-rate curve",
-        artifact_kind="figure", artifact_policy=_STRICT, planned_output=_planned(uri),
+        artifact_kind="figure", artifact_policy=_STRICT,
+        planned_output=_planned(uri, target_kind="existing"),
     )
     with pytest.raises(si_mod.SprintItemArtifactPointerRequired) as exc:
         await db_module.complete_sprint_item(db, pid, item["id"], actor="exec")
@@ -141,7 +199,13 @@ async def test_a_bare_docx_or_directory_is_not_an_exact_pointer(db, uri, code):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_require_exact_table_flag_is_enforced_even_under_warn(db):
+async def test_require_exact_table_flag_is_enforced_even_under_warn(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "outputs" / "tables" / "ablation.csv"
+    output.parent.mkdir(parents=True)
+    output.write_text("metric,value\nthroughput,1\n", encoding="utf-8")
     pid = await _project(db, "req-table")
     policy = {"artifact_pointer_check": "warn",
               "require_exact_table_output_pointer": True}
@@ -155,7 +219,8 @@ async def test_require_exact_table_flag_is_enforced_even_under_warn(db):
 
     ok = await _claimed(
         db, pid, "Summarise throughput per worker count", artifact_kind="table",
-        artifact_policy=policy, planned_output=_planned("outputs/tables/ablation.csv"),
+        artifact_policy=policy,
+        planned_output=_planned("outputs/tables/ablation.csv", target_kind="existing"),
     )
     assert (await db_module.complete_sprint_item(
         db, pid, ok["id"], actor="exec"))["status"] == "done"
@@ -255,7 +320,13 @@ def _complete_args(pid, item, **extra):
 
 
 @pytest.mark.asyncio
-async def test_mcp_refuses_then_completes_once_the_pointer_exists(db):
+async def test_mcp_refuses_then_completes_once_the_pointer_exists(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "outputs" / "figures" / "error_rate.png"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"figure")
     pid, item = await _mcp_strict_item(db, "mcp-strict")
     res = await srv._dispatch_mcp_tool("complete_sprint_item", _complete_args(pid, item), db, "/tmp")
     assert res["error"] == "ARTIFACT_POINTER_REQUIRED"
@@ -265,7 +336,8 @@ async def test_mcp_refuses_then_completes_once_the_pointer_exists(db):
 
     await srv._dispatch_mcp_tool(
         "update_sprint_item",
-        {"project_id": pid, "item_id": item["id"], "planned_output": _planned(), "force": True},
+        {"project_id": pid, "item_id": item["id"],
+         "planned_output": _planned(target_kind="existing"), "force": True},
         db, "/tmp",
     )
     done = await srv._dispatch_mcp_tool("complete_sprint_item", _complete_args(pid, item), db, "/tmp")
@@ -400,7 +472,13 @@ async def test_override_flags_are_inert_when_the_gate_does_not_block(db):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_http_complete_route_returns_409_for_a_strict_item_without_a_pointer(client):
+async def test_http_complete_route_returns_409_for_a_strict_item_without_a_pointer(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "outputs" / "figures" / "error_rate.png"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"figure")
     db = client.app.state.db
     pid = await _project(db, "http-strict")
     item = await _claimed(
@@ -411,7 +489,9 @@ async def test_http_complete_route_returns_409_for_a_strict_item_without_a_point
     assert r.json()["detail"]["error"] == "ARTIFACT_POINTER_REQUIRED"
     assert await _status(db, item["id"]) == "in_progress"
 
-    await db_module.patch_sprint_item(db, pid, item["id"], planned_output=_planned())
+    await db_module.patch_sprint_item(
+        db, pid, item["id"], planned_output=_planned(target_kind="existing")
+    )
     ok = client.post(f"/projects/{pid}/sprint-items/{item['id']}/complete", json={})
     assert ok.status_code == 200, ok.text
     assert ok.json()["status"] == "done"
@@ -426,9 +506,11 @@ def test_policy_schema_text_describes_the_enforcement_that_now_exists():
     check = props["artifact_pointer_check"]["description"]
     assert "complete_sprint_item refuses" in check and "ARTIFACT_POINTER_REQUIRED" in check
     assert "non-executable" in check, "the handoff half of strict must still be described"
+    assert "planned_new" in check and "never satisfies completion" in check
     for flag in ("require_exact_figure_output_pointer", "require_exact_table_output_pointer"):
         text = props[flag]["description"]
         assert "complete_sprint_item refuses" in text and "ARTIFACT_POINTER_REQUIRED" in text
+        assert "planned_new" in text and "planning-only" in text
     # allow_document_only_override is consulted by nothing: the text must say so
     # instead of promising a bypass.
     doc_only = props["allow_document_only_override"]["description"]

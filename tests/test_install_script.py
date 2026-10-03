@@ -195,6 +195,15 @@ def test_install_windows_ps1_adds_path_without_setx():
     assert not any("setx" in ln.lower() for ln in code_lines)
 
 
+def test_install_windows_tray_offers_local_zotero_setup_without_cli_credentials():
+    src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+    assert "[switch]$ConfigureZotero" in src
+    assert "Configure your local Zotero connection now? [y/N]" in src
+    assert "& $dest --configure-zotero" in src
+    assert "configure it later from the Meridian tray menu" in src
+    assert "ZOTERO_API_KEY" not in src
+
+
 def test_install_windows_ps1_route_serves_script(client):
     r = client.get("/install-windows.ps1")
     assert r.status_code == 200
@@ -213,6 +222,27 @@ def test_install_windows_ps1_exposes_tray_switch():
     src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
     assert "[switch]$Tray" in src
     assert "if ($Tray) {" in src
+
+
+def test_install_windows_ps1_autostart_is_explicit_and_tray_only():
+    src = _install_windows_ps1_src()
+    assert "[switch]$Autostart" in src
+    assert "if ($Autostart -and -not $Tray)" in src
+    assert '"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"' in src
+    assert '$command = \'"{0}"\' -f $TargetPath' in src
+
+    tray_start = src.index("if ($Tray) {")
+    tray_block = src[tray_start:]
+    assert "if ($Autostart) {" in tray_block
+    assert "Enable-MeridianAutostart -TargetPath $dest" in tray_block
+
+
+def test_install_windows_ps1_uninstall_removes_optional_autostart_entry():
+    src = _install_windows_ps1_src()
+    uninstall_idx = src.index("if ($Uninstall) {")
+    exit_idx = src.index("exit 0", uninstall_idx)
+    uninstall_block = src[uninstall_idx:exit_idx]
+    assert "Remove-MeridianAutostart" in uninstall_block
 
 
 def test_install_windows_ps1_tray_downloads_meridian_tray_exe():

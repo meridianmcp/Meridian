@@ -53,6 +53,7 @@ import argparse
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -81,11 +82,13 @@ from .local_runner import (
     LocalRunner,
     RunnerAlreadyRunningError,
 )
+from .zotero_setup import ZoteroSetupError, run_zotero_setup_dialog
 
 _logger = logging.getLogger(__name__)
 
 SCOPE = "meridian-tray"
 _RUN_SERVER_FLAG = "--run-server"
+_CONFIGURE_ZOTERO_FLAG = "--configure-zotero"
 _HEALTH_PROBE_TIMEOUT_SECONDS = 1.5
 
 
@@ -189,6 +192,45 @@ def _server_command() -> "list[str]":
     if getattr(sys, "frozen", False):
         return [sys.executable, _RUN_SERVER_FLAG]
     return [sys.executable, "-m", "meridian"]
+
+
+def _local_cli_command(*args: str) -> list[str]:
+    """Build a command for an existing local-only Meridian maintenance tool.
+
+    Reuse the same executable in packaged mode and the current Python
+    environment in source mode, so the tray never depends on a second
+    Meridian installation or sends local paths to the hosted dashboard.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, *args]
+    return [sys.executable, "-m", "meridian", *args]
+
+
+def _launch_local_cli(*args: str, cwd: str | None = None) -> None:
+    """Open one local maintenance command in a visible console when possible."""
+    command = _local_cli_command(*args)
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if sys.platform == "win32" else 0
+    try:
+        subprocess.Popen(command, cwd=cwd, creationflags=creationflags)
+    except OSError as exc:
+        _show_error_dialog("Meridian local tool failed to open", str(exc))
+
+
+def _choose_project_root(title: str, parent: Any | None = None) -> str | None:
+    """Ask which local repository a setup or health command should inspect."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    owns_root = parent is None
+    root = parent if parent is not None else tk.Tk()
+    if owns_root:
+        root.withdraw()
+    try:
+        selected = filedialog.askdirectory(parent=root, title=title, mustexist=True)
+        return str(selected) if selected else None
+    finally:
+        if owns_root:
+            root.destroy()
 
 
 def _server_env() -> "dict[str, str]":
@@ -323,7 +365,7 @@ def _sweep_stale_runtime_extractions() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _show_status_dialog(runner: LocalRunner) -> None:
+def _show_status_dialog(runner: LocalRunner, parent: Any | None = None) -> None:
     import tkinter as tk
     from tkinter import messagebox
 
@@ -337,35 +379,74 @@ def _show_status_dialog(runner: LocalRunner) -> None:
     if status.warnings:
         lines.append("")
         lines.extend(f"Warning: {w}" for w in status.warnings)
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showinfo("Meridian status", "\n".join(lines), parent=root)
-    root.destroy()
+    owns_root = parent is None
+    root = parent if parent is not None else tk.Tk()
+    if owns_root:
+        root.withdraw()
+    try:
+        messagebox.showinfo("Meridian status", "\n".join(lines), parent=root)
+    finally:
+        if owns_root:
+            root.destroy()
 
 
-def _show_logs_window(runner: LocalRunner) -> None:
+def _show_logs_window(runner: LocalRunner, parent: Any | None = None) -> None:
     import tkinter as tk
     from tkinter import scrolledtext
 
     tail = runner.tail_log() or "(no log output yet)"
-    root = tk.Tk()
+    root = tk.Toplevel(parent) if parent is not None else tk.Tk()
     root.title("Meridian -- log tail")
     root.geometry("800x500")
     text = scrolledtext.ScrolledText(root, wrap="word")
     text.insert("1.0", tail)
     text.configure(state="disabled")
     text.pack(fill="both", expand=True)
-    root.mainloop()
+    if parent is None:
+        root.mainloop()
 
 
-def _show_error_dialog(title: str, message: str) -> None:
+def _show_error_dialog(title: str, message: str, parent: Any | None = None) -> None:
     import tkinter as tk
     from tkinter import messagebox
 
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror(title, message, parent=root)
-    root.destroy()
+    owns_root = parent is None
+    root = parent if parent is not None else tk.Tk()
+    if owns_root:
+        root.withdraw()
+    try:
+        messagebox.showerror(title, message, parent=root)
+    finally:
+        if owns_root:
+            root.destroy()
+
+
+class _TkUiDispatcher:
+    """Run tray-triggered Tk actions from the thread that owns the Tk root."""
+
+    def __init__(self, root: Any) -> None:
+        import queue
+
+        self._queue_module = queue
+        self._pending = queue.SimpleQueue()
+        self._root = root
+        root.after(0, self._drain)
+
+    def submit(self, callback: Any) -> None:
+        self._pending.put(callback)
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                try:
+                    callback = self._pending.get_nowait()
+                except self._queue_module.Empty:
+                    break
+                callback()
+        finally:
+            # Keep the queue alive after a failed menu action. Tk will still
+            # report the callback exception, while later actions remain usable.
+            self._root.after(25, self._drain)
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +457,20 @@ def _show_error_dialog(title: str, message: str) -> None:
 def _run_tray() -> int:
     import pystray
     from PIL import Image
+
+    ui_root = None
+    ui_dispatcher = None
+    darwin_nsapplication = None
+    if sys.platform == "darwin":
+        import tkinter as tk
+        from AppKit import NSApplication
+
+        # Tk and the Darwin status item both need the process main thread. Let
+        # Tk own that thread and attach pystray to Tk's shared Cocoa run loop.
+        ui_root = tk.Tk()
+        ui_root.withdraw()
+        ui_dispatcher = _TkUiDispatcher(ui_root)
+        darwin_nsapplication = NSApplication.sharedApplication()
 
     _sweep_stale_runtime_extractions()
     runner = _build_runner()
@@ -402,6 +497,7 @@ def _run_tray() -> int:
             _show_error_dialog(
                 "Meridian did not become ready",
                 status.local_mcp.detail or f"local MCP state: {status.local_mcp.state.value}",
+                parent=ui_root,
             )
     except RunnerAlreadyRunningError:
         # Already running (from a prior launch, or another tray instance) --
@@ -416,7 +512,13 @@ def _run_tray() -> int:
         except Exception:  # noqa: BLE001 -- a broken status check must never crash the tray
             should_open_dashboard = False
     except Exception as exc:  # noqa: BLE001 -- must not silently exit with no UI at all
-        _show_error_dialog("Meridian failed to start", str(exc))
+        _show_error_dialog("Meridian failed to start", str(exc), parent=ui_root)
+        if ui_root is not None:
+            ui_root.destroy()
+        return 1
+
+    if not should_open_dashboard and ui_root is not None:
+        ui_root.destroy()
         return 1
 
     if should_open_dashboard:
@@ -434,21 +536,74 @@ def _run_tray() -> int:
         # rather than crashing the whole app over cosmetics.
         image = Image.new("RGBA", (64, 64), (0, 102, 204, 255))
 
+    def _dispatch_ui(callback: Any) -> None:
+        if ui_dispatcher is not None:
+            ui_dispatcher.submit(callback)
+        else:
+            threading.Thread(target=callback, daemon=True).start()
+
     def _open_dashboard(icon: "pystray.Icon", item: Any) -> None:
         webbrowser.open(_dashboard_url())
 
     def _show_status(icon: "pystray.Icon", item: Any) -> None:
-        threading.Thread(target=_show_status_dialog, args=(runner,), daemon=True).start()
+        _dispatch_ui(lambda: _show_status_dialog(runner, parent=ui_root))
 
     def _show_logs(icon: "pystray.Icon", item: Any) -> None:
-        threading.Thread(target=_show_logs_window, args=(runner,), daemon=True).start()
+        _dispatch_ui(lambda: _show_logs_window(runner, parent=ui_root))
+
+    def _configure_zotero(icon: "pystray.Icon", item: Any) -> None:
+        def _open_setup() -> None:
+            try:
+                run_zotero_setup_dialog(parent=ui_root)
+            except ZoteroSetupError as exc:
+                _show_error_dialog("Zotero setup unavailable", str(exc), parent=ui_root)
+            except Exception as exc:  # noqa: BLE001 — tray stays alive if the dialog fails
+                _show_error_dialog("Zotero setup failed", str(exc), parent=ui_root)
+
+        _dispatch_ui(_open_setup)
+
+    def _configure_local_project(icon: "pystray.Icon", item: Any) -> None:
+        def _choose_and_configure() -> None:
+            try:
+                project_root = _choose_project_root(
+                    "Choose a local project to set up", parent=ui_root,
+                )
+                if project_root:
+                    _launch_local_cli("setup", "--repo", project_root, cwd=project_root)
+            except Exception as exc:  # noqa: BLE001 -- keep the tray available if the picker fails
+                _show_error_dialog("Meridian project setup failed", str(exc), parent=ui_root)
+
+        _dispatch_ui(_choose_and_configure)
+
+    def _check_local_project(icon: "pystray.Icon", item: Any) -> None:
+        def _choose_and_check() -> None:
+            try:
+                project_root = _choose_project_root(
+                    "Choose a local project to check", parent=ui_root,
+                )
+                if project_root:
+                    _launch_local_cli("doctor", "--repo", project_root, cwd=project_root)
+            except Exception as exc:  # noqa: BLE001 -- keep the tray available if the picker fails
+                _show_error_dialog("Meridian project check failed", str(exc), parent=ui_root)
+
+        _dispatch_ui(_choose_and_check)
+
+    def _catalog_local_sessions(icon: "pystray.Icon", item: Any) -> None:
+        _launch_local_cli("recovery", "catalog")
+
+    def _show_artifact_commands(icon: "pystray.Icon", item: Any) -> None:
+        _launch_local_cli("artifacts", "--help")
 
     def _restart(icon: "pystray.Icon", item: Any) -> None:
         def _do_restart() -> None:
             try:
                 runner.restart()
             except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
-                _show_error_dialog("Meridian restart failed", str(exc))
+                _dispatch_ui(
+                    lambda error=exc: _show_error_dialog(
+                        "Meridian restart failed", str(error), parent=ui_root,
+                    )
+                )
 
         threading.Thread(target=_do_restart, daemon=True).start()
 
@@ -458,22 +613,103 @@ def _run_tray() -> int:
         except Exception:  # noqa: BLE001 -- shutting down must never hang the tray
             pass
         icon.stop()
+        if ui_dispatcher is not None and ui_root is not None:
+            ui_dispatcher.submit(ui_root.quit)
 
+    local_tools = pystray.Menu(
+        pystray.MenuItem("Set up a local project…", _configure_local_project),
+        pystray.MenuItem("Check a local project…", _check_local_project),
+        pystray.MenuItem("Catalog local sessions", _catalog_local_sessions),
+        pystray.MenuItem("Artifact capture commands", _show_artifact_commands),
+    )
     menu = pystray.Menu(
         pystray.MenuItem("Open Dashboard", _open_dashboard, default=True),
         pystray.MenuItem("Status", _show_status),
+        pystray.MenuItem("Local workstation tools", local_tools),
+        pystray.MenuItem("Zotero connection…", _configure_zotero),
         pystray.MenuItem("View Logs", _show_logs),
         pystray.MenuItem("Restart", _restart),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", _quit),
     )
-    icon = pystray.Icon("meridian-tray", image, "Meridian", menu)
-    icon.run()
+    icon_options = {}
+    if darwin_nsapplication is not None:
+        icon_options["darwin_nsapplication"] = darwin_nsapplication
+    icon = pystray.Icon("meridian-tray", image, "Meridian", menu, **icon_options)
+    if ui_root is None:
+        icon.run()
+    else:
+        try:
+            icon.run_detached()
+            ui_root.mainloop()
+        finally:
+            ui_root.destroy()
     return 0
+
+
+def _acquire_windows_tray_lock() -> tuple[str, Any | None]:
+    """Acquire a per-user byte-range lock so Windows launches share one tray."""
+    if sys.platform != "win32":
+        return "unsupported", None
+
+    import errno
+    import msvcrt
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base_dir = (
+        Path(local_app_data)
+        if local_app_data
+        else Path.home() / "AppData" / "Local"
+    )
+    lock_path = base_dir / "Meridian" / "tray-instance.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            handle.close()
+            if (
+                exc.errno in {errno.EACCES, errno.EDEADLK}
+                or getattr(exc, "winerror", None) in {32, 33}
+            ):
+                return "already_running", None
+            raise
+        return "acquired", handle
+    except BaseException:
+        if not handle.closed:
+            handle.close()
+        raise
+
+
+def _release_windows_tray_lock(handle: Any | None) -> None:
+    if handle is None:
+        return
+    try:
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    finally:
+        handle.close()
 
 
 def main(argv: "list[str] | None" = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
+    # The packaged tray executable also exposes offline Meridian maintenance
+    # commands such as ``setup``. Route those through the shared CLI dispatcher
+    # instead of treating them as tray-only arguments.
+    if argv and argv[0] in {"artifacts", "doctor", "hooks", "memory", "recovery", "setup"}:
+        from .__main__ import main as meridian_main
+
+        return meridian_main(argv)
     parser = argparse.ArgumentParser(
         prog="meridian-tray",
         description="Windows tray icon wrapping the Meridian local HTTP server (4e4c3817).",
@@ -483,7 +719,20 @@ def main(argv: "list[str] | None" = None) -> int:
         action="store_true",
         help=argparse.SUPPRESS,  # internal self-relaunch flag -- never for a human to type
     )
+    parser.add_argument(
+        _CONFIGURE_ZOTERO_FLAG,
+        action="store_true",
+        help="Open the optional, local-only Zotero connection setup.",
+    )
     args = parser.parse_args(argv)
+
+    if args.configure_zotero:
+        try:
+            run_zotero_setup_dialog()
+            return 0
+        except ZoteroSetupError as exc:
+            _show_error_dialog("Zotero setup unavailable", str(exc))
+            return 1
 
     if args.run_server:
         os.environ["MERIDIAN_FROZEN_MODE"] = "server"
@@ -491,7 +740,26 @@ def main(argv: "list[str] | None" = None) -> int:
 
         return meridian_entry.main([])
 
-    return _run_tray()
+    try:
+        lock_state, lock_handle = _acquire_windows_tray_lock()
+    except OSError as exc:
+        _show_error_dialog(
+            "Meridian tray could not start",
+            f"Could not establish the single-instance lock: {exc}",
+        )
+        return 1
+    if lock_state == "already_running":
+        # A second click should bring the user back to Meridian without adding
+        # another icon to the tray overflow area.
+        try:
+            webbrowser.open(_dashboard_url())
+        except Exception:  # noqa: BLE001 -- the existing tray remains usable
+            pass
+        return 0
+    try:
+        return _run_tray()
+    finally:
+        _release_windows_tray_lock(lock_handle)
 
 
 if __name__ == "__main__":  # pragma: no cover -- exercised via main() in tests

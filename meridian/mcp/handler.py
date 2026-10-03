@@ -4780,6 +4780,7 @@ async def _handle_session_tools(
         handle_social_search,
         handle_zotero_search,
         handle_get_session_brief,
+        handle_get_project_state_milestones,
     )
     from .handlers.research_tools import (  # noqa: PLC0415
         handle_github_search,
@@ -4847,6 +4848,7 @@ async def _handle_session_tools(
         "list_research_runs": handle_list_research_runs,
         "promote_research_run": handle_promote_research_run,
         "get_session_brief": handle_get_session_brief,
+        "get_project_state_milestones": handle_get_project_state_milestones,
         "save_watchlist_query": handle_save_watchlist_query,
         "list_watchlist_queries": handle_list_watchlist_queries,
         "run_watchlist_query": handle_run_watchlist_query,
@@ -6882,6 +6884,7 @@ async def _handle_code_index_tools(
                 kind=kind,
                 db_path=db_path,
                 reindex=bool(reindex),
+                allow_broad_root=bool(args.get("allow_broad_root", False)),
                 label="search_code_semantic",
             )
         except _hardening.HeavyToolTimeout as exc:

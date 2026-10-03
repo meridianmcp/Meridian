@@ -54,7 +54,7 @@ jobs:
           name: meridian-tray-windows
           path: dist/meridian-tray.exe
 
-  # 73257801 -- macOS tray build (meridian-tray-mac, unsigned .app). Same
+  # macOS tray build (unsigned .app + drag-and-drop DMG). Same
   # PyInstaller+pystray mechanism as build-tray above (meridian/tray_main.py
   # has zero platform-specific code -- see meridian-tray.spec's own darwin
   # branch for where platform actually matters: hiddenimports and the
@@ -64,7 +64,8 @@ jobs:
   # constraint already accepted for the slim client per decision 80f1d4bc).
   # No UPX install step, matching build-mac-arm64's existing precedent for
   # this runner (pixi run -e dev build-tray still passes upx=True; PyInstaller
-  # skips compression gracefully when the upx binary isn't on PATH).
+  # skips compression gracefully when the upx binary isn't on PATH). The
+  # build-tray-mac task creates the ICNS asset from the shared Meridian mark.
   # Ships UNSIGNED / not notarized, matching build-tray's own Windows
   # precedent -- code signing/notarization is a deliberate, separate follow-up
   # (see meridian-tray.spec's module docstring for the macOS Gatekeeper
@@ -78,17 +79,25 @@ jobs:
           pixi-version: v0.79.0
           cache: true
       - name: Build macOS tray app bundle
-        run: pixi run -e dev build-tray
+        run: pixi run -e dev build-tray-mac
       - name: Zip app bundle
         # ditto (not a plain `zip`) preserves the .app bundle's resource
         # forks/extended attributes correctly -- Apple's own documented tool
         # for this, matching how Finder's own "Compress" does it.
         run: ditto -c -k --sequesterRsrc --keepParent dist/meridian-tray.app meridian-tray-mac.zip
+      - name: Create drag-and-drop DMG
+        run: |
+          mkdir -p dist/meridian-tray-dmg
+          ditto dist/meridian-tray.app dist/meridian-tray-dmg/Meridian.app
+          ln -s /Applications dist/meridian-tray-dmg/Applications
+          hdiutil create -volname Meridian -srcfolder dist/meridian-tray-dmg -ov -format UDZO meridian-tray-mac.dmg
       - name: Upload tray artifact
         uses: actions/upload-artifact@v4
         with:
           name: meridian-tray-mac
-          path: meridian-tray-mac.zip
+          path: |
+            meridian-tray-mac.zip
+            meridian-tray-mac.dmg
 
   build-linux:
     runs-on: ubuntu-latest
@@ -209,6 +218,7 @@ jobs:
             dist-artifacts/meridian-windows/meridian.exe \
             dist-artifacts/meridian-tray-windows/meridian-tray.exe \
             dist-artifacts/meridian-tray-mac/meridian-tray-mac.zip \
+            dist-artifacts/meridian-tray-mac/meridian-tray-mac.dmg \
             dist-artifacts/meridian-linux/meridian-linux \
             dist-artifacts/meridian-mac-arm64/meridian-mac-arm64 \
             dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux \
@@ -237,6 +247,7 @@ jobs:
             dist-artifacts/meridian-windows/meridian.exe
             dist-artifacts/meridian-tray-windows/meridian-tray.exe
             dist-artifacts/meridian-tray-mac/meridian-tray-mac.zip
+            dist-artifacts/meridian-tray-mac/meridian-tray-mac.dmg
             dist-artifacts/meridian-linux/meridian-linux
             dist-artifacts/meridian-mac-arm64/meridian-mac-arm64
             dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux

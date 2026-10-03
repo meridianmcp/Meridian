@@ -7596,13 +7596,26 @@ grep -qE '"name"[[:space:]]*:[[:space:]]*"mcp__[^"]*__claim_sprint_item"' "$tp" 
 sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)".*/\\1/' || true)"
 url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count"
 [ -n "$sid" ] && url="$url?session_id=$sid"
+# Hosted instances require a bearer token. Read it from the hook environment,
+# validate it, and pass it to curl through stdin config so it never appears in
+# the process arguments or this hook's output.
+_auth_token="${MERIDIAN_TOKEN:-${BEARER_TOKEN:-}}"
+_auth_config=""
+if [[ "$_auth_token" =~ ^[A-Za-z0-9._~+/-]+=*$ ]]; then
+  _auth_quote='"'
+  _auth_config="header = ${_auth_quote}Authorization: Bearer ${_auth_token}${_auth_quote}"
+fi
 # 41f26499 -- a Meridian-unreachable window (or a malformed/empty response)
 # used to fail open SILENTLY here, which could abandon this session's file
 # claims with no visible signal (they then only clear via the file-claim 2h
 # TTL). Fail-open behavior is UNCHANGED (still exit 0) but now surfaces a
 # clear stderr warning so the human/agent notices instead of silently
 # continuing.
-resp="$(curl -sf --connect-timeout 1 --max-time 5 "$url" 2>/dev/null || true)"
+if [ -n "$_auth_config" ]; then
+  resp="$(printf '%s\\n' "$_auth_config" | curl -sf --connect-timeout 1 --max-time 5 --config - "$url" 2>/dev/null || true)"
+else
+  resp="$(curl -sf --connect-timeout 1 --max-time 5 "$url" 2>/dev/null || true)"
+fi
 if [ -z "$resp" ]; then
   echo "Meridian (41f26499): could not reach $MERIDIAN_URL to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again." >&2
   exit 0
@@ -7732,8 +7745,13 @@ $reqUrl = "$live/projects/$ProjectId/sprint/pending_count"
 if ($payload -and $payload.session_id) {
     $reqUrl = "${reqUrl}?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
 }
+$authHeaders = @{}
+$authToken = if ($env:MERIDIAN_TOKEN) { [string]$env:MERIDIAN_TOKEN } else { [string]$env:BEARER_TOKEN }
+if ($authToken -match '^[A-Za-z0-9._~+/-]+=*$') {
+    $authHeaders["Authorization"] = "Bearer $authToken"
+}
 try {
-    $r = Invoke-RestMethod -Method GET -Uri $reqUrl -TimeoutSec 5
+    $r = Invoke-RestMethod -Method GET -Uri $reqUrl -Headers $authHeaders -TimeoutSec 5
 } catch {
     [Console]::Error.WriteLine("Meridian (41f26499): could not reach $Url to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again.")
     exit 0

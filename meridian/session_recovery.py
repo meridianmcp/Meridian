@@ -59,7 +59,9 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +76,7 @@ __all__ = [
     "DEFAULT_STALE_AFTER_SECONDS",
     "DEFAULT_DEAD_AFTER_SECONDS",
     "SNAPSHOT_SCHEMA_VERSION",
+    "CLIENT_LOCAL_RECOVERY_SCHEMA_VERSION",
     "LOCAL_ONLY_IDENTITY_KEYS",
     "validate_transport",
     "validate_lifecycle_status",
@@ -85,6 +88,12 @@ __all__ = [
     "session_recovery_snapshot_path",
     "write_local_recovery_snapshot",
     "read_local_recovery_snapshot",
+    "default_client_local_recovery_data_dir",
+    "client_local_recovery_snapshot_path",
+    "read_client_local_recovery_snapshot",
+    "prepare_client_local_registration",
+    "record_client_local_agent_lifecycle",
+    "client_local_recovery_context",
     "build_log_description",
 ]
 
@@ -115,6 +124,10 @@ DEFAULT_STALE_AFTER_SECONDS = 15 * 60       # 15 minutes with no heartbeat
 DEFAULT_DEAD_AFTER_SECONDS = 6 * 60 * 60    # 6 hours with no heartbeat
 
 SNAPSHOT_SCHEMA_VERSION = 1
+CLIENT_LOCAL_RECOVERY_SCHEMA_VERSION = 1
+CLIENT_LOCAL_RECOVERY_MAX_RECORDS = 512
+CLIENT_LOCAL_AGENT_LIMIT = 128
+_CLIENT_LOCAL_RECOVERY_LOCK = threading.RLock()
 MAX_METADATA_BYTES = 20_000
 
 # Identity fields that must NEVER cross into hosted metadata -- these are
@@ -496,6 +509,347 @@ def new_local_ref_id() -> str:
     snapshot file, safe to persist hosted-side (it is not derived from, and
     does not embed, any sensitive identity value)."""
     return uuid.uuid4().hex
+
+
+def default_client_local_recovery_data_dir() -> Path:
+    """Return this workstation's private state root, never the hosted server's data_dir."""
+    override = os.environ.get("MERIDIAN_SESSION_RECOVERY_STATE_DIR", "").strip()
+    return Path(override).expanduser() if override else Path.home() / ".meridian"
+
+
+def client_local_recovery_snapshot_path(data_dir: str | os.PathLike[str]) -> Path:
+    """Path to the caller-only identity map shared by local Claude hooks."""
+    return Path(data_dir) / "session_recovery" / "client_local.json"
+
+
+@contextmanager
+def _client_snapshot_file_lock(path: Path):
+    """Serialize short client snapshot updates across hook processes."""
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt  # noqa: PLC0415
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            deadline = time.monotonic() + 3.0
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out waiting for local recovery snapshot lock")
+                    time.sleep(0.02)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl  # noqa: PLC0415
+
+            deadline = time.monotonic() + 3.0
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out waiting for local recovery snapshot lock")
+                    time.sleep(0.02)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _empty_client_local_snapshot() -> dict[str, Any]:
+    return {
+        "schema_version": CLIENT_LOCAL_RECOVERY_SCHEMA_VERSION,
+        "records": {},
+        "pending_agents": {},
+    }
+
+
+def _read_client_local_snapshot_unlocked(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _empty_client_local_snapshot()
+    payload = json.loads(raw)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != CLIENT_LOCAL_RECOVERY_SCHEMA_VERSION
+        or not isinstance(payload.get("records"), dict)
+        or not isinstance(payload.get("pending_agents"), dict)
+    ):
+        raise ValueError("invalid caller-local recovery snapshot")
+    return payload
+
+
+def _write_client_local_snapshot_unlocked(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+        if os.name != "nt":
+            path.chmod(0o600)
+    except (OSError, TypeError, ValueError):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _update_client_local_snapshot(data_dir: str | os.PathLike[str], updater: Any) -> Any:
+    path = client_local_recovery_snapshot_path(data_dir)
+    with _CLIENT_LOCAL_RECOVERY_LOCK, _client_snapshot_file_lock(path):
+        snapshot = _read_client_local_snapshot_unlocked(path)
+        result = updater(snapshot)
+        _write_client_local_snapshot_unlocked(path, snapshot)
+        return result
+
+
+def read_client_local_recovery_snapshot(data_dir: str | os.PathLike[str]) -> dict[str, Any]:
+    """Read the workstation-only registry; hosted handlers never use this file."""
+    path = client_local_recovery_snapshot_path(data_dir)
+    with _CLIENT_LOCAL_RECOVERY_LOCK, _client_snapshot_file_lock(path):
+        return _read_client_local_snapshot_unlocked(path)
+
+
+def _bounded_local_text(value: Any, field: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    value = value.strip()
+    if not value or len(value) > maximum or any(ord(char) < 32 for char in value):
+        raise ValueError(f"{field} is empty, too long, or contains control characters")
+    return value
+
+
+def _trim_local_rows(rows: dict[str, Any], limit: int) -> dict[str, Any]:
+    if len(rows) <= limit:
+        return rows
+    keep = sorted(
+        rows.items(),
+        key=lambda pair: str(pair[1].get("updated_at", ""))
+        if isinstance(pair[1], dict) else "",
+    )[-limit:]
+    return dict(keep)
+
+
+def prepare_client_local_registration(
+    data_dir: str | os.PathLike[str],
+    tool_input: dict[str, Any],
+    *,
+    provider_session_id: str | None,
+) -> dict[str, Any] | None:
+    """Persist local identity on the caller, then return redacted hosted arguments."""
+    identity_input = tool_input.get("local_identity")
+    if identity_input in (None, {}):
+        return None
+    if not isinstance(identity_input, dict):
+        raise ValueError("local_identity must be an object")
+
+    allowed_identity = {
+        key: identity_input[key]
+        for key in ("local_session_id", "bridge_id", "environment_id", "local_transcript_path", "argv")
+        if key in identity_input and identity_input[key] is not None
+    }
+    if provider_session_id:
+        allowed_identity["local_session_id"] = _bounded_local_text(
+            provider_session_id, "provider session id", 256
+        )
+    for key in ("local_session_id", "bridge_id", "environment_id", "local_transcript_path"):
+        if key in allowed_identity:
+            allowed_identity[key] = _bounded_local_text(allowed_identity[key], key, 4096)
+    if "argv" in allowed_identity:
+        argv = allowed_identity["argv"]
+        if (
+            not isinstance(argv, list)
+            or len(argv) > 128
+            or any(not isinstance(part, str) or len(part) > 4096 for part in argv)
+        ):
+            raise ValueError("local_identity.argv must be a bounded list of strings")
+
+    transport = validate_transport(tool_input.get("transport"))
+    client_type = tool_input.get("client_type")
+    recipe, blocked_reason = build_resume_recipe(transport, client_type, allowed_identity)
+    local_ref_id = new_local_ref_id()
+    provider_sid = allowed_identity.get("local_session_id")
+    entry = {
+        "meridian_session_id": _bounded_local_text(tool_input.get("session_id"), "session_id", 256),
+        "project_reference": tool_input.get("project_id") or tool_input.get("project_name"),
+        "provider_session_id": provider_sid,
+        "local_identity": allowed_identity,
+        "transport": transport,
+        "client_type": client_type,
+        "resume_recipe": recipe,
+        "resume_blocked_reason": blocked_reason,
+        "agents": {},
+        "updated_at": utcnow_iso(),
+    }
+
+    def update(snapshot: dict[str, Any]) -> None:
+        agents = snapshot["pending_agents"].pop(provider_sid, {}) if provider_sid else {}
+        if isinstance(agents, dict):
+            entry["agents"] = agents
+        snapshot["records"][local_ref_id] = entry
+        snapshot["records"] = _trim_local_rows(
+            snapshot["records"], CLIENT_LOCAL_RECOVERY_MAX_RECORDS
+        )
+        snapshot["pending_agents"] = _trim_local_rows(snapshot["pending_agents"], 512)
+
+    _update_client_local_snapshot(data_dir, update)
+    redacted = dict(tool_input)
+    redacted.pop("local_identity", None)
+    redacted["local_ref_id"] = local_ref_id
+    redacted["verified_resumable"] = recipe is not None
+    return redacted
+
+
+def record_client_local_agent_lifecycle(
+    data_dir: str | os.PathLike[str], payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Record subagent IDs and lifecycle state locally, ignoring transcript data."""
+    event = payload.get("hook_event_name")
+    if event not in {"SubagentStart", "SubagentStop"}:
+        return None
+    provider_sid = payload.get("session_id")
+    agent_id = payload.get("agent_id")
+    if not isinstance(provider_sid, str) or not provider_sid.strip():
+        return None
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        return None
+    provider_sid = _bounded_local_text(provider_sid, "provider session id", 256)
+    agent_id = _bounded_local_text(agent_id, "agent id", 256)
+    agent_type = payload.get("agent_type")
+    if isinstance(agent_type, str) and agent_type.strip():
+        agent_type = _bounded_local_text(agent_type, "agent type", 128)
+    else:
+        agent_type = "unknown"
+    now = utcnow_iso()
+    is_start = event == "SubagentStart"
+    event_record = {
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "status": "active" if is_start else "completed",
+        "started_at": now if is_start else None,
+        "ended_at": None if is_start else now,
+        "updated_at": now,
+    }
+
+    def update(snapshot: dict[str, Any]) -> dict[str, Any]:
+        for record in snapshot["records"].values():
+            if isinstance(record, dict) and record.get("provider_session_id") == provider_sid:
+                agents = record.setdefault("agents", {})
+                previous = agents.get(agent_id, {})
+                if isinstance(previous, dict):
+                    if is_start and previous.get("status") == "active":
+                        event_record["started_at"] = previous.get("started_at") or now
+                    elif not is_start:
+                        event_record["started_at"] = previous.get("started_at")
+                agents[agent_id] = event_record
+                record["agents"] = _trim_local_rows(agents, CLIENT_LOCAL_AGENT_LIMIT)
+                record["updated_at"] = now
+                return {"ok": True, "bound": True, "status": event_record["status"]}
+
+        pending = snapshot["pending_agents"].setdefault(provider_sid, {})
+        previous = pending.get(agent_id, {})
+        if isinstance(previous, dict):
+            if is_start and previous.get("status") == "active":
+                event_record["started_at"] = previous.get("started_at") or now
+            elif not is_start:
+                event_record["started_at"] = previous.get("started_at")
+        pending[agent_id] = event_record
+        snapshot["pending_agents"] = _trim_local_rows(snapshot["pending_agents"], 512)
+        return {"ok": True, "bound": False, "status": event_record["status"]}
+
+    return _update_client_local_snapshot(data_dir, update)
+
+
+def _extract_recovery_record(value: Any, depth: int = 0) -> dict[str, Any] | None:
+    if depth > 6:
+        return None
+    if isinstance(value, str):
+        try:
+            return _extract_recovery_record(json.loads(value), depth + 1)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, list):
+        for item in value:
+            result = _extract_recovery_record(item, depth + 1)
+            if result is not None:
+                return result
+        return None
+    if not isinstance(value, dict):
+        return None
+    recovery = value.get("recovery")
+    if isinstance(recovery, dict):
+        return recovery
+    for key in ("structuredContent", "result", "data", "content", "text"):
+        if key in value:
+            result = _extract_recovery_record(value[key], depth + 1)
+            if result is not None:
+                return result
+    return None
+
+
+def client_local_recovery_context(
+    data_dir: str | os.PathLike[str],
+    tool_response: Any,
+    *,
+    expected_session_id: str,
+) -> str | None:
+    """Return a workstation-only recipe summary for a matching hosted result."""
+    hosted_record = _extract_recovery_record(tool_response)
+    if not hosted_record:
+        return None
+    local_ref_id = hosted_record.get("local_ref_id")
+    session_id = hosted_record.get("meridian_session_id")
+    if (
+        not isinstance(local_ref_id, str)
+        or not isinstance(session_id, str)
+        or session_id != expected_session_id
+    ):
+        return None
+    snapshot = read_client_local_recovery_snapshot(data_dir)
+    local_record = snapshot["records"].get(local_ref_id)
+    if (
+        not isinstance(local_record, dict)
+        or local_record.get("meridian_session_id") != session_id
+    ):
+        return None
+    summary: dict[str, Any] = {
+        "meridian_session_id": session_id,
+        "resume_blocked_reason": local_record.get("resume_blocked_reason"),
+        "agents": [
+            {
+                "agent_id": entry.get("agent_id"),
+                "agent_type": entry.get("agent_type"),
+                "status": entry.get("status"),
+            }
+            for entry in local_record.get("agents", {}).values()
+            if isinstance(entry, dict)
+        ],
+    }
+    recipe = local_record.get("resume_recipe")
+    if recipe is not None:
+        summary["resume_recipe"] = recipe
+    return (
+        "Caller-local recovery details matched this Meridian session by its opaque "
+        "local reference. This data stays on this workstation. Review any resume recipe "
+        "before using it:\n"
+        + json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True)
+    )
 
 
 def build_log_description(action: str, record: dict[str, Any]) -> str:

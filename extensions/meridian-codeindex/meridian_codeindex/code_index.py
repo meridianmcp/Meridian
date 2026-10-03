@@ -472,21 +472,17 @@ class MerkleNode:
 
 @dataclass
 class MerkleTree:
-    """A persisted Merkle tree over a source directory's indexable files.
-
-    :meth:`diff` against a previous tree returns exactly the set of files that
-    were added / modified / deleted, computed by comparing hashes top-down and
-    skipping any subtree whose interior hash is unchanged.
-    """
+    """A Merkle tree over a source scope and its indexable files."""
 
     root: MerkleNode
+    scan_info: dict[str, Any] | None = None
 
     @property
     def root_hash(self) -> str:
         return self.root.hash
 
     def files(self) -> dict[str, str]:
-        """``{rel_path: content_hash}`` for every leaf (file) in the tree."""
+        """Return relative paths and content hashes for all leaves."""
         out: dict[str, str] = {}
 
         def _walk(node: MerkleNode) -> None:
@@ -500,15 +496,14 @@ class MerkleTree:
         return out
 
     def diff(self, previous: "MerkleTree | None") -> "MerkleDiff":
-        """Files added / modified / removed vs ``previous`` (``None`` → all added).
-
-        The top-down hash compare is the whole point: if a directory node's hash
-        equals the previous tree's node at the same path, its ENTIRE subtree is
-        identical and is skipped without descending (O(1) per unchanged dir).
-        """
+        """Return files added, modified or removed against a prior tree."""
+        if previous is not None:
+            current_scope = (self.scan_info or {}).get("scope_id")
+            previous_scope = (previous.scan_info or {}).get("scope_id")
+            if current_scope and previous_scope and current_scope != previous_scope:
+                previous = None
         if previous is None:
-            added = sorted(self.files().keys())
-            return MerkleDiff(added=added, modified=[], removed=[])
+            return MerkleDiff(added=sorted(self.files()), modified=[], removed=[])
         if self.root_hash == previous.root_hash:
             return MerkleDiff(added=[], modified=[], removed=[])
 
@@ -517,7 +512,6 @@ class MerkleTree:
         removed: list[str] = []
 
         def _descend(cur: MerkleNode | None, old: MerkleNode | None) -> None:
-            # Both present and identical hash → whole subtree unchanged, skip.
             if cur is not None and old is not None and cur.hash == old.hash:
                 return
             if cur is not None and cur.is_file:
@@ -536,16 +530,26 @@ class MerkleTree:
 
         _descend(self.root, previous.root)
         return MerkleDiff(
-            added=sorted(added), modified=sorted(modified),
+            added=sorted(added),
+            modified=sorted(modified),
             removed=sorted(removed),
         )
 
     def to_json(self) -> str:
-        return json.dumps(self.root.to_dict())
+        return json.dumps(
+            {"root": self.root.to_dict(), "scan_info": self.scan_info or {}},
+            sort_keys=True,
+        )
 
     @classmethod
     def from_json(cls, blob: str) -> "MerkleTree":
-        return cls(root=MerkleNode.from_dict(json.loads(blob)))
+        payload = json.loads(blob)
+        if isinstance(payload, dict) and isinstance(payload.get("root"), dict):
+            return cls(
+                root=MerkleNode.from_dict(payload["root"]),
+                scan_info=payload.get("scan_info") or None,
+            )
+        return cls(root=MerkleNode.from_dict(payload))
 
 
 @dataclass
@@ -581,52 +585,474 @@ def _hash_file_bytes(path: str) -> str | None:
         return None
 
 
-def _iter_indexable_files(root_dir: str) -> Iterable[str]:
-    """Yield absolute paths of every indexable source file under ``root_dir``.
 
-    Prunes :data:`_SKIP_DIRS` in-place so vendored/build trees are never walked.
+def _run_bounded_nul_list(
+    command: list[str],
+    *,
+    max_entries: int,
+    max_bytes: int,
+    deadline: float,
+) -> tuple[list[bytes], str | None]:
+    """Read a NUL-delimited subprocess stream with strict count/byte/time bounds."""
+    import queue
+    import subprocess
+    import threading
+
+    if max_entries < 1 or max_bytes < 1:
+        return [], "file_list_budget_exceeded"
+    try:
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except OSError:
+        return [], "tracked_file_list_unavailable"
+
+    chunks: queue.Queue[bytes | object] = queue.Queue(maxsize=4)
+    finished = object()
+    reader_errors: list[OSError] = []
+
+    def publish(value: bytes | object) -> None:
+        while True:
+            try:
+                chunks.put(value, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def read_stdout() -> None:
+        try:
+            if proc.stdout is not None:
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    publish(chunk)
+        except OSError as exc:
+            reader_errors.append(exc)
+        finally:
+            publish(finished)
+
+    reader = threading.Thread(target=read_stdout, name="meridian-git-path-reader", daemon=True)
+    reader.start()
+    paths: list[bytes] = []
+    buffered = bytearray()
+    total_bytes = 0
+    reason: str | None = None
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            reason = "time_budget_exceeded"
+            break
+        try:
+            chunk = chunks.get(timeout=min(0.1, remaining))
+        except queue.Empty:
+            continue
+        if chunk is finished:
+            break
+        assert isinstance(chunk, bytes)
+        if total_bytes + len(chunk) > max_bytes:
+            reason = "file_list_byte_budget_exceeded"
+            break
+        total_bytes += len(chunk)
+        buffered.extend(chunk)
+        while True:
+            try:
+                end = buffered.index(0)
+            except ValueError:
+                break
+            path = bytes(buffered[:end])
+            del buffered[: end + 1]
+            if not path:
+                continue
+            if len(paths) >= max_entries:
+                reason = "file_list_entry_budget_exceeded"
+                break
+            paths.append(path)
+        if reason:
+            break
+
+    if reason is None:
+        try:
+            remaining = max(0.001, deadline - time.monotonic())
+            return_code = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            reason = "time_budget_exceeded"
+        else:
+            if reader_errors:
+                reason = "tracked_file_list_unavailable"
+            elif return_code != 0:
+                reason = "tracked_file_list_unavailable"
+            elif buffered:
+                reason = "tracked_file_list_malformed"
+
+    if reason is not None and proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    if reason is not None:
+        # Drain while the reader exits so a full queue cannot strand its thread.
+        while reader.is_alive():
+            try:
+                chunks.get(timeout=0.05)
+            except queue.Empty:
+                pass
+    reader.join(timeout=0.5)
+    try:
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    return paths, reason
+
+def _iter_indexable_files(
+    root_dir: str,
+    *,
+    scan_info: dict[str, Any] | None = None,
+    allow_broad_root: bool = False,
+    max_files: int = 20_000,
+    max_file_bytes: int = 4_000_000,
+    max_total_bytes: int = 512_000_000,
+    max_seconds: float = 30.0,
+) -> Iterable[str]:
+    """Yield a bounded, deterministic view of one canonical source root.
+
+    Git scope enumeration itself is bounded in elapsed time, path count, and
+    bytes before paths are materialized. Git projects default to tracked files,
+    then a bounded check-ignore pass removes ignored tracked source. Small
+    non-Git projects use a bounded walk. Broad non-project roots are refused
+    unless explicitly opted in. scan_info records truthful completeness.
     """
-    for cur, dirs, files in os.walk(root_dir):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
-        for fn in files:
-            if is_indexable(fn):
-                yield os.path.join(cur, fn)
+    import subprocess
+
+    info = scan_info if scan_info is not None else {}
+    root = normalize_root_dir(root_dir)
+    excluded = _SKIP_DIRS | {
+        ".codex", ".serena", ".cache", "cache", "caches",
+        "OneDrive", "Dropbox", "Google Drive", "iCloud Drive", "iCloudDrive",
+    }
+    excluded_folded = {name.casefold() for name in excluded}
+    scope_id = hashlib.sha256(
+        os.path.normcase(root).encode("utf-8", "surrogatepass")
+    ).hexdigest()
+    info.update({
+        "canonical_root": root,
+        "scope_id": scope_id,
+        "repo_root": None,
+        "is_git_worktree": False,
+        "git_common_dir": None,
+        "scope_mode": "bounded_walk",
+        "scan_complete": True,
+        "scan_reason": None,
+        "indexed_file_count": 0,
+        "listed_path_count": 0,
+        "total_bytes": 0,
+        "excluded_paths": sorted(excluded, key=str.casefold),
+        "allow_broad_root": bool(allow_broad_root),
+    })
+    started = time.monotonic()
+    if not root or not os.path.isdir(root):
+        info.update(
+            scan_complete=False, scan_reason="root_missing", scope_mode="unavailable"
+        )
+        return
+
+    def mark_partial(reason: str) -> None:
+        info["scan_complete"] = False
+        if info["scan_reason"] is None:
+            info["scan_reason"] = reason
+
+    def inside_root(path: str) -> bool:
+        try:
+            return os.path.commonpath([root, os.path.realpath(path)]) == root
+        except (OSError, ValueError):
+            return False
+
+    probe_timeout = max(0.25, min(3.0, max_seconds))
+    try:
+        git_root_result = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=probe_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        mark_partial("git_scope_probe_timed_out")
+        info["scope_mode"] = "unavailable"
+        return
+
+    if git_root_result.returncode == 0 and git_root_result.stdout.strip():
+        repo_root = normalize_root_dir(git_root_result.stdout.strip())
+        info["repo_root"] = repo_root
+        git_marker = os.path.join(repo_root, ".git")
+        info["is_git_worktree"] = os.path.isfile(git_marker)
+        try:
+            common_result = subprocess.run(
+                ["git", "-C", root, "rev-parse", "--git-common-dir"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=max(0.25, min(3.0, max_seconds)),
+            )
+        except subprocess.TimeoutExpired:
+            mark_partial("git_identity_probe_timed_out")
+            info["scope_mode"] = "unavailable"
+            return
+        if common_result.returncode != 0 or not common_result.stdout.strip():
+            mark_partial("git_identity_probe_failed")
+            info["scope_mode"] = "unavailable"
+            return
+        common = common_result.stdout.strip()
+        if not os.path.isabs(common):
+            common = os.path.join(repo_root, common)
+        info["git_common_dir"] = os.path.realpath(common)
+        info["scope_mode"] = "git_tracked"
+
+        # A default proportional cap prevents a huge non-source file list from
+        # bypassing max_files before source filtering. The byte cap bounds both
+        # the subprocess reader and the materialized Python path list.
+        max_listed_paths = max(1024, min(100_000, max_files * 8))
+        max_listed_bytes = max(
+            8 * 1024 * 1024, min(64 * 1024 * 1024, max_listed_paths * 256)
+        )
+        deadline = started + max_seconds
+        tracked_bytes, list_error = _run_bounded_nul_list(
+            [
+                "git", "-C", root, "ls-files", "--cached", "--full-name", "-z",
+                "--", ".",
+            ],
+            max_entries=max_listed_paths,
+            max_bytes=max_listed_bytes,
+            deadline=deadline,
+        )
+        info["listed_path_count"] = len(tracked_bytes)
+        if list_error:
+            mark_partial(list_error)
+            return
+        tracked_paths = sorted({
+            os.fsdecode(part).replace("\\", "/") for part in tracked_bytes if part
+        })
+
+        candidate_paths: list[str] = []
+        for rel_repo_path in tracked_paths:
+            parts = rel_repo_path.split("/")
+            if any(part.casefold() in excluded_folded for part in parts):
+                continue
+            if not is_indexable(rel_repo_path):
+                continue
+            abs_path = os.path.join(repo_root, *parts)
+            if inside_root(abs_path) and os.path.isfile(abs_path):
+                candidate_paths.append(rel_repo_path)
+
+        ignored_paths: set[str] = set()
+        if candidate_paths:
+            remaining = max_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                mark_partial("time_budget_exceeded")
+                return
+            try:
+                ignored_result = subprocess.run(
+                    [
+                        "git", "-C", repo_root, "check-ignore", "--no-index",
+                        "--stdin", "-z",
+                    ],
+                    input=b"\0".join(os.fsencode(path) for path in candidate_paths) + b"\0",
+                    capture_output=True,
+                    check=False,
+                    timeout=remaining,
+                )
+            except subprocess.TimeoutExpired:
+                mark_partial("time_budget_exceeded")
+                return
+            if ignored_result.returncode not in (0, 1):
+                mark_partial("ignored_path_filter_unavailable")
+                return
+            ignored_paths = {
+                os.fsdecode(part).replace("\\", "/")
+                for part in ignored_result.stdout.split(b"\0") if part
+            }
+
+        yielded = 0
+        for rel_repo_path in candidate_paths:
+            if time.monotonic() - started > max_seconds:
+                mark_partial("time_budget_exceeded")
+                break
+            if yielded >= max_files:
+                mark_partial("file_count_budget_exceeded")
+                break
+            if rel_repo_path in ignored_paths:
+                continue
+            parts = rel_repo_path.split("/")
+            abs_path = os.path.join(repo_root, *parts)
+            try:
+                size = os.path.getsize(abs_path)
+            except OSError:
+                mark_partial("file_stat_failed")
+                continue
+            if size > max_file_bytes:
+                mark_partial("file_size_budget_exceeded")
+                continue
+            if int(info["total_bytes"]) + size > max_total_bytes:
+                mark_partial("total_size_budget_exceeded")
+                break
+            rel_to_root = os.path.relpath(abs_path, root).replace(os.sep, "/")
+            if rel_to_root in (".", "..") or rel_to_root.startswith("../"):
+                continue
+            yielded += 1
+            info["indexed_file_count"] = yielded
+            info["total_bytes"] = int(info["total_bytes"]) + size
+            yield abs_path
+        return
+
+    if os.path.exists(os.path.join(root, ".git")):
+        mark_partial("git_identity_unavailable")
+        info["scope_mode"] = "unavailable"
+        return
+
+    project_markers = (
+        "pyproject.toml", "package.json", "Cargo.toml", "go.mod",
+        "pom.xml", "build.gradle", "requirements.txt", "setup.py",
+        "CMakeLists.txt", "Makefile",
+    )
+    has_project_marker = any(os.path.isfile(os.path.join(root, name)) for name in project_markers)
+    home = normalize_root_dir(os.path.expanduser("~"))
+    drive, _ = os.path.splitdrive(root)
+    drive_root = drive + os.sep if drive else ""
+    broad_roots = {
+        home,
+        normalize_root_dir(os.path.dirname(home)),
+        normalize_root_dir(drive_root),
+    }
+    top_entries = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                top_entries.append(entry.name)
+                if len(top_entries) > 128:
+                    break
+    except OSError:
+        mark_partial("root_listing_failed")
+        info["scope_mode"] = "unavailable"
+        return
+    if not allow_broad_root and not has_project_marker and (
+        root in broad_roots or len(top_entries) > 128
+    ):
+        mark_partial("broad_root_refused")
+        info["scope_mode"] = "refused_broad_root"
+        return
+
+    yielded = 0
+    for current, dirs, files in os.walk(root, followlinks=False):
+        if time.monotonic() - started > max_seconds:
+            mark_partial("time_budget_exceeded")
+            break
+        dirs[:] = sorted(
+            d for d in dirs
+            if d.casefold() not in excluded_folded
+            and not os.path.islink(os.path.join(current, d))
+        )
+        for filename in sorted(files):
+            if not is_indexable(filename):
+                continue
+            if time.monotonic() - started > max_seconds:
+                mark_partial("time_budget_exceeded")
+                break
+            if yielded >= max_files:
+                mark_partial("file_count_budget_exceeded")
+                break
+            abs_path = os.path.join(current, filename)
+            if not inside_root(abs_path):
+                continue
+            try:
+                size = os.path.getsize(abs_path)
+            except OSError:
+                mark_partial("file_stat_failed")
+                continue
+            if size > max_file_bytes:
+                mark_partial("file_size_budget_exceeded")
+                continue
+            if int(info["total_bytes"]) + size > max_total_bytes:
+                mark_partial("total_size_budget_exceeded")
+                break
+            yielded += 1
+            info["indexed_file_count"] = yielded
+            info["total_bytes"] = int(info["total_bytes"]) + size
+            yield abs_path
+        if not info["scan_complete"]:
+            break
 
 
 def build_merkle_tree(
-    root_dir: str, *, hasher: Callable[[str], str | None] = _hash_file_bytes,
+    root_dir: str,
+    *,
+    hasher: Callable[[str], str | None] = _hash_file_bytes,
+    allow_broad_root: bool = False,
+    max_files: int = 20_000,
+    max_file_bytes: int = 4_000_000,
+    max_total_bytes: int = 512_000_000,
+    max_seconds: float = 30.0,
 ) -> MerkleTree:
-    """Build the content Merkle tree over the indexable files under ``root_dir``.
-
-    Only indexable source files (Python/TS/JS) become leaves; empty directories
-    and skipped subtrees contribute nothing. ``hasher`` is injectable for tests.
-    A file that can't be read is hashed as the empty string so it still appears
-    (and a later read that succeeds shows up as a modification).
-    """
-    root_dir = os.path.abspath(root_dir)
-    # Build a nested dict of the relative path segments → leaf hashes.
+    """Build a content tree plus explicit scope and completeness metadata."""
+    root_dir = normalize_root_dir(root_dir)
+    scan_info: dict[str, Any] = {}
     file_hashes: dict[str, str] = {}
-    for abs_path in _iter_indexable_files(root_dir):
+    unreadable = 0
+    for abs_path in _iter_indexable_files(
+        root_dir,
+        scan_info=scan_info,
+        allow_broad_root=allow_broad_root,
+        max_files=max_files,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        max_seconds=max_seconds,
+    ):
         rel = os.path.relpath(abs_path, root_dir).replace(os.sep, "/")
-        file_hashes[rel] = hasher(abs_path) or ""
+        try:
+            digest = hasher(abs_path)
+        except Exception:  # noqa: BLE001 — unreadable hashes must fail closed
+            digest = None
+        if digest is None:
+            unreadable += 1
+            scan_info["scan_complete"] = False
+            if scan_info.get("scan_reason") is None:
+                scan_info["scan_reason"] = "file_hash_failed"
+            continue
+        file_hashes[rel] = digest
 
+    if unreadable:
+        scan_info["unreadable_file_count"] = unreadable
     root = MerkleNode(rel_path="", is_file=False, hash="")
-    for rel, h in sorted(file_hashes.items()):
+    for rel, content_hash in sorted(file_hashes.items()):
         segments = rel.split("/")
         node = root
-        for i, seg in enumerate(segments):
+        for i, segment in enumerate(segments):
             is_last = i == len(segments) - 1
-            child = node.children.get(seg)
+            child = node.children.get(segment)
             if child is None:
                 child_rel = "/".join(segments[: i + 1])
                 child = MerkleNode(
-                    rel_path=child_rel, is_file=is_last,
-                    hash=(h if is_last else ""),
+                    rel_path=child_rel,
+                    is_file=is_last,
+                    hash=content_hash if is_last else "",
                 )
-                node.children[seg] = child
+                node.children[segment] = child
             node = child
     _recompute_hashes(root)
-    return MerkleTree(root=root)
+    return MerkleTree(root=root, scan_info=scan_info)
 
 
 def _recompute_hashes(node: MerkleNode) -> str:
@@ -781,10 +1207,7 @@ class _Embedder:
 
 @dataclass(frozen=True)
 class IndexConvergenceState:
-    """A single, explicit snapshot of how fresh/converged one
-    :class:`CodeIndex`'s embeddings are, right now. See
-    :meth:`CodeIndex.get_convergence_state`.
-    """
+    """A structured freshness and scope snapshot for one code index."""
 
     root_dir: str
     source_fingerprint: str | None
@@ -798,6 +1221,16 @@ class IndexConvergenceState:
     last_checkpoint_at: float | None
     degraded: bool
     converged: bool
+    canonical_root: str | None = None
+    scope_id: str | None = None
+    is_git_worktree: bool | None = None
+    git_common_dir: str | None = None
+    scope_mode: str | None = None
+    scan_complete: bool = False
+    scan_reason: str | None = None
+    indexed_file_count: int = 0
+    total_bytes: int = 0
+    excluded_paths: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -835,9 +1268,66 @@ class CodeIndex:
         connection: Any = None,
         embedder: _Embedder | None = None,
         hasher: Callable[[str], str | None] = _hash_file_bytes,
+        allow_broad_root: bool = False,
     ) -> None:
-        self.root_dir = os.path.abspath(root_dir)
-        self._db_path = db_path
+        canonical_root = normalize_root_dir(root_dir)
+        self.root_dir = canonical_root or os.path.realpath(os.path.abspath(root_dir))
+        scope_id = hashlib.sha256(
+            os.path.normcase(self.root_dir).encode("utf-8", "surrogatepass")
+        ).hexdigest()
+        git_common_dir = None
+        is_git_worktree = False
+        git_marker = os.path.join(self.root_dir, ".git")
+        if os.path.isdir(git_marker):
+            git_common_dir = os.path.realpath(git_marker)
+        elif os.path.isfile(git_marker):
+            try:
+                with open(git_marker, "r", encoding="utf-8", errors="replace") as stream:
+                    first_line = stream.readline().strip()
+                if first_line.lower().startswith("gitdir:"):
+                    git_dir = first_line.split(":", 1)[1].strip()
+                    if not os.path.isabs(git_dir):
+                        git_dir = os.path.join(self.root_dir, git_dir)
+                    git_dir = os.path.realpath(git_dir)
+                    is_git_worktree = True
+                    parent = os.path.dirname(git_dir)
+                    git_common_dir = (
+                        os.path.dirname(parent)
+                        if os.path.basename(parent).casefold() == "worktrees"
+                        else git_dir
+                    )
+            except OSError:
+                pass
+        excluded = sorted(
+            _SKIP_DIRS | {
+                ".codex", ".serena", ".cache", "cache", "caches",
+                "OneDrive", "Dropbox", "Google Drive", "iCloud Drive", "iCloudDrive",
+            },
+            key=str.casefold,
+        )
+        self._allow_broad_root = bool(allow_broad_root)
+        cache_policy = "broad" if self._allow_broad_root else "default"
+        cache_scope_id = hashlib.sha256(
+            f"{scope_id}:{cache_policy}".encode("utf-8")
+        ).hexdigest()
+        self._root_identity = {
+            "canonical_root": self.root_dir,
+            "scope_id": scope_id,
+            "cache_scope_id": cache_scope_id,
+            "cache_policy": cache_policy,
+            "is_git_worktree": is_git_worktree,
+            "git_common_dir": git_common_dir,
+            "excluded_paths": excluded,
+        }
+        if connection is None and db_path not in ("", ":memory:"):
+            base_path = os.path.abspath(os.path.expanduser(db_path))
+            stem, suffix = os.path.splitext(base_path)
+            suffix = suffix or ".duckdb"
+            self._db_path = (
+                f"{stem}.root-{scope_id[:16]}.{cache_policy}{suffix}"
+            )
+        else:
+            self._db_path = db_path
         self._hasher = hasher
         self._embedder = embedder if embedder is not None else _Embedder()
         self._lock = threading.RLock()
@@ -846,10 +1336,6 @@ class CodeIndex:
         self._fts_built = False
         self._vss_ready = False
         self._vss_dim: int | None = None
-        # e631d54f — in-memory mirror of the persisted index_revision, kept
-        # in lockstep by reindex()/index_paths() so a caller that just
-        # bumped it doesn't need a round-trip through _load_meta() to see
-        # its own write reflected.
         self._index_revision: int = 0
 
     # -- connection / schema -------------------------------------------------
@@ -872,19 +1358,13 @@ class CodeIndex:
             "CREATE TABLE IF NOT EXISTS code_index_meta ("
             "id INTEGER PRIMARY KEY, merkle_json VARCHAR, "
             "embedding_model VARCHAR, index_revision INTEGER, "
-            "last_checkpoint_at DOUBLE)"
+            "last_checkpoint_at DOUBLE, scope_info_json VARCHAR)"
         )
-        # e631d54f — migrate a sidecar DB persisted before these freshness
-        # columns existed (same upgrade shape as outputs_local's
-        # _HASH_ALGO_VERSION precedent). ADD COLUMN IF NOT EXISTS is a no-op
-        # on an already-current schema, so this is cheap to run on every
-        # connect; any failure (e.g. a DuckDB build without IF NOT EXISTS
-        # support) is swallowed — the meta row simply keeps its existing
-        # columns and freshness tracking degrades gracefully to defaults.
         for col, coltype in (
             ("embedding_model", "VARCHAR"),
             ("index_revision", "INTEGER"),
             ("last_checkpoint_at", "DOUBLE"),
+            ("scope_info_json", "VARCHAR"),
         ):
             try:
                 con.execute(
@@ -901,51 +1381,72 @@ class CodeIndex:
     }
 
     def _load_meta(self, con: Any) -> dict[str, Any]:
-        """Load the persisted Merkle tree + embedding-freshness state.
-
-        Never raises — a missing/corrupt/pre-migration row falls back to
-        :data:`_META_DEFAULTS` (revision 0, no model, no checkpoint) so a
-        fresh or partially-written sidecar can't crash a caller's lifecycle
-        hook.
-        """
+        """Load the last complete tree and latest explicit scope state."""
+        defaults = dict(self._META_DEFAULTS)
+        defaults.setdefault("scan_info", None)
         try:
             rows = con.execute(
                 "SELECT merkle_json, embedding_model, index_revision, "
-                "last_checkpoint_at FROM code_index_meta WHERE id = 1"
+                "last_checkpoint_at, scope_info_json "
+                "FROM code_index_meta WHERE id = 1"
             ).fetchall()
         except Exception:  # noqa: BLE001
-            return dict(self._META_DEFAULTS)
+            return defaults
         if not rows:
-            return dict(self._META_DEFAULTS)
-        merkle_json, embedding_model, index_revision, last_checkpoint_at = rows[0]
+            return defaults
+        merkle_json, embedding_model, index_revision, last_checkpoint_at, scope_json = rows[0]
         merkle: MerkleTree | None = None
         if merkle_json:
             try:
                 merkle = MerkleTree.from_json(merkle_json)
             except Exception:  # noqa: BLE001
                 merkle = None
+        scan_info = None
+        if scope_json:
+            try:
+                scan_info = json.loads(scope_json)
+            except (TypeError, ValueError):
+                scan_info = None
+        if scan_info is None and merkle is not None:
+            scan_info = merkle.scan_info
         return {
             "merkle": merkle,
             "embedding_model": embedding_model,
             "index_revision": int(index_revision) if index_revision is not None else 0,
             "last_checkpoint_at": last_checkpoint_at,
+            "scan_info": scan_info,
         }
 
     def _store_meta(
         self,
         con: Any,
         *,
-        tree: MerkleTree,
+        tree: MerkleTree | None,
         embedding_model: str | None,
         index_revision: int,
-        last_checkpoint_at: float,
+        last_checkpoint_at: float | None,
+        scan_info: dict[str, Any] | None = None,
     ) -> None:
+        state = scan_info or (tree.scan_info if tree is not None else None) or {
+            **self._root_identity,
+            "scope_mode": "unknown",
+            "scan_complete": False,
+            "scan_reason": "scope_state_unavailable",
+            "indexed_file_count": 0,
+            "total_bytes": 0,
+        }
         con.execute("DELETE FROM code_index_meta WHERE id = 1")
         con.execute(
             "INSERT INTO code_index_meta "
-            "(id, merkle_json, embedding_model, index_revision, last_checkpoint_at) "
-            "VALUES (1, ?, ?, ?, ?)",
-            [tree.to_json(), embedding_model, index_revision, last_checkpoint_at],
+            "(id, merkle_json, embedding_model, index_revision, "
+            "last_checkpoint_at, scope_info_json) VALUES (1, ?, ?, ?, ?, ?)",
+            [
+                tree.to_json() if tree is not None else None,
+                embedding_model,
+                index_revision,
+                last_checkpoint_at,
+                json.dumps(state, sort_keys=True),
+            ],
         )
 
     # -- chunk row upsert / delete ------------------------------------------
@@ -971,46 +1472,51 @@ class CodeIndex:
     # -- (re)index -----------------------------------------------------------
 
     def reindex(self, *, full: bool = False) -> dict[str, Any]:
-        """Incrementally reindex the tree via a Merkle diff. Returns a summary.
-
-        Builds a fresh Merkle tree, diffs it against the persisted one, and
-        re-chunks ONLY the added/modified files (removed files' chunks are
-        deleted). ``full=True`` forces a from-scratch pass (ignores the stored
-        tree). Rebuilds the FTS (+ optional VSS) index afterwards **only when
-        something changed**. Best-effort: a DuckDB failure is logged and
-        swallowed. Returns
-        ``{changed_files, added, modified, removed, chunks_written,
-        root_hash, rebuilt}``.
-
-        e631d54f — deterministic invalidation: a Merkle diff can only ever
-        see SOURCE changes. If the configured embedding model has changed
-        since the last successful vector build (or the vector leg was
-        enabled after chunks already existed), the vector leg is stale even
-        on a run where NOTHING on disk moved — a plain "diff is empty, do
-        nothing" short-circuit would silently keep serving embeddings from
-        the old model forever. When that mismatch is detected on an
-        otherwise-empty diff, this refreshes ONLY the vector leg (not a full
-        re-chunk) so the index never mixes embeddings across model versions.
-        Every successful rebuild (chunk-driven or vector-only) bumps a
-        persisted ``index_revision`` and ``last_checkpoint_at`` — see
-        :meth:`get_convergence_state`.
-        """
+        """Reindex one bounded scope and report incomplete scans truthfully."""
         with self._lock:
-            new_tree = build_merkle_tree(self.root_dir, hasher=self._hasher)
+            new_tree = build_merkle_tree(
+                self.root_dir,
+                hasher=self._hasher,
+                allow_broad_root=self._allow_broad_root,
+            )
+            scan_info = new_tree.scan_info or {}
             summary: dict[str, Any] = {
-                "changed_files": [], "added": [], "modified": [],
-                "removed": [], "chunks_written": 0,
-                "root_hash": new_tree.root_hash, "rebuilt": False,
+                "changed_files": [],
+                "added": [],
+                "modified": [],
+                "removed": [],
+                "chunks_written": 0,
+                "root_hash": new_tree.root_hash,
+                "rebuilt": False,
+                **scan_info,
+                "partial": not bool(scan_info.get("scan_complete")),
             }
             try:
                 con = self._connect()
                 self._ensure_schema(con)
                 meta = self._load_meta(con)
-                prev = None if full else meta["merkle"]
                 revision = meta["index_revision"]
+                if not scan_info.get("scan_complete", False):
+                    # Keep the last complete Merkle baseline and all indexed
+                    # rows intact. A bounded/failed pass must never make
+                    # unseen files look deleted or the old index look current.
+                    self._store_meta(
+                        con,
+                        tree=meta["merkle"],
+                        embedding_model=meta["embedding_model"],
+                        index_revision=revision,
+                        last_checkpoint_at=meta["last_checkpoint_at"],
+                        scan_info=scan_info,
+                    )
+                    self._index_revision = revision
+                    summary["error"] = scan_info.get("scan_reason") or "incomplete_scope"
+                    return summary
+
+                prev = None if full else meta["merkle"]
                 diff = new_tree.diff(prev)
                 summary.update({
-                    "added": diff.added, "modified": diff.modified,
+                    "added": diff.added,
+                    "modified": diff.modified,
                     "removed": diff.removed,
                     "changed_files": diff.changed_files,
                 })
@@ -1018,13 +1524,13 @@ class CodeIndex:
                     self._embedder.model_name if self._embedder.available() else None
                 )
                 if diff.is_empty and prev is not None:
-                    # Nothing moved on disk — the whole point of the Merkle
-                    # short-circuit. Still persist (unchanged tree, fresh
-                    # checkpoint timestamp) so get_convergence_state() sees a
-                    # recent last_checkpoint_at even on a no-op pass.
                     self._store_meta(
-                        con, tree=new_tree, embedding_model=meta["embedding_model"],
-                        index_revision=revision, last_checkpoint_at=time.time(),
+                        con,
+                        tree=new_tree,
+                        embedding_model=meta["embedding_model"],
+                        index_revision=revision,
+                        last_checkpoint_at=time.time(),
+                        scan_info=scan_info,
                     )
                     self._index_revision = revision
                     if configured_model and configured_model != meta["embedding_model"]:
@@ -1032,12 +1538,17 @@ class CodeIndex:
                         if self._vss_ready:
                             revision += 1
                             self._store_meta(
-                                con, tree=new_tree, embedding_model=configured_model,
-                                index_revision=revision, last_checkpoint_at=time.time(),
+                                con,
+                                tree=new_tree,
+                                embedding_model=configured_model,
+                                index_revision=revision,
+                                last_checkpoint_at=time.time(),
+                                scan_info=scan_info,
                             )
                             self._index_revision = revision
                             summary["rebuilt"] = True
                     return summary
+
                 if diff.removed:
                     self._delete_file_chunks(con, diff.removed)
                 written = 0
@@ -1054,13 +1565,19 @@ class CodeIndex:
                     configured_model if self._vss_ready else meta["embedding_model"]
                 )
                 self._store_meta(
-                    con, tree=new_tree, embedding_model=new_embedding_model,
-                    index_revision=revision, last_checkpoint_at=time.time(),
+                    con,
+                    tree=new_tree,
+                    embedding_model=new_embedding_model,
+                    index_revision=revision,
+                    last_checkpoint_at=time.time(),
+                    scan_info=scan_info,
                 )
                 self._index_revision = revision
                 summary["rebuilt"] = True
-            except Exception:  # noqa: BLE001 — never crash a caller's lifecycle hook
+            except Exception:  # noqa: BLE001
                 _log.debug("CodeIndex.reindex failed", exc_info=True)
+                summary["error"] = "index_write_failed"
+                summary["partial"] = True
             return summary
 
     def _chunk_path(self, abs_path: str) -> list[CodeChunk]:
@@ -1316,41 +1833,32 @@ class CodeIndex:
     # -- explicit embedding-freshness / convergence state (e631d54f) --------
 
     def get_convergence_state(self) -> "IndexConvergenceState":
-        """Return an explicit, structured freshness snapshot for THIS index.
-
-        Answers "can a caller trust this index's vector results right now,
-        or are they degraded" without having to separately inspect
-        ``_vss_ready`` / guess at staleness. ``degraded`` is ``False``
-        whenever the vector leg is disabled (``vectors_enabled=False``) —
-        the BM25 leg alone has no partial/stale state to track (see the
-        module comment above :class:`IndexConvergenceState`). When the
-        vector leg IS enabled, ``degraded`` is ``True`` if: the last
-        vector build didn't succeed (``not vectors_ready``), some chunks
-        still have no embedding (``pending_embedding_count > 0``), or the
-        model that produced the persisted embeddings no longer matches the
-        currently configured model (a pending deterministic-invalidation
-        case that the NEXT :meth:`reindex` call will resolve). Never
-        raises: a DuckDB failure reports a conservative ``degraded=True``
-        snapshot rather than crashing the caller.
-        """
+        """Return scope identity and freshness for this exact index."""
         with self._lock:
             try:
                 con = self._connect()
                 self._ensure_schema(con)
                 meta = self._load_meta(con)
-                total = int(
-                    con.execute("SELECT COUNT(*) FROM code_chunks").fetchone()[0]
-                )
+                total = int(con.execute("SELECT COUNT(*) FROM code_chunks").fetchone()[0])
             except Exception:  # noqa: BLE001
                 _log.debug("CodeIndex.get_convergence_state failed", exc_info=True)
                 return IndexConvergenceState(
-                    root_dir=self.root_dir, source_fingerprint=None,
-                    index_revision=0, embedding_model=None,
+                    root_dir=self.root_dir,
+                    source_fingerprint=None,
+                    index_revision=0,
+                    embedding_model=None,
                     configured_embedding_model=None,
                     vectors_enabled=self._embedder.available(),
-                    vectors_ready=False, total_chunks=0,
-                    pending_embedding_count=0, last_checkpoint_at=None,
-                    degraded=True, converged=False,
+                    vectors_ready=False,
+                    total_chunks=0,
+                    pending_embedding_count=0,
+                    last_checkpoint_at=None,
+                    degraded=True,
+                    converged=False,
+                    **self._root_identity,
+                    scope_mode="unavailable",
+                    scan_complete=False,
+                    scan_reason="metadata_unavailable",
                 )
             vectors_enabled = self._embedder.available()
             configured_model = self._embedder.model_name if vectors_enabled else None
@@ -1362,19 +1870,36 @@ class CodeIndex:
                             "SELECT COUNT(*) FROM code_chunks WHERE embedding IS NULL"
                         ).fetchone()[0]
                     )
-                except Exception:  # noqa: BLE001 — no embedding column yet: every row pending
+                except Exception:  # noqa: BLE001
                     pending = total
             model_mismatch = bool(
                 vectors_enabled and configured_model and meta["embedding_model"]
                 and meta["embedding_model"] != configured_model
             )
-            degraded = bool(
+            scan_info = meta.get("scan_info") or {
+                **self._root_identity,
+                "scope_mode": "not_scanned",
+                "scan_complete": False,
+                "scan_reason": "not_scanned",
+                "indexed_file_count": 0,
+                "total_bytes": 0,
+            }
+            scan_complete = bool(scan_info.get("scan_complete"))
+            vector_degraded = bool(
                 vectors_enabled and (
                     not self._vss_ready or pending > 0 or model_mismatch
                     or meta["embedding_model"] is None
                 )
             )
+            degraded = bool(not scan_complete or vector_degraded)
             merkle = meta["merkle"]
+            identity = {
+                key: scan_info.get(key, self._root_identity.get(key))
+                for key in (
+                    "canonical_root", "scope_id", "is_git_worktree",
+                    "git_common_dir", "excluded_paths",
+                )
+            }
             return IndexConvergenceState(
                 root_dir=self.root_dir,
                 source_fingerprint=merkle.root_hash if merkle is not None else None,
@@ -1388,66 +1913,54 @@ class CodeIndex:
                 last_checkpoint_at=meta["last_checkpoint_at"],
                 degraded=degraded,
                 converged=not degraded,
+                **identity,
+                scope_mode=scan_info.get("scope_mode"),
+                scan_complete=scan_complete,
+                scan_reason=scan_info.get("scan_reason"),
+                indexed_file_count=int(scan_info.get("indexed_file_count") or 0),
+                total_bytes=int(scan_info.get("total_bytes") or 0),
             )
 
     # -- targeted registration after provenance writes (e631d54f) -----------
 
     def index_paths(self, paths: list[str]) -> dict[str, Any]:
-        """Synchronously (re)chunk + persist a small, EXPLICIT set of files,
-        bypassing the ambient Merkle-diff walk over the whole root — mirrors
-        ``meridian_outputs.outputs_local.OutputsFtsIndex.index_paths`` /
-        ``register_priority_path`` (item 6af1518d requirement 3) on the
-        code-index side. Cost is bounded by ``len(paths)``, not by the size
-        of ``root_dir`` — safe to call synchronously right after a
-        provenance write for one of these paths (e.g. a generator script
-        just wrote/overwrote it) even on a large tree whose own ambient
-        :meth:`reindex` pass hasn't reached it yet.
-
-        Deliberately does NOT touch the persisted Merkle tree — the next
-        full :meth:`reindex` will (harmlessly, via ``INSERT OR REPLACE``)
-        rediscover these paths through its own diff and re-process them if
-        their content has moved on since; this call only makes them
-        searchable NOW instead of waiting for that next pass. Paths outside
-        ``root_dir`` or with an unsupported extension are silently skipped.
-        On success, bumps the persisted ``index_revision`` and
-        ``last_checkpoint_at`` (only when a prior full :meth:`reindex` has
-        already established a Merkle baseline to persist alongside) so
-        :meth:`get_convergence_state` reflects the targeted write. Rebuilds
-        the FTS (+ vector, if enabled) index over the WHOLE chunk table —
-        same cost model :meth:`reindex` already pays on any change. Best
-        -effort: never raises. Returns
-        ``{"indexed": N, "skipped": N, "paths": [...]}``.
-        """
+        """Index an explicit, bounded allowlist under the canonical root."""
         with self._lock:
-            targets: list[tuple[str, str]] = []  # (abs_path, rel_path)
+            targets: list[tuple[str, str]] = []
             skipped = 0
-            for p in paths or []:
-                if not p:
+            for path in paths or []:
+                if not path:
                     skipped += 1
                     continue
-                abs_p = p if os.path.isabs(p) else self._abs(p)
-                abs_p = os.path.normpath(abs_p)
-                if not is_indexable(abs_p):
-                    skipped += 1
-                    continue
+                candidate = path if os.path.isabs(path) else self._abs(path)
+                abs_path = os.path.realpath(os.path.abspath(candidate))
                 try:
-                    rel = os.path.relpath(abs_p, self.root_dir).replace(os.sep, "/")
-                except ValueError:  # different drive on Windows
+                    if os.path.commonpath([self.root_dir, abs_path]) != self.root_dir:
+                        skipped += 1
+                        continue
+                except ValueError:
                     skipped += 1
                     continue
-                if rel.startswith(".."):
-                    skipped += 1  # outside root_dir
+                if not is_indexable(abs_path) or not os.path.isfile(abs_path):
+                    skipped += 1
                     continue
-                targets.append((abs_p, rel))
+                rel = os.path.relpath(abs_path, self.root_dir).replace(os.sep, "/")
+                targets.append((abs_path, rel))
+            base = {
+                "canonical_root": self.root_dir,
+                "scope_id": self._root_identity["scope_id"],
+                "scope_mode": "explicit_allowlist",
+                "allowlisted_paths": sorted(rel for _, rel in targets),
+            }
             if not targets:
-                return {"indexed": 0, "skipped": skipped, "paths": []}
+                return {**base, "indexed": 0, "skipped": skipped, "paths": []}
             try:
                 con = self._connect()
                 self._ensure_schema(con)
                 written_rel: list[str] = []
-                for abs_p, rel in targets:
+                for abs_path, rel in targets:
                     self._delete_file_chunks(con, [rel])
-                    chunks = self._chunk_path(abs_p)
+                    chunks = self._chunk_path(abs_path)
                     if chunks:
                         self._insert_chunks(con, chunks)
                         written_rel.append(rel)
@@ -1459,27 +1972,33 @@ class CodeIndex:
                     if meta["merkle"] is not None:
                         revision = meta["index_revision"] + 1
                         configured_model = (
-                            self._embedder.model_name
-                            if self._embedder.available() else None
+                            self._embedder.model_name if self._embedder.available() else None
                         )
-                        new_embedding_model = (
-                            configured_model if self._vss_ready
-                            else meta["embedding_model"]
-                        )
+                        new_model = configured_model if self._vss_ready else meta["embedding_model"]
                         self._store_meta(
-                            con, tree=meta["merkle"],
-                            embedding_model=new_embedding_model,
+                            con,
+                            tree=meta["merkle"],
+                            embedding_model=new_model,
                             index_revision=revision,
                             last_checkpoint_at=time.time(),
+                            scan_info=meta.get("scan_info"),
                         )
                         self._index_revision = revision
                 return {
-                    "indexed": len(written_rel), "skipped": skipped,
+                    **base,
+                    "indexed": len(written_rel),
+                    "skipped": skipped,
                     "paths": written_rel,
                 }
-            except Exception:  # noqa: BLE001 — never crash a caller's write path
+            except Exception:  # noqa: BLE001
                 _log.debug("CodeIndex.index_paths failed", exc_info=True)
-                return {"indexed": 0, "skipped": len(paths or []), "paths": []}
+                return {
+                    **base,
+                    "indexed": 0,
+                    "skipped": len(paths or []),
+                    "paths": [],
+                    "error": "index_write_failed",
+                }
 
     def describe_vector_index(self) -> "IndexMetadata":
         """Backend-neutral metadata snapshot of this index's optional VSS leg
@@ -1573,51 +2092,41 @@ _INDEX_CACHE_LOCK = threading.Lock()
 
 
 def normalize_root_dir(root_dir: str | None) -> str:
-    """Normalize a caller-supplied ``root_dir`` before any ``os.path.isdir`` check.
+    """Normalize a caller-supplied root into one symlink-resolved identity.
 
-    a0cf71ef — ``search_code_semantic`` reported ``root_dir does not exist`` for
-    paths that ARE valid local directories, because the raw string was fed to
-    ``os.path.isdir`` unnormalized. Real clients hand us the path in shapes that
-    ``isdir`` rejects verbatim even though the directory exists:
-
-    * surrounding single/double quotes (``"C:\\Users\\...\\repository"``) — a
-      shell / JSON round-trip that never got unquoted;
-    * a leading ``~`` (or ``~user``) that was never expanded;
-    * ``$VAR`` / ``%VAR%`` environment references;
-    * stray surrounding whitespace or a trailing separator.
-
-    We strip quotes + whitespace, expand ``~`` and env vars, and collapse the
-    path with ``abspath`` (which also normalizes separators, so a forward-slash
-    path from a POSIX-style client resolves on Windows). Slash STYLE is left to
-    the OS — both ``os.path.isdir`` and ``os.walk`` accept ``/`` and ``\\`` on
-    Windows, so we deliberately do not rewrite separators ourselves. Returns
-    "" for a falsy input so callers still hit their "required"/"does not exist"
-    guard.
+    Shell/JSON quoting, home/environment references and relative segments are
+    normalized before any filesystem check. realpath collapses symlink aliases
+    so cache keys and containment checks identify the same tree.
     """
     if not root_dir:
         return ""
-    s = str(root_dir).strip()
-    # Strip a single layer of matching surrounding quotes (JSON/shell artifacts).
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        s = s[1:-1].strip()
-    if not s:
+    value = str(root_dir).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1].strip()
+    if not value:
         return ""
-    # Expand ~ and environment variables, then collapse to an absolute path.
-    s = os.path.expanduser(os.path.expandvars(s))
-    return os.path.abspath(s)
+    value = os.path.expanduser(os.path.expandvars(value))
+    return os.path.realpath(os.path.abspath(value))
 
 
-def get_code_index(root_dir: str, *, db_path: str = ":memory:") -> CodeIndex:
-    """Return a process-cached :class:`CodeIndex` for ``(root_dir, db_path)``.
-
-    A file ``db_path`` persists the chunk table + Merkle tree across restarts, so
-    the first checkpoint after a restart does an incremental (not full) reindex.
-    """
-    key = (os.path.abspath(root_dir), db_path)
+def get_code_index(
+    root_dir: str,
+    *,
+    db_path: str = ":memory:",
+    allow_broad_root: bool = False,
+) -> CodeIndex:
+    """Return a cached index isolated by canonical root and scope policy."""
+    canonical_root = normalize_root_dir(root_dir)
+    resolved_root = canonical_root or os.path.realpath(os.path.abspath(root_dir))
+    key = (resolved_root, db_path, bool(allow_broad_root))
     with _INDEX_CACHE_LOCK:
         idx = _INDEX_CACHE.get(key)
         if idx is None:
-            idx = CodeIndex(root_dir, db_path=db_path)
+            idx = CodeIndex(
+                resolved_root,
+                db_path=db_path,
+                allow_broad_root=allow_broad_root,
+            )
             _INDEX_CACHE[key] = idx
         return idx
 
@@ -1684,39 +2193,9 @@ def search_code_semantic(
     kind: str | None = None,
     db_path: str = ":memory:",
     reindex: bool = True,
+    allow_broad_root: bool = False,
 ) -> dict[str, Any]:
-    """Stateless one-shot hybrid code search over a local source tree.
-
-    Ensures the ``root_dir`` index is current (an incremental Merkle-diff
-    reindex unless ``reindex=False``), then runs the hybrid BM25 (+ optional
-    VSS) search. With the vector leg disabled (the default posture), this is a
-    pure BM25 code search over tree-sitter/ast chunks — a real, complete
-    deliverable on its own. Returns
-    ``{root_dir, query, total_indexed, vectors_enabled, hits:[...]}``. A missing
-    directory / empty tree returns an empty hits list, never an error.
-
-    e631d54f — the response also carries ``convergence``
-    (:meth:`CodeIndex.get_convergence_state`, as a dict) and a top-level
-    ``degraded`` bool mirroring ``convergence["degraded"]``. ``degraded`` is
-    always ``False`` when the vector leg is off (pure-BM25 hits have no
-    partial/stale state to flag); when the vector leg IS enabled, a
-    ``degraded=True`` result means the returned ``hits`` may be missing
-    vector-leg candidates (stale/absent embeddings, or a model-version
-    mismatch pending the next reindex) — such hits are real BM25 matches but
-    must NOT be read as "the vector leg found nothing better", and must
-    never satisfy an authoritative pointer/provenance gate on their own.
-
-    This function reads ``root_dir`` off the filesystem of whatever process
-    calls it — there is no remote/hosted awareness here at all. A caller
-    embedding this in a client/server split of its own (e.g. Meridian's
-    hosted-vs-self-hosted split) is responsible for guarding against a
-    mismatch between "the filesystem this process can see" and "the
-    filesystem the end user actually means" in its own wrapper.
-    """
-    # a0cf71ef — normalize (unquote / expanduser / abspath) so a valid local dir
-    # handed to us in a quoted or ~-prefixed shape resolves; report the resolved
-    # path back so the caller sees exactly what was searched. "does not exist" is
-    # then returned ONLY when the normalized path truly is not a directory.
+    """Search one local root and return its explicit scope/convergence state."""
     root_dir = normalize_root_dir(root_dir)
     result: dict[str, Any] = {
         "root_dir": root_dir,
@@ -1731,13 +2210,33 @@ def search_code_semantic(
     if not root_dir or not os.path.isdir(root_dir):
         result["error"] = f"root_dir does not exist: {root_dir}"
         return result
-    idx = get_code_index(root_dir, db_path=db_path)
-    if reindex:
-        idx.reindex()
+    idx = get_code_index(
+        root_dir,
+        db_path=db_path,
+        allow_broad_root=allow_broad_root,
+    )
+    reindex_result = idx.reindex() if reindex else None
     result["total_indexed"] = idx.count()
     result["vectors_active"] = idx._vss_ready
     result["hits"] = idx.search(query, limit=limit, kind=kind)
     convergence = idx.get_convergence_state().to_dict()
     result["convergence"] = convergence
+    result["scope"] = {
+        "canonical_root": convergence["canonical_root"],
+        "scope_id": convergence["scope_id"],
+        "is_git_worktree": convergence["is_git_worktree"],
+        "git_common_dir": convergence["git_common_dir"],
+        "scope_mode": convergence["scope_mode"],
+        "scan_complete": convergence["scan_complete"],
+        "scan_reason": convergence["scan_reason"],
+        "indexed_file_count": convergence["indexed_file_count"],
+        "total_bytes": convergence["total_bytes"],
+        "excluded_paths": convergence["excluded_paths"],
+    }
+    if reindex_result and reindex_result.get("partial"):
+        result["partial"] = True
+        result["scan_reason"] = reindex_result.get("scan_reason")
+        if reindex_result.get("error"):
+            result["error"] = reindex_result["error"]
     result["degraded"] = convergence["degraded"]
     return result

@@ -298,7 +298,63 @@ async def handle_checkpoint(
             "in_progress / fail_sprint_item(item_id, reason) if not done. "
             "These are NOT auto-reconciled from git — you must mark them."
         )
+    # Deep project-state snapshots are separate from the small, replaceable
+    # checkpoint_data above. Routine checkpoints stay unchanged unless the
+    # caller declares a material transition or reports risk signals.
+    if (
+        args.get("milestone_trigger")
+        or args.get("risk_signals")
+        or args.get("artifact_manifest") is not None
+    ):
+        from meridian.session_milestones import (  # noqa: PLC0415
+            maybe_capture_project_state_milestone,
+        )
+
+        try:
+            _milestone_result = await maybe_capture_project_state_milestone(
+                db,
+                project_id,
+                session_id,
+                version=_ckpt_version,
+                milestone_trigger=args.get("milestone_trigger"),
+                risk_signals=args.get("risk_signals"),
+                artifact_manifest=args.get("artifact_manifest"),
+            )
+            _ckpt_resp["milestone_escalation"] = _milestone_result.get("escalation")
+            if _milestone_result.get("captured"):
+                _ckpt_resp["project_state_milestone"] = _milestone_result.get("milestone")
+                _ckpt_resp["milestone_pointer"] = _milestone_result.get("pointer")
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — never lose the routine checkpoint
+            _ckpt_resp["milestone_error"] = type(exc).__name__
     return _ckpt_resp
+
+
+async def handle_get_project_state_milestones(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> dict[str, Any]:
+    """Read project-scoped immutable milestones with content-hash status."""
+    project_id = args.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise ValueError("project_id is required")
+    limit = args.get("limit", 20)
+    before_sequence = args.get("before_sequence")
+    rows = await db_module.list_project_state_milestones(
+        db,
+        project_id.strip(),
+        limit=limit,
+        before_sequence=before_sequence,
+    )
+    return {
+        "project_id": project_id.strip(),
+        "milestones": rows,
+        "next_before_sequence": min((int(row["sequence"]) for row in rows), default=None),
+    }
 
 
 async def handle_register_external_job(
@@ -1140,16 +1196,15 @@ async def handle_zotero_search(
     github_search (811881c6/f65f6111/d58000c6), following the identical
     per-source pattern, but over the caller's OWN Zotero library rather than
     a public corpus. A public group library needs no credential; a private
-    user library needs an api_key (or the server-side ZOTERO_API_KEY env
-    var) — see meridian/zotero_search.py's module docstring for why this is
-    config rather than a per-tenant BYOK secret.
+    user library needs a Zotero API key. This hosted tool accepts no key;
+    private user libraries must use the local Zotero MCP connection so the
+    credential stays on the workstation.
     """
     from meridian.zotero_search import zotero_search  # noqa: PLC0415
     return await zotero_search(
         args.get("query", ""),
         library_type=args.get("library_type", "user"),
         library_id=args.get("library_id", ""),
-        api_key=args.get("api_key"),
         limit=args.get("limit", 10),
         sort_by=args.get("sort_by", "relevance"),
     )

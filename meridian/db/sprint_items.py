@@ -2362,11 +2362,43 @@ async def evaluate_artifact_pointer_gate(
     classification = _ac.classify_artifact_work(enriched)
     kind = classification.get("classification")
 
+    # A planned_new pointer is useful while planning an output, and should
+    # continue to appear in handoffs, but it cannot prove that the output
+    # exists when an item is completed. Keep the original candidate set for
+    # classification so a planned .png/.csv still identifies figure/table
+    # work and cannot make an otherwise untyped item evade the gate.
+    completion_evidence = dict(enriched)
+    planned_output = _artifact_declaration.effective_planned_output(enriched)
+    if isinstance(planned_output, dict):
+        completed_plan = dict(planned_output)
+        completed_plan["targets"] = [
+            target
+            for target in (planned_output.get("targets") or [])
+            if not isinstance(target, dict) or target.get("target_kind") != "planned_new"
+        ]
+        completion_evidence["planned_output"] = completed_plan
+    completion_evidence["pointer_records"] = [
+        {
+            "id": record.get("id"),
+            "targets": [
+                target
+                for target in (record.get("targets") or [])
+                if not isinstance(target, dict) or target.get("target_kind") != "planned_new"
+            ],
+        }
+        for record in enriched["pointer_records"]
+        if isinstance(record, dict)
+    ]
+    if kind in {"figure", "table"}:
+        # Preserve the classification across candidate filtering when it was
+        # inferred from a planned_new URI rather than a declared artifact_kind.
+        completion_evidence["artifact_kind"] = kind
+
     triggers: list[str] = []
     warning_code: str | None = None
     remediation: str | None = None
     if strict:
-        verdict = _pointers.evaluate_artifact_pointer_policy(enriched)
+        verdict = _pointers.evaluate_artifact_pointer_policy(completion_evidence)
         if not verdict.get("ready", True):
             triggers.append("artifact_pointer_check=strict")
             warning_code = verdict.get("warning_code")
@@ -2379,13 +2411,15 @@ async def evaluate_artifact_pointer_gate(
             continue
         have_exact = any(
             _ac._classify_uri(uri) == want  # noqa: SLF001 — same-package rule reuse
-            for uri, _source, _pid in _ac._iter_candidate_uris(enriched)  # noqa: SLF001
+            for uri, _source, _pid in _ac._iter_candidate_uris(completion_evidence)  # noqa: SLF001
         )
         if have_exact:
             continue
         triggers.append(flag)
         if warning_code is None:
-            warning_code, _affected = _ac.artifact_pointer_insufficiency_evidence(enriched)
+            warning_code, _affected = _ac.artifact_pointer_insufficiency_evidence(
+                completion_evidence
+            )
             warning_code = warning_code or _ac.INSUFFICIENT_MISSING_POINTER
             remediation = _ac._INSUFFICIENCY_REMEDIATION.get(  # noqa: SLF001
                 warning_code,
@@ -2407,8 +2441,9 @@ async def evaluate_artifact_pointer_gate(
             "message": (
                 f"item {item['id']} is {kind} work under an enforced artifact "
                 f"policy ({', '.join(triggers)}) but has no exact output pointer "
-                f"on file ({warning_code}). {remediation} Attach the pointer "
-                "(planned_output or add_sprint_item_pointer) and retry. Only a "
+                f"on file ({warning_code}). {remediation} Attach an existing pointer "
+                "(planned_output or add_sprint_item_pointer; planned_new targets are "
+                "planning-only) and retry. Only a "
                 "human-approved override can complete it without one: "
                 "override_artifact_pointer=true + override_reason + "
                 "override_hitl_id (the first call files the require_human "

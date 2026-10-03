@@ -73,11 +73,27 @@ The current code already establishes a useful privacy boundary:
   client type, lifecycle, a non-identifying `verified_resumable` boolean,
   an opaque `local_ref_id`, sprint version, and checkpoint/handoff references.
   The database API does not accept a provider transcript ID as its session ID.
-- `write_local_recovery_snapshot` stores the mapping under
-  `<data_dir>/session_recovery/<safe-project-id>.json`. Local records may hold
+- Self-hosted servers may keep the mapping under
+  `<data_dir>/session_recovery/<safe-project-id>.json`, because that process
+  runs on the same machine as its caller. Hosted servers must never write this
+  mapping to Fly's ephemeral `data_dir`.
+- Hosted Claude Code callers use `.claude/hooks/session_recovery_hook.py`:
+  `PreToolUse` writes the provider identity and resume recipe to
+  `~/.meridian/session_recovery/client_local.json` (override with
+  `MERIDIAN_SESSION_RECOVERY_STATE_DIR`) and removes `local_identity` before
+  sending the tool request. The hosted row receives only an opaque random
+  `local_ref_id` and a non-identifying resumability hint. A hosted call that
+  still contains `local_identity` is rejected. `PostToolUse` adds a local
+  recipe only when both the opaque reference and requested Meridian session
+  id match this workstation's record.
+- `SubagentStart` and `SubagentStop` update only the caller-local lifecycle
+  map: provider session id, agent id/type, state, and timestamps. The hook
+  ignores transcript paths and `last_assistant_message`. The mapping may hold
   `local_session_id`, `bridge_id`, `environment_id`, `local_transcript_path`,
-  `argv`, and the computed resume recipe or blocked reason. `local_ref_id` is a
-  random opaque token; it is not derived from those values.
+  `argv`, and the computed recipe or blocked reason; none of these are sent to
+  hosted Meridian. `local_ref_id` is random and is not derived from those values.
+- Clients without the local hook should omit `local_identity`. Hosted recovery
+  still stores the safe registry row, but the caller receives no resume recipe.
 - `reject_local_only_keys` rejects known host-local identity keys recursively
   when they appear inside hosted metadata. Keep this denylist in step with any
   future provider-specific identifier fields.
@@ -235,3 +251,40 @@ Research run was launched or relied on for these findings.
 - Anthropic: [Claude Code CLI session commands](https://docs.anthropic.com/en/docs/claude-code/cli-usage); [Agent SDK session storage, enumeration, and resume](https://code.claude.com/docs/en/agent-sdk/sessions); [Claude account data export](https://support.anthropic.com/en/articles/9450526-how-can-i-export-my-claude-data).
 - OpenAI: [ChatGPT archive/delete and retention](https://help.openai.com/en/articles/8809935-deleting-and-archiving-chats-in-chatgpt); [ChatGPT data export](https://help.openai.com/en/articles/7260999-exporting-your-chatgpt-history-and-data); [Codex `resume` command source](https://github.com/openai/codex/blob/main/codex-rs/exec/src/cli.rs); [Codex rollout stores](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/lib.rs); [Codex rollout lookup](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/list.rs); [Codex app-server thread resume](https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server).
 - Meridian: [handoff receiver runbook](meridian-handoff-contract.md); [per-mode handoff persistence](meridian-handoff-mode-contract-2026-08-26.md); [local identity boundary](../meridian/session_recovery.py); [registry and live-board continuation](../meridian/db/session_recovery.py); [typed evidence pointers](../meridian/pointers.py).
+
+## Local CLI catalog and context packs
+
+The first local adapter is exposed as `meridian recovery catalog` and
+`meridian recovery pack`:
+
+```powershell
+meridian recovery catalog --limit 200
+meridian recovery pack --provider claude_code --session-id <uuid> `
+  --project-id <project-id> --sprint-version <version> --context-file .\recovery-context.json `
+  --repo-root .
+```
+
+The catalog enumerates Claude Code project JSONL filenames and Codex CLI
+rollout filenames under `sessions` and `archived_sessions`. It reports the
+provider-native resume argv as a **candidate**, and marks it unverified until
+the provider CLI is actually invoked by the user. Cataloging reads filesystem
+metadata only; it does not read transcript content or Codex's session index.
+Traversal and result counts are bounded. `not_cataloged_surfaces` explicitly
+directs Claude Agent SDK and Codex app sessions to their host APIs, and web
+account chats to the provider UI or a user-requested export.
+
+The `pack` command builds a compact, integrity-hashed local JSON file under
+Meridian's app-state directory. Its required context file contains a `task`
+object with short `objective` and `next_action` summaries; optional fields may
+include `current_step`, `recent_transcript`, `constraints`, `decisions`,
+`failed_approaches`, `recency_tail`, `command_error_ledger`, `source_refs`,
+`meridian_recovery`, and `artifact_refs`. Compact summaries can reference
+`provider-range-0` so the note remains linked to the selected local range.
+When a range is selected, the adapter hashes it after checking that the source
+file still matches the cataloged identity and time. Line contents are never
+copied into the pack; the caller supplies a short, secret-checked summary.
+The pack reports whether live board state, a transcript summary, and a verified
+repository snapshot were supplied, and whether reconstruction is complete. It
+never claims byte restoration, provider-native resume, or successful
+restoration without the corresponding evidence. These commands do not upload
+the pack or provider locators to Meridian.

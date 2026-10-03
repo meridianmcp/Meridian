@@ -407,3 +407,52 @@ def test_ensure_meridian_codeindex_importable_does_not_mask_transitive_dependenc
     err = ci._ensure_meridian_codeindex_importable()
     assert isinstance(err, ModuleNotFoundError)
     assert err.name == "duckdb"
+
+
+
+def test_search_code_semantic_forwards_broad_root_opt_in(monkeypatch, tmp_path):
+    from meridian_codeindex import code_index as impl
+
+    captured = {}
+
+    def fake_search(root_dir, query, **kwargs):
+        captured.update(kwargs)
+        return {"canonical_root": root_dir, "scope_id": "test-scope", "hits": []}
+
+    monkeypatch.setattr(impl, "search_code_semantic", fake_search)
+    result = ci.search_code_semantic(
+        str(tmp_path), "scope marker", allow_broad_root=True
+    )
+    assert captured["allow_broad_root"] is True
+    assert result["scope_id"] == "test-scope"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_search_code_semantic_forwards_broad_root_opt_in(monkeypatch, tmp_path):
+    from meridian import hardening, server as srv
+
+    captured = {}
+
+    async def fake_run_in_bulkhead(func, *args, **kwargs):
+        captured["function"] = func
+        captured["kwargs"] = kwargs
+        return {"hits": [], "scope_id": "test-scope", "convergence": {}, "degraded": False}
+
+    monkeypatch.setattr(hardening, "run_in_bulkhead", fake_run_in_bulkhead)
+    await srv._dispatch_mcp_tool(
+        "search_code_semantic",
+        {"root_dir": str(tmp_path), "query": "scope marker", "allow_broad_root": True},
+        None,
+        str(tmp_path),
+    )
+    assert captured["kwargs"]["allow_broad_root"] is True
+
+
+
+def test_search_code_semantic_schema_exposes_broad_root_opt_in():
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    tool = next(item for item in _MCP_TOOLS_LIST if item["name"] == "search_code_semantic")
+    prop = tool["inputSchema"]["properties"]["allow_broad_root"]
+    assert prop["type"] == "boolean"
+    assert "Default false" in prop["description"]

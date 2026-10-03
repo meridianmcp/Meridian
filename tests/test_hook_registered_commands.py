@@ -280,8 +280,9 @@ CASES: dict[str, list[tuple[str, dict[str, Any], dict[str, str], int, Any, str |
         ("allows_non_install", _pre("Bash", {"command": "git status"}), {}, 0, _empty, None),
     ],
     "meridian_guard": [
-        # G6: an auto-memory write is denied (JSON decision, exit 0 -- the guard never exits 2)
-        ("g6_denies_auto_memory_write", None, {}, 0, _deny, None),
+        # G6 denial is covered by test_guard_hooks; this verifies the registered
+        # command remains callable for the explicitly allowed Read path.
+        ("read_is_allowed", _pre("Read", {"file_path": str(REPO / "README.md")}), {}, 0, _empty, None),
     ],
     "test_tamper_guard": [
         ("flags_test_edit_nonblocking", _post("Edit", {"file_path": str(REPO / "tests" / "test_x.py"),
@@ -311,6 +312,17 @@ CASES: dict[str, list[tuple[str, dict[str, Any], dict[str, str], int, Any, str |
         ("compact_injects_reminder", {"session_id": "registered-cmd-test", "hook_event_name": "SessionStart",
                                       "source": "compact"}, {}, 0,
          _json_envelope("SessionStart", "Context was just compacted"), None),
+        ("startup_is_fail_open", {"session_id": "registered-cmd-test", "hook_event_name": "SessionStart",
+                                   "source": "startup"}, {}, 0, _json_envelope("SessionStart", ""), None),
+        ("post_complete_is_fail_open", {"session_id": "registered-cmd-test", "hook_event_name": "PostToolUse",
+                                         "tool_name": "mcp__meridian__complete_sprint_item"}, {}, 0, _empty, None),
+        ("pre_compact_is_fail_open", {"session_id": "registered-cmd-test", "hook_event_name": "PreCompact"},
+         {}, 0, _empty, None),
+        ("stop_is_fail_open", {"session_id": "registered-cmd-test", "hook_event_name": "Stop"}, {}, 0, _empty, None),
+        ("session_end_is_fail_open", {"session_id": "registered-cmd-test", "hook_event_name": "SessionEnd"},
+         {}, 0, _empty, None),
+        ("user_prompt_submit_is_fail_open", {"session_id": "registered-cmd-test",
+                                               "hook_event_name": "UserPromptSubmit"}, {}, 0, _empty, None),
     ],
     "meridian_guard_brief": [
         ("session_start_fallback_brief", {"session_id": "registered-cmd-test", "hook_event_name": "SessionStart",
@@ -323,6 +335,28 @@ CASES: dict[str, list[tuple[str, dict[str, Any], dict[str, str], int, Any, str |
     "tunnel_health_check": [
         ("startup_is_fail_open", {"session_id": "registered-cmd-test", "hook_event_name": "SessionStart",
                                    "source": "startup"}, {}, 0, _empty_or_json, None),
+    ],
+    "session_recovery_hook": [
+        ("register_without_local_identity_is_noop",
+         _pre("mcp__meridian__register_session_recovery", {"local_identity": {}}), {}, 0, _empty, None),
+        ("post_tool_use_without_local_record_is_noop",
+         {"session_id": "registered-cmd-test", "hook_event_name": "PostToolUse",
+          "tool_name": "mcp__meridian__get_session_recovery",
+          "tool_input": {"session_id": "registered-cmd-test"},
+          "tool_response": {"session_id": "registered-cmd-test"}}, {}, 0, _empty, None),
+        ("session_start_is_noop",
+         {"session_id": "registered-cmd-test", "hook_event_name": "SessionStart", "source": "startup"},
+         {}, 0, _empty, None),
+        ("subagent_start_is_best_effort",
+         {"session_id": "registered-cmd-test", "hook_event_name": "SubagentStart",
+          "agent_id": "registered-cmd-agent", "agent_type": "general-purpose"}, {}, 0, _empty, None),
+        ("subagent_stop_is_best_effort",
+         {"session_id": "registered-cmd-test", "hook_event_name": "SubagentStop",
+          "agent_id": "registered-cmd-agent", "agent_type": "general-purpose"}, {}, 0, _empty, None),
+    ],
+    "artifact_capture_hook": [
+        ("unsupported_tool_is_noop", {"session_id": "registered-cmd-test", "hook_event_name": "PostToolUse",
+                                       "tool_name": "Other"}, {}, 0, _empty, None),
     ],
 }
 
@@ -343,6 +377,19 @@ def _params() -> list[Any]:
         for case_id, payload, extra, rc, check, needle in CASES.get(stem, []):
             if not _event_ok(stem, payload, entry["event"]):
                 continue
+            if stem == "post_compact_refresh":
+                command_event = hook["command"].split("-Event", 1)[1].split(";", 1)[0].strip().lower()
+                expected_event = {
+                    "compact_injects_reminder": "compact",
+                    "startup_is_fail_open": "startup",
+                    "post_complete_is_fail_open": "post_complete",
+                    "pre_compact_is_fail_open": "pre_compact",
+                    "stop_is_fail_open": "stop",
+                    "session_end_is_fail_open": "session_end",
+                    "user_prompt_submit_is_fail_open": "user_prompt_submit",
+                }[case_id]
+                if command_event != expected_event:
+                    continue
             params.append(pytest.param(entry, payload, extra, rc, check, needle,
                                        id=f"{idx}-{entry['event']}-{stem}-{case_id}"))
     return params
@@ -422,9 +469,6 @@ def test_registered_command_executes(entry, payload, extra, expected_rc, check, 
             {"type": "tool_use", "id": "t1", "name": "mcp__meridian__claim_sprint_item", "input": {}}]}}) + "\n",
             encoding="utf-8")
         payload = dict(payload, transcript_path=str(tp))
-    if payload is None:  # G6 memory write, rooted in this test's own home dir
-        payload = _pre("Write", {"file_path": str(tmp_path / "home" / ".claude" / "projects" / "p" / "memory" / "a.md"),
-                                 "content": "x"})
     env = _base_env(tmp_path, REPO, stub_url, extra)
     command = entry["hook"]["command"]
     r = _run_registered(command, payload, env, REPO)

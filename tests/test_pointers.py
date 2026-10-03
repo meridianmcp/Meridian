@@ -4006,9 +4006,120 @@ def test_add_sprint_item_pointer_schema_advertises_new_selector_types():
     haystack = tool["description"] + tool["inputSchema"]["properties"]["targets"]["description"]
     for token in (
         "directory", "git", "remote_fs", "artifact", "text_quote", "finding_id",
-        "freshness", "canonical_url", "retrieval_hash",
+        "freshness", "canonical_url", "retrieval_hash", "provider_conversation",
+        "provider_artifact", "identity-only", "no transcript",
     ):
         assert token in haystack, f"{token!r} not advertised in add_sprint_item_pointer schema"
+
+
+def test_provider_chat_pointer_is_metadata_only_and_resolves_identity_without_fetching():
+    import asyncio
+
+    from meridian.pointers import resolve_pointer, validate_pointer
+
+    digest = "a" * 64
+    pointer = validate_pointer({
+        "source_type": "external_conversation",
+        "targets": [{
+            "uri": "codex://conversation/thread-123",
+            "selector": {
+                "type": "provider_conversation",
+                "provider": "codex",
+                "conversation_id": "thread-123",
+                "transcript_hash": digest,
+                "subSelector": {"type": "range", "start_line": 3, "end_line": 7},
+                # Unrecognized payload fields are not carried into the stored shape.
+                "transcript": "private full transcript",
+            },
+        }],
+    })
+
+    selector = pointer["targets"][0]["selector"]
+    assert "transcript" not in selector
+    assert selector["transcript_hash"] == digest
+    resolved = asyncio.run(resolve_pointer(None, pointer, project_id="project-1"))
+    target = resolved["targets"][0]
+    assert target["resolved"] is True
+    assert target["resolution_scope"] == "identity_only"
+    assert target["content_loaded"] is False
+    assert target["conversation_id"] == "thread-123"
+    assert target["subResolved"]["range"] == {"start_line": 3, "end_line": 7}
+    assert "transcript" not in target
+
+
+def test_provider_artifact_pointer_requires_hash_for_range_and_rejects_bad_providers():
+    import asyncio
+    import pytest
+
+    from meridian.pointers import PointerValidationError, resolve_pointer, validate_pointer
+
+    base = {
+        "source_type": "external_artifact",
+        "targets": [{
+            "uri": "chatgpt://conversation/c-1/artifact/a-1",
+            "selector": {
+                "type": "provider_artifact",
+                "provider": "chatgpt",
+                "conversation_id": "c-1",
+                "artifact_id": "a-1",
+                "subSelector": {"type": "range", "start_line": 1, "end_line": 2},
+            },
+        }],
+    }
+    with pytest.raises(PointerValidationError, match="content_hash"):
+        validate_pointer(base)
+
+    base["targets"][0]["selector"]["content_hash"] = "b" * 64
+    normalized = validate_pointer(base)
+    assert normalized["targets"][0]["selector"]["artifact_id"] == "a-1"
+    resolved = asyncio.run(resolve_pointer(None, normalized, project_id="project-1"))
+    target = resolved["targets"][0]
+    assert target["resolution_scope"] == "identity_only"
+    assert target["artifact_id"] == "a-1"
+    assert target["content_hash"] == "b" * 64
+    assert target["content_loaded"] is False
+
+    base["targets"][0]["selector"]["provider"] = "unknown"
+    with pytest.raises(PointerValidationError, match="provider"):
+        validate_pointer(base)
+
+
+def test_provider_references_allow_unranged_ids_and_reject_unbound_or_malformed_ranges():
+    import pytest
+
+    from meridian.pointers import PointerValidationError, validate_pointer
+
+    def pointer(selector):
+        return {"source_type": "external", "targets": [{"uri": "provider://ref", "selector": selector}]}
+
+    # Hashes are optional for whole-conversation and whole-artifact references.
+    assert validate_pointer(pointer({
+        "type": "provider_conversation", "provider": "claude.ai", "conversation_id": "c-2"
+    }))
+    assert validate_pointer(pointer({
+        "type": "provider_artifact", "provider": "chatgpt", "conversation_id": "c-3", "artifact_id": "a-3"
+    }))
+
+    with pytest.raises(PointerValidationError, match="transcript_hash"):
+        validate_pointer(pointer({
+            "type": "provider_conversation", "provider": "codex", "conversation_id": "c-4",
+            "subSelector": {"type": "range", "start_line": 1, "end_line": 2},
+        }))
+    with pytest.raises(PointerValidationError, match="range"):
+        validate_pointer(pointer({
+            "type": "provider_conversation", "provider": "codex", "conversation_id": "c-4",
+            "transcript_hash": "d" * 64,
+            "subSelector": {"type": "text_quote", "exact": "private text"},
+        }))
+    with pytest.raises(PointerValidationError, match="SHA-256"):
+        validate_pointer(pointer({
+            "type": "provider_artifact", "provider": "chatgpt", "conversation_id": "c-3",
+            "artifact_id": "a-3", "content_hash": "not-a-digest",
+        }))
+    with pytest.raises(PointerValidationError, match="artifact_id"):
+        validate_pointer(pointer({
+            "type": "provider_artifact", "provider": "chatgpt", "conversation_id": "c-3",
+        }))
 
 
 def test_resolve_sprint_item_pointers_schema_mentions_freshness_state():

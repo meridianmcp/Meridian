@@ -11,6 +11,9 @@
 # bare CLI. Built by the same PyInstaller pipeline, published to the same GitHub
 # release, but was never reachable through this documented install path until now.
 #   & ([scriptblock]::Create((irm https://usemeridian.us/install-windows.ps1))) -Tray
+# Add -Autostart to register the tray companion for this Windows user at sign-in.
+# It is opt-in; a normal -Tray install only creates the Start Menu shortcut.
+#   & ([scriptblock]::Create((irm https://usemeridian.us/install-windows.ps1))) -Tray -Autostart
 #
 # The -Tray path also now creates a per-user Start Menu shortcut and registers
 # a Programs-and-Features / Settings > Apps entry (HKCU, no admin required --
@@ -24,12 +27,17 @@
 # saves a runnable copy of this script next to meridian-tray.exe for the
 # registered UninstallString to invoke later.
 #   & ([scriptblock]::Create((irm https://usemeridian.us/install-windows.ps1))) -Uninstall
+# Add -ConfigureZotero to open the optional local-only Zotero setup after
+# installing; interactive -Tray installs offer the same choice by default.
 #
 param(
     [switch]$Tray,
+    [switch]$Autostart,
+    [switch]$ConfigureZotero,
     [switch]$Uninstall
 )
 $ErrorActionPreference = "Stop"
+$TargetRepo = (Get-Location).Path
 # Captured once, at top level: $PSCommandPath is only populated when this
 # script runs from a saved .ps1 file (-File ...); piped `irm | iex` execution
 # leaves it empty. Passed explicitly into Save-MeridianUninstallerCopy below
@@ -43,8 +51,43 @@ $ScriptSelfPath = $PSCommandPath
 # Get-MeridianDeviceToken/Get-MeridianCachedToken are top level in install.ps1
 # (cee295bd bug fix there): must be reachable regardless of which branch runs.
 $MeridianUninstallKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Meridian"
+$MeridianRunKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$MeridianAutostartValueName = "MeridianTray"
 $MeridianStartMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Meridian.lnk"
 $MeridianTrayInstallerSelfUrl = "https://usemeridian.us/install-windows.ps1"
+
+function Enable-MeridianAutostart {
+    param([Parameter(Mandatory = $true)][string]$TargetPath)
+    try {
+        New-Item -Path $MeridianRunKeyPath -Force | Out-Null
+        $command = '"{0}"' -f $TargetPath
+        New-ItemProperty -Path $MeridianRunKeyPath -Name $MeridianAutostartValueName `
+            -Value $command -PropertyType String -Force | Out-Null
+        Write-Host "Enabled Meridian tray start at sign-in."
+        return $true
+    } catch {
+        Write-Warning "Could not enable Meridian tray start at sign-in: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-MeridianAutostart {
+    if (-not (Test-Path -LiteralPath $MeridianRunKeyPath)) {
+        return
+    }
+    $entry = Get-ItemProperty -LiteralPath $MeridianRunKeyPath `
+        -Name $MeridianAutostartValueName -ErrorAction SilentlyContinue
+    if ($null -eq $entry) {
+        return
+    }
+    try {
+        Remove-ItemProperty -LiteralPath $MeridianRunKeyPath -Name $MeridianAutostartValueName `
+            -Force -ErrorAction Stop
+        Write-Host "Removed Meridian tray start at sign-in."
+    } catch {
+        Write-Warning "Could not remove Meridian tray start at sign-in: $($_.Exception.Message)"
+    }
+}
 
 function New-MeridianStartMenuShortcut {
     <#
@@ -234,6 +277,7 @@ if ($Uninstall) {
     }
 
     Remove-MeridianStartMenuShortcut
+    Remove-MeridianAutostart
     Remove-MeridianUninstallEntry
 
     if (Test-Path -LiteralPath $uninstallerCopy) {
@@ -245,6 +289,11 @@ if ($Uninstall) {
     Write-Host "Note: $binDir was left on your PATH -- it is a shared user bin directory"
     Write-Host "(other tools may live there too), so it is never removed automatically."
     exit 0
+}
+
+if ($Autostart -and -not $Tray) {
+    Write-Error "-Autostart applies only to a -Tray install."
+    exit 2
 }
 
 # ---- f66e8f23: SHA-256 verification of the downloaded binary -----------------
@@ -399,6 +448,45 @@ if ($Tray) {
     $shortcutCreated = New-MeridianStartMenuShortcut -TargetPath $dest
     $registered = Register-MeridianUninstallEntry -ExePath $dest -InstallDir $binDir `
         -Version $releaseTag -LocalSourcePath $ScriptSelfPath
+    $autostartConfigured = $false
+    if ($Autostart) {
+        $autostartConfigured = Enable-MeridianAutostart -TargetPath $dest
+    }
+
+    $configureZoteroNow = [bool]$ConfigureZotero
+    if (-not $configureZoteroNow -and $Host.Name -eq "ConsoleHost" -and -not [Console]::IsInputRedirected) {
+        try {
+            $answer = Read-Host "Configure your local Zotero connection now? [y/N]"
+            $configureZoteroNow = $answer -match '^(?i:y|yes)$'
+        } catch {
+            # Install scripts are also used in automation and through irm | iex;
+            # declining setup must never turn a successful install into failure.
+            $configureZoteroNow = $false
+        }
+    }
+    if ($configureZoteroNow) {
+        Write-Host "Opening the local Zotero connection setup..."
+        try {
+            & $dest --configure-zotero
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Zotero setup did not finish. You can open it later from the Meridian tray menu."
+            }
+        } catch {
+            Write-Warning "Could not open Zotero setup. You can open it later from the Meridian tray menu."
+        }
+    } else {
+        Write-Host "Zotero setup skipped; you can configure it later from the Meridian tray menu."
+    }
+
+    Write-Host "Configuring the Meridian MCP bundle for $TargetRepo..."
+    try {
+        & $dest setup --repo $TargetRepo
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "MCP bundle setup reported a conflict or error. Re-run: meridian-tray setup --repo `"$TargetRepo`""
+        }
+    } catch {
+        Write-Warning "Could not run MCP bundle setup: $($_.Exception.Message)"
+    }
 
     Write-Host ""
     Write-Host "Done. Launch it by double-clicking $dest in File Explorer,"
@@ -410,6 +498,11 @@ if ($Tray) {
     Write-Host "  & `"$dest`""
     Write-Host "This starts the Meridian server in the background and shows a tray icon"
     Write-Host "(Open Dashboard / Status / View Logs / Restart / Quit)."
+    if ($autostartConfigured) {
+        Write-Host "Meridian tray will also start when this Windows user signs in."
+    } else {
+        Write-Host "Start-at-sign-in is off; pass -Autostart to enable it on a future install."
+    }
     if ($registered) {
         Write-Host ""
         Write-Host "To uninstall: Settings > Apps > Installed apps > Meridian > Uninstall,"
@@ -433,6 +526,11 @@ if ($null -ne $uv) {
         Write-Host "If 'meridian' isn't found, run:  uv tool update-shell  (then restart your terminal)"
         Write-Host ""
         Write-Host "Done. In a NEW terminal, run:  meridian --tunnel --repo ."
+        Write-Host "Configuring the Meridian MCP bundle for $TargetRepo..."
+        & uv tool run --from meridian-server meridian setup --repo $TargetRepo
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "MCP bundle setup reported a conflict or error. Re-run: meridian setup --repo `"$TargetRepo`""
+        }
         exit 0
     }
     Write-Warning "uv tool install failed; falling back to binary download."
@@ -514,3 +612,12 @@ if ($userPath -notlike "*$binDir*") {
 
 Write-Host ""
 Write-Host "Done. In a NEW terminal, run:  meridian --tunnel --repo ."
+Write-Host "Configuring the Meridian MCP bundle for $TargetRepo..."
+try {
+    & $dest setup --repo $TargetRepo
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "MCP bundle setup reported a conflict or error. Re-run: meridian setup --repo `"$TargetRepo`""
+    }
+} catch {
+    Write-Warning "Could not run MCP bundle setup: $($_.Exception.Message)"
+}

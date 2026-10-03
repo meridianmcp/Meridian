@@ -1022,9 +1022,44 @@ def index_docx(
     sources carry no path to track, so no staleness check is possible for them
     — read calls on such an index simply skip the check.
     """
+    canonical_source = None
+    if isinstance(source, str):
+        try:
+            canonical_source = os.path.normcase(
+                os.path.realpath(os.path.abspath(source))
+            )
+        except (OSError, ValueError):
+            canonical_source = os.path.normcase(os.path.abspath(source))
+    canonical_db_path = (
+        index_db_path
+        if index_db_path == ":memory:"
+        else os.path.normcase(os.path.realpath(os.path.abspath(index_db_path)))
+    )
+    scope_id = (
+        f"source:{canonical_source}"
+        if canonical_source is not None
+        else f"sidecar:{canonical_db_path}"
+    )
     paragraphs = parse_docx(source)
     conn = _connect(index_db_path)
     try:
+        stored_scope_row = conn.execute(
+            "SELECT value FROM docx_index_meta WHERE key = ?", ("source_scope_id",)
+        ).fetchone()
+        stored_path_row = conn.execute(
+            "SELECT value FROM docx_index_meta WHERE key = ?", ("source_path",)
+        ).fetchone()
+        stored_scope_id = stored_scope_row[0] if stored_scope_row else None
+        if stored_scope_id is None and stored_path_row and stored_path_row[0]:
+            stored_path = os.path.normcase(
+                os.path.realpath(os.path.abspath(str(stored_path_row[0])))
+            )
+            stored_scope_id = f"source:{stored_path}"
+        if stored_scope_id and stored_scope_id != scope_id:
+            raise ValueError(
+                "index_db_path is already scoped to a different DOCX source; "
+                "use a separate sidecar per canonical document path"
+            )
         existing = {
             row[0]: (row[1], row[2], row[3])
             for row in conn.execute("SELECT para_id, idx, style, text FROM docx_paragraphs")
@@ -1061,11 +1096,15 @@ def index_docx(
             )
         deleted = len(stale_ids)
 
-        if isinstance(source, str):
-            mtime = _stat_mtime(source)
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("source_scope_id", scope_id),
+        )
+        if canonical_source is not None:
+            mtime = _stat_mtime(canonical_source)
             conn.execute(
                 "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
-                ("source_path", source),
+                ("source_path", canonical_source),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
@@ -1076,6 +1115,8 @@ def index_docx(
         conn.close()
     return {
         "index_db": index_db_path,
+        "canonical_source": canonical_source,
+        "scope_id": scope_id,
         "paragraph_count": len(paragraphs),
         "heading_count": sum(1 for p in paragraphs if _is_heading(p["style"])),
         "delta": {

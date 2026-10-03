@@ -514,6 +514,510 @@ def test_main_without_flag_runs_the_tray(monkeypatch):
     assert tray_main.main([]) is sentinel
 
 
+def test_main_second_windows_launch_opens_dashboard_without_another_tray(monkeypatch):
+    monkeypatch.setattr(
+        tray_main, "_acquire_windows_tray_lock", lambda: ("already_running", None),
+    )
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+    monkeypatch.setattr(
+        tray_main, "_run_tray", lambda: pytest.fail("a second icon must not start"),
+    )
+
+    assert tray_main.main([]) == 0
+    assert opened == [tray_main._dashboard_url()]
+
+
+def test_windows_tray_instance_lock_releases_its_byte_range(monkeypatch, tmp_path):
+    fake_msvcrt = mock.MagicMock()
+    fake_msvcrt.LK_NBLCK = 1
+    fake_msvcrt.LK_UNLCK = 2
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    state, handle = tray_main._acquire_windows_tray_lock()
+
+    assert state == "acquired"
+    assert handle is not None
+    assert (tmp_path / "Meridian" / "tray-instance.lock").read_bytes() == b"\0"
+    tray_main._release_windows_tray_lock(handle)
+    assert fake_msvcrt.locking.call_args_list[0].args[1:] == (1, 1)
+    assert fake_msvcrt.locking.call_args_list[1].args[1:] == (2, 1)
+    assert handle.closed
+
+
+def test_windows_tray_instance_lock_treats_a_busy_lock_as_an_existing_instance(
+    monkeypatch, tmp_path,
+):
+    import errno
+
+    fake_msvcrt = mock.MagicMock()
+    fake_msvcrt.LK_NBLCK = 1
+    fake_msvcrt.locking.side_effect = OSError(errno.EACCES, "lock is held")
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert tray_main._acquire_windows_tray_lock() == ("already_running", None)
+
+
+def test_main_reports_single_instance_lock_errors(monkeypatch):
+    monkeypatch.setattr(
+        tray_main, "_acquire_windows_tray_lock", mock.Mock(side_effect=OSError("lock unavailable")),
+    )
+    show_error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
+    monkeypatch.setattr(
+        tray_main, "_run_tray", lambda: pytest.fail("tray cannot start without its lock"),
+    )
+
+    assert tray_main.main([]) == 1
+    show_error.assert_called_once_with(
+        "Meridian tray could not start",
+        "Could not establish the single-instance lock: lock unavailable",
+    )
+
+
+def test_run_tray_uses_the_tk_cocoa_main_loop_on_macos(monkeypatch):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: None)
+    monkeypatch.setattr(tray_main.sys, "platform", "darwin")
+
+    fake_root = mock.MagicMock()
+    fake_tk = mock.MagicMock()
+    fake_tk.Tk.return_value = fake_root
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    appkit = mock.MagicMock()
+    cocoa_app = object()
+    appkit.NSApplication.sharedApplication.return_value = cocoa_app
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    assert tray_main._run_tray() == 0
+
+    fake_tk.Tk.assert_called_once_with()
+    fake_icon.run_detached.assert_called_once_with()
+    fake_icon.run.assert_not_called()
+    fake_root.mainloop.assert_called_once_with()
+    fake_root.destroy.assert_called_once_with()
+    assert fake_pystray.Icon.call_args.kwargs["darwin_nsapplication"] is cocoa_app
+
+
+def test_run_tray_cleans_up_macos_root_when_startup_is_not_ready(monkeypatch):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.COLD_START_TIMEOUT)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.sys, "platform", "darwin")
+    monkeypatch.setattr(tray_main, "_show_error_dialog", mock.Mock())
+
+    fake_root = mock.MagicMock()
+    fake_tk = mock.MagicMock()
+    fake_tk.Tk.return_value = fake_root
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    appkit = mock.MagicMock()
+    appkit.NSApplication.sharedApplication.return_value = object()
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    assert tray_main._run_tray() == 1
+
+    fake_root.destroy.assert_called_once_with()
+    fake_pystray.Icon.assert_not_called()
+
+
+def test_run_tray_reports_startup_exception_and_closes_macos_root(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.side_effect = RuntimeError("startup failed")
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.sys, "platform", "darwin")
+    show_error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
+
+    fake_root = mock.MagicMock()
+    fake_tk = mock.MagicMock()
+    fake_tk.Tk.return_value = fake_root
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    appkit = mock.MagicMock()
+    appkit.NSApplication.sharedApplication.return_value = object()
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    assert tray_main._run_tray() == 1
+
+    show_error.assert_called_once_with("Meridian failed to start", "startup failed", parent=fake_root)
+    fake_root.destroy.assert_called_once_with()
+
+
+def test_run_tray_closes_macos_root_when_existing_runner_status_fails(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    record = mock.MagicMock(pid=123, run_id="existing")
+    fake_runner.start.side_effect = tray_main.RunnerAlreadyRunningError("default", record)
+    fake_runner.status.return_value = _fake_status(tray_main.LocalMcpState.COLD_START_TIMEOUT)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.sys, "platform", "darwin")
+
+    fake_root = mock.MagicMock()
+    fake_tk = mock.MagicMock()
+    fake_tk.Tk.return_value = fake_root
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    appkit = mock.MagicMock()
+    appkit.NSApplication.sharedApplication.return_value = object()
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    assert tray_main._run_tray() == 1
+
+    fake_runner.status.assert_called_once_with()
+    fake_root.destroy.assert_called_once_with()
+
+
+def test_run_tray_falls_back_to_a_solid_icon_when_the_asset_is_missing(monkeypatch):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    image_module = sys.modules["PIL.Image"]
+    image_module.open.side_effect = OSError("missing image")
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: None)
+
+    assert tray_main._run_tray() == 0
+
+    image_module.new.assert_called_once_with("RGBA", (64, 64), (0, 102, 204, 255))
+    fake_pystray.Icon.assert_called_once()
+    fake_icon.run.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("failure", "title"),
+    [
+        (tray_main.ZoteroSetupError("credential vault unavailable"), "Zotero setup unavailable"),
+        (RuntimeError("unexpected setup failure"), "Zotero setup failed"),
+    ],
+)
+def test_run_tray_reports_zotero_setup_errors(monkeypatch, failure, title):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: None)
+    monkeypatch.setattr(tray_main, "run_zotero_setup_dialog", mock.Mock(side_effect=failure))
+    show_error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+    assert tray_main._run_tray() == 0
+    callbacks = {
+        call.args[0]: call.args[1]
+        for call in fake_pystray.MenuItem.call_args_list
+        if isinstance(call.args[0], str)
+    }
+    callbacks["Zotero connection…"](mock.MagicMock(), None)
+
+    show_error.assert_called_once_with(title, str(failure), parent=None)
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin"])
+def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platform):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", mock.Mock())
+    monkeypatch.setattr(tray_main.sys, "platform", platform)
+
+    parent = None
+    if platform == "darwin":
+        parent = mock.MagicMock()
+        fake_tk = mock.MagicMock()
+        fake_tk.Tk.return_value = parent
+        monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+        appkit = mock.MagicMock()
+        appkit.NSApplication.sharedApplication.return_value = object()
+        monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    monkeypatch.setattr(tray_main, "_show_status_dialog", mock.Mock())
+    monkeypatch.setattr(tray_main, "_show_logs_window", mock.Mock())
+    monkeypatch.setattr(tray_main, "run_zotero_setup_dialog", mock.Mock())
+    errors = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", errors)
+    monkeypatch.setattr(
+        tray_main, "_choose_project_root",
+        mock.Mock(side_effect=["C:/work/project", None, None]),
+    )
+    launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
+    fake_runner.restart.side_effect = RuntimeError("restart failed")
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+
+    def click_actions(*_args):
+        callbacks = {
+            call.args[0]: call.args[1]
+            for call in fake_pystray.MenuItem.call_args_list
+            if isinstance(call.args[0], str)
+        }
+        for label in (
+            "Open Dashboard", "Status", "View Logs", "Zotero connection…",
+            "Set up a local project…", "Check a local project…",
+            "Catalog local sessions", "Artifact capture commands", "Restart", "Quit",
+        ):
+            callbacks[label](fake_icon, None)
+        # A second setup-menu invocation covers the user's picker-cancel path.
+        callbacks["Set up a local project…"](fake_icon, None)
+
+    if platform == "darwin":
+        fake_icon.run_detached.side_effect = click_actions
+        parent.mainloop.side_effect = lambda: parent.after.call_args_list[0].args[1]()
+    else:
+        fake_icon.run.side_effect = click_actions
+
+    assert tray_main._run_tray() == 0
+
+    tray_main._show_status_dialog.assert_called_once_with(fake_runner, parent=parent)
+    tray_main._show_logs_window.assert_called_once_with(fake_runner, parent=parent)
+    tray_main.run_zotero_setup_dialog.assert_called_once_with(parent=parent)
+    assert tray_main._choose_project_root.call_count == 3
+    setup = mock.call("setup", "--repo", "C:/work/project", cwd="C:/work/project")
+    recovery = mock.call("recovery", "catalog")
+    artifacts = mock.call("artifacts", "--help")
+    assert launch.call_args_list == (
+        [setup, recovery, artifacts] if platform == "win32" else [recovery, artifacts, setup]
+    )
+    fake_runner.restart.assert_called_once_with()
+    errors.assert_called_once_with("Meridian restart failed", "restart failed", parent=parent)
+    fake_runner.stop.assert_called_once_with()
+    fake_icon.stop.assert_called_once_with()
+
+
+def test_tk_ui_dispatcher_keeps_rescheduling_after_callback_error():
+    root = mock.MagicMock()
+    dispatcher = tray_main._TkUiDispatcher(root)
+    failing = mock.Mock(side_effect=RuntimeError("menu action failed"))
+    following = mock.Mock()
+    dispatcher.submit(failing)
+    dispatcher.submit(following)
+
+    first_tick = root.after.call_args.args[1]
+    with pytest.raises(RuntimeError, match="menu action failed"):
+        first_tick()
+
+    second_tick = root.after.call_args.args[1]
+    second_tick()
+    failing.assert_called_once()
+    following.assert_called_once()
+
+
+def test_local_cli_command_uses_the_tray_executable_when_frozen(monkeypatch):
+    monkeypatch.setattr(tray_main.sys, "executable", "C:/Meridian/meridian-tray.exe")
+    monkeypatch.setattr(tray_main.sys, "frozen", True, raising=False)
+
+    assert tray_main._local_cli_command("recovery", "catalog") == [
+        "C:/Meridian/meridian-tray.exe", "recovery", "catalog",
+    ]
+
+
+def test_local_cli_command_uses_current_python_in_source_mode(monkeypatch):
+    monkeypatch.setattr(tray_main.sys, "executable", "C:/Python/python.exe")
+    monkeypatch.setattr(tray_main.sys, "frozen", False, raising=False)
+
+    assert tray_main._local_cli_command("doctor", "--repo", "C:/work/project") == [
+        "C:/Python/python.exe", "-m", "meridian", "doctor", "--repo", "C:/work/project",
+    ]
+
+
+def test_launch_local_cli_uses_a_visible_windows_console(monkeypatch):
+    popen = mock.Mock()
+    monkeypatch.setattr(tray_main.subprocess, "Popen", popen)
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+    monkeypatch.setattr(tray_main.subprocess, "CREATE_NEW_CONSOLE", 0x10, raising=False)
+    monkeypatch.setattr(tray_main, "_local_cli_command", lambda *args: ["meridian", *args])
+
+    tray_main._launch_local_cli("recovery", "catalog")
+
+    popen.assert_called_once_with(
+        ["meridian", "recovery", "catalog"], cwd=None, creationflags=0x10,
+    )
+
+
+def test_choose_project_root_returns_the_selected_local_path(monkeypatch):
+    fake_tkinter = mock.MagicMock()
+    fake_filedialog = mock.MagicMock()
+    fake_tkinter.Tk.return_value = mock.MagicMock()
+    fake_tkinter.filedialog = fake_filedialog
+    fake_filedialog.askdirectory.return_value = "C:/work/project"
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    assert tray_main._choose_project_root("Choose project") == "C:/work/project"
+    fake_filedialog.askdirectory.assert_called_once_with(
+        parent=fake_tkinter.Tk.return_value, title="Choose project", mustexist=True,
+    )
+    fake_tkinter.Tk.return_value.destroy.assert_called_once_with()
+
+
+def test_choose_project_root_returns_none_when_dialog_is_cancelled(monkeypatch):
+    fake_tkinter = mock.MagicMock()
+    fake_filedialog = mock.MagicMock()
+    fake_tkinter.filedialog = fake_filedialog
+    fake_filedialog.askdirectory.return_value = ""
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    assert tray_main._choose_project_root("Choose project") is None
+    fake_tkinter.Tk.return_value.destroy.assert_called_once_with()
+
+
+def test_launch_local_cli_reports_process_start_failure(monkeypatch):
+    monkeypatch.setattr(tray_main, "_local_cli_command", lambda *args: ["missing", *args])
+    monkeypatch.setattr(tray_main.subprocess, "Popen", mock.Mock(side_effect=OSError("not found")))
+    show_error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
+
+    tray_main._launch_local_cli("doctor")
+
+    show_error.assert_called_once_with("Meridian local tool failed to open", "not found")
+
+
+def test_run_tray_exposes_local_workstation_tools(monkeypatch):
+    fake_pystray, fake_icon_instance = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+
+    assert tray_main._run_tray() == 0
+
+    labels = [call.args[0] for call in fake_pystray.MenuItem.call_args_list]
+    assert "Local workstation tools" in labels
+    assert "Set up a local project…" in labels
+    assert "Check a local project…" in labels
+    assert "Catalog local sessions" in labels
+    assert "Artifact capture commands" in labels
+    fake_icon_instance.run.assert_called_once()
+
+
+def test_local_project_setup_menu_uses_the_selected_root(monkeypatch):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+    monkeypatch.setattr(
+        tray_main, "_choose_project_root", lambda _title, parent=None: "C:/work/project",
+    )
+    launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+    tray_main._run_tray()
+    setup_item = next(
+        call for call in fake_pystray.MenuItem.call_args_list
+        if call.args[0] == "Set up a local project…"
+    )
+    setup_item.args[1](None, None)
+
+    launch.assert_called_once_with(
+        "setup", "--repo", "C:/work/project", cwd="C:/work/project",
+    )
+
+
+def test_local_tools_launch_check_recovery_and_artifact_commands(monkeypatch):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+    monkeypatch.setattr(
+        tray_main, "_choose_project_root", lambda _title, parent=None: "C:/work/project",
+    )
+    launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+    tray_main._run_tray()
+    callbacks = {
+        call.args[0]: call.args[1]
+        for call in fake_pystray.MenuItem.call_args_list
+    }
+    callbacks["Check a local project…"](None, None)
+    callbacks["Catalog local sessions"](None, None)
+    callbacks["Artifact capture commands"](None, None)
+
+    assert launch.call_args_list == [
+        mock.call("doctor", "--repo", "C:/work/project", cwd="C:/work/project"),
+        mock.call("recovery", "catalog"),
+        mock.call("artifacts", "--help"),
+    ]
+
+
+def test_local_project_menu_reports_picker_errors_without_stopping_tray(monkeypatch):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+    monkeypatch.setattr(
+        tray_main, "_choose_project_root", mock.Mock(side_effect=RuntimeError("dialog unavailable")),
+    )
+    errors = []
+    monkeypatch.setattr(
+        tray_main, "_show_error_dialog",
+        lambda title, message, parent=None: errors.append((title, message)),
+    )
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+    assert tray_main._run_tray() == 0
+    callbacks = {
+        call.args[0]: call.args[1]
+        for call in fake_pystray.MenuItem.call_args_list
+    }
+    callbacks["Set up a local project…"](None, None)
+    callbacks["Check a local project…"](None, None)
+
+    assert errors == [
+        ("Meridian project setup failed", "dialog unavailable"),
+        ("Meridian project check failed", "dialog unavailable"),
+    ]
+
+
 def test_run_server_flag_is_hidden_from_help(capsys):
     with pytest.raises(SystemExit):
         tray_main.main(["--help"])
@@ -654,7 +1158,8 @@ def test_run_tray_does_not_auto_open_when_server_fails_to_start(monkeypatch):
     monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
     dialog_calls = []
     monkeypatch.setattr(
-        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+        tray_main, "_show_error_dialog",
+        lambda title, msg, parent=None: dialog_calls.append((title, msg))
     )
 
     rc = tray_main._run_tray()
@@ -681,7 +1186,8 @@ def test_run_tray_does_not_auto_open_on_cold_start_timeout(monkeypatch):
     monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
     dialog_calls = []
     monkeypatch.setattr(
-        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+        tray_main, "_show_error_dialog",
+        lambda title, msg, parent=None: dialog_calls.append((title, msg))
     )
 
     rc = tray_main._run_tray()
@@ -725,6 +1231,15 @@ def test_run_tray_opens_dashboard_when_local_mcp_not_configured(monkeypatch):
 
     assert rc == 0
     assert opened == [tray_main._dashboard_url()]
+
+
+def test_configure_zotero_flag_opens_setup_without_starting_tray(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tray_main, "run_zotero_setup_dialog", lambda: calls.append("setup"))
+    monkeypatch.setattr(tray_main, "_run_tray", lambda: pytest.fail("tray should not start"))
+
+    assert tray_main.main(["--configure-zotero"]) == 0
+    assert calls == ["setup"]
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1422,7 @@ class TestTraySpecPreShipConsistency:
             "pystray._win32",  # _run_tray()'s lazily-imported `import pystray`
             "PIL",  # _run_tray()'s lazily-imported `from PIL import Image`
             "PIL.Image",
+            "keyring.backends.macOS" if sys.platform == "darwin" else "keyring.backends.Windows",
         ],
     )
     def test_spec_hiddenimports_covers_tray_mains_real_dependencies(self, required_entry):
@@ -978,7 +1494,8 @@ def test_run_tray_does_not_auto_open_on_cold_start_timeout(monkeypatch):
     monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
     dialog_calls = []
     monkeypatch.setattr(
-        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+        tray_main, "_show_error_dialog",
+        lambda title, msg, parent=None: dialog_calls.append((title, msg))
     )
 
     rc = tray_main._run_tray()

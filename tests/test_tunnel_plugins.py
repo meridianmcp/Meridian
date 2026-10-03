@@ -859,6 +859,25 @@ def test_custom_plugin_carries_env_dict():
     assert custom[0]["env"] == {"ZOTERO_LOCAL": "true"}
 
 
+def test_plugin_config_strips_zotero_api_keys_from_server_env():
+    secret = "test-only-private-zotero-key"
+    config = [
+        {"name": "zotero-mcp", "env": {
+            "ZOTERO_API_KEY": secret, "zotero_api_key": "also-private",
+            "ZOTERO_LOCAL": "true",
+        }},
+        {"name": "my-local-mcp", "command": "uvx my-local-mcp", "port": 8814,
+         "env": {"ZOTERO_API_KEY": secret, "SAFE_SETTING": "kept"}},
+    ]
+
+    normalized = tp.normalize_plugins_config(config)
+    custom = tp.resolve_custom_plugins(config)
+
+    assert normalized["zotero-mcp"]["env"] == {"ZOTERO_LOCAL": "true"}
+    assert custom[0]["env"] == {"SAFE_SETTING": "kept"}
+    assert secret not in repr(tp.sanitize_plugin_config_secrets(config))
+
+
 def test_custom_plugin_coerces_and_drops_bad_env():
     # Non-dict / empty / blank-key env is dropped so the descriptor shape is
     # unchanged for envless entries.
@@ -896,7 +915,7 @@ def test_validate_custom_plugin_valid_with_explicit_port():
 
 
 def test_validate_custom_plugin_auto_assigns_port_when_omitted():
-    # No port → first free port at/after _CUSTOM_PORT_START (8820), avoiding the
+    # No port → first free port at/after _CUSTOM_PORT_START, avoiding the
     # built-in default ports and any existing_ports.
     entry, err = tp.validate_custom_plugin("fetch", "uvx x", None)
     assert err is None and entry["port"] == tp._CUSTOM_PORT_START

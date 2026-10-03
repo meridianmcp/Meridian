@@ -1414,3 +1414,63 @@ def test_mcp_proxy_routes_self_hosted_mode_unaffected_by_auth_gate(monkeypatch):
     monkeypatch.setattr(tn, "_get_tenant_from_request", fail_if_called)
     resp = asyncio.run(tn.fs_mcp_proxy("t1", _FakeProxyReq("/fs/mcp/t1")))
     assert resp.status_code == 503
+
+
+def test_get_tunnel_plugins_scrubs_legacy_zotero_keys(monkeypatch, tmp_path):
+    from meridian import db as db_module
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        tenant = _run(db_module.upsert_tenant(
+            client.app.state.db, f"zotero-scrub-{uuid.uuid4().hex}@example.com"))
+        raw_token, _row = _run(db_module.create_api_token(
+            client.app.state.db, tenant["id"], label="zotero-scrub"))
+        default_config = {
+            "zotero-mcp": {"env": {
+                "ZOTERO_API_KEY": "legacy-default-test-secret",
+                "ZOTERO_LOCAL": "true",
+            }},
+        }
+        host_config = {
+            "workstation": {"zotero-mcp": {"env": {
+                "zotero_api_key": "legacy-host-test-secret",
+                "ZOTERO_LOCAL": "true",
+            }}},
+        }
+        _run(db_module.update_tenant(
+            client.app.state.db,
+            tenant["id"],
+            tunnel_plugins=json.dumps(default_config),
+            tunnel_plugins_by_host=json.dumps(host_config),
+        ))
+
+        headers = {"Authorization": f"Bearer {raw_token}"}
+        default_response = client.get("/tunnel/plugins", headers=headers)
+        assert default_response.status_code == 200
+        assert default_response.json()["config"]["zotero-mcp"]["env"] == {
+            "ZOTERO_LOCAL": "true",
+        }
+
+        host_response = client.get(
+            "/tunnel/plugins?hostname=workstation", headers=headers)
+        assert host_response.status_code == 200
+        assert host_response.json()["config"]["zotero-mcp"]["env"] == {
+            "ZOTERO_LOCAL": "true",
+        }
+
+        put_response = client.put(
+            "/tunnel/plugins",
+            headers=headers,
+            json={"config": [{"name": "zotero-mcp", "env": {
+                "ZOTERO_API_KEY": "new-put-test-secret",
+                "ZOTERO_LOCAL": "true",
+            }}]},
+        )
+        assert put_response.status_code == 200
+        assert put_response.json()["config"]["zotero-mcp"]["env"] == {
+            "ZOTERO_LOCAL": "true",
+        }
+
+        stored = _run(db_module.get_tenant_by_id(client.app.state.db, tenant["id"]))
+        assert "legacy-default-test-secret" not in stored["tunnel_plugins"]
+        assert "legacy-host-test-secret" not in stored["tunnel_plugins_by_host"]
+        assert "new-put-test-secret" not in stored["tunnel_plugins"]

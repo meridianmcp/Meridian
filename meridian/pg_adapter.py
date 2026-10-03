@@ -5513,6 +5513,35 @@ async def _migrate_pg_backfill_finding_note_kind(conn: PostgresConnection) -> No
     )
 
 
+async def _migrate_pg_project_state_milestones(conn: PostgresConnection) -> None:
+    """Add the immutable project-state milestone ledger on Postgres."""
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_state_milestones ("
+        "id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, "
+        "sequence BIGINT NOT NULL, session_id TEXT NOT NULL, trigger TEXT NOT NULL, "
+        "risk_score INTEGER NOT NULL, risk_threshold INTEGER NOT NULL, previous_hash TEXT, "
+        "content_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL, captured_at TEXT NOT NULL, "
+        "UNIQUE(project_id, sequence))"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_state_milestones_recent "
+        "ON project_state_milestones(project_id, sequence DESC)"
+    )
+    await conn.execute(
+        "CREATE OR REPLACE FUNCTION meridian_reject_project_state_milestone_update() "
+        "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "RAISE EXCEPTION 'project state milestones are append-only'; END; $$"
+    )
+    await conn.execute(
+        "DROP TRIGGER IF EXISTS project_state_milestones_no_update ON project_state_milestones"
+    )
+    await conn.execute(
+        "CREATE TRIGGER project_state_milestones_no_update BEFORE UPDATE "
+        "ON project_state_milestones FOR EACH ROW "
+        "EXECUTE FUNCTION meridian_reject_project_state_milestone_update()"
+    )
+
+
 async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     """7c96d41b — Postgres mirror of the paper_contract schema: the
     first-class versioned editorial-intent document for Meridian's
@@ -5806,4 +5835,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_lock_session_id,
     _migrate_pg_sprint_item_coarse_lock_files,
     _migrate_pg_backfill_finding_note_kind,
+    _migrate_pg_project_state_milestones,
 )

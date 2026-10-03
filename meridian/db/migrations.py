@@ -1176,6 +1176,32 @@ async def _migrate_checkpoint_data(db: aiosqlite.Connection) -> None:
     await db.execute(
         "DELETE FROM project_notes WHERE title LIKE ?", ("checkpoint:%",)
     )
+
+
+async def _migrate_project_state_milestones(db: aiosqlite.Connection) -> None:
+    """Create the append-only, project-scoped recovery milestone ledger."""
+    await db.executescript(
+        "CREATE TABLE IF NOT EXISTS project_state_milestones ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    sequence INTEGER NOT NULL,"
+        "    session_id TEXT NOT NULL,"
+        "    trigger TEXT NOT NULL,"
+        "    risk_score INTEGER NOT NULL,"
+        "    risk_threshold INTEGER NOT NULL,"
+        "    previous_hash TEXT,"
+        "    content_hash TEXT NOT NULL,"
+        "    snapshot_json TEXT NOT NULL,"
+        "    captured_at TEXT NOT NULL,"
+        "    UNIQUE(project_id, sequence)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_project_state_milestones_recent "
+        "ON project_state_milestones(project_id, sequence DESC);"
+        "CREATE TRIGGER IF NOT EXISTS project_state_milestones_no_update "
+        "BEFORE UPDATE ON project_state_milestones BEGIN "
+        "SELECT RAISE(ABORT, 'project state milestones are append-only'); END;"
+    )
+    await db.commit()
     await db.commit()
 
 

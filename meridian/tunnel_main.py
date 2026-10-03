@@ -3,8 +3,9 @@
 The full server entry point (``meridian/__main__entry.py``) pulls in FastAPI,
 uvicorn, psycopg3, langgraph, the hosted/billing routes and every DB dependency.
 The standalone binary that users download (``meridian.exe`` / ``meridian-linux``
-/ ``meridian-mac-*``) is only ever used as a Pro filesystem tunnel client
-(``meridian --tunnel --repo .``), so bundling the whole server is wasteful.
+/ ``meridian-mac-*``) is used as a Pro filesystem tunnel client
+(``meridian --tunnel --repo .``) and for the offline ``meridian setup`` MCP
+bundle installer, so bundling the whole server is wasteful.
 
 This module is the dedicated tunnel-client entry point. It imports ONLY what the
 tunnel needs:
@@ -18,8 +19,8 @@ It deliberately does NOT import ``meridian.server``, ``meridian.pg_adapter``,
 ``meridian.hosted``, langgraph, FastAPI or uvicorn. The PyInstaller spec
 (``meridian.spec``) excludes those modules so the frozen binary stays small.
 
-CLI flags mirror the ``--tunnel`` subset of ``meridian/__main__.py`` so the
-binary behaves exactly like ``python -m meridian --tunnel ...``.
+CLI flags mirror the ``--tunnel`` subset of ``meridian/__main__.py``; the
+additional offline ``setup`` command is shared by source and packaged installs.
 """
 from __future__ import annotations
 
@@ -307,8 +308,15 @@ def _resolve_loop() -> asyncio.AbstractEventLoop:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the supervised tunnel client or its internal worker process."""
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    # The slim downloadable binary also carries the offline MCP bundle setup
+    # command, so installers can configure hosts without a Python checkout.
+    if raw_argv and raw_argv[0] == "setup":
+        from .setup_bundle import cli_main
+
+        return cli_main(raw_argv[1:])
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     if args.tunnel_child:
         return _run_tunnel(args)
     return _run_supervised(args)

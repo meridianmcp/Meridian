@@ -2810,6 +2810,27 @@ def test_run_tunnel_wires_outputs_slot_when_enabled(monkeypatch, tmp_path):
     assert outputs_spawns, "outputs slot (meridian-outputs-mcp) was not spawned"
 
 
+def test_run_tunnel_wires_latex_slot_when_enabled(monkeypatch, tmp_path):
+    """Enabling meridian-latex must spawn it and use the latex reconnect slot."""
+    procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "tid-latex", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "meridian-latex", "enabled": True},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    latex_spawns = [p for p in procs if "meridian-latex" in p.cmd]
+    assert latex_spawns, "latex slot was not spawned"
+    assert latex_spawns[0].cmd[-2:] == ["meridian-latex", "mcp"]
+
+
 def test_run_tunnel_wires_debug_slot_when_enabled(monkeypatch, tmp_path):
     """Enabling the 'debug' slot (mcp-debugger) via tunnel_plugins_config must
     spawn its SlotProxy the same way. debug's session_mode is 'persistent'
