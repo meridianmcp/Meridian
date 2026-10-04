@@ -126,7 +126,9 @@ interface RecorderPaths {
 }
 
 interface TeXDistributionResolution {
+  enginePath: string | null;
   roots: string[];
+  excludedRoots: string[];
   reason: string | null;
   phaseResults: Array<{ tool: string; result: CommandResult }>;
 }
@@ -1016,7 +1018,9 @@ async function usableExecutable(path: string): Promise<string | null> {
     const stat = await fs.stat(realPath);
     if (!stat.isFile()) return null;
     await fs.access(realPath, process.platform === "win32" ? undefined : constants.X_OK);
-    return realPath;
+    // Preserve the PATH entry's basename: TeX Live commonly exposes engines
+    // such as pdflatex as symlinks to pdftex, and argv[0] selects the format.
+    return resolve(path);
   } catch {
     return null;
   }
@@ -1055,9 +1059,9 @@ async function resolveTeXDistributionRoots(
   invoke: (executable: string, args: string[], cwd: string, commandTimeout: number, env?: NodeJS.ProcessEnv) => Promise<CommandResult>,
 ): Promise<TeXDistributionResolution> {
   const enginePath = await resolveExecutableInPath(engine, env, cwd);
-  if (!enginePath) return { roots: [], reason: "The active TeX engine could not be resolved on PATH to verify its distribution.", phaseResults: [] };
+  if (!enginePath) return { enginePath: null, roots: [], excludedRoots: [], reason: "The active TeX engine could not be resolved on PATH to verify its distribution.", phaseResults: [] };
   const kpsewhich = await resolveExecutableBeside("kpsewhich", enginePath, env);
-  if (!kpsewhich) return { roots: [], reason: "The active TeX engine has no sibling kpsewhich; its TeX distribution roots cannot be verified.", phaseResults: [] };
+  if (!kpsewhich) return { enginePath, roots: [], excludedRoots: [], reason: "The active TeX engine has no sibling kpsewhich; its TeX distribution roots cannot be verified.", phaseResults: [] };
 
   // Ignore user-supplied TEXMF overrides and query from the engine's own bin
   // directory so a project-local texmf.cnf cannot define trusted roots. The
@@ -1069,6 +1073,7 @@ async function resolveTeXDistributionRoots(
   kpseEnv.PWD = distributionCwd;
   const variables = ["TEXMFDIST", "TEXMFROOT", "TEXMFMAIN", "TEXMFSYSVAR", "TEXMFSYSCONFIG", "TEXMFLOCAL"];
   const roots = new Map<string, string>();
+  const excludedRoots = new Map<string, string>();
   const phaseResults: TeXDistributionResolution["phaseResults"] = [];
   let requiredRootError: string | null = null;
   const lookups = await Promise.all(variables.map(async (variable) => ({
@@ -1078,35 +1083,42 @@ async function resolveTeXDistributionRoots(
   for (const { variable, result } of lookups) {
     phaseResults.push({ tool: "kpsewhich --var-value=" + variable, result });
     if (result.exitCode !== 0) {
-      if (variable === "TEXMFDIST") requiredRootError = "The active TeX distribution's kpsewhich could not resolve TEXMFDIST.";
+      if (variable === "TEXMFDIST" && !requiredRootError) requiredRootError = "The active TeX distribution's kpsewhich could not resolve TEXMFDIST.";
+      if (variable === "TEXMFLOCAL" && !requiredRootError) requiredRootError = "The active TeX distribution's kpsewhich could not resolve TEXMFLOCAL, so local TeX additions cannot be excluded from trusted roots.";
       continue;
     }
     const reported = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     if (reported.length !== 1 || !isAbsolute(reported[0])) {
-      if (variable === "TEXMFDIST") requiredRootError = "The active TeX distribution's kpsewhich returned an invalid TEXMFDIST path.";
+      if (variable === "TEXMFDIST" && !requiredRootError) requiredRootError = "The active TeX distribution's kpsewhich returned an invalid TEXMFDIST path.";
+      if (variable === "TEXMFLOCAL" && !requiredRootError) requiredRootError = "The active TeX distribution's kpsewhich returned an invalid TEXMFLOCAL path, so local TeX additions cannot be excluded from trusted roots.";
       continue;
     }
     try {
       const root = await fs.realpath(reported[0]);
       if (!(await fs.stat(root)).isDirectory()) throw new Error("not a directory");
-      roots.set(pathKey(root), root);
+      if (variable === "TEXMFLOCAL") excludedRoots.set(pathKey(root), root);
+      else roots.set(pathKey(root), root);
     } catch {
-      if (variable === "TEXMFDIST") requiredRootError = "The active TeX distribution's kpsewhich returned a TEXMFDIST path that is not an accessible directory.";
+      if (variable === "TEXMFDIST" && !requiredRootError) requiredRootError = "The active TeX distribution's kpsewhich returned a TEXMFDIST path that is not an accessible directory.";
+      if (variable === "TEXMFLOCAL" && !requiredRootError) requiredRootError = "The active TeX distribution's kpsewhich returned a TEXMFLOCAL path that is not an accessible directory, so local TeX additions cannot be excluded from trusted roots.";
     }
   }
   if (requiredRootError || !roots.size) {
     return {
+      enginePath,
       roots: [],
+      excludedRoots: [...excludedRoots.values()],
       reason: requiredRootError ?? "The active TeX distribution's kpsewhich returned no usable system roots.",
       phaseResults,
     };
   }
-  return { roots: [...roots.values()], reason: null, phaseResults };
+  return { enginePath, roots: [...roots.values()], excludedRoots: [...excludedRoots.values()], reason: null, phaseResults };
 }
 
-async function isVerifiedTeXDistributionInput(path: string, distributionRoots: string[]): Promise<boolean> {
+async function isVerifiedTeXDistributionInput(path: string, distributionRoots: string[], excludedRoots: string[]): Promise<boolean> {
   try {
     const actualPath = await fs.realpath(path);
+    if (excludedRoots.some((root) => inside(root, actualPath))) return false;
     return distributionRoots.some((root) => inside(root, actualPath));
   } catch {
     return false;
@@ -1124,7 +1136,7 @@ function redirectProjectSearchPath(value: string, originalRoot: string, snapshot
   }).join(delimiter);
 }
 
-async function externalSearchPathEntries(value: string | undefined, originalRoot: string, snapshotRoot: string, excludedBuildDir: string, distributionRoots: string[]): Promise<string[]> {
+async function externalSearchPathEntries(value: string | undefined, originalRoot: string, snapshotRoot: string, excludedBuildDir: string, distributionRoots: string[], excludedDistributionRoots: string[]): Promise<string[]> {
   if (!value) return [];
   const external: string[] = [];
   for (const entry of value.split(delimiter).map((part) => part.trim().replace(/^!!/, "")).filter(Boolean)) {
@@ -1136,7 +1148,7 @@ async function externalSearchPathEntries(value: string | undefined, originalRoot
     if (inside(originalRoot, path)) {
       const firstPart = relative(originalRoot, path).split(sep)[0]?.toLowerCase();
       if (inside(excludedBuildDir, path) || firstPart === ".git" || firstPart === "node_modules") external.push(path);
-    } else if (!inside(snapshotRoot, path) && !(await isVerifiedTeXDistributionInput(path, distributionRoots))) {
+    } else if (!inside(snapshotRoot, path) && !(await isVerifiedTeXDistributionInput(path, distributionRoots, excludedDistributionRoots))) {
       external.push(path);
     }
   }
@@ -1150,6 +1162,7 @@ async function parseRecorderPaths(
   snapshotRoot: string,
   buildDir: string,
   distributionRoots: string[],
+  excludedDistributionRoots: string[],
   knownGeneratedOutputs: string[],
 ): Promise<RecorderPaths> {
   let recorderCwd = compileRoot;
@@ -1191,7 +1204,7 @@ async function parseRecorderPaths(
       }
     } else if (inside(originalRoot, candidate)) {
       result.bypassedProjectInputs.push(candidate);
-    } else if (await isVerifiedTeXDistributionInput(candidate, distributionRoots)) {
+    } else if (await isVerifiedTeXDistributionInput(candidate, distributionRoots, excludedDistributionRoots)) {
       // System distribution files are outside the local project source manifest.
     } else {
       result.externalInputs.push(candidate);
@@ -1393,7 +1406,10 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
   const distribution = await resolveTeXDistributionRoots(engine, compileEnv, snapshot.sourceRoot, timeoutMs, invoke);
   for (const distributionPhase of distribution.phaseResults) phases.push(phase(distributionPhase.tool, distributionPhase.result));
   if (distribution.reason) prerequisiteNotes.push(distribution.reason);
-  const compilerVersion = await invoke(engine, ["--version"], snapshot.sourceRoot, Math.min(timeoutMs, 15_000), compileEnv);
+  const enginePath = distribution.enginePath;
+  const compilerVersion = enginePath
+    ? await invoke(enginePath, ["--version"], snapshot.sourceRoot, Math.min(timeoutMs, 15_000), compileEnv)
+    : { exitCode: null, stdout: "", stderr: "", durationMs: 0, errorCode: "ENOENT" };
   phases.push(phase(`${engine} --version`, compilerVersion));
   let status: CompileStatus = "failed";
   let version: string | null = compilerVersion.stdout.split(/\r?\n/).find((line) => line.trim())?.trim() ?? null;
@@ -1405,13 +1421,15 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
 
   if (compilerVersion.errorCode === "ENOENT") {
     status = "unavailable";
-    prerequisiteNotes.push(`Required TeX engine "${engine}" was not found on PATH. Install a TeX distribution that provides it.`);
+    prerequisiteNotes.push(enginePath
+      ? `Required TeX engine "${engine}" could not be started from its resolved PATH location. Check its installation and permissions.`
+      : `Required TeX engine "${engine}" was not found on PATH. Install a TeX distribution that provides it.`);
   } else if (compilerVersion.exitCode !== 0 || !version) {
     status = "unavailable";
     prerequisiteNotes.push(`Could not identify TeX engine "${engine}". Check that its installation is healthy and the executable is on PATH.`);
   }
   else {
-    const initial = await invoke(engine, args, snapshot.sourceRoot, timeoutMs, compileEnv);
+    const initial = await invoke(enginePath!, args, snapshot.sourceRoot, timeoutMs, compileEnv);
     phases.push(phase(engine, initial));
     if (initial.errorCode === "ENOENT") {
       status = "unavailable";
@@ -1448,7 +1466,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
         const passCount = sources.bibliographyBackend === "none" ? 1 : 2;
         status = "passed";
         for (let pass = 0; pass < passCount; pass += 1) {
-          const result = await invoke(engine, args, snapshot.sourceRoot, timeoutMs, compileEnv);
+          const result = await invoke(enginePath!, args, snapshot.sourceRoot, timeoutMs, compileEnv);
           phases.push(phase(`${engine} pass ${pass + 2}`, result));
           if (result.errorCode === "ENOENT") {
             status = "unavailable";
@@ -1474,12 +1492,12 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
       : "The compiler did not produce a readable TeX recorder file.";
   }
   const recorderPaths = recorderContents
-    ? await parseRecorderPaths(recorderContents, snapshot.sourceRoot, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots, knownGeneratedOutputs)
+    ? await parseRecorderPaths(recorderContents, snapshot.sourceRoot, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots, distribution.excludedRoots, knownGeneratedOutputs)
     : { inputs: [], bypassedProjectInputs: [], externalInputs: [] };
   const externalSearchPaths = await Promise.all([
-    externalSearchPathEntries(process.env.TEXINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots),
-    externalSearchPathEntries(process.env.BIBINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots),
-    externalSearchPathEntries(process.env.BSTINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots),
+    externalSearchPathEntries(process.env.TEXINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots, distribution.excludedRoots),
+    externalSearchPathEntries(process.env.BIBINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots, distribution.excludedRoots),
+    externalSearchPathEntries(process.env.BSTINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots, distribution.excludedRoots),
   ]);
   recorderPaths.externalInputs.push(...externalSearchPaths.flat());
   const recorderIncompleteReason = recorderReadFailure

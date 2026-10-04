@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { chmod, mkdtemp, mkdir, open as openFile, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, relative } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { compileLocalLatex, getLatestCompileReceiptSummary, getWorkflowStatusPayload, runBoundedCommand, type CommandResult, type CommandRunner, type LatexEngine } from "./overleaf-workflow.js";
 
@@ -69,14 +69,15 @@ function fakeRunner(engine: LatexEngine, extraRecordedInputs: string[] = []) {
   };
   const runCommand = async (executable: string, args: string[], cwd: string): Promise<CommandResult> => {
     calls.push({ executable, args, cwd });
-    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "kpsewhich" && args[0]?.startsWith("--var-value=")) {
+    const executableName = basename(executable).toLowerCase().replace(/\.exe$/, "");
+    if (executableName === "kpsewhich" && args[0]?.startsWith("--var-value=")) {
       const root = fakeDistributionRoots[args[0].slice("--var-value=".length)];
       return { exitCode: 0, stdout: (root ?? "") + "\n", stderr: "", durationMs: 1 };
     }
     if (args[0] === "--version") {
       return { exitCode: 0, stdout: `${executable} version 1.2.3\n`, stderr: "", durationMs: 2 };
     }
-    if (executable === engine) {
+    if (executableName === engine.toLowerCase()) {
       const outputArg = args.find((arg) => arg.startsWith("-output-directory="));
       assert.ok(outputArg, "engine receives a local output directory");
       const outDir = outputArg!.slice("-output-directory=".length);
@@ -116,8 +117,8 @@ test("compile receipt hashes transitive TeX and BibTeX inputs while preserving n
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "chapters/body.tex"));
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "chapters/methods.tex"), "literal import paths are added to the source manifest");
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "references.bib"));
-  assert.equal(fake.calls.filter((call) => call.executable === "pdflatex" && call.args[0] !== "--version").length, 3);
-  assert.ok(fake.calls.filter((call) => call.executable === "pdflatex" && call.args[0] !== "--version").every((call) => call.args.includes("-no-shell-escape")));
+  assert.equal(fake.calls.filter((call) => basename(call.executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && call.args[0] !== "--version").length, 3);
+  assert.ok(fake.calls.filter((call) => basename(call.executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && call.args[0] !== "--version").every((call) => call.args.includes("-no-shell-escape")));
   assert.equal(receipt.root_file, "main.tex");
   assert.ok(receipt.source_manifest.files.every((file) => !file.path.includes(root)), "manifest paths are project-relative");
   assert.ok(receipt.output.pdf_path?.includes("build"), "local CLI receipt points to the local build artifact");
@@ -143,7 +144,7 @@ test("project search paths keep their order while pointing at the compile snapsh
   let compileEnv: NodeJS.ProcessEnv | undefined;
   const fake = fakeRunner("pdflatex");
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
-    if (executable === "pdflatex" && args[0] !== "--version") {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version") {
       compileCwd = cwd;
       compileEnv = env;
     }
@@ -511,7 +512,8 @@ test("missing local compiler yields an unavailable receipt rather than a false p
   assert.equal(receipt.status, "unavailable");
   assert.equal(receipt.compiler.version, null);
   assert.equal(receipt.output.pdf_sha256, null);
-  assert.ok(receipt.limitations.some((limitation) => limitation.includes("not found on PATH") && limitation.includes("TeX distribution")));
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("could not be started from its resolved PATH location")));
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("TeX distribution's kpsewhich")));
   assert.equal((await getLatestCompileReceiptSummary("project_789", state))?.status, "unavailable");
 });
 
@@ -536,7 +538,7 @@ test("source changes during compile produce an incomplete receipt", async () => 
   let changed = false;
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version" && !changed) {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version" && !changed) {
       changed = true;
       await writeFile(join(root, "main.tex"), "\\begin{document}After\\end{document}\n", "utf8");
     }
@@ -559,7 +561,7 @@ test("unbraced input changes during compile retain the exact snapshot hash", asy
   let changed = false;
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version" && !changed) {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version" && !changed) {
       changed = true;
       await writeFile(chapterPath, "Changed during compile.\n", "utf8");
     }
@@ -583,7 +585,7 @@ test("recorder-only local inputs changed during compile retain the exact snapsho
   let changed = false;
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version" && !changed) {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version" && !changed) {
       changed = true;
       await writeFile(chapterPath, "Changed recorder-only input.\n", "utf8");
     }
@@ -607,7 +609,7 @@ test("deleted recorder-only local inputs keep the source manifest incomplete", a
   let deleted = false;
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version" && !deleted) {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version" && !deleted) {
       deleted = true;
       await rm(chapterPath);
     }
@@ -633,7 +635,7 @@ test("change then restore in the live project cannot change the compiled snapsho
   let compiledChapter = "";
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version" && !changed) {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version" && !changed) {
       changed = true;
       compiledChapter = await readFile(join(cwd, "chapter.tex"), "utf8");
       await writeFile(chapterPath, "Transient contents seen during compilation.\n", "utf8");
@@ -656,7 +658,7 @@ test("compile snapshot write protection blocks edits or fails the receipt closed
   let snapshotWriteSucceeded = false;
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version") {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version") {
       try {
         await writeFile(join(cwd, "main.tex"), "Transient snapshot tamper.\n", "utf8");
         snapshotWriteSucceeded = true;
@@ -688,7 +690,7 @@ test("recorder paths that bypass the immutable project snapshot make the manifes
   const fake = fakeRunner("pdflatex");
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version") {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version") {
       const outputArg = args.find((arg) => arg.startsWith("-output-directory="))!;
       const flsPath = join(outputArg.slice("-output-directory=".length), "main.fls");
       const fls = await readFile(flsPath, "utf8");
@@ -739,6 +741,26 @@ test("the active engine's kpsewhich TEXMFDIST is accepted as the distribution ro
   assert.ok(!receipt.limitations.some((limitation) => limitation.includes("distribution roots cannot be verified")));
 });
 
+test("compiler and kpsewhich use the same PATH-resolved engine despite a same-name project executable", async () => {
+  const shadowName = process.platform === "win32" ? "pdflatex.exe" : "pdflatex";
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}Stable\\end{document}\n",
+    [shadowName]: "project-local executable shadow",
+  });
+  if (process.platform !== "win32") await chmod(join(root, shadowName), 0o755);
+  const fake = fakeRunner("pdflatex");
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+  const expectedEngine = join(dirname(fakeDistributionRoot), "pdflatex" + (process.platform === "win32" ? ".exe" : ""));
+  const kpsewhichCall = fake.calls.find((call) => basename(call.executable).toLowerCase().replace(/\.exe$/, "") === "kpsewhich");
+  const engineCalls = fake.calls.filter((call) => basename(call.executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex");
+
+  assert.equal(receipt.status, "passed");
+  assert.ok(kpsewhichCall);
+  assert.ok(engineCalls.length >= 2, "the version check and compile passes use the resolved engine");
+  assert.ok(engineCalls.every((call) => resolve(call.executable).toLowerCase() === expectedEngine.toLowerCase()));
+  assert.ok(engineCalls.every((call) => call.executable !== "pdflatex"));
+});
+
 test("unavailable active-engine kpsewhich roots make the receipt incomplete", async () => {
   const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
   const fake = fakeRunner("pdflatex");
@@ -763,6 +785,19 @@ test("a texlive-looking external path is not trusted without kpsewhich proof", a
   await mkdir(dirname(untrustedDistributionPath), { recursive: true });
   await writeFile(untrustedDistributionPath, "untrusted external package", "utf8");
   const fake = fakeRunner("pdflatex", [untrustedDistributionPath]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
+});
+
+test("TEXMFLOCAL inputs are not trusted even when nested under TEXMFROOT", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const localInput = join(fakeDistributionRoots.TEXMFLOCAL, "tex", "latex", "site-local.sty");
+  await mkdir(dirname(localInput), { recursive: true });
+  await writeFile(localInput, "site-local input", "utf8");
+  const fake = fakeRunner("pdflatex", [localInput]);
   const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
 
   assert.equal(receipt.status, "incomplete");
@@ -795,7 +830,7 @@ test("only recorder-declared existing build outputs are ignored as current-job i
   let generatedOutput = "";
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version") {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version") {
       const outputArg = args.find((arg) => arg.startsWith("-output-directory="))!;
       const buildDir = outputArg.slice("-output-directory=".length);
       generatedOutput = join(buildDir, "main.aux");
@@ -820,7 +855,7 @@ test("unverified build-directory recorder inputs are external and fail closed", 
   let unverifiedInput = "";
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
-    if (executable === "pdflatex" && args[0] !== "--version") {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] !== "--version") {
       const outputArg = args.find((arg) => arg.startsWith("-output-directory="))!;
       const buildDir = outputArg.slice("-output-directory=".length);
       unverifiedInput = join(buildDir, "unverified.sty");
@@ -867,7 +902,7 @@ test("unique per-run build directories prevent stale outputs and concurrent clob
   const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
   const firstRunner = fakeRunner("pdflatex");
   const first = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: firstRunner.runCommand });
-  const noOutputRunner: CommandRunner = async (executable, args) => executable === "pdflatex" && args[0] === "--version"
+  const noOutputRunner: CommandRunner = async (executable, args) => basename(executable).toLowerCase().replace(/\.exe$/, "") === "pdflatex" && args[0] === "--version"
     ? { exitCode: 0, stdout: "pdflatex test\n", stderr: "", durationMs: 1 }
     : { exitCode: 0, stdout: "", stderr: "", durationMs: 1 };
   const noOutput = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: noOutputRunner });
