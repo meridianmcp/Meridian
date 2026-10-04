@@ -84,6 +84,33 @@ case "$1" in
   *)  echo "$FAKE_UNAME_S" ;;
 esac
 """
+_FAKE_UNAME_RUNNER = r"""
+uname() {
+  case "$1" in
+    -m) printf '%s\n' "$FAKE_UNAME_M" ;;
+    *)  printf '%s\n' "$FAKE_UNAME_S" ;;
+  esac
+}
+fakebin_path="$(cygpath -u "$1")"
+fake_home="$(cygpath -u "$2")"
+script_path="$3"
+curl_shim_path="$(cygpath -u "$4")"
+shift 4
+export PATH="$fakebin_path:$PATH"
+export HOME="$fake_home"
+if [ -n "${MERIDIAN_BIN_DIR:-}" ]; then
+  MERIDIAN_BIN_DIR="$(cygpath -u "$MERIDIAN_BIN_DIR")"
+  export MERIDIAN_BIN_DIR
+fi
+if [ -n "${FAKE_CALL_LOG:-}" ]; then
+  FAKE_CALL_LOG="$(cygpath -u "$FAKE_CALL_LOG")"
+  export FAKE_CALL_LOG
+fi
+curl() {
+  sh "$curl_shim_path" "$@"
+}
+. "$script_path" "$@"
+"""
 
 # Records every invocation; every download "fails" so nothing real can happen.
 _FAKE_RECORDER = """#!/bin/sh
@@ -143,8 +170,23 @@ class _Box:
             "FAKE_CALL_LOG": self.log.as_posix(),
         }
         env.pop("MERIDIAN_INSTALL_ALLOW_UNVERIFIED", None)
+        argv = [shell, script.as_posix()]
+        if os.name == "nt":
+            # Git Bash/MSYS may search its own uname.exe before a temporary
+            # PATH shim. Define uname in the shell process so simulated targets
+            # remain deterministic on Windows too.
+            argv = [
+                shell,
+                "-c",
+                _FAKE_UNAME_RUNNER,
+                "meridian-installer-test",
+                self.fakebin.as_posix(),
+                self.home.as_posix(),
+                script.as_posix(),
+                (self.fakebin / "curl").as_posix(),
+            ]
         return subprocess.run(
-            [shell, script.as_posix()], cwd=self.root, env=env,
+            argv, cwd=self.root, env=env,
             capture_output=True, text=True, timeout=120,
         )
 
@@ -299,7 +341,16 @@ def test_source_install_on_linux_arm64_still_succeeds_through_uv(box):
     _source_box(box, uv="ok")
     proc = box.run(_BASH, _SOURCE_INSTALL_SH, "Linux", "aarch64")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert box.calls() == [f"uv tool install {_pypi_name()}"]
+    calls = box.calls()
+    assert calls[0] == f"uv tool install {_pypi_name()}"
+    assert calls[1] == (
+        "uv tool run --from meridian-server meridian setup --repo "
+        + subprocess.run(
+            [_BASH, "-c", "pwd -P"], cwd=box.root, capture_output=True,
+            text=True, timeout=15,
+        ).stdout.strip()
+    )
+    assert len(calls) == 2
 
 
 @_needs_bash
@@ -312,4 +363,5 @@ def test_source_install_pixi_fallback_is_not_blocked_on_pixi_platforms(box, unam
     calls = box.calls()
     assert any(c.startswith("git clone") for c in calls), calls
     assert "pixi install" in calls, calls
+    assert any(c.startswith("pixi run python -m meridian setup --repo ") for c in calls), calls
     assert "not available on Linux arm64" not in proc.stderr

@@ -131,24 +131,20 @@ builtin_known="pip pip3 setuptools wheel pip-tools uv npm npx corepack pixi cond
 # `name = "meridian"` under [workspace] would be misread as package names.
 extract_pixi_toml_deps() {
     [ -f "$PIXI_TOML" ] || return 0
-    local in_dep=0
-    local line
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            \[dependencies\]|\[pypi-dependencies\]|\[feature.*.dependencies\]|\[feature.*.pypi-dependencies\])
-                in_dep=1
-                continue
-                ;;
-            \[*)
-                in_dep=0
-                continue
-                ;;
-        esac
-        [ "$in_dep" = "1" ] || continue
-        if printf '%s\n' "$line" | grep -qE '^[A-Za-z0-9][A-Za-z0-9_.-]*[[:space:]]*='; then
-            printf '%s\n' "$line" | sed -E 's/^([A-Za-z0-9][A-Za-z0-9_.-]*)[[:space:]]*=.*/\1/'
-        fi
-    done < "$PIXI_TOML"
+    # Parse the manifest in one process. Spawning grep/sed for every line here
+    # makes this per-tool-call hook extremely slow under Git Bash on Windows.
+    awk '
+        /^\[dependencies\]$/ || /^\[pypi-dependencies\]$/ ||
+        /^\[feature\..*\.dependencies\]$/ || /^\[feature\..*\.pypi-dependencies\]$/ {
+            in_dep = 1
+            next
+        }
+        /^\[/ { in_dep = 0; next }
+        in_dep && /^[A-Za-z0-9][A-Za-z0-9_.-]*[[:space:]]*=/ {
+            sub(/[[:space:]]*=.*/, "", $0)
+            print $0
+        }
+    ' "$PIXI_TOML"
 }
 
 # Build the known-good package set (normalized, one per line): repo manifests
@@ -162,7 +158,7 @@ known="$(
             | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/'
         extract_pixi_toml_deps
         [ -f "$ALLOWLIST" ] && grep -vE '^[[:space:]]*(#|$)' "$ALLOWLIST"
-    } 2>/dev/null | tr -d '\r' | while IFS= read -r n; do normalize "$n"; done
+    } 2>/dev/null | tr -d '\r' | tr '[:upper:]' '[:lower:]' | sed -E 's/[-_.]+/-/g'
 )"
 
 is_known() {
