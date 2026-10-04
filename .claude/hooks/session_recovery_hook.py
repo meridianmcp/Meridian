@@ -44,11 +44,25 @@ def handle_hook_payload(
             }
         if tool_input.get("local_identity") in (None, {}):
             return None
+        provider_session_id = payload.get("session_id")
+        if (
+            not isinstance(provider_session_id, str)
+            or not provider_session_id.strip()
+        ):
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "Cannot safely register recovery identity without this host's session id."
+                    ),
+                }
+            }
         try:
             redacted = prepare_client_local_registration(
                 local_dir,
                 tool_input,
-                provider_session_id=payload.get("session_id"),
+                provider_session_id=provider_session_id,
             )
         except Exception:  # noqa: BLE001 -- fail closed before a hosted request
             return {

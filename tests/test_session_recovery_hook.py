@@ -67,6 +67,36 @@ def test_pretool_persists_identity_locally_and_redacts_hosted_arguments(tmp_path
     assert record["resume_recipe"]
 
 
+@pytest.mark.parametrize(
+    ("session_id_present", "session_id"),
+    [
+        (False, None),
+        (True, ""),
+        (True, " \t "),
+        (True, 123),
+    ],
+)
+def test_pretool_refuses_local_identity_without_active_host_session_id(
+    tmp_path, session_id_present, session_id
+):
+    tool_input = _registration_input()
+    tool_input["local_identity"]["local_session_id"] = "forged-other-host-session"
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "mcp__meridian__register_session_recovery",
+        "tool_input": tool_input,
+    }
+    if session_id_present:
+        payload["session_id"] = session_id
+
+    response = hook.handle_hook_payload(payload, data_dir=tmp_path)
+
+    hook_output = response["hookSpecificOutput"]
+    assert hook_output["permissionDecision"] == "deny"
+    assert "updatedInput" not in hook_output
+    assert not recovery.client_local_recovery_snapshot_path(tmp_path).exists()
+
+
 def test_subagent_start_stop_are_local_and_recovery_context_is_session_bound(tmp_path):
     start = {
         "hook_event_name": "SubagentStart",
