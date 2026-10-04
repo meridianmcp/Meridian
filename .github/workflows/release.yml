@@ -81,6 +81,7 @@ jobs:
       - name: Build macOS tray app bundle
         run: pixi run -e dev build-tray-mac
       - name: Zip app bundle
+        id: zip_app
         # ditto (not a plain `zip`) preserves the .app bundle's resource
         # forks/extended attributes correctly -- Apple's own documented tool
         # for this, matching how Finder's own "Compress" does it.
@@ -91,7 +92,9 @@ jobs:
           ditto dist/meridian-tray.app dist/meridian-tray-dmg/Meridian.app
           ln -s /Applications dist/meridian-tray-dmg/Applications
           hdiutil create -volname Meridian -srcfolder dist/meridian-tray-dmg -ov -format UDZO meridian-tray-mac.dmg
+      # DMG packaging is optional: preserve the ZIP if hdiutil fails afterward.
       - name: Upload tray artifact
+        if: ${{ always() && steps.zip_app.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: meridian-tray-mac
