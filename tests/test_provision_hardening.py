@@ -130,6 +130,39 @@ def test_provision_with_retry_exhausts_and_enqueues(monkeypatch):
 # 8b6c19d3 — on-demand provisioning from POST /projects
 # ---------------------------------------------------------------------------
 
+def test_local_project_creation_persists_across_server_restart(monkeypatch, tmp_path):
+    """Self-hosted first-run creation must work without Neon and survive restart."""
+    db_path = tmp_path / "local-meridian.sqlite"
+    monkeypatch.setenv("MERIDIAN_DB", str(db_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_HOSTED", "0")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DOC_STORE_URL", ":memory:")
+
+    from fastapi.testclient import TestClient
+    import importlib
+    import meridian.server as server_module
+
+    server_module = importlib.reload(server_module)
+    with TestClient(server_module.app) as client:
+        response = client.post("/projects", json={"name": "Local first project"})
+        assert response.status_code == 201, response.text
+        created = response.json()
+        assert created["name"] == "Local first project"
+
+    server_module = importlib.reload(server_module)
+    with TestClient(server_module.app) as client:
+        projects = client.get("/projects").json()
+        assert any(
+            project["id"] == created["id"]
+            and project["name"] == "Local first project"
+            for project in projects
+        )
+
+
 def test_create_project_provisions_on_demand_for_unprovisioned_tenant(monkeypatch, tmp_path):
     """A tenant with no neon_project_id (e.g. an accepted workspace member whose
     OAuth-login background provisioning never ran) must self-heal on the one

@@ -1221,6 +1221,18 @@ def _neon_api_key_for_tier(tier: str) -> str:
     return _require_cfg("NEON_API_KEY")
 
 
+def _neon_org_id_for_tier(tier: str) -> str | None:
+    """Return the optional Neon organization id for project creation.
+
+    Personal Neon API keys need an explicit organization id. Organization-
+    scoped keys infer it, so the setting stays optional for those deployments.
+    Pro may use a separate Neon organization and can override the common id.
+    """
+    if tier == "pro":
+        return _cfg("NEON_ORG_ID_PRO") or _cfg("NEON_ORG_ID")
+    return _cfg("NEON_ORG_ID")
+
+
 async def _set_neon_pitr(api_key: str, neon_project_id: str, retention_seconds: int) -> None:
     """Set point-in-time recovery retention on a Neon project. Idempotent."""
     import httpx
@@ -1289,6 +1301,9 @@ async def _create_neon_pool_project(
             },
         }
     }
+    org_id = _neon_org_id_for_tier(tier)
+    if org_id:
+        payload["project"]["org_id"] = org_id
 
     async with httpx.AsyncClient(timeout=30) as http:
         resp = await http.post(
@@ -1296,6 +1311,14 @@ async def _create_neon_pool_project(
             headers=headers,
             json=payload,
         )
+        if not resp.is_success:
+            # httpx.raise_for_status() omits the response body, hiding Neon
+            # validation errors from provisioning logs. Keep the diagnostic
+            # bounded and make sure a reflected key can never reach the log.
+            detail = (resp.text or "").replace(api_key, "[REDACTED]")[:800]
+            raise RuntimeError(
+                f"Neon project creation failed with HTTP {resp.status_code}: {detail}"
+            )
         resp.raise_for_status()
         data = resp.json()
 
