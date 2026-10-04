@@ -651,6 +651,37 @@ def _choose_tex_file(title: str, parent: Any | None = None) -> str | None:
             root.destroy()
 
 
+def _choose_overleaf_project_id(parent: Any | None = None) -> str | None:
+    """Ask for an optional Overleaf id to link the local compile receipt."""
+    import re
+    import tkinter as tk
+    from tkinter import simpledialog
+
+    owns_root = parent is None
+    root = parent if parent is not None else tk.Tk()
+    if owns_root:
+        root.withdraw()
+    try:
+        value = simpledialog.askstring(
+            "Link compile receipt",
+            "Optional: enter the Overleaf project ID from its /project/<id> URL. "
+            "This links the receipt in the workflow popup; it does not sync files. "
+            "Leave blank to compile without linking. Cancel to cancel the compile.",
+            parent=root,
+        )
+        if value is None:
+            return None
+        project_id = value.strip()
+        if not project_id:
+            return ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", project_id):
+            raise ValueError("Enter a valid Overleaf project ID using letters, numbers, underscores, or hyphens.")
+        return project_id
+    finally:
+        if owns_root:
+            root.destroy()
+
+
 def _launch_local_cli(*args: str, cwd: str | None = None) -> None:
     """Open one local maintenance command in a visible console when possible."""
     command = _local_cli_command(*args)
@@ -1223,7 +1254,13 @@ def _run_tray() -> int:
                     parent=ui_root,
                 )
                 if source_file:
-                    _launch_meridian_latex_cli("compile", source_file, parent=ui_root)
+                    project_id = _choose_overleaf_project_id(parent=ui_root)
+                    if project_id is None:
+                        return
+                    command_args = ["compile", source_file]
+                    if project_id:
+                        command_args.append(f"--project-id={project_id}")
+                    _launch_meridian_latex_cli(*command_args, parent=ui_root)
             except Exception as exc:  # noqa: BLE001 -- keep the tray available if the picker fails
                 _show_error_dialog("Local LaTeX compile failed", str(exc), parent=ui_root)
 

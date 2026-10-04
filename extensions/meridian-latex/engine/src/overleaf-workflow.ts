@@ -142,6 +142,54 @@ function extractReferences(source: string): Array<{ command: string; value: stri
   return refs;
 }
 
+function readBracedGroup(source: string, start: number): { value: string; end: number } | null {
+  if (source[start] !== "{") return null;
+  let depth = 1;
+  for (let index = start + 1; index < source.length; index += 1) {
+    if (source[index] === "\\") {
+      // TeX control symbols can escape braces; do not treat those as groups.
+      index += 1;
+      continue;
+    }
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return { value: source.slice(start + 1, index), end: index + 1 };
+    }
+  }
+  return null;
+}
+
+function extractGraphicspathDeclarations(source: string): Array<{ paths: string[]; malformed: boolean }> {
+  const code = withoutComments(source);
+  const declarations: Array<{ paths: string[]; malformed: boolean }> = [];
+  for (const match of code.matchAll(/\\graphicspath\b/g)) {
+    let cursor = match.index! + match[0].length;
+    while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+    const outer = readBracedGroup(code, cursor);
+    if (!outer) {
+      declarations.push({ paths: [], malformed: true });
+      continue;
+    }
+    const paths: string[] = [];
+    let malformed = false;
+    cursor = 0;
+    while (cursor < outer.value.length) {
+      while (/\s/.test(outer.value[cursor] ?? "")) cursor += 1;
+      if (cursor >= outer.value.length) break;
+      const path = readBracedGroup(outer.value, cursor);
+      if (!path) {
+        malformed = true;
+        break;
+      }
+      if (path.value.trim()) paths.push(path.value.trim());
+      cursor = path.end;
+    }
+    declarations.push({ paths, malformed });
+  }
+  return declarations;
+}
+
 function safeRelativePath(root: string, file: string): string {
   return relative(root, file).split(sep).join("/");
 }
@@ -151,6 +199,7 @@ async function resolveLocalReference(
   from: string,
   command: string,
   raw: string,
+  graphicDirectories: string[] = [],
 ): Promise<{ file: string; kind: CompileManifestFile["kind"] } | { reason: UnresolvedReference["reason"] } | null> {
   const spec = FILE_COMMAND_EXTENSIONS[command];
   if (!spec && command !== "includegraphics") return null;
@@ -162,9 +211,13 @@ async function resolveLocalReference(
   const extensions = command === "includegraphics"
     ? (extname(base) ? [""] : GRAPHICS_EXTENSIONS)
     : (extname(base) ? [""] : [spec!.extension]);
-  const candidates = [resolve(fromDirectory, base), ...extensions.map((ext) => resolve(fromDirectory, `${base}${ext}`))];
-  // TeX searches the project root as well as the including file's directory.
-  candidates.push(resolve(root, base), ...extensions.map((ext) => resolve(root, `${base}${ext}`)));
+  const searchDirectories = command === "includegraphics"
+    ? [fromDirectory, ...graphicDirectories, root]
+    : [fromDirectory, root];
+  const candidates = searchDirectories.flatMap((directory) => [
+    resolve(directory, base),
+    ...extensions.map((ext) => resolve(directory, `${base}${ext}`)),
+  ]);
   for (const candidate of [...new Set(candidates)]) {
     if (!inside(root, candidate)) return { reason: "outside_project" };
     try {
@@ -180,6 +233,41 @@ async function resolveLocalReference(
   // local copies are part of this project-local source manifest.
   if (spec && !spec.required) return null;
   return { reason: "missing" };
+}
+
+async function resolveGraphicDirectory(
+  root: string,
+  raw: string,
+): Promise<{ directory: string } | { reason: UnresolvedReference["reason"] }> {
+  if (/[\\$#{}\r\n]/.test(raw)) return { reason: "dynamic" };
+  if (!raw || isAbsolute(raw) || /^[a-zA-Z]:[\\/]/.test(raw)) return { reason: "outside_project" };
+  if (raw.replace(/\\/g, "/").split("/").includes("..")) return { reason: "outside_project" };
+  const candidate = resolve(root, raw);
+  if (!inside(root, candidate)) return { reason: "outside_project" };
+  try {
+    const actual = await fs.realpath(candidate);
+    if (!inside(root, actual)) return { reason: "outside_project" };
+    if ((await fs.stat(actual)).isDirectory()) return { directory: actual };
+    return { reason: "missing" };
+  } catch {
+    return { reason: "missing" };
+  }
+}
+
+function recordedGraphicMatch(raw: string, inputs: string[]): string | null {
+  if (!raw || /[\\$#\r\n]/.test(raw) || raw.includes("/")) return null;
+  const requestedLeaf = basename(raw.replace(/^['"]|['"]$/g, ""));
+  const requestedExtension = extname(requestedLeaf).toLowerCase();
+  const requestedStem = (requestedExtension ? requestedLeaf.slice(0, -requestedExtension.length) : requestedLeaf).toLowerCase();
+  const matches = [...new Set(inputs.filter((path) => {
+    if (manifestKind(path) !== "asset") return false;
+    const extension = extname(path).toLowerCase();
+    if (requestedExtension && extension !== requestedExtension) return false;
+    return basename(path, extname(path)).toLowerCase() === requestedStem;
+  }))];
+  // The recorder resolves TeX's effective search path. Reconcile only when
+  // the literal basename identifies exactly one in-project recorded asset.
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function explicitBiblatexBackend(source: string): "bibtex" | "bibtex8" | "biber" | null {
@@ -214,6 +302,7 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
   const files = new Map<string, CompileManifestFile>();
   const sourceTexts = new Map<string, string>();
   const unresolved: UnresolvedReference[] = [];
+  const recorderInputFiles: string[] = [];
   const queued = [realMain];
   const queuedSet = new Set(queued);
 
@@ -230,6 +319,7 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
     if (files.has(file)) continue;
     const content = await addFile(file, extname(file).toLowerCase() === ".cls" ? "class" : extname(file).toLowerCase() === ".sty" ? "style" : "tex");
     for (const reference of extractReferences(content)) {
+      if (reference.command === "includegraphics") continue;
       const values = ["bibliography", "usepackage"].includes(reference.command)
         ? reference.value.split(",").map((value) => value.trim()).filter(Boolean)
         : [reference.value];
@@ -256,9 +346,11 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
     const candidate = isAbsolute(input) ? input : resolve(realRoot, input);
     try {
       const actual = await fs.realpath(candidate);
-      if (!inside(realRoot, actual) || files.has(actual)) continue;
+      if (!inside(realRoot, actual)) continue;
       const stat = await fs.stat(actual);
       if (!stat.isFile()) continue;
+      recorderInputFiles.push(actual);
+      if (files.has(actual)) continue;
       const kind = manifestKind(actual);
       if (["tex", "class", "style"].includes(kind)) {
         if (!queuedSet.has(actual)) {
@@ -281,6 +373,7 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
     if (files.has(file)) continue;
     const content = await addFile(file, manifestKind(file) as "tex" | "class" | "style");
     for (const reference of extractReferences(content)) {
+      if (reference.command === "includegraphics") continue;
       const values = ["bibliography", "usepackage"].includes(reference.command)
         ? reference.value.split(",").map((value) => value.trim()).filter(Boolean)
         : [reference.value];
@@ -300,6 +393,69 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
         }
       }
     }
+  }
+
+  // Walk the complete literal TeX source closure before resolving figures:
+  // a \graphicspath declaration in a nested source file can affect a figure
+  // reference in another file, and the recorder may reveal the compiler's
+  // effective local input when TeX has additional search-path configuration.
+  const graphicReferences: Array<{ file: string; value: string }> = [];
+  const graphicDirectories: string[] = [];
+  const graphicPathIssues: UnresolvedReference[] = [];
+  for (const [file, content] of sourceTexts) {
+    for (const reference of extractReferences(content)) {
+      if (reference.command === "includegraphics") graphicReferences.push({ file, value: reference.value });
+    }
+    for (const declaration of extractGraphicspathDeclarations(content)) {
+      if (declaration.malformed) {
+        graphicPathIssues.push({
+          source: safeRelativePath(realRoot, file),
+          command: "graphicspath",
+          reason: "dynamic",
+          digest: sha256("graphicspath:malformed"),
+        });
+      }
+      for (const rawPath of declaration.paths) {
+        const resolved = await resolveGraphicDirectory(realRoot, rawPath);
+        if ("reason" in resolved) {
+          // Missing search directories are harmless when another declared
+          // directory resolves the image; unsafe/dynamic directories are
+          // retained as unresolved provenance instead of being traversed.
+          if (resolved.reason !== "missing") {
+            graphicPathIssues.push({
+              source: safeRelativePath(realRoot, file),
+              command: "graphicspath",
+              reason: resolved.reason,
+              digest: sha256(`graphicspath:${rawPath}`),
+            });
+          }
+        } else if (!graphicDirectories.includes(resolved.directory)) {
+          graphicDirectories.push(resolved.directory);
+        }
+      }
+    }
+  }
+  if (graphicReferences.length > 0) unresolved.push(...graphicPathIssues);
+  for (const reference of graphicReferences) {
+    const resolved = await resolveLocalReference(realRoot, reference.file, "includegraphics", reference.value, graphicDirectories);
+    if (!resolved) continue;
+    if ("reason" in resolved) {
+      const recorded = resolved.reason === "missing"
+        ? recordedGraphicMatch(reference.value, recorderInputFiles)
+        : null;
+      if (recorded) {
+        if (!files.has(recorded)) await addFile(recorded, "asset");
+        continue;
+      }
+      unresolved.push({
+        source: safeRelativePath(realRoot, reference.file),
+        command: "includegraphics",
+        reason: resolved.reason,
+        digest: sha256(`includegraphics:${reference.value}`),
+      });
+      continue;
+    }
+    if (!files.has(resolved.file)) await addFile(resolved.file, resolved.kind);
   }
 
   const combined = [...sourceTexts.values()].join("\n");
@@ -393,6 +549,7 @@ function buildReceipt(input: {
   logHash: string | null;
   overleafProjectId?: string;
   sourceChanged: boolean;
+  prerequisiteNotes: string[];
 }): CompileReceipt {
   const files = [...input.files].sort((a, b) => a.path.localeCompare(b.path));
   const complete = input.complete && input.unresolved.length === 0;
@@ -412,13 +569,15 @@ function buildReceipt(input: {
     limitations: [
       "This receipt covers a local compile only; it does not prove the local source was synchronized to Overleaf.",
       "A successful compiler exit does not prove citation resolution, visual quality, or editorial correctness.",
+      "Shell escape is disabled, but TeX is not sandboxed: it can read or write files, including source-tree files, with the current user's permissions. Compile only sources you trust.",
       "System TeX packages are identified by the compiler environment and are not individually hashed.",
+      ...input.prerequisiteNotes,
       ...(input.sourceChanged ? ["A local source file changed while compiling; the source manifest is incomplete."] : []),
     ],
   };
 }
 
-/** Compile a local source tree without editing source files or contacting Overleaf. */
+/** Compile a local source tree without contacting Overleaf. This is not a TeX sandbox. */
 export async function compileLocalLatex(options: CompileLocalLatexOptions): Promise<CompileReceipt> {
   const engine = options.engine ?? "pdflatex";
   if (!ENGINE_NAMES.includes(engine)) throw new Error(`unsupported TeX engine: ${String(engine)}`);
@@ -442,17 +601,26 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
   const compilerVersion = await runner(engine, ["--version"], sources.projectRoot, Math.min(timeoutMs, 15_000));
   phases.push(phase(`${engine} --version`, compilerVersion));
   let status: CompileStatus = "failed";
+  const prerequisiteNotes: string[] = [];
   let version: string | null = compilerVersion.stdout.split(/\r?\n/).find((line) => line.trim())?.trim() ?? null;
   let pdfHash: string | null = null;
   let logHash: string | null = null;
   let recordedInputs: string[] = [];
 
-  if (compilerVersion.errorCode === "ENOENT") status = "unavailable";
-  else if (compilerVersion.exitCode !== 0 || !version) status = "unavailable";
+  if (compilerVersion.errorCode === "ENOENT") {
+    status = "unavailable";
+    prerequisiteNotes.push(`Required TeX engine "${engine}" was not found on PATH. Install a TeX distribution that provides it.`);
+  } else if (compilerVersion.exitCode !== 0 || !version) {
+    status = "unavailable";
+    prerequisiteNotes.push(`Could not identify TeX engine "${engine}". Check that its installation is healthy and the executable is on PATH.`);
+  }
   else {
     const initial = await runner(engine, args, sources.projectRoot, timeoutMs);
     phases.push(phase(engine, initial));
-    if (initial.errorCode === "ENOENT") status = "unavailable";
+    if (initial.errorCode === "ENOENT") {
+      status = "unavailable";
+      prerequisiteNotes.push(`Required TeX engine "${engine}" could not be started. Check its installation and PATH.`);
+    }
     else if (initial.exitCode === 0) {
       let bibliographyOk = true;
       if (sources.bibliographyBackend !== "none") {
@@ -462,6 +630,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
         if (bibVersion.errorCode === "ENOENT") {
           bibliographyOk = false;
           status = "unavailable";
+          prerequisiteNotes.push(`Bibliography backend "${bibtool}" was not found on PATH. Install the matching BibTeX/Biber tool for this document.`);
         } else if (bibVersion.exitCode !== 0) {
           bibliographyOk = false;
           status = "failed";
@@ -471,7 +640,10 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
           const bib = await runner(bibtool, [jobName], buildDir, timeoutMs, bibliographyEnv);
           phases.push(phase(bibtool, bib));
           bibliographyOk = bib.exitCode === 0;
-          if (!bibliographyOk) status = bib.errorCode === "ENOENT" ? "unavailable" : "failed";
+          if (!bibliographyOk) {
+            status = bib.errorCode === "ENOENT" ? "unavailable" : "failed";
+            if (bib.errorCode === "ENOENT") prerequisiteNotes.push(`Bibliography backend "${bibtool}" could not be started. Check its installation and PATH.`);
+          }
         }
       }
       if (bibliographyOk) {
@@ -480,7 +652,10 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
         for (let pass = 0; pass < passCount; pass += 1) {
           const result = await runner(engine, args, sources.projectRoot, timeoutMs);
           phases.push(phase(`${engine} pass ${pass + 2}`, result));
-          if (result.errorCode === "ENOENT") status = "unavailable";
+          if (result.errorCode === "ENOENT") {
+            status = "unavailable";
+            prerequisiteNotes.push(`TeX engine "${engine}" could not be restarted for another compile pass.`);
+          }
           else if (result.exitCode !== 0) status = "failed";
           if (status !== "passed") break;
         }
@@ -517,6 +692,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     logHash,
     overleafProjectId: options.overleafProjectId,
     sourceChanged,
+    prerequisiteNotes,
   });
   await persistReceipt(receipt, receiptsDir);
   return receipt;

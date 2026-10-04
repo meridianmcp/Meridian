@@ -770,8 +770,10 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
         tray_main, "_choose_project_root",
         mock.Mock(side_effect=["C:/work/project", None, None]),
     )
-    choose_tex = mock.Mock(return_value=None)
+    choose_tex = mock.Mock(return_value="C:/papers/draft paper.tex")
     monkeypatch.setattr(tray_main, "_choose_tex_file", choose_tex)
+    choose_overleaf_id = mock.Mock(side_effect=["project_123", "", None])
+    monkeypatch.setattr(tray_main, "_choose_overleaf_project_id", choose_overleaf_id)
     latex_launch = mock.Mock()
     monkeypatch.setattr(tray_main, "_launch_meridian_latex_cli", latex_launch)
     launch = mock.Mock()
@@ -804,6 +806,8 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
             "Automatic tunnel recovery", "Quit",
         ):
             callbacks[label](fake_icon, None)
+        callbacks["Compile a LaTeX file locally…"](fake_icon, None)
+        callbacks["Compile a LaTeX file locally…"](fake_icon, None)
         # A second setup-menu invocation covers the user's picker-cancel path.
         callbacks["Set up a local project…"](fake_icon, None)
 
@@ -828,8 +832,18 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
     tray_main._show_logs_window.assert_called_once_with(fake_runner, parent=parent)
     tray_main.run_zotero_setup_dialog.assert_called_once_with(parent=parent)
     assert tray_main._choose_project_root.call_count == 3
-    choose_tex.assert_called_once_with("Choose a LaTeX source file to compile locally", parent=parent)
-    latex_launch.assert_not_called()
+    assert choose_tex.call_args_list == [
+        mock.call("Choose a LaTeX source file to compile locally", parent=parent),
+        mock.call("Choose a LaTeX source file to compile locally", parent=parent),
+        mock.call("Choose a LaTeX source file to compile locally", parent=parent),
+    ]
+    assert choose_overleaf_id.call_args_list == [
+        mock.call(parent=parent), mock.call(parent=parent), mock.call(parent=parent),
+    ]
+    assert latex_launch.call_args_list == [
+        mock.call("compile", "C:/papers/draft paper.tex", "--project-id=project_123", parent=parent),
+        mock.call("compile", "C:/papers/draft paper.tex", parent=parent),
+    ]
     setup = mock.call("setup", "--repo", "C:/work/project", cwd="C:/work/project")
     recovery = mock.call("recovery", "catalog")
     artifacts = mock.call("artifacts", "--help")
@@ -1042,6 +1056,30 @@ def test_choose_tex_file_rejects_non_tex_selection(monkeypatch):
         tray_main._choose_tex_file("Choose source")
 
 
+def test_choose_overleaf_project_id_validates_trims_and_distinguishes_blank_from_cancel(monkeypatch):
+    import pytest
+
+    fake_tkinter = mock.MagicMock()
+    fake_dialog = mock.MagicMock()
+    fake_tkinter.simpledialog = fake_dialog
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    parent = mock.MagicMock()
+    fake_dialog.askstring.side_effect = [" project_123 ", "   ", None]
+
+    assert tray_main._choose_overleaf_project_id(parent=parent) == "project_123"
+    assert tray_main._choose_overleaf_project_id(parent=parent) == ""
+    assert tray_main._choose_overleaf_project_id(parent=parent) is None
+    assert fake_dialog.askstring.call_count == 3
+    assert all(call.kwargs["parent"] is parent for call in fake_dialog.askstring.call_args_list)
+    assert "Leave blank to compile without linking" in fake_dialog.askstring.call_args.args[1]
+    assert "Cancel to cancel the compile" in fake_dialog.askstring.call_args.args[1]
+
+    fake_dialog.askstring.side_effect = None
+    fake_dialog.askstring.return_value = "../invalid"
+    with pytest.raises(ValueError, match="valid Overleaf project ID"):
+        tray_main._choose_overleaf_project_id(parent=parent)
+
+
 def test_meridian_latex_cli_command_resolves_external_node_and_windows_npm_shim(monkeypatch, tmp_path):
     import shutil
     from pathlib import Path
@@ -1237,6 +1275,7 @@ def test_local_tools_launch_check_recovery_and_artifact_commands(monkeypatch):
     monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
     choose_tex = mock.Mock(side_effect=["C:/papers/draft paper.tex", None])
     monkeypatch.setattr(tray_main, "_choose_tex_file", choose_tex)
+    monkeypatch.setattr(tray_main, "_choose_overleaf_project_id", lambda parent=None: "project_123")
     latex_launch = mock.Mock()
     monkeypatch.setattr(tray_main, "_launch_meridian_latex_cli", latex_launch)
 
@@ -1268,7 +1307,9 @@ def test_local_tools_launch_check_recovery_and_artifact_commands(monkeypatch):
         mock.call("artifacts", "--help"),
     ]
     assert choose_tex.call_count == 2
-    latex_launch.assert_called_once_with("compile", "C:/papers/draft paper.tex", parent=None)
+    latex_launch.assert_called_once_with(
+        "compile", "C:/papers/draft paper.tex", "--project-id=project_123", parent=None,
+    )
 
 
 def test_local_project_menu_reports_picker_errors_without_stopping_tray(monkeypatch):

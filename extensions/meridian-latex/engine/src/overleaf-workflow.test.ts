@@ -2,7 +2,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -62,6 +62,7 @@ test("compile receipt hashes transitive TeX and BibTeX inputs while preserving n
   assert.equal(receipt.compiler.bibliography_backend, "bibtex");
   assert.equal(receipt.overleaf_sync, "not_attested");
   assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("TeX is not sandboxed") && limitation.includes("current user's permissions")));
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "chapters/body.tex"));
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "chapters/methods.tex"), "literal import paths are added to the source manifest");
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "references.bib"));
@@ -231,6 +232,87 @@ test("recorder entries add local TeX closure and asset files to the receipt", as
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "figure.png" && file.kind === "asset"));
 });
 
+test("literal graphicspath directories resolve local graphics into the manifest", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\graphicspath{{figures/}{assets/}}\n\\begin{document}\\includegraphics{chart}\\end{document}\n",
+    "figures/chart.png": "fake image bytes",
+  });
+  const imagePath = join(root, "figures", "chart.png");
+  const fake = fakeRunner("pdflatex", [imagePath]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "figures/chart.png" && file.kind === "asset"));
+});
+
+test("recorder-listed unique graphics reconcile TeX search paths outside literal graphicspath", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}\\includegraphics{chart}\\end{document}\n",
+    "images/chart.png": "fake image bytes",
+  });
+  const imagePath = join(root, "images", "chart.png");
+  const fake = fakeRunner("pdflatex", [imagePath]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.unresolved_count, 0);
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "images/chart.png"));
+});
+
+test("recorder reconciliation does not guess a missing directory from a matching basename", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}\\includegraphics{missing/chart}\\end{document}\n",
+    "images/chart.png": "different image bytes",
+  });
+  const fake = fakeRunner("pdflatex", [join(root, "images", "chart.png")]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.source_manifest.unresolved_count > 0);
+});
+
+test("dynamic and traversal graphic paths remain unresolved", async () => {
+  for (const [source, label] of [
+    ["\\graphicspath{{\\assetDirectory/}}\\begin{document}\\includegraphics{chart}\\end{document}\n", "dynamic"],
+    ["\\graphicspath{{../outside/}}\\begin{document}\\includegraphics{chart}\\end{document}\n", "traversal"],
+  ] as const) {
+    const { root, state } = await project({
+      "main.tex": source,
+      "images/chart.png": "fake image bytes",
+    });
+    const fake = fakeRunner("pdflatex", [join(root, "images", "chart.png")]);
+    const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+    assert.equal(receipt.status, "incomplete", `${label} graphic paths are not claimed complete`);
+    assert.equal(receipt.source_manifest.complete, false);
+    assert.ok(receipt.source_manifest.unresolved_count > 0);
+  }
+});
+
+test("symlinked graphicspath directories that escape the project remain unresolved", async (context) => {
+  const { root, state } = await project({
+    "main.tex": "\\graphicspath{{escape/}}\\begin{document}\\includegraphics{chart}\\end{document}\n",
+  });
+  const outside = await mkdtemp(join(tmpdir(), "meridian-latex-outside-"));
+  temporaryDirectories.push(outside);
+  await writeFile(join(outside, "chart.png"), "outside image bytes", "utf8");
+  try {
+    await symlink(outside, join(root, "escape"), process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    context.skip(`directory symlinks are unavailable: ${String(error)}`);
+    return;
+  }
+  const fake = fakeRunner("pdflatex", [join(outside, "chart.png")]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.source_manifest.unresolved_count > 0);
+  assert.ok(receipt.source_manifest.files.every((file) => !file.path.includes("chart.png")));
+});
+
 test("missing local compiler yields an unavailable receipt rather than a false pass", async () => {
   const { root, state } = await project({ "main.tex": "\\begin{document}Hello\\end{document}\n" });
   const runCommand = async (): Promise<CommandResult> => ({ exitCode: null, stdout: "", stderr: "", durationMs: 1, errorCode: "ENOENT" });
@@ -239,7 +321,23 @@ test("missing local compiler yields an unavailable receipt rather than a false p
   assert.equal(receipt.status, "unavailable");
   assert.equal(receipt.compiler.version, null);
   assert.equal(receipt.output.pdf_sha256, null);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("not found on PATH") && limitation.includes("TeX distribution")));
   assert.equal((await getLatestCompileReceiptSummary("project_789", state))?.status, "unavailable");
+});
+
+test("missing bibliography backend gives actionable prerequisite guidance", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\usepackage[backend=biber]{biblatex}\\addbibresource{references.bib}\\begin{document}Text.\\end{document}\n",
+    "references.bib": "@book{key, title={Book}}\n",
+  });
+  const fake = fakeRunner("xelatex");
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => executable === "biber" && args[0] === "--version"
+    ? { exitCode: null, stdout: "", stderr: "", durationMs: 1, errorCode: "ENOENT" }
+    : fake.runCommand(executable, args, cwd);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "unavailable");
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("biber") && limitation.includes("not found on PATH")));
 });
 
 test("source changes during compile produce an incomplete receipt", async () => {
