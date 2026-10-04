@@ -246,6 +246,73 @@ test("literal graphicspath directories resolve local graphics into the manifest"
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "figures/chart.png" && file.kind === "asset"));
 });
 
+test("redefined graphicspath declarations resolve duplicate basenames in declaration order", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\graphicspath{{first/}}\\includegraphics{chart}\n\\graphicspath{{second/}}\\includegraphics{chart}\n",
+    "first/chart.png": "first image bytes",
+    "second/chart.png": "second image bytes",
+  });
+  const firstImage = join(root, "first", "chart.png");
+  const secondImage = join(root, "second", "chart.png");
+  const fake = fakeRunner("pdflatex", [firstImage, secondImage]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "first/chart.png"));
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "second/chart.png"));
+});
+
+test("graphicspath state follows ordered local inputs", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\graphicspath{{first/}}\\input{chapters/first}\n\\graphicspath{{second/}}\\input{chapters/second}\n",
+    "chapters/first.tex": "\\includegraphics{chart}\n",
+    "chapters/second.tex": "\\includegraphics{chart}\n",
+    "first/chart.png": "first image bytes",
+    "second/chart.png": "second image bytes",
+  });
+  const fake = fakeRunner("pdflatex", [
+    join(root, "chapters", "first.tex"),
+    join(root, "first", "chart.png"),
+    join(root, "chapters", "second.tex"),
+    join(root, "second", "chart.png"),
+  ]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "first/chart.png"));
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "second/chart.png"));
+});
+
+test("ambiguous duplicate basenames without recorder evidence keep the manifest incomplete", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\graphicspath{{first/}{second/}}\\begin{document}\\includegraphics{chart}\\end{document}\n",
+    "first/chart.png": "first image bytes",
+    "second/chart.png": "second image bytes",
+  });
+  const fake = fakeRunner("pdflatex");
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.source_manifest.unresolved_count > 0);
+});
+
+test("normalized in-project parent segments in graphicspath resolve safely", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\graphicspath{{chapters/../figures/}}\\begin{document}\\includegraphics{chart}\\end{document}\n",
+    "figures/chart.png": "fake image bytes",
+  });
+  const imagePath = join(root, "figures", "chart.png");
+  const fake = fakeRunner("pdflatex", [imagePath]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "figures/chart.png"));
+});
+
 test("recorder-listed unique graphics reconcile TeX search paths outside literal graphicspath", async () => {
   const { root, state } = await project({
     "main.tex": "\\begin{document}\\includegraphics{chart}\\end{document}\n",
@@ -258,6 +325,37 @@ test("recorder-listed unique graphics reconcile TeX search paths outside literal
   assert.equal(receipt.status, "passed");
   assert.equal(receipt.source_manifest.unresolved_count, 0);
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "images/chart.png"));
+});
+
+test("path-qualified graphic references reconcile from one unique recorder input", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\graphicspath{{not-created/}}\\begin{document}\\includegraphics{images/chart}\\end{document}\n",
+    "rendered/images/chart.png": "fake image bytes",
+  });
+  const imagePath = join(root, "rendered", "images", "chart.png");
+  const fake = fakeRunner("pdflatex", [imagePath]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.unresolved_count, 0);
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "rendered/images/chart.png"));
+});
+
+test("path-qualified graphics stay incomplete when multiple recorder inputs share their suffix", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\graphicspath{{not-created/}}\\begin{document}\\includegraphics{images/chart}\\end{document}\n",
+    "first/images/chart.png": "first image bytes",
+    "second/images/chart.png": "second image bytes",
+  });
+  const fake = fakeRunner("pdflatex", [
+    join(root, "first", "images", "chart.png"),
+    join(root, "second", "images", "chart.png"),
+  ]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.source_manifest.unresolved_count > 0);
 });
 
 test("recorder reconciliation does not guess a missing directory from a matching basename", async () => {

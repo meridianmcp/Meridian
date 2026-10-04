@@ -81,7 +81,7 @@ const FILE_COMMAND_EXTENSIONS: Record<string, { extension: string; kind: Compile
 interface UnresolvedReference {
   source: string;
   command: string;
-  reason: "dynamic" | "missing" | "outside_project";
+  reason: "dynamic" | "missing" | "outside_project" | "ambiguous";
   digest: string;
 }
 
@@ -160,15 +160,15 @@ function readBracedGroup(source: string, start: number): { value: string; end: n
   return null;
 }
 
-function extractGraphicspathDeclarations(source: string): Array<{ paths: string[]; malformed: boolean }> {
+function extractGraphicspathDeclarations(source: string): Array<{ start: number; paths: string[]; malformed: boolean }> {
   const code = withoutComments(source);
-  const declarations: Array<{ paths: string[]; malformed: boolean }> = [];
+  const declarations: Array<{ start: number; paths: string[]; malformed: boolean }> = [];
   for (const match of code.matchAll(/\\graphicspath\b/g)) {
     let cursor = match.index! + match[0].length;
     while (/\s/.test(code[cursor] ?? "")) cursor += 1;
     const outer = readBracedGroup(code, cursor);
     if (!outer) {
-      declarations.push({ paths: [], malformed: true });
+      declarations.push({ start: match.index!, paths: [], malformed: true });
       continue;
     }
     const paths: string[] = [];
@@ -185,9 +185,52 @@ function extractGraphicspathDeclarations(source: string): Array<{ paths: string[
       if (path.value.trim()) paths.push(path.value.trim());
       cursor = path.end;
     }
-    declarations.push({ paths, malformed });
+    declarations.push({ start: match.index!, paths, malformed });
   }
   return declarations;
+}
+
+function extractGraphicReferences(source: string): Array<{ start: number; value: string; malformed: boolean }> {
+  const code = withoutComments(source);
+  const references: Array<{ start: number; value: string; malformed: boolean }> = [];
+  for (const match of code.matchAll(/\\includegraphics\*?(?![a-zA-Z])/g)) {
+    let cursor = match.index! + match[0].length;
+    while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+    while (code[cursor] === "[") {
+      let depth = 1;
+      cursor += 1;
+      while (cursor < code.length && depth > 0) {
+        if (code[cursor] === "\\") cursor += 1;
+        else if (code[cursor] === "[") depth += 1;
+        else if (code[cursor] === "]") depth -= 1;
+        cursor += 1;
+      }
+      while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+    }
+    const group = readBracedGroup(code, cursor);
+    references.push({ start: match.index!, value: group?.value.trim() ?? "", malformed: !group });
+  }
+  return references;
+}
+
+function extractTeXInputReferences(source: string): Array<{ start: number; value: string; command: string }> {
+  const code = withoutComments(source);
+  const references: Array<{ start: number; value: string; command: string }> = [];
+  for (const match of code.matchAll(/\\(input|include|subfile)\*?(?![a-zA-Z])\s*/g)) {
+    let cursor = match.index! + match[0].length;
+    while (code[cursor] === "[") {
+      const end = code.indexOf("]", cursor + 1);
+      if (end < 0) break;
+      cursor = end + 1;
+      while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+    }
+    const group = readBracedGroup(code, cursor);
+    if (group) references.push({ start: match.index!, value: group.value.trim(), command: match[1].toLowerCase() });
+  }
+  for (const match of code.matchAll(/\\(?:sub)?import\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g)) {
+    references.push({ start: match.index!, value: `${match[1].trim()}${match[2].trim()}`, command: "input" });
+  }
+  return references;
 }
 
 function safeRelativePath(root: string, file: string): string {
@@ -200,6 +243,7 @@ async function resolveLocalReference(
   command: string,
   raw: string,
   graphicDirectories: string[] = [],
+  recordedGraphicInputs?: Set<string>,
 ): Promise<{ file: string; kind: CompileManifestFile["kind"] } | { reason: UnresolvedReference["reason"] } | null> {
   const spec = FILE_COMMAND_EXTENSIONS[command];
   if (!spec && command !== "includegraphics") return null;
@@ -218,16 +262,41 @@ async function resolveLocalReference(
     resolve(directory, base),
     ...extensions.map((ext) => resolve(directory, `${base}${ext}`)),
   ]);
+  const recordedMatches: string[] = [];
+  let recorderContainmentFailure = false;
   for (const candidate of [...new Set(candidates)]) {
-    if (!inside(root, candidate)) return { reason: "outside_project" };
+    if (!inside(root, candidate)) {
+      if (command === "includegraphics" && recordedGraphicInputs !== undefined) {
+        recorderContainmentFailure = true;
+        continue;
+      }
+      return { reason: "outside_project" };
+    }
     try {
       const actual = await fs.realpath(candidate);
-      if (!inside(root, actual)) return { reason: "outside_project" };
+      if (!inside(root, actual)) {
+        if (command === "includegraphics" && recordedGraphicInputs !== undefined) {
+          recorderContainmentFailure = true;
+          continue;
+        }
+        return { reason: "outside_project" };
+      }
       const stat = await fs.stat(actual);
-      if (stat.isFile()) return { file: actual, kind: spec?.kind ?? "asset" };
+      if (!stat.isFile()) continue;
+      if (command === "includegraphics" && recordedGraphicInputs !== undefined) {
+        if (recordedGraphicInputs.has(actual)) recordedMatches.push(actual);
+        continue;
+      }
+      return { file: actual, kind: spec?.kind ?? "asset" };
     } catch {
       // Continue through TeX's candidate extensions.
     }
+  }
+  if (command === "includegraphics" && recordedGraphicInputs !== undefined) {
+    const uniqueMatches = [...new Set(recordedMatches)];
+    if (uniqueMatches.length === 1) return { file: uniqueMatches[0], kind: "asset" };
+    if (uniqueMatches.length > 1) return { reason: "ambiguous" };
+    if (recorderContainmentFailure) return { reason: "outside_project" };
   }
   // documentclass/usepackage can be installed with the TeX distribution; only
   // local copies are part of this project-local source manifest.
@@ -241,7 +310,6 @@ async function resolveGraphicDirectory(
 ): Promise<{ directory: string } | { reason: UnresolvedReference["reason"] }> {
   if (/[\\$#{}\r\n]/.test(raw)) return { reason: "dynamic" };
   if (!raw || isAbsolute(raw) || /^[a-zA-Z]:[\\/]/.test(raw)) return { reason: "outside_project" };
-  if (raw.replace(/\\/g, "/").split("/").includes("..")) return { reason: "outside_project" };
   const candidate = resolve(root, raw);
   if (!inside(root, candidate)) return { reason: "outside_project" };
   try {
@@ -254,20 +322,35 @@ async function resolveGraphicDirectory(
   }
 }
 
-function recordedGraphicMatch(raw: string, inputs: string[]): string | null {
-  if (!raw || /[\\$#\r\n]/.test(raw) || raw.includes("/")) return null;
-  const requestedLeaf = basename(raw.replace(/^['"]|['"]$/g, ""));
-  const requestedExtension = extname(requestedLeaf).toLowerCase();
-  const requestedStem = (requestedExtension ? requestedLeaf.slice(0, -requestedExtension.length) : requestedLeaf).toLowerCase();
+function recordedGraphicMatch(
+  raw: string,
+  root: string,
+  inputs: string[],
+): { file: string } | { reason: "ambiguous" } | null {
+  if (!raw || /[\\$#\r\n]/.test(raw) || isAbsolute(raw) || /^[a-zA-Z]:[\\/]/.test(raw)) return null;
+  const normalizedParts: string[] = [];
+  for (const part of raw.replace(/^['"]|['"]$/g, "").split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (normalizedParts.length === 0) return null;
+      normalizedParts.pop();
+    } else normalizedParts.push(part);
+  }
+  if (normalizedParts.length === 0) return null;
+  const requested = normalizedParts.join("/").toLowerCase();
+  const requestedExtension = extname(normalizedParts.at(-1) ?? "").toLowerCase();
   const matches = [...new Set(inputs.filter((path) => {
     if (manifestKind(path) !== "asset") return false;
-    const extension = extname(path).toLowerCase();
-    if (requestedExtension && extension !== requestedExtension) return false;
-    return basename(path, extname(path)).toLowerCase() === requestedStem;
+    const relativePath = safeRelativePath(root, path).toLowerCase();
+    const actualExtension = extname(path).toLowerCase();
+    if (requestedExtension && actualExtension !== requestedExtension) return false;
+    const expected = requestedExtension ? requested : `${requested}${actualExtension}`;
+    return relativePath === expected || relativePath.endsWith(`/${expected}`);
   }))];
-  // The recorder resolves TeX's effective search path. Reconcile only when
-  // the literal basename identifies exactly one in-project recorded asset.
-  return matches.length === 1 ? matches[0] : null;
+  // The recorder resolves TeX's effective search path. Reconcile a literal
+  // path only when its normalized suffix identifies one in-project input.
+  if (matches.length === 1) return { file: matches[0] };
+  return matches.length > 1 ? { reason: "ambiguous" } : null;
 }
 
 function explicitBiblatexBackend(source: string): "bibtex" | "bibtex8" | "biber" | null {
@@ -395,19 +478,59 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
     }
   }
 
-  // Walk the complete literal TeX source closure before resolving figures:
-  // a \graphicspath declaration in a nested source file can affect a figure
-  // reference in another file, and the recorder may reveal the compiler's
-  // effective local input when TeX has additional search-path configuration.
-  const graphicReferences: Array<{ file: string; value: string }> = [];
-  const graphicDirectories: string[] = [];
+  // Preserve declaration/reference order within each source file. A later
+  // \graphicspath redefines the search list, so combining every declaration
+  // globally can attach a duplicate-basename image from the wrong directory.
+  const graphicReferences: Array<{ file: string; value: string; directories: string[] }> = [];
   const graphicPathIssues: UnresolvedReference[] = [];
-  for (const [file, content] of sourceTexts) {
-    for (const reference of extractReferences(content)) {
-      if (reference.command === "includegraphics") graphicReferences.push({ file, value: reference.value });
-    }
-    for (const declaration of extractGraphicspathDeclarations(content)) {
-      if (declaration.malformed) {
+  let sawGraphicReference = false;
+  const visitedGraphicSources = new Set<string>();
+  const collectGraphicEvents = async (
+    file: string,
+    content: string,
+    initialDirectories: string[],
+    ancestry: Set<string>,
+  ): Promise<string[]> => {
+    visitedGraphicSources.add(file);
+    const events = [
+      ...extractGraphicspathDeclarations(content).map((declaration) => ({ type: "paths" as const, ...declaration })),
+      ...extractGraphicReferences(content).map((reference) => ({ type: "reference" as const, ...reference })),
+      ...extractTeXInputReferences(content).map((reference) => ({ type: "input" as const, ...reference })),
+    ].sort((left, right) => left.start - right.start);
+    let activeDirectories = [...initialDirectories];
+    for (const event of events) {
+      if (event.type === "input") {
+        const resolved = await resolveLocalReference(realRoot, file, event.command, event.value);
+        if (resolved && !("reason" in resolved) && !ancestry.has(resolved.file)) {
+          const childSource = sourceTexts.get(resolved.file);
+          if (childSource !== undefined) {
+            activeDirectories = await collectGraphicEvents(
+              resolved.file,
+              childSource,
+              activeDirectories,
+              new Set([...ancestry, file]),
+            );
+          }
+        }
+        continue;
+      }
+      if (event.type === "reference") {
+        sawGraphicReference = true;
+        if (event.malformed) {
+          unresolved.push({
+            source: safeRelativePath(realRoot, file),
+            command: "includegraphics",
+            reason: "dynamic",
+            digest: sha256("includegraphics:malformed"),
+          });
+        } else {
+          graphicReferences.push({ file, value: event.value, directories: [...activeDirectories] });
+        }
+        continue;
+      }
+
+      activeDirectories = [];
+      if (event.malformed) {
         graphicPathIssues.push({
           source: safeRelativePath(realRoot, file),
           command: "graphicspath",
@@ -415,12 +538,12 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
           digest: sha256("graphicspath:malformed"),
         });
       }
-      for (const rawPath of declaration.paths) {
+      for (const rawPath of event.paths) {
         const resolved = await resolveGraphicDirectory(realRoot, rawPath);
         if ("reason" in resolved) {
           // Missing search directories are harmless when another declared
-          // directory resolves the image; unsafe/dynamic directories are
-          // retained as unresolved provenance instead of being traversed.
+          // directory resolves the image; unsafe/dynamic directories remain
+          // unresolved provenance instead of being traversed.
           if (resolved.reason !== "missing") {
             graphicPathIssues.push({
               source: safeRelativePath(realRoot, file),
@@ -429,28 +552,48 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
               digest: sha256(`graphicspath:${rawPath}`),
             });
           }
-        } else if (!graphicDirectories.includes(resolved.directory)) {
-          graphicDirectories.push(resolved.directory);
+        } else if (!activeDirectories.includes(resolved.directory)) {
+          activeDirectories.push(resolved.directory);
         }
       }
     }
+    return activeDirectories;
+  };
+
+  const rootSource = sourceTexts.get(realMain);
+  const rootGraphicDirectories = rootSource
+    ? await collectGraphicEvents(realMain, rootSource, [], new Set())
+    : [];
+  for (const [file, content] of sourceTexts) {
+    if (!visitedGraphicSources.has(file)) {
+      await collectGraphicEvents(file, content, rootGraphicDirectories, new Set([file]));
+    }
   }
-  if (graphicReferences.length > 0) unresolved.push(...graphicPathIssues);
+  if (sawGraphicReference) unresolved.push(...graphicPathIssues);
+  const recorderGraphicInputs = extraInputs.length > 0 ? new Set(recorderInputFiles) : undefined;
   for (const reference of graphicReferences) {
-    const resolved = await resolveLocalReference(realRoot, reference.file, "includegraphics", reference.value, graphicDirectories);
+    const resolved = await resolveLocalReference(
+      realRoot,
+      reference.file,
+      "includegraphics",
+      reference.value,
+      reference.directories,
+      recorderGraphicInputs,
+    );
     if (!resolved) continue;
     if ("reason" in resolved) {
-      const recorded = resolved.reason === "missing"
-        ? recordedGraphicMatch(reference.value, recorderInputFiles)
+      const recorded = ["missing", "ambiguous"].includes(resolved.reason)
+        ? recordedGraphicMatch(reference.value, realRoot, recorderInputFiles)
         : null;
-      if (recorded) {
-        if (!files.has(recorded)) await addFile(recorded, "asset");
+      if (recorded && "file" in recorded) {
+        if (!files.has(recorded.file)) await addFile(recorded.file, "asset");
         continue;
       }
+      const reason = recorded && "reason" in recorded ? recorded.reason : resolved.reason;
       unresolved.push({
         source: safeRelativePath(realRoot, reference.file),
         command: "includegraphics",
-        reason: resolved.reason,
+        reason,
         digest: sha256(`includegraphics:${reference.value}`),
       });
       continue;
