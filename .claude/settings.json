@@ -7,7 +7,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& python \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\session_recovery_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "command": "& python \"$env:CLAUDE_PROJECT_DIR/.claude/hooks/session_recovery_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 10
                     }
                 ]
@@ -81,7 +81,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& python \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\session_recovery_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "command": "& python \"$env:CLAUDE_PROJECT_DIR/.claude/hooks/session_recovery_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 10
                     }
                 ]
@@ -112,7 +112,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& python \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\artifact_capture_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "command": "& python \"$env:CLAUDE_PROJECT_DIR/.claude/hooks/artifact_capture_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 10
                     }
                 ]
@@ -244,7 +244,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& python \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\session_recovery_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "command": "& python \"$env:CLAUDE_PROJECT_DIR/.claude/hooks/session_recovery_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 10
                     }
                 ]
@@ -257,7 +257,7 @@
                     {
                         "type": "command",
                         "shell": "powershell",
-                        "command": "& python \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\session_recovery_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
+                        "command": "& python \"$env:CLAUDE_PROJECT_DIR/.claude/hooks/session_recovery_hook.py\"; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1",
                         "timeout": 10
                     }
                 ]

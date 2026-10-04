@@ -136,7 +136,10 @@ def test_hash_selected_range_rejects_replaced_session_symlink(tmp_path, monkeypa
     except OSError as exc:
         pytest.skip(f"symlink creation is unavailable: {exc}")
 
-    with pytest.raises(ps.ProviderSessionError, match="regular file|changed"):
+    with pytest.raises(
+        ps.ProviderSessionError,
+        match="regular file|changed|outside its configured local root",
+    ):
         ps.hash_selected_jsonl_lines(session, 1, 1)
 
 

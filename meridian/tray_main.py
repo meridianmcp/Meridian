@@ -62,7 +62,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # This module is also PyInstaller's Analysis entry-point script
 # (meridian-tray.spec: Analysis(['meridian/tray_main.py'], ...)), which runs

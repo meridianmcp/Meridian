@@ -387,8 +387,7 @@ def test_real_mcp_dispatch_survives_simulated_ai_log_storage_timeout(client, mon
     assert r.status_code == 200
     assert _result(r)["session_id"]  # the real boundary result is intact
 
-    import asyncio
-    rows = asyncio.run(_events(client.app.state.db, pid))
+    rows = client.portal.call(_events, client.app.state.db, pid)
     assert rows == []  # the simulated write failure left no partial row
 
 
