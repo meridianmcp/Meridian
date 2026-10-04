@@ -105,6 +105,7 @@ def test_subagent_start_stop_are_local_and_recovery_context_is_session_bound(tmp
     response = hook.handle_hook_payload(
         {
             "hook_event_name": "PostToolUse",
+            "session_id": "claude-provider-session-1",
             "tool_name": "mcp__meridian__get_session_recovery",
             "tool_input": {"project_id": "project-1", "session_id": "meridian-session-1"},
             "tool_response": {
@@ -135,8 +136,56 @@ def test_posttool_refuses_local_context_for_a_different_session(tmp_path):
     response = hook.handle_hook_payload(
         {
             "hook_event_name": "PostToolUse",
+            "session_id": "claude-provider-session-1",
             "tool_name": "mcp__meridian__get_session_recovery",
             "tool_input": {"session_id": "another-meridian-session"},
+            "tool_response": {
+                "recovery": {
+                    "local_ref_id": updated["local_ref_id"],
+                    "meridian_session_id": "meridian-session-1",
+                }
+            },
+        },
+        data_dir=tmp_path,
+    )
+    assert response is None
+
+
+def test_posttool_refuses_local_context_for_different_active_host_session(tmp_path):
+    updated = recovery.prepare_client_local_registration(
+        tmp_path,
+        _registration_input(),
+        provider_session_id="claude-provider-session-a",
+    )
+    response = hook.handle_hook_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "session_id": "claude-provider-session-b",
+            "tool_name": "mcp__meridian__get_session_recovery",
+            "tool_input": {"session_id": "meridian-session-1"},
+            "tool_response": {
+                "recovery": {
+                    "local_ref_id": updated["local_ref_id"],
+                    "meridian_session_id": "meridian-session-1",
+                }
+            },
+        },
+        data_dir=tmp_path,
+    )
+    assert response is None
+
+
+def test_posttool_suppresses_local_context_without_active_host_session_id(tmp_path):
+    updated = recovery.prepare_client_local_registration(
+        tmp_path,
+        _registration_input(),
+        provider_session_id="claude-provider-session-a",
+    )
+    response = hook.handle_hook_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "mcp__meridian__get_session_recovery",
+            "tool_input": {"session_id": "meridian-session-1"},
             "tool_response": {
                 "recovery": {
                     "local_ref_id": updated["local_ref_id"],

@@ -808,8 +808,9 @@ def client_local_recovery_context(
     tool_response: Any,
     *,
     expected_session_id: str,
+    expected_provider_session_id: str | None = None,
 ) -> str | None:
-    """Return a workstation-only recipe summary for a matching hosted result."""
+    """Return a local recipe only when both host and Meridian sessions match."""
     hosted_record = _extract_recovery_record(tool_response)
     if not hosted_record:
         return None
@@ -826,6 +827,9 @@ def client_local_recovery_context(
     if (
         not isinstance(local_record, dict)
         or local_record.get("meridian_session_id") != session_id
+        or not isinstance(expected_provider_session_id, str)
+        or not expected_provider_session_id
+        or local_record.get("provider_session_id") != expected_provider_session_id
     ):
         return None
     summary: dict[str, Any] = {
@@ -845,8 +849,8 @@ def client_local_recovery_context(
     if recipe is not None:
         summary["resume_recipe"] = recipe
     return (
-        "Caller-local recovery details matched this Meridian session by its opaque "
-        "local reference. This data stays on this workstation. Review any resume recipe "
+        "Caller-local recovery details matched this host and Meridian session by their "
+        "opaque local reference. This data stays on this workstation. Review any resume recipe "
         "before using it:\n"
         + json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True)
     )

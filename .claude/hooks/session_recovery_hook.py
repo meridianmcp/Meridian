@@ -75,13 +75,19 @@ def handle_hook_payload(
         expected_session_id = (
             tool_input.get("session_id") if isinstance(tool_input, dict) else None
         )
-        if not isinstance(expected_session_id, str):
+        active_provider_session_id = payload.get("session_id")
+        if (
+            not isinstance(expected_session_id, str)
+            or not isinstance(active_provider_session_id, str)
+            or not active_provider_session_id
+        ):
             return None
         try:
             context = client_local_recovery_context(
                 local_dir,
                 payload.get("tool_response"),
                 expected_session_id=expected_session_id,
+                expected_provider_session_id=active_provider_session_id,
             )
         except (OSError, TypeError, ValueError):
             return None
