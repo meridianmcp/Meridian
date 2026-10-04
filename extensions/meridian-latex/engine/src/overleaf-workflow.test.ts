@@ -805,6 +805,19 @@ test("TEXMFLOCAL inputs are not trusted even when nested under TEXMFROOT", async
   assert.ok(receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
 });
 
+test("TEXMFROOT does not make arbitrary installation files trusted", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const installationInput = join(fakeDistributionRoots.TEXMFROOT, "tlpkg", "untrusted.tex");
+  await mkdir(dirname(installationInput), { recursive: true });
+  await writeFile(installationInput, "outside the identified TeX trees", "utf8");
+  const fake = fakeRunner("pdflatex", [installationInput]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
+});
+
 test("external user TEXINPUTS entries make the source manifest incomplete", async () => {
   const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
   const outside = await mkdtemp(join(tmpdir(), "meridian-latex-texinputs-decoy-"));

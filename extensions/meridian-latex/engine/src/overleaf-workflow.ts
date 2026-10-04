@@ -1071,7 +1071,10 @@ async function resolveTeXDistributionRoots(
   for (const key of Object.keys(kpseEnv)) if (/^TEXMF/i.test(key)) delete kpseEnv[key];
   const distributionCwd = dirname(kpsewhich);
   kpseEnv.PWD = distributionCwd;
-  const variables = ["TEXMFDIST", "TEXMFROOT", "TEXMFMAIN", "TEXMFSYSVAR", "TEXMFSYSCONFIG", "TEXMFLOCAL"];
+  // TEXMFROOT is only the umbrella installation directory (it may contain
+  // binaries, caches, configuration, and site-managed files). Trust only the
+  // concrete TeX trees reported by kpsewhich, and keep TEXMFLOCAL excluded.
+  const variables = ["TEXMFDIST", "TEXMFMAIN", "TEXMFSYSVAR", "TEXMFSYSCONFIG", "TEXMFLOCAL"];
   const roots = new Map<string, string>();
   const excludedRoots = new Map<string, string>();
   const phaseResults: TeXDistributionResolution["phaseResults"] = [];
