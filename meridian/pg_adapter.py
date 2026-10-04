@@ -375,6 +375,14 @@ class PostgresConnection:
     # ------------------------------------------------------------------ API
 
     def execute(self, sql: str, params: tuple = ()) -> _ExecProxy:
+        pending = self._pending_txn_var.get()
+        if pending is not None:
+            pending._assert_owner_task()
+            # A begin_transaction() scope pins one borrowed connection. Keep
+            # ordinary adapter calls in that same task on the pinned handle
+            # too, so callers that share helpers using ``db.execute`` cannot
+            # silently escape the transaction or release row locks early.
+            return _ExecProxy(pending.execute(sql, params))
         return _ExecProxy(self._do_execute(sql, params))
 
     def begin_transaction(self) -> "_PendingPgTransaction":
@@ -413,13 +421,19 @@ class PostgresConnection:
         isolation, which wraps the whole test in one outer transaction) or
         not (a fresh production pool connection, autocommit=True) — the
         savepoint owns only ITS OWN scope either way and never accidentally
-        commits/rolls back a transaction it did not itself start.
+        commits/rolls back a transaction it did not itself start. Ordinary
+        ``PostgresConnection.execute()`` calls in this task are also routed to
+        the pinned handle until commit/rollback finishes the transaction.
         """
+        pending = self._pending_txn_var.get()
+        if pending is not None:
+            pending._assert_owner_task()
         return _PendingPgTransaction(self)
 
     async def _finish_pending_txn(self, *, rollback: bool) -> None:
         pending = self._pending_txn_var.get()
         if pending is not None:
+            pending._assert_owner_task()
             await pending.finish(rollback=rollback)
 
     async def executescript(self, sql: str) -> None:
@@ -802,7 +816,10 @@ class _PendingPgTransaction:
     transaction.
     """
 
-    __slots__ = ("_owner", "_conn", "_savepoint", "_started_own_txn", "_done", "_token")
+    __slots__ = (
+        "_owner", "_conn", "_savepoint", "_started_own_txn", "_done",
+        "_token", "_owner_task",
+    )
 
     def __init__(self, owner: "PostgresConnection") -> None:
         self._owner = owner
@@ -811,23 +828,62 @@ class _PendingPgTransaction:
         self._started_own_txn = False
         self._done = False
         self._token: Any = None
+        self._owner_task: Any = None
 
     async def __aenter__(self) -> _PinnedExec:
         import psycopg.pq  # local import — keeps SQLite-only installs psycopg-free
 
+        self._owner_task = asyncio.current_task()
         self._conn = await self._owner._pool.getconn()
-        self._started_own_txn = (
-            self._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
-        )
-        if self._started_own_txn:
-            await self._conn.execute("BEGIN")
-        self._savepoint = f"sp_rwrco_{uuid.uuid4().hex}"
-        await self._conn.execute(f"SAVEPOINT {self._savepoint}")
-        # Per-task, not per-connection-instance — see the ContextVar's own
-        # comment on PostgresConnection.__init__ for why a plain attribute
-        # would be unsafe under concurrent requests sharing this pool.
-        self._token = self._owner._pending_txn_var.set(self)
-        return _PinnedExec(self._conn)
+        savepoint_started = False
+        try:
+            self._started_own_txn = (
+                self._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+            )
+            if self._started_own_txn:
+                await self._conn.execute("BEGIN")
+            self._savepoint = f"sp_rwrco_{uuid.uuid4().hex}"
+            await self._conn.execute(f"SAVEPOINT {self._savepoint}")
+            savepoint_started = True
+            # Per-task, not per-connection-instance — see the ContextVar's own
+            # comment on PostgresConnection.__init__ for why a plain attribute
+            # would be unsafe under concurrent requests sharing this pool.
+            self._token = self._owner._pending_txn_var.set(self)
+            return _PinnedExec(self._conn)
+        except BaseException:
+            # __aexit__ is never invoked when __aenter__ raises. Restore a
+            # clean transaction boundary here before returning the borrowed
+            # connection; when an ambient transaction has no confirmed
+            # savepoint boundary, discard it rather than risk poisoning the
+            # caller's outer transaction.
+            try:
+                if self._started_own_txn:
+                    await self._conn.execute("ROLLBACK")
+                elif savepoint_started:
+                    await self._conn.execute(
+                        f"ROLLBACK TO SAVEPOINT {self._savepoint}"
+                    )
+                    await self._conn.execute(f"RELEASE SAVEPOINT {self._savepoint}")
+                else:
+                    raise RuntimeError("failed before an ambient savepoint was established")
+            except BaseException:
+                await self._discard_connection()
+            else:
+                conn = self._conn
+                try:
+                    await self._return_connection()
+                except BaseException:
+                    # Preserve the setup error and make a second best effort
+                    # to discard the connection if pool return itself failed.
+                    try:
+                        await conn.close()
+                    except BaseException:
+                        pass
+                    try:
+                        await self._owner._pool.putconn(conn)
+                    except BaseException:
+                        pass
+            raise
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         # An exception (including asyncio.CancelledError from a caller that
@@ -847,20 +903,74 @@ class _PendingPgTransaction:
             await self.finish(rollback=False)
         return False
 
+    async def execute(self, sql: str, params: tuple = ()) -> _PgCursor:
+        """Execute on this transaction's pinned connection."""
+        self._assert_owner_task()
+        if self._done or self._conn is None:
+            raise RuntimeError("cannot execute on a completed Postgres transaction")
+        return await _PinnedExec(self._conn).execute(sql, params)
+
+    def _assert_owner_task(self) -> None:
+        """Reject child tasks that inherited this ContextVar transaction."""
+        if asyncio.current_task() is not self._owner_task:
+            raise RuntimeError(
+                "Postgres transaction context cannot be used from a different task"
+            )
+
     async def finish(self, *, rollback: bool) -> None:
+        self._assert_owner_task()
         if self._done:
             return
-        self._done = True
-        if self._token is not None:
-            self._owner._pending_txn_var.reset(self._token)
-            self._token = None
         try:
             verb = "ROLLBACK TO SAVEPOINT" if rollback else "RELEASE SAVEPOINT"
             await self._conn.execute(f"{verb} {self._savepoint}")
             if self._started_own_txn:
                 await self._conn.execute("ROLLBACK" if rollback else "COMMIT")
-        finally:
-            await self._owner._pool.putconn(self._conn)
+        except BaseException:
+            # Keep the ContextVar and borrowed connection live until the
+            # finalizer succeeds. If COMMIT/RELEASE failed, recover the owned
+            # transaction (or just our savepoint inside an ambient one) before
+            # returning the connection to the pool.
+            try:
+                if self._started_own_txn:
+                    await self._conn.execute("ROLLBACK")
+                else:
+                    await self._conn.execute(
+                        f"ROLLBACK TO SAVEPOINT {self._savepoint}"
+                    )
+                    await self._conn.execute(f"RELEASE SAVEPOINT {self._savepoint}")
+            except BaseException:
+                await self._discard_connection()
+            else:
+                await self._return_connection()
+            raise
+        else:
+            await self._return_connection()
+
+    def _reset_pending_context(self) -> None:
+        self._done = True
+        if self._token is not None:
+            self._owner._pending_txn_var.reset(self._token)
+            self._token = None
+
+    async def _return_connection(self) -> None:
+        self._reset_pending_context()
+        conn = self._conn
+        self._conn = None
+        await self._owner._pool.putconn(conn)
+
+    async def _discard_connection(self) -> None:
+        self._reset_pending_context()
+        conn = self._conn
+        self._conn = None
+        try:
+            await conn.close()
+        except BaseException:
+            pass
+        try:
+            await self._owner._pool.putconn(conn)
+        except BaseException:
+            pass
 
 
 # ---------------------------------------------------------------------------

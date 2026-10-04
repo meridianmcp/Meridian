@@ -575,6 +575,460 @@ def test_doc_store_batch_rechecks_marker_ref_at_insert(tmp_path):
     _run(scenario())
 
 
+def test_doc_store_batch_and_document_replacement_serialize_across_connections(tmp_path):
+    async def scenario():
+        import asyncio
+
+        db_path = str(tmp_path / "doc_structure.db")
+        connection_a = await db_module.init_db(db_path)
+        connection_b = await db_module.init_db(db_path)
+        store_a = doc_store.DocStructureStore(connection_a)
+        store_b = doc_store.DocStructureStore(connection_b)
+        await store_a.ensure_schema()
+        await store_b.ensure_schema()
+        try:
+            await store_a.put_document(
+                "project-1",
+                "latex",
+                [{
+                    "ordinal": 0,
+                    "level": None,
+                    "kind": "citation",
+                    "text": r"\cite{doe2020}",
+                    "ref": "doe2020",
+                    "parent_ordinal": None,
+                }],
+                source="paper.tex",
+            )
+            marker = (await store_a.get_pending_zotero_citations("project-1"))["markers"][0]
+            result = {
+                "element_id": marker["id"],
+                "ref": marker["ref"],
+                "zotero_key": "ITEMKEY1",
+                "title": "Paper",
+            }
+
+            commit_waiting = asyncio.Event()
+            release_commit = asyncio.Event()
+            original_commit = connection_a.commit
+            paused = False
+
+            async def pause_first_commit():
+                nonlocal paused
+                if not paused:
+                    paused = True
+                    commit_waiting.set()
+                    await release_commit.wait()
+                await original_commit()
+
+            connection_a.commit = pause_first_commit
+            apply_task = asyncio.create_task(
+                store_a.apply_resolved_zotero_edges("project-1", [result])
+            )
+            await asyncio.wait_for(commit_waiting.wait(), timeout=5)
+
+            replacement_started = asyncio.Event()
+
+            async def replace_document():
+                replacement_started.set()
+                return await store_b.put_document(
+                    "project-1",
+                    "latex",
+                    [{
+                        "ordinal": 0,
+                        "level": None,
+                        "kind": "citation",
+                        "text": r"\cite{new2021}",
+                        "ref": "new2021",
+                        "parent_ordinal": None,
+                    }],
+                    source="paper.tex",
+                )
+
+            replacement_task = asyncio.create_task(
+                replace_document()
+            )
+            await asyncio.wait_for(replacement_started.wait(), timeout=5)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not replacement_task.done()
+
+            release_commit.set()
+            summary = await asyncio.wait_for(apply_task, timeout=5)
+            await asyncio.wait_for(replacement_task, timeout=5)
+
+            assert summary["applied"] == 1
+            assert (await store_a.get_pending_zotero_citations("project-1"))["markers"][0]["ref"] == "new2021"
+            assert await store_a.get_edges("project-1") == []
+        finally:
+            if "release_commit" in locals():
+                release_commit.set()
+            await connection_a.close()
+            await connection_b.close()
+
+    _run(scenario())
+
+
+def test_doc_store_batch_and_document_replacement_serialize_on_shared_connection(tmp_path):
+    async def scenario():
+        import asyncio
+
+        connection = await db_module.init_db(str(tmp_path / "doc_structure.db"))
+        store_a = doc_store.DocStructureStore(connection)
+        store_b = doc_store.DocStructureStore(connection)
+        await store_a.ensure_schema()
+        await store_b.ensure_schema()
+        try:
+            await store_a.put_document(
+                "project-1",
+                "latex",
+                [{
+                    "ordinal": 0,
+                    "level": None,
+                    "kind": "citation",
+                    "text": r"\cite{doe2020}",
+                    "ref": "doe2020",
+                    "parent_ordinal": None,
+                }],
+                source="paper.tex",
+            )
+            marker = (await store_a.get_pending_zotero_citations("project-1"))["markers"][0]
+            result = {
+                "element_id": marker["id"],
+                "ref": marker["ref"],
+                "zotero_key": "ITEMKEY1",
+                "title": "Paper",
+            }
+
+            commit_waiting = asyncio.Event()
+            release_commit = asyncio.Event()
+            replacement_started = asyncio.Event()
+            original_commit = connection.commit
+            paused = False
+
+            async def pause_first_commit():
+                nonlocal paused
+                if not paused:
+                    paused = True
+                    commit_waiting.set()
+                    await release_commit.wait()
+                await original_commit()
+
+            connection.commit = pause_first_commit
+            apply_task = asyncio.create_task(
+                store_a.apply_resolved_zotero_edges("project-1", [result])
+            )
+            await asyncio.wait_for(commit_waiting.wait(), timeout=5)
+
+            async def replace_document():
+                replacement_started.set()
+                return await store_b.put_document(
+                    "project-1",
+                    "latex",
+                    [{
+                        "ordinal": 0,
+                        "level": None,
+                        "kind": "citation",
+                        "text": r"\cite{new2021}",
+                        "ref": "new2021",
+                        "parent_ordinal": None,
+                    }],
+                    source="paper.tex",
+                )
+
+            replacement_task = asyncio.create_task(replace_document())
+            await asyncio.wait_for(replacement_started.wait(), timeout=5)
+            await asyncio.sleep(0)
+            assert not replacement_task.done()
+
+            release_commit.set()
+            summary = await asyncio.wait_for(apply_task, timeout=5)
+            await asyncio.wait_for(replacement_task, timeout=5)
+
+            assert summary["applied"] == 1
+            assert (await store_a.get_pending_zotero_citations("project-1"))["markers"][0]["ref"] == "new2021"
+            assert await store_a.get_edges("project-1") == []
+        finally:
+            if "release_commit" in locals():
+                release_commit.set()
+            await connection.close()
+
+    _run(scenario())
+
+
+def test_doc_store_zotero_postgres_locks_then_rereads_before_insert():
+    class Cursor:
+        def __init__(self, *, rowcount=-1, row=None):
+            self.rowcount = rowcount
+            self._row = row
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def fetchone(self):
+            return self._row
+
+    class Transaction:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def __aenter__(self):
+            self.connection.events.append("begin")
+            self.connection.pending = True
+
+        async def __aexit__(self, *args):
+            self.connection.pending = False
+            self.connection.events.append("exit")
+
+    class Postgres:
+        def __init__(self):
+            self.events = []
+            self.statements = []
+            self.pending = False
+
+        def begin_transaction(self):
+            return Transaction(self)
+
+        def execute(self, sql, params=()):
+            self.events.append("execute_pinned" if self.pending else "execute_pooled")
+            self.statements.append((sql, params))
+            if sql.lstrip().upper().startswith("SELECT"):
+                return Cursor(row=("doc-1",))
+            if sql.lstrip().upper().startswith("INSERT"):
+                return Cursor(rowcount=1)
+            return Cursor()
+
+        async def commit(self):
+            self.events.append("commit")
+
+        async def rollback(self):
+            self.events.append("rollback")
+
+    async def scenario():
+        connection = Postgres()
+        store = doc_store.DocStructureStore(connection)
+        result = await store._insert_zotero_edge_if_current(
+            "project-1", "citation-1", "doe2020", "zotero:ITEMKEY1", None
+        )
+
+        assert result == "applied"
+        assert "FOR UPDATE OF d" in connection.statements[0][0]
+        assert "e.ref = ?" in connection.statements[1][0]
+        assert connection.statements[1][1] == ("project-1", "citation-1", "doe2020")
+        assert connection.statements[2][0].lstrip().upper().startswith("INSERT")
+        assert connection.events == [
+            "begin",
+            "execute_pinned",
+            "execute_pinned",
+            "execute_pinned",
+            "commit",
+            "exit",
+        ]
+
+    _run(scenario())
+
+
+def test_doc_store_postgres_advisory_lock_serializes_concurrent_first_insert():
+    async def scenario():
+        import asyncio
+
+        class Cursor:
+            def __init__(self, row=None):
+                self.rowcount = 0
+                self.row = row
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def fetchone(self):
+                return self.row
+
+        class SharedDatabase:
+            def __init__(self):
+                self.documents = {}
+                self.locks = {}
+                self.statements = []
+                self.events = {}
+
+            def lock_for(self, key):
+                return self.locks.setdefault(key, asyncio.Lock())
+
+            def note(self, event):
+                self.events.setdefault(asyncio.current_task(), []).append(event)
+
+        class LockQuery(Cursor):
+            def __init__(self, connection, key):
+                super().__init__((None,))
+                self.connection = connection
+                self.key = key
+
+            async def __aenter__(self):
+                lock = self.connection.shared.lock_for(self.key)
+                await lock.acquire()
+                self.connection.held_locks.append(lock)
+                self.connection.shared.note("advisory_lock")
+                return self
+
+        class Transaction:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def __aenter__(self):
+                self.connection.pending = True
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        class Postgres:
+            def __init__(self, shared):
+                self.shared = shared
+                self.pending = False
+                self.held_locks = []
+
+            def begin_transaction(self):
+                return Transaction(self)
+
+            def execute(self, sql, params=()):
+                self.shared.statements.append((sql, params))
+                if "pg_advisory_xact_lock" in sql:
+                    return LockQuery(self, params[0])
+                if "FOR UPDATE" in sql:
+                    return Cursor((params[1],))
+                return Cursor()
+
+            async def commit(self):
+                self.pending = False
+                for lock in self.held_locks:
+                    lock.release()
+                self.held_locks.clear()
+
+            async def rollback(self):
+                await self.commit()
+
+        shared = SharedDatabase()
+        connection_a = Postgres(shared)
+        connection_b = Postgres(shared)
+        store_a = doc_store.DocStructureStore(connection_a)
+        store_b = doc_store.DocStructureStore(connection_b)
+
+        async def fetch_document(project_id, source):
+            shared.note("source_read")
+            document_id = shared.documents.get((project_id, source))
+            return {"id": document_id} if document_id is not None else None
+
+        store_a._fetch_document_row = fetch_document
+        store_b._fetch_document_row = fetch_document
+        first_inserting = asyncio.Event()
+        second_started = asyncio.Event()
+        allow_first_commit = asyncio.Event()
+        inserted_ids = iter(("document-a", "document-b"))
+
+        async def ingest(store, *, pause_before_commit=False):
+            if not pause_before_commit:
+                second_started.set()
+            async with doc_store._doc_store_write_transaction(store._db):
+                existing = await store._fetch_and_lock_document_row(
+                    "project-1", " paper.tex "
+                )
+                if existing is not None:
+                    return existing["id"]
+                document_id = next(inserted_ids)
+                shared.documents[("project-1", "paper.tex")] = document_id
+                if pause_before_commit:
+                    first_inserting.set()
+                    await allow_first_commit.wait()
+                return document_id
+
+        first = asyncio.create_task(ingest(store_a, pause_before_commit=True))
+        await asyncio.wait_for(first_inserting.wait(), timeout=5)
+        second = asyncio.create_task(ingest(store_b))
+        await asyncio.wait_for(second_started.wait(), timeout=5)
+        await asyncio.sleep(0)
+        assert not second.done()
+
+        allow_first_commit.set()
+        first_id, second_id = await asyncio.gather(first, second)
+
+        assert first_id == second_id == "document-a"
+        assert shared.documents == {("project-1", "paper.tex"): "document-a"}
+        advisory_calls = [
+            params[0]
+            for sql, params in shared.statements
+            if "pg_advisory_xact_lock" in sql
+        ]
+        assert len(advisory_calls) == 2
+        assert advisory_calls[0] == advisory_calls[1]
+        assert -(1 << 63) <= advisory_calls[0] < (1 << 63)
+        assert len(shared.events) == 2
+        for task_events in shared.events.values():
+            assert task_events[0] == "advisory_lock"
+            assert "source_read" in task_events
+
+    _run(scenario())
+
+
+def test_doc_store_put_document_rolls_back_if_commit_fails(tmp_path):
+    async def scenario():
+        connection = await db_module.init_db(str(tmp_path / "doc_structure.db"))
+        store = doc_store.DocStructureStore(connection)
+        await store.ensure_schema()
+        original_commit = connection.commit
+        try:
+            await store.put_document(
+                "project-1",
+                "latex",
+                [{
+                    "ordinal": 0,
+                    "level": None,
+                    "kind": "citation",
+                    "text": r"\cite{doe2020}",
+                    "ref": "doe2020",
+                    "parent_ordinal": None,
+                }],
+                source="paper.tex",
+            )
+
+            async def fail_commit():
+                raise OSError("simulated commit failure")
+
+            connection.commit = fail_commit
+            try:
+                await store.put_document(
+                    "project-1",
+                    "latex",
+                    [{
+                        "ordinal": 0,
+                        "level": None,
+                        "kind": "citation",
+                        "text": r"\cite{new2021}",
+                        "ref": "new2021",
+                        "parent_ordinal": None,
+                    }],
+                    source="paper.tex",
+                )
+            except OSError as exc:
+                assert str(exc) == "simulated commit failure"
+            else:
+                raise AssertionError("commit failure should propagate")
+
+            assert not connection.in_transaction
+            connection.commit = original_commit
+            marker = (await store.get_pending_zotero_citations("project-1"))["markers"][0]
+            assert marker["ref"] == "doe2020"
+        finally:
+            connection.commit = original_commit
+            await connection.close()
+
+    _run(scenario())
+
+
 def test_doc_store_batch_respects_legacy_random_id_zotero_edge(tmp_path):
     async def scenario():
         connection = await db_module.init_db(str(tmp_path / "doc_structure.db"))

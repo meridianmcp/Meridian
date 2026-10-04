@@ -84,14 +84,19 @@ import json
 import os
 import re
 import shutil
+import asyncio
+import hashlib
+import inspect
+import logging
 import tempfile
 import threading
 import time
 import uuid
-import hashlib
-import logging
+import weakref
 import zipfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Awaitable, Callable, Iterable
 
 from lxml import etree as _LET
@@ -100,6 +105,122 @@ from . import fallbacks
 from .zotero_client import resolve_citation_ref
 
 _log = logging.getLogger(__name__)
+
+
+class _AsyncReentrantLock:
+    """A task-reentrant gate for the connection-wide SQLite transaction state."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[Any] | None = None
+        self._depth = 0
+
+    async def __aenter__(self) -> "_AsyncReentrantLock":
+        task = asyncio.current_task()
+        if task is not None and task is self._owner:
+            self._depth += 1
+            return self
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+
+_SQLITE_DOC_STORE_LOCKS: weakref.WeakKeyDictionary[Any, _AsyncReentrantLock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _sqlite_doc_store_lock(db: Any) -> _AsyncReentrantLock:
+    """Return the one task gate shared by every store wrapper for this connection."""
+    lock = _SQLITE_DOC_STORE_LOCKS.get(db)
+    if lock is None:
+        lock = _AsyncReentrantLock()
+        _SQLITE_DOC_STORE_LOCKS[db] = lock
+    return lock
+
+
+def _is_postgres_connection(db: Any) -> bool:
+    return callable(getattr(db, "begin_transaction", None))
+
+
+def _serialize_sqlite_doc_store_methods(cls: type) -> type:
+    """Keep one cached aiosqlite connection's multi-statement calls task-atomic.
+
+    SQLite connection transactions are connection-wide, so a second handler
+    using the same cached connection could otherwise read an intermediate
+    document replacement or commit another handler's transaction. PostgreSQL
+    uses a pooled connection pinned per task and does not need this gate.
+    """
+    for name, method in tuple(cls.__dict__.items()):
+        if name == "resolve_zotero_edges" or not inspect.iscoroutinefunction(method):
+            # Resolve may await Zotero's local HTTP API for an arbitrary time;
+            # its DB phases call the separately gated store methods below.
+            continue
+
+        @wraps(method)
+        async def _serialized(
+            self: Any, *args: Any, __method: Any = method, **kwargs: Any
+        ) -> Any:
+            if _is_postgres_connection(self._db):
+                return await __method(self, *args, **kwargs)
+            async with _sqlite_doc_store_lock(self._db):
+                return await __method(self, *args, **kwargs)
+
+        setattr(cls, name, _serialized)
+    return cls
+
+
+@asynccontextmanager
+async def _doc_store_write_transaction(db: Any):
+    """Pin a write transaction and its lock across document/edge mutations."""
+    if _is_postgres_connection(db):
+        async with db.begin_transaction():
+            try:
+                yield
+                await db.commit()
+            except BaseException:
+                # PostgresConnection deliberately leaves a failed transaction
+                # pinned until the caller explicitly chooses rollback/commit.
+                try:
+                    await db.rollback()
+                except BaseException:  # noqa: BLE001 — preserve the original failure
+                    _log.exception("Failed to roll back document-store transaction")
+                raise
+        return
+
+    # All SQLite store methods share this lock, including reads and commits, so
+    # no other handler can observe or prematurely commit this transaction.
+    async with _sqlite_doc_store_lock(db):
+        nested = bool(getattr(db, "in_transaction", False))
+        savepoint = f"doc_store_{uuid.uuid4().hex}"
+        if nested:
+            await db.execute(f"SAVEPOINT {savepoint}")
+        else:
+            # Reserve SQLite's single writer before the first validation read.
+            await db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            if nested:
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                await db.commit()
+        except BaseException:
+            try:
+                if nested:
+                    await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    await db.rollback()
+            except BaseException:  # noqa: BLE001 — preserve the original failure
+                _log.exception("Failed to roll back document-store transaction")
+            raise
 
 # Cross-store resolve-through seam (d2a3537a): a callable that maps a figure's
 # ``file_path`` to its ``outputs_index`` row (or ``None`` when the path names no
@@ -2546,6 +2667,7 @@ def _table_similarity(a: str, b: str) -> float:
 # The store
 # ---------------------------------------------------------------------------
 
+@_serialize_sqlite_doc_store_methods
 class DocStructureStore:
     """Persistent, backend-agnostic store for parsed document structure.
 
@@ -2558,6 +2680,48 @@ class DocStructureStore:
 
     def __init__(self, db: Any) -> None:
         self._db = db
+
+    async def _lock_document_row(self, project_id: str, document_id: str) -> bool:
+        """Lock one document row on PostgreSQL; SQLite uses BEGIN IMMEDIATE."""
+        if not _is_postgres_connection(self._db):
+            return True
+        async with self._db.execute(
+            "SELECT id FROM doc_documents WHERE project_id = ? AND id = ? "
+            "FOR UPDATE",
+            (project_id, document_id),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def _fetch_and_lock_document_row(
+        self, project_id: str, source: str
+    ) -> dict[str, Any] | None:
+        """Serialize a source upsert, then re-read its row after locking it."""
+        source = source.strip() if isinstance(source, str) else source
+        if _is_postgres_connection(self._db):
+            # A row lock cannot serialize the first insert because no row
+            # exists yet. A transaction-scoped advisory lock on the natural
+            # key makes first insert, replacement, and delete mutually
+            # exclusive without serializing unrelated sources in a project.
+            lock_key = hashlib.sha256(
+                f"meridian.doc_documents.source\0{project_id}\0{source}".encode(
+                    "utf-8"
+                )
+            ).digest()[:8]
+            advisory_id = int.from_bytes(lock_key, byteorder="big", signed=True)
+            async with self._db.execute(
+                "SELECT pg_advisory_xact_lock(?)", (advisory_id,)
+            ) as cur:
+                await cur.fetchone()
+
+        existing = await self._fetch_document_row(project_id, source)
+        while existing is not None:
+            document_id = existing["id"]
+            locked = await self._lock_document_row(project_id, document_id)
+            latest = await self._fetch_document_row(project_id, source)
+            if locked and latest is not None and latest["id"] == document_id:
+                return latest
+            existing = latest
+        return None
 
     # -- schema --------------------------------------------------------------
 
@@ -2752,6 +2916,29 @@ class DocStructureStore:
         content_hash: str | None = None,
         link_status: str | None = None,
     ) -> dict[str, Any]:
+        """Store or replace one document under the Zotero writer lock."""
+        async with _doc_store_write_transaction(self._db):
+            return await self._put_document_in_transaction(
+                project_id,
+                doc_type,
+                elements,
+                source=source,
+                title=title,
+                content_hash=content_hash,
+                link_status=link_status,
+            )
+
+    async def _put_document_in_transaction(
+        self,
+        project_id: str,
+        doc_type: str,
+        elements: list[dict[str, Any]],
+        *,
+        source: str | None = None,
+        title: str | None = None,
+        content_hash: str | None = None,
+        link_status: str | None = None,
+    ) -> dict[str, Any]:
         """Store (or replace) a document's structure and return its doc dict.
 
         Upsert semantics: when ``source`` is resolvable and a document already
@@ -2775,20 +2962,19 @@ class DocStructureStore:
         PRESERVES the existing row's status rather than silently reverting a
         deprecated/independent doc back to live.
 
-        NB: the delete-then-reinsert upsert is NOT wrapped in a single
-        transaction — the shared adapter runs each ``execute`` on its own pooled
-        connection under autocommit (matching the ~140 existing call sites), so a
-        crash mid-upsert can leave a torn write. This is acceptable because
-        structure persistence is best-effort (all call sites guard it and never
-        surface a failure) and self-healing: the next ``ingest``/parse of the
-        same source re-derives and re-upserts the full structure.
+        The caller holds a transaction across the upsert. The parent
+        ``doc_documents`` row is locked before old edges/elements are removed,
+        serializing it with a concurrent Zotero resolution for the same marker.
         """
         src = source.strip() if isinstance(source, str) and source.strip() else None
         now = _now_iso()
         ordered = list(elements or [])
         ch = content_hash if content_hash is not None else compute_content_hash(ordered)
 
-        existing = await self._fetch_document_row(project_id, src) if src else None
+        existing = (
+            await self._fetch_and_lock_document_row(project_id, src)
+            if src else None
+        )
         if existing is not None:
             doc_id = existing["id"]
             created_at = existing.get("created_at") or now
@@ -2859,7 +3045,6 @@ class DocStructureStore:
         # store the fresh doc_id guarantees no pre-existing edges to collide with.
         await self._materialize_citation_edges(project_id, prepared, now)
 
-        await self._db.commit()
         stored = await self._fetch_document_row(project_id, src) if src else None
         if stored is not None:
             return stored
@@ -3024,18 +3209,31 @@ class DocStructureStore:
         target_ref: str,
         target_document_id: str | None,
     ) -> str:
-        """Atomically validate and insert one project-bound Zotero edge.
+        """Serialize with document replacement and insert one current Zotero edge.
 
-        All Zotero edge writers use the same deterministic primary key for a
-        marker. The INSERT also rechecks the marker's current project/ref, so
-        concurrent syncs and late results cannot add duplicate or stale edges.
-        Existing legacy rows keep their original ids and are respected by the
-        NOT EXISTS predicate.
+        PostgreSQL locks the marker's parent document row before re-reading its
+        exact ref. SQLite begins an immediate transaction before the same check.
+        Document replacement/deletion takes the matching lock before edge
+        cleanup, so either ordering leaves no edge attached to a stale marker.
+        Stable ids and the legacy-edge predicate preserve idempotency/data.
         """
         edge_id = uuid.uuid5(
             uuid.NAMESPACE_URL, f"meridian-zotero-edge:{project_id}:{element_id}"
         ).hex
         now = _now_iso()
+        postgres = _is_postgres_connection(self._db)
+        lock_parent_sql = (
+            "SELECT d.id FROM doc_documents d "
+            "JOIN doc_elements e ON e.document_id = d.id "
+            "WHERE d.project_id = ? AND e.id = ? AND e.kind = 'citation'"
+            + (" FOR UPDATE OF d" if postgres else "")
+        )
+        exact_marker_sql = (
+            "SELECT 1 AS current FROM doc_documents d "
+            "JOIN doc_elements e ON e.document_id = d.id "
+            "WHERE d.project_id = ? AND e.id = ? AND e.kind = 'citation' "
+            "AND e.ref = ?"
+        )
         sql = (
             "INSERT INTO doc_edges "
             "(id, project_id, source_element_id, edge_kind, target_kind, "
@@ -3052,22 +3250,44 @@ class DocStructureStore:
             "AND existing.target_kind = 'zotero_item') "
             "ON CONFLICT (id) DO NOTHING"
         )
-        params = (
-            edge_id,
-            project_id,
-            target_ref,
-            target_document_id,
-            now,
-            now,
-            project_id,
-            element_id,
-            expected_ref,
-            project_id,
-        )
         try:
-            async with self._db.execute(sql, params) as cur:
-                inserted = cur.rowcount
-            await self._db.commit()
+            async with _doc_store_write_transaction(self._db):
+                async with self._db.execute(
+                    lock_parent_sql, (project_id, element_id)
+                ) as cur:
+                    parent = await cur.fetchone()
+                if parent is None:
+                    return "stale"
+
+                # Re-read the marker after any PostgreSQL row-lock wait. The
+                # first SELECT only locates/locks the parent; it does not rely
+                # on its statement snapshot for the content/ref validation.
+                async with self._db.execute(
+                    exact_marker_sql, (project_id, element_id, expected_ref)
+                ) as cur:
+                    marker = await cur.fetchone()
+                if marker is None:
+                    return "stale"
+
+                params = (
+                    edge_id,
+                    project_id,
+                    target_ref,
+                    target_document_id,
+                    now,
+                    now,
+                    project_id,
+                    element_id,
+                    expected_ref,
+                    project_id,
+                )
+                async with self._db.execute(sql, params) as cur:
+                    inserted = cur.rowcount
+                if inserted == 1:
+                    return "applied"
+                return await self._zotero_edge_write_status(
+                    project_id, element_id, expected_ref,
+                )
         except Exception:  # noqa: BLE001 — classify benign races, report other write failures
             _log.debug(
                 "Zotero edge insert failed for element=%s", element_id,
@@ -3076,11 +3296,6 @@ class DocStructureStore:
             return await self._zotero_edge_write_status(
                 project_id, element_id, expected_ref,
             )
-        if inserted == 1:
-            return "applied"
-        return await self._zotero_edge_write_status(
-            project_id, element_id, expected_ref,
-        )
 
     async def resolve_zotero_edges(
         self,
@@ -3555,7 +3770,13 @@ class DocStructureStore:
 
     async def delete_document(self, project_id: str, source: str) -> bool:
         """Delete a document (its elements + edges) by source. Return True if removed."""
-        doc = await self.get_document(project_id, source)
+        async with _doc_store_write_transaction(self._db):
+            return await self._delete_document_in_transaction(project_id, source)
+
+    async def _delete_document_in_transaction(
+        self, project_id: str, source: str
+    ) -> bool:
+        doc = await self._fetch_and_lock_document_row(project_id, source)
         if doc is None:
             return False
         # Drop edges FIRST (subquery over the still-present elements) so deleting a
@@ -3565,7 +3786,6 @@ class DocStructureStore:
         await self._db.execute(
             "DELETE FROM doc_documents WHERE id = ?", (doc["id"],)
         )
-        await self._db.commit()
         return True
 
     async def set_link_status(
