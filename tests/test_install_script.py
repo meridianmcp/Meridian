@@ -553,14 +553,36 @@ def test_install_windows_ps1_uninstall_is_idempotent():
     assert "Test-Path -LiteralPath $uninstallerCopy" in uninstall_block
     # $ErrorActionPreference is "Stop" for the whole script, so the exe
     # removal (the one Remove-Item most likely to fail -- e.g. the process is
-    # still running) must be try/caught rather than left to propagate and
-    # abort the rest of the uninstall sequence.
+    # still running) must be try/caught, then handled by the explicit retry
+    # gate before the rest of the uninstall sequence.
     exe_removal_idx = uninstall_block.index("Remove-Item -LiteralPath $exePath")
     preceding = uninstall_block[:exe_removal_idx]
     assert preceding.rstrip().endswith("try {"), (
         "the exe removal must be inside its own try block so a failure "
-        "(e.g. the process is still running) doesn't abort the rest of -Uninstall"
+        "(e.g. the process is still running) can preserve retry paths"
     )
+
+
+def test_install_windows_ps1_preserves_uninstall_retry_paths_when_exe_is_locked():
+    """A still-running tray binary keeps every way to retry uninstall."""
+    src = _install_windows_ps1_src()
+    uninstall_idx = src.index("if ($Uninstall) {")
+    exit_idx = src.index("exit 0", uninstall_idx)
+    uninstall_block = src[uninstall_idx:exit_idx]
+    failure_gate_idx = uninstall_block.index("if ($exeRemovalFailed) {")
+    failure_gate_end = uninstall_block.index("Remove-MeridianStartMenuShortcut", failure_gate_idx)
+    failure_gate = uninstall_block[failure_gate_idx:failure_gate_end]
+
+    assert "$exeRemovalFailed = Test-Path -LiteralPath $exePath" in uninstall_block
+    assert "The Meridian tray executable is still present" in failure_gate
+    assert "exit 1" in failure_gate
+    for cleanup in (
+        "Remove-MeridianStartMenuShortcut",
+        "Remove-MeridianAutostart",
+        "Remove-MeridianUninstallEntry",
+        "Remove-Item -LiteralPath $uninstallerCopy",
+    ):
+        assert failure_gate_idx < uninstall_block.index(cleanup)
 
 
 def test_install_windows_ps1_start_menu_shortcut_targets_current_user_only():

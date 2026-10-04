@@ -248,10 +248,11 @@ function Remove-MeridianUninstallEntry {
 
 # ---- -Uninstall: reverse exactly what the -Tray path installs --------------
 # Short-circuits before -Tray / uv / meridian.exe logic below -- -Uninstall is
-# a standalone action, not a modifier of a normal install run. Every step
-# checks existence first and is independently try/caught, so a partial prior
-# manual removal (or a second -Uninstall run) never errors out partway
-# through -- each piece is removed if present, reported either way.
+# a standalone action, not a modifier of a normal install run. The tray binary
+# is removed before its retry paths; if Windows cannot delete a running binary,
+# preserve the shortcut, autostart entry, Apps registration, and uninstaller
+# copy so the user can close Meridian and retry. After the executable is gone,
+# each remaining cleanup is best-effort and idempotent.
 #
 # Deliberately does NOT touch ~/.local\bin or the user PATH: that directory
 # is a SHARED per-user bin directory (uv, serena, and other unrelated tools
@@ -265,15 +266,22 @@ if ($Uninstall) {
     $exePath = Join-Path $binDir "meridian-tray.exe"
     $uninstallerCopy = Join-Path $binDir "install-windows.ps1"
 
+    $exeRemovalFailed = $false
     if (Test-Path -LiteralPath $exePath) {
         try {
             Remove-Item -LiteralPath $exePath -Force -ErrorAction Stop
             Write-Host "Removed $exePath"
         } catch {
             Write-Warning "Could not remove $exePath -- it may still be running. Close Meridian (tray icon > Quit) and try again. ($($_.Exception.Message))"
+            $exeRemovalFailed = Test-Path -LiteralPath $exePath
         }
     } else {
         Write-Host "meridian-tray.exe not found at $exePath (already removed)."
+    }
+
+    if ($exeRemovalFailed) {
+        Write-Warning "The Meridian tray executable is still present. Its Start Menu shortcut, autostart entry, Apps registration, and uninstaller were preserved so you can retry after closing Meridian."
+        exit 1
     }
 
     Remove-MeridianStartMenuShortcut
