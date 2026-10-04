@@ -1473,36 +1473,30 @@ def npy_metadata(path: str) -> NpyMetadata:
 
 
 def _normalize_output_path(path: Any) -> str:
-    """Canonical cross-platform path for equality matching."""
+    """Canonical case/slash-insensitive identity path used by the output cache."""
     if not isinstance(path, str):
         return ""
-    s = path.strip()
-    if not s:
+    value = path.strip()
+    if not value:
         return ""
     try:
-        s = os.path.abspath(s)
+        canonical = os.path.realpath(os.path.abspath(value))
     except (OSError, ValueError):
-        pass
-    return os.path.normcase(os.path.normpath(s)).replace("\\", "/")
+        canonical = os.path.abspath(value)
+    return os.path.normcase(os.path.normpath(canonical)).replace("\\", "/")
 
 
 def _canonical_storage_path(path: Any) -> str:
-    """Return one absolute storage spelling without case-folding it.
-
-    The equality normalizer is intentionally case/slash insensitive. Persisted
-    rows and public result paths must retain the established Windows display
-    spelling, so those concerns stay separate.
-    """
+    """Return a real absolute storage identity without case-folding its display."""
     if not isinstance(path, str):
         return ""
-    s = path.strip()
-    if not s:
+    value = path.strip()
+    if not value:
         return ""
     try:
-        s = os.path.abspath(s)
+        return os.path.normpath(os.path.realpath(os.path.abspath(value)))
     except (OSError, ValueError):
-        pass
-    return os.path.normpath(s)
+        return os.path.normpath(os.path.abspath(value))
 
 
 def _classify_suffix(path: str) -> str:
@@ -2338,6 +2332,10 @@ class ConvergenceState:
     # silently folded into `converged=True` alongside a genuine confirmed
     # convergence. False for every branch except the genuinely-untouched one.
     never_walked: bool = False
+    # Explicit canonical identity for this root/subtree convergence snapshot.
+    canonical_root: str | None = None
+    canonical_scope: str | None = None
+    scope_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -7250,6 +7248,10 @@ class OutputsFtsIndex:
                     subtree_scanned and pending == 0
                     and not self._fts_pending and last_error is None
                 )
+            canonical_scope = (
+                _canonical_storage_path(subtree)
+                if subtree is not None else self.outputs_dir
+            )
             return ConvergenceState(
                 outputs_dir=self.outputs_dir,
                 subtree=scope_desc,
@@ -7264,6 +7266,9 @@ class OutputsFtsIndex:
                 partial=bool(self.last_rebuild_partial),
                 index_lock=self.lock_diagnostics(),
                 never_walked=never_walked,
+                canonical_root=self.outputs_dir,
+                canonical_scope=canonical_scope,
+                scope_id=f"outputs:{self.outputs_dir}::{canonical_scope}",
             )
 
     def lock_diagnostics(self) -> dict[str, Any] | None:
@@ -8280,8 +8285,8 @@ def get_subtree_index(root_outputs_dir: str, subtree_path: str) -> OutputsFtsInd
     optimisation -- searching the subtree directly without ever calling this
     still works, just without the ancestor-seeding speedup.
     """
-    root_norm = os.path.normpath(os.path.abspath(root_outputs_dir))
-    sub_norm = os.path.normpath(os.path.abspath(subtree_path))
+    root_norm = _canonical_storage_path(root_outputs_dir) or os.path.normpath(os.path.abspath(root_outputs_dir))
+    sub_norm = _canonical_storage_path(subtree_path) or os.path.normpath(os.path.abspath(subtree_path))
     if sub_norm != root_norm:
         try:
             common = os.path.commonpath([root_norm, sub_norm])

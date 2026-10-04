@@ -90,6 +90,7 @@ numpy = ">=1.26"
 watchdog = ">=4.0"
 
 [pypi-dependencies]
+keyring = ">=25,<27"
 # d45c2cc8 — detachable doc-intelligence sub-package (docs_intel + latex_intel).
 # Editable path install so `import docparse` resolves for the app + test suite while
 # the code lives standalone in packages/docparse/ (pip install -e ./packages/docparse).
@@ -284,7 +285,8 @@ test-fast = "python scripts/run_tests.py tests/test_core.py tests/test_new_v25.p
 worktree-hygiene = "python -m meridian.worktree_hygiene --repo-root ."
 build-exe = "pyinstaller meridian.spec --clean"
 build-connect = "pyinstaller meridian-connect.spec --clean"
-build-tray = "pyinstaller meridian-tray.spec --clean"
+  build-tray = "pyinstaller meridian-tray.spec --clean --noconfirm"
+  build-tray-mac = "bash scripts/build-tray-macos.sh"
 smoke-bundle = "node scripts/smoke_bundle.mjs"
 demo = "python scripts/demo.py"
 test-mcp = "python scripts/test_mcp.py"

@@ -88,14 +88,43 @@ def _free_url() -> str:
 def _run(shell: str, hook: str, payload: Any, env: dict[str, str], cwd: Path | None = None,
          timeout: float = 90) -> subprocess.CompletedProcess:
     data = payload if isinstance(payload, str) else json.dumps(payload)
+    run_env = env
     if shell == "ps1":
         argv = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(HOOKS / f"{hook}.ps1")]
     else:
         argv = [BASH, str(HOOKS / f"{hook}.sh")]
+        if os.name == "nt" and "CLAUDE_PROJECT_DIR" in env:
+            # Git Bash/MSYS rewrites Windows paths passed through the process
+            # environment. Export every hook path input inside bash so the
+            # project, temp, home, and payload paths keep the same spelling.
+            run_env = dict(env)
+            assignments = []
+            for name in (
+                "CLAUDE_PROJECT_DIR",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "HOME",
+                "USERPROFILE",
+                "LOCALAPPDATA",
+                "CLAUDE_CONFIG_DIR",
+            ):
+                value = run_env.pop(name, None)
+                if value is not None:
+                    value = value.replace("'", "'\\''")
+                    assignments.append(f"export {name}='{value}'")
+            command = "; ".join([*assignments, "exec bash \"$1\""])
+            argv = [
+                BASH,
+                "-c",
+                command,
+                "meridian-hook-test",
+                str(HOOKS / f"{hook}.sh"),
+            ]
     last = None
     for _ in range(3):
         try:
-            last = subprocess.run(argv, input=data.encode("utf-8"), capture_output=True, env=env,
+            last = subprocess.run(argv, input=data.encode("utf-8"), capture_output=True, env=run_env,
                                   cwd=str(cwd or REPO), timeout=timeout)
         except subprocess.TimeoutExpired:
             continue

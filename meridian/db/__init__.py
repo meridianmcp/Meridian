@@ -1012,6 +1012,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_github_integration(db)
     await _migrate_workspace_layer(db)
     await _migrate_checkpoint_data(db)
+    from .migrations import _migrate_project_state_milestones  # noqa: PLC0415
+
+    await _migrate_project_state_milestones(db)
     await _migrate_v33_hitl_kind_payload(db)
     await _migrate_v34_hitl_auto_answer(db)
     await _migrate_v34_workspace_settings(db)
@@ -11566,6 +11569,166 @@ async def get_session_checkpoint(
         return json.loads(raw)
     except (ValueError, TypeError):
         return None
+
+
+def _project_state_milestone_hash_material(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "project_id": record.get("project_id"),
+        "sequence": record.get("sequence"),
+        "session_id": record.get("session_id"),
+        "trigger": record.get("trigger"),
+        "risk_score": record.get("risk_score"),
+        "risk_threshold": record.get("risk_threshold"),
+        "previous_hash": record.get("previous_hash"),
+        "snapshot": record.get("snapshot"),
+        "captured_at": record.get("captured_at"),
+    }
+
+
+def _project_state_milestone_record(row: Any) -> dict[str, Any] | None:
+    import hashlib  # noqa: PLC0415
+
+    record = _row_to_dict(row)
+    if record is None:
+        return None
+    try:
+        record["snapshot"] = json.loads(record.pop("snapshot_json"))
+    except (ValueError, TypeError, KeyError):
+        record["snapshot"] = None
+    material = json.dumps(
+        _project_state_milestone_hash_material(record),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    record["integrity_verified"] = (
+        isinstance(record.get("snapshot"), dict)
+        and hashlib.sha256(material.encode("utf-8")).hexdigest() == record.get("content_hash")
+    )
+    return record
+
+
+async def append_project_state_milestone(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session_id: str,
+    *,
+    trigger: str,
+    risk_score: int,
+    risk_threshold: int,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Append one project milestone, retrying a concurrent sequence race."""
+    import hashlib  # noqa: PLC0415
+    import uuid  # noqa: PLC0415
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    if not isinstance(snapshot, dict):
+        raise ValueError("project state milestone snapshot must be an object")
+    snapshot_json = json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    captured_at = str(snapshot.get("captured_at") or datetime.now(timezone.utc).isoformat())
+    for attempt in range(8):
+        async with db.execute(
+            "SELECT sequence, content_hash FROM project_state_milestones "
+            "WHERE project_id = ? ORDER BY sequence DESC LIMIT 1",
+            (project_id,),
+        ) as cursor:
+            latest = await cursor.fetchone()
+        previous_hash = latest["content_hash"] if latest is not None else None
+        sequence = int(latest["sequence"]) + 1 if latest is not None else 1
+        record = {
+            "project_id": project_id,
+            "sequence": sequence,
+            "session_id": session_id,
+            "trigger": trigger,
+            "risk_score": int(risk_score),
+            "risk_threshold": int(risk_threshold),
+            "previous_hash": previous_hash,
+            "snapshot": snapshot,
+            "captured_at": captured_at,
+        }
+        material = json.dumps(
+            _project_state_milestone_hash_material(record),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        content_hash = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        milestone_id = str(uuid.uuid4())
+        try:
+            await db.execute(
+                "INSERT INTO project_state_milestones "
+                "(id, project_id, sequence, session_id, trigger, risk_score, "
+                "risk_threshold, previous_hash, content_hash, snapshot_json, captured_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    milestone_id,
+                    project_id,
+                    sequence,
+                    session_id,
+                    trigger,
+                    int(risk_score),
+                    int(risk_threshold),
+                    previous_hash,
+                    content_hash,
+                    snapshot_json,
+                    captured_at,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — retry only the unique sequence race
+            message = str(exc).lower()
+            if attempt < 7 and ("unique" in message or "duplicate" in message):
+                continue
+            raise
+        if not hasattr(db, "_pool"):
+            await db.commit()
+        result = await get_project_state_milestone(db, project_id, milestone_id)
+        if result is None:
+            raise RuntimeError("appended project state milestone could not be read back")
+        return result
+    raise RuntimeError("could not allocate a project milestone sequence")
+
+
+async def get_project_state_milestone(
+    db: aiosqlite.Connection,
+    project_id: str,
+    milestone_id: str,
+) -> dict[str, Any] | None:
+    async with db.execute(
+        "SELECT * FROM project_state_milestones WHERE project_id = ? AND id = ?",
+        (project_id, milestone_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return _project_state_milestone_record(row)
+
+
+async def list_project_state_milestones(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    limit: int = 20,
+    before_sequence: int | None = None,
+) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 100))
+    if before_sequence is None:
+        sql = (
+            "SELECT * FROM project_state_milestones WHERE project_id = ? "
+            "ORDER BY sequence DESC LIMIT ?"
+        )
+        params: tuple[Any, ...] = (project_id, limit)
+    else:
+        sql = (
+            "SELECT * FROM project_state_milestones WHERE project_id = ? AND sequence < ? "
+            "ORDER BY sequence DESC LIMIT ?"
+        )
+        params = (project_id, int(before_sequence), limit)
+    async with db.execute(sql, params) as cursor:
+        rows = await cursor.fetchall()
+    return [
+        record
+        for record in (_project_state_milestone_record(row) for row in rows)
+        if record is not None
+    ]
 
 
 # ---------------------------------------------------------------------------

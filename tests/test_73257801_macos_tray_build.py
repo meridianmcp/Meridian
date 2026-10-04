@@ -1,10 +1,7 @@
 """73257801 -- regression coverage for the macOS tray build.
 
-meridian/tray_main.py itself has ZERO platform-specific code (confirmed by
-grep for win32/sys.platform/platform.system/darwin before this item was
-worked -- see the sprint item's own notes). The only place platform
-actually matters is meridian-tray.spec (PyInstaller packaging) and the new
-build-tray-mac CI job in .github/workflows/release.yml. This file is a
+meridian/tray_main.py now has a small Darwin event-loop integration; the
+packaging and release behavior is also covered here. This file is a
 PACKAGING/CI regression test, not an application-logic one -- it would have
 caught:
 
@@ -116,6 +113,8 @@ def test_macos_hiddenimports_use_darwin_backend_only(monkeypatch: pytest.MonkeyP
     hiddenimports = rec.namespace["a"].hiddenimports  # type: ignore[attr-defined]
     assert "pystray._darwin" in hiddenimports
     assert "pystray._win32" not in hiddenimports
+    assert "AppKit" in hiddenimports
+    assert "msvcrt" not in hiddenimports
 
 
 def test_windows_build_is_onefile_exe_with_no_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,6 +146,7 @@ def test_macos_build_produces_app_bundle_via_collect_and_bundle(
     assert len(rec.bundle_calls) == 1
     bundle_kwargs = rec.bundle_calls[0]["kwargs"]
     assert bundle_kwargs.get("name") == "meridian-tray.app"
+    assert bundle_kwargs.get("icon") == "dist/meridian-tray.icns"
     # LSUIElement=True keeps this a menu-bar-only app (no Dock icon), same
     # UX intent as the Windows build's console=False.
     assert bundle_kwargs.get("info_plist", {}).get("LSUIElement") is True
@@ -203,13 +203,11 @@ def test_build_tray_mac_job_builds_via_the_shared_pixi_task() -> None:
     jobs = _load_release_workflow()["jobs"]
     steps = jobs["build-tray-mac"]["steps"]
     run_commands = [s["run"] for s in steps if "run" in s]
-    # Same pixi task the Windows tray job uses (`build-tray` in pixi.toml is
-    # already generic -- `pyinstaller meridian-tray.spec --clean` -- so no
-    # new pixi task was needed, only the spec's own platform branch).
-    assert any("pixi run -e dev build-tray" in cmd for cmd in run_commands)
+    # This task creates the native .icns icon before invoking the shared spec.
+    assert any("pixi run -e dev build-tray-mac" in cmd for cmd in run_commands)
 
 
-def test_build_tray_mac_job_uploads_a_zipped_app_bundle() -> None:
+def test_build_tray_mac_job_uploads_zip_and_drag_install_dmg() -> None:
     jobs = _load_release_workflow()["jobs"]
     steps = jobs["build-tray-mac"]["steps"]
     run_commands = [s["run"] for s in steps if "run" in s]
@@ -222,7 +220,8 @@ def test_build_tray_mac_job_uploads_a_zipped_app_bundle() -> None:
     ]
     assert len(upload_steps) == 1
     assert upload_steps[0]["with"]["name"] == "meridian-tray-mac"
-    assert upload_steps[0]["with"]["path"] == "meridian-tray-mac.zip"
+    assert "meridian-tray-mac.zip" in upload_steps[0]["with"]["path"]
+    assert "meridian-tray-mac.dmg" in upload_steps[0]["with"]["path"]
 
 
 def test_release_job_depends_on_build_tray_mac() -> None:
@@ -234,6 +233,15 @@ def test_release_job_ships_the_mac_tray_artifact() -> None:
     jobs = _load_release_workflow()["jobs"]
     files_block = jobs["release"]["steps"][-1]["with"]["files"]
     assert "dist-artifacts/meridian-tray-mac/meridian-tray-mac.zip" in files_block
+    assert "dist-artifacts/meridian-tray-mac/meridian-tray-mac.dmg" in files_block
+
+
+def test_macos_icon_script_builds_an_icns_from_the_checked_in_png() -> None:
+    script = (REPO_ROOT / "scripts" / "build-tray-macos.sh").read_text(encoding="utf-8")
+    assert "meridian/static/icon-192.png" in script
+    assert "sips" in script
+    assert "iconutil -c icns" in script
+    assert "dist/meridian-tray.icns" in script
 
 
 def test_release_job_still_ships_every_pre_existing_artifact() -> None:

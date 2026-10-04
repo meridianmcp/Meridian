@@ -181,6 +181,7 @@ _tunnel_outputs_sockets: dict[str, WebSocket] = {}
 
 # 121e6a27 — mcp-debugger slot (7-language DAP debugger via @debugmcp/mcp-debugger).
 _tunnel_debug_sockets: dict[str, WebSocket] = {}
+_tunnel_latex_sockets: dict[str, WebSocket] = {}
 
 # e37187f3 — per-host coexistence bookkeeping: (tenant_id, slot_label) ->
 # {host_id: WebSocket}. Keyed by (tenant_id, slot_label) rather than bare
@@ -281,6 +282,7 @@ _pending_docs_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_zotero_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_outputs_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_debug_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_latex_reqs: dict[str, asyncio.Future[dict]] = {}
 
 # ab956c80 follow-up — Streamable HTTP MCP servers such as persistent
 # ``mcp-proxy`` require initialize/initialized before real tools traffic. Keep
@@ -1287,6 +1289,12 @@ async def tunnel_debug_ws(ws: WebSocket, tenant_id: str) -> None:
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_debug_sockets, _pending_debug_reqs, "debug")
 
 
+@router.websocket("/tunnel-latex/{tenant_id}")
+async def tunnel_latex_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's meridian-latex proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_latex_sockets, _pending_latex_reqs, "latex")
+
+
 # 8fb69d54 — register the 4 custom-slot WebSocket routes (/tunnel-p0 … /tunnel-p3)
 # so a custom plugin bound to a slot gets a real server route.
 def _make_custom_slot_ws(_slot: str):
@@ -2027,6 +2035,26 @@ async def outputs_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request)
                                _tunnel_outputs_sockets, _pending_outputs_reqs, "outputs")
 
 
+@router.get("/latex/mcp/{tenant_id}")
+@router.post("/latex/mcp/{tenant_id}")
+@router.options("/latex/mcp/{tenant_id}")
+async def latex_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's meridian-latex server over the latex tunnel."""
+    prefix = f"/latex/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_latex_sockets, _pending_latex_reqs, "latex")
+
+
+@router.get("/latex/mcp/{tenant_id}/{rest:path}")
+@router.post("/latex/mcp/{tenant_id}/{rest:path}")
+@router.options("/latex/mcp/{tenant_id}/{rest:path}")
+async def latex_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Proxy sub-path requests to the tenant's meridian-latex server."""
+    return await _office_proxy(tenant_id, "/" + rest, request,
+                               _tunnel_latex_sockets, _pending_latex_reqs, "latex")
+
+
 @router.get("/debug/mcp/{tenant_id}")
 @router.post("/debug/mcp/{tenant_id}")
 @router.options("/debug/mcp/{tenant_id}")
@@ -2126,6 +2154,7 @@ async def tunnel_status(tenant_id: str, request: Request = None) -> dict:  # typ
         "zotero_active": tenant_id in _tunnel_zotero_sockets,
         "outputs_active": tenant_id in _tunnel_outputs_sockets,
         "debug_active": tenant_id in _tunnel_debug_sockets,
+        "latex_active": tenant_id in _tunnel_latex_sockets,
         # d71ba2e7 — slots the client reported unhealthy (pre-flight tools/list
         # failed / watchdog gave up). Absent slot ⇒ assumed healthy. Dashboard
         # renders these as a degraded status dot.
@@ -2240,11 +2269,19 @@ async def get_tunnel_plugins(request: Request) -> Response:
     # 8660d701 — per-machine config. ?hostname=X scopes to that machine's config
     # (from tunnel_plugins_by_host), falling back to the per-tenant default. No
     # hostname → the default config (back-compat with the single-machine dashboard).
-    from ..tunnel_plugins import select_host_config, parse_plugins_by_host
+    from ..tunnel_plugins import (
+        select_host_config,
+        parse_plugins_by_host,
+        sanitize_plugin_config_secrets,
+    )
     hostname = (request.query_params.get("hostname") or "").strip() or None
 
-    default_cfg = _parse_plugins_json(tenant.get("tunnel_plugins"))
-    by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+    default_cfg_raw = _parse_plugins_json(tenant.get("tunnel_plugins"))
+    default_cfg = sanitize_plugin_config_secrets(default_cfg_raw)
+    default_secret_changed = default_cfg != default_cfg_raw
+    by_host_raw = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+    by_host = sanitize_plugin_config_secrets(by_host_raw)
+    by_host_secret_changed = by_host != by_host_raw
 
     # 4b26c2ef — self-heal a stale `word: {enabled: true}` override left over
     # from before the word slot was retired. Covers BOTH the tenant's default
@@ -2258,16 +2295,17 @@ async def get_tunnel_plugins(request: Request) -> Response:
         if host_changed:
             by_host[host_key] = migrated_host
             by_host_changed = True
-    if default_changed or by_host_changed:
+    secret_scrub_failed = False
+    if default_changed or default_secret_changed or by_host_changed or by_host_secret_changed:
         _update_fields: dict[str, Any] = {}
-        if default_changed:
+        if default_changed or default_secret_changed:
             _update_fields["tunnel_plugins"] = json.dumps(default_cfg) if default_cfg else None
-        if by_host_changed:
+        if by_host_changed or by_host_secret_changed:
             _update_fields["tunnel_plugins_by_host"] = json.dumps(by_host) if by_host else None
         try:
             await db_module.update_tenant(request.app.state.db, tenant["id"], **_update_fields)
         except Exception:  # noqa: BLE001 — self-heal is best-effort, never blocks the GET
-            pass
+            secret_scrub_failed = default_secret_changed or by_host_secret_changed
 
     parsed = select_host_config(default_cfg, by_host, hostname)
     tid = tenant.get("id")
@@ -2306,6 +2344,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "zotero": tid in _tunnel_zotero_sockets,
             "outputs": tid in _tunnel_outputs_sockets,
             "debug": tid in _tunnel_debug_sockets,
+            "latex": tid in _tunnel_latex_sockets,
             **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
@@ -2328,6 +2367,8 @@ async def get_tunnel_plugins(request: Request) -> Response:
         # /tunnel/status/{tenant_id} attaches. See pinned decision ee7bccc9
         # for why this is workspace-scoped only (no project/session layers).
         "profile_binding": await _build_tunnel_profile_binding(request.app.state.db),
+        **({"credential_scrub_warning": "Legacy Zotero credentials could not be removed from stored plugin settings."}
+           if secret_scrub_failed else {}),
     })
 
 
@@ -3786,7 +3827,7 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug") + _CUSTOM_SLOTS
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug", "latex") + _CUSTOM_SLOTS
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -3805,6 +3846,7 @@ SLOT_DISPLAY_NAMES = {
     "outputs": "meridian-outputs",
     # 121e6a27 — debug slot: tools namespaced as "mcp-debugger__set_breakpoint" etc.
     "debug": "mcp-debugger",
+    "latex": "meridian-latex",
     "p0": "custom-p0",
     "p1": "custom-p1",
     "p2": "custom-p2",
@@ -4010,6 +4052,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_outputs_sockets, _pending_outputs_reqs
     if label == "debug":
         return _tunnel_debug_sockets, _pending_debug_reqs
+    if label == "latex":
+        return _tunnel_latex_sockets, _pending_latex_reqs
     if label in _tunnel_custom_sockets:  # 8fb69d54 — custom slots p0-p3
         return _tunnel_custom_sockets[label], _pending_custom_reqs[label]
     return _tunnel_extract_sockets, _pending_extract_reqs
@@ -4028,6 +4072,7 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_zotero_sockets
         or tenant_id in _tunnel_outputs_sockets
         or tenant_id in _tunnel_debug_sockets
+        or tenant_id in _tunnel_latex_sockets
         or any(tenant_id in s for s in _tunnel_custom_sockets.values())
     )
 
@@ -4214,6 +4259,7 @@ def active_tunnel_tenant_ids() -> "set[str]":
     ids.update(_tunnel_zotero_sockets)
     ids.update(_tunnel_outputs_sockets)
     ids.update(_tunnel_debug_sockets)
+    ids.update(_tunnel_latex_sockets)
     for s in _tunnel_custom_sockets.values():
         ids.update(s)
     return ids

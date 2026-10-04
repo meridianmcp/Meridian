@@ -106,6 +106,9 @@ class _FakeConn:
         self.log: list[tuple] = []
         self._status = pq.TransactionStatus.IDLE
         self.closed = False
+        self.fail_once_on: str | None = None
+        self.pause_once_on: str | None = None
+        self.execution_paused = asyncio.Event()
 
     @property
     def info(self):
@@ -123,6 +126,17 @@ class _FakeConn:
 
         self.log.append(("conn.execute", sql, params))
         upper = sql.strip().upper()
+        if self.fail_once_on and (
+            self.fail_once_on == upper or upper.startswith(self.fail_once_on + " ")
+        ):
+            self.fail_once_on = None
+            raise OSError(f"simulated failure: {upper}")
+        if self.pause_once_on and (
+            self.pause_once_on == upper or upper.startswith(self.pause_once_on + " ")
+        ):
+            self.pause_once_on = None
+            self.execution_paused.set()
+            await asyncio.Event().wait()
         if upper == "BEGIN":
             self._status = pq.TransactionStatus.INTRANS
         elif upper in ("COMMIT", "ROLLBACK"):
@@ -139,22 +153,35 @@ class _FakePool:
     (like tests/conftest.py's _SingleConnPool) unless told to simulate a
     real multi-connection pool via `distinct_connections=True`."""
 
-    def __init__(self, table_info_rows=None, distinct_connections: bool = False) -> None:
+    def __init__(
+        self,
+        table_info_rows=None,
+        distinct_connections: bool = False,
+        fail_once_on: str | None = None,
+        pause_once_on: str | None = None,
+    ) -> None:
         self._shared_conn = _FakeConn()
         self._shared_conn.table_info_rows = table_info_rows or []  # type: ignore[attr-defined]
+        self._shared_conn.fail_once_on = fail_once_on
+        self._shared_conn.pause_once_on = pause_once_on
         self.distinct_connections = distinct_connections
+        self.fail_once_on = fail_once_on
+        self.pause_once_on = pause_once_on
         self.issued: list[_FakeConn] = []
+        self.returned: list[_FakeConn] = []
 
     async def getconn(self) -> _FakeConn:
         if self.distinct_connections:
             conn = _FakeConn()
             conn.table_info_rows = self._shared_conn.table_info_rows  # type: ignore[attr-defined]
+            conn.fail_once_on = self.fail_once_on
+            conn.pause_once_on = self.pause_once_on
             self.issued.append(conn)
             return conn
         return self._shared_conn
 
     async def putconn(self, conn) -> None:
-        pass
+        self.returned.append(conn)
 
     def connection(self):
         return self
@@ -234,6 +261,208 @@ async def test_begin_transaction_adds_begin_commit_bookend_when_idle():
     assert verbs[1].startswith("SAVEPOINT")
     assert verbs[-2].startswith("RELEASE SAVEPOINT")
     assert verbs[-1] == "COMMIT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_statement", ["BEGIN", "SAVEPOINT"])
+async def test_transaction_entry_failure_rolls_back_before_returning_connection(
+    failed_statement,
+):
+    pool = _FakePool(distinct_connections=True, fail_once_on=failed_statement)
+    db = PostgresConnection(pool)
+
+    with pytest.raises(OSError, match="simulated failure"):
+        async with db.begin_transaction():
+            pytest.fail("transaction entry should have failed")
+
+    conn = pool.issued[0]
+    import psycopg.pq as pq
+
+    assert conn.transaction_status == pq.TransactionStatus.IDLE
+    assert not conn.closed
+    assert pool.returned == [conn]
+    verbs = [
+        entry[1].strip().upper()
+        for entry in conn.log
+        if entry[0] == "conn.execute"
+    ]
+    assert "ROLLBACK" in verbs
+
+    # Failed entry must not leave a ContextVar behind or strand the pool lease.
+    await db.execute("INSERT INTO after_entry_failure (a) VALUES (?)", (1,))
+    assert pool.issued[-1] is not conn
+
+
+@pytest.mark.asyncio
+async def test_ambient_savepoint_entry_failure_discards_connection():
+    pool = _FakePool(fail_once_on="SAVEPOINT")
+    import psycopg.pq as pq
+
+    pool._shared_conn._status = pq.TransactionStatus.INTRANS
+    db = PostgresConnection(pool)
+
+    with pytest.raises(OSError, match="simulated failure"):
+        async with db.begin_transaction():
+            pytest.fail("savepoint creation should have failed")
+
+    assert pool._shared_conn.closed
+    assert pool.returned == [pool._shared_conn]
+    verbs = [
+        entry[1].strip().upper()
+        for entry in pool._shared_conn.log
+        if entry[0] == "conn.execute"
+    ]
+    assert "ROLLBACK" not in verbs
+
+
+@pytest.mark.asyncio
+async def test_cancelled_transaction_entry_rolls_back_before_returning_connection():
+    pool = _FakePool(distinct_connections=True, pause_once_on="SAVEPOINT")
+    db = PostgresConnection(pool)
+
+    async def enter_transaction():
+        async with db.begin_transaction():
+            pytest.fail("the body must not run before SAVEPOINT completes")
+
+    task = asyncio.create_task(enter_transaction())
+    while not pool.issued:
+        await asyncio.sleep(0)
+    conn = pool.issued[0]
+    await asyncio.wait_for(conn.execution_paused.wait(), timeout=5)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    import psycopg.pq as pq
+
+    assert conn.transaction_status == pq.TransactionStatus.IDLE
+    assert pool.returned == [conn]
+    assert not conn.closed
+    assert any(
+        entry[0] == "conn.execute" and entry[1].strip().upper() == "ROLLBACK"
+        for entry in conn.log
+    )
+
+
+async def test_adapter_execute_uses_connection_pinned_by_pending_transaction():
+    pool = _FakePool(distinct_connections=True)
+    db = PostgresConnection(pool)
+
+    async with db.begin_transaction():
+        await db.execute("INSERT INTO tx_calls (a) VALUES (?)", (1,))
+        await db.commit()
+
+    pinned_conn = pool.issued[0]
+    assert any(
+        entry[0] == "cursor.execute" and "INSERT INTO tx_calls" in entry[1]
+        for entry in pinned_conn.log
+    )
+    assert not any(
+        entry[0] == "cursor.execute" and "INSERT INTO tx_calls" in entry[1]
+        for entry in pool._shared_conn.log
+    )
+
+    await db.execute("INSERT INTO autocommit_calls (a) VALUES (?)", (2,))
+    autocommit_conn = pool.issued[-1]
+    assert autocommit_conn is not pinned_conn
+    assert any(
+        entry[0] == "cursor.execute" and "INSERT INTO autocommit_calls" in entry[1]
+        for entry in autocommit_conn.log
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_finalizer", ["COMMIT", "RELEASE SAVEPOINT"])
+async def test_failed_postgres_transaction_finalizer_rolls_back_before_returning_connection(
+    failed_finalizer,
+):
+    pool = _FakePool(distinct_connections=True)
+    db = PostgresConnection(pool)
+
+    with pytest.raises(OSError, match="simulated failure"):
+        async with db.begin_transaction():
+            conn = pool.issued[0]
+            pending = db._pending_txn_var.get()
+            assert pending is not None
+            conn.fail_once_on = (
+                f"{failed_finalizer} {pending._savepoint}".upper()
+                if failed_finalizer == "RELEASE SAVEPOINT"
+                else failed_finalizer
+            )
+            await db.execute("INSERT INTO tx_calls (a) VALUES (?)", (1,))
+            await db.commit()
+
+    conn = pool.issued[0]
+    import psycopg.pq as pq
+
+    assert conn.transaction_status == pq.TransactionStatus.IDLE
+    verbs = [
+        entry[1].strip().upper()
+        for entry in conn.log
+        if entry[0] == "conn.execute"
+    ]
+    assert "ROLLBACK" in verbs
+
+    # Finalization failure must also clear the task-scoped transaction handle.
+    await db.execute("INSERT INTO autocommit_calls (a) VALUES (?)", (2,))
+    assert pool.issued[-1] is not conn
+
+
+@pytest.mark.asyncio
+async def test_failed_ambient_savepoint_release_rolls_back_only_its_savepoint():
+    pool = _FakePool()
+    import psycopg.pq as pq
+
+    pool._shared_conn._status = pq.TransactionStatus.INTRANS
+    db = PostgresConnection(pool)
+
+    with pytest.raises(OSError, match="simulated failure"):
+        async with db.begin_transaction():
+            pending = db._pending_txn_var.get()
+            assert pending is not None
+            pool._shared_conn.fail_once_on = f"RELEASE SAVEPOINT {pending._savepoint.upper()}"
+            await db.execute("INSERT INTO tx_calls (a) VALUES (?)", (1,))
+            await db.commit()
+
+    verbs = [
+        entry[1].strip().upper()
+        for entry in pool._shared_conn.log
+        if entry[0] == "conn.execute"
+    ]
+    assert not any(verb == "ROLLBACK" for verb in verbs)
+    assert any(verb.startswith("ROLLBACK TO SAVEPOINT") for verb in verbs)
+    assert verbs[-1].startswith("RELEASE SAVEPOINT")
+    assert pool._shared_conn.transaction_status == pq.TransactionStatus.INTRANS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_operation", ["execute", "commit"])
+async def test_inherited_transaction_context_cannot_be_used_by_child_task(child_operation):
+    pool = _FakePool()
+    db = PostgresConnection(pool)
+
+    async with db.begin_transaction():
+        pending = db._pending_txn_var.get()
+        assert pending is not None
+
+        async def use_inherited_context():
+            if child_operation == "commit":
+                await db.commit()
+            else:
+                await db.execute("INSERT INTO child_calls (a) VALUES (?)", (1,))
+
+        with pytest.raises(RuntimeError, match="different task"):
+            await asyncio.create_task(use_inherited_context())
+
+        assert not pending._done
+        if child_operation == "execute":
+            assert not any(
+                entry[0] == "cursor.execute" and "child_calls" in entry[1]
+                for entry in pool._shared_conn.log
+            )
+        await db.execute("INSERT INTO parent_calls (a) VALUES (?)", (2,))
+        await db.commit()
 
 
 @pytest.mark.asyncio

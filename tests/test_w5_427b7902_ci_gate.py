@@ -11,8 +11,8 @@ EVIDENCE_REQUIRED refusal:
   * ``unknown`` (no repo configured, no check-runs yet, self-hosted / no-GitHub)
     and ``pending`` (CI still running — the normal push-then-complete race) are
     ALWAYS allowed through. The gate never blocks on absent/unknown CI.
-  * ``override_ci=true`` is the escape hatch (consistent with existing ``force=``
-    patterns): it completes anyway and records the failing CI on the item.
+  * ``override_ci=true`` with a reason requests human approval; after an approved
+    HITL is supplied, completion proceeds and records the failing CI on the item.
 
 The GitHub HTTP seam is never touched — ``github_ci.verify_commit_ci`` is
 monkeypatched, exactly as tests/test_github_ci.py does.
@@ -193,14 +193,21 @@ async def test_override_ci_completes_on_failure(db, monkeypatch):
     item = await db_module.add_sprint_item(db, p["id"], "v1", "ship widget")
     monkeypatch.setattr(github_ci, "verify_commit_ci", _fake_ci("failure", failed=1))
 
+    base = {"project_id": p["id"], "item_id": item["id"],
+            "notes": "done; committed abc1234 to main", "override_ci": True,
+            "override_reason": "CI failure is an unrelated flaky job"}
+    approval = await srv._dispatch_mcp_tool(
+        "complete_sprint_item", base, db, "/tmp")
+    assert approval["error"] == "HUMAN_APPROVAL_REQUIRED"
+    await db_module.answer_hitl_request(
+        db, approval["hitl_id"], "Yes, approve this override", answered_by="human-reviewer",
+    )
     res = await srv._dispatch_mcp_tool(
         "complete_sprint_item",
-        {"project_id": p["id"], "item_id": item["id"],
-         "notes": "done; committed abc1234 to main", "override_ci": True,
-         "override_reason": "CI failure is an unrelated flaky job"},
+        {**base, "completion_override_hitl_id": approval["hitl_id"]},
         db, "/tmp")
 
-    # Completed despite red CI — but the failing CI is recorded on the item.
+    # Completed after human approval despite red CI; the failing CI is recorded.
     assert res.get("error") is None
     assert res["status"] == "done"
     assert res["ci_verification"]["state"] == "failure"

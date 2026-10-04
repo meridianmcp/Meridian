@@ -3952,6 +3952,29 @@ def _office_slot_spawn_env(env: object) -> "dict[str, str]":
     return merged
 
 
+def _zotero_slot_spawn_env(env: object) -> "dict[str, str]":
+    """Spawn env for Zotero with credentials sourced only from the local OS vault."""
+    merged = _office_slot_spawn_env(env)
+    # The server-configured env and the parent process may both contain stale or
+    # legacy copies. Never let either cross into the Zotero child process.
+    for name in tuple(merged):
+        if name.casefold() in {"zotero_api_key", "zotero_library_id", "zotero_library_type"}:
+            merged.pop(name, None)
+    from .tunnel_config import (  # noqa: PLC0415 — local-only, lazy
+        get_zotero_api_key,
+        get_zotero_library_id,
+    )
+
+    local_key = get_zotero_api_key()
+    if local_key:
+        merged["ZOTERO_API_KEY"] = local_key
+    local_library_id = get_zotero_library_id()
+    if local_library_id:
+        merged["ZOTERO_LIBRARY_ID"] = local_library_id
+        merged["ZOTERO_LIBRARY_TYPE"] = "user"
+    return merged
+
+
 def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
     """Stop a spawned proxy *and its whole child tree*. Best-effort; never raises.
 
@@ -6280,6 +6303,27 @@ async def _fetch_filesystem_roots(
     """
     import httpx
 
+    def canonical_root(value: str) -> str:
+        normalized = _normalize_path_arg(value)
+        if not normalized:
+            return ""
+        try:
+            return os.path.normcase(os.path.realpath(os.path.abspath(normalized)))
+        except (OSError, ValueError):
+            return normalized
+
+    def canonical_roots(values: Any) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values if isinstance(values, (list, tuple)) else []:
+            if not isinstance(value, str):
+                continue
+            path = canonical_root(value)
+            if path and path not in seen:
+                result.append(path)
+                seen.add(path)
+        return result
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(
@@ -6293,10 +6337,10 @@ async def _fetch_filesystem_roots(
                 serena_repo = data.get("serena_repo_path") or ""
                 code_dirs = data.get("codebase_code_dirs") or []
                 return (
-                    [_normalize_path_arg(x) for x in roots if isinstance(x, str) and _normalize_path_arg(x)],
-                    [_normalize_path_arg(x) for x in known if isinstance(x, str) and _normalize_path_arg(x)],
-                    _normalize_path_arg(serena_repo) if isinstance(serena_repo, str) else "",
-                    [_normalize_path_arg(x) for x in code_dirs if isinstance(x, str) and _normalize_path_arg(x)],
+                    canonical_roots(roots),
+                    canonical_roots(known),
+                    canonical_root(serena_repo) if isinstance(serena_repo, str) else "",
+                    canonical_roots(code_dirs),
                 )
     except Exception:  # noqa: BLE001 — network/parse error → defaults
         pass
@@ -7693,7 +7737,7 @@ async def run_tunnel(
     from .tunnel_plugins import (
         resolve_plugins, resolve_custom_plugins, detect_office_binaries,
         expand_command, SERENA_EXTRACT_COMMAND,
-        DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT,
+        DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT, DEFAULT_LATEX_PORT,
     )
     # Auto-enable Office slots whose launcher is installed on this machine, unless
     # the user explicitly configured them. Resolve locally from the raw config
@@ -7720,6 +7764,7 @@ async def run_tunnel(
     # reconnect loop for them — enabling either from the dashboard had zero effect.
     outputs_plugin = by_slot.get("outputs") or {}
     debug_plugin = by_slot.get("debug") or {}
+    latex_plugin = by_slot.get("latex") or {}
     # Per-slot effective ports (override > the run_tunnel arg default).
     fs_port = int(fs_plugin.get("port") or port)
     code_port = int(code_plugin.get("port") or code_port)
@@ -7738,6 +7783,7 @@ async def run_tunnel(
     # same function, so there's no circular-import concern to work around here.
     outputs_port = int(outputs_plugin.get("port") or DEFAULT_OUTPUTS_PORT)
     debug_port = int(debug_plugin.get("port") or DEFAULT_DEBUG_PORT)
+    latex_port = int(latex_plugin.get("port") or DEFAULT_LATEX_PORT)
 
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
@@ -7864,7 +7910,8 @@ async def run_tunnel(
                     "docs": docs_port, "zotero": zotero_port,
                     # 12afe021 — outputs/debug now share the office-family lazy-spawn
                     # + reconnect-loop wiring below instead of being silently dropped.
-                    "outputs": outputs_port, "debug": debug_port}
+                    "outputs": outputs_port, "debug": debug_port,
+                    "latex": latex_port}
     # 4ea1b9d5 — slots whose session_mode is "persistent" (e.g. Desktop
     # Commander): they keep a stateful inner process, so they skip the
     # idle-killer that would otherwise tear the session down after 30min.
@@ -8071,7 +8118,8 @@ async def run_tunnel(
                                 ("docs", docs_plugin, "meridian-docs"),
                                 ("zotero", zotero_plugin, "zotero-mcp"),
                                 ("outputs", outputs_plugin, "meridian-outputs"),
-                                ("debug", debug_plugin, "mcp-debugger")):
+                                ("debug", debug_plugin, "mcp-debugger"),
+                                ("latex", latex_plugin, "meridian-latex")):
         if not plugin.get("enabled", False):
             continue
         cmd = _office_slot_command(slot, plugin)
@@ -8090,7 +8138,11 @@ async def run_tunnel(
         # 2b04a361 — Office slots spawn third-party Python MCP servers (docx-mcp,
         # powerpoint-mcp) that log non-ASCII; force UTF-8 stdio in the child env
         # so their own loggers can't crash on Windows' cp1252 console encoding.
-        spawn_env = _office_slot_spawn_env(plugin.get("env"))
+        spawn_env = (
+            _zotero_slot_spawn_env(plugin.get("env"))
+            if slot == "zotero"
+            else _office_slot_spawn_env(plugin.get("env"))
+        )
         # 4ea1b9d5 — persistent slots omit --stateless so their inner process
         # keeps state across requests (DC terminal sessions).
         _persistent = plugin.get("session_mode") == "persistent"
@@ -8278,7 +8330,7 @@ async def run_tunnel(
     slot_prefixes = {
         s: (by_slot.get(s) or {}).get("prefix")
         for s in ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero",
-                   "outputs", "debug")
+                   "outputs", "debug", "latex")
     }
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)

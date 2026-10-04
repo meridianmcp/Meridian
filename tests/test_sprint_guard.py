@@ -67,7 +67,13 @@ def test_write_sprint_guard_hooks_bakes_project_id(tmp_path):
         assert "pending_count" in text                # hits the endpoint
         assert "__PROJECT_ID__" not in text           # placeholders replaced
         assert "__URL__" not in text
+        assert "MERIDIAN_TOKEN" in text
+        assert "BEARER_TOKEN" in text
+    assert "Authorization: Bearer" in sh
+    assert 'authHeaders["Authorization"]' in ps1
     assert "exit 2" in sh                             # blocks the stop when pending>0
+    assert "--config -" in sh                         # token is not a curl argument
+    assert '-Headers $authHeaders' in ps1              # PowerShell uses in-memory headers
 
 
 def test_write_sprint_guard_hooks_skipped_under_pytest_without_root():

@@ -18,6 +18,7 @@ import pytest
 from meridian import capability_contract as cc
 from meridian import db as db_module
 from meridian import executor_contract as ec
+from meridian import gate_override
 from meridian import handoff as handoff_module
 import meridian.server  # noqa: F401 — load the server before handler to avoid its import cycle
 from meridian.mcp import handler as mcp_handler
@@ -2369,16 +2370,24 @@ async def test_goal_compliance_cross_session_completion_reattributes(db):
 
     8693b6a8 — this is the coordinator/hand-off pattern the claim-ownership
     gate's force_foreign_claim escape hatch exists for: B completing A's live,
-    non-stale claim on purpose. Pass force_foreign_claim=True to acknowledge
-    that explicitly, same as a real coordinator session would."""
+    non-stale claim on purpose. The override requires a human-approved HITL,
+    which this test answers before completing the hand-off."""
     p = await db_module.create_project(db, "gc-xsession")
     a = (await db_module.register_session(db, p["id"], "claimer"))["id"]
     b = (await db_module.register_session(db, p["id"], "completer"))["id"]
     it = await db_module.add_sprint_item(db, p["id"], "v1", "handed-off item")
     await db_module.claim_sprint_item(db, p["id"], it["id"], actor=a)
+    reason = "coordinator hand-off: completer finalises the claimer's item"
+    approval = await gate_override.request_gate_override_hitl(
+        db, p["id"], gate=gate_override.FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE,
+        subject_id=it["id"], reason=reason, description="coordinator hand-off",
+    )
+    await db_module.answer_hitl_request(
+        db, approval["id"], "Yes, approve this override", answered_by="human-reviewer",
+    )
     await db_module.complete_sprint_item(
         db, p["id"], it["id"], actor=b, force_foreign_claim=True,
-        override_reason="coordinator hand-off: completer finalises the claimer's item",
+        override_reason=reason, foreign_claim_override_hitl_id=approval["id"],
     )
     ma = await db_module.compute_session_goal_compliance(db, p["id"], a)
     mb = await db_module.compute_session_goal_compliance(db, p["id"], b)

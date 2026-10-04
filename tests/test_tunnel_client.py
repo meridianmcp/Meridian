@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from meridian import tunnel_client as tc
+from meridian import tunnel_config
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,27 @@ def test_resolve_token_empty_when_unset(monkeypatch):
     monkeypatch.delenv("MERIDIAN_API_KEY", raising=False)
     monkeypatch.delenv("BEARER_TOKEN", raising=False)
     assert tc._resolve_token() == ""
+
+
+def test_zotero_slot_spawn_env_scrubs_inherited_secrets_and_uses_local_vault(monkeypatch):
+    monkeypatch.setattr(tc, "_office_slot_spawn_env", lambda env: dict(env))
+    monkeypatch.setattr(tunnel_config, "get_zotero_api_key", lambda: "vault-key")
+    monkeypatch.setattr(tunnel_config, "get_zotero_library_id", lambda: "123456")
+
+    env = tc._zotero_slot_spawn_env(
+        {
+            "PATH": "keep-me",
+            "ZOTERO_API_KEY": "stale-server-key",
+            "zotero_library_id": "stale-server-user",
+            "ZOTERO_LIBRARY_TYPE": "group",
+        }
+    )
+
+    assert env["PATH"] == "keep-me"
+    assert env["ZOTERO_API_KEY"] == "vault-key"
+    assert env["ZOTERO_LIBRARY_ID"] == "123456"
+    assert env["ZOTERO_LIBRARY_TYPE"] == "user"
+    assert "zotero_library_id" not in env
 
 
 # ---------------------------------------------------------------------------
@@ -6811,6 +6833,34 @@ def test_reconnect_loop_backs_off_on_repeated_never_ready_not_busy_loop(monkeypa
     # normally" behavior produced.
     assert len(sleeps) == 3
     assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_zotero_slot_spawn_env_uses_only_local_keyring_value(monkeypatch):
+    from meridian import tunnel_client as tc
+    from meridian import tunnel_config
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "parent-test-secret")
+    monkeypatch.setattr(tunnel_config, "get_zotero_api_key", lambda: "vault-test-secret")
+    env = tc._zotero_slot_spawn_env({
+        "ZOTERO_API_KEY": "hosted-test-secret",
+        "zotero_api_key": "lowercase-hosted-test-secret",
+        "ZOTERO_LOCAL": "true",
+    })
+
+    assert env["ZOTERO_API_KEY"] == "vault-test-secret"
+    assert "zotero_api_key" not in env
+    assert env["ZOTERO_LOCAL"] == "true"
+
+
+def test_zotero_slot_spawn_env_drops_stale_key_when_vault_is_empty(monkeypatch):
+    from meridian import tunnel_client as tc
+    from meridian import tunnel_config
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "parent-test-secret")
+    monkeypatch.setattr(tunnel_config, "get_zotero_api_key", lambda: None)
+    env = tc._zotero_slot_spawn_env({"ZOTERO_API_KEY": "hosted-test-secret"})
+
+    assert not any(name.casefold() == "zotero_api_key" for name in env)
 
 
 def test_reconnect_loop_lazy_backs_off_on_repeated_never_ready_not_busy_loop(monkeypatch):

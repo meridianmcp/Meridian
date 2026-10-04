@@ -278,8 +278,10 @@ _ARTIFACT_POLICY_SCHEMA: dict[str, Any] = {
         "'off', never a silent 'strict'; an item that declares no policy is never "
         "blocked. ENFORCEMENT (275a8631): complete_sprint_item refuses (error "
         "ARTIFACT_POINTER_REQUIRED) a figure/table item under 'strict' or a "
-        "require_exact_* flag that has no EXACT output pointer — a planned_output "
-        "target, a sprint_item_pointer, or a file: touches_resources entry whose uri "
+        "require_exact_* flag that has no MATERIALIZED exact output pointer — a "
+        "planned_output or sprint_item_pointer target counts only when target_kind "
+        "is not 'planned_new' (planned_new stays useful during planning but never "
+        "satisfies completion), or a file: touches_resources entry whose uri "
         "is a concrete figure file (.png/.jpg/.jpeg/.gif/.svg/.webp/.tif/.tiff/.eps/"
         ".bmp) or table file (.csv/.tsv/.xlsx/.xls); a bare .docx, a directory or a "
         "generic mcp_tool:/db:/route: reference does not count. Whether an item is "
@@ -293,9 +295,9 @@ _ARTIFACT_POLICY_SCHEMA: dict[str, Any] = {
     ),
     "properties": {
         "artifact_pointer_check": {"type": "string", "enum": ["off", "warn", "strict"],
-            "description": "off = no enforcement of any kind (also switches off the require_exact_* flags); warn = surface the finding in handoffs but never block (default); strict = the handoff marks the item non-executable AND complete_sprint_item refuses it (ARTIFACT_POINTER_REQUIRED) while it is figure/table work with no exact output pointer. Items that are not figure/table work (document_only, caption/equation/code-only, no signal) are unaffected."},
-        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a figure-kind item that has no exact figure-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). Default false."},
-        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a table-kind item that has no exact table-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). Default false."},
+            "description": "off = no enforcement of any kind (also switches off the require_exact_* flags); warn = surface the finding in handoffs but never block (default); strict = the handoff marks the item non-executable AND complete_sprint_item refuses it (ARTIFACT_POINTER_REQUIRED) while it is figure/table work with no exact, materialized output pointer. target_kind='planned_new' stays useful for planning but never satisfies completion. Items that are not figure/table work (document_only, caption/equation/code-only, no signal) are unaffected."},
+        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a figure-kind item that has no exact, materialized figure-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). target_kind='planned_new' is planning-only. Default false."},
+        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, complete_sprint_item refuses (ARTIFACT_POINTER_REQUIRED) a table-kind item that has no exact, materialized table-file output pointer, independent of artifact_pointer_check (except 'off', which disables it). target_kind='planned_new' is planning-only. Default false."},
         "allow_document_only_override": {"type": "boolean", "description": "Reserved — currently NOT consulted by any enforcement path (a figure/table item can never self-declare its way out of the pointer check, and a document_only-kind item is never pointer-checked in the first place). Stored and echoed only. Default false."},
     },
 }
@@ -982,8 +984,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."}},
+         "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."},
+         "milestone_trigger": {"type": "string", "enum": ["manual_requested", "goal_scope_changed", "decision_committed", "sprint_item_completed", "provider_session_unavailable", "artifact_captured", "recovery_verified", "release_preparation"], "description": "Optional material transition that appends a deep, immutable project-state milestone. Omit for a routine checkpoint."},
+         "risk_signals": {"type": "array", "items": {"type": "string", "enum": ["provider_unavailable", "dirty_worktree", "artifact_integrity_uncertain", "artifact_hash_mismatch", "stale_source", "missing_source", "cross_project_ambiguity", "unexpected_active_claims", "large_uncommitted_change"]}, "description": "Optional bounded risk signals; a deep milestone is appended when their score reaches the adaptive threshold."},
+         "artifact_manifest": {"type": "object", "properties": {"status": {"type": "string", "enum": ["available", "not_configured", "degraded", "unavailable"]}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "occurrence_count": {"type": "integer", "minimum": 0}}, "additionalProperties": False, "description": "Optional local-client receipt for the artifact manifest; the hosted server records it as client-reported and does not claim to verify workstation-local bytes."}},
          "required": ["session_id"]}},
+    {"name": "get_project_state_milestones", "description":
+        "Read project-scoped, append-only recovery milestones and their content-hash status. "
+        "Milestones contain compact state and pointers only; provider transcripts and artifact bytes stay in their local stores. "
+        "Pass before_sequence for older records. A pointer is resolved only in the owning project and only when its stored hash verifies.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+         "before_sequence": {"type": "integer", "minimum": 1}},
+         "required": []}},
     {"name": "register_external_job", "description":
         "Create or reaffirm a project-scoped record for long-running external work "
         "such as RunPod, SSH, Slurm, or CI. Meridian records the opaque external "
@@ -1106,8 +1121,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "transport": {"type": "string", "enum": ["stdio", "remote_control", "cloud_environment", "tunnel", "unknown"]},
          "client_type": {"type": "string", "description": "e.g. claude-code, claude-desktop, cursor, other."},
          "lifecycle_status": {"type": "string", "enum": ["active", "idle", "ended", "crashed", "unknown"]},
-         "local_identity": {"type": "object", "description": "HOST-LOCAL ONLY, never persisted hosted-side: local_session_id, bridge_id, environment_id, argv, local_transcript_path. Used only to compute a resume recipe and to refresh the host-local snapshot."},
-         "local_ref_id": {"type": "string", "description": "Optional stable opaque token correlating this hosted row to the host-local snapshot entry; generated if omitted."},
+         "local_identity": {"type": "object", "description": "Self-hosted only. A hosted call rejects this field; a caller-local PreToolUse hook must persist it on this workstation and remove it before the hosted request."},
+         "local_ref_id": {"type": "string", "description": "Optional opaque client-local reference. Hosted callers should let the local recovery hook generate it."},
+         "verified_resumable": {"type": "boolean", "description": "Non-identifying caller-local status hint. Hosted Meridian stores the boolean only; it cannot verify the provider identity behind it."},
          "last_checkpoint_ref": {"type": "string", "description": "An id/label for the last checkpoint — never content."},
          "last_handoff_ref": {"type": "string", "description": "An id/label for the last handoff — never content."},
          "sprint_version": {"type": "string"},
@@ -1326,6 +1342,38 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally."},
          "max_items": {"type": "integer", "description": "Cap how many unresolved markers to attempt this pass. Omit to attempt all."}},
          "required": []}},
+    {"name": "get_pending_zotero_citations", "description":
+        "Read a bounded, deterministic page of this project's citation markers "
+        "that do not yet have a Zotero edge. Intended for a workstation with "
+        "Zotero Desktop running locally; hosted Meridian does not contact the "
+        "workstation's Zotero API.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "max_items": {"type": "integer", "minimum": 1, "maximum": 500}},
+         "required": []}},
+    {"name": "apply_zotero_citation_edges", "description":
+        "Apply workstation-resolved Zotero items to existing citation markers. "
+        "The hosted handler revalidates every marker id/ref within project_id "
+        "before writing through DocStore. This accepts no attachment bytes, "
+        "local paths, or credentials; attachment provenance stays local.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "selected_collection_keys": {"type": "array", "maxItems": 100,
+             "items": {"type": "string"}},
+         "resolutions": {"type": "array", "maxItems": 500, "items": {
+             "type": "object", "additionalProperties": False,
+             "properties": {
+                 "element_id": {"type": "string"},
+                 "ref": {"type": "string"},
+                 "zotero_key": {"type": "string"},
+                 "doi": {"type": ["string", "null"]},
+                 "title": {"type": ["string", "null"]},
+                 "version": {"type": ["integer", "null"]},
+                 "collection_keys": {"type": "array", "items": {"type": "string"}}},
+             "required": ["element_id", "ref", "zotero_key"]}}},
+         "required": ["resolutions"]}},
     {"name": "index_equation", "description":
         "06df6ab3 — index ONE Word equation (OMML) against a document already "
         "stored in the doc-structure store — populated by ingest_document (which "
@@ -2049,6 +2097,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "build/output artifact's manifest URI plus an optional fingerprint and a link to "
         "the producing run/sprint-item/provenance record. Resolving it (local files only "
         "by default) hashes the manifest file to report its current fingerprint.\n"
+        "• provider_conversation — {\"type\":\"provider_conversation\", "
+        "\"provider\":\"claude.ai\"|\"codex\"|\"chatgpt\", "
+        "\"conversation_id\":str, \"transcript_hash\"?:sha256} — a provider-native "
+        "conversation id; an optional range subSelector requires transcript_hash.\n"
+        "• provider_artifact — {\"type\":\"provider_artifact\", "
+        "\"provider\":\"claude.ai\"|\"codex\"|\"chatgpt\", "
+        "\"conversation_id\":str, \"artifact_id\":str, \"content_hash\"?:sha256} — "
+        "a provider artifact id; an optional range subSelector requires content_hash. "
+        "These are identity-only references: no transcript or artifact bytes are uploaded "
+        "or fetched by resolving them.\n"
         "An optional selector.subSelector nests finer granularity (W3C hasSubSelector) — "
         "e.g. {\"type\":\"symbol\", \"qualified_name\":\"a.b.f\", \"subSelector\": "
         "{\"type\":\"range\", \"start_line\":3, \"end_line\":4}} = 'these lines, within "
@@ -2103,7 +2161,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
              "(>=1 required), path?}; remote_fs {\"type\":\"remote_fs\", host_id, "
              "filesystem_slot, path, lease_id?, session_id?, snapshot_id?}; artifact "
              "{\"type\":\"artifact\", manifest_uri, fingerprint?, run_id?, item_id?, "
-             "provenance_id?} (62640241 for the last five). An optional subSelector is "
+             "provenance_id?} (62640241); provider_conversation {provider, conversation_id, "
+             "transcript_hash?}; provider_artifact {provider, conversation_id, artifact_id, "
+             "content_hash?}. Provider references accept only IDs, hashes, and range "
+             "subSelectors; resolution is identity-only and never fetches or stores chat "
+             "content. An optional subSelector is "
              "itself a full selector and MUST carry its own \"type\". target_kind is "
              "\"existing\" (default; explicit \"existing\" is verified against the real "
              "filesystem) or \"planned_new\" (a file not created yet — exempt from that "
@@ -3003,8 +3065,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "group, deferred_until (enforced deferral), track, or depends_on (dependency ordering). "
         "Only the fields you pass are changed; omitted fields are left untouched. Pass an empty "
         "string for human_id, group, deferred_until, track, or depends_on to clear it. Returns "
-        "the updated item, or an error if the id is unknown. For TWO OR MORE independent item "
-        "patches, prefer the single execute_batch(operation='item_updates', entries=[...], "
+        "the updated item, or an error if the id is unknown. "
+        "Setting prospect_bypass=true is an override of the prospecting safety gate: it needs a"
+        " non-empty override_reason and a human-approved require_human HITL. The first call"
+        " returns HUMAN_APPROVAL_REQUIRED; after a human answers Yes, retry with override_hitl_id."
+        " For TWO OR MORE independent item patches, prefer the single execute_batch(operation='item_updates', entries=[...], "
         "mode='best_effort' or 'all_or_nothing', idempotency_key='...') call instead of "
         "repeating this tool: it validates and reports each item in input order, supports "
         "per-item correlation_key values, and makes retries idempotent. Use best_effort when "
@@ -3030,14 +3095,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "wave": {"type": "string",
                   "description": "58a45b92 — set/clear the stored wave label (e.g. 'wave-1') for enforced parallel-batch grouping. Hand-override of what assign_sprint_waves computes. Pass an empty string to CLEAR (unassigned); omit to leave unchanged."},
          "prospect_bypass": {"type": "boolean",
-                             "description": "94c26322 — HUMAN/PLANNING SESSIONS ONLY. Set true to explicitly allow this item through the prospecting safety gate even without code_pointers or confirmed prospect_status. This is the ONLY way to include an unprospected item in a /goal's auto-run claimable batch. 0ff5e59f — setting it true is an AUDITED override: it requires a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise) and writes an action_audit_log row. Set false to re-enable the structural gate (no reason needed). Omit to leave unchanged. Executor sessions must NOT set this field."},
-         "override_reason": {"type": "string", "description": "0ff5e59f — REQUIRED with prospect_bypass=true: why this item may be claimed without prospecting evidence. Recorded to action_audit_log (who/when/why)."},
+                             "description": "94c26322 — Set true to explicitly allow this item through the prospecting safety gate without code_pointers or confirmed prospect_status. This is the only way to include an unprospected item in a /goal's auto-run claimable batch. 0ff5e59f — this override requires a non-empty override_reason AND human approval via a require_human HITL; after approval, retry with override_hitl_id. Set false to re-enable the structural gate. Omit to leave unchanged."},
+         "override_reason": {"type": "string", "description": "0ff5e59f — required with prospect_bypass=true: why this item may be claimed without prospecting evidence. Recorded to action_audit_log."},
+         "override_hitl_id": {"type": "string", "description": "0ff5e59f — id of the answered Yes gate_override HITL approving this item's prospect_bypass change. Single-use and bound to this item."},
          "depends_on": {"type": "string",
                         "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
          "require_verification": {"type": "boolean",
                              "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."},
          "require_strict_evidence": {"type": "boolean",
-                             "description": "5fe3502e — set true to require STRICT (fail-closed) completion-evidence verification: complete_sprint_item then refuses (STRICT_EVIDENCE_BLOCKED) unless declared evidence is present, resolves to something real on disk/in the DB, isn't stale (predates the current claim), matches the completing session's own worktree, and no file was edited without a claim_file/claim_symbol lock — unless the caller explicitly passes override_strict_evidence=true with a non-empty override_reason (audited). Set false to re-enable ordinary advisory-only evidence checks. Omit to leave unchanged. Equivalent to passing strict_evidence=true on a single complete_sprint_item call, but persists across attempts."},
+                             "description": "5fe3502e — set true to require STRICT (fail-closed) completion-evidence verification: complete_sprint_item then refuses (STRICT_EVIDENCE_BLOCKED) unless declared evidence is present, resolves to something real on disk/in the DB, isn't stale (predates the current claim), matches the completing session's own worktree, and no file was edited without a claim_file/claim_symbol lock — unless the caller passes override_strict_evidence=true, a non-empty override_reason, and human approval for the exact failing-gate bundle. Set false to re-enable ordinary advisory-only evidence checks. Omit to leave unchanged. Equivalent to passing strict_evidence=true on a single complete_sprint_item call, but persists across attempts."},
          "required_tool": {"type": "string",
                   "description": "4d1fb28f — pin (or re-pin) the specific MCP tool/plugin the executor MUST use for this item, rendered as a hard directive in the /goal block — not left to executor habit. Pass an empty string to CLEAR the pin (ordinary executor discretion); omit to leave unchanged."},
          "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA,
@@ -3069,13 +3135,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "claim is stale (claimed 2h+ ago, or the claiming session is dead/closed) — the "
         "exact stale-cleanup pattern of closing items left behind by a dead session keeps "
         "working automatically. For a live, non-stale foreign claim, pass "
-        "force_foreign_claim=true to explicitly acknowledge and complete anyway. "
+        "force_foreign_claim=true to explicitly acknowledge and complete anyway; this is an"
+        " override and needs a human-approved require_human HITL. "
         "5fe3502e — pass strict_evidence=true (or flag the item require_strict_evidence=true "
         "via update_sprint_item) for STRICT, fail-closed evidence verification: completion is "
         "refused (STRICT_EVIDENCE_BLOCKED, with typed evidence_errors codes — EVIDENCE_ABSENT/"
         "EVIDENCE_INVALID/EVIDENCE_STALE/WRONG_WORKTREE/UNCLAIMED_EDIT) unless evidence is "
         "present, verifiable, fresh, from the right worktree, and every modified file was "
-        "claimed. Default (no strict_evidence, no require_strict_evidence) behavior is exactly "
+        "claimed. Overriding a strict-evidence or other failing completion gate requires a"
+        " human-approved require_human HITL bound to the complete set of failing gates; pass"
+        " completion_override_hitl_id after a human answers Yes. Default (no strict_evidence, no require_strict_evidence) behavior is exactly "
         "the pre-existing advisory-only evidence checks — nothing changes unless you opt in. "
         "a8c0f3b7 — CODE-INTEL PROSPECTING RECEIPT gate: opt in at the PROJECT level via "
         "set_capability_manifest(capabilities=[{id:'code_intel_prospecting', ...}]) — no "
@@ -3085,8 +3154,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "find_symbol/prospect_symbol call happened since the item was claimed (see "
         "meridian.code_intel_receipt) — or refused (CODE_INTEL_UNAVAILABLE) when the capability "
         "is availability_policy='required' and code-intel itself is unavailable. Pass "
-        "override_code_intel_receipt=true with a non-empty override_reason to acknowledge and "
-        "complete anyway (audited). 'optional'/'degraded_ok' policies never block — they degrade "
+        "override_code_intel_receipt=true with a non-empty override_reason and a human-approved"
+        " completion_override_hitl_id to acknowledge and complete anyway (audited)."
+        " 'optional'/'degraded_ok' policies never block — they degrade "
         "with a code_intel_receipt_warning on the returned item instead. "
         "275a8631 — ARTIFACT-POINTER gate (OPT-IN per item): if the item's policy "
         "(update_sprint_item policy=...) sets artifact_pointer_check='strict' or "
@@ -3103,19 +3173,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "item_id": {"type": "string"},
          "task_id": {"type": "string"},
          "notes": {"type": "string", "description": "Evidence for the completion (what shipped / how it was verified). Persisted on the item; satisfies the required_notes gate."},
-         "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id). Checked against the item's claim owner (8693b6a8) — a mismatch on a live, non-stale claim is refused unless force_foreign_claim=true."},
+         "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id). Checked against the item's claim owner (8693b6a8) — a mismatch on a live, non-stale claim is refused unless force_foreign_claim=true with its required reason and human-approved HITL."},
          "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."},
          "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must be a REAL session of this project (0ff5e59f: the id the verifier's own start_session returned) that differs from actor/session_id and from the claim holder, or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
          "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
          "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."},
-         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit, AUDITED override (0ff5e59f): it must be paired with a non-empty override_reason in the SAME call or the completion is refused (CLAIM_MISMATCH), and an action_audit_log row is written. Never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. This human-approved override requires override_reason; the first call returns HUMAN_APPROVAL_REQUIRED, and after a human answers Yes retry with foreign_claim_override_hitl_id. An action_audit_log row records the approval. Never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "foreign_claim_override_hitl_id": {"type": "string", "description": "0ff5e59f — id of the answered Yes require_human HITL for this item's live foreign claim override. Single-use and bound to this item."},
          "override_artifact_pointer": {"type": "boolean", "description": "275a8631 — request the HUMAN-approved override of an ARTIFACT_POINTER_REQUIRED rejection. Requires override_reason. The first call files a require_human gate-override HITL and returns HUMAN_APPROVAL_REQUIRED + hitl_id; after a human answers Yes, retry with override_hitl_id. Ignored when the gate does not block this item."},
          "override_hitl_id": {"type": "string", "description": "275a8631 — id of the answered (Yes) gate-override HITL a human approved for THIS item's artifact-pointer override. Single-use; bound to this item."},
-         "override_ci": {"type": "boolean", "description": "427b7902 — explicit override of a CI_FAILING rejection (GitHub Actions is genuinely failing for the commit named in the notes). 0ff5e59f — must be paired with a non-empty override_reason in the SAME call (OVERRIDE_REASON_REQUIRED otherwise); audited to action_audit_log."},
+         "completion_override_hitl_id": {"type": "string", "description": "0ff5e59f — id of the answered Yes require_human HITL for the exact set of failing completion gates overridden in this call (for example CI, strict evidence, code-intel, test-run receipt, or strict merge approval). Single-use; the gate bundle and reasons must match the original request."},
+         "override_ci": {"type": "boolean", "description": "427b7902 — explicit override of a CI_FAILING rejection (GitHub Actions is genuinely failing for the commit named in the notes). 0ff5e59f — requires a non-empty override_reason and the human-approved completion_override_hitl_id for the exact set of failing gates."},
          "strict_evidence": {"type": "boolean", "description": "5fe3502e — opt in to the STRICT, fail-closed evidence gate for THIS call only (see meridian.sprint_evidence_guard). Omit/false preserves the exact pre-existing advisory-only behavior. Equivalent, persistent alternative: update_sprint_item(require_strict_evidence=true)."},
-         "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit, audited override of a STRICT_EVIDENCE_BLOCKED rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Never inferred; omit/false for normal strict behavior."},
-         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside ANY override flag (override_strict_evidence, override_code_intel_receipt, override_test_run_receipt, override_ci, force_foreign_claim, override_artifact_pointer): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
-         "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit, audited override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Only relevant for a project that declared the 'code_intel_prospecting' capability."}},
+         "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit override of a STRICT_EVIDENCE_BLOCKED rejection. Requires a non-empty override_reason and a human-approved completion_override_hitl_id for the exact set of failing gates."},
+         "override_test_run_receipt": {"type": "boolean", "description": "e24f2daa — explicit override of a TEST_RUN_RECEIPT_BLOCKED rejection. Requires a non-empty override_reason and a human-approved completion_override_hitl_id for the exact set of failing gates."},
+         "override_merge_approval": {"type": "boolean", "description": "e7548587 — explicit override of the strict merge-approval gate. Requires override_merge_approval_reason and a human-approved completion_override_hitl_id for the exact set of failing gates."},
+         "override_merge_approval_reason": {"type": "string", "description": "Why strict merge approval is being overridden. Recorded to action_audit_log after human approval."},
+         "override_reason": {"type": "string", "description": "Required alongside override_ci, override_strict_evidence, override_code_intel_receipt, override_test_run_receipt, override_artifact_pointer, or force_foreign_claim: why the rejection or live claim is being overridden. Recorded to action_audit_log after human approval."},
+         "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Requires a non-empty override_reason and a human-approved completion_override_hitl_id. Only relevant for projects that declared the 'code_intel_prospecting' capability."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "
@@ -3585,6 +3660,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "published, url, pdf_url, ...}]} plus a per-source id — arxiv_id, openalex_id "
         "(+doi), s2_id (+doi, citation_count, tldr), pmid (+doi), doi (crossref: +venue, "
         "issn, publisher, type, citation_count), or core_id (+doi, venue, has_full_text). "
+        "When OpenAlex answers directly or the arXiv search falls back to OpenAlex, the "
+        "result also includes openalex_query_stage ('phrase_and', 'and', or 'loose') for "
+        "the last successful relevance-relaxation stage. "
         "An unknown source returns {error}.",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "Search terms (matches title / abstract / authors)."},
@@ -3624,16 +3702,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "zotero_search", "description":
         "Search a Zotero library — sibling to paper_search/social_search/github_search, "
         "but over YOUR OWN saved references rather than a public corpus. A public "
-        "GROUP library needs no credential; a private USER library needs a Zotero API "
-        "key (pass api_key, or set the ZOTERO_API_KEY env var server-side — Meridian "
-        "has no per-tenant bring-your-own-key storage yet, so this is config, not a "
-        "per-call secret). Returns {query, count, results:[{title, authors, summary, "
+        "GROUP library needs no credential; a private USER library must be searched "
+        "through the locally configured Zotero MCP connection so its API key stays "
+        "on the workstation. Returns {query, count, results:[{title, authors, summary, "
         "published, url, zotero_key, item_type, tags, ...}]}.",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "Search terms (matches title/creator/year by default, or full text — see qmode)."},
          "library_type": {"type": "string", "enum": ["user", "group"], "description": "'user' (default; a personal library) or 'group' (a shared, possibly-public library)."},
          "library_id": {"type": "string", "description": "The numeric Zotero userID or groupID to search. Required."},
-         "api_key": {"type": "string", "description": "Optional Zotero API key for a private library; falls back to the ZOTERO_API_KEY env var, then to no auth (fine for a public group library)."},
          "limit": {"type": "integer", "description": "Max results to return (default 10, max 50)."},
          "sort_by": {"type": "string", "enum": ["relevance", "date"], "description": "Sort order (default relevance = Zotero's own ordering; 'date' = most recently added first)."}},
          "required": ["query", "library_id"]}},
@@ -4683,6 +4759,7 @@ _READ_ONLY_TOOLS = {
     "get_external_job", "list_external_jobs",
     "list_remote_tasks",
     "list_resumable_sessions", "get_session_recovery",
+    "get_project_state_milestones",
     "get_research_run", "list_research_runs",
     "get_experiment", "list_experiments", "get_experiment_run", "list_experiment_runs",
     "get_experiment_events",
@@ -4703,6 +4780,7 @@ _READ_ONLY_TOOLS = {
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "list_active_worktrees", "list_worktrees_pending_cleanup",
     "get_citation_edges",
+    "get_pending_zotero_citations",
     "find_similar_equation", "find_symbol_usages",
     "find_similar_figure",
     "find_similar_table",
@@ -4801,6 +4879,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "register_session_recovery": "session",
     "list_resumable_sessions":   "session",
     "get_session_recovery":      "session",
+    "get_project_state_milestones": "session",
     "start_research_run":       "research",
     "complete_research_run":    "research",
     "get_research_run":         "research",
@@ -4952,6 +5031,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_latex_structure":    "docx",
     "get_citation_edges":     "docx",
     "resolve_citations":      "docx",
+    "get_pending_zotero_citations": "docx",
+    "apply_zotero_citation_edges": "docx",
     "index_equation":         "docx",
     "find_similar_equation":  "docx",
     "insert_equation":        "docx",
@@ -5123,6 +5204,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "register_session_recovery":  "both",
     "list_resumable_sessions":    "both",
     "get_session_recovery":       "both",
+    "get_project_state_milestones": "both",
     "start_research_run":         "both",
     "complete_research_run":      "both",
     "get_research_run":           "both",
@@ -5285,6 +5367,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_latex_structure":       "both",
     "get_citation_edges":        "both",
     "resolve_citations":         "both",
+    "get_pending_zotero_citations": "both",
+    "apply_zotero_citation_edges": "executor",
     "find_similar_equation":     "both",
     "find_symbol_usages":        "both",
     "find_similar_figure":       "both",
@@ -5561,6 +5645,8 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "find_orphaned_docx_staged_files": "maintenance-only",
     "get_citation_edges":         "maintenance-only",
     "resolve_citations":          "maintenance-only",
+    "get_pending_zotero_citations": "maintenance-only",
+    "apply_zotero_citation_edges": "maintenance-only",
     "link_flag_to_section":       "maintenance-only",
     "get_flag_drift":             "maintenance-only",
     # W1-K — derivative-document provenance: docx write-back family, same
@@ -5984,6 +6070,24 @@ def _select_active_tool_set(
         "keyword_signals": keyword_signals,
         "mode": "deterministic",
     }
+
+
+# The code index's wide-root override is deliberately opt-in. Keep the MCP
+# schema in sync with the local wrapper without duplicating its static tool list.
+for _tool in _MCP_TOOLS_LIST:
+    if _tool.get("name") == "search_code_semantic":
+        _tool["inputSchema"]["properties"]["allow_broad_root"] = {
+            "type": "boolean",
+            "description": (
+                "Default false: refuse broad non-project roots. Set true only "
+                "when you intentionally need a bounded scan outside a project "
+                "checkout. The response includes canonical root/scope and "
+                "partial-scan status."
+            ),
+        }
+        break
+else:
+    raise RuntimeError("search_code_semantic MCP schema is missing")
 
 
 # ---------------------------------------------------------------------------

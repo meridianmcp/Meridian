@@ -2079,9 +2079,14 @@ _ARXIV_SEARCH_PREFIXES = ("/list", "/a/", "/search", "/find", "/catchup", "/api/
 
 
 def _research_domain(host: str, path: str) -> bool:
-    """WebSearch ``allowed_domains`` entry that restricts a search to literature hosts."""
+    """WebSearch ``allowed_domains`` entry that restricts a search to literature or repo hosts."""
     host = host.lower()
-    if host == "github.com" or host.endswith(".github.com"):
+    if host in {"github.com", "www.github.com"}:
+        # WebSearch's allowed_domains entries are commonly bare hosts. A
+        # GitHub-only domain restriction is repo/code search intent even
+        # though the client does not expose the eventual /search path.
+        return path == "/" or path.startswith("/search")
+    if host.endswith(".github.com"):
         return path.startswith("/search")
     if "/blob/" in path or "/raw/" in path:
         return False
@@ -2151,7 +2156,9 @@ def research_shaped(tool: str, ti: dict[str, Any]) -> bool:
         q = str(ti.get("query") or "").lower()
         if "bibtex" in q:
             return False  # a citation lookup for one known paper
-        if "site:arxiv" in q or "prior art" in q or "papers on" in q or re.search(r"\bet al\b", q):
+        github_site = re.search(r"(?<![\w.-])site:(?:www\.)?github\.com(?:[^\w.-]|$)", q)
+        if ("site:arxiv" in q or github_site or "prior art" in q or "papers on" in q
+                or re.search(r"\bet al\b", q)):
             return True
         doms = ti.get("allowed_domains")
         if isinstance(doms, list):

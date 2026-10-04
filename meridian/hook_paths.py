@@ -76,7 +76,7 @@ PROJECT_DIR_TOKENS: tuple[str, ...] = (
 # Script path embedded in a hook "command" string, e.g.
 # '& "$CLAUDE_PROJECT_DIR\.claude\hooks\secret_guard.ps1"' or a bare
 # absolute global path like '"C:\Users\me\.claude\hooks\meridian-stop.ps1"'.
-_COMMAND_SCRIPT_RE = re.compile(r'"([^"]+\.(?:ps1|sh))"')
+_COMMAND_SCRIPT_RE = re.compile(r'"([^"]+\.(?:ps1|sh|py))"')
 
 # Diagnostic status values -- see resolve_configured_hook_command.
 STATUS_OK = "ok"

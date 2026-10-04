@@ -7,7 +7,7 @@ structural gap, not a deliberate design. Coverage:
   1. Same-actor completion (or no actor at all) is unaffected — no regression.
   2. A different actor completing a LIVE, non-stale claim is refused
      (SprintItemClaimMismatch); the item stays in_progress.
-  3. The refusal is bypassable with an explicit force_foreign_claim=True.
+  3. The refusal can be overridden only with an explicit, human-approved HITL.
   4. The established "close out a dead session's stale claim" pattern keeps
      working WITHOUT force, via two independent staleness signals:
        a. claimed_at is older than the 2h threshold, even if the claiming
@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from meridian import db as db_module
+from meridian import gate_override
 
 
 def _past_ts(hours: float) -> str:
@@ -72,19 +73,21 @@ async def test_different_actor_live_claim_refused(db):
 
 
 @pytest.mark.asyncio
-async def test_force_foreign_claim_overrides_refusal(db):
+async def test_force_foreign_claim_requires_human_approval(db):
     p = await db_module.create_project(db, "ownership-force")
     item = await db_module.add_sprint_item(db, p["id"], "v1", "do the thing")
     owner = await db_module.register_session(db, p["id"], "owner-session")
     await db_module.claim_sprint_item(db, p["id"], item["id"], actor=owner["id"])
 
-    done = await db_module.complete_sprint_item(
-        db, p["id"], item["id"],
-        actor="a-different-live-session",
-        force_foreign_claim=True,
-        override_reason="coordinator finishing a hand-off on purpose",
-    )
-    assert done["status"] == "done"
+    with pytest.raises(gate_override.GateOverrideError) as no_approval:
+        await db_module.complete_sprint_item(
+            db, p["id"], item["id"],
+            actor="a-different-live-session",
+            force_foreign_claim=True,
+            override_reason="coordinator finishing a hand-off on purpose",
+        )
+    assert no_approval.value.code == "HUMAN_APPROVAL_REQUIRED"
+    assert (await db_module.get_sprint_item(db, item["id"]))["status"] == "in_progress"
 
 
 @pytest.mark.asyncio
@@ -166,13 +169,15 @@ async def test_unrecognised_actor_string_is_not_treated_as_dead(db):
             db, p["id"], item["id"], actor="a-different-session"
         )
 
-    done = await db_module.complete_sprint_item(
-        db, p["id"], item["id"],
-        actor="a-different-session",
-        force_foreign_claim=True,
-        override_reason="owner session is gone; finishing its work",
-    )
-    assert done["status"] == "done"
+    with pytest.raises(gate_override.GateOverrideError) as no_approval:
+        await db_module.complete_sprint_item(
+            db, p["id"], item["id"],
+            actor="a-different-session",
+            force_foreign_claim=True,
+            override_reason="owner session is gone; finishing its work",
+        )
+    assert no_approval.value.code == "HUMAN_APPROVAL_REQUIRED"
+    assert (await db_module.get_sprint_item(db, item["id"]))["status"] == "in_progress"
 
 
 # ---------------------------------------------------------------------------

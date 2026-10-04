@@ -444,11 +444,47 @@ def _extract_between(text: str, start: str, end: str) -> str:
 def _ps(script: str, env_extra: dict | None = None, timeout: int = 90) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _TOKEN_ENV_NAMES}
     env.update(env_extra or {})
+    # Codex can prepend its PowerShell 7 module directory to PSModulePath.
+    # Windows PowerShell 5.1 then loads the incompatible v7 security module
+    # before its inbox module, which breaks SecureString/DPAPI calls in tests.
+    if (
+        sys.platform == "win32"
+        and _POWERSHELL
+        and Path(_POWERSHELL).name.lower() == "powershell.exe"
+    ):
+        module_paths = [Path.home() / "Documents" / "WindowsPowerShell" / "Modules"]
+        program_files = env.get("ProgramFiles")
+        if program_files:
+            module_paths.append(Path(program_files) / "WindowsPowerShell" / "Modules")
+        module_paths.append(Path(_POWERSHELL).resolve().parent / "Modules")
+        env["PSModulePath"] = os.pathsep.join(str(path) for path in module_paths)
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     return subprocess.run(
         [_POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
         capture_output=True, text=True, timeout=timeout, env=env,
     )
+
+
+@_windows_only
+@_needs_ps
+def test_ps_uses_windows_powershell_compatible_module_path(monkeypatch):
+    monkeypatch.setenv(
+        "PSModulePath",
+        r"C:\Users\codex\codex-primary-runtime\dependencies\native\powershell\Modules",
+    )
+    captured = {}
+
+    def capture_run(args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", capture_run)
+
+    _ps("Write-Output 'test'")
+
+    module_paths = captured["env"]["PSModulePath"].split(os.pathsep)
+    assert "codex-primary-runtime" not in captured["env"]["PSModulePath"].lower()
+    assert str(Path(_POWERSHELL).resolve().parent / "Modules") in module_paths
 
 
 def _load_ps_functions(script: Path, *names: str) -> str:

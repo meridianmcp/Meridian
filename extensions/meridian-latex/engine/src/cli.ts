@@ -15,6 +15,7 @@ import { type OutlineNodeLike } from "./range-locate.js";
 import { listDocPaths } from "./project-tree.js";
 import { joinDocExpanded } from "./input-expansion.js";
 import { snapshotDoc } from "./local-snapshot.js";
+import { compileLocalLatex, type LatexEngine } from "./overleaf-workflow.js";
 import { openStore } from "./store.js";
 import { writeFileSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -40,6 +41,12 @@ commands:
                         unresolved nested sub-labels. Never throws: a parse
                         failure itself becomes a single finding, printed the
                         same as any other.
+  compile <path.tex> [--engine=pdflatex|xelatex|lualatex] [--project-id=<id>]
+                        compile a local source tree with shell escape disabled;
+                        hash its TeX/BibTeX inputs and PDF/log into a local
+                        receipt. BibTeX and Biber runs follow their source syntax.
+                        A receipt never attests that local changes were synced to
+                        Overleaf. Output and receipts stay in ~/.meridian-latex.
   serve                start the local engine server (http://127.0.0.1:8471) --
                         this is what the Chrome extension's popup talks to
   login                open a dedicated browser window to capture your Overleaf
@@ -317,6 +324,32 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     console.log(JSON.stringify(outlineFile(path), null, 2));
+  } else if (command === "compile") {
+    const path = rest[0];
+    if (!path) {
+      console.error("usage: meridian-latex compile <path-to.tex> [--engine=pdflatex|xelatex|lualatex] [--project-id=<id>]");
+      process.exit(1);
+    }
+    const options = rest.slice(1);
+    const engineArg = options.find((value) => value.startsWith("--engine="));
+    const projectArg = options.find((value) => value.startsWith("--project-id="));
+    if (options.some((value) => value !== engineArg && value !== projectArg)) {
+      console.error("compile accepts only --engine and --project-id options");
+      process.exit(1);
+    }
+    const engine = (engineArg?.slice("--engine=".length) ?? "pdflatex") as LatexEngine;
+    try {
+      const receipt = await compileLocalLatex({
+        rootFile: path,
+        engine,
+        overleafProjectId: projectArg?.slice("--project-id=".length),
+      });
+      console.log(JSON.stringify(receipt, null, 2));
+      if (receipt.status !== "passed") process.exitCode = 1;
+    } catch (error) {
+      console.error(`Compile failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
   } else if (command === "lint") {
     const path = rest[0];
     if (!path) {

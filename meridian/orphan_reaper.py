@@ -90,6 +90,8 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+
+from .hook_auth import bearer_headers_from_env
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -997,7 +999,8 @@ def fetch_dead_worktree_paths(
     gate, and MUST fail open exactly like sprint_guard.{sh,ps1}."""
     url = f"{base_url.rstrip('/')}/projects/{project_id}/worktrees/pending_cleanup"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 — trusted, own MERIDIAN_URL
+        request = urllib.request.Request(url, headers=bearer_headers_from_env())
+        with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310 — trusted, own MERIDIAN_URL
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return []

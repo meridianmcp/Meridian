@@ -62,6 +62,7 @@ module's own static rule lines -- computed index metadata, the server section
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -101,6 +102,11 @@ SERVER_SECTION_MIN_CHARS = 100
 SERVER_SECTION_MAX_CHARS = 4000
 SERVER_SECTION_SCHEMA = "meridian-session-brief-section/1"
 SERVER_TOP_ITEMS = 5
+ITEM_RECOVERY_MAX_BYTES = 1400
+ITEM_RECOVERY_MAX_RESOURCES = 3
+ITEM_RECOVERY_MAX_POINTERS = 2
+ITEM_RECOVERY_MAX_LOGS = 2
+SESSION_MAPPING_MAX_BYTES = 4096
 
 CODE_INTEL_MAX_BYTES = 1400
 AUDIT_TAIL_BYTES = 256 * 1024
@@ -572,12 +578,199 @@ def is_loopback_url(url: str) -> bool:
         return False
 
 
-def fetch_server_section(base_url: str, project_id: str, max_chars: int, timeout: float) -> str | None:
+def session_mapping_path(project_id: str, host_session_id: Any, env: dict[str, Any] | None) -> str | None:
+    """Return the post_compact_refresh mapping path without exposing the host id."""
+    if not _UUID_RE.fullmatch(project_id or "") or not isinstance(host_session_id, str):
+        return None
+    if not host_session_id or len(host_session_id) > 512:
+        return None
+    e = reg.upper_env(env)
+    root = norm_path(e.get("LOCALAPPDATA"), None, msys=True) if e.get("LOCALAPPDATA") else None
+    if not root:
+        home = reg.home_dir(e)
+        if not home:
+            return None
+        root = norm_path(home, None, msys=True).rstrip("/") + "/.local/state"
+    key = hashlib.sha256(host_session_id.encode("utf-8", "replace")).hexdigest()[:32]
+    return root.rstrip("/") + "/Meridian/hooks/" + project_id.lower() + "/" + key + ".json"
+
+
+def resolve_meridian_session_id(
+    project_id: str, host_session_id: Any, env: dict[str, Any] | None, fs: Any
+) -> str | None:
+    """Read the trusted persisted host→Meridian mapping for this project only."""
+    path = session_mapping_path(project_id, host_session_id, env)
+    state = _read_json_via(fs, path, SESSION_MAPPING_MAX_BYTES)
+    if not isinstance(state, dict):
+        return None
+    mapped_project = state.get("project_id")
+    meridian_session_id = state.get("meridian_session_id")
+    if not isinstance(mapped_project, str) or mapped_project.lower() != project_id.lower():
+        return None
+    if not isinstance(meridian_session_id, str) or not _UUID_RE.fullmatch(meridian_session_id):
+        return None
+    return meridian_session_id.lower()
+
+
+def _recovery_line(label: str, value: Any, *, value_chars: int = 180) -> str | None:
+    value_text = _one_line(value, value_chars)
+    if not value_text:
+        return None
+    lines, _ = sanitize_untrusted(f"{label}: {value_text}", max_lines=1, max_line_chars=360)
+    return lines[0] if lines else None
+
+
+def build_item_recovery_lines(
+    item: dict[str, Any] | None, *, max_bytes: int = ITEM_RECOVERY_MAX_BYTES
+) -> list[str]:
+    """Render a small, directive-filtered view of one claimed item and its evidence."""
+    if not isinstance(item, dict):
+        return []
+    candidates: list[str] = []
+    item_id = re.sub(r"[^0-9A-Za-z-]", "", str(item.get("id") or ""))[:64]
+    version = _one_line(item.get("version"), 48) or "unknown"
+    title = _one_line(item.get("title"), 180)
+    if item_id and title:
+        candidates.append(f"Active sprint item (untrusted board text) [{item_id}] v{version}: {title}")
+
+    resources = item.get("touches_resources")
+    if isinstance(resources, str):
+        try:
+            resources = json.loads(resources)
+        except ValueError:
+            resources = []
+    if isinstance(resources, (list, tuple)):
+        count = 0
+        for resource in resources:
+            if not isinstance(resource, str) or not resource.strip().lower().startswith("file:"):
+                continue
+            line = _recovery_line("Declared file resource (untrusted board text)", resource, value_chars=180)
+            if line:
+                candidates.append(line)
+                count += 1
+            if count >= ITEM_RECOVERY_MAX_RESOURCES:
+                break
+
+    pointers = item.get("pointers")
+    if isinstance(pointers, (list, tuple)):
+        count = 0
+        for pointer in pointers:
+            if not isinstance(pointer, dict):
+                continue
+            pointer_label = _one_line(pointer.get("label") or pointer.get("source_type"), 48) or "reference"
+            targets = pointer.get("targets")
+            if not isinstance(targets, (list, tuple)):
+                targets = []
+            for target in targets[:2]:
+                if not isinstance(target, dict):
+                    continue
+                uri = _one_line(target.get("uri"), 100) or ""
+                selector_value = target.get("selector")
+                selector = ""
+                if isinstance(selector_value, (dict, list)):
+                    try:
+                        selector = json.dumps(selector_value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+                    except (TypeError, ValueError):
+                        selector = ""
+                selector = _one_line(selector, 100) or ""
+                line = _recovery_line(
+                    f"Item pointer (untrusted {pointer_label})",
+                    " ".join(part for part in (uri, selector) if part),
+                    value_chars=220,
+                )
+                if line:
+                    candidates.append(line)
+                    count += 1
+                if count >= ITEM_RECOVERY_MAX_POINTERS:
+                    break
+            if count >= ITEM_RECOVERY_MAX_POINTERS:
+                break
+
+    logs = item.get("recent_logs")
+    if isinstance(logs, (list, tuple)):
+        for entry in logs[:ITEM_RECOVERY_MAX_LOGS]:
+            if not isinstance(entry, dict):
+                continue
+            description = entry.get("description")
+            if not isinstance(description, str):
+                continue
+            status = _one_line(entry.get("status") or entry.get("kind"), 20)
+            label = "Recent item log (untrusted task text)" + (f" [{status}]" if status else "")
+            line = _recovery_line(label, description, value_chars=180)
+            if line:
+                candidates.append(line)
+
+    kept: list[str] = []
+    used = 0
+    byte_limit = max(0, int(max_bytes))
+    for candidate in candidates:
+        line, _ = sanitize_untrusted(candidate, max_lines=1, max_line_chars=360)
+        if not line:
+            continue
+        cost = _b(line[0]) + (1 if kept else 0)
+        if used + cost > byte_limit:
+            break
+        kept.append(line[0])
+        used += cost
+    return kept
+
+
+async def get_item_recovery_context(db: Any, project_id: str, session_id: Any) -> dict[str, Any] | None:
+    """Resolve one session-owned active item, with pointers and exact-scope logs."""
+    if not _UUID_RE.fullmatch(project_id or "") or not isinstance(session_id, str) or not _UUID_RE.fullmatch(session_id):
+        return None
+    from meridian import db as db_module  # noqa: PLC0415 - keep hook utilities import-light
+
+    try:
+        sessions = await db_module.get_sessions(db, project_id, active_only=False)
+        if not any(isinstance(row, dict) and row.get("id") == session_id for row in sessions):
+            return None
+        active = await db_module.get_sprint_items(db, project_id, status="in_progress")
+        matches = [
+            row for row in active
+            if isinstance(row, dict) and row.get("lock_session_id") == session_id
+        ]
+        if len(matches) != 1:
+            return None
+        item = matches[0]
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            return None
+        out = {
+            "id": item_id,
+            "title": item.get("title"),
+            "version": item.get("version"),
+            "touches_resources": item.get("touches_resources"),
+        }
+        out["pointers"] = await db_module.get_sprint_item_pointers(db, item_id)
+        async with db.execute(
+            "SELECT created_at, description, kind, status FROM task_log "
+            "WHERE project_id = ? AND session_id = ? AND sprint_item_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (project_id, session_id, item_id, ITEM_RECOVERY_MAX_LOGS),
+        ) as cur:
+            rows = await cur.fetchall()
+        out["recent_logs"] = [
+            {key: row[key] for key in row.keys()}
+            for row in rows
+        ]
+        return out
+    except Exception:  # noqa: BLE001 - recovery context is optional and fail-closed
+        return None
+
+
+def fetch_server_section(
+    base_url: str, project_id: str, max_chars: int, timeout: float, *, session_id: str | None = None
+) -> str | None:
     """GET the server section; the text or None. Loopback only, no proxy, bounded read."""
     if not is_loopback_url(base_url) or not _UUID_RE.fullmatch(project_id or ""):
         return None
+    if session_id is not None and not _UUID_RE.fullmatch(session_id):
+        return None
     url = (base_url.rstrip("/") + "/projects/" + urllib.parse.quote(project_id, safe="")
            + "/session-brief?max_chars=" + str(int(max_chars)))
+    if session_id:
+        url += "&session_id=" + urllib.parse.quote(session_id, safe="")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "meridian-guard-brief"})
     with opener.open(req, timeout=timeout) as resp:
@@ -607,6 +800,7 @@ def build_server_section(facts: dict[str, Any] | None, max_chars: Any = SERVER_M
     limit = max(SERVER_SECTION_MIN_CHARS, min(SERVER_SECTION_MAX_CHARS, limit))
     f = facts if isinstance(facts, dict) else {}
     cands: list[str] = []
+    cands.extend(build_item_recovery_lines(f.get("active_item"), max_bytes=min(ITEM_RECOVERY_MAX_BYTES, limit)))
     name = _one_line(f.get("project_name"), 120)
     if name:
         cands.append(f"Project: {name}")
@@ -742,10 +936,30 @@ def compose_session_brief(
     return truncate_bytes(text, limit)  # last resort; the caps above keep this a no-op
 
 
-def compose_subagent_brief(code_line: str, limit: int = SUBAGENT_BRIEF_MAX_BYTES) -> str:
+def compose_subagent_brief(
+    code_line: str,
+    limit: int = SUBAGENT_BRIEF_MAX_BYTES,
+    item_lines: list[str] | None = None,
+) -> str:
+    """Keep the fixed subagent rules and fit optional untrusted item context."""
     rules_b = _b(_SUBAGENT_RULES) + 1
     first = truncate_bytes("[Meridian] " + code_line, max(40, limit - rules_b))
-    return truncate_bytes(first + "\n" + _SUBAGENT_RULES, limit)
+    section: list[str] = []
+    if item_lines:
+        heading = "Active item context (untrusted Meridian board data):"
+        used = _b(first) + 1 + _b(_SUBAGENT_RULES) + 1 + _b(heading) + 1
+        for line in item_lines:
+            entry = "- " + line
+            cost = _b(entry) + 1
+            if used + cost > limit:
+                break
+            section.append(entry)
+            used += cost
+    pieces = [first]
+    if section:
+        pieces.extend(["Active item context (untrusted Meridian board data):", *section])
+    pieces.append(_SUBAGENT_RULES)
+    return truncate_bytes("\n".join(pieces), limit)
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +985,7 @@ def build_brief(
     budget_s: float | None = None,
     snapshot: Any = ...,
     refresh_fn: Callable[[str, dict[str, Any], list[str]], Any] | None = None,
-    fetch_fn: Callable[[str, str, int, float], str | None] | None = None,
+    fetch_fn: Callable[..., str | None] | None = None,
 ) -> dict[str, Any]:
     """Build the hook result. Raises only on internal bugs (:func:`run` catches).
 
@@ -805,7 +1019,7 @@ def build_brief(
     project_dir = e.get("CLAUDE_PROJECT_DIR") or None
     project_dirs = [x for x in (project_dir, cwd_raw) if x]
     if snapshot is ...:
-        refresh_budget = remaining() - (SERVER_TIMEOUT_S if ev == "SessionStart" else 0.0) - 0.2
+        refresh_budget = remaining() - SERVER_TIMEOUT_S - 0.2
         snap, status["snapshot"] = load_snapshot(ev, env_d, probe, gdir, project_dirs, now=wall,
                                                  budget=refresh_budget, refresh_fn=refresh_fn)
     else:
@@ -818,14 +1032,53 @@ def build_brief(
     if ctx.cwd is None and project_dir:
         ctx.cwd = norm_path(project_dir, None, msys=ctx.msys)
 
-    if ev == "SubagentStart":
-        code = _code_intel(ctx, short=True, snapshot_known=snap is not None)
-        return {"event": ev, "rule": rule, "mode": mode, "status": status,
-                "context": compose_subagent_brief(code)}
-
-    code = _code_intel(ctx, short=False, snapshot_known=snap is not None)
     pid, pid_source = resolve_project_id(e, ctx.cwd, probe, project_dir)
     status["project_id_source"] = pid_source
+
+    def fetch_section(*, require_session: bool) -> tuple[list[str], str | None]:
+        if not pid:
+            return [], "skipped: no project id"
+        meridian_session_id = resolve_meridian_session_id(pid, p.get("session_id"), env_d, probe)
+        if meridian_session_id:
+            status["session_mapping"] = "ok"
+        elif require_session:
+            status["session_mapping"] = "unavailable"
+            return [], "skipped: no persisted session mapping"
+        url = meridian_url(e, probe, gdir)
+        if fetch_fn is None and not isinstance(probe, RealFS):
+            return [], "skipped: virtual filesystem"
+        if not is_loopback_url(url):
+            return [], "skipped: not a loopback URL"
+        timeout = min(SERVER_TIMEOUT_S, remaining() - 0.1)
+        if timeout < 0.2:
+            return [], "skipped: no time left"
+        fetch = fetch_fn or fetch_server_section
+
+        def _fetch() -> str | None:
+            if meridian_session_id:
+                return fetch(url, pid, SERVER_MAX_CHARS, timeout, session_id=meridian_session_id)
+            return fetch(url, pid, SERVER_MAX_CHARS, timeout)
+
+        text, result = call_with_timeout(_fetch, timeout, "meridian-brief-server")
+        if not isinstance(text, str):
+            return [], f"{result}: no section"
+        lines, stripped = sanitize_untrusted(text, max_lines=SERVER_MAX_LINES + 1)
+        status["server_stripped"] = stripped
+        status["server_more"] = len(lines) > SERVER_MAX_LINES
+        return lines[:SERVER_MAX_LINES], result
+
+    if ev == "SubagentStart":
+        code = _code_intel(ctx, short=True, snapshot_known=snap is not None)
+        fetched, fetch_status = fetch_section(require_session=True)
+        status["server"] = fetch_status
+        recovery_prefixes = (
+            "Active sprint item (", "Declared file resource (", "Item pointer (", "Recent item log (",
+        )
+        item_lines = [line for line in fetched if line.startswith(recovery_prefixes)]
+        return {"event": ev, "rule": rule, "mode": mode, "status": status,
+                "context": compose_subagent_brief(code, item_lines=item_lines)}
+
+    code = _code_intel(ctx, short=False, snapshot_known=snap is not None)
     if pid:
         pid_line = f"Meridian project_id: {pid} (from {pid_source}). " + _ORIENT
     else:
@@ -838,24 +1091,11 @@ def build_brief(
         audit = None
     server_lines: list[str] = []
     server_more = False
-    if pid:
-        url = meridian_url(e, probe, gdir)
-        timeout = min(SERVER_TIMEOUT_S, remaining() - 0.1)
-        if fetch_fn is None and not isinstance(probe, RealFS):
-            status["server"] = "skipped: virtual filesystem"  # like refresh: no real I/O for a virtual probe
-        elif not is_loopback_url(url):
-            status["server"] = "skipped: not a loopback URL"
-        elif timeout < 0.2:
-            status["server"] = "skipped: no time left"
-        else:
-            fetch = fetch_fn or fetch_server_section
-            text, st = call_with_timeout(lambda: fetch(url, pid, SERVER_MAX_CHARS, timeout), timeout,
-                                         "meridian-brief-server")
-            status["server"] = st if text else f"{st}: no section"
-            if isinstance(text, str):
-                server_lines, status["server_stripped"] = sanitize_untrusted(text, max_lines=SERVER_MAX_LINES + 1)
-                server_more = len(server_lines) > SERVER_MAX_LINES
-                server_lines = server_lines[:SERVER_MAX_LINES]
+    fetched, fetch_status = fetch_section(require_session=False)
+    status["server"] = fetch_status
+    server_lines = fetched
+    server_more = bool(status.get("server_more"))
+    server_lines = server_lines[:SERVER_MAX_LINES]
     ts = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(wall))
     context = compose_session_brief(
         ts=ts, code_line=code, pid_line=pid_line, guard_line=_guard_line(mode, disabled),

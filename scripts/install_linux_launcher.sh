@@ -31,6 +31,7 @@
 #   MERIDIAN_AUTOSTART=1 bash install_linux_launcher.sh
 
 set -euo pipefail
+TARGET_REPO="$(pwd -P)"
 
 # -- detect OS ----------------------------------------------------------------
 OS="$(uname -s)"
@@ -148,4 +149,9 @@ else
   echo ""
   echo "Autostart not enabled. Re-run with MERIDIAN_AUTOSTART=1 to also install a"
   echo "systemd --user unit that starts Meridian automatically at login."
+fi
+
+echo "Configuring the Meridian MCP bundle for this repository..."
+if ! "$MERIDIAN_BIN" setup --repo "$TARGET_REPO"; then
+  echo "warning: MCP bundle setup reported a conflict or error; run 'meridian setup --repo \"$TARGET_REPO\"' to retry." >&2
 fi

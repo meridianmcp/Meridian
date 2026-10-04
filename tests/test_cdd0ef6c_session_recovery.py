@@ -403,3 +403,77 @@ async def test_mcp_register_session_recovery_project_id_not_required_schema():
         schema = by_name[name]["inputSchema"]
         assert "project_id" not in (schema.get("required") or [])
         assert "project_name" in schema["properties"]
+    registration = by_name["register_session_recovery"]["inputSchema"]["properties"]
+    assert "caller-local PreToolUse hook" in registration["local_identity"]["description"]
+    assert "verified_resumable" in registration
+
+
+@pytest.mark.asyncio
+async def test_hosted_recovery_never_reads_or_writes_server_local_identity(db, tmp_path):
+    from meridian.mcp.handlers.session_recovery_tools import (
+        handle_get_session_recovery,
+        handle_register_session_recovery,
+    )
+
+    project, session = await _session(db, "hosted-recovery-local-boundary")
+    server_data_dir = tmp_path / "fly-data-dir"
+    result = await handle_register_session_recovery(
+        {
+            "project_id": project["id"],
+            "session_id": session["id"],
+            "transport": "remote_control",
+            "client_type": "claude-code",
+            "local_ref_id": "a" * 32,
+            "verified_resumable": True,
+        },
+        db,
+        str(server_data_dir),
+        {"id": "tenant-1"},
+        "tenant-1",
+    )
+    assert result["recovery"]["verified_resumable"] is True
+    assert result["resume_recipe"] is None
+    assert result["resume_recipe_scope"] == "caller_local"
+    assert result["local_snapshot"] == {"ok": True, "scope": "caller_local"}
+    assert not model.session_recovery_snapshot_path(server_data_dir, project["id"]).exists()
+
+    fetched = await handle_get_session_recovery(
+        {
+            "project_id": project["id"],
+            "session_id": session["id"],
+            "include_continuation": False,
+        },
+        db,
+        str(server_data_dir),
+        {"id": "tenant-1"},
+        "tenant-1",
+    )
+    assert fetched["resume_recipe"] is None
+    assert fetched["resume_recipe_scope"] == "caller_local"
+    assert not model.session_recovery_snapshot_path(server_data_dir, project["id"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_hosted_recovery_rejects_local_identity_that_was_not_redacted(db, tmp_path):
+    from meridian.mcp.handlers.session_recovery_tools import handle_register_session_recovery
+
+    project, session = await _session(db, "hosted-recovery-unredacted")
+    result = await handle_register_session_recovery(
+        {
+            "project_id": project["id"],
+            "session_id": session["id"],
+            "transport": "remote_control",
+            "local_identity": {
+                "bridge_id": "private-bridge",
+                "local_transcript_path": "C:/Users/private/session.jsonl",
+            },
+        },
+        db,
+        str(tmp_path),
+        {"id": "tenant-1"},
+        "tenant-1",
+    )
+    assert result["code"] == "CALLER_LOCAL_IDENTITY_REQUIRED"
+    assert "private-bridge" not in str(result)
+    assert await recovery_db.get_session_recovery(db, project["id"], session_id=session["id"]) is None
+    assert not model.session_recovery_snapshot_path(tmp_path, project["id"]).exists()

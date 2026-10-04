@@ -106,8 +106,36 @@ class TestEnums:
         required = {
             "claim", "source", "citation", "dataset", "code", "run",
             "output", "figure", "table", "document", "review",
+            "conversation", "transcript_range", "provider_artifact",
         }
         assert {k.value for k in RE.EvidenceKind} == required
+
+    def test_external_ai_reference_kinds_round_trip_without_chat_payloads(self):
+        digest = "c" * 64
+        records = [
+            _record(RE.EvidenceKind.CONVERSATION, "codex:thread-123"),
+            _record(RE.EvidenceKind.TRANSCRIPT_RANGE, "codex:thread-123:range-1"),
+            _record(RE.EvidenceKind.PROVIDER_ARTIFACT, "chatgpt:c-1:a-1"),
+        ]
+        records[0].identity.external_ids = {
+            "provider": "codex", "conversation_id": "thread-123"
+        }
+        records[1].identity.external_ids = {
+            "provider": "codex", "conversation_id": "thread-123",
+            "transcript_sha256": digest,
+        }
+        records[1].attributes["range"] = {"start_line": 4, "end_line": 8}
+        records[2].identity.external_ids = {
+            "provider": "chatgpt", "conversation_id": "c-1", "artifact_id": "a-1",
+            "content_sha256": digest,
+        }
+        envelope = RE.build_envelope(records=records)
+
+        for fmt in ("json", "xml"):
+            serialized = RE.serialize_provenance_envelope(envelope, fmt)
+            restored = RE.parse_provenance_envelope(serialized, fmt)
+            assert RE.envelope_to_dict(restored) == RE.envelope_to_dict(envelope)
+            assert "private full transcript" not in serialized
 
     def test_all_required_resolver_statuses_present(self):
         # PROV-CANONICAL (7d9b8251) added pending_retry/failed to the

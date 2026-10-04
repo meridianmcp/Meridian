@@ -5,7 +5,11 @@ rather than silently continuing to run a missing/empty binary.
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 _INSTALL_PS1 = Path(__file__).resolve().parent.parent / "install.ps1"
 
@@ -191,6 +195,15 @@ def test_install_windows_ps1_adds_path_without_setx():
     assert not any("setx" in ln.lower() for ln in code_lines)
 
 
+def test_install_windows_tray_offers_local_zotero_setup_without_cli_credentials():
+    src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+    assert "[switch]$ConfigureZotero" in src
+    assert "Configure your local Zotero connection now? [y/N]" in src
+    assert "& $dest --configure-zotero" in src
+    assert "configure it later from the Meridian tray menu" in src
+    assert "ZOTERO_API_KEY" not in src
+
+
 def test_install_windows_ps1_route_serves_script(client):
     r = client.get("/install-windows.ps1")
     assert r.status_code == 200
@@ -209,6 +222,27 @@ def test_install_windows_ps1_exposes_tray_switch():
     src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
     assert "[switch]$Tray" in src
     assert "if ($Tray) {" in src
+
+
+def test_install_windows_ps1_autostart_is_explicit_and_tray_only():
+    src = _install_windows_ps1_src()
+    assert "[switch]$Autostart" in src
+    assert "if ($Autostart -and -not $Tray)" in src
+    assert '"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"' in src
+    assert '$command = \'"{0}"\' -f $TargetPath' in src
+
+    tray_start = src.index("if ($Tray) {")
+    tray_block = src[tray_start:]
+    assert "if ($Autostart) {" in tray_block
+    assert "Enable-MeridianAutostart -TargetPath $dest" in tray_block
+
+
+def test_install_windows_ps1_uninstall_removes_optional_autostart_entry():
+    src = _install_windows_ps1_src()
+    uninstall_idx = src.index("if ($Uninstall) {")
+    exit_idx = src.index("exit 0", uninstall_idx)
+    uninstall_block = src[uninstall_idx:exit_idx]
+    assert "Remove-MeridianAutostart" in uninstall_block
 
 
 def test_install_windows_ps1_tray_downloads_meridian_tray_exe():
@@ -405,3 +439,252 @@ class TestLocalRepoHint:
             encoding="utf-8"
         )
         assert 'cd \\"$HOME\\"' not in src, "must not unconditionally fall back to $HOME"
+
+
+# ---------------------------------------------------------------------------
+# GUI installer: -Tray gains a Start Menu shortcut + Add/Remove Programs
+# registration (Settings > Apps > Installed apps), and a new -Uninstall
+# switch reverses both plus removes meridian-tray.exe. HKCU-only, no admin
+# rights -- matches this script's and install.ps1's existing no-admin
+# philosophy. Deliberately does NOT touch ~/.local\bin or the user PATH: that
+# directory is shared with unrelated tools (uv, serena, ...), unlike
+# install.ps1's dedicated $env:APPDATA\meridian directory.
+# ---------------------------------------------------------------------------
+
+
+def _install_windows_ps1_src() -> str:
+    return _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+
+
+def test_install_windows_ps1_is_pure_ascii_no_bom():
+    """b0d28a61 fixed 5 pre-existing em-dashes here but never added a
+    regression guard (that commit's own message flags this file "was never
+    covered by the repo's existing ASCII-enforcement test"). PowerShell 5.1
+    reads a BOM-less file as cp1252, so any non-ASCII byte silently corrupts
+    characters and can break the parser."""
+    raw = _INSTALL_WINDOWS_PS1.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "install-windows.ps1 must not have a UTF-8 BOM"
+    assert not raw.startswith(b"\xff\xfe") and not raw.startswith(b"\xfe\xff"), (
+        "install-windows.ps1 must not be UTF-16"
+    )
+    non_ascii = [(i, b) for i, b in enumerate(raw) if b > 0x7F]
+    assert not non_ascii, f"install-windows.ps1 has non-ASCII bytes at {non_ascii[:10]}"
+
+
+def _powershell_exe() -> str | None:
+    for exe in ("pwsh", "powershell"):
+        found = shutil.which(exe)
+        if found:
+            return found
+    return None
+
+
+def test_install_windows_ps1_parses_with_zero_errors():
+    """install.ps1 has this check (test_install_ps1_parses_with_zero_errors);
+    install-windows.ps1 never did despite being just as user-facing."""
+    ps = _powershell_exe()
+    if ps is None:
+        pytest.skip("no PowerShell interpreter available on this host")
+    ps_script = (
+        "$tokens=$null;$errors=$null;"
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{_INSTALL_WINDOWS_PS1.as_posix()}',[ref]$tokens,[ref]$errors)|Out-Null;"
+        "if($errors){$errors|ForEach-Object{Write-Output $_.Message};exit 1}"
+        "else{Write-Output 'PARSE_OK';exit 0}"
+    )
+    proc = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    assert proc.returncode == 0, f"install-windows.ps1 failed to parse:\n{proc.stdout}\n{proc.stderr}"
+    assert "PARSE_OK" in proc.stdout
+
+
+def test_install_windows_ps1_exposes_uninstall_switch():
+    src = _install_windows_ps1_src()
+    assert "[switch]$Uninstall" in src
+    assert "if ($Uninstall) {" in src
+
+
+def test_install_windows_ps1_uninstall_short_circuits_before_tray_and_uv():
+    """-Uninstall must be handled before -Tray / uv / meridian.exe logic --
+    it is a standalone action, not a modifier of a normal install run."""
+    src = _install_windows_ps1_src()
+    uninstall_idx = src.index("if ($Uninstall) {")
+    tray_idx = src.index("if ($Tray) {")
+    uv_idx = src.index("& uv tool install meridian-server")
+    assert uninstall_idx < tray_idx, "-Uninstall must be checked before the -Tray branch"
+    assert uninstall_idx < uv_idx, "-Uninstall must be checked before the uv/meridian.exe path"
+
+
+def test_install_windows_ps1_uninstall_never_touches_path_or_bindir_removal():
+    """Deliberate design choice, not an oversight: ~/.local\\bin is a SHARED
+    per-user bin directory (uv.exe/serena.exe/etc. commonly live there too),
+    unlike install.ps1's Meridian-exclusive $env:APPDATA\\meridian. Stripping
+    it from PATH or deleting the directory on uninstall could silently break
+    unrelated tools, so the -Uninstall block must never do either."""
+    src = _install_windows_ps1_src()
+    uninstall_idx = src.index("if ($Uninstall) {")
+    exit_idx = src.index("exit 0", uninstall_idx)
+    uninstall_block = src[uninstall_idx:exit_idx]
+    assert "SetEnvironmentVariable" not in uninstall_block
+    # Only two specific, narrow file removals happen in this block -- the
+    # tray exe and the persisted uninstaller-script copy -- never a bare
+    # directory removal of $binDir itself.
+    assert "Remove-Item -LiteralPath $exePath" in uninstall_block
+    assert "Remove-Item -LiteralPath $uninstallerCopy" in uninstall_block
+    assert "Remove-Item -Recurse -Force -Path $binDir" not in uninstall_block
+    assert "Remove-Item -LiteralPath $binDir" not in uninstall_block
+
+
+def test_install_windows_ps1_uninstall_is_idempotent():
+    """Every removal in the -Uninstall block must check existence first, and
+    each check must be independently guarded so a partial prior removal (or a
+    second -Uninstall run) never errors out partway through."""
+    src = _install_windows_ps1_src()
+    uninstall_idx = src.index("if ($Uninstall) {")
+    exit_idx = src.index("exit 0", uninstall_idx)
+    uninstall_block = src[uninstall_idx:exit_idx]
+    assert "Test-Path -LiteralPath $exePath" in uninstall_block
+    assert "Remove-MeridianStartMenuShortcut" in uninstall_block
+    assert "Remove-MeridianUninstallEntry" in uninstall_block
+    assert "Test-Path -LiteralPath $uninstallerCopy" in uninstall_block
+    # $ErrorActionPreference is "Stop" for the whole script, so the exe
+    # removal (the one Remove-Item most likely to fail -- e.g. the process is
+    # still running) must be try/caught, then handled by the explicit retry
+    # gate before the rest of the uninstall sequence.
+    exe_removal_idx = uninstall_block.index("Remove-Item -LiteralPath $exePath")
+    preceding = uninstall_block[:exe_removal_idx]
+    assert preceding.rstrip().endswith("try {"), (
+        "the exe removal must be inside its own try block so a failure "
+        "(e.g. the process is still running) can preserve retry paths"
+    )
+
+
+def test_install_windows_ps1_preserves_uninstall_retry_paths_when_exe_is_locked():
+    """A still-running tray binary keeps every way to retry uninstall."""
+    src = _install_windows_ps1_src()
+    uninstall_idx = src.index("if ($Uninstall) {")
+    exit_idx = src.index("exit 0", uninstall_idx)
+    uninstall_block = src[uninstall_idx:exit_idx]
+    failure_gate_idx = uninstall_block.index("if ($exeRemovalFailed) {")
+    failure_gate_end = uninstall_block.index("Remove-MeridianStartMenuShortcut", failure_gate_idx)
+    failure_gate = uninstall_block[failure_gate_idx:failure_gate_end]
+
+    assert "$exeRemovalFailed = Test-Path -LiteralPath $exePath" in uninstall_block
+    assert "The Meridian tray executable is still present" in failure_gate
+    assert "exit 1" in failure_gate
+    for cleanup in (
+        "Remove-MeridianStartMenuShortcut",
+        "Remove-MeridianAutostart",
+        "Remove-MeridianUninstallEntry",
+        "Remove-Item -LiteralPath $uninstallerCopy",
+    ):
+        assert failure_gate_idx < uninstall_block.index(cleanup)
+
+
+def test_install_windows_ps1_start_menu_shortcut_targets_current_user_only():
+    """Never the all-users Start Menu (%ProgramData%) -- matches the
+    no-admin-required philosophy this script and install.ps1 both document."""
+    src = _install_windows_ps1_src()
+    assert "function New-MeridianStartMenuShortcut" in src
+    assert 'Join-Path $env:APPDATA "Microsoft\\Windows\\Start Menu\\Programs\\Meridian.lnk"' in src
+    assert "ProgramData" not in src
+    assert "AllUsersStartMenu" not in src
+    # Uses the standard PowerShell-native COM approach, no extra dependency.
+    assert "New-Object -ComObject WScript.Shell" in src
+
+
+def test_install_windows_ps1_start_menu_shortcut_points_at_tray_exe():
+    src = _install_windows_ps1_src()
+    fn_idx = src.index("function New-MeridianStartMenuShortcut")
+    fn_end = src.index("\nfunction ", fn_idx + 1)
+    fn_body = src[fn_idx:fn_end]
+    assert "$shortcut.TargetPath = $TargetPath" in fn_body
+    assert "$shortcut.Save()" in fn_body
+    # Called from the -Tray branch with $dest -- the meridian-tray.exe path.
+    tray_idx = src.index("if ($Tray) {")
+    exit_idx = src.index("exit 0", tray_idx)
+    tray_block = src[tray_idx:exit_idx]
+    assert "New-MeridianStartMenuShortcut -TargetPath $dest" in tray_block
+
+
+def test_install_windows_ps1_registers_hkcu_uninstall_entry_with_documented_values():
+    """The real, current Microsoft-documented Uninstall registry key
+    convention (Settings > Apps / classic Add-or-Remove-Programs reads both
+    HKLM and HKCU under Software\\Microsoft\\Windows\\CurrentVersion\\
+    Uninstall\\<key>): DisplayName, DisplayVersion, Publisher,
+    UninstallString, InstallLocation, DisplayIcon, EstimatedSize are the
+    documented value names this installer sets. HKCU only -- no admin."""
+    src = _install_windows_ps1_src()
+    assert (
+        '$MeridianUninstallKeyPath = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Meridian"'
+        in src
+    )
+    assert "function Register-MeridianUninstallEntry" in src
+    for name in (
+        "DisplayName",
+        "DisplayVersion",
+        "Publisher",
+        "UninstallString",
+        "InstallLocation",
+        "DisplayIcon",
+        "EstimatedSize",
+        "NoModify",
+        "NoRepair",
+    ):
+        assert name in src, f"missing documented Uninstall registry value {name}"
+    # EstimatedSize/NoModify/NoRepair are REG_DWORD, not REG_SZ -- confirmed
+    # via the type-dispatch in Register-MeridianUninstallEntry.
+    assert '"DWord"' in src and '"String"' in src
+
+
+def test_install_windows_ps1_never_uses_hklm():
+    """Regression guard for the no-admin-required philosophy: this script
+    must never write to HKLM (that would require admin rights, a real
+    regression from the current design). Matches "HKLM:" (an actual registry
+    path prefix), not the bare word -- comments explaining why HKCU is used
+    instead legitimately mention "HKLM" in prose."""
+    src = _install_windows_ps1_src()
+    assert "HKLM:" not in src
+
+
+def test_install_windows_ps1_uninstall_entry_wired_into_normal_tray_install():
+    """Task requirement: the shortcut + registry registration happen as part
+    of a normal `-Tray` install, not as a separate opt-in step."""
+    src = _install_windows_ps1_src()
+    tray_idx = src.index("if ($Tray) {")
+    exit_idx = src.index("exit 0", tray_idx)
+    tray_block = src[tray_idx:exit_idx]
+    assert "New-MeridianStartMenuShortcut -TargetPath $dest" in tray_block
+    assert "Register-MeridianUninstallEntry -ExePath $dest -InstallDir $binDir" in tray_block
+    # Both calls happen after the download is verified, never before.
+    downloaded_idx = tray_block.index("if (-not $downloaded)")
+    shortcut_idx = tray_block.index("New-MeridianStartMenuShortcut -TargetPath $dest")
+    assert downloaded_idx < shortcut_idx
+
+
+def test_install_windows_ps1_uninstaller_copy_persists_for_later_invocation():
+    """UninstallString must point at something that still exists whenever the
+    user later clicks Uninstall -- including when the original install ran
+    via `irm | iex` with no local .ps1 file at all. Save-MeridianUninstallerCopy
+    prefers copying the actually-running local file and falls back to
+    re-downloading a fresh copy from the canonical URL."""
+    src = _install_windows_ps1_src()
+    assert "function Save-MeridianUninstallerCopy" in src
+    fn_idx = src.index("function Save-MeridianUninstallerCopy")
+    fn_end = src.index("\nfunction ", fn_idx + 1)
+    fn_body = src[fn_idx:fn_end]
+    assert "Copy-Item -LiteralPath $LocalSourcePath" in fn_body
+    assert "Invoke-WebRequest -Uri $MeridianTrayInstallerSelfUrl" in fn_body
+    # The UninstallString invokes the persisted copy with -Uninstall.
+    assert '-File `"$uninstallerPath`" -Uninstall' in src
+
+
+def test_install_windows_ps1_route_serves_uninstall_switch(client):
+    r = client.get("/install-windows.ps1")
+    assert r.status_code == 200
+    assert "[switch]$Uninstall" in r.text
+    assert "Register-MeridianUninstallEntry" in r.text

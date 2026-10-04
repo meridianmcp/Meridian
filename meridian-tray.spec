@@ -80,8 +80,15 @@ a = Analysis(
         'meridian',
         'meridian.tray_main',
         'meridian.__main__',
+        'meridian.setup_bundle',
+        'meridian.artifact_capture',
         'meridian.server',
         'meridian.local_runner',
+        # keyring resolves its native credential provider through package
+        # entry-point metadata at runtime. The tray's Zotero setup stores the
+        # optional web key only in the platform vault, so freeze that provider
+        # explicitly for the Windows/macOS release build.
+        'keyring.backends.macOS' if _IS_MACOS else 'keyring.backends.Windows',
         # pystray's platform backend is selected by a conditional import
         # inside pystray/__init__.py -- PyInstaller's static analysis should
         # already catch this, but declare it explicitly as a safety net,
@@ -93,6 +100,9 @@ a = Analysis(
         # Analysis step fail outright on that platform, so exactly one of
         # the two is ever listed, never both.
         'pystray._darwin' if _IS_MACOS else 'pystray._win32',
+        # Tk/pystray integration shares NSApplication on macOS. The Windows
+        # tray's one-instance guard uses the standard-library byte-lock API.
+        'AppKit' if _IS_MACOS else 'msvcrt',
         'PIL',
         'PIL.Image',
         'PIL.ImageDraw',
@@ -160,12 +170,9 @@ if _IS_MACOS:
     app = BUNDLE(
         coll,
         name='meridian-tray.app',
-        # No .icns yet -- meridian-tray.ico is a Windows icon format PyInstaller's
-        # BUNDLE() can't use directly on macOS. A real macOS app icon is a
-        # reasonable follow-up (flagged on sprint item 73257801), not required
-        # for an unsigned v1 .app -- omitting it just means the generic
-        # PyInstaller/Python rocket-ship icon shows in the menu bar/Finder.
-        icon=None,
+        # The macOS build task converts the shared Meridian mark into an ICNS
+        # iconset before PyInstaller evaluates this spec.
+        icon='dist/meridian-tray.icns',
         bundle_identifier='us.usemeridian.tray',
         info_plist={
             # Menu-bar-only app: no Dock icon, no Cmd-Tab entry -- this IS a

@@ -12136,6 +12136,124 @@
    }
   },
   {
+   "name": "G11_site_github_repo_query",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebSearch",
+    "tool_input": {
+     "query": "mcp server site:github.com"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G11",
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allowed_domains_github",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebSearch",
+    "tool_input": {
+     "query": "mcp server",
+     "allowed_domains": [
+      "github.com"
+     ]
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "deny",
+   "expected_rule": "G11",
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_allowed_domains_github_api_docs_allowed",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebSearch",
+    "tool_input": {
+     "query": "github API rate limits docs",
+     "allowed_domains": [
+      "api.github.com"
+     ]
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "name": "G11_github_site_lookalike_allowed",
+   "group": "G11",
+   "source": "rule",
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "replay-session",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "WebSearch",
+    "tool_input": {
+     "query": "mcp server site:github.com.evil"
+    },
+    "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
+   },
+   "snapshot_key": "indexed",
+   "fs_key": "machine_2026_09_26",
+   "env": {},
+   "expected_decision": "allow",
+   "expected_rule": null,
+   "state": {
+    "research_receipts": [
+     [
+      1790452500,
+      true
+     ]
+    ]
+   }
+  },
+  {
    "name": "G11_et_al_query",
    "group": "G11",
    "source": "rule",

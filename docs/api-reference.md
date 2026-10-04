@@ -907,6 +907,18 @@ No auth required.
 | `GET` | `/journal-style-presets` | 9c1a3fd2 -- catalog for the journal-preset picker on the document |
 
 
+### `/latex`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/latex/mcp/{tenant_id}` | Proxy requests to the tenant's meridian-latex server over the latex tunnel |
+| `OPTIONS` | `/latex/mcp/{tenant_id}` | Proxy requests to the tenant's meridian-latex server over the latex tunnel |
+| `POST` | `/latex/mcp/{tenant_id}` | Proxy requests to the tenant's meridian-latex server over the latex tunnel |
+| `GET` | `/latex/mcp/{tenant_id}/{rest:path}` | Proxy sub-path requests to the tenant's meridian-latex server |
+| `OPTIONS` | `/latex/mcp/{tenant_id}/{rest:path}` | Proxy sub-path requests to the tenant's meridian-latex server |
+| `POST` | `/latex/mcp/{tenant_id}/{rest:path}` | Proxy sub-path requests to the tenant's meridian-latex server |
+
+
 ### `/mcp`
 
 | Method | Path | Description |

@@ -63,6 +63,8 @@ from typing import Any
 _ARXIV_API = "https://export.arxiv.org/api/query"
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _OPENALEX_API = "https://api.openalex.org/works"
+# bd1cf318 — staged search shares one wall-clock budget across all query relaxations.
+_OPENALEX_STAGED_SEARCH_BUDGET_SECONDS = 15.0
 # 2e51a41a — Semantic Scholar (keyless, 100 req/min unauthenticated)
 _S2_PAPER_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 _S2_AUTHOR_API = "https://api.semanticscholar.org/graph/v1/author/search"
@@ -284,6 +286,116 @@ def parse_openalex_works(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
     return out
 
 
+def _openalex_query_stages(query: str) -> list[tuple[str, str]]:
+    """Build bounded relevance-first searches for ordinary multi-word queries.
+
+    Explicit Boolean/quoted queries and short queries preserve their caller-provided
+    semantics with one request. Plain queries with three or more terms first keep the
+    first two words together as a phrase, then require all words with AND, then relax to
+    OpenAlex's ordinary search string.
+    """
+    terms = query.split()
+    if (
+        len(terms) < 3
+        or '"' in query
+        or re.search(r"\b(?:AND|OR|NOT)\b", query, re.IGNORECASE)
+    ):
+        return [("loose", query)]
+
+    phrase = f'"{terms[0]} {terms[1]}"'
+    phrase_and = " AND ".join([phrase, *terms[2:]])
+    explicit_and = " AND ".join(terms)
+    stages = [("phrase_and", phrase_and)]
+    if explicit_and != phrase_and:
+        stages.append(("and", explicit_and))
+    if query != explicit_and:
+        stages.append(("loose", query))
+    return stages
+
+
+def _openalex_row_identity(row: dict[str, Any], ordinal: int) -> str:
+    """Stable dedup key across progressively broader OpenAlex query stages."""
+    for field in ("arxiv_id", "openalex_id", "doi", "url"):
+        value = row.get(field)
+        if isinstance(value, str) and value.strip():
+            return f"{field}:{value.strip().casefold()}"
+    title = " ".join(str(row.get("title") or "").split()).casefold()
+    return f"title:{title}" if title else f"anonymous:{ordinal}"
+
+
+async def _openalex_staged_rows(
+    query: str,
+    limit: int,
+    sort_by: Any,
+    *,
+    api_key: str = "",
+    filter_expr: str = "",
+    parser=parse_openalex_works,
+) -> tuple[list[dict[str, Any]], str]:
+    """Return relevance-first unique rows and the last stage that supplied them.
+
+    Each stage is attempted only when fewer than ``limit`` unique rows have been
+    collected. Failed strict stages degrade to the next stage. The full sequence shares
+    one wall-clock budget so relaxing search cannot multiply the tool's latency.
+    """
+    deadline = time.monotonic() + _OPENALEX_STAGED_SEARCH_BUDGET_SECONDS
+    rows: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    stage_used: str | None = None
+    last_error: Exception | None = None
+
+    for stage, stage_query in _openalex_query_stages(query):
+        if len(rows) >= limit:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            payload = await asyncio.wait_for(
+                _openalex_get_works(
+                    stage_query,
+                    limit,
+                    sort_by,
+                    api_key=api_key,
+                    filter_expr=filter_expr,
+                    budget=remaining,
+                ),
+                timeout=remaining,
+            )
+            stage_rows = parser(payload, limit)
+        except Exception as exc:  # noqa: BLE001 — a bad strict query should relax, not crash
+            last_error = exc
+            if _http_status(exc) == 429:
+                # A rate limit applies to the caller, not to this particular query string.
+                # Don't spend the remaining budget repeating the same denied search.
+                raise
+            continue
+
+        stage_used = stage
+        for row in stage_rows:
+            key = _openalex_row_identity(row, len(rows))
+            existing_index = positions.get(key)
+            if existing_index is None:
+                positions[key] = len(rows)
+                rows.append(dict(row))
+            else:
+                existing = rows[existing_index]
+                for field, value in row.items():
+                    if (
+                        existing.get(field) in (None, "", [], {})
+                        and value not in (None, "", [], {})
+                    ):
+                        existing[field] = value
+            if len(rows) >= limit:
+                break
+
+    if stage_used is None:
+        if last_error is not None:
+            raise last_error
+        raise TimeoutError("OpenAlex staged search exceeded its latency budget")
+    return rows[:limit], stage_used
+
+
 async def openalex_search(
     query: str, limit: int = 10, sort_by: str = "relevance"
 ) -> dict[str, Any]:
@@ -306,8 +418,9 @@ async def openalex_search(
     n = max(1, min(int(limit or 10), 50))
     api_key = _openalex_api_key()
     try:
-        payload = await _openalex_get_works(q, n, sort_by, api_key=api_key)
-        results = parse_openalex_works(payload, n)
+        results, query_stage = await _openalex_staged_rows(
+            q, n, sort_by, api_key=api_key,
+        )
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
         message = f"openalex search failed: {exc}"
         if _http_status(exc) == 429 and not api_key:
@@ -316,7 +429,12 @@ async def openalex_search(
                 "(free key: https://openalex.org/rest-api) for a higher limit"
             )
         return {"error": _redact(message, api_key), "query": q}
-    return {"query": q, "count": len(results), "results": results}
+    return {
+        "query": q,
+        "count": len(results),
+        "results": results,
+        "openalex_query_stage": query_stage,
+    }
 
 
 def _openalex_api_key() -> str:
@@ -324,7 +442,13 @@ def _openalex_api_key() -> str:
 
 
 async def _openalex_get_works(
-    q: str, n: int, sort_by: Any, *, api_key: str = "", filter_expr: str = ""
+    q: str,
+    n: int,
+    sort_by: Any,
+    *,
+    api_key: str = "",
+    filter_expr: str = "",
+    budget: float | None = None,
 ) -> Any:
     """GET OpenAlex ``/works?search=`` and return the decoded JSON; raises on failure.
 
@@ -345,7 +469,8 @@ async def _openalex_get_works(
     import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
     async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
         resp = await _fetch_with_backoff(
-            http, _OPENALEX_API, params, headers, retry_statuses=_TRANSIENT_STATUSES,
+            http, _OPENALEX_API, params, headers,
+            retry_statuses=_TRANSIENT_STATUSES, budget=budget,
         )
         return resp.json()
 
@@ -1156,19 +1281,29 @@ def parse_semantic_scholar_arxiv_papers(payload: Any, limit: int = 10) -> list[d
     return out
 
 
-async def _openalex_arxiv_rows(q: str, n: int, sort_by: Any) -> list[dict[str, Any]]:
+async def _openalex_arxiv_rows_staged(
+    q: str, n: int, sort_by: Any
+) -> tuple[list[dict[str, Any]], str]:
     """OpenAlex search restricted to works with an arXiv location; raises on failure.
 
     ``locations.source.id`` rather than ``primary_location.source.id``: the latter only
     matches preprint-only works and misses every arXiv paper that was later published
     (verified live 2026-09-27: 23,829 such works for 2023 alone).
     """
-    payload = await _openalex_get_works(
-        q, n, sort_by,
+    return await _openalex_staged_rows(
+        q,
+        n,
+        sort_by,
         api_key=_openalex_api_key(),
         filter_expr=f"locations.source.id:{_OPENALEX_ARXIV_SOURCE}",
+        parser=parse_openalex_arxiv_works,
     )
-    return parse_openalex_arxiv_works(payload, n)
+
+
+async def _openalex_arxiv_rows(q: str, n: int, sort_by: Any) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning arXiv-shaped rows without stage metadata."""
+    rows, _ = await _openalex_arxiv_rows_staged(q, n, sort_by)
+    return rows
 
 
 async def _semantic_scholar_arxiv_rows(q: str, n: int, sort_by: Any) -> list[dict[str, Any]]:
@@ -1232,7 +1367,7 @@ async def _arxiv_fallback_search(
     ``{error, query}`` with ``sources_tried`` added.
     """
     fallbacks = (
-        ("openalex", "OpenAlex", _openalex_arxiv_rows),
+        ("openalex", "OpenAlex", _openalex_arxiv_rows_staged),
         ("semantic_scholar", "Semantic Scholar", _semantic_scholar_arxiv_rows),
     )
     tried = ["arxiv"]
@@ -1240,7 +1375,11 @@ async def _arxiv_fallback_search(
     for name, label, fetch in fallbacks:
         tried.append(name)
         try:
-            rows = await fetch(q, n, sort_by)
+            fetched = await fetch(q, n, sort_by)
+            if name == "openalex":
+                rows, query_stage = fetched
+            else:
+                rows, query_stage = fetched, None
         except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
             detail = _describe_failure(exc)
             if name == "openalex" and _http_status(exc) == 429 and not _openalex_api_key():
@@ -1257,7 +1396,7 @@ async def _arxiv_fallback_search(
             warning += " Semantic Scholar cannot sort by date, so they are in relevance order."
         if failures:
             warning += " Also unavailable: " + "; ".join(failures) + "."
-        return {
+        result = {
             "query": q,
             "count": len(rows),
             "results": rows,
@@ -1265,6 +1404,9 @@ async def _arxiv_fallback_search(
             "warning": warning,
             "sources_tried": tried,
         }
+        if query_stage is not None:
+            result["openalex_query_stage"] = query_stage
+        return result
     return {
         "error": (
             f"arxiv search failed: arXiv was unreachable from this server ({arxiv_reason}) "

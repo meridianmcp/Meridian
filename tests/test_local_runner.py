@@ -108,7 +108,11 @@ def test_runner_status_as_dict_separates_child_local_mcp_tunnel():
         tunnel=lr.TunnelReadinessStatus(configured=False, label=None, state="not_configured", detail=""),
     )
     payload = status.as_dict()
-    assert set(payload) == {"scope", "generated_at", "child", "local_mcp", "tunnel", "warnings"}
+    assert set(payload) == {
+        "scope", "generated_at", "child", "local_mcp", "tunnel", "warnings",
+        "last_restart_reason",
+    }
+    assert payload["last_restart_reason"] is None
     assert payload["child"]["state"] == "not_started"
     assert payload["local_mcp"]["state"] == "not_configured"
     assert payload["tunnel"]["state"] == "not_configured"
@@ -1138,6 +1142,18 @@ def test_restart_replaces_the_child_and_increments_restart_count(state_dir, brok
         assert second.child.pid != first.child.pid
         assert second.child.restart_count == 1
         assert _wait_until(lambda: not _pid_alive(first.child.pid), timeout=5.0)
+
+
+def test_restart_reason_is_persisted_and_exposed_in_status(state_dir, broker):
+    scope = "restart-reason-scope"
+    with _make_runner(scope, _sleepy_cmd(), state_dir=state_dir, broker=broker) as runner:
+        runner.start()
+        restarted = runner.restart(reason="watchdog: hosted tunnel disconnected")
+        assert restarted.last_restart_reason == "watchdog: hosted tunnel disconnected"
+        assert restarted.as_dict()["last_restart_reason"] == "watchdog: hosted tunnel disconnected"
+
+        recovered = _make_runner(scope, None, state_dir=state_dir, broker=broker)
+        assert recovered.status().last_restart_reason == "watchdog: hosted tunnel disconnected"
 
 
 def test_restart_without_a_prior_record_behaves_like_a_fresh_start(state_dir):

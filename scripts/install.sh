@@ -3,6 +3,7 @@ set -e
 
 REPO="https://github.com/meridianmcp/Meridian.git"
 INSTALL_DIR="$HOME/.meridian"
+TARGET_REPO="$(pwd -P)"
 
 echo "Installing Meridian..."
 
@@ -18,6 +19,10 @@ if command -v uv >/dev/null 2>&1; then
     echo "Installed meridian-server with uv."
     echo "If 'meridian' isn't found, run: uv tool update-shell  (then restart your shell)"
     echo "Run: meridian --tunnel --repo ."
+    echo "Configuring the Meridian MCP bundle for this repository..."
+    if ! uv tool run --from meridian-server meridian setup --repo "$TARGET_REPO"; then
+      echo "warning: MCP bundle setup reported a conflict or error; run 'meridian setup --repo \"$TARGET_REPO\"' to retry." >&2
+    fi
     exit 0
   fi
   echo "uv tool install failed; falling back to source install." >&2
@@ -80,3 +85,7 @@ chmod +x "$HOME/.local/bin/meridian"
 echo ""
 echo "Meridian installed. Run: meridian"
 echo "Dashboard: http://localhost:7878/dashboard"
+echo "Configuring the Meridian MCP bundle for this repository..."
+if ! pixi run python -m meridian setup --repo "$TARGET_REPO"; then
+  echo "warning: MCP bundle setup reported a conflict or error; run 'meridian setup --repo \"$TARGET_REPO\"' to retry." >&2
+fi

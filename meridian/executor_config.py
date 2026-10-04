@@ -419,6 +419,24 @@ def merge_repo_paths(
     return out
 
 
+MAX_CHECKPOINT_TURNS = 10000
+
+
+def normalize_checkpoint_turns(value: Any) -> int | None:
+    """Return a safe prompt-turn checkpoint interval; zero disables it."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        turns = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not 0 <= turns <= MAX_CHECKPOINT_TURNS:
+        return None
+    return turns
+
+
 def normalize_executor_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     """Keep only the supported executor_config keys."""
     if not isinstance(raw, dict):
@@ -428,7 +446,11 @@ def normalize_executor_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         value = raw.get(key)
         if value is None:
             continue
-        if isinstance(value, str):
+        if key == "checkpoint_turns":
+            value = normalize_checkpoint_turns(value)
+            if value is None:
+                continue
+        elif isinstance(value, str):
             value = value.strip()
             if not value:
                 continue
