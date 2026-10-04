@@ -23,7 +23,7 @@ beforeEach(async () => {
   fakeDistributionRoots = {
     TEXMFDIST: fakeDistributionRoot,
     TEXMFROOT: toolsDirectory,
-    TEXMFMAIN: fakeDistributionRoot,
+    TEXMFMAIN: join(toolsDirectory, "texmf-main"),
     TEXMFSYSVAR: join(toolsDirectory, "texmf-var"),
     TEXMFSYSCONFIG: join(toolsDirectory, "texmf-config"),
     TEXMFLOCAL: join(toolsDirectory, "texmf-local"),
@@ -739,6 +739,36 @@ test("the active engine's kpsewhich TEXMFDIST is accepted as the distribution ro
   assert.ok(kpsewhichCall);
   assert.equal(kpsewhichCall!.cwd, dirname(kpsewhichCall!.executable), "kpsewhich runs from the active engine's binary directory");
   assert.ok(!receipt.limitations.some((limitation) => limitation.includes("distribution roots cannot be verified")));
+});
+
+test("the active engine's kpsewhich TEXMFMAIN is accepted as a distinct distribution root", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const systemMainInput = join(fakeDistributionRoots.TEXMFMAIN, "tex", "latex", "main-tree.sty");
+  await mkdir(dirname(systemMainInput), { recursive: true });
+  await writeFile(systemMainInput, "verified TEXMFMAIN input", "utf8");
+  const fake = fakeRunner("pdflatex", [systemMainInput]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+  const mainLookup = fake.calls.find((call) => basename(call.executable).toLowerCase().replace(/\.exe$/, "") === "kpsewhich" && call.args[0] === "--var-value=TEXMFMAIN");
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(mainLookup, "the active engine's kpsewhich resolves TEXMFMAIN");
+  assert.ok(!receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
+});
+
+test("the active engine's kpsewhich TEXMFSYSCONFIG is accepted as a distribution root", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const systemConfigInput = join(fakeDistributionRoots.TEXMFSYSCONFIG, "web2c", "texmf.cnf");
+  await mkdir(dirname(systemConfigInput), { recursive: true });
+  await writeFile(systemConfigInput, "verified TEXMFSYSCONFIG input", "utf8");
+  const fake = fakeRunner("pdflatex", [systemConfigInput]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+  const configLookup = fake.calls.find((call) => basename(call.executable).toLowerCase().replace(/\.exe$/, "") === "kpsewhich" && call.args[0] === "--var-value=TEXMFSYSCONFIG");
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(configLookup, "the active engine's kpsewhich resolves TEXMFSYSCONFIG");
+  assert.ok(!receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
 });
 
 test("compiler and kpsewhich use the same PATH-resolved engine despite a same-name project executable", async () => {
