@@ -66,6 +66,7 @@ from ._deps import (
     _render_workspace_block,
     _render_context_block,
 )
+from .pid_probe import pid_is_alive
 
 # The slowapi Limiter is a process-singleton in ._deps so extracted routers can
 # apply _rate_limit at import time. The test suite reloads THIS module to get a
@@ -667,11 +668,10 @@ async def lifespan(app: FastAPI):
                         pid = t.get("worker_pid")
                         if pid is None:
                             continue
-                        try:
-                            os.kill(int(pid), 0)  # 0 = check existence only
-                        except (ProcessLookupError, PermissionError, OSError):
-                            # PID is dead — mark the task failed
-                            # OSError covers Windows WinError 87 for non-existent PIDs
+                        if not pid_is_alive(int(pid)):
+                            # PID is dead — mark the task failed. Use the
+                            # shared cross-platform probe: os.kill(pid, 0) on
+                            # Windows can emit a console CTRL+C event.
                             await db_module.update_task(
                                 db, t["id"],
                                 status="failed",

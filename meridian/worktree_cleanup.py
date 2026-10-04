@@ -44,6 +44,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .pid_probe import pid_is_alive
+
 logger = logging.getLogger(__name__)
 
 
@@ -190,23 +192,8 @@ def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
 
 
 def _pid_is_alive(pid: int) -> bool:
-    """Liveness check for a recorded worktree-owner PID.
-
-    Mirrors the exact catch tuple the existing task_log PID watchdog uses
-    (meridian/server.py's ``_auto_summary_loop``) so this repo has ONE
-    liveness-check convention, not two subtly different ones:
-    ``os.kill(pid, 0)`` signals nothing (signal 0), it only probes whether
-    the OS will let us address the PID at all. ``ProcessLookupError`` means
-    the PID is genuinely gone; ``PermissionError``/other ``OSError`` (incl.
-    Windows' WinError 87 for a non-existent PID) are both treated the same
-    as "not alive" here, matching the established repo-wide precedent rather
-    than inventing a new interpretation for this one call site.
-    """
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
+    """Liveness check for a recorded worktree-owner PID."""
+    return pid_is_alive(pid)
 
 
 def validate_worktree_cleanup_target(

@@ -51,6 +51,8 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from .pid_probe import pid_is_alive
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -164,16 +166,8 @@ def plan_worktree_cache_cleanup(worktree_root: "str | Path") -> dict[str, Any]:
 
 
 def _pid_is_alive(pid: int) -> bool:
-    """Liveness probe. Mirrors ``worktree_cleanup._pid_is_alive``'s exact
-    catch tuple (kept as a small, independent copy here rather than an
-    import — this module and worktree_cleanup.py cover distinct concerns
-    and neither should have to import the other just for a five-line
-    liveness check)."""
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
+    """Liveness probe shared with the repo's other cleanup paths."""
+    return pid_is_alive(pid)
 
 
 def execute_worktree_cache_cleanup(

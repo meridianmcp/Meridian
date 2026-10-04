@@ -995,9 +995,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Pass before_sequence for older records. A pointer is resolved only in the owning project and only when its stored hash verifies.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "limit": {"type": "integer", "minimum": 1, "maximum": 100},
          "before_sequence": {"type": "integer", "minimum": 1}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "register_external_job", "description":
         "Create or reaffirm a project-scoped record for long-running external work "
         "such as RunPod, SSH, Slurm, or CI. Meridian records the opaque external "
@@ -1348,8 +1349,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "workstation's Zotero API.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "max_items": {"type": "integer", "minimum": 1, "maximum": 500}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "apply_zotero_citation_edges", "description":
         "Apply workstation-resolved Zotero items to existing citation markers. "
         "The hosted handler revalidates every marker id/ref within project_id "
@@ -1357,6 +1359,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "local paths, or credentials; attachment provenance stays local.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "selected_collection_keys": {"type": "array", "maxItems": 100,
              "items": {"type": "string"}},
          "resolutions": {"type": "array", "maxItems": 500, "items": {
@@ -1370,7 +1373,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                  "version": {"type": ["integer", "null"]},
                  "collection_keys": {"type": "array", "items": {"type": "string"}}},
              "required": ["element_id", "ref", "zotero_key"]}}},
-         "required": ["project_id", "resolutions"]}},
+         "required": ["resolutions"]}},
     {"name": "index_equation", "description":
         "06df6ab3 — index ONE Word equation (OMML) against a document already "
         "stored in the doc-structure store — populated by ingest_document (which "

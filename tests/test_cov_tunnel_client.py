@@ -2320,6 +2320,12 @@ def test_run_tunnel_no_staleness_warning_masks_no_plugins_error(monkeypatch, tmp
     monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
     monkeypatch.setattr(tc, "_tunnel_client_commit_hash_sync", lambda *a, **k: "cafef00d1234")
     monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
+    # run_tunnel's startup orphan sweep is unrelated to the no-plugins guard.
+    # Keep this integration test away from the developer's durable PID registry
+    # and its Serena lease files; those have dedicated focused coverage.
+    monkeypatch.setattr(
+        tc, "_all_spawned_registry_path", lambda: tmp_path / "spawned_pids.json"
+    )
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={

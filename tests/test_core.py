@@ -1185,7 +1185,7 @@ def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     }
     # 02dbd8b4 — config_generation/inflight/safe_to_restart are always present
     # (empty/True for a tenant with no recorded runtime config generation yet).
-    assert body == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}, "config_generation": {}, "inflight": {}, "safe_to_restart": True}
+    assert body == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "latex_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}, "config_generation": {}, "inflight": {}, "safe_to_restart": True}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):
@@ -3401,6 +3401,17 @@ async def test_dispatch_project_scoped_tool_with_only_project_name(db):
         "get_sprint_items", {"project_name": "only-by-name-proj"}, db, "/tmp"
     )
     assert any(it["id"] == added["id"] for it in items)
+
+    # get_project_state_milestones follows the same project-name resolution
+    # contract as other read-only project-scoped tools.
+    milestones = await srv._dispatch_mcp_tool(
+        "get_project_state_milestones",
+        {"project_name": "only-by-name-proj"},
+        db,
+        "/tmp",
+    )
+    assert milestones["project_id"] == p["id"]
+    assert milestones["milestones"] == []
 
 
 @pytest.mark.asyncio
@@ -7350,6 +7361,8 @@ async def test_in_progress_status_set_on_spawn(db):
 @pytest.mark.asyncio
 async def test_watchdog_marks_dead_pid_failed(db):
     """get_in_progress_tasks_with_pid returns rows; update_task marks them failed."""
+    from meridian.pid_probe import pid_is_alive
+
     proj = await db_module.create_project(db, "watchdog-test")
     sess = await db_module.register_session(db, proj["id"], "s")
     task = await db_module.log_task(db, sess["id"], proj["id"], "work", "pending")
@@ -7366,10 +7379,7 @@ async def test_watchdog_marks_dead_pid_failed(db):
         pid = t.get("worker_pid")
         if pid is None:
             continue
-        try:
-            os.kill(int(pid), 0)
-        except (ProcessLookupError, PermissionError, OSError):
-            # OSError covers Windows WinError 87 for non-existent PIDs
+        if not pid_is_alive(int(pid)):
             await db_module.update_task(db, t["id"], status="failed",
                 description=f"[claude-error] worker process died unexpectedly (PID {pid})")
 
@@ -8576,10 +8586,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_lock_session_id",
         "_migrate_pg_sprint_item_coarse_lock_files",
         "_migrate_pg_backfill_finding_note_kind",
+        "_migrate_pg_project_state_milestones",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 174
+    assert len(allnames) == len(set(allnames)) == 175
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
