@@ -2,10 +2,10 @@ import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open as openFile, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { compileLocalLatex, getLatestCompileReceiptSummary, getWorkflowStatusPayload, runBoundedCommand, type CommandResult, type CommandRunner, type LatexEngine } from "./overleaf-workflow.js";
 
@@ -28,6 +28,16 @@ async function project(files: Record<string, string>): Promise<{ root: string; s
 
 function fakeRunner(engine: LatexEngine, extraRecordedInputs: string[] = []) {
   const calls: Array<{ executable: string; args: string[]; cwd: string }> = [];
+  const rebaseProjectInput = (path: string, cwd: string): string => {
+    if (!isAbsolute(path)) return path;
+    let ancestor = path;
+    while (true) {
+      if (basename(ancestor).startsWith("meridian-latex-project-")) return join(cwd, relative(ancestor, path));
+      const parent = dirname(ancestor);
+      if (parent === ancestor) return path;
+      ancestor = parent;
+    }
+  };
   const runCommand = async (executable: string, args: string[], cwd: string): Promise<CommandResult> => {
     calls.push({ executable, args, cwd });
     if (args[0] === "--version") {
@@ -41,7 +51,7 @@ function fakeRunner(engine: LatexEngine, extraRecordedInputs: string[] = []) {
       const jobName = basename(rootFile).replace(/\.tex$/i, "");
       await writeFile(join(outDir, `${jobName}.pdf`), "%PDF-fake receipt test\n");
       await writeFile(join(outDir, `${jobName}.log`), "Fake compiler completed.\n");
-      const recordedInputs = [rootFile, ...extraRecordedInputs];
+      const recordedInputs = [rootFile, ...extraRecordedInputs.map((path) => rebaseProjectInput(path, cwd))];
       try {
         await readFile(join(cwd, "references.bib"));
         recordedInputs.push(join(cwd, "references.bib"));
@@ -78,6 +88,48 @@ test("compile receipt hashes transitive TeX and BibTeX inputs while preserving n
   assert.equal(receipt.root_file, "main.tex");
   assert.ok(receipt.source_manifest.files.every((file) => !file.path.includes(root)), "manifest paths are project-relative");
   assert.ok(receipt.output.pdf_path?.includes("build"), "local CLI receipt points to the local build artifact");
+});
+
+test("project search paths keep their order while pointing at the compile snapshot", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}Stable\\end{document}\n",
+    "macros/local.tex": "Macro.\n",
+    "styles/custom.sty": "\\ProvidesPackage{custom}\n",
+    "bib/references.bib": "@book{key,title={Example}}\n",
+    "bst/local.bst": "STYLE\n",
+  });
+  const previous = {
+    tex: process.env.TEXINPUTS,
+    bib: process.env.BIBINPUTS,
+    bst: process.env.BSTINPUTS,
+  };
+  process.env.TEXINPUTS = join(root, "macros") + delimiter + join(root, "styles");
+  process.env.BIBINPUTS = join(root, "bib");
+  process.env.BSTINPUTS = "bst";
+  let compileCwd = "";
+  let compileEnv: NodeJS.ProcessEnv | undefined;
+  const fake = fakeRunner("pdflatex");
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    if (executable === "pdflatex" && args[0] !== "--version") {
+      compileCwd = cwd;
+      compileEnv = env;
+    }
+    return fake.runCommand(executable, args, cwd);
+  };
+  try {
+    const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+    assert.equal(receipt.status, "passed");
+    assert.equal(compileEnv?.TEXINPUTS, join(compileCwd, "macros") + delimiter + join(compileCwd, "styles"));
+    assert.equal(compileEnv?.BIBINPUTS, compileCwd + delimiter + join(compileCwd, "bib"));
+    assert.equal(compileEnv?.BSTINPUTS, join(compileCwd, "bst"));
+  } finally {
+    if (previous.tex === undefined) delete process.env.TEXINPUTS;
+    else process.env.TEXINPUTS = previous.tex;
+    if (previous.bib === undefined) delete process.env.BIBINPUTS;
+    else process.env.BIBINPUTS = previous.bib;
+    if (previous.bst === undefined) delete process.env.BSTINPUTS;
+    else process.env.BSTINPUTS = previous.bst;
+  }
 });
 
 test("biblatex addbibresource selects Biber and records a local compile receipt summary", async () => {
@@ -464,7 +516,7 @@ test("source changes during compile produce an incomplete receipt", async () => 
   assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
 });
 
-test("unbraced input changes during compile invalidate the precompile source baseline", async () => {
+test("unbraced input changes during compile retain the exact snapshot hash", async () => {
   const { root, state } = await project({
     "main.tex": "\\begin{document}\\input chapter\\end{document}\n",
     "chapter.tex": "Before compile.\n",
@@ -484,11 +536,11 @@ test("unbraced input changes during compile invalidate the precompile source bas
 
   assert.equal(receipt.status, "incomplete");
   assert.equal(receipt.source_manifest.complete, false);
-  assert.equal(receipt.source_manifest.files.find((file) => file.path === "chapter.tex")?.sha256, createHash("sha256").update("Changed during compile.\n").digest("hex"));
+  assert.equal(receipt.source_manifest.files.find((file) => file.path === "chapter.tex")?.sha256, createHash("sha256").update("Before compile.\n").digest("hex"));
   assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
 });
 
-test("recorder-only local inputs changed during compile invalidate their bounded precompile baseline", async () => {
+test("recorder-only local inputs changed during compile retain the exact snapshot hash", async () => {
   const { root, state } = await project({
     "main.tex": "\\begin{document}No lexical input reference.\\end{document}\n",
     "chapter.tex": "Recorder-only input.\n",
@@ -508,7 +560,7 @@ test("recorder-only local inputs changed during compile invalidate their bounded
 
   assert.equal(receipt.status, "incomplete");
   assert.equal(receipt.source_manifest.complete, false);
-  assert.ok(receipt.source_manifest.files.some((file) => file.path === "chapter.tex"));
+  assert.equal(receipt.source_manifest.files.find((file) => file.path === "chapter.tex")?.sha256, createHash("sha256").update("Recorder-only input.\n").digest("hex"));
   assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
 });
 
@@ -532,11 +584,11 @@ test("deleted recorder-only local inputs keep the source manifest incomplete", a
 
   assert.equal(receipt.status, "incomplete");
   assert.equal(receipt.source_manifest.complete, false);
-  assert.ok(receipt.source_manifest.unresolved_count > 0);
-  assert.ok(!receipt.source_manifest.files.some((file) => file.path === "chapter.tex"));
+  assert.equal(receipt.source_manifest.files.find((file) => file.path === "chapter.tex")?.sha256, createHash("sha256").update("Recorder-only input.\n").digest("hex"));
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
 });
 
-test("change then restore during compilation is detected even when final hashes match", async () => {
+test("change then restore in the live project cannot change the compiled snapshot bytes", async () => {
   const original = "Recorder-only input.\n";
   const { root, state } = await project({
     "main.tex": "\\begin{document}No lexical input reference.\\end{document}\n",
@@ -545,10 +597,12 @@ test("change then restore during compilation is detected even when final hashes 
   const chapterPath = join(root, "chapter.tex");
   const fake = fakeRunner("pdflatex", [chapterPath]);
   let changed = false;
+  let compiledChapter = "";
   const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
     const result = await fake.runCommand(executable, args, cwd);
     if (executable === "pdflatex" && args[0] !== "--version" && !changed) {
       changed = true;
+      compiledChapter = await readFile(join(cwd, "chapter.tex"), "utf8");
       await writeFile(chapterPath, "Transient contents seen during compilation.\n", "utf8");
       await writeFile(chapterPath, original, "utf8");
     }
@@ -556,13 +610,95 @@ test("change then restore during compilation is detected even when final hashes 
   };
   const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
 
-  assert.equal(receipt.status, "incomplete");
-  assert.equal(receipt.source_manifest.complete, false);
+  assert.equal(compiledChapter, original);
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
   assert.equal(receipt.source_manifest.files.find((file) => file.path === "chapter.tex")?.sha256, createHash("sha256").update(original).digest("hex"));
-  assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
 });
 
-test("precompile source snapshot fails closed when directory traversal reaches its limit", async () => {
+test("compile snapshot write protection blocks edits or fails the receipt closed", async () => {
+  const original = "\\begin{document}Stable\\end{document}\n";
+  const { root, state } = await project({ "main.tex": original });
+  const fake = fakeRunner("pdflatex");
+  let snapshotWriteSucceeded = false;
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    const result = await fake.runCommand(executable, args, cwd);
+    if (executable === "pdflatex" && args[0] !== "--version") {
+      try {
+        await writeFile(join(cwd, "main.tex"), "Transient snapshot tamper.\n", "utf8");
+        snapshotWriteSucceeded = true;
+        await writeFile(join(cwd, "main.tex"), original, "utf8");
+      } catch {
+        // Expected when the filesystem enforced snapshot write protection.
+      }
+    }
+    return result;
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  if (process.platform === "win32") assert.equal(snapshotWriteSucceeded, false, "the Windows snapshot ACL blocks TeX-side edits");
+  if (snapshotWriteSucceeded) {
+    assert.equal(receipt.status, "incomplete");
+    assert.equal(receipt.source_manifest.complete, false);
+  } else {
+    assert.equal(receipt.status, "passed");
+    assert.equal(receipt.source_manifest.complete, true);
+  }
+});
+
+test("recorder paths that bypass the immutable project snapshot make the manifest incomplete", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}Stable\\end{document}\n",
+    "chapter.tex": "Local recorder input.\n",
+  });
+  const chapterPath = join(root, "chapter.tex");
+  const fake = fakeRunner("pdflatex");
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    const result = await fake.runCommand(executable, args, cwd);
+    if (executable === "pdflatex" && args[0] !== "--version") {
+      const outputArg = args.find((arg) => arg.startsWith("-output-directory="))!;
+      const flsPath = join(outputArg.slice("-output-directory=".length), "main.fls");
+      const fls = await readFile(flsPath, "utf8");
+      await writeFile(flsPath, fls + "INPUT " + chapterPath + "\n", "utf8");
+    }
+    return result;
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("original project path outside the compile snapshot")));
+});
+
+test("recorder inputs outside the snapshot and TeX distribution fail closed regardless of extension", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const outside = await mkdtemp(join(tmpdir(), "meridian-latex-outside-"));
+  temporaryDirectories.push(outside);
+  const externalInput = join(outside, "runtime-data.bin");
+  await writeFile(externalInput, "external recorder input", "utf8");
+  const fake = fakeRunner("pdflatex", [externalInput]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.source_manifest.unresolved_count > 0);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
+});
+
+test("bounded snapshot streaming stops at the aggregate byte limit", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const oversized = await openFile(join(root, "large.bin"), "w");
+  await oversized.truncate(64 * 1024 * 1024 + 1);
+  await oversized.close();
+  const fake = fakeRunner("pdflatex");
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("byte limit (67108864)")));
+});
+
+test("compile snapshot fails closed when directory traversal reaches its limit", async () => {
   const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
   await Promise.all(Array.from({ length: 4_097 }, (_, index) => mkdir(join(root, `empty-${index}`))));
   const fake = fakeRunner("pdflatex");

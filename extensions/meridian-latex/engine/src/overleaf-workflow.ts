@@ -10,7 +10,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { watch, type FSWatcher } from "node:fs";
+import { constants } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -65,6 +65,11 @@ export type CommandRunner = (executable: string, args: string[], cwd: string, ti
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_CAPTURED_OUTPUT = 1_000_000;
+const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+const MAX_SNAPSHOT_FILES = 20_000;
+const MAX_SNAPSHOT_DIRECTORIES = 4_096;
+const MAX_SNAPSHOT_ENTRIES = 100_000;
+const SNAPSHOT_READ_CHUNK_BYTES = 64 * 1024;
 const ENGINE_NAMES: LatexEngine[] = ["pdflatex", "xelatex", "lualatex"];
 const GRAPHICS_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".eps", ".svg"];
 const GRAPHICS_COMMANDS = new Set(["includegraphics"]);
@@ -95,23 +100,55 @@ interface CollectedSources {
   bibliographyBackend: BibliographyBackend;
 }
 
-interface RecorderBaseline {
+interface CompileSnapshot {
+  sourceRoot: string;
   files: Map<string, string>;
+  directories: string[];
   complete: boolean;
   limitReason: string | null;
 }
 
-interface SourceChangeMonitorResult {
-  changed: boolean;
-  unavailable: boolean;
+interface SnapshotProtection {
+  enforced: boolean;
+  reason: string | null;
+  release(): Promise<boolean>;
 }
 
-interface SourceChangeMonitor {
-  finish(): Promise<SourceChangeMonitorResult>;
+interface ProcessOutput {
+  exitCode: number | null;
+  stdout: string;
+}
+
+interface RecorderPaths {
+  inputs: string[];
+  bypassedProjectInputs: string[];
+  externalInputs: string[];
 }
 
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function readFileBounded(path: string, maximumBytes: number): Promise<Buffer> {
+  const file = await fs.open(path, "r");
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const remaining = maximumBytes - totalBytes;
+      // Read at most one byte beyond the remaining allowance to distinguish
+      // an exactly-at-limit file from a file that grew while it was being read.
+      const buffer = Buffer.allocUnsafe(Math.min(SNAPSHOT_READ_CHUNK_BYTES, remaining + 1));
+      const { bytesRead } = await file.read(buffer, 0, buffer.byteLength, null);
+      if (bytesRead === 0) break;
+      if (bytesRead > remaining) throw new Error("file exceeds bounded read limit (" + maximumBytes + " bytes)");
+      chunks.push(buffer.subarray(0, bytesRead));
+      totalBytes += bytesRead;
+    }
+    return Buffer.concat(chunks, totalBytes);
+  } finally {
+    await file.close();
+  }
 }
 
 function inside(root: string, candidate: string): boolean {
@@ -414,7 +451,7 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
   const queuedSet = new Set(queued);
 
   const addFile = async (file: string, kind: CompileManifestFile["kind"]): Promise<string> => {
-    const data = await fs.readFile(file);
+    const data = await readFileBounded(file, MAX_SNAPSHOT_BYTES);
     const entry = { path: safeRelativePath(realRoot, file), kind, sha256: sha256(data), size_bytes: data.byteLength };
     files.set(file, entry);
     if (["tex", "class", "style"].includes(kind)) sourceTexts.set(file, data.toString("utf8"));
@@ -657,29 +694,147 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
   return { rootFile: realMain, projectRoot: realRoot, files, sourceTexts, unresolved, bibliographyBackend };
 }
 
-async function captureRecorderBaseline(
+async function runProcess(executable: string, args: string[]): Promise<ProcessOutput> {
+  return new Promise((resolveResult) => {
+    let stdout = "";
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (exitCode: number | null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolveResult({ exitCode, stdout });
+    };
+    let child;
+    try {
+      child = spawn(executable, args, { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      finish(null);
+      return;
+    }
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout = (stdout + chunk.toString("utf8")).slice(-8_192);
+    });
+    timer = setTimeout(() => {
+      child.kill();
+      finish(null);
+    }, 15_000);
+    child.once("error", () => finish(null));
+    child.once("close", (code) => finish(code));
+  });
+}
+
+async function hashFileStream(path: string, maximumBytes = MAX_SNAPSHOT_BYTES): Promise<string> {
+  const file = await fs.open(path, "r");
+  const digest = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(SNAPSHOT_READ_CHUNK_BYTES);
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const remaining = maximumBytes - totalBytes;
+      const readLength = Math.min(buffer.byteLength, remaining + 1);
+      const { bytesRead } = await file.read(buffer, 0, readLength, null);
+      if (bytesRead === 0) break;
+      if (bytesRead > remaining) throw new Error("file exceeds bounded hash limit (" + maximumBytes + " bytes)");
+      digest.update(buffer.subarray(0, bytesRead));
+      totalBytes += bytesRead;
+    }
+    return digest.digest("hex");
+  } finally {
+    await file.close();
+  }
+}
+
+function sameFileIdentity(left: { dev: number; ino: number }, right: { dev: number; ino: number }): boolean {
+  return left.dev === right.dev && left.ino !== 0 && left.ino === right.ino;
+}
+
+async function copyFileStream(source: string, target: string, projectRoot: string, remainingBytes: number): Promise<{ hash: string; bytes: number }> {
+  const linkStat = await fs.lstat(source);
+  if (!linkStat.isFile() || linkStat.isSymbolicLink()) throw new Error("source path is not a regular file");
+  const actualSource = await fs.realpath(source);
+  if (!inside(projectRoot, actualSource)) throw new Error("source path escaped the project root");
+  const sourceFile = await fs.open(actualSource, process.platform === "win32"
+    ? "r"
+    : constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let targetFile;
+  try {
+    const openedStat = await sourceFile.stat();
+    if (!openedStat.isFile() || !sameFileIdentity(linkStat, openedStat)) throw new Error("source path changed while opening");
+    await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    targetFile = await fs.open(target, "wx", 0o600);
+    const buffer = Buffer.allocUnsafe(SNAPSHOT_READ_CHUNK_BYTES);
+    const digest = createHash("sha256");
+    let bytes = 0;
+    while (true) {
+      const remaining = remainingBytes - bytes;
+      const readLength = Math.min(buffer.byteLength, remaining + 1);
+      const { bytesRead } = await sourceFile.read(buffer, 0, readLength, null);
+      if (bytesRead === 0) break;
+      if (bytesRead > remaining) throw new Error("byte limit (" + MAX_SNAPSHOT_BYTES + ")");
+      const chunk = buffer.subarray(0, bytesRead);
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await targetFile.write(chunk, written, bytesRead - written, null);
+        if (result.bytesWritten <= 0) throw new Error("snapshot write made no progress");
+        written += result.bytesWritten;
+      }
+      digest.update(chunk);
+      bytes += bytesRead;
+    }
+    return { hash: digest.digest("hex"), bytes };
+  } finally {
+    await sourceFile.close();
+    if (targetFile) await targetFile.close();
+  }
+}
+
+async function captureCompileSnapshot(
   projectRoot: string,
-  initialFiles: Map<string, CompileManifestFile>,
-  buildDir: string,
-): Promise<RecorderBaseline> {
+  rootFile: string,
+  snapshotRoot: string,
+  excludedBuildDir: string,
+): Promise<CompileSnapshot> {
   const root = await fs.realpath(projectRoot);
-  const baseline = new Map([...initialFiles].map(([path, file]) => [path, file.sha256]));
+  const main = await fs.realpath(rootFile);
+  if (!inside(root, main)) throw new Error("root .tex file must be inside the selected project root");
+  const relativeMain = relative(root, main);
+  const files = new Map<string, string>();
+  const directories = new Set<string>([""]);
   const pending = [root];
-  const visitedDirectories = new Set(pending);
-  const excludedBuildDir = resolve(buildDir);
+  const visitedDirectories = new Set<string>([root]);
+  const excluded = resolve(excludedBuildDir);
   let scannedDirectories = 0;
   let scannedEntries = 0;
-  let scannedFiles = 0;
   let scannedBytes = 0;
   let limitReason: string | null = null;
-  const maximumDirectories = 4_096;
-  const maximumEntries = 100_000;
-  const maximumFiles = 20_000;
-  const maximumBytes = 64 * 1024 * 1024;
+  await fs.mkdir(snapshotRoot, { recursive: true, mode: 0o700 });
+
+  const copyOne = async (source: string, relativePath: string): Promise<void> => {
+    if (files.has(relativePath)) return;
+    if (files.size >= MAX_SNAPSHOT_FILES) {
+      limitReason = "file limit (" + MAX_SNAPSHOT_FILES + ")";
+      return;
+    }
+    try {
+      const copied = await copyFileStream(source, join(snapshotRoot, relativePath), root, MAX_SNAPSHOT_BYTES - scannedBytes);
+      scannedBytes += copied.bytes;
+      files.set(relativePath, copied.hash);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "source copy failed";
+      limitReason = message.startsWith("byte limit") ? message : "unsafe or unreadable source file";
+      await fs.rm(join(snapshotRoot, relativePath), { force: true }).catch(() => undefined);
+    }
+  };
+
+  await copyOne(main, relativeMain);
+  if (!files.has(relativeMain)) {
+    throw new Error("root .tex file could not be copied into the bounded compile snapshot: " + (limitReason ?? "unknown error"));
+  }
 
   while (pending.length > 0 && !limitReason) {
-    if (scannedDirectories >= maximumDirectories) {
-      limitReason = `directory limit (${maximumDirectories})`;
+    if (scannedDirectories >= MAX_SNAPSHOT_DIRECTORIES) {
+      limitReason = "directory limit (" + MAX_SNAPSHOT_DIRECTORIES + ")";
       break;
     }
     scannedDirectories += 1;
@@ -688,98 +843,219 @@ async function captureRecorderBaseline(
     try {
       directory = await fs.opendir(directoryPath);
     } catch {
-      continue;
+      limitReason = "unreadable project directory";
+      break;
     }
     for await (const entry of directory) {
-      if (scannedEntries >= maximumEntries) {
-        limitReason = `entry limit (${maximumEntries})`;
+      if (scannedEntries >= MAX_SNAPSHOT_ENTRIES) {
+        limitReason = "entry limit (" + MAX_SNAPSHOT_ENTRIES + ")";
         break;
       }
       scannedEntries += 1;
       const child = join(directoryPath, entry.name);
-      if (entry.isSymbolicLink() || inside(excludedBuildDir, child)) continue;
+      if (inside(excluded, child)) continue;
+      if (entry.isSymbolicLink()) {
+        limitReason = "symbolic link encountered";
+        break;
+      }
       if (entry.isDirectory()) {
-        if ([".git", "node_modules"].includes(entry.name)) continue;
+        if (entry.name === ".git" || entry.name.toLowerCase() === "node_modules") continue;
         try {
+          const linkStat = await fs.lstat(child);
+          if (!linkStat.isDirectory() || linkStat.isSymbolicLink()) {
+            limitReason = "unsafe project directory entry";
+            break;
+          }
           const actualDirectory = await fs.realpath(child);
-          if (inside(root, actualDirectory) && !visitedDirectories.has(actualDirectory)) {
+          if (!inside(root, actualDirectory)) {
+            limitReason = "project directory escaped the selected root";
+            break;
+          }
+          if (!visitedDirectories.has(actualDirectory)) {
             visitedDirectories.add(actualDirectory);
+            const relativeDirectory = relative(root, actualDirectory);
+            directories.add(relativeDirectory);
+            await fs.mkdir(join(snapshotRoot, relativeDirectory), { recursive: true, mode: 0o700 });
             pending.push(actualDirectory);
           }
         } catch {
-          // An unreadable directory cannot provide a baseline; a recorder
-          // reference to a file inside it will be reported as unbaselined.
+          limitReason = "unsafe or unreadable project directory";
+          break;
         }
         continue;
       }
-      if (!entry.isFile()) continue;
-      if (scannedFiles >= maximumFiles) {
-        limitReason = `file limit (${maximumFiles})`;
-        break;
+      if (entry.isFile()) {
+        const relativePath = relative(root, child);
+        await copyOne(child, relativePath);
+        if (limitReason) break;
+        continue;
       }
-      scannedFiles += 1;
-      try {
-        const actual = await fs.realpath(child);
-        if (!inside(root, actual) || baseline.has(actual)) continue;
-        const stat = await fs.stat(actual);
-        if (!stat.isFile() || scannedBytes + stat.size > maximumBytes) {
-          limitReason = `byte limit (${maximumBytes})`;
-          break;
-        }
-        const data = await fs.readFile(actual);
-        scannedBytes += data.byteLength;
-        baseline.set(actual, sha256(data));
-        if (scannedBytes >= maximumBytes) {
-          limitReason = `byte limit (${maximumBytes})`;
-          break;
-        }
-      } catch {
-        // A later recorder reference without a captured hash fails closed.
-      }
+      limitReason = "unsupported filesystem entry";
+      break;
     }
   }
-  return { files: baseline, complete: limitReason === null, limitReason };
+
+  return { sourceRoot: snapshotRoot, files, directories: [...directories], complete: limitReason === null, limitReason };
 }
 
-function startSourceChangeMonitor(projectRoot: string, excludedBuildDir: string): SourceChangeMonitor {
-  let changed = false;
-  let unavailable = false;
-  let watcher: FSWatcher | undefined;
-  const root = resolve(projectRoot);
-  const buildRoot = resolve(excludedBuildDir);
-
-  try {
-    // Recursive watching is supported by the workflow's Node >=22 runtime.
-    // Any setup/runtime error fails closed rather than claiming an unobserved
-    // compile was source-stable.
-    watcher = watch(root, { recursive: true, persistent: false }, (_event, filename) => {
-      if (filename === null) {
-        changed = true;
-        return;
-      }
-      const eventPath = resolve(root, filename.toString());
-      if (inside(buildRoot, eventPath)) return;
-      const relativePath = relative(root, eventPath);
-      const firstPart = relativePath.split(sep)[0]?.toLowerCase();
-      if (firstPart === ".git" || firstPart === "node_modules") return;
-      changed = true;
-    });
-    watcher.on("error", () => { unavailable = true; });
-    watcher.unref();
-  } catch {
-    unavailable = true;
+async function protectCompileSnapshot(snapshot: CompileSnapshot): Promise<SnapshotProtection> {
+  if (process.platform === "win32") {
+    const identity = await runProcess("whoami", ["/user", "/fo", "csv", "/nh"]);
+    const sid = identity.stdout.match(/S-1-(?:\d+-)+\d+/)?.[0];
+    if (identity.exitCode !== 0 || !sid) {
+      return { enforced: false, reason: "current Windows user identity could not be resolved", release: async () => true };
+    }
+    const principal = "*" + sid;
+    const applied = await runProcess("icacls", [snapshot.sourceRoot, "/deny", principal + ":(OI)(CI)(WD,AD,WEA,WA)", "/t", "/c"]);
+    if (applied.exitCode !== 0) {
+      return {
+        enforced: false,
+        reason: "Windows denied-write ACL could not be applied to the compile snapshot",
+        release: async () => (await runProcess("icacls", [snapshot.sourceRoot, "/remove:d", principal, "/t", "/c"])).exitCode === 0,
+      };
+    }
+    let blocked = false;
+    const probe = join(snapshot.sourceRoot, ".meridian-write-probe-" + randomUUID());
+    try {
+      await fs.writeFile(probe, "probe", { flag: "wx" });
+      await fs.rm(probe, { force: true });
+    } catch (error) {
+      blocked = ["EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "");
+    }
+    return {
+      enforced: blocked,
+      reason: blocked ? null : "Windows filesystem did not enforce the compile snapshot write denial",
+      release: async () => (await runProcess("icacls", [snapshot.sourceRoot, "/remove:d", principal, "/t", "/c"])).exitCode === 0,
+    };
   }
 
+  try {
+    for (const path of snapshot.files.keys()) await fs.chmod(join(snapshot.sourceRoot, path), 0o444);
+    for (const path of [...snapshot.directories].sort((a, b) => b.length - a.length)) {
+      await fs.chmod(path ? join(snapshot.sourceRoot, path) : snapshot.sourceRoot, 0o555);
+    }
+  } catch {
+    return { enforced: false, reason: "read-only permissions could not be applied to the compile snapshot", release: async () => true };
+  }
+  let blocked = false;
+  const probe = join(snapshot.sourceRoot, ".meridian-write-probe-" + randomUUID());
+  try {
+    await fs.writeFile(probe, "probe", { flag: "wx" });
+    await fs.rm(probe, { force: true });
+  } catch (error) {
+    blocked = ["EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "");
+  }
   return {
-    async finish() {
-      // Give queued native notifications one event-loop turn to arrive before
-      // closing the watcher. Content hashes below independently catch any
-      // persistent final-state difference.
-      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
-      watcher?.close();
-      return { changed, unavailable };
+    enforced: blocked,
+    reason: blocked ? null : "filesystem did not enforce read-only permissions on the compile snapshot",
+    release: async () => {
+      try {
+        for (const path of snapshot.directories) {
+          await fs.chmod(path ? join(snapshot.sourceRoot, path) : snapshot.sourceRoot, 0o700);
+        }
+        for (const path of snapshot.files.keys()) await fs.chmod(join(snapshot.sourceRoot, path), 0o600);
+        return true;
+      } catch {
+        return false;
+      }
     },
   };
+}
+
+async function verifyCompileSnapshot(snapshot: CompileSnapshot): Promise<boolean> {
+  for (const [relativePath, expectedHash] of snapshot.files) {
+    try {
+      const path = join(snapshot.sourceRoot, relativePath);
+      const linkStat = await fs.lstat(path);
+      if (!linkStat.isFile() || linkStat.isSymbolicLink()) return false;
+      const actualPath = await fs.realpath(path);
+      if (!inside(snapshot.sourceRoot, actualPath) || await hashFileStream(actualPath) !== expectedHash) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function compareOriginalProjectToSnapshot(projectRoot: string, snapshot: CompileSnapshot): Promise<boolean> {
+  const root = await fs.realpath(projectRoot);
+  for (const [relativePath, expectedHash] of snapshot.files) {
+    try {
+      const path = join(root, relativePath);
+      const linkStat = await fs.lstat(path);
+      if (!linkStat.isFile() || linkStat.isSymbolicLink()) return true;
+      const actualPath = await fs.realpath(path);
+      if (!inside(root, actualPath) || await hashFileStream(actualPath) !== expectedHash) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isTeXDistributionInput(path: string): boolean {
+  const segments = path.replace(/\\/g, "/").toLowerCase().split("/");
+  if (segments.some((segment) => ["texlive", "texmf-dist", "texmf-var", "texmf-config", "texmf-local"].includes(segment) || /^miktex(?:\s|$)/.test(segment))) return true;
+  return segments.some((segment, index) => segment === "texmf" && ["share", "etc", "var"].includes(segments[index - 1] ?? ""));
+}
+
+function redirectProjectSearchPath(value: string, originalRoot: string, snapshotRoot: string): string {
+  return value.split(delimiter).map((entry) => {
+    const prefix = entry.startsWith("!!") ? "!!" : "";
+    const rawPath = prefix ? entry.slice(2) : entry;
+    if (!rawPath || /[$*{}]/.test(rawPath)) return entry;
+    const originalPath = isAbsolute(rawPath) ? resolve(rawPath) : resolve(originalRoot, rawPath);
+    if (inside(originalRoot, originalPath)) return prefix + join(snapshotRoot, relative(originalRoot, originalPath));
+    return prefix + originalPath;
+  }).join(delimiter);
+}
+
+function externalSearchPathEntries(value: string | undefined, originalRoot: string, snapshotRoot: string, excludedBuildDir: string): string[] {
+  if (!value) return [];
+  return value.split(delimiter)
+    .map((entry) => entry.trim().replace(/^!!/, ""))
+    .filter(Boolean)
+    .filter((entry) => {
+      if (/[$*{}]/.test(entry)) return true;
+      const path = isAbsolute(entry) ? resolve(entry) : resolve(originalRoot, entry);
+      if (inside(originalRoot, path)) {
+        const firstPart = relative(originalRoot, path).split(sep)[0]?.toLowerCase();
+        return inside(excludedBuildDir, path) || firstPart === ".git" || firstPart === "node_modules";
+      }
+      return !isTeXDistributionInput(path) && !inside(snapshotRoot, path);
+    });
+}
+
+function parseRecorderPaths(contents: string, compileRoot: string, originalRoot: string, snapshotRoot: string, buildDir: string): RecorderPaths {
+  let recorderCwd = compileRoot;
+  const lines = contents.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith("PWD ")) {
+      const reported = line.slice(4).trim();
+      recorderCwd = isAbsolute(reported) ? resolve(reported) : resolve(compileRoot, reported);
+      break;
+    }
+  }
+  const result: RecorderPaths = { inputs: [], bypassedProjectInputs: [], externalInputs: [] };
+  for (const line of lines) {
+    if (!line.startsWith("INPUT ")) continue;
+    const raw = line.slice(6).trim();
+    if (!raw) continue;
+    const candidate = isAbsolute(raw) ? resolve(raw) : resolve(recorderCwd, raw);
+    if (inside(snapshotRoot, candidate)) {
+      result.inputs.push(candidate);
+    } else if (inside(buildDir, candidate)) {
+      // Ignore this run's own aux files and the nested snapshot directory.
+    } else if (inside(originalRoot, candidate)) {
+      result.bypassedProjectInputs.push(candidate);
+    } else if (isTeXDistributionInput(candidate)) {
+      // TeX package files and this run's own aux files are outside the local
+      // project source manifest by design.
+    } else {
+      result.externalInputs.push(candidate);
+    }
+  }
+  return result;
 }
 
 function manifestKind(path: string): CompileManifestFile["kind"] {
@@ -866,9 +1142,14 @@ function buildReceipt(input: {
   logHash: string | null;
   overleafProjectId?: string;
   sourceChanged: boolean;
-  sourceMonitoringUnavailable: boolean;
-  baselineLimitReason: string | null;
+  snapshotLimitReason: string | null;
+  snapshotProtectionReason: string | null;
+  snapshotIntegrityVerified: boolean;
+  snapshotProtectionReleased: boolean;
   unbaselinedInputs: string[];
+  bypassedProjectInputs: string[];
+  externalInputs: string[];
+  recorderIncompleteReason: string | null;
   prerequisiteNotes: string[];
 }): CompileReceipt {
   const files = [...input.files].sort((a, b) => a.path.localeCompare(b.path));
@@ -890,12 +1171,17 @@ function buildReceipt(input: {
       "This receipt covers a local compile only; it does not prove the local source was synchronized to Overleaf.",
       "A successful compiler exit does not prove citation resolution, visual quality, or editorial correctness.",
       "Shell escape is disabled, but TeX is not sandboxed: it can read or write files, including source-tree files, with the current user's permissions. Compile only sources you trust.",
-      "System TeX packages are identified by the compiler environment and are not individually hashed.",
+      "Recognized TeX distribution inputs outside the project snapshot are not individually hashed.",
       ...input.prerequisiteNotes,
-      ...(input.sourceChanged ? ["A local source file changed while compiling; the source manifest is incomplete."] : []),
-      ...(input.sourceMonitoringUnavailable ? ["Filesystem change monitoring was unavailable during compilation; source integrity cannot be confirmed."] : []),
-      ...(input.baselineLimitReason ? [`The precompile project snapshot reached its ${input.baselineLimitReason}; source integrity cannot be confirmed.`] : []),
-      ...(input.unbaselinedInputs.length > 0 ? ["The TeX recorder found local project input(s) without a precompile hash baseline; source integrity cannot be confirmed."] : []),
+      ...(input.sourceChanged ? ["A local source file changed while compiling or disappeared; the source manifest is incomplete."] : []),
+      ...(input.snapshotLimitReason ? ["The compile snapshot reached its " + input.snapshotLimitReason + "; source integrity cannot be confirmed."] : []),
+      ...(input.snapshotProtectionReason ? [input.snapshotProtectionReason + "; source integrity cannot be confirmed."] : []),
+      ...(!input.snapshotIntegrityVerified ? ["The compile snapshot changed or could not be verified after compilation; source integrity cannot be confirmed."] : []),
+      ...(!input.snapshotProtectionReleased ? ["Compile snapshot write protection could not be released cleanly."] : []),
+      ...(input.unbaselinedInputs.length > 0 ? ["The TeX recorder found local project input(s) absent from the compile snapshot; source integrity cannot be confirmed."] : []),
+      ...(input.bypassedProjectInputs.length > 0 ? ["The TeX recorder found input(s) from the original project path outside the compile snapshot; source integrity cannot be confirmed."] : []),
+      ...(input.externalInputs.length > 0 ? ["The TeX recorder or bibliography search configuration includes input(s) outside the compile snapshot and TeX distribution; source integrity cannot be confirmed."] : []),
+      ...(input.recorderIncompleteReason ? [input.recorderIncompleteReason] : []),
     ],
   };
 }
@@ -910,27 +1196,53 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
 
   const rootFileInput = resolve(options.rootFile);
   const projectRoot = resolve(options.projectRoot ?? dirname(rootFileInput));
-  const sources = await collectSources(rootFileInput, projectRoot);
+  const originalRoot = await fs.realpath(projectRoot);
+  const originalMain = await fs.realpath(rootFileInput);
+  if (!inside(originalRoot, originalMain)) throw new Error("root .tex file must be inside the selected project root");
+  const relativeMain = relative(originalRoot, originalMain);
   const stateDir = options.stateDir ?? join(homedir(), ".meridian-latex");
-  const identity = options.overleafProjectId ? `overleaf:${options.overleafProjectId}` : `local:${sources.projectRoot}`;
+  const identity = options.overleafProjectId ? "overleaf:" + options.overleafProjectId : "local:" + originalRoot;
   const receiptsDir = receiptDirectory(stateDir, identity);
   // Isolate every invocation so concurrent runs of one project cannot
   // overwrite each other's .aux/.fls/PDF or reuse stale artifacts.
-  const buildDir = join(stateDir, "build", sha256(`local:${sources.projectRoot}`), randomUUID());
+  const buildDir = join(stateDir, "build", sha256("local:" + originalRoot), randomUUID());
   await fs.mkdir(buildDir, { recursive: true, mode: 0o700 });
-  const recorderBaseline = await captureRecorderBaseline(sources.projectRoot, sources.files, join(stateDir, "build"));
-  const sourceChangeMonitor = startSourceChangeMonitor(sources.projectRoot, join(stateDir, "build"));
+  const snapshot = await captureCompileSnapshot(originalRoot, originalMain, join(buildDir, "source"), join(stateDir, "build"));
+  const snapshotMain = join(snapshot.sourceRoot, relativeMain);
+  const sources = await collectSources(snapshotMain, snapshot.sourceRoot);
+  const snapshotProtection = await protectCompileSnapshot(snapshot);
   const runner = options.runCommand ?? runBoundedCommand;
-  const args = ["-no-shell-escape", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "-recorder", `-output-directory=${buildDir}`, sources.rootFile];
+  const invoke = async (executable: string, commandArgs: string[], cwd: string, commandTimeout: number, env?: NodeJS.ProcessEnv): Promise<CommandResult> => {
+    try {
+      return await runner(executable, commandArgs, cwd, commandTimeout, env);
+    } catch (error) {
+      return {
+        exitCode: null,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : "command runner failed",
+        durationMs: 0,
+        errorCode: "RUNNER_FAILED",
+      };
+    }
+  };
+  const compileEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PWD: snapshot.sourceRoot,
+    BIBINPUTS: snapshot.sourceRoot + delimiter + redirectProjectSearchPath(process.env.BIBINPUTS ?? "", originalRoot, snapshot.sourceRoot),
+  };
+  if (process.env.TEXINPUTS !== undefined) compileEnv.TEXINPUTS = redirectProjectSearchPath(process.env.TEXINPUTS, originalRoot, snapshot.sourceRoot);
+  if (process.env.BSTINPUTS !== undefined) compileEnv.BSTINPUTS = redirectProjectSearchPath(process.env.BSTINPUTS, originalRoot, snapshot.sourceRoot);
+  const args = ["-no-shell-escape", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "-recorder", "-output-directory=" + buildDir, sources.rootFile];
   const phases: CompileReceipt["phases"] = [];
-  const compilerVersion = await runner(engine, ["--version"], sources.projectRoot, Math.min(timeoutMs, 15_000));
+  const compilerVersion = await invoke(engine, ["--version"], snapshot.sourceRoot, Math.min(timeoutMs, 15_000), compileEnv);
   phases.push(phase(`${engine} --version`, compilerVersion));
   let status: CompileStatus = "failed";
   const prerequisiteNotes: string[] = [];
   let version: string | null = compilerVersion.stdout.split(/\r?\n/).find((line) => line.trim())?.trim() ?? null;
   let pdfHash: string | null = null;
   let logHash: string | null = null;
-  let recordedInputs: string[] = [];
+  let recorderContents: string | null = null;
+  let recorderReadFailure: string | null = null;
 
   if (compilerVersion.errorCode === "ENOENT") {
     status = "unavailable";
@@ -940,7 +1252,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     prerequisiteNotes.push(`Could not identify TeX engine "${engine}". Check that its installation is healthy and the executable is on PATH.`);
   }
   else {
-    const initial = await runner(engine, args, sources.projectRoot, timeoutMs);
+    const initial = await invoke(engine, args, snapshot.sourceRoot, timeoutMs, compileEnv);
     phases.push(phase(engine, initial));
     if (initial.errorCode === "ENOENT") {
       status = "unavailable";
@@ -950,7 +1262,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
       let bibliographyOk = true;
       if (sources.bibliographyBackend !== "none") {
         const bibtool = sources.bibliographyBackend;
-        const bibVersion = await runner(bibtool, ["--version"], buildDir, Math.min(timeoutMs, 15_000));
+        const bibVersion = await invoke(bibtool, ["--version"], buildDir, Math.min(timeoutMs, 15_000), compileEnv);
         phases.push(phase(`${bibtool} --version`, bibVersion));
         if (bibVersion.errorCode === "ENOENT") {
           bibliographyOk = false;
@@ -961,8 +1273,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
           status = "failed";
         } else {
           const jobName = basename(sources.rootFile, extname(sources.rootFile));
-          const bibliographyEnv = { ...process.env, BIBINPUTS: `${sources.projectRoot}${delimiter}${process.env.BIBINPUTS ?? ""}` };
-          const bib = await runner(bibtool, [jobName], buildDir, timeoutMs, bibliographyEnv);
+          const bib = await invoke(bibtool, [jobName], buildDir, timeoutMs, compileEnv);
           phases.push(phase(bibtool, bib));
           bibliographyOk = bib.exitCode === 0;
           if (!bibliographyOk) {
@@ -975,7 +1286,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
         const passCount = sources.bibliographyBackend === "none" ? 1 : 2;
         status = "passed";
         for (let pass = 0; pass < passCount; pass += 1) {
-          const result = await runner(engine, args, sources.projectRoot, timeoutMs);
+          const result = await invoke(engine, args, snapshot.sourceRoot, timeoutMs, compileEnv);
           phases.push(phase(`${engine} pass ${pass + 2}`, result));
           if (result.errorCode === "ENOENT") {
             status = "unavailable";
@@ -989,27 +1300,91 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
   }
 
   const jobName = basename(sources.rootFile, extname(sources.rootFile));
-  const pdfPath = join(buildDir, `${jobName}.pdf`);
-  const logPath = join(buildDir, `${jobName}.log`);
-  try { pdfHash = sha256(await fs.readFile(pdfPath)); } catch { /* absent output is recorded honestly */ }
-  try { logHash = sha256(await fs.readFile(logPath)); } catch { /* absent output is recorded honestly */ }
+  const pdfPath = join(buildDir, jobName + ".pdf");
+  const logPath = join(buildDir, jobName + ".log");
+  try { pdfHash = await hashFileStream(pdfPath, Number.MAX_SAFE_INTEGER); } catch { /* absent output is recorded honestly */ }
+  try { logHash = await hashFileStream(logPath, Number.MAX_SAFE_INTEGER); } catch { /* absent output is recorded honestly */ }
   try {
-    const fls = await fs.readFile(join(buildDir, `${jobName}.fls`), "utf8");
-    recordedInputs = fls.split(/\r?\n/).flatMap((line) => line.startsWith("INPUT ") ? [line.slice(6).trim()] : []);
-  } catch { /* a compiler failure can occur before it creates a recorder file */ }
-  const finalSources = recordedInputs.length > 0 ? await collectSources(sources.rootFile, sources.projectRoot, recordedInputs) : sources;
-  const sourceMonitor = await sourceChangeMonitor.finish();
-  const sourceChanged = [...sources.files.entries()].some(([path, before]) => finalSources.files.get(path)?.sha256 !== before.sha256)
-    || [...finalSources.files.entries()].some(([path, after]) => recorderBaseline.files.has(path) && recorderBaseline.files.get(path) !== after.sha256)
-    || sourceMonitor.changed;
-  const unbaselinedInputs = [...finalSources.files.keys()].filter((path) => !recorderBaseline.files.has(path));
+    recorderContents = (await readFileBounded(join(buildDir, jobName + ".fls"), 8 * 1024 * 1024)).toString("utf8");
+  } catch (error) {
+    recorderReadFailure = error instanceof Error && error.message.includes("bounded read limit")
+      ? "The TeX recorder file exceeded the 8 MiB bounded read limit."
+      : "The compiler did not produce a readable TeX recorder file.";
+  }
+  const recorderPaths = recorderContents
+    ? parseRecorderPaths(recorderContents, snapshot.sourceRoot, originalRoot, snapshot.sourceRoot, buildDir)
+    : { inputs: [], bypassedProjectInputs: [], externalInputs: [] };
+  recorderPaths.externalInputs.push(
+    ...externalSearchPathEntries(process.env.BIBINPUTS, originalRoot, snapshot.sourceRoot, buildDir),
+    ...externalSearchPathEntries(process.env.BSTINPUTS, originalRoot, snapshot.sourceRoot, buildDir),
+  );
+  const recorderIncompleteReason = recorderReadFailure
+    ?? (recorderPaths.inputs.length === 0 ? "The TeX recorder did not list any inputs from the compile snapshot." : null);
+  let finalSources = sources;
+  try {
+    if (recorderPaths.inputs.length > 0) {
+      finalSources = await collectSources(sources.rootFile, snapshot.sourceRoot, recorderPaths.inputs);
+    }
+  } catch {
+    finalSources.unresolved.push({
+      source: safeRelativePath(snapshot.sourceRoot, sources.rootFile),
+      command: "recorder_input",
+      reason: "missing",
+      digest: sha256("recorder-input-collection-failed"),
+    });
+  }
+  for (const path of recorderPaths.bypassedProjectInputs) {
+    const relativePath = safeRelativePath(originalRoot, path);
+    finalSources.unresolved.push({
+      source: relativePath,
+      command: "recorder_input",
+      reason: "outside_project",
+      digest: sha256("snapshot-bypass:" + relativePath),
+    });
+  }
+  for (const path of recorderPaths.externalInputs) {
+    finalSources.unresolved.push({
+      source: "<external>",
+      command: "external_path",
+      reason: "outside_project",
+      digest: sha256("external-recorder-input:" + path),
+    });
+  }
+  if (recorderIncompleteReason) {
+    finalSources.unresolved.push({
+      source: safeRelativePath(snapshot.sourceRoot, sources.rootFile),
+      command: "recorder_input",
+      reason: "missing",
+      digest: sha256("recorder-incomplete:" + recorderIncompleteReason),
+    });
+  }
+  const snapshotIntegrityVerified = await verifyCompileSnapshot(snapshot);
+  const snapshotProtectionReleased = await snapshotProtection.release();
+  let sourceChanged = true;
+  try {
+    sourceChanged = await compareOriginalProjectToSnapshot(originalRoot, snapshot);
+  } catch {
+    // Losing access to the live tree is an incomplete result, even though
+    // TeX consumed only the already-hashed private snapshot.
+  }
+  const unbaselinedInputs = [...finalSources.files.keys()]
+    .filter((path) => !snapshot.files.has(relative(snapshot.sourceRoot, path)));
+  const integrityComplete = snapshot.complete
+    && snapshotProtection.enforced
+    && snapshotIntegrityVerified
+    && snapshotProtectionReleased
+    && recorderPaths.inputs.length > 0
+    && !sourceChanged
+    && unbaselinedInputs.length === 0
+    && recorderPaths.bypassedProjectInputs.length === 0
+    && recorderPaths.externalInputs.length === 0;
   if (status === "passed" && !pdfHash) status = "failed";
-  if (status === "passed" && (sourceChanged || sourceMonitor.unavailable || !recorderBaseline.complete || unbaselinedInputs.length > 0)) status = "incomplete";
+  if (status === "passed" && !integrityComplete) status = "incomplete";
   const receipt = buildReceipt({
     status,
     rootFile: safeRelativePath(finalSources.projectRoot, finalSources.rootFile),
     files: [...finalSources.files.values()],
-    complete: finalSources.unresolved.length === 0 && recordedInputs.length > 0 && !sourceChanged && !sourceMonitor.unavailable && recorderBaseline.complete && unbaselinedInputs.length === 0,
+    complete: finalSources.unresolved.length === 0 && integrityComplete,
     unresolved: finalSources.unresolved,
     engine,
     version,
@@ -1021,9 +1396,14 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     logHash,
     overleafProjectId: options.overleafProjectId,
     sourceChanged,
-    sourceMonitoringUnavailable: sourceMonitor.unavailable,
-    baselineLimitReason: recorderBaseline.limitReason,
+    snapshotLimitReason: snapshot.limitReason,
+    snapshotProtectionReason: snapshotProtection.reason,
+    snapshotIntegrityVerified,
+    snapshotProtectionReleased,
     unbaselinedInputs,
+    bypassedProjectInputs: recorderPaths.bypassedProjectInputs,
+    externalInputs: recorderPaths.externalInputs,
+    recorderIncompleteReason,
     prerequisiteNotes,
   });
   await persistReceipt(receipt, receiptsDir);
