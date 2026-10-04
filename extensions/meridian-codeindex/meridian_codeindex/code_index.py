@@ -1552,6 +1552,7 @@ class CodeIndex:
                 if diff.is_empty and prev is not None:
                     if configured_model and configured_model != meta["embedding_model"]:
                         self._prepare_search_extensions(con)
+                        search_state = self._search_feature_state()
                         con.execute("BEGIN TRANSACTION")
                         try:
                             self._rebuild_vss(con)
@@ -1567,10 +1568,7 @@ class CodeIndex:
                                 )
                             con.execute("COMMIT")
                         except Exception:
-                            try:
-                                con.execute("ROLLBACK")
-                            except Exception:  # noqa: BLE001
-                                pass
+                            self._restore_search_feature_state(con, search_state)
                             raise
                         if self._vss_ready:
                             self._index_revision = revision
@@ -1613,6 +1611,7 @@ class CodeIndex:
                     prepared[rel] = chunks
 
                 self._prepare_search_extensions(con)
+                search_state = self._search_feature_state()
                 con.execute("BEGIN TRANSACTION")
                 try:
                     if full:
@@ -1645,10 +1644,7 @@ class CodeIndex:
                     )
                     con.execute("COMMIT")
                 except Exception:
-                    try:
-                        con.execute("ROLLBACK")
-                    except Exception:  # noqa: BLE001
-                        pass
+                    self._restore_search_feature_state(con, search_state)
                     raise
                 self._index_revision = revision
                 summary["rebuilt"] = True
@@ -1701,6 +1697,26 @@ class CodeIndex:
                 con.execute("LOAD vss")
             except Exception:  # noqa: BLE001 — VSS is an optional search leg
                 _log.debug("CodeIndex could not load VSS", exc_info=True)
+
+    def _search_feature_state(self) -> tuple[bool, bool, int | None]:
+        """Capture instance flags that mirror transactional search objects."""
+        return self._fts_built, self._vss_ready, self._vss_dim
+
+    def _restore_search_feature_state(
+        self, con: Any, state: tuple[bool, bool, int | None],
+    ) -> None:
+        """Roll back DB work and keep instance flags aligned with its outcome."""
+        try:
+            con.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 — transaction outcome is now uncertain
+            # The connection may have lost the transaction while retaining
+            # partially changed search objects. Force callers to avoid both
+            # accelerators until the next successful rebuild.
+            self._fts_built = False
+            self._vss_ready = False
+            self._vss_dim = None
+            return
+        self._fts_built, self._vss_ready, self._vss_dim = state
 
     # -- FTS + VSS index build ----------------------------------------------
 
@@ -2090,6 +2106,30 @@ class CodeIndex:
                 "scope_mode": "explicit_allowlist",
                 "allowlisted_paths": sorted(rel for _, rel in targets),
             }
+            if canonical_prune_root:
+                normalized_scope = os.path.normcase(
+                    os.path.abspath(canonical_prune_root)
+                )
+                outside_scope = False
+                for abs_path, _rel in targets:
+                    normalized_path = os.path.normcase(os.path.abspath(abs_path))
+                    try:
+                        if os.path.commonpath(
+                            [normalized_scope, normalized_path]
+                        ) != normalized_scope:
+                            outside_scope = True
+                            break
+                    except (OSError, ValueError):
+                        outside_scope = True
+                        break
+                if outside_scope:
+                    return {
+                        **base,
+                        "indexed": 0,
+                        "skipped": skipped + len(targets),
+                        "paths": [],
+                        "error": "path_outside_prune_scope",
+                    }
             if canonical_prune_root and skipped:
                 return {
                     **base,
@@ -2118,6 +2158,7 @@ class CodeIndex:
                     prepared.append((abs_path, rel, chunks))
 
                 self._prepare_search_extensions(con)
+                search_state = self._search_feature_state()
                 con.execute("BEGIN TRANSACTION")
                 try:
                     deleted = 0
@@ -2153,10 +2194,7 @@ class CodeIndex:
                             )
                     con.execute("COMMIT")
                 except Exception:
-                    try:
-                        con.execute("ROLLBACK")
-                    except Exception:  # noqa: BLE001
-                        pass
+                    self._restore_search_feature_state(con, search_state)
                     raise
                 self._index_revision = revision
                 return {

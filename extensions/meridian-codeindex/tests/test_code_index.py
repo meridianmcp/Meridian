@@ -653,6 +653,41 @@ def test_reindex_write_failure_rolls_back_rows_and_merkle_baseline(tmp_path, mon
         idx.close()
 
 
+def test_reindex_rollback_restores_search_feature_flags(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    db_path = str(tmp_path / "cache.duckdb")
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    original = ci.CodeIndex(str(root), db_path=db_path)
+    try:
+        original.reindex()
+    finally:
+        original.close()
+
+    # A reopened persistent index starts with conservative instance flags even
+    # though the database already has its prior FTS state.
+    idx = ci.CodeIndex(str(root), db_path=db_path)
+    assert idx._fts_built is False
+    _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+
+    def fail_meta(*_args, **_kwargs):
+        raise RuntimeError("simulated metadata publication failure")
+
+    monkeypatch.setattr(idx, "_store_meta", fail_meta)
+    try:
+        result = idx.reindex()
+
+        assert result["error"] == "index_write_failed"
+        assert idx._fts_built is False
+        assert idx._vss_ready is False
+        assert idx._vss_dim is None
+        state = idx.get_convergence_state()
+        assert state.indexed_file_count == 1
+    finally:
+        idx.close()
+
+
 def test_index_paths_read_failure_preserves_existing_rows_and_baseline(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -677,6 +712,45 @@ def test_index_paths_read_failure_preserves_existing_rows_and_baseline(tmp_path,
         assert after.index_revision == before.index_revision
         assert idx.search("retaineduniquetoken")
         assert not idx.search("newuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_index_paths_rejects_targets_outside_prune_scope_before_mutation(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "repo"
+    subtree = root / "subtree"
+    subtree.mkdir(parents=True)
+    outside_dir = root / "elsewhere"
+    outside_dir.mkdir()
+    inside = subtree / "inside.py"
+    outside = outside_dir / "outside.py"
+    _write(inside, "def subtree_marker():\n    return 'prunescopemarker'")
+    _write(outside, "def outside_marker():\n    return 'outsideprunescope'")
+
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"))
+    try:
+        idx.reindex()
+        assert idx.search("prunescopemarker")
+        assert idx.search("outsideprunescope")
+
+        original_connect = idx._connect
+        connect_calls = 0
+
+        def track_connect():
+            nonlocal connect_calls
+            connect_calls += 1
+            return original_connect()
+
+        monkeypatch.setattr(idx, "_connect", track_connect)
+        result = idx.index_paths([str(outside)], prune_root=str(subtree))
+        assert result["error"] == "path_outside_prune_scope"
+        assert connect_calls == 0
+
+        monkeypatch.setattr(idx, "_connect", original_connect)
+        assert idx.search("prunescopemarker")
+        assert idx.search("outsideprunescope")
     finally:
         idx.close()
 
