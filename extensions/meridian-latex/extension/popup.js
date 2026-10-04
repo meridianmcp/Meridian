@@ -81,6 +81,7 @@ async function check() {
     setStatus("Not on an Overleaf project page.", "missing");
     return;
   }
+  const workflowStatus = getLocalWorkflowStatus(projectIdFromUrl(tab.url || ""));
   chrome.tabs.sendMessage(tab.id, { type: "MERIDIAN_LATEX_GET_STATUS" }, (resp) => {
     if (chrome.runtime.lastError || !resp) {
       setStatus("No response from content script — try reloading the Overleaf tab.", "missing");
@@ -90,8 +91,29 @@ async function check() {
       setStatus("Overleaf page found, but no .cm-content editor detected — selector may need updating.", "missing");
       return;
     }
-    setStatus(`Editor detected: ${resp.lineCount} lines, ${resp.charCount} chars.`, "ok");
+    workflowStatus.then((summary) => {
+      setStatus(`Editor detected: ${resp.lineCount} lines, ${resp.charCount} chars. ${summary}`, "ok");
+    });
   });
+}
+
+async function getLocalWorkflowStatus(projectId) {
+  if (!projectId) return "Local compile status is unavailable for this page.";
+  try {
+    const response = await fetch(`${ENGINE_URL}/workflow-status?project_id=${encodeURIComponent(projectId)}`);
+    if (!response.ok) return "Local compile status is unavailable.";
+    const result = await response.json();
+    const receipt = result?.localCompile?.receipt;
+    if (!receipt) {
+      return "No local compile receipt is linked. Run meridian-latex compile <main.tex> --project-id=<id>; Overleaf sync is not attested.";
+    }
+    const manifest = receipt.source_manifest_complete ? "source manifest complete" : "source manifest incomplete";
+    const compiledAt = new Date(receipt.created_at);
+    const dateLabel = Number.isNaN(compiledAt.getTime()) ? "time unknown" : compiledAt.toLocaleString();
+    return `Last local compile: ${receipt.status} (${receipt.engine}, ${manifest}, ${dateLabel}); Overleaf sync is not attested.`;
+  } catch {
+    return "Local compile status is unavailable; Overleaf sync is not attested.";
+  }
 }
 
 function setOutline(text, cls) {

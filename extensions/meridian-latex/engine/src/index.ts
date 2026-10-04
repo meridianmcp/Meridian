@@ -26,6 +26,7 @@ export { expandInputs, joinDocExpanded, MAX_INPUT_DEPTH } from "./input-expansio
 export { expandSectionAliases } from "./section-alias.js";
 export { parseBibitems, parseBibtexEntries, getBibliography } from "./bibliography.js";
 export { lintText, lintFile } from "./lint.js";
+export { compileLocalLatex, getLatestCompileReceiptSummary, getWorkflowStatusPayload } from "./overleaf-workflow.js";
 export {
   STYLE_GUIDE,
   SECTION_TYPE_ORDER,

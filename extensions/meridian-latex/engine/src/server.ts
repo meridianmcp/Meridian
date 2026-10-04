@@ -41,6 +41,7 @@
 //                    already open returns alreadyRunning:true rather than
 //                    piling up windows)
 //   GET  /health     ->  { ok: true }
+//   GET  /workflow-status?project_id=...  -> path-free local compile receipt summary
 //
 // CORS: allows requests from any chrome-extension:// origin only (an
 // extension's content/background scripts are the only intended caller;
@@ -60,6 +61,7 @@ import { claimNode, leaseWholeDocument, releaseClaims, getLiveClaims } from "./c
 import { recordEdit, listProvenance, markSynced } from "./provenance.js";
 import { lookupCitationKey } from "./zotero.js";
 import { launchOverleafBrowser, type LaunchedChromeLike } from "./browser.js";
+import { getWorkflowStatusPayload } from "./overleaf-workflow.js";
 
 // One shared connection for the lifetime of this process -- matches the
 // spec's "one local Node process on one machine" framing (no pooling, no
@@ -173,6 +175,25 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (req.method === "GET" && req.url && req.url.startsWith("/workflow-status")) {
+    try {
+      const url = new URL(req.url, "http://127.0.0.1");
+      const project_id = url.searchParams.get("project_id") ?? "";
+      if (!/^[a-zA-Z0-9_-]{1,128}$/.test(project_id)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "missing or invalid 'project_id' query parameter" }));
+        return;
+      }
+      const workflowStatus = await getWorkflowStatusPayload(project_id);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(workflowStatus));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+    }
     return;
   }
 
