@@ -2992,6 +2992,96 @@ class DocStructureStore:
                 return doc_id
         return None
 
+    async def _zotero_edge_write_status(
+        self, project_id: str, element_id: str, expected_ref: str
+    ) -> str:
+        """Classify an idempotent Zotero edge insert that wrote no row."""
+        async with self._db.execute(
+            "SELECT e.ref AS current_ref "
+            "FROM doc_elements e "
+            "JOIN doc_documents d ON d.id = e.document_id "
+            "WHERE d.project_id = ? AND e.id = ? AND e.kind = 'citation'",
+            (project_id, element_id),
+        ) as cur:
+            marker = await cur.fetchone()
+        if marker is None or _row_get(marker, "current_ref") != expected_ref:
+            return "stale"
+
+        async with self._db.execute(
+            "SELECT 1 AS linked FROM doc_edges "
+            "WHERE project_id = ? AND source_element_id = ? "
+            "AND target_kind = 'zotero_item' LIMIT 1",
+            (project_id, element_id),
+        ) as cur:
+            linked = await cur.fetchone()
+        return "already_resolved" if linked is not None else "rejected"
+
+    async def _insert_zotero_edge_if_current(
+        self,
+        project_id: str,
+        element_id: str,
+        expected_ref: str,
+        target_ref: str,
+        target_document_id: str | None,
+    ) -> str:
+        """Atomically validate and insert one project-bound Zotero edge.
+
+        All Zotero edge writers use the same deterministic primary key for a
+        marker. The INSERT also rechecks the marker's current project/ref, so
+        concurrent syncs and late results cannot add duplicate or stale edges.
+        Existing legacy rows keep their original ids and are respected by the
+        NOT EXISTS predicate.
+        """
+        edge_id = uuid.uuid5(
+            uuid.NAMESPACE_URL, f"meridian-zotero-edge:{project_id}:{element_id}"
+        ).hex
+        now = _now_iso()
+        sql = (
+            "INSERT INTO doc_edges "
+            "(id, project_id, source_element_id, edge_kind, target_kind, "
+            "target_ref, target_element_id, target_document_id, "
+            "resolved_at, created_at) "
+            "SELECT ?, ?, e.id, 'cites', 'zotero_item', ?, NULL, ?, ?, ? "
+            "FROM doc_elements e "
+            "JOIN doc_documents d ON d.id = e.document_id "
+            "WHERE d.project_id = ? AND e.id = ? AND e.kind = 'citation' "
+            "AND e.ref = ? "
+            "AND NOT EXISTS (SELECT 1 FROM doc_edges existing "
+            "WHERE existing.project_id = ? "
+            "AND existing.source_element_id = e.id "
+            "AND existing.target_kind = 'zotero_item') "
+            "ON CONFLICT (id) DO NOTHING"
+        )
+        params = (
+            edge_id,
+            project_id,
+            target_ref,
+            target_document_id,
+            now,
+            now,
+            project_id,
+            element_id,
+            expected_ref,
+            project_id,
+        )
+        try:
+            async with self._db.execute(sql, params) as cur:
+                inserted = cur.rowcount
+            await self._db.commit()
+        except Exception:  # noqa: BLE001 — classify benign races, report other write failures
+            _log.debug(
+                "Zotero edge insert failed for element=%s", element_id,
+                exc_info=True,
+            )
+            return await self._zotero_edge_write_status(
+                project_id, element_id, expected_ref,
+            )
+        if inserted == 1:
+            return "applied"
+        return await self._zotero_edge_write_status(
+            project_id, element_id, expected_ref,
+        )
+
     async def resolve_zotero_edges(
         self,
         project_id: str,
@@ -3057,28 +3147,18 @@ class DocStructureStore:
                     target_document_id = await self._find_document_for_doi(
                         project_id, doi, item.get("title")
                     )
-                now = _now_iso()
-                await self._db.execute(
-                    "INSERT INTO doc_edges "
-                    "(id, project_id, source_element_id, edge_kind, target_kind, "
-                    "target_ref, target_element_id, target_document_id, "
-                    "resolved_at, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        uuid.uuid4().hex,
-                        project_id,
-                        el["id"],
-                        "cites",
-                        "zotero_item",
-                        target_ref,
-                        None,
-                        target_document_id,
-                        now,
-                        now,
-                    ),
+                state = await self._insert_zotero_edge_if_current(
+                    project_id,
+                    el["id"],
+                    str(ref),
+                    target_ref,
+                    target_document_id,
                 )
-                await self._db.commit()
-                resolved += 1
+                if state in {"applied", "already_resolved"}:
+                    resolved += 1
+                else:
+                    unresolved += 1
+                    continue
                 if target_document_id is not None:
                     cross_doc_linked += 1
             except Exception:  # noqa: BLE001 — a write failure skips this marker only
@@ -3207,28 +3287,10 @@ class DocStructureStore:
                 target_document_id = await self._find_document_for_doi(
                     project_id, doi, title
                 )
-            now = _now_iso()
             try:
-                await self._db.execute(
-                    "INSERT INTO doc_edges "
-                    "(id, project_id, source_element_id, edge_kind, target_kind, "
-                    "target_ref, target_element_id, target_document_id, "
-                    "resolved_at, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        uuid.uuid4().hex,
-                        project_id,
-                        element_id,
-                        "cites",
-                        "zotero_item",
-                        target_ref,
-                        None,
-                        target_document_id,
-                        now,
-                        now,
-                    ),
+                state = await self._insert_zotero_edge_if_current(
+                    project_id, element_id, ref, target_ref, target_document_id,
                 )
-                await self._db.commit()
             except Exception:  # noqa: BLE001 — one marker must not abort a batch
                 _log.debug(
                     "local Zotero edge write failed for element=%s", element_id,
@@ -3236,9 +3298,16 @@ class DocStructureStore:
                 )
                 rejected += 1
                 continue
-            applied += 1
-            if target_document_id is not None:
-                cross_doc_linked += 1
+            if state == "applied":
+                applied += 1
+                if target_document_id is not None:
+                    cross_doc_linked += 1
+            elif state == "already_resolved":
+                already_resolved += 1
+            elif state == "stale":
+                stale += 1
+            else:
+                rejected += 1
 
         return {
             "applied": applied,

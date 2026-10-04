@@ -558,6 +558,99 @@ def _local_cli_command(*args: str) -> list[str]:
     return [sys.executable, "-m", "meridian", *args]
 
 
+def _meridian_latex_cli_command(*args: str) -> list[str]:
+    """Resolve the separate Node CLI without invoking a shell or npm shim."""
+    import os
+    import re
+    import shutil
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js 22 or newer is required for the local LaTeX workflow.")
+    try:
+        version_result = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=5, check=False, shell=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FileNotFoundError(f"Node.js could not be started: {exc}") from exc
+    version_match = re.fullmatch(r"v?(\d+)\.\d+\.\d+", version_result.stdout.strip())
+    if version_result.returncode != 0 or not version_match or int(version_match.group(1)) < 22:
+        version = version_result.stdout.strip() or version_result.stderr.strip() or "unknown version"
+        raise FileNotFoundError(f"Node.js 22 or newer is required for the local LaTeX workflow; found {version}.")
+
+    repo_root = Path(__file__).resolve().parent.parent
+    candidates: list[Path] = []
+    if not getattr(sys, "frozen", False):
+        candidates.append(repo_root / "extensions" / "meridian-latex" / "engine" / "dist" / "cli.js")
+
+    prefixes: list[Path] = [repo_root, Path.home(), Path("/usr/local"), Path("/usr")]
+    for variable in ("NPM_CONFIG_PREFIX", "npm_config_prefix"):
+        if os.environ.get(variable):
+            prefixes.append(Path(os.environ[variable]))
+    if os.environ.get("APPDATA"):
+        prefixes.append(Path(os.environ["APPDATA"]) / "npm")
+    prefixes.extend(Path(path) for path in os.environ.get("NODE_PATH", "").split(os.pathsep) if path)
+    prefixes.extend((Path.home() / ".npm-global", Path.home() / ".local"))
+
+    package_suffix = Path("@meridianmcp") / "mcp" / "latex" / "cli.js"
+    for prefix in prefixes:
+        candidates.extend((
+            prefix / "node_modules" / package_suffix,
+            prefix / "lib" / "node_modules" / package_suffix,
+            prefix / package_suffix,
+        ))
+
+    cli_shim = shutil.which("meridian-latex.cmd") if os.name == "nt" else None
+    cli_shim = cli_shim or shutil.which("meridian-latex")
+    if cli_shim:
+        shim_path = Path(cli_shim)
+        if shim_path.suffix.lower() in {".cmd", ".bat"}:
+            # Windows npm installs a cmd shim beside its global node_modules.
+            # Resolve its known package location and pass that .js file to Node.
+            candidates.append(shim_path.parent / "node_modules" / package_suffix)
+        elif shim_path.suffix.lower() == ".js":
+            candidates.append(shim_path)
+        elif shim_path.suffix == "":
+            try:
+                if shim_path.read_text(encoding="utf-8", errors="replace").startswith("#!/usr/bin/env node"):
+                    candidates.append(shim_path)
+            except OSError:
+                pass
+
+    cli_path = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+    if cli_path is None:
+        message = "The meridian-latex CLI was not found. Install Node.js 22+ and run npm install -g @meridianmcp/mcp."
+        if not getattr(sys, "frozen", False):
+            message += " In a source checkout, you can also build it with npm run build --workspace=extensions/meridian-latex/engine."
+        raise FileNotFoundError(message)
+    return [node, str(cli_path), *args]
+
+
+def _choose_tex_file(title: str, parent: Any | None = None) -> str | None:
+    """Ask for one local .tex source file."""
+    import os
+    import tkinter as tk
+    from tkinter import filedialog
+
+    owns_root = parent is None
+    root = parent if parent is not None else tk.Tk()
+    if owns_root:
+        root.withdraw()
+    try:
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title=title,
+            filetypes=(("LaTeX source files", "*.tex"), ("All files", "*.*")),
+        )
+        if not selected:
+            return None
+        if os.path.splitext(str(selected))[1].lower() != ".tex":
+            raise ValueError("Choose a .tex source file.")
+        return str(selected)
+    finally:
+        if owns_root:
+            root.destroy()
+
+
 def _launch_local_cli(*args: str, cwd: str | None = None) -> None:
     """Open one local maintenance command in a visible console when possible."""
     command = _local_cli_command(*args)
@@ -566,6 +659,20 @@ def _launch_local_cli(*args: str, cwd: str | None = None) -> None:
         subprocess.Popen(command, cwd=cwd, creationflags=creationflags)
     except OSError as exc:
         _show_error_dialog("Meridian local tool failed to open", str(exc))
+
+
+def _launch_meridian_latex_cli(*args: str, parent: Any | None = None) -> None:
+    """Start a local LaTeX CLI process without a shell or Overleaf sync claim."""
+    try:
+        command = _meridian_latex_cli_command(*args)
+    except FileNotFoundError as exc:
+        _show_error_dialog("Local LaTeX workflow unavailable", str(exc), parent=parent)
+        return
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if sys.platform == "win32" else 0
+    try:
+        subprocess.Popen(command, creationflags=creationflags, shell=False)
+    except OSError as exc:
+        _show_error_dialog("Local LaTeX workflow failed to start", str(exc), parent=parent)
 
 
 def _choose_project_root(title: str, parent: Any | None = None) -> str | None:
@@ -1108,6 +1215,20 @@ def _run_tray() -> int:
     def _show_artifact_commands(icon: "pystray.Icon", item: Any) -> None:
         _launch_local_cli("artifacts", "--help")
 
+    def _compile_local_latex(icon: "pystray.Icon", item: Any) -> None:
+        def _choose_and_compile() -> None:
+            try:
+                source_file = _choose_tex_file(
+                    "Choose a LaTeX source file to compile locally",
+                    parent=ui_root,
+                )
+                if source_file:
+                    _launch_meridian_latex_cli("compile", source_file, parent=ui_root)
+            except Exception as exc:  # noqa: BLE001 -- keep the tray available if the picker fails
+                _show_error_dialog("Local LaTeX compile failed", str(exc), parent=ui_root)
+
+        _dispatch_ui(_choose_and_compile)
+
     def _restart(icon: "pystray.Icon", item: Any) -> None:
         def _do_restart() -> None:
             try:
@@ -1139,6 +1260,7 @@ def _run_tray() -> int:
     local_tools = pystray.Menu(
         pystray.MenuItem("Set up a local project…", _configure_local_project),
         pystray.MenuItem("Check a local project…", _check_local_project),
+        pystray.MenuItem("Compile a LaTeX file locally…", _compile_local_latex),
         pystray.MenuItem("Catalog local sessions", _catalog_local_sessions),
         pystray.MenuItem("Artifact capture commands", _show_artifact_commands),
     )

@@ -459,6 +459,187 @@ def test_doc_store_batch_is_project_bound_bounded_and_idempotent(tmp_path):
     _run(scenario())
 
 
+def test_doc_store_batch_concurrent_apply_is_idempotent(tmp_path):
+    async def scenario():
+        import asyncio
+
+        db_path = str(tmp_path / "doc_structure.db")
+        connection_a = await db_module.init_db(db_path)
+        connection_b = await db_module.init_db(db_path)
+        store_a = doc_store.DocStructureStore(connection_a)
+        store_b = doc_store.DocStructureStore(connection_b)
+        await store_a.ensure_schema()
+        await store_b.ensure_schema()
+        try:
+            await store_a.put_document(
+                "project-1",
+                "latex",
+                [{
+                    "ordinal": 0,
+                    "level": None,
+                    "kind": "citation",
+                    "text": r"\cite{doe2020}",
+                    "ref": "doe2020",
+                    "parent_ordinal": None,
+                }],
+                source="paper.tex",
+            )
+            marker = (await store_a.get_pending_zotero_citations("project-1"))["markers"][0]
+            result = {
+                "element_id": marker["id"],
+                "ref": marker["ref"],
+                "zotero_key": "ITEMKEY1",
+                "doi": "10.1000/example",
+                "title": "Paper",
+            }
+
+            # Force both calls past their preliminary reads before either write.
+            gate = asyncio.Event()
+            arrivals = 0
+
+            def install_write_barrier(store):
+                original = store._insert_zotero_edge_if_current
+
+                async def wait_then_insert(*args):
+                    nonlocal arrivals
+                    arrivals += 1
+                    if arrivals == 2:
+                        gate.set()
+                    await gate.wait()
+                    return await original(*args)
+
+                store._insert_zotero_edge_if_current = wait_then_insert
+
+            install_write_barrier(store_a)
+            install_write_barrier(store_b)
+            first, second = await asyncio.gather(
+                store_a.apply_resolved_zotero_edges("project-1", [result]),
+                store_b.apply_resolved_zotero_edges("project-1", [result]),
+            )
+
+            assert first["applied"] + second["applied"] == 1
+            assert first["already_resolved"] + second["already_resolved"] == 1
+            assert len(await store_a.get_edges("project-1")) == 1
+        finally:
+            await connection_a.close()
+            await connection_b.close()
+
+    _run(scenario())
+
+
+def test_doc_store_batch_rechecks_marker_ref_at_insert(tmp_path):
+    async def scenario():
+        connection = await db_module.init_db(str(tmp_path / "doc_structure.db"))
+        store = doc_store.DocStructureStore(connection)
+        await store.ensure_schema()
+        try:
+            await store.put_document(
+                "project-1",
+                "latex",
+                [{
+                    "ordinal": 0,
+                    "level": None,
+                    "kind": "citation",
+                    "text": r"\cite{doe2020}",
+                    "ref": "doe2020",
+                    "parent_ordinal": None,
+                }],
+                source="paper.tex",
+            )
+            marker = (await store.get_pending_zotero_citations("project-1"))["markers"][0]
+            result = {
+                "element_id": marker["id"],
+                "ref": marker["ref"],
+                "zotero_key": "ITEMKEY1",
+                "title": "Paper",
+            }
+            original = store._insert_zotero_edge_if_current
+
+            async def change_ref_before_insert(*args):
+                await connection.execute(
+                    "UPDATE doc_elements SET ref = ? WHERE id = ?",
+                    ("changed-reference", marker["id"]),
+                )
+                await connection.commit()
+                return await original(*args)
+
+            store._insert_zotero_edge_if_current = change_ref_before_insert
+            summary = await store.apply_resolved_zotero_edges("project-1", [result])
+
+            assert summary["applied"] == 0
+            assert summary["stale"] == 1
+            assert await store.get_edges("project-1") == []
+        finally:
+            await connection.close()
+
+    _run(scenario())
+
+
+def test_doc_store_batch_respects_legacy_random_id_zotero_edge(tmp_path):
+    async def scenario():
+        connection = await db_module.init_db(str(tmp_path / "doc_structure.db"))
+        store = doc_store.DocStructureStore(connection)
+        await store.ensure_schema()
+        try:
+            await store.put_document(
+                "project-1",
+                "latex",
+                [{
+                    "ordinal": 0,
+                    "level": None,
+                    "kind": "citation",
+                    "text": r"\cite{doe2020}",
+                    "ref": "doe2020",
+                    "parent_ordinal": None,
+                }],
+                source="paper.tex",
+            )
+            marker = (await store.get_pending_zotero_citations("project-1"))["markers"][0]
+            result = {
+                "element_id": marker["id"],
+                "ref": marker["ref"],
+                "zotero_key": "ITEMKEY1",
+                "title": "Paper",
+            }
+            original = store._insert_zotero_edge_if_current
+
+            async def commit_legacy_edge_before_insert(*args):
+                await connection.execute(
+                    "INSERT INTO doc_edges "
+                    "(id, project_id, source_element_id, edge_kind, target_kind, "
+                    "target_ref, target_element_id, target_document_id, "
+                    "resolved_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "legacy-random-id",
+                        "project-1",
+                        marker["id"],
+                        "cites",
+                        "zotero_item",
+                        "zotero:OLDKEY01",
+                        None,
+                        None,
+                        "2026-10-03T00:00:00+00:00",
+                        "2026-10-03T00:00:00+00:00",
+                    ),
+                )
+                await connection.commit()
+                return await original(*args)
+
+            store._insert_zotero_edge_if_current = commit_legacy_edge_before_insert
+            summary = await store.apply_resolved_zotero_edges("project-1", [result])
+            edges = await store.get_edges("project-1")
+
+            assert summary["applied"] == 0
+            assert summary["already_resolved"] == 1
+            assert len(edges) == 1
+            assert edges[0]["id"] == "legacy-random-id"
+        finally:
+            await connection.close()
+
+    _run(scenario())
+
+
 def test_hosted_write_rejects_local_paths_and_binds_project(monkeypatch):
     async def scenario():
         result = await hosted_zotero_sync.handle_apply_zotero_citation_edges(

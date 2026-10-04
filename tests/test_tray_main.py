@@ -770,6 +770,10 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
         tray_main, "_choose_project_root",
         mock.Mock(side_effect=["C:/work/project", None, None]),
     )
+    choose_tex = mock.Mock(return_value=None)
+    monkeypatch.setattr(tray_main, "_choose_tex_file", choose_tex)
+    latex_launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_meridian_latex_cli", latex_launch)
     launch = mock.Mock()
     monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
     fake_runner.restart.side_effect = RuntimeError("restart failed")
@@ -795,6 +799,7 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
         for label in (
             "Open Dashboard", "Status", "View Logs", "Zotero connection…",
             "Set up a local project…", "Check a local project…",
+            "Compile a LaTeX file locally…",
             "Catalog local sessions", "Artifact capture commands", "Restart",
             "Automatic tunnel recovery", "Quit",
         ):
@@ -823,6 +828,8 @@ def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platf
     tray_main._show_logs_window.assert_called_once_with(fake_runner, parent=parent)
     tray_main.run_zotero_setup_dialog.assert_called_once_with(parent=parent)
     assert tray_main._choose_project_root.call_count == 3
+    choose_tex.assert_called_once_with("Choose a LaTeX source file to compile locally", parent=parent)
+    latex_launch.assert_not_called()
     setup = mock.call("setup", "--repo", "C:/work/project", cwd="C:/work/project")
     recovery = mock.call("recovery", "catalog")
     artifacts = mock.call("artifacts", "--help")
@@ -996,6 +1003,145 @@ def test_choose_project_root_returns_the_selected_local_path(monkeypatch):
     fake_tkinter.Tk.return_value.destroy.assert_called_once_with()
 
 
+def test_choose_tex_file_filters_tex_sources_and_supports_cancel(monkeypatch):
+    fake_tkinter = mock.MagicMock()
+    fake_filedialog = mock.MagicMock()
+    fake_tkinter.filedialog = fake_filedialog
+    fake_filedialog.askopenfilename.side_effect = ["C:/papers/draft paper.tex", ""]
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    assert tray_main._choose_tex_file("Choose source") == "C:/papers/draft paper.tex"
+    assert tray_main._choose_tex_file("Choose source") is None
+    assert fake_filedialog.askopenfilename.call_args_list == [
+        mock.call(
+            parent=fake_tkinter.Tk.return_value,
+            title="Choose source",
+            filetypes=(("LaTeX source files", "*.tex"), ("All files", "*.*")),
+        ),
+        mock.call(
+            parent=fake_tkinter.Tk.return_value,
+            title="Choose source",
+            filetypes=(("LaTeX source files", "*.tex"), ("All files", "*.*")),
+        ),
+    ]
+    assert fake_tkinter.Tk.return_value.destroy.call_count == 2
+
+
+def test_choose_tex_file_rejects_non_tex_selection(monkeypatch):
+    import pytest
+
+    fake_tkinter = mock.MagicMock()
+    fake_filedialog = mock.MagicMock()
+    fake_tkinter.filedialog = fake_filedialog
+    fake_filedialog.askopenfilename.return_value = "C:/papers/references.bib"
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    with pytest.raises(ValueError, match="Choose a .tex source file"):
+        tray_main._choose_tex_file("Choose source")
+
+
+def test_meridian_latex_cli_command_resolves_external_node_and_windows_npm_shim(monkeypatch, tmp_path):
+    import shutil
+    from pathlib import Path
+
+    checkout = tmp_path / "source checkout"
+    (checkout / "meridian").mkdir(parents=True)
+    monkeypatch.setattr(tray_main, "__file__", str(checkout / "meridian" / "tray_main.py"))
+    monkeypatch.setattr(tray_main.sys, "frozen", False, raising=False)
+    fake_home = tmp_path / "isolated home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    for key in ("NPM_CONFIG_PREFIX", "npm_config_prefix", "APPDATA", "NODE_PATH"):
+        monkeypatch.delenv(key, raising=False)
+
+    npm_prefix = tmp_path / "custom npm prefix"
+    shim = npm_prefix / "meridian-latex.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("npm cmd shim is only a locator", encoding="utf-8")
+    cli = npm_prefix / "node_modules" / "@meridianmcp" / "mcp" / "latex" / "cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    node = tmp_path / "Node Runtime" / "node.exe"
+
+    def which(name):
+        if name == "node":
+            return str(node)
+        if name in {"meridian-latex", "meridian-latex.cmd"}:
+            return str(shim)
+        return None
+
+    monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(tray_main.subprocess, "run", mock.Mock(return_value=mock.Mock(returncode=0, stdout="v22.12.0\n", stderr="")))
+    source = str(tmp_path / "paper path" / "draft paper & notes.tex")
+    expected = [str(node), str(cli.resolve()), "compile", source]
+
+    for frozen in (False, True):
+        monkeypatch.setattr(tray_main.sys, "frozen", frozen, raising=False)
+        assert tray_main._meridian_latex_cli_command("compile", source) == expected
+
+    assert tray_main.subprocess.run.call_args_list == [
+        mock.call([str(node), "--version"], capture_output=True, text=True, timeout=5, check=False, shell=False),
+        mock.call([str(node), "--version"], capture_output=True, text=True, timeout=5, check=False, shell=False),
+    ]
+
+
+def test_meridian_latex_cli_command_reports_missing_or_old_node(monkeypatch):
+    import pytest
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    with pytest.raises(FileNotFoundError, match="Node.js 22 or newer"):
+        tray_main._meridian_latex_cli_command("compile", "draft.tex")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "C:/node.exe" if name == "node" else None)
+    monkeypatch.setattr(tray_main.subprocess, "run", mock.Mock(return_value=mock.Mock(returncode=0, stdout="v20.11.0\n", stderr="")))
+    with pytest.raises(FileNotFoundError, match="found v20.11.0"):
+        tray_main._meridian_latex_cli_command("compile", "draft.tex")
+
+
+def test_frozen_tray_missing_cli_message_only_offers_global_install(monkeypatch, tmp_path):
+    import shutil
+    from pathlib import Path
+
+    node = tmp_path / "Node Runtime" / "node.exe"
+    monkeypatch.setattr(shutil, "which", lambda name: str(node) if name == "node" else None)
+    monkeypatch.setattr(tray_main.subprocess, "run", mock.Mock(return_value=mock.Mock(returncode=0, stdout="v22.12.0\n", stderr="")))
+    monkeypatch.setattr(tray_main, "__file__", str(tmp_path / "tray" / "tray_main.py"))
+    monkeypatch.setattr(tray_main.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "isolated home")
+    for key in ("NPM_CONFIG_PREFIX", "npm_config_prefix", "APPDATA", "NODE_PATH"):
+        monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        tray_main._meridian_latex_cli_command("compile", "draft.tex")
+
+    assert "npm install -g @meridianmcp/mcp" in str(exc_info.value)
+    assert "npm run build" not in str(exc_info.value)
+
+
+def test_launch_meridian_latex_cli_uses_shell_free_argv_and_reports_missing_cli(monkeypatch):
+    tex_path = "C:/papers/draft paper & notes.tex"
+    command = ["C:/Node Runtime/node.exe", "C:/npm/latex/cli.js", "compile", tex_path]
+    resolver = mock.Mock(return_value=command)
+    popen = mock.Mock()
+    monkeypatch.setattr(tray_main, "_meridian_latex_cli_command", resolver)
+    monkeypatch.setattr(tray_main.subprocess, "Popen", popen)
+    monkeypatch.setattr(tray_main.sys, "platform", "linux")
+
+    tray_main._launch_meridian_latex_cli("compile", tex_path)
+
+    resolver.assert_called_once_with("compile", tex_path)
+    popen.assert_called_once_with(command, creationflags=0, shell=False)
+
+    parent = object()
+    error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_meridian_latex_cli_command", mock.Mock(side_effect=FileNotFoundError("install Node.js 22+")))
+    monkeypatch.setattr(tray_main, "_show_error_dialog", error)
+    tray_main._launch_meridian_latex_cli("compile", tex_path, parent=parent)
+    error.assert_called_once_with("Local LaTeX workflow unavailable", "install Node.js 22+", parent=parent)
+
+
 def test_choose_project_root_returns_none_when_dialog_is_cancelled(monkeypatch):
     fake_tkinter = mock.MagicMock()
     fake_filedialog = mock.MagicMock()
@@ -1033,6 +1179,7 @@ def test_run_tray_exposes_local_workstation_tools(monkeypatch):
     assert "Set up a local project…" in labels
     assert "Automatic tunnel recovery" in labels
     assert "Check a local project…" in labels
+    assert "Compile a LaTeX file locally…" in labels
     assert "Catalog local sessions" in labels
     assert "Artifact capture commands" in labels
     fake_icon_instance.run.assert_called_once()
@@ -1047,8 +1194,12 @@ def test_local_project_setup_menu_uses_the_selected_root(monkeypatch):
     monkeypatch.setattr(
         tray_main, "_choose_project_root", lambda _title, parent=None: "C:/work/project",
     )
+    choose_tex = mock.Mock(side_effect=["C:/papers/draft paper.tex", None])
+    monkeypatch.setattr(tray_main, "_choose_tex_file", choose_tex)
     launch = mock.Mock()
     monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
+    latex_launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_meridian_latex_cli", latex_launch)
 
     class ImmediateThread:
         def __init__(self, *, target, daemon, name=None, args=()):
@@ -1084,6 +1235,10 @@ def test_local_tools_launch_check_recovery_and_artifact_commands(monkeypatch):
     )
     launch = mock.Mock()
     monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
+    choose_tex = mock.Mock(side_effect=["C:/papers/draft paper.tex", None])
+    monkeypatch.setattr(tray_main, "_choose_tex_file", choose_tex)
+    latex_launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_meridian_latex_cli", latex_launch)
 
     class ImmediateThread:
         def __init__(self, *, target, daemon, name=None, args=()):
@@ -1104,12 +1259,16 @@ def test_local_tools_launch_check_recovery_and_artifact_commands(monkeypatch):
     callbacks["Check a local project…"](None, None)
     callbacks["Catalog local sessions"](None, None)
     callbacks["Artifact capture commands"](None, None)
+    callbacks["Compile a LaTeX file locally…"](None, None)
+    callbacks["Compile a LaTeX file locally…"](None, None)
 
     assert launch.call_args_list == [
         mock.call("doctor", "--repo", "C:/work/project", cwd="C:/work/project"),
         mock.call("recovery", "catalog"),
         mock.call("artifacts", "--help"),
     ]
+    assert choose_tex.call_count == 2
+    latex_launch.assert_called_once_with("compile", "C:/papers/draft paper.tex", parent=None)
 
 
 def test_local_project_menu_reports_picker_errors_without_stopping_tray(monkeypatch):
