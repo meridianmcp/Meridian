@@ -2,7 +2,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, mkdir, open as openFile, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, open as openFile, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative } from "node:path";
@@ -10,9 +10,38 @@ import { createHash, randomUUID } from "node:crypto";
 import { compileLocalLatex, getLatestCompileReceiptSummary, getWorkflowStatusPayload, runBoundedCommand, type CommandResult, type CommandRunner, type LatexEngine } from "./overleaf-workflow.js";
 
 const temporaryDirectories: string[] = [];
+let originalPath: string | undefined;
+let fakeDistributionRoot = "";
+let fakeDistributionRoots: Record<string, string> = {};
 
-beforeEach(() => { temporaryDirectories.length = 0; });
-afterEach(async () => { await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true }))); });
+beforeEach(async () => {
+  temporaryDirectories.length = 0;
+  originalPath = process.env.PATH;
+  const toolsDirectory = await mkdtemp(join(tmpdir(), "meridian-latex-tools-"));
+  temporaryDirectories.push(toolsDirectory);
+  fakeDistributionRoot = join(toolsDirectory, "texmf-dist");
+  fakeDistributionRoots = {
+    TEXMFDIST: fakeDistributionRoot,
+    TEXMFROOT: toolsDirectory,
+    TEXMFMAIN: fakeDistributionRoot,
+    TEXMFSYSVAR: join(toolsDirectory, "texmf-var"),
+    TEXMFSYSCONFIG: join(toolsDirectory, "texmf-config"),
+    TEXMFLOCAL: join(toolsDirectory, "texmf-local"),
+  };
+  await Promise.all(Object.values(fakeDistributionRoots).map((path) => mkdir(path, { recursive: true })));
+  const extension = process.platform === "win32" ? ".exe" : "";
+  for (const name of ["pdflatex", "xelatex", "lualatex", "kpsewhich"]) {
+    const executable = join(toolsDirectory, name + extension);
+    await writeFile(executable, "test executable placeholder");
+    if (process.platform !== "win32") await chmod(executable, 0o755);
+  }
+  process.env.PATH = [toolsDirectory, originalPath].filter(Boolean).join(delimiter);
+});
+afterEach(async () => {
+  if (originalPath === undefined) delete process.env.PATH;
+  else process.env.PATH = originalPath;
+  await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
+});
 
 async function project(files: Record<string, string>): Promise<{ root: string; state: string }> {
   const root = await mkdtemp(join(tmpdir(), "meridian-latex-project-"));
@@ -40,6 +69,10 @@ function fakeRunner(engine: LatexEngine, extraRecordedInputs: string[] = []) {
   };
   const runCommand = async (executable: string, args: string[], cwd: string): Promise<CommandResult> => {
     calls.push({ executable, args, cwd });
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "kpsewhich" && args[0]?.startsWith("--var-value=")) {
+      const root = fakeDistributionRoots[args[0].slice("--var-value=".length)];
+      return { exitCode: 0, stdout: (root ?? "") + "\n", stderr: "", durationMs: 1 };
+    }
     if (args[0] === "--version") {
       return { exitCode: 0, stdout: `${executable} version 1.2.3\n`, stderr: "", durationMs: 2 };
     }
@@ -682,6 +715,127 @@ test("recorder inputs outside the snapshot and TeX distribution fail closed rega
   assert.equal(receipt.status, "incomplete");
   assert.equal(receipt.source_manifest.complete, false);
   assert.ok(receipt.source_manifest.unresolved_count > 0);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
+});
+
+test("the active engine's kpsewhich TEXMFDIST is accepted as the distribution root", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const systemInput = join(fakeDistributionRoot, "tex", "latex", "article.cls");
+  const systemVariableInput = join(fakeDistributionRoots.TEXMFSYSVAR, "web2c", "pdftex", "pdflatex.fmt");
+  await mkdir(dirname(systemInput), { recursive: true });
+  await mkdir(dirname(systemVariableInput), { recursive: true });
+  await writeFile(systemInput, "verified distribution input", "utf8");
+  await writeFile(systemVariableInput, "verified system variable input", "utf8");
+  const fake = fakeRunner("pdflatex", [systemInput, systemVariableInput]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+  const kpsewhichCall = fake.calls.find((call) => basename(call.executable).toLowerCase().replace(/\.exe$/, "") === "kpsewhich");
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(!receipt.source_manifest.files.some((file) => file.path.includes("article.cls")));
+  assert.ok(!receipt.source_manifest.files.some((file) => file.path.includes("pdflatex.fmt")));
+  assert.ok(kpsewhichCall);
+  assert.equal(kpsewhichCall!.cwd, dirname(kpsewhichCall!.executable), "kpsewhich runs from the active engine's binary directory");
+  assert.ok(!receipt.limitations.some((limitation) => limitation.includes("distribution roots cannot be verified")));
+});
+
+test("unavailable active-engine kpsewhich roots make the receipt incomplete", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const fake = fakeRunner("pdflatex");
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    if (basename(executable).toLowerCase().replace(/\.exe$/, "") === "kpsewhich") {
+      return { exitCode: 1, stdout: "", stderr: "distribution lookup failed", durationMs: 1 };
+    }
+    return fake.runCommand(executable, args, cwd);
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("kpsewhich could not resolve TEXMFDIST")));
+});
+
+test("a texlive-looking external path is not trusted without kpsewhich proof", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const outside = await mkdtemp(join(tmpdir(), "meridian-latex-texlive-decoy-"));
+  temporaryDirectories.push(outside);
+  const untrustedDistributionPath = join(outside, "texlive", "texmf-dist", "tex", "latex", "untrusted.sty");
+  await mkdir(dirname(untrustedDistributionPath), { recursive: true });
+  await writeFile(untrustedDistributionPath, "untrusted external package", "utf8");
+  const fake = fakeRunner("pdflatex", [untrustedDistributionPath]);
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
+});
+
+test("external user TEXINPUTS entries make the source manifest incomplete", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const outside = await mkdtemp(join(tmpdir(), "meridian-latex-texinputs-decoy-"));
+  temporaryDirectories.push(outside);
+  const previous = process.env.TEXINPUTS;
+  process.env.TEXINPUTS = join(outside, "texlive", "texmf-dist");
+  try {
+    const fake = fakeRunner("pdflatex");
+    const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+    assert.equal(receipt.status, "incomplete");
+    assert.equal(receipt.source_manifest.complete, false);
+    assert.ok(receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
+  } finally {
+    if (previous === undefined) delete process.env.TEXINPUTS;
+    else process.env.TEXINPUTS = previous;
+  }
+});
+
+test("only recorder-declared existing build outputs are ignored as current-job inputs", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const fake = fakeRunner("pdflatex");
+  let generatedOutput = "";
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    const result = await fake.runCommand(executable, args, cwd);
+    if (executable === "pdflatex" && args[0] !== "--version") {
+      const outputArg = args.find((arg) => arg.startsWith("-output-directory="))!;
+      const buildDir = outputArg.slice("-output-directory=".length);
+      generatedOutput = join(buildDir, "main.aux");
+      await writeFile(generatedOutput, "current run auxiliary output", "utf8");
+      const flsPath = join(buildDir, "main.fls");
+      const fls = await readFile(flsPath, "utf8");
+      await writeFile(flsPath, fls + "OUTPUT " + generatedOutput + "\nINPUT " + generatedOutput + "\n", "utf8");
+    }
+    return result;
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.source_manifest.complete, true);
+  assert.ok(generatedOutput);
+  assert.ok(!receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
+});
+
+test("unverified build-directory recorder inputs are external and fail closed", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  const fake = fakeRunner("pdflatex");
+  let unverifiedInput = "";
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    const result = await fake.runCommand(executable, args, cwd);
+    if (executable === "pdflatex" && args[0] !== "--version") {
+      const outputArg = args.find((arg) => arg.startsWith("-output-directory="))!;
+      const buildDir = outputArg.slice("-output-directory=".length);
+      unverifiedInput = join(buildDir, "unverified.sty");
+      await writeFile(unverifiedInput, "not declared as a compiler output", "utf8");
+      const flsPath = join(buildDir, "main.fls");
+      const fls = await readFile(flsPath, "utf8");
+      await writeFile(flsPath, fls + "INPUT " + unverifiedInput + "\n", "utf8");
+    }
+    return result;
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(unverifiedInput);
   assert.ok(receipt.limitations.some((limitation) => limitation.includes("outside the compile snapshot and TeX distribution")));
 });
 

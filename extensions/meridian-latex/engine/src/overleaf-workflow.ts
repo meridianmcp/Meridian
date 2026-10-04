@@ -125,6 +125,12 @@ interface RecorderPaths {
   externalInputs: string[];
 }
 
+interface TeXDistributionResolution {
+  roots: string[];
+  reason: string | null;
+  phaseResults: Array<{ tool: string; result: CommandResult }>;
+}
+
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -993,10 +999,118 @@ async function compareOriginalProjectToSnapshot(projectRoot: string, snapshot: C
   return false;
 }
 
-function isTeXDistributionInput(path: string): boolean {
-  const segments = path.replace(/\\/g, "/").toLowerCase().split("/");
-  if (segments.some((segment) => ["texlive", "texmf-dist", "texmf-var", "texmf-config", "texmf-local"].includes(segment) || /^miktex(?:\s|$)/.test(segment))) return true;
-  return segments.some((segment, index) => segment === "texmf" && ["share", "etc", "var"].includes(segments[index - 1] ?? ""));
+function pathKey(path: string): string {
+  const normalized = resolve(path);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function executableExtensions(env: NodeJS.ProcessEnv): string[] {
+  if (process.platform !== "win32") return [""];
+  const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+  return extensions.length > 0 ? extensions : [".EXE"];
+}
+
+async function usableExecutable(path: string): Promise<string | null> {
+  try {
+    const realPath = await fs.realpath(path);
+    const stat = await fs.stat(realPath);
+    if (!stat.isFile()) return null;
+    await fs.access(realPath, process.platform === "win32" ? undefined : constants.X_OK);
+    return realPath;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveExecutableInPath(name: string, env: NodeJS.ProcessEnv, cwd: string): Promise<string | null> {
+  const pathValue = env.PATH ?? env.Path ?? "";
+  const extensions = executableExtensions(env);
+  for (const entry of pathValue.split(delimiter)) {
+    if (!entry) continue;
+    const directory = isAbsolute(entry) ? entry : resolve(cwd, entry);
+    for (const extension of extensions) {
+      const candidate = join(directory, name.toLowerCase().endsWith(extension.toLowerCase()) ? name : name + extension);
+      const usable = await usableExecutable(candidate);
+      if (usable) return usable;
+    }
+  }
+  return null;
+}
+
+async function resolveExecutableBeside(name: string, siblingPath: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+  const extensions = executableExtensions(env);
+  const directory = dirname(siblingPath);
+  for (const extension of extensions) {
+    const usable = await usableExecutable(join(directory, name.toLowerCase().endsWith(extension.toLowerCase()) ? name : name + extension));
+    if (usable) return usable;
+  }
+  return null;
+}
+
+async function resolveTeXDistributionRoots(
+  engine: LatexEngine,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  timeoutMs: number,
+  invoke: (executable: string, args: string[], cwd: string, commandTimeout: number, env?: NodeJS.ProcessEnv) => Promise<CommandResult>,
+): Promise<TeXDistributionResolution> {
+  const enginePath = await resolveExecutableInPath(engine, env, cwd);
+  if (!enginePath) return { roots: [], reason: "The active TeX engine could not be resolved on PATH to verify its distribution.", phaseResults: [] };
+  const kpsewhich = await resolveExecutableBeside("kpsewhich", enginePath, env);
+  if (!kpsewhich) return { roots: [], reason: "The active TeX engine has no sibling kpsewhich; its TeX distribution roots cannot be verified.", phaseResults: [] };
+
+  // Ignore user-supplied TEXMF overrides and query from the engine's own bin
+  // directory so a project-local texmf.cnf cannot define trusted roots. The
+  // compile still inherits the caller's actual environment; inputs outside
+  // these verified system roots are treated as external.
+  const kpseEnv: NodeJS.ProcessEnv = { ...env };
+  for (const key of Object.keys(kpseEnv)) if (/^TEXMF/i.test(key)) delete kpseEnv[key];
+  const distributionCwd = dirname(kpsewhich);
+  kpseEnv.PWD = distributionCwd;
+  const variables = ["TEXMFDIST", "TEXMFROOT", "TEXMFMAIN", "TEXMFSYSVAR", "TEXMFSYSCONFIG", "TEXMFLOCAL"];
+  const roots = new Map<string, string>();
+  const phaseResults: TeXDistributionResolution["phaseResults"] = [];
+  let requiredRootError: string | null = null;
+  const lookups = await Promise.all(variables.map(async (variable) => ({
+    variable,
+    result: await invoke(kpsewhich, ["--var-value=" + variable], distributionCwd, Math.min(timeoutMs, 15_000), kpseEnv),
+  })));
+  for (const { variable, result } of lookups) {
+    phaseResults.push({ tool: "kpsewhich --var-value=" + variable, result });
+    if (result.exitCode !== 0) {
+      if (variable === "TEXMFDIST") requiredRootError = "The active TeX distribution's kpsewhich could not resolve TEXMFDIST.";
+      continue;
+    }
+    const reported = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (reported.length !== 1 || !isAbsolute(reported[0])) {
+      if (variable === "TEXMFDIST") requiredRootError = "The active TeX distribution's kpsewhich returned an invalid TEXMFDIST path.";
+      continue;
+    }
+    try {
+      const root = await fs.realpath(reported[0]);
+      if (!(await fs.stat(root)).isDirectory()) throw new Error("not a directory");
+      roots.set(pathKey(root), root);
+    } catch {
+      if (variable === "TEXMFDIST") requiredRootError = "The active TeX distribution's kpsewhich returned a TEXMFDIST path that is not an accessible directory.";
+    }
+  }
+  if (requiredRootError || !roots.size) {
+    return {
+      roots: [],
+      reason: requiredRootError ?? "The active TeX distribution's kpsewhich returned no usable system roots.",
+      phaseResults,
+    };
+  }
+  return { roots: [...roots.values()], reason: null, phaseResults };
+}
+
+async function isVerifiedTeXDistributionInput(path: string, distributionRoots: string[]): Promise<boolean> {
+  try {
+    const actualPath = await fs.realpath(path);
+    return distributionRoots.some((root) => inside(root, actualPath));
+  } catch {
+    return false;
+  }
 }
 
 function redirectProjectSearchPath(value: string, originalRoot: string, snapshotRoot: string): string {
@@ -1010,23 +1124,34 @@ function redirectProjectSearchPath(value: string, originalRoot: string, snapshot
   }).join(delimiter);
 }
 
-function externalSearchPathEntries(value: string | undefined, originalRoot: string, snapshotRoot: string, excludedBuildDir: string): string[] {
+async function externalSearchPathEntries(value: string | undefined, originalRoot: string, snapshotRoot: string, excludedBuildDir: string, distributionRoots: string[]): Promise<string[]> {
   if (!value) return [];
-  return value.split(delimiter)
-    .map((entry) => entry.trim().replace(/^!!/, ""))
-    .filter(Boolean)
-    .filter((entry) => {
-      if (/[$*{}]/.test(entry)) return true;
-      const path = isAbsolute(entry) ? resolve(entry) : resolve(originalRoot, entry);
-      if (inside(originalRoot, path)) {
-        const firstPart = relative(originalRoot, path).split(sep)[0]?.toLowerCase();
-        return inside(excludedBuildDir, path) || firstPart === ".git" || firstPart === "node_modules";
-      }
-      return !isTeXDistributionInput(path) && !inside(snapshotRoot, path);
-    });
+  const external: string[] = [];
+  for (const entry of value.split(delimiter).map((part) => part.trim().replace(/^!!/, "")).filter(Boolean)) {
+    if (/[$*{}]/.test(entry)) {
+      external.push(entry);
+      continue;
+    }
+    const path = isAbsolute(entry) ? resolve(entry) : resolve(originalRoot, entry);
+    if (inside(originalRoot, path)) {
+      const firstPart = relative(originalRoot, path).split(sep)[0]?.toLowerCase();
+      if (inside(excludedBuildDir, path) || firstPart === ".git" || firstPart === "node_modules") external.push(path);
+    } else if (!inside(snapshotRoot, path) && !(await isVerifiedTeXDistributionInput(path, distributionRoots))) {
+      external.push(path);
+    }
+  }
+  return external;
 }
 
-function parseRecorderPaths(contents: string, compileRoot: string, originalRoot: string, snapshotRoot: string, buildDir: string): RecorderPaths {
+async function parseRecorderPaths(
+  contents: string,
+  compileRoot: string,
+  originalRoot: string,
+  snapshotRoot: string,
+  buildDir: string,
+  distributionRoots: string[],
+  knownGeneratedOutputs: string[],
+): Promise<RecorderPaths> {
   let recorderCwd = compileRoot;
   const lines = contents.split(/\r?\n/);
   for (const line of lines) {
@@ -1037,6 +1162,19 @@ function parseRecorderPaths(contents: string, compileRoot: string, originalRoot:
     }
   }
   const result: RecorderPaths = { inputs: [], bypassedProjectInputs: [], externalInputs: [] };
+  const recorderOutputs = new Set<string>();
+  for (const line of lines) {
+    if (!line.startsWith("OUTPUT ")) continue;
+    const raw = line.slice(7).trim();
+    if (!raw) continue;
+    const candidates = isAbsolute(raw) ? [resolve(raw)] : [resolve(buildDir, raw), resolve(recorderCwd, raw)];
+    for (const candidate of candidates) {
+      if (inside(buildDir, candidate) && !inside(snapshotRoot, candidate)) recorderOutputs.add(pathKey(candidate));
+    }
+  }
+  for (const path of knownGeneratedOutputs) {
+    if (inside(buildDir, path) && !inside(snapshotRoot, path)) recorderOutputs.add(pathKey(path));
+  }
   for (const line of lines) {
     if (!line.startsWith("INPUT ")) continue;
     const raw = line.slice(6).trim();
@@ -1045,17 +1183,32 @@ function parseRecorderPaths(contents: string, compileRoot: string, originalRoot:
     if (inside(snapshotRoot, candidate)) {
       result.inputs.push(candidate);
     } else if (inside(buildDir, candidate)) {
-      // Ignore this run's own aux files and the nested snapshot directory.
+      if (recorderOutputs.has(pathKey(candidate)) && await isVerifiedCurrentJobOutput(candidate, buildDir, snapshotRoot)) {
+        // The current job declared this output and it still resolves to a
+        // regular file in the private per-run build directory.
+      } else {
+        result.externalInputs.push(candidate);
+      }
     } else if (inside(originalRoot, candidate)) {
       result.bypassedProjectInputs.push(candidate);
-    } else if (isTeXDistributionInput(candidate)) {
-      // TeX package files and this run's own aux files are outside the local
-      // project source manifest by design.
+    } else if (await isVerifiedTeXDistributionInput(candidate, distributionRoots)) {
+      // System distribution files are outside the local project source manifest.
     } else {
       result.externalInputs.push(candidate);
     }
   }
   return result;
+}
+
+async function isVerifiedCurrentJobOutput(path: string, buildDir: string, snapshotRoot: string): Promise<boolean> {
+  try {
+    const info = await fs.lstat(path);
+    if (!info.isFile() || info.isSymbolicLink()) return false;
+    const actualPath = await fs.realpath(path);
+    return inside(buildDir, actualPath) && !inside(snapshotRoot, actualPath);
+  } catch {
+    return false;
+  }
 }
 
 function manifestKind(path: string): CompileManifestFile["kind"] {
@@ -1150,6 +1303,7 @@ function buildReceipt(input: {
   bypassedProjectInputs: string[];
   externalInputs: string[];
   recorderIncompleteReason: string | null;
+  distributionRootsReason: string | null;
   prerequisiteNotes: string[];
 }): CompileReceipt {
   const files = [...input.files].sort((a, b) => a.path.localeCompare(b.path));
@@ -1171,7 +1325,7 @@ function buildReceipt(input: {
       "This receipt covers a local compile only; it does not prove the local source was synchronized to Overleaf.",
       "A successful compiler exit does not prove citation resolution, visual quality, or editorial correctness.",
       "Shell escape is disabled, but TeX is not sandboxed: it can read or write files, including source-tree files, with the current user's permissions. Compile only sources you trust.",
-      "Recognized TeX distribution inputs outside the project snapshot are not individually hashed.",
+      "Verified TeX distribution inputs outside the project snapshot are not individually hashed.",
       ...input.prerequisiteNotes,
       ...(input.sourceChanged ? ["A local source file changed while compiling or disappeared; the source manifest is incomplete."] : []),
       ...(input.snapshotLimitReason ? ["The compile snapshot reached its " + input.snapshotLimitReason + "; source integrity cannot be confirmed."] : []),
@@ -1182,6 +1336,7 @@ function buildReceipt(input: {
       ...(input.bypassedProjectInputs.length > 0 ? ["The TeX recorder found input(s) from the original project path outside the compile snapshot; source integrity cannot be confirmed."] : []),
       ...(input.externalInputs.length > 0 ? ["The TeX recorder or bibliography search configuration includes input(s) outside the compile snapshot and TeX distribution; source integrity cannot be confirmed."] : []),
       ...(input.recorderIncompleteReason ? [input.recorderIncompleteReason] : []),
+      ...(input.distributionRootsReason ? [input.distributionRootsReason + "; source integrity cannot be confirmed."] : []),
     ],
   };
 }
@@ -1234,15 +1389,19 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
   if (process.env.BSTINPUTS !== undefined) compileEnv.BSTINPUTS = redirectProjectSearchPath(process.env.BSTINPUTS, originalRoot, snapshot.sourceRoot);
   const args = ["-no-shell-escape", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "-recorder", "-output-directory=" + buildDir, sources.rootFile];
   const phases: CompileReceipt["phases"] = [];
+  const prerequisiteNotes: string[] = [];
+  const distribution = await resolveTeXDistributionRoots(engine, compileEnv, snapshot.sourceRoot, timeoutMs, invoke);
+  for (const distributionPhase of distribution.phaseResults) phases.push(phase(distributionPhase.tool, distributionPhase.result));
+  if (distribution.reason) prerequisiteNotes.push(distribution.reason);
   const compilerVersion = await invoke(engine, ["--version"], snapshot.sourceRoot, Math.min(timeoutMs, 15_000), compileEnv);
   phases.push(phase(`${engine} --version`, compilerVersion));
   let status: CompileStatus = "failed";
-  const prerequisiteNotes: string[] = [];
   let version: string | null = compilerVersion.stdout.split(/\r?\n/).find((line) => line.trim())?.trim() ?? null;
   let pdfHash: string | null = null;
   let logHash: string | null = null;
   let recorderContents: string | null = null;
   let recorderReadFailure: string | null = null;
+  const knownGeneratedOutputs: string[] = [];
 
   if (compilerVersion.errorCode === "ENOENT") {
     status = "unavailable";
@@ -1276,6 +1435,9 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
           const bib = await invoke(bibtool, [jobName], buildDir, timeoutMs, compileEnv);
           phases.push(phase(bibtool, bib));
           bibliographyOk = bib.exitCode === 0;
+          if (bibliographyOk) {
+            knownGeneratedOutputs.push(join(buildDir, jobName + ".bbl"), join(buildDir, jobName + ".blg"));
+          }
           if (!bibliographyOk) {
             status = bib.errorCode === "ENOENT" ? "unavailable" : "failed";
             if (bib.errorCode === "ENOENT") prerequisiteNotes.push(`Bibliography backend "${bibtool}" could not be started. Check its installation and PATH.`);
@@ -1312,12 +1474,14 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
       : "The compiler did not produce a readable TeX recorder file.";
   }
   const recorderPaths = recorderContents
-    ? parseRecorderPaths(recorderContents, snapshot.sourceRoot, originalRoot, snapshot.sourceRoot, buildDir)
+    ? await parseRecorderPaths(recorderContents, snapshot.sourceRoot, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots, knownGeneratedOutputs)
     : { inputs: [], bypassedProjectInputs: [], externalInputs: [] };
-  recorderPaths.externalInputs.push(
-    ...externalSearchPathEntries(process.env.BIBINPUTS, originalRoot, snapshot.sourceRoot, buildDir),
-    ...externalSearchPathEntries(process.env.BSTINPUTS, originalRoot, snapshot.sourceRoot, buildDir),
-  );
+  const externalSearchPaths = await Promise.all([
+    externalSearchPathEntries(process.env.TEXINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots),
+    externalSearchPathEntries(process.env.BIBINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots),
+    externalSearchPathEntries(process.env.BSTINPUTS, originalRoot, snapshot.sourceRoot, buildDir, distribution.roots),
+  ]);
+  recorderPaths.externalInputs.push(...externalSearchPaths.flat());
   const recorderIncompleteReason = recorderReadFailure
     ?? (recorderPaths.inputs.length === 0 ? "The TeX recorder did not list any inputs from the compile snapshot." : null);
   let finalSources = sources;
@@ -1358,6 +1522,14 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
       digest: sha256("recorder-incomplete:" + recorderIncompleteReason),
     });
   }
+  if (distribution.reason) {
+    finalSources.unresolved.push({
+      source: "<unverified-tex-distribution>",
+      command: "kpsewhich",
+      reason: "outside_project",
+      digest: sha256("distribution-roots-unverified:" + distribution.reason),
+    });
+  }
   const snapshotIntegrityVerified = await verifyCompileSnapshot(snapshot);
   const snapshotProtectionReleased = await snapshotProtection.release();
   let sourceChanged = true;
@@ -1374,6 +1546,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     && snapshotIntegrityVerified
     && snapshotProtectionReleased
     && recorderPaths.inputs.length > 0
+    && distribution.reason === null
     && !sourceChanged
     && unbaselinedInputs.length === 0
     && recorderPaths.bypassedProjectInputs.length === 0
@@ -1404,6 +1577,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     bypassedProjectInputs: recorderPaths.bypassedProjectInputs,
     externalInputs: recorderPaths.externalInputs,
     recorderIncompleteReason,
+    distributionRootsReason: distribution.reason,
     prerequisiteNotes,
   });
   await persistReceipt(receipt, receiptsDir);
