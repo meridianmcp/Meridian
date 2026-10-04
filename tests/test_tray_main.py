@@ -2351,3 +2351,71 @@ def test_queued_watchdog_restart_is_superseded_by_manual_reconnect():
     assert operation_lock.acquisition_order == ["manual-reconnect", "queued-watchdog-tick"]
     assert tick_result == [None]
     runner.restart.assert_called_once_with(reason="manual tunnel reconnect")
+
+
+def test_manual_action_during_slow_probe_discards_stale_disconnected_result():
+    import threading
+
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    probe_calls = [0]
+
+    def status_probe():
+        probe_calls[0] += 1
+        if probe_calls[0] == 2:
+            probe_started.set()
+            assert release_probe.wait(3), "test did not release the slow diagnostics probe"
+        return {"state": "disconnected", "detail": "stale no active socket"}
+
+    def restart(*, reason):
+        if reason == "manual tunnel reconnect":
+            raise RuntimeError("manual reconnect failed")
+
+    runner = mock.Mock()
+    runner.restart.side_effect = restart
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=status_probe)
+    watchdog.arm()
+    assert watchdog.tick() is None
+    assert watchdog._consecutive_failures == 1
+
+    tick_result = []
+    slow_tick = threading.Thread(target=lambda: tick_result.append(watchdog.tick()))
+    slow_tick.start()
+    manual = None
+    try:
+        assert probe_started.wait(2), "watchdog did not enter the slow diagnostics probe"
+        action_generation, starting_sequence = watchdog.begin_manual_action()
+        manual_finished = threading.Event()
+
+        def run_manual_reconnect():
+            def restart_manually():
+                assert not watchdog.manual_action_can_reuse_restart(
+                    action_generation,
+                    starting_sequence,
+                    child_running=False,
+                )
+                try:
+                    runner.restart(reason="manual tunnel reconnect")
+                except RuntimeError:
+                    watchdog.finish_manual_action(action_generation, succeeded=False)
+                else:
+                    watchdog.finish_manual_action(action_generation, succeeded=True)
+                finally:
+                    manual_finished.set()
+
+            watchdog.serialize_runner_operation(restart_manually)
+
+        manual = threading.Thread(target=run_manual_reconnect)
+        manual.start()
+        assert manual_finished.wait(2), "manual reconnect did not finish during the probe"
+    finally:
+        release_probe.set()
+        slow_tick.join(3)
+        if manual is not None:
+            manual.join(3)
+
+    assert not slow_tick.is_alive()
+    assert manual is not None and not manual.is_alive()
+    assert tick_result == [None]
+    assert watchdog._consecutive_failures == 1
+    runner.restart.assert_called_once_with(reason="manual tunnel reconnect")

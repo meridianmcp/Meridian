@@ -539,6 +539,22 @@ class _TunnelWatchdog:
         self._circuit_open = False
         self._last_restart_reason = None
 
+    def _probe_snapshot_is_current_locked(
+        self,
+        generation: int,
+        manual_action_generation: int,
+        restart_sequence: int,
+    ) -> bool:
+        return (
+            self._enabled
+            and self._armed
+            and not self._circuit_open
+            and not self._manual_action_pending
+            and generation == self._generation
+            and manual_action_generation == self._manual_action_generation
+            and restart_sequence == self._restart_sequence
+        )
+
     def tick(self) -> str | None:
         """Perform at most one bounded diagnostics request and one restart."""
         if not self._tick_lock.acquire(blocking=False):
@@ -553,16 +569,26 @@ class _TunnelWatchdog:
                 ):
                     return None
                 generation = self._generation
+                manual_action_generation = self._manual_action_generation
+                restart_sequence = self._restart_sequence
             try:
                 hosted = self._status_probe()
             except Exception as exc:  # noqa: BLE001 -- a probe failure is not restart evidence
                 with self._lock:
+                    if not self._probe_snapshot_is_current_locked(
+                        generation, manual_action_generation, restart_sequence,
+                    ):
+                        return None
                     self._consecutive_failures = 0
                     self._healthy_since = None
                 _logger.warning("tunnel watchdog diagnostics probe failed: %s", type(exc).__name__)
                 return None
             if not isinstance(hosted, dict):
                 with self._lock:
+                    if not self._probe_snapshot_is_current_locked(
+                        generation, manual_action_generation, restart_sequence,
+                    ):
+                        return None
                     self._consecutive_failures = 0
                     self._healthy_since = None
                 return None
@@ -571,12 +597,8 @@ class _TunnelWatchdog:
             now = self._clock()
             restart_request: tuple[int, int, int, str] | None = None
             with self._lock:
-                if (
-                    not self._enabled
-                    or not self._armed
-                    or self._circuit_open
-                    or self._manual_action_pending
-                    or generation != self._generation
+                if not self._probe_snapshot_is_current_locked(
+                    generation, manual_action_generation, restart_sequence,
                 ):
                     return None
                 if state == "connected":
@@ -621,8 +643,8 @@ class _TunnelWatchdog:
                 self._next_restart_at = now + _TUNNEL_WATCHDOG_BACKOFF_SECONDS[attempt]
                 restart_request = (
                     generation,
-                    self._manual_action_generation,
-                    self._restart_sequence,
+                    manual_action_generation,
+                    restart_sequence,
                     reason,
                 )
 
