@@ -923,6 +923,95 @@ def test_run_tray_exposes_hosted_tunnel_enable_reconnect_disable_and_diagnostics
     tray_main.webbrowser.open.assert_any_call("https://usemeridian.us/tunnel/diagnostics/tenant-123")
 
 
+def test_run_tray_dispatches_enable_picker_after_runner_lock_is_released(monkeypatch):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    fake_tunnel_runner = mock.MagicMock(command=None)
+    fake_tunnel_runner.status.return_value.child.state = mock.sentinel.not_running
+
+    def no_saved_command(*, reason):
+        assert reason == "manual tunnel enable"
+        raise ValueError("no prior tunnel command")
+
+    fake_tunnel_runner.restart.side_effect = no_saved_command
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main, "_build_tunnel_runner", lambda: fake_tunnel_runner)
+    monkeypatch.setattr(tray_main, "_hosted_tunnel_status", lambda: {
+        "state": "unknown",
+        "detail": "not checked",
+        "last_error": None,
+        "base_url": "https://usemeridian.us",
+        "diagnostics_url": "https://usemeridian.us/tunnel/diagnostics/tenant-123",
+    })
+    monkeypatch.setattr(tray_main, "_choose_project_root", mock.Mock(return_value="C:/work/project"))
+    monkeypatch.setattr(tray_main.webbrowser, "open", mock.Mock())
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+
+    watchdogs = []
+    original_watchdog_init = tray_main._TunnelWatchdog.__init__
+
+    def capture_watchdog(watchdog, *args, **kwargs):
+        original_watchdog_init(watchdog, *args, **kwargs)
+        watchdogs.append(watchdog)
+
+    monkeypatch.setattr(tray_main._TunnelWatchdog, "__init__", capture_watchdog)
+    real_thread = tray_main.threading.Thread
+    asynchronous_ui_threads = []
+
+    class SplitThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.daemon = daemon
+            self.name = name
+            self.args = args
+
+        def start(self):
+            if self.name == "meridian-tunnel-watchdog":
+                return
+            if getattr(self.target, "__name__", None) == "_start":
+                # Keep runner work deterministic, while letting the UI dispatch
+                # itself run on a real asynchronous thread below.
+                self.target(*self.args)
+                return
+
+            assert watchdogs
+            assert not watchdogs[0]._runner_operation_lock.locked(), (
+                "UI picker callback was launched while a runner operation held its lock"
+            )
+            thread = real_thread(
+                target=self.target,
+                args=self.args,
+                daemon=self.daemon,
+                name=self.name,
+            )
+            asynchronous_ui_threads.append(thread)
+            thread.start()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", SplitThread)
+
+    def click_enable(*_args):
+        callbacks = {
+            call.args[0]: call.args[1]
+            for call in fake_pystray.MenuItem.call_args_list
+            if isinstance(call.args[0], str)
+        }
+        callbacks["Enable tunnel…"](fake_icon, None)
+
+    fake_icon.run.side_effect = click_enable
+    assert tray_main._run_tray() == 0
+
+    for thread in asynchronous_ui_threads:
+        thread.join(3)
+        assert not thread.is_alive(), "asynchronous UI picker callback did not finish"
+
+    tray_main._choose_project_root.assert_called_once_with(
+        "Choose a local project to share through the Meridian tunnel", parent=None,
+    )
+    fake_tunnel_runner.restart.assert_called_once_with(reason="manual tunnel enable")
+    fake_tunnel_runner.start.assert_called_once_with()
+
+
 @pytest.mark.parametrize("frozen", [False, True])
 def test_tunnel_command_uses_the_supervised_entrypoint(monkeypatch, tmp_path, frozen):
     project = tmp_path / "project"
@@ -1463,6 +1552,63 @@ def test_hosted_tunnel_status_reports_missing_auth_without_network_calls(monkeyp
     assert result["state"] == "not signed in"
     assert result["base_url"] == "https://example.test"
     network.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    [
+        {},
+        {"tunnel_process": {}, "slots": {}},
+        {"tunnel_process": {"any_active": "false"}, "slots": {}},
+        {"slots": {"filesystem": {"process_active": "false"}}},
+    ],
+)
+def test_hosted_tunnel_status_is_unknown_without_valid_activity_evidence(monkeypatch, diagnostics):
+    import json
+
+    from meridian import tunnel_client
+
+    monkeypatch.setattr(tunnel_client, "_resolve_base_url", lambda: "https://example.test")
+    monkeypatch.setattr(tunnel_client, "_resolve_token", lambda: "test-token")
+    monkeypatch.setattr(tunnel_client, "_read_cached_token", lambda _base_url: None)
+    payloads = iter([{"tenant_id": "tenant-123"}, diagnostics])
+
+    def fake_urlopen(_request, *, timeout):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(next(payloads)).encode("utf-8")
+        response.__enter__.return_value = response
+        return response
+
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", fake_urlopen)
+
+    result = tray_main._hosted_tunnel_status()
+
+    assert result["state"] == "unknown"
+    assert "valid activity evidence" in result["detail"]
+
+
+def test_hosted_tunnel_status_accepts_complete_legacy_slot_activity(monkeypatch):
+    import json
+
+    from meridian import tunnel_client
+
+    monkeypatch.setattr(tunnel_client, "_resolve_base_url", lambda: "https://example.test")
+    monkeypatch.setattr(tunnel_client, "_resolve_token", lambda: "test-token")
+    monkeypatch.setattr(tunnel_client, "_read_cached_token", lambda _base_url: None)
+    payloads = iter([
+        {"tenant_id": "tenant-123"},
+        {"slots": {"filesystem": {"process_active": False}}},
+    ])
+
+    def fake_urlopen(_request, *, timeout):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(next(payloads)).encode("utf-8")
+        response.__enter__.return_value = response
+        return response
+
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", fake_urlopen)
+
+    assert tray_main._hosted_tunnel_status()["state"] == "disconnected"
 
 
 # ---------------------------------------------------------------------------
@@ -2012,3 +2158,115 @@ def test_tunnel_watchdog_preference_defaults_on_and_persists(tmp_path):
     assert tray_main._load_tunnel_watchdog_enabled(path) is False
     tray_main._save_tunnel_watchdog_enabled(True, path)
     assert tray_main._load_tunnel_watchdog_enabled(path) is True
+
+
+def test_tunnel_watchdog_disable_supersedes_an_inflight_restart():
+    import threading
+
+    now = [100.0]
+    entered_restart = threading.Event()
+    release_restart = threading.Event()
+
+    def restart(*, reason):
+        entered_restart.set()
+        assert release_restart.wait(3), "test did not release the blocked restart"
+
+    runner = mock.Mock()
+    runner.restart.side_effect = restart
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "no active socket"})
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    watchdog.arm()
+    watchdog.tick()
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+
+    recovery = threading.Thread(target=watchdog.tick)
+    recovery.start()
+    try:
+        assert entered_restart.wait(2), "watchdog did not begin its recovery restart"
+        disarm_finished = threading.Event()
+
+        def disable_recovery():
+            watchdog.disarm()
+            disarm_finished.set()
+
+        disable = threading.Thread(target=disable_recovery)
+        disable.start()
+        assert disarm_finished.wait(1), "disarm blocked behind LocalRunner.restart"
+    finally:
+        release_restart.set()
+        recovery.join(3)
+        if "disable" in locals():
+            disable.join(3)
+
+    assert not recovery.is_alive()
+    assert not disable.is_alive()
+    runner.restart.assert_called_once()
+    runner.stop.assert_called_once_with()
+    assert "waiting for the tunnel to be enabled" in watchdog.status_text
+
+
+def test_tunnel_watchdog_restart_coalesces_with_pending_manual_reconnect():
+    import threading
+
+    now = [100.0]
+    entered_restart = threading.Event()
+    release_restart = threading.Event()
+    child_running = threading.Event()
+
+    def restart(*, reason):
+        entered_restart.set()
+        assert release_restart.wait(3), "test did not release the blocked restart"
+        child_running.set()
+
+    runner = mock.Mock()
+    runner.restart.side_effect = restart
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "no active socket"})
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    watchdog.arm()
+    watchdog.tick()
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+
+    recovery = threading.Thread(target=watchdog.tick)
+    recovery.start()
+    manual_action_started = threading.Event()
+    manual_action_entered = threading.Event()
+    reused_restart = []
+
+    try:
+        assert entered_restart.wait(2), "watchdog did not begin its recovery restart"
+        action_generation, starting_sequence = watchdog.begin_manual_action()
+
+        def manual_reconnect():
+            manual_action_started.set()
+
+            def run_manual_action():
+                manual_action_entered.set()
+                reused = watchdog.manual_action_can_reuse_restart(
+                    action_generation,
+                    starting_sequence,
+                    child_running=child_running.is_set(),
+                )
+                reused_restart.append(reused)
+                if not reused:
+                    runner.restart(reason="manual tunnel reconnect")
+                watchdog.finish_manual_action(
+                    action_generation, succeeded=True, reset_budget=True,
+                )
+
+            watchdog.serialize_runner_operation(run_manual_action)
+
+        manual = threading.Thread(target=manual_reconnect)
+        manual.start()
+        assert manual_action_started.wait(1)
+        assert not manual_action_entered.wait(0.1), "manual operation overlapped watchdog recovery"
+    finally:
+        release_restart.set()
+        recovery.join(3)
+        if "manual" in locals():
+            manual.join(3)
+
+    assert not recovery.is_alive()
+    assert not manual.is_alive()
+    assert reused_restart == [True]
+    runner.restart.assert_called_once()
+    runner.stop.assert_not_called()

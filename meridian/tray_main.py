@@ -313,12 +313,16 @@ def _hosted_tunnel_status() -> dict[str, str | None]:
         tunnel_process = {}
     if not isinstance(slots, dict):
         slots = {}
-    active = tunnel_process.get("any_active")
-    if active is None:
-        active = any(
-            isinstance(slot, dict) and slot.get("process_active")
-            for slot in slots.values()
-        )
+    active: bool | None = None
+    if isinstance(tunnel_process.get("any_active"), bool):
+        active = tunnel_process["any_active"]
+    elif slots and all(
+        isinstance(slot, dict) and isinstance(slot.get("process_active"), bool)
+        for slot in slots.values()
+    ):
+        # Older hosted diagnostics did not expose tunnel_process.any_active.
+        # A complete per-slot activity snapshot is still usable evidence.
+        active = any(slot["process_active"] for slot in slots.values())
     errors = [
         f"{name}: {slot['last_error']}"
         for name, slot in slots.items()
@@ -328,8 +332,16 @@ def _hosted_tunnel_status() -> dict[str, str | None]:
     if last_error:
         last_error = last_error[:500]
     return {
-        "state": "connected" if active else "disconnected",
-        "detail": "Hosted diagnostics report an active tunnel." if active else "No active hosted tunnel socket is reported.",
+        "state": (
+            "connected" if active is True else
+            "disconnected" if active is False else
+            "unknown"
+        ),
+        "detail": (
+            "Hosted diagnostics report an active tunnel." if active is True else
+            "No active hosted tunnel socket is reported." if active is False else
+            "Hosted tunnel diagnostics did not include valid activity evidence."
+        ),
         "last_error": last_error,
         "base_url": base_url,
         "diagnostics_url": diagnostics_url,
@@ -402,6 +414,11 @@ class _TunnelWatchdog:
         self._armed = False
         self._lock = threading.Lock()
         self._tick_lock = threading.Lock()
+        self._runner_operation_lock = threading.Lock()
+        self._generation = 0
+        self._manual_action_generation = 0
+        self._manual_action_pending = False
+        self._restart_sequence = 0
         self._consecutive_failures = 0
         self._restart_count = 0
         self._next_restart_at = 0.0
@@ -443,11 +460,76 @@ class _TunnelWatchdog:
             if reset_budget:
                 self._reset_budget_locked()
 
-    def disarm(self) -> None:
+    def begin_manual_action(self) -> tuple[int, int]:
+        """Suppress new watchdog work while a user start/reconnect is pending."""
         with self._lock:
+            self._manual_action_generation += 1
+            self._manual_action_pending = True
+            return self._manual_action_generation, self._restart_sequence
+
+    def resume_manual_action(self, action_generation: int) -> bool:
+        """Resume the latest user request after an enable picker returns."""
+        with self._lock:
+            if action_generation != self._manual_action_generation:
+                return False
+            self._manual_action_pending = True
+            return True
+
+    def finish_manual_action(
+        self,
+        action_generation: int,
+        *,
+        succeeded: bool,
+        reset_budget: bool = False,
+    ) -> bool:
+        """Complete the latest user request; a newer action supersedes it."""
+        with self._lock:
+            if action_generation != self._manual_action_generation:
+                return False
+            self._manual_action_pending = False
+            if succeeded:
+                self._armed = True
+                if reset_budget:
+                    self._reset_budget_locked()
+            return True
+
+    def manual_action_is_current(self, action_generation: int) -> bool:
+        with self._lock:
+            return action_generation == self._manual_action_generation
+
+    def manual_action_can_reuse_restart(
+        self,
+        action_generation: int,
+        starting_restart_sequence: int,
+        *,
+        child_running: bool,
+    ) -> bool:
+        with self._lock:
+            return (
+                action_generation == self._manual_action_generation
+                and self._restart_sequence > starting_restart_sequence
+                and child_running
+            )
+
+    @property
+    def restart_sequence(self) -> int:
+        with self._lock:
+            return self._restart_sequence
+
+    def serialize_runner_operation(self, operation: Any) -> Any:
+        """Serialize manual and automatic operations on the same supervisor."""
+        with self._runner_operation_lock:
+            return operation()
+
+    def disarm(self) -> int:
+        with self._lock:
+            self._generation += 1
+            self._manual_action_generation += 1
+            self._manual_action_pending = False
             self._armed = False
             self._consecutive_failures = 0
             self._healthy_since = None
+            return self._manual_action_generation
 
     def _reset_budget_locked(self) -> None:
         self._consecutive_failures = 0
@@ -463,8 +545,14 @@ class _TunnelWatchdog:
             return None
         try:
             with self._lock:
-                if not self._enabled or not self._armed or self._circuit_open:
+                if (
+                    not self._enabled
+                    or not self._armed
+                    or self._circuit_open
+                    or self._manual_action_pending
+                ):
                     return None
+                generation = self._generation
             try:
                 hosted = self._status_probe()
             except Exception as exc:  # noqa: BLE001 -- a probe failure is not restart evidence
@@ -481,8 +569,15 @@ class _TunnelWatchdog:
 
             state = str(hosted.get("state") or "unknown").strip().casefold()
             now = self._clock()
+            restart_request: tuple[int, str] | None = None
             with self._lock:
-                if not self._enabled or not self._armed or self._circuit_open:
+                if (
+                    not self._enabled
+                    or not self._armed
+                    or self._circuit_open
+                    or self._manual_action_pending
+                    or generation != self._generation
+                ):
                     return None
                 if state == "connected":
                     self._consecutive_failures = 0
@@ -524,19 +619,71 @@ class _TunnelWatchdog:
                 self._restart_count += 1
                 self._consecutive_failures = 0
                 self._next_restart_at = now + _TUNNEL_WATCHDOG_BACKOFF_SECONDS[attempt]
-                self._last_restart_reason = reason
-                try:
-                    self._runner.restart(reason=reason)
-                except Exception as exc:  # noqa: BLE001 -- surface failure but keep the tray/watchdog alive
-                    self._last_restart_reason = (
-                        f"{reason}; local helper restart failed: {type(exc).__name__}: {exc}"
-                    )[:500]
-                    _logger.warning("tunnel watchdog restart failed: %s", type(exc).__name__)
-                else:
-                    _logger.warning("tunnel watchdog restarted local helper: %s", reason)
-                return self._last_restart_reason
+                restart_request = (generation, reason)
+
+            if restart_request is None:
+                return None
+
+            return self._restart_for_generation(*restart_request)
         finally:
             self._tick_lock.release()
+
+    def _restart_for_generation(self, generation: int, reason: str) -> str | None:
+        def _restart() -> str | None:
+            with self._lock:
+                if (
+                    generation != self._generation
+                    or not self._enabled
+                    or not self._armed
+                    or self._circuit_open
+                    or self._manual_action_pending
+                ):
+                    return None
+
+            restart_error: Exception | None = None
+            try:
+                # Never hold the watchdog state lock across LocalRunner's
+                # blocking stop/start and readiness checks.
+                self._runner.restart(reason=reason)
+            except Exception as exc:  # noqa: BLE001 -- surface failure but keep the tray/watchdog alive
+                restart_error = exc
+
+            with self._lock:
+                keep_running = self._armed
+                if restart_error is None and keep_running:
+                    # A manual reconnect arriving during this restart can use
+                    # this completed operation instead of immediately doing it
+                    # again after it acquires the runner-operation lock.
+                    self._restart_sequence += 1
+                if generation == self._generation and keep_running:
+                    if restart_error is None:
+                        self._last_restart_reason = reason
+                    else:
+                        self._last_restart_reason = (
+                            f"{reason}; local helper restart failed: "
+                            f"{type(restart_error).__name__}: {restart_error}"
+                        )[:500]
+                    result = self._last_restart_reason
+                else:
+                    result = None
+
+            if not keep_running:
+                # Disable/disarm is an immediate state change even if a
+                # restart had already entered LocalRunner. Ensure that stale
+                # recovery cannot leave the helper running after it returns.
+                try:
+                    self._runner.stop()
+                except Exception as exc:  # noqa: BLE001 -- Disable will retry under the same operation lock
+                    _logger.warning("cancelled tunnel watchdog restart could not stop helper: %s", type(exc).__name__)
+                return None
+
+            if restart_error is not None:
+                _logger.warning("tunnel watchdog restart failed: %s", type(restart_error).__name__)
+            elif result is not None:
+                _logger.warning("tunnel watchdog restarted local helper: %s", reason)
+            return result
+
+        return self.serialize_runner_operation(_restart)
 
     def run(self, stop_event: threading.Event) -> None:
         while not stop_event.wait(_TUNNEL_WATCHDOG_INTERVAL_SECONDS):
@@ -1082,66 +1229,110 @@ def _run_tray() -> int:
 
         threading.Thread(target=_collect_and_show, daemon=True).start()
 
-    def _choose_and_enable_tunnel() -> None:
+    def _choose_and_enable_tunnel(
+        action: tuple[int, int] | None = None,
+    ) -> None:
+        if action is None:
+            action = watchdog.begin_manual_action()
+        elif not watchdog.resume_manual_action(action[0]):
+            return
         try:
             project_root = _choose_project_root(
                 "Choose a local project to share through the Meridian tunnel",
                 parent=ui_root,
             )
             if not project_root:
+                watchdog.finish_manual_action(action[0], succeeded=False)
                 return
-            tunnel_runner.command = _tunnel_command(project_root)
-            tunnel_runner.cwd = project_root
-            tunnel_runner.env = _tunnel_env()
-            _start_tunnel_supervisor(reconnect=False)
+            _start_tunnel_supervisor(reconnect=False, action=action, project_root=project_root)
         except Exception as exc:  # noqa: BLE001 -- keep the tray available if setup fails
-            _show_error_dialog("Meridian tunnel setup failed", str(exc), parent=ui_root)
+            if watchdog.finish_manual_action(action[0], succeeded=False):
+                _show_error_dialog("Meridian tunnel setup failed", str(exc), parent=ui_root)
 
-    def _start_tunnel_supervisor(*, reconnect: bool) -> None:
+    def _start_tunnel_supervisor(
+        *,
+        reconnect: bool,
+        action: tuple[int, int] | None = None,
+        project_root: str | None = None,
+    ) -> None:
+        if action is None:
+            action = watchdog.begin_manual_action()
+        elif not watchdog.resume_manual_action(action[0]):
+            return
+
         def _start() -> None:
             nonlocal tunnel_started_here
-            try:
-                current = tunnel_runner.status()
-                if current.child.state is ChildState.RUNNING:
-                    if not reconnect:
-                        tunnel_started_here = True
-                        watchdog.arm(reset_budget=True)
-                        return
-                    tunnel_runner.restart(reason="manual tunnel reconnect")
-                elif tunnel_runner.command is None:
-                    # A previous run persists its command in LocalRunner's
-                    # scope record. restart() recovers that command; with no
-                    # previous record it raises ValueError and opens the repo
-                    # picker so we never fall back to the home directory.
-                    tunnel_runner.restart(
-                        reason="manual tunnel reconnect" if reconnect else "manual tunnel enable",
-                    )
-                elif reconnect:
-                    tunnel_runner.restart(reason="manual tunnel reconnect")
-                else:
-                    tunnel_runner.start()
-                tunnel_started_here = True
-                watchdog.arm(reset_budget=True)
-            except RunnerAlreadyRunningError:
-                # A sibling tray already owns the same supervisor scope.
-                return
-            except ValueError as exc:
-                if tunnel_runner.command is None:
-                    _dispatch_ui(_choose_and_enable_tunnel)
+            deferred_ui_callback: Callable[[], None] | None = None
+
+            def _perform_start() -> None:
+                nonlocal deferred_ui_callback, tunnel_started_here
+                if not watchdog.manual_action_is_current(action[0]):
                     return
-                _dispatch_ui(
-                    lambda error=exc: _show_error_dialog(
-                        "Meridian tunnel could not start",
-                        str(error),
-                        parent=ui_root,
+                try:
+                    if project_root:
+                        tunnel_runner.command = _tunnel_command(project_root)
+                        tunnel_runner.cwd = project_root
+                        tunnel_runner.env = _tunnel_env()
+
+                    current = tunnel_runner.status()
+                    if current.child.state is ChildState.RUNNING:
+                        if reconnect and not watchdog.manual_action_can_reuse_restart(
+                            action[0], action[1], child_running=True,
+                        ):
+                            tunnel_runner.restart(reason="manual tunnel reconnect")
+                    elif tunnel_runner.command is None:
+                        # A previous run persists its command in LocalRunner's
+                        # scope record. restart() recovers that command; with no
+                        # previous record it raises ValueError and opens the repo
+                        # picker so we never fall back to the home directory.
+                        tunnel_runner.restart(
+                            reason="manual tunnel reconnect" if reconnect else "manual tunnel enable",
+                        )
+                    elif reconnect:
+                        if not watchdog.manual_action_can_reuse_restart(
+                            action[0], action[1], child_running=False,
+                        ):
+                            tunnel_runner.restart(reason="manual tunnel reconnect")
+                    else:
+                        tunnel_runner.start()
+
+                    if watchdog.finish_manual_action(
+                        action[0], succeeded=True, reset_budget=True,
+                    ):
+                        tunnel_started_here = True
+                        return
+                    # A newer Disable/Enable/Restart request arrived while
+                    # LocalRunner was starting. Do not leave its stale child up.
+                    try:
+                        tunnel_runner.stop()
+                    except Exception as exc:  # noqa: BLE001 -- a newer operation will retry under this lock
+                        tunnel_started_here = True
+                        _logger.warning("superseded tunnel start could not stop helper: %s", type(exc).__name__)
+                    else:
+                        tunnel_started_here = False
+                except RunnerAlreadyRunningError:
+                    watchdog.finish_manual_action(action[0], succeeded=False)
+                except ValueError as exc:
+                    should_show_error = watchdog.finish_manual_action(
+                        action[0], succeeded=False,
                     )
-                )
-            except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
-                _dispatch_ui(
-                    lambda error=exc: _show_error_dialog(
-                        "Meridian tunnel could not start", str(error), parent=ui_root,
-                    )
-                )
+                    if should_show_error and tunnel_runner.command is None:
+                        deferred_ui_callback = lambda: _choose_and_enable_tunnel(action)
+                    elif should_show_error:
+                        deferred_ui_callback = lambda error=exc: _show_error_dialog(
+                            "Meridian tunnel could not start",
+                            str(error),
+                            parent=ui_root,
+                        )
+                except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
+                    if watchdog.finish_manual_action(action[0], succeeded=False):
+                        deferred_ui_callback = lambda error=exc: _show_error_dialog(
+                            "Meridian tunnel could not start", str(error), parent=ui_root,
+                        )
+
+            watchdog.serialize_runner_operation(_perform_start)
+            if deferred_ui_callback is not None:
+                _dispatch_ui(deferred_ui_callback)
 
         threading.Thread(target=_start, daemon=True).start()
 
@@ -1152,18 +1343,27 @@ def _run_tray() -> int:
         _start_tunnel_supervisor(reconnect=True)
 
     def _disable_tunnel(icon: "pystray.Icon", item: Any) -> None:
+        action_generation = watchdog.disarm()
+
         def _stop() -> None:
             nonlocal tunnel_started_here
-            watchdog.disarm()
-            tunnel_started_here = False
-            try:
-                tunnel_runner.stop()
-            except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
-                _dispatch_ui(
-                    lambda error=exc: _show_error_dialog(
-                        "Meridian tunnel could not stop", str(error), parent=ui_root,
-                    )
-                )
+            def _perform_stop() -> None:
+                nonlocal tunnel_started_here
+                if not watchdog.manual_action_is_current(action_generation):
+                    return
+                try:
+                    tunnel_runner.stop()
+                except Exception as exc:  # noqa: BLE001 -- report, don't crash the tray
+                    if watchdog.manual_action_is_current(action_generation):
+                        _dispatch_ui(
+                            lambda error=exc: _show_error_dialog(
+                                "Meridian tunnel could not stop", str(error), parent=ui_root,
+                            )
+                        )
+                else:
+                    tunnel_started_here = False
+
+            watchdog.serialize_runner_operation(_perform_stop)
 
         threading.Thread(target=_stop, daemon=True).start()
 
@@ -1281,11 +1481,20 @@ def _run_tray() -> int:
 
     def _quit(icon: "pystray.Icon", item: Any) -> None:
         watchdog_stop.set()
-        if tunnel_started_here:
+        action_generation = watchdog.disarm()
+
+        def _stop_owned_tunnel() -> None:
+            nonlocal tunnel_started_here
+            if not watchdog.manual_action_is_current(action_generation) or not tunnel_started_here:
+                return
             try:
                 tunnel_runner.stop()
             except Exception:  # noqa: BLE001 -- shutting down must never hang the tray
                 pass
+            else:
+                tunnel_started_here = False
+
+        watchdog.serialize_runner_operation(_stop_owned_tunnel)
         try:
             runner.stop()
         except Exception:  # noqa: BLE001 -- shutting down must never hang the tray
