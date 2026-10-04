@@ -569,7 +569,7 @@ class _TunnelWatchdog:
 
             state = str(hosted.get("state") or "unknown").strip().casefold()
             now = self._clock()
-            restart_request: tuple[int, str] | None = None
+            restart_request: tuple[int, int, int, str] | None = None
             with self._lock:
                 if (
                     not self._enabled
@@ -619,7 +619,12 @@ class _TunnelWatchdog:
                 self._restart_count += 1
                 self._consecutive_failures = 0
                 self._next_restart_at = now + _TUNNEL_WATCHDOG_BACKOFF_SECONDS[attempt]
-                restart_request = (generation, reason)
+                restart_request = (
+                    generation,
+                    self._manual_action_generation,
+                    self._restart_sequence,
+                    reason,
+                )
 
             if restart_request is None:
                 return None
@@ -628,11 +633,19 @@ class _TunnelWatchdog:
         finally:
             self._tick_lock.release()
 
-    def _restart_for_generation(self, generation: int, reason: str) -> str | None:
+    def _restart_for_generation(
+        self,
+        generation: int,
+        manual_action_generation: int,
+        restart_sequence: int,
+        reason: str,
+    ) -> str | None:
         def _restart() -> str | None:
             with self._lock:
                 if (
                     generation != self._generation
+                    or manual_action_generation != self._manual_action_generation
+                    or restart_sequence != self._restart_sequence
                     or not self._enabled
                     or not self._armed
                     or self._circuit_open

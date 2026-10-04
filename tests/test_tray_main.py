@@ -2270,3 +2270,84 @@ def test_tunnel_watchdog_restart_coalesces_with_pending_manual_reconnect():
     assert reused_restart == [True]
     runner.restart.assert_called_once()
     runner.stop.assert_not_called()
+
+
+def test_queued_watchdog_restart_is_superseded_by_manual_reconnect():
+    import threading
+
+    class GatedRunnerOperationLock:
+        """Hold a queued watchdog request outside the lock until manual wins."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.watchdog_waiting = threading.Event()
+            self.allow_watchdog = threading.Event()
+            self.gate_timed_out = threading.Event()
+            self.acquisition_order = []
+
+        def __enter__(self):
+            name = threading.current_thread().name
+            if name == "queued-watchdog-tick":
+                self.watchdog_waiting.set()
+                if not self.allow_watchdog.wait(3):
+                    self.gate_timed_out.set()
+            self._lock.acquire()
+            self.acquisition_order.append(name)
+            return self
+
+        def __exit__(self, *_exc_info):
+            self._lock.release()
+
+    now = [100.0]
+    runner = mock.Mock()
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "no active socket"})
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    operation_lock = GatedRunnerOperationLock()
+    watchdog._runner_operation_lock = operation_lock
+    watchdog.arm()
+    watchdog.tick()
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+
+    tick_result = []
+    queued_tick = threading.Thread(
+        target=lambda: tick_result.append(watchdog.tick()),
+        name="queued-watchdog-tick",
+    )
+    queued_tick.start()
+    manual = None
+    try:
+        assert operation_lock.watchdog_waiting.wait(2), "watchdog did not queue its restart request"
+        action_generation, starting_sequence = watchdog.begin_manual_action()
+        manual_finished = threading.Event()
+
+        def run_manual_reconnect():
+            def restart_manually():
+                if not watchdog.manual_action_can_reuse_restart(
+                    action_generation,
+                    starting_sequence,
+                    child_running=False,
+                ):
+                    runner.restart(reason="manual tunnel reconnect")
+                watchdog.finish_manual_action(
+                    action_generation, succeeded=True, reset_budget=True,
+                )
+                manual_finished.set()
+
+            watchdog.serialize_runner_operation(restart_manually)
+
+        manual = threading.Thread(target=run_manual_reconnect, name="manual-reconnect")
+        manual.start()
+        assert manual_finished.wait(2), "manual reconnect did not acquire the runner lock first"
+        operation_lock.allow_watchdog.set()
+    finally:
+        operation_lock.allow_watchdog.set()
+        queued_tick.join(3)
+        if manual is not None:
+            manual.join(3)
+
+    assert not operation_lock.gate_timed_out.is_set()
+    assert not queued_tick.is_alive()
+    assert manual is not None and not manual.is_alive()
+    assert operation_lock.acquisition_order == ["manual-reconnect", "queued-watchdog-tick"]
+    assert tick_result == [None]
+    runner.restart.assert_called_once_with(reason="manual tunnel reconnect")
