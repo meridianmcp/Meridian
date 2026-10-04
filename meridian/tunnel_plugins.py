@@ -751,6 +751,26 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
         ),
     },
     {
+        # The LaTeX/Overleaf MCP engine is a first-class built-in on the `latex`
+        # slot. Keep the catalog inventory aligned with mcp-server.ts's TOOLS.
+        "name": "meridian-latex",
+        "package": "@meridianmcp/mcp",
+        "runtime": "npx",
+        "slot": "latex",
+        "bundled": True,
+        "owner_item": None,
+        "description": (
+            "Local LaTeX and Overleaf workflows. Engine tools: "
+            "outline_tex, outline_tex_file, claim_node, lease_document, "
+            "release_claim, get_live_claims, record_provenance, list_provenance, "
+            "mark_provenance_synced, lookup_citation_key, list_project_docs, "
+            "pull_doc_expanded, get_bibliography, expand_section_aliases, "
+            "list_local_snapshots, overleaf_login_status, list_citation_keys, "
+            "snapshot_document, lint_tex, lint_tex_file, get_style_guide, "
+            "check_section_style, lookup_published_framing."
+        ),
+    },
+    {
         # 88dbb675 — Context7 (by Upstash): general-purpose library/framework docs MCP.
         # Indexes React, Tailwind, Next.js, and thousands of other libraries so agents
         # get up-to-date API docs without web search. Complements paper_search (academic)
