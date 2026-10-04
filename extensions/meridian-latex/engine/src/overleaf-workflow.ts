@@ -132,6 +132,14 @@ function extractReferences(source: string): Array<{ command: string; value: stri
       refs.push({ command, value: match[2].trim() });
     }
   }
+  // TeX also accepts the common unbraced form `\\input chapter`. Hash simple
+  // literal filenames during preflight so recorder reconciliation can compare
+  // against a precompile baseline; a bounded tree snapshot covers recorder-only
+  // inputs that this lexical scan cannot identify.
+  const unbracedInputPattern = /\\input(?![a-zA-Z])\s+([^\s{}%\\]+)/g;
+  for (const match of code.matchAll(unbracedInputPattern)) {
+    refs.push({ command: "input", value: match[1].trim() });
+  }
   // \import{directory}{file} is common in multi-file papers and is not a
   // one-argument command. Resolve only literal paths; macro-expanded paths are
   // recorded as unknown below instead of being guessed.
@@ -608,6 +616,69 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
   return { rootFile: realMain, projectRoot: realRoot, files, sourceTexts, unresolved, bibliographyBackend };
 }
 
+async function captureRecorderBaseline(
+  projectRoot: string,
+  initialFiles: Map<string, CompileManifestFile>,
+  buildDir: string,
+): Promise<Map<string, string>> {
+  const root = await fs.realpath(projectRoot);
+  const baseline = new Map([...initialFiles].map(([path, file]) => [path, file.sha256]));
+  const pending = [root];
+  const visitedDirectories = new Set(pending);
+  const excludedBuildDir = resolve(buildDir);
+  let scannedFiles = 0;
+  let scannedBytes = 0;
+  const maximumFiles = 20_000;
+  const maximumBytes = 64 * 1024 * 1024;
+
+  while (pending.length > 0 && scannedFiles < maximumFiles && scannedBytes < maximumBytes) {
+    const directoryPath = pending.pop()!;
+    let directory;
+    try {
+      directory = await fs.opendir(directoryPath);
+    } catch {
+      continue;
+    }
+    for await (const entry of directory) {
+      const child = join(directoryPath, entry.name);
+      if (entry.isSymbolicLink() || inside(excludedBuildDir, child)) continue;
+      if (entry.isDirectory()) {
+        if ([".git", "node_modules"].includes(entry.name)) continue;
+        try {
+          const actualDirectory = await fs.realpath(child);
+          if (inside(root, actualDirectory) && !visitedDirectories.has(actualDirectory)) {
+            visitedDirectories.add(actualDirectory);
+            pending.push(actualDirectory);
+          }
+        } catch {
+          // An unreadable directory cannot provide a baseline; a recorder
+          // reference to a file inside it will be reported as unbaselined.
+        }
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      scannedFiles += 1;
+      if (scannedFiles > maximumFiles) break;
+      try {
+        const actual = await fs.realpath(child);
+        if (!inside(root, actual) || baseline.has(actual)) continue;
+        const stat = await fs.stat(actual);
+        if (!stat.isFile() || scannedBytes + stat.size > maximumBytes) {
+          if (stat.size > maximumBytes) scannedBytes = maximumBytes;
+          continue;
+        }
+        const data = await fs.readFile(actual);
+        scannedBytes += data.byteLength;
+        baseline.set(actual, sha256(data));
+      } catch {
+        // A later recorder reference without a captured hash fails closed.
+      }
+      if (scannedBytes >= maximumBytes) break;
+    }
+  }
+  return baseline;
+}
+
 function manifestKind(path: string): CompileManifestFile["kind"] {
   switch (extname(path).toLowerCase()) {
     case ".tex": return "tex";
@@ -692,6 +763,7 @@ function buildReceipt(input: {
   logHash: string | null;
   overleafProjectId?: string;
   sourceChanged: boolean;
+  unbaselinedInputs: string[];
   prerequisiteNotes: string[];
 }): CompileReceipt {
   const files = [...input.files].sort((a, b) => a.path.localeCompare(b.path));
@@ -716,6 +788,7 @@ function buildReceipt(input: {
       "System TeX packages are identified by the compiler environment and are not individually hashed.",
       ...input.prerequisiteNotes,
       ...(input.sourceChanged ? ["A local source file changed while compiling; the source manifest is incomplete."] : []),
+      ...(input.unbaselinedInputs.length > 0 ? ["The TeX recorder found local project input(s) without a precompile hash baseline; source integrity cannot be confirmed."] : []),
     ],
   };
 }
@@ -738,6 +811,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
   // overwrite each other's .aux/.fls/PDF or reuse stale artifacts.
   const buildDir = join(stateDir, "build", sha256(`local:${sources.projectRoot}`), randomUUID());
   await fs.mkdir(buildDir, { recursive: true, mode: 0o700 });
+  const recorderBaseline = await captureRecorderBaseline(sources.projectRoot, sources.files, join(stateDir, "build"));
   const runner = options.runCommand ?? runBoundedCommand;
   const args = ["-no-shell-escape", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "-recorder", `-output-directory=${buildDir}`, sources.rootFile];
   const phases: CompileReceipt["phases"] = [];
@@ -816,14 +890,16 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     recordedInputs = fls.split(/\r?\n/).flatMap((line) => line.startsWith("INPUT ") ? [line.slice(6).trim()] : []);
   } catch { /* a compiler failure can occur before it creates a recorder file */ }
   const finalSources = recordedInputs.length > 0 ? await collectSources(sources.rootFile, sources.projectRoot, recordedInputs) : sources;
-  const sourceChanged = [...sources.files.entries()].some(([path, before]) => finalSources.files.get(path)?.sha256 !== before.sha256);
+  const sourceChanged = [...sources.files.entries()].some(([path, before]) => finalSources.files.get(path)?.sha256 !== before.sha256)
+    || [...finalSources.files.entries()].some(([path, after]) => recorderBaseline.has(path) && recorderBaseline.get(path) !== after.sha256);
+  const unbaselinedInputs = [...finalSources.files.keys()].filter((path) => !recorderBaseline.has(path));
   if (status === "passed" && !pdfHash) status = "failed";
-  if (status === "passed" && sourceChanged) status = "incomplete";
+  if (status === "passed" && (sourceChanged || unbaselinedInputs.length > 0)) status = "incomplete";
   const receipt = buildReceipt({
     status,
     rootFile: safeRelativePath(finalSources.projectRoot, finalSources.rootFile),
     files: [...finalSources.files.values()],
-    complete: finalSources.unresolved.length === 0 && recordedInputs.length > 0 && !sourceChanged,
+    complete: finalSources.unresolved.length === 0 && recordedInputs.length > 0 && !sourceChanged && unbaselinedInputs.length === 0,
     unresolved: finalSources.unresolved,
     engine,
     version,
@@ -835,6 +911,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     logHash,
     overleafProjectId: options.overleafProjectId,
     sourceChanged,
+    unbaselinedInputs,
     prerequisiteNotes,
   });
   await persistReceipt(receipt, receiptsDir);

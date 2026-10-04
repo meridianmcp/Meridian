@@ -457,6 +457,54 @@ test("source changes during compile produce an incomplete receipt", async () => 
   assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
 });
 
+test("unbraced input changes during compile invalidate the precompile source baseline", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}\\input chapter\\end{document}\n",
+    "chapter.tex": "Before compile.\n",
+  });
+  const chapterPath = join(root, "chapter.tex");
+  const fake = fakeRunner("pdflatex", [chapterPath]);
+  let changed = false;
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    const result = await fake.runCommand(executable, args, cwd);
+    if (executable === "pdflatex" && args[0] !== "--version" && !changed) {
+      changed = true;
+      await writeFile(chapterPath, "Changed during compile.\n", "utf8");
+    }
+    return result;
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.equal(receipt.source_manifest.files.find((file) => file.path === "chapter.tex")?.sha256, createHash("sha256").update("Changed during compile.\n").digest("hex"));
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
+});
+
+test("recorder-only local inputs changed during compile invalidate their bounded precompile baseline", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}No lexical input reference.\\end{document}\n",
+    "chapter.tex": "Recorder-only input.\n",
+  });
+  const chapterPath = join(root, "chapter.tex");
+  const fake = fakeRunner("pdflatex", [join(root, "chapter.tex")]);
+  let changed = false;
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    const result = await fake.runCommand(executable, args, cwd);
+    if (executable === "pdflatex" && args[0] !== "--version" && !changed) {
+      changed = true;
+      await writeFile(chapterPath, "Changed recorder-only input.\n", "utf8");
+    }
+    return result;
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.source_manifest.files.some((file) => file.path === "chapter.tex"));
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
+});
+
 test("unique per-run build directories prevent stale outputs and concurrent clobbering", async () => {
   const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
   const firstRunner = fakeRunner("pdflatex");
