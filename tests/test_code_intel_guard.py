@@ -1483,12 +1483,22 @@ class TestCompleteSprintItemCodeIntelGate:
             db, pid, [_cap_receipt(availability_policy="required")],
         )
         item = await _make_prospected_item(db, pid, "Override this one")
+        reason = "manually verified via structured code review"
+        base = {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "override_code_intel_receipt": True, "override_reason": reason,
+        }
+        approval = await _st_mod.handle_complete_sprint_item(
+            base, db, "/tmp/meridian-test", None, None,
+        )
+        assert approval.get("error") == "HUMAN_APPROVAL_REQUIRED", approval
+        hitl_id = approval.get("hitl_id")
+        assert hitl_id
+        await db_module.answer_hitl_request(
+            db, hitl_id, "Yes, approve this override", answered_by="human-reviewer",
+        )
         result = await _st_mod.handle_complete_sprint_item(
-            {
-                "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
-                "override_code_intel_receipt": True,
-                "override_reason": "manually verified via structured code review",
-            },
+            {**base, "completion_override_hitl_id": hitl_id},
             db, "/tmp/meridian-test", None, None,
         )
         assert result.get("status") == "done", result

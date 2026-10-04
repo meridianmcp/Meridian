@@ -86,9 +86,9 @@ async def test_verify_commit_ci_guarded_on_error_and_missing_args():
 
 @pytest.mark.asyncio
 async def test_complete_sprint_item_flags_failing_ci(db, monkeypatch):
-    """427b7902 — a GENUINELY failing CI now REFUSES completion (was advisory-only
-    under b121348e). override_ci=true is the escape hatch and records the warning.
-    (Full green/unknown/pending/override matrix lives in test_w5_427b7902_ci_gate.)"""
+    """427b7902 — failing CI refuses completion unless a reasoned override gets
+    human approval; the approved override records the warning. The full state
+    matrix lives in test_w5_427b7902_ci_gate."""
     from meridian import server as srv
     p = await db_module.create_project(db, "ci-proj")
     await db_module.update_project_settings(db, p["id"], github_repo="meridianmcp/Meridian")
@@ -109,12 +109,18 @@ async def test_complete_sprint_item_flags_failing_ci(db, monkeypatch):
     still = await db_module.get_sprint_item(db, item["id"])
     assert still["status"] != "done"
 
-    # override_ci=true completes anyway and records the failing CI as a warning.
+    # A reasoned override requires human approval before completion.
+    base = {"project_id": p["id"], "item_id": item["id"],
+            "notes": "done; committed abc1234 to main", "override_ci": True,
+            "override_reason": "CI failure is an unrelated flaky job"}
+    approval = await srv._dispatch_mcp_tool("complete_sprint_item", base, db, "/tmp")
+    assert approval["error"] == "HUMAN_APPROVAL_REQUIRED"
+    await db_module.answer_hitl_request(
+        db, approval["hitl_id"], "Yes, approve this override", answered_by="human-reviewer",
+    )
     res = await srv._dispatch_mcp_tool(
         "complete_sprint_item",
-        {"project_id": p["id"], "item_id": item["id"],
-         "notes": "done; committed abc1234 to main", "override_ci": True,
-         "override_reason": "CI failure is an unrelated flaky job"},
+        {**base, "completion_override_hitl_id": approval["hitl_id"]},
         db, "/tmp")
     assert res["status"] == "done"
     assert res["ci_verification"]["state"] == "failure"
