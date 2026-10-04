@@ -524,6 +524,185 @@ def test_unreadable_file_hash_keeps_last_complete_index(tmp_path):
         idx.close()
 
 
+def test_reindex_snapshot_read_failure_preserves_last_complete_index(tmp_path, monkeypatch):
+    import builtins
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    arm_failure = False
+    fail_next_read = False
+
+    def hasher(path):
+        nonlocal fail_next_read
+        digest = ci._hash_file_bytes(path)
+        if arm_failure:
+            fail_next_read = True
+        return digest
+
+    original_open = builtins.open
+
+    def fail_snapshot_read(path, mode="r", *args, **kwargs):
+        nonlocal fail_next_read
+        if (
+            fail_next_read
+            and os.path.realpath(os.fspath(path)) == os.path.realpath(source)
+            and mode == "rb"
+        ):
+            fail_next_read = False
+            raise OSError("simulated transient chunk read failure")
+        return original_open(path, mode, *args, **kwargs)
+
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"), hasher=hasher)
+    try:
+        first = idx.reindex()
+        before = idx.get_convergence_state()
+        assert first["scan_complete"] is True
+        assert idx.search("retaineduniquetoken")
+
+        _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+        arm_failure = True
+        monkeypatch.setattr(builtins, "open", fail_snapshot_read)
+        partial = idx.reindex()
+
+        assert partial["scan_complete"] is False
+        assert partial["scan_reason"] == "file_read_failed"
+        assert partial["partial"] is True
+        after = idx.get_convergence_state()
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.index_revision == before.index_revision
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("newuniquetoken")
+
+        monkeypatch.setattr(builtins, "open", original_open)
+        recovered = idx.reindex()
+        assert recovered["scan_complete"] is True
+        assert idx.search("newuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_reindex_source_change_between_hash_and_chunk_keeps_previous_snapshot(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    replace_after_hash = False
+
+    def racing_hasher(path):
+        nonlocal replace_after_hash
+        digest = ci._hash_file_bytes(path)
+        if replace_after_hash:
+            replace_after_hash = False
+            _write(source, "def latestmarker():\n    return 'latestuniquetoken'\n")
+        return digest
+
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"), hasher=racing_hasher)
+    try:
+        first = idx.reindex()
+        before = idx.get_convergence_state()
+        assert first["scan_complete"] is True
+
+        _write(source, "def middlemarker():\n    return 'middleuniquetoken'\n")
+        replace_after_hash = True
+        partial = idx.reindex()
+
+        assert partial["scan_complete"] is False
+        assert partial["scan_reason"] == "file_changed_during_chunk"
+        assert partial["partial"] is True
+        after = idx.get_convergence_state()
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.index_revision == before.index_revision
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("middleuniquetoken")
+        assert not idx.search("latestuniquetoken")
+
+        recovered = idx.reindex()
+        assert recovered["scan_complete"] is True
+        assert idx.search("latestuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_reindex_write_failure_rolls_back_rows_and_merkle_baseline(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"))
+    try:
+        idx.reindex()
+        before = idx.get_convergence_state()
+        _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+
+        def fail_insert(_con, _chunks):
+            raise RuntimeError("simulated insert failure")
+
+        monkeypatch.setattr(idx, "_insert_chunks", fail_insert)
+        failed = idx.reindex()
+
+        assert failed["error"] == "index_write_failed"
+        assert failed["partial"] is True
+        after = idx.get_convergence_state()
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.index_revision == before.index_revision
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("newuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_index_paths_read_failure_preserves_existing_rows_and_baseline(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"))
+    try:
+        idx.reindex()
+        before = idx.get_convergence_state()
+        _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+        monkeypatch.setattr(
+            idx,
+            "_chunk_snapshot",
+            lambda _path, **_kwargs: (None, "file_read_failed"),
+        )
+
+        result = idx.index_paths([str(source)])
+
+        assert result["error"] == "file_read_failed"
+        after = idx.get_convergence_state()
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.index_revision == before.index_revision
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("newuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_full_reindex_prunes_deleted_file_chunks(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    deleted = root / "gone.py"
+    kept = root / "keep.py"
+    _write(deleted, "def doomedmarker():\n    return 'doomeduniquetoken'\n")
+    _write(kept, "def survivormarker():\n    return 'survivoruniquetoken'\n")
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"))
+    try:
+        idx.reindex()
+        assert idx.search("doomeduniquetoken")
+        deleted.unlink()
+
+        summary = idx.reindex(full=True)
+
+        assert summary["scan_complete"] is True
+        assert not idx.search("doomeduniquetoken")
+        assert idx.search("survivoruniquetoken")
+    finally:
+        idx.close()
+
+
 def test_bounded_git_path_reader_stops_at_entry_limit():
     import sys
     import time

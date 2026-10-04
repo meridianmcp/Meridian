@@ -1435,9 +1435,8 @@ class CodeIndex:
             "indexed_file_count": 0,
             "total_bytes": 0,
         }
-        con.execute("DELETE FROM code_index_meta WHERE id = 1")
         con.execute(
-            "INSERT INTO code_index_meta "
+            "INSERT OR REPLACE INTO code_index_meta "
             "(id, merkle_json, embedding_model, index_revision, "
             "last_checkpoint_at, scope_info_json) VALUES (1, ?, ?, ?, ?, ?)",
             [
@@ -1455,6 +1454,33 @@ class CodeIndex:
         for rel in rel_paths:
             abs_path = self._abs(rel)
             con.execute("DELETE FROM code_chunks WHERE path = ?", [abs_path])
+
+    def _delete_paths_outside_keep_set(
+        self, con: Any, scope_root: str, keep_paths: Iterable[str],
+    ) -> int:
+        """Delete cached paths under ``scope_root`` absent from a complete scan."""
+        normalized_root = os.path.normcase(os.path.abspath(scope_root))
+        keep = {
+            os.path.normcase(os.path.abspath(path))
+            for path in keep_paths
+        }
+        rows = con.execute("SELECT DISTINCT path FROM code_chunks").fetchall()
+        deleted = 0
+        for row in rows:
+            path = row[0]
+            if not isinstance(path, str):
+                continue
+            normalized_path = os.path.normcase(os.path.abspath(path))
+            try:
+                within_scope = os.path.commonpath(
+                    [normalized_root, normalized_path]
+                ) == normalized_root
+            except (OSError, ValueError):
+                within_scope = False
+            if within_scope and normalized_path not in keep:
+                con.execute("DELETE FROM code_chunks WHERE path = ?", [path])
+                deleted += 1
+        return deleted
 
     def _insert_chunks(self, con: Any, chunks: list[CodeChunk]) -> None:
         for c in chunks:
@@ -1524,54 +1550,106 @@ class CodeIndex:
                     self._embedder.model_name if self._embedder.available() else None
                 )
                 if diff.is_empty and prev is not None:
+                    if configured_model and configured_model != meta["embedding_model"]:
+                        self._prepare_search_extensions(con)
+                        con.execute("BEGIN TRANSACTION")
+                        try:
+                            self._rebuild_vss(con)
+                            if self._vss_ready:
+                                revision += 1
+                                self._store_meta(
+                                    con,
+                                    tree=new_tree,
+                                    embedding_model=configured_model,
+                                    index_revision=revision,
+                                    last_checkpoint_at=time.time(),
+                                    scan_info=scan_info,
+                                )
+                            con.execute("COMMIT")
+                        except Exception:
+                            try:
+                                con.execute("ROLLBACK")
+                            except Exception:  # noqa: BLE001
+                                pass
+                            raise
+                        if self._vss_ready:
+                            self._index_revision = revision
+                            summary["rebuilt"] = True
+                    else:
+                        self._store_meta(
+                            con,
+                            tree=new_tree,
+                            embedding_model=meta["embedding_model"],
+                            index_revision=revision,
+                            last_checkpoint_at=time.time(),
+                            scan_info=scan_info,
+                        )
+                        self._index_revision = revision
+                    return summary
+
+                file_hashes = new_tree.files()
+                prepared: dict[str, list[CodeChunk]] = {}
+                for rel in diff.changed_files:
+                    chunks, error = self._chunk_snapshot(
+                        self._abs(rel), expected_hash=file_hashes.get(rel),
+                    )
+                    if error is not None:
+                        scan_info["scan_complete"] = False
+                        scan_info["scan_reason"] = error
+                        summary.update(scan_info)
+                        summary["partial"] = True
+                        summary["error"] = error
+                        self._store_meta(
+                            con,
+                            tree=meta["merkle"],
+                            embedding_model=meta["embedding_model"],
+                            index_revision=revision,
+                            last_checkpoint_at=meta["last_checkpoint_at"],
+                            scan_info=scan_info,
+                        )
+                        self._index_revision = revision
+                        return summary
+                    assert chunks is not None
+                    prepared[rel] = chunks
+
+                self._prepare_search_extensions(con)
+                con.execute("BEGIN TRANSACTION")
+                try:
+                    if full:
+                        self._delete_paths_outside_keep_set(
+                            con,
+                            self.root_dir,
+                            (self._abs(rel) for rel in file_hashes),
+                        )
+                    elif diff.removed:
+                        self._delete_file_chunks(con, diff.removed)
+
+                    written = 0
+                    for rel, chunks in prepared.items():
+                        self._delete_file_chunks(con, [rel])
+                        self._insert_chunks(con, chunks)
+                        written += len(chunks)
+                    summary["chunks_written"] = written
+                    self._rebuild_search(con)
+                    revision += 1
+                    new_embedding_model = (
+                        configured_model if self._vss_ready else meta["embedding_model"]
+                    )
                     self._store_meta(
                         con,
                         tree=new_tree,
-                        embedding_model=meta["embedding_model"],
+                        embedding_model=new_embedding_model,
                         index_revision=revision,
                         last_checkpoint_at=time.time(),
                         scan_info=scan_info,
                     )
-                    self._index_revision = revision
-                    if configured_model and configured_model != meta["embedding_model"]:
-                        self._rebuild_vss(con)
-                        if self._vss_ready:
-                            revision += 1
-                            self._store_meta(
-                                con,
-                                tree=new_tree,
-                                embedding_model=configured_model,
-                                index_revision=revision,
-                                last_checkpoint_at=time.time(),
-                                scan_info=scan_info,
-                            )
-                            self._index_revision = revision
-                            summary["rebuilt"] = True
-                    return summary
-
-                if diff.removed:
-                    self._delete_file_chunks(con, diff.removed)
-                written = 0
-                for rel in diff.changed_files:
-                    abs_path = self._abs(rel)
-                    self._delete_file_chunks(con, [rel])
-                    chunks = self._chunk_path(abs_path)
-                    self._insert_chunks(con, chunks)
-                    written += len(chunks)
-                summary["chunks_written"] = written
-                self._rebuild_search(con)
-                revision += 1
-                new_embedding_model = (
-                    configured_model if self._vss_ready else meta["embedding_model"]
-                )
-                self._store_meta(
-                    con,
-                    tree=new_tree,
-                    embedding_model=new_embedding_model,
-                    index_revision=revision,
-                    last_checkpoint_at=time.time(),
-                    scan_info=scan_info,
-                )
+                    con.execute("COMMIT")
+                except Exception:
+                    try:
+                        con.execute("ROLLBACK")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise
                 self._index_revision = revision
                 summary["rebuilt"] = True
             except Exception:  # noqa: BLE001
@@ -1589,6 +1667,41 @@ class CodeIndex:
             return []
         return chunk_file(abs_path, source)
 
+    def _chunk_snapshot(
+        self, abs_path: str, *, expected_hash: str | None = None,
+    ) -> tuple[list[CodeChunk] | None, str | None]:
+        """Read a bounded source snapshot and optionally bind it to its Merkle hash.
+
+        The tree scan and chunk read are separate filesystem operations.  A
+        source may be removed, become unreadable, or change between them, so a
+        caller publishing Merkle-backed changes must verify the exact bytes it
+        will chunk before deleting any existing rows.
+        """
+        max_bytes = 4_000_000
+        try:
+            with open(abs_path, "rb") as stream:
+                raw = stream.read(max_bytes + 1)
+        except OSError:
+            return None, "file_read_failed"
+        if len(raw) > max_bytes:
+            return None, "file_size_budget_exceeded"
+        content_hash = hashlib.sha256(raw).hexdigest()
+        if expected_hash is not None and content_hash != expected_hash:
+            return None, "file_changed_during_chunk"
+        source = raw.decode("utf-8", errors="replace")
+        return chunk_file(abs_path, source), None
+
+    def _prepare_search_extensions(self, con: Any) -> None:
+        """Load DuckDB search extensions before opening a write transaction."""
+        con.execute("INSTALL fts")
+        con.execute("LOAD fts")
+        if self._embedder.available():
+            try:
+                con.execute("INSTALL vss")
+                con.execute("LOAD vss")
+            except Exception:  # noqa: BLE001 — VSS is an optional search leg
+                _log.debug("CodeIndex could not load VSS", exc_info=True)
+
     # -- FTS + VSS index build ----------------------------------------------
 
     def _rebuild_search(self, con: Any) -> None:
@@ -1601,8 +1714,6 @@ class CodeIndex:
         """(Re)build the DuckDB FTS index over chunk ``content``, keyed on
         ``chunk_id`` — ``overwrite`` because the FTS index never tracks source
         changes."""
-        con.execute("INSTALL fts")
-        con.execute("LOAD fts")
         con.execute(
             "PRAGMA create_fts_index("
             "'code_chunks', 'chunk_id', 'content', "
@@ -1634,8 +1745,6 @@ class CodeIndex:
         if dim <= 0:
             return
         try:
-            con.execute("INSTALL vss")
-            con.execute("LOAD vss")
             con.execute("SET hnsw_enable_experimental_persistence = true")
             con.execute("DROP INDEX IF EXISTS code_chunks_vec_idx")
             # Recreate the embedding column with the right fixed dimension.
@@ -1923,11 +2032,40 @@ class CodeIndex:
 
     # -- targeted registration after provenance writes (e631d54f) -----------
 
-    def index_paths(self, paths: list[str]) -> dict[str, Any]:
-        """Index an explicit, bounded allowlist under the canonical root."""
+    def index_paths(
+        self, paths: list[str], *, prune_root: str | None = None,
+    ) -> dict[str, Any]:
+        """Index an explicit allowlist, optionally reconciling a complete subtree."""
         with self._lock:
             targets: list[tuple[str, str]] = []
             skipped = 0
+            canonical_prune_root = normalize_root_dir(prune_root) if prune_root else None
+            if canonical_prune_root:
+                try:
+                    if os.path.commonpath(
+                        [self.root_dir, canonical_prune_root]
+                    ) != self.root_dir:
+                        return {
+                            "canonical_root": self.root_dir,
+                            "scope_id": self._root_identity["scope_id"],
+                            "scope_mode": "explicit_allowlist",
+                            "allowlisted_paths": [],
+                            "indexed": 0,
+                            "skipped": len(paths or []),
+                            "paths": [],
+                            "error": "prune_scope_outside_root",
+                        }
+                except (OSError, ValueError):
+                    return {
+                        "canonical_root": self.root_dir,
+                        "scope_id": self._root_identity["scope_id"],
+                        "scope_mode": "explicit_allowlist",
+                        "allowlisted_paths": [],
+                        "indexed": 0,
+                        "skipped": len(paths or []),
+                        "paths": [],
+                        "error": "prune_scope_outside_root",
+                    }
             for path in paths or []:
                 if not path:
                     skipped += 1
@@ -1952,43 +2090,80 @@ class CodeIndex:
                 "scope_mode": "explicit_allowlist",
                 "allowlisted_paths": sorted(rel for _, rel in targets),
             }
-            if not targets:
+            if canonical_prune_root and skipped:
+                return {
+                    **base,
+                    "indexed": 0,
+                    "skipped": skipped,
+                    "paths": [],
+                    "error": "subtree_path_changed",
+                }
+            if not targets and not canonical_prune_root:
                 return {**base, "indexed": 0, "skipped": skipped, "paths": []}
             try:
                 con = self._connect()
                 self._ensure_schema(con)
-                written_rel: list[str] = []
+                prepared: list[tuple[str, str, list[CodeChunk]]] = []
                 for abs_path, rel in targets:
-                    self._delete_file_chunks(con, [rel])
-                    chunks = self._chunk_path(abs_path)
-                    if chunks:
-                        self._insert_chunks(con, chunks)
-                        written_rel.append(rel)
-                    else:
-                        skipped += 1
-                if written_rel:
-                    self._rebuild_search(con)
-                    meta = self._load_meta(con)
-                    if meta["merkle"] is not None:
-                        revision = meta["index_revision"] + 1
-                        configured_model = (
-                            self._embedder.model_name if self._embedder.available() else None
-                        )
-                        new_model = configured_model if self._vss_ready else meta["embedding_model"]
-                        self._store_meta(
+                    chunks, error = self._chunk_snapshot(abs_path)
+                    if error is not None:
+                        return {
+                            **base,
+                            "indexed": 0,
+                            "skipped": skipped + 1,
+                            "paths": [],
+                            "error": error,
+                        }
+                    assert chunks is not None
+                    prepared.append((abs_path, rel, chunks))
+
+                self._prepare_search_extensions(con)
+                con.execute("BEGIN TRANSACTION")
+                try:
+                    deleted = 0
+                    if canonical_prune_root:
+                        deleted = self._delete_paths_outside_keep_set(
                             con,
-                            tree=meta["merkle"],
-                            embedding_model=new_model,
-                            index_revision=revision,
-                            last_checkpoint_at=time.time(),
-                            scan_info=meta.get("scan_info"),
+                            canonical_prune_root,
+                            (abs_path for abs_path, _, _ in prepared),
                         )
-                        self._index_revision = revision
+                    for _abs_path, rel, chunks in prepared:
+                        self._delete_file_chunks(con, [rel])
+                        self._insert_chunks(con, chunks)
+                    changed = bool(prepared or deleted)
+                    meta = self._load_meta(con)
+                    revision = meta["index_revision"]
+                    if changed:
+                        self._rebuild_search(con)
+                        if meta["merkle"] is not None:
+                            revision += 1
+                            configured_model = (
+                                self._embedder.model_name if self._embedder.available() else None
+                            )
+                            new_model = (
+                                configured_model if self._vss_ready else meta["embedding_model"]
+                            )
+                            self._store_meta(
+                                con,
+                                tree=meta["merkle"],
+                                embedding_model=new_model,
+                                index_revision=revision,
+                                last_checkpoint_at=time.time(),
+                                scan_info=meta.get("scan_info"),
+                            )
+                    con.execute("COMMIT")
+                except Exception:
+                    try:
+                        con.execute("ROLLBACK")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise
+                self._index_revision = revision
                 return {
                     **base,
-                    "indexed": len(written_rel),
+                    "indexed": len(prepared),
                     "skipped": skipped,
-                    "paths": written_rel,
+                    "paths": [rel for _, rel, _ in prepared],
                 }
             except Exception:  # noqa: BLE001
                 _log.debug("CodeIndex.index_paths failed", exc_info=True)
