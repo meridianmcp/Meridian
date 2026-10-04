@@ -10,6 +10,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { watch, type FSWatcher } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -92,6 +93,21 @@ interface CollectedSources {
   sourceTexts: Map<string, string>;
   unresolved: UnresolvedReference[];
   bibliographyBackend: BibliographyBackend;
+}
+
+interface RecorderBaseline {
+  files: Map<string, string>;
+  complete: boolean;
+  limitReason: string | null;
+}
+
+interface SourceChangeMonitorResult {
+  changed: boolean;
+  unavailable: boolean;
+}
+
+interface SourceChangeMonitor {
+  finish(): Promise<SourceChangeMonitorResult>;
 }
 
 function sha256(value: string | Buffer): string {
@@ -435,11 +451,34 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
   }
   for (const input of extraInputs) {
     const candidate = isAbsolute(input) ? input : resolve(realRoot, input);
+    if (!inside(realRoot, candidate)) continue;
+    const normalizedCandidate = resolve(candidate);
+    const missingInput = () => {
+      const path = safeRelativePath(realRoot, normalizedCandidate);
+      unresolved.push({
+        source: path,
+        command: "recorder_input",
+        reason: "missing",
+        digest: sha256(`recorder-input:${path}`),
+      });
+    };
     try {
       const actual = await fs.realpath(candidate);
-      if (!inside(realRoot, actual)) continue;
+      if (!inside(realRoot, actual)) {
+        const path = safeRelativePath(realRoot, normalizedCandidate);
+        unresolved.push({
+          source: path,
+          command: "recorder_input",
+          reason: "outside_project",
+          digest: sha256(`recorder-input:${path}`),
+        });
+        continue;
+      }
       const stat = await fs.stat(actual);
-      if (!stat.isFile()) continue;
+      if (!stat.isFile()) {
+        missingInput();
+        continue;
+      }
       recorderInputFiles.push(actual);
       if (files.has(actual)) continue;
       const kind = manifestKind(actual);
@@ -452,8 +491,10 @@ async function collectSources(rootFile: string, projectRoot: string, extraInputs
         await addFile(actual, kind);
       }
     } catch {
-      // TeX recorder entries may name deleted transient files; leave the
-      // lexical completeness signal to the preflight scan.
+      // A recorder-listed in-project file may have disappeared after TeX read
+      // it. Keep that path in the integrity result instead of silently
+      // dropping it and accidentally treating the remaining manifest complete.
+      missingInput();
     }
   }
   // Recorder-listed .tex/.cls/.sty inputs can contain their own inputs or
@@ -620,18 +661,28 @@ async function captureRecorderBaseline(
   projectRoot: string,
   initialFiles: Map<string, CompileManifestFile>,
   buildDir: string,
-): Promise<Map<string, string>> {
+): Promise<RecorderBaseline> {
   const root = await fs.realpath(projectRoot);
   const baseline = new Map([...initialFiles].map(([path, file]) => [path, file.sha256]));
   const pending = [root];
   const visitedDirectories = new Set(pending);
   const excludedBuildDir = resolve(buildDir);
+  let scannedDirectories = 0;
+  let scannedEntries = 0;
   let scannedFiles = 0;
   let scannedBytes = 0;
+  let limitReason: string | null = null;
+  const maximumDirectories = 4_096;
+  const maximumEntries = 100_000;
   const maximumFiles = 20_000;
   const maximumBytes = 64 * 1024 * 1024;
 
-  while (pending.length > 0 && scannedFiles < maximumFiles && scannedBytes < maximumBytes) {
+  while (pending.length > 0 && !limitReason) {
+    if (scannedDirectories >= maximumDirectories) {
+      limitReason = `directory limit (${maximumDirectories})`;
+      break;
+    }
+    scannedDirectories += 1;
     const directoryPath = pending.pop()!;
     let directory;
     try {
@@ -640,6 +691,11 @@ async function captureRecorderBaseline(
       continue;
     }
     for await (const entry of directory) {
+      if (scannedEntries >= maximumEntries) {
+        limitReason = `entry limit (${maximumEntries})`;
+        break;
+      }
+      scannedEntries += 1;
       const child = join(directoryPath, entry.name);
       if (entry.isSymbolicLink() || inside(excludedBuildDir, child)) continue;
       if (entry.isDirectory()) {
@@ -657,26 +713,73 @@ async function captureRecorderBaseline(
         continue;
       }
       if (!entry.isFile()) continue;
+      if (scannedFiles >= maximumFiles) {
+        limitReason = `file limit (${maximumFiles})`;
+        break;
+      }
       scannedFiles += 1;
-      if (scannedFiles > maximumFiles) break;
       try {
         const actual = await fs.realpath(child);
         if (!inside(root, actual) || baseline.has(actual)) continue;
         const stat = await fs.stat(actual);
         if (!stat.isFile() || scannedBytes + stat.size > maximumBytes) {
-          if (stat.size > maximumBytes) scannedBytes = maximumBytes;
-          continue;
+          limitReason = `byte limit (${maximumBytes})`;
+          break;
         }
         const data = await fs.readFile(actual);
         scannedBytes += data.byteLength;
         baseline.set(actual, sha256(data));
+        if (scannedBytes >= maximumBytes) {
+          limitReason = `byte limit (${maximumBytes})`;
+          break;
+        }
       } catch {
         // A later recorder reference without a captured hash fails closed.
       }
-      if (scannedBytes >= maximumBytes) break;
     }
   }
-  return baseline;
+  return { files: baseline, complete: limitReason === null, limitReason };
+}
+
+function startSourceChangeMonitor(projectRoot: string, excludedBuildDir: string): SourceChangeMonitor {
+  let changed = false;
+  let unavailable = false;
+  let watcher: FSWatcher | undefined;
+  const root = resolve(projectRoot);
+  const buildRoot = resolve(excludedBuildDir);
+
+  try {
+    // Recursive watching is supported by the workflow's Node >=22 runtime.
+    // Any setup/runtime error fails closed rather than claiming an unobserved
+    // compile was source-stable.
+    watcher = watch(root, { recursive: true, persistent: false }, (_event, filename) => {
+      if (filename === null) {
+        changed = true;
+        return;
+      }
+      const eventPath = resolve(root, filename.toString());
+      if (inside(buildRoot, eventPath)) return;
+      const relativePath = relative(root, eventPath);
+      const firstPart = relativePath.split(sep)[0]?.toLowerCase();
+      if (firstPart === ".git" || firstPart === "node_modules") return;
+      changed = true;
+    });
+    watcher.on("error", () => { unavailable = true; });
+    watcher.unref();
+  } catch {
+    unavailable = true;
+  }
+
+  return {
+    async finish() {
+      // Give queued native notifications one event-loop turn to arrive before
+      // closing the watcher. Content hashes below independently catch any
+      // persistent final-state difference.
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+      watcher?.close();
+      return { changed, unavailable };
+    },
+  };
 }
 
 function manifestKind(path: string): CompileManifestFile["kind"] {
@@ -763,6 +866,8 @@ function buildReceipt(input: {
   logHash: string | null;
   overleafProjectId?: string;
   sourceChanged: boolean;
+  sourceMonitoringUnavailable: boolean;
+  baselineLimitReason: string | null;
   unbaselinedInputs: string[];
   prerequisiteNotes: string[];
 }): CompileReceipt {
@@ -788,6 +893,8 @@ function buildReceipt(input: {
       "System TeX packages are identified by the compiler environment and are not individually hashed.",
       ...input.prerequisiteNotes,
       ...(input.sourceChanged ? ["A local source file changed while compiling; the source manifest is incomplete."] : []),
+      ...(input.sourceMonitoringUnavailable ? ["Filesystem change monitoring was unavailable during compilation; source integrity cannot be confirmed."] : []),
+      ...(input.baselineLimitReason ? [`The precompile project snapshot reached its ${input.baselineLimitReason}; source integrity cannot be confirmed.`] : []),
       ...(input.unbaselinedInputs.length > 0 ? ["The TeX recorder found local project input(s) without a precompile hash baseline; source integrity cannot be confirmed."] : []),
     ],
   };
@@ -812,6 +919,7 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
   const buildDir = join(stateDir, "build", sha256(`local:${sources.projectRoot}`), randomUUID());
   await fs.mkdir(buildDir, { recursive: true, mode: 0o700 });
   const recorderBaseline = await captureRecorderBaseline(sources.projectRoot, sources.files, join(stateDir, "build"));
+  const sourceChangeMonitor = startSourceChangeMonitor(sources.projectRoot, join(stateDir, "build"));
   const runner = options.runCommand ?? runBoundedCommand;
   const args = ["-no-shell-escape", "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "-recorder", `-output-directory=${buildDir}`, sources.rootFile];
   const phases: CompileReceipt["phases"] = [];
@@ -890,16 +998,18 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     recordedInputs = fls.split(/\r?\n/).flatMap((line) => line.startsWith("INPUT ") ? [line.slice(6).trim()] : []);
   } catch { /* a compiler failure can occur before it creates a recorder file */ }
   const finalSources = recordedInputs.length > 0 ? await collectSources(sources.rootFile, sources.projectRoot, recordedInputs) : sources;
+  const sourceMonitor = await sourceChangeMonitor.finish();
   const sourceChanged = [...sources.files.entries()].some(([path, before]) => finalSources.files.get(path)?.sha256 !== before.sha256)
-    || [...finalSources.files.entries()].some(([path, after]) => recorderBaseline.has(path) && recorderBaseline.get(path) !== after.sha256);
-  const unbaselinedInputs = [...finalSources.files.keys()].filter((path) => !recorderBaseline.has(path));
+    || [...finalSources.files.entries()].some(([path, after]) => recorderBaseline.files.has(path) && recorderBaseline.files.get(path) !== after.sha256)
+    || sourceMonitor.changed;
+  const unbaselinedInputs = [...finalSources.files.keys()].filter((path) => !recorderBaseline.files.has(path));
   if (status === "passed" && !pdfHash) status = "failed";
-  if (status === "passed" && (sourceChanged || unbaselinedInputs.length > 0)) status = "incomplete";
+  if (status === "passed" && (sourceChanged || sourceMonitor.unavailable || !recorderBaseline.complete || unbaselinedInputs.length > 0)) status = "incomplete";
   const receipt = buildReceipt({
     status,
     rootFile: safeRelativePath(finalSources.projectRoot, finalSources.rootFile),
     files: [...finalSources.files.values()],
-    complete: finalSources.unresolved.length === 0 && recordedInputs.length > 0 && !sourceChanged && unbaselinedInputs.length === 0,
+    complete: finalSources.unresolved.length === 0 && recordedInputs.length > 0 && !sourceChanged && !sourceMonitor.unavailable && recorderBaseline.complete && unbaselinedInputs.length === 0,
     unresolved: finalSources.unresolved,
     engine,
     version,
@@ -911,6 +1021,8 @@ export async function compileLocalLatex(options: CompileLocalLatexOptions): Prom
     logHash,
     overleafProjectId: options.overleafProjectId,
     sourceChanged,
+    sourceMonitoringUnavailable: sourceMonitor.unavailable,
+    baselineLimitReason: recorderBaseline.limitReason,
     unbaselinedInputs,
     prerequisiteNotes,
   });

@@ -41,7 +41,14 @@ function fakeRunner(engine: LatexEngine, extraRecordedInputs: string[] = []) {
       const jobName = basename(rootFile).replace(/\.tex$/i, "");
       await writeFile(join(outDir, `${jobName}.pdf`), "%PDF-fake receipt test\n");
       await writeFile(join(outDir, `${jobName}.log`), "Fake compiler completed.\n");
-      await writeFile(join(outDir, `${jobName}.fls`), `INPUT ${rootFile}\nINPUT ${join(cwd, "references.bib")}\n${extraRecordedInputs.map((path) => `INPUT ${path}`).join("\n")}\n`);
+      const recordedInputs = [rootFile, ...extraRecordedInputs];
+      try {
+        await readFile(join(cwd, "references.bib"));
+        recordedInputs.push(join(cwd, "references.bib"));
+      } catch {
+        // Do not invent recorder inputs that the fake compiler did not read.
+      }
+      await writeFile(join(outDir, `${jobName}.fls`), `${recordedInputs.map((path) => `INPUT ${path}`).join("\n")}\n`);
     }
     return { exitCode: 0, stdout: `${executable} completed\n`, stderr: "", durationMs: 3 };
   };
@@ -503,6 +510,67 @@ test("recorder-only local inputs changed during compile invalidate their bounded
   assert.equal(receipt.source_manifest.complete, false);
   assert.ok(receipt.source_manifest.files.some((file) => file.path === "chapter.tex"));
   assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
+});
+
+test("deleted recorder-only local inputs keep the source manifest incomplete", async () => {
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}No lexical input reference.\\end{document}\n",
+    "chapter.tex": "Recorder-only input.\n",
+  });
+  const chapterPath = join(root, "chapter.tex");
+  const fake = fakeRunner("pdflatex", [chapterPath]);
+  let deleted = false;
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    const result = await fake.runCommand(executable, args, cwd);
+    if (executable === "pdflatex" && args[0] !== "--version" && !deleted) {
+      deleted = true;
+      await rm(chapterPath);
+    }
+    return result;
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.source_manifest.unresolved_count > 0);
+  assert.ok(!receipt.source_manifest.files.some((file) => file.path === "chapter.tex"));
+});
+
+test("change then restore during compilation is detected even when final hashes match", async () => {
+  const original = "Recorder-only input.\n";
+  const { root, state } = await project({
+    "main.tex": "\\begin{document}No lexical input reference.\\end{document}\n",
+    "chapter.tex": original,
+  });
+  const chapterPath = join(root, "chapter.tex");
+  const fake = fakeRunner("pdflatex", [chapterPath]);
+  let changed = false;
+  const runCommand: CommandRunner = async (executable, args, cwd, timeoutMs, env) => {
+    const result = await fake.runCommand(executable, args, cwd);
+    if (executable === "pdflatex" && args[0] !== "--version" && !changed) {
+      changed = true;
+      await writeFile(chapterPath, "Transient contents seen during compilation.\n", "utf8");
+      await writeFile(chapterPath, original, "utf8");
+    }
+    return result;
+  };
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.equal(receipt.source_manifest.files.find((file) => file.path === "chapter.tex")?.sha256, createHash("sha256").update(original).digest("hex"));
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("changed while compiling")));
+});
+
+test("precompile source snapshot fails closed when directory traversal reaches its limit", async () => {
+  const { root, state } = await project({ "main.tex": "\\begin{document}Stable\\end{document}\n" });
+  await Promise.all(Array.from({ length: 4_097 }, (_, index) => mkdir(join(root, `empty-${index}`))));
+  const fake = fakeRunner("pdflatex");
+  const receipt = await compileLocalLatex({ rootFile: join(root, "main.tex"), stateDir: state, runCommand: fake.runCommand });
+
+  assert.equal(receipt.status, "incomplete");
+  assert.equal(receipt.source_manifest.complete, false);
+  assert.ok(receipt.limitations.some((limitation) => limitation.includes("directory limit (4096)")));
 });
 
 test("unique per-run build directories prevent stale outputs and concurrent clobbering", async () => {
