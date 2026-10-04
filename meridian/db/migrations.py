@@ -1176,6 +1176,32 @@ async def _migrate_checkpoint_data(db: aiosqlite.Connection) -> None:
     await db.execute(
         "DELETE FROM project_notes WHERE title LIKE ?", ("checkpoint:%",)
     )
+
+
+async def _migrate_project_state_milestones(db: aiosqlite.Connection) -> None:
+    """Create the append-only, project-scoped recovery milestone ledger."""
+    await db.executescript(
+        "CREATE TABLE IF NOT EXISTS project_state_milestones ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    sequence INTEGER NOT NULL,"
+        "    session_id TEXT NOT NULL,"
+        "    trigger TEXT NOT NULL,"
+        "    risk_score INTEGER NOT NULL,"
+        "    risk_threshold INTEGER NOT NULL,"
+        "    previous_hash TEXT,"
+        "    content_hash TEXT NOT NULL,"
+        "    snapshot_json TEXT NOT NULL,"
+        "    captured_at TEXT NOT NULL,"
+        "    UNIQUE(project_id, sequence)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_project_state_milestones_recent "
+        "ON project_state_milestones(project_id, sequence DESC);"
+        "CREATE TRIGGER IF NOT EXISTS project_state_milestones_no_update "
+        "BEFORE UPDATE ON project_state_milestones BEGIN "
+        "SELECT RAISE(ABORT, 'project state milestones are append-only'); END;"
+    )
+    await db.commit()
     await db.commit()
 
 
@@ -4372,6 +4398,10 @@ async def _migrate_external_job_register(db: aiosqlite.Connection) -> None:
     SQLite databases receive the same schema as fresh databases without an
     unguarded startup index.
     """
+    # Serialize the first schema check/ALTER with other server startups. The
+    # existing event-order migration also backfills rows and seeds its counter.
+    if not db.in_transaction:
+        await db.execute("BEGIN IMMEDIATE")
     await db.execute(
         """CREATE TABLE IF NOT EXISTS external_jobs (
             id TEXT PRIMARY KEY,
@@ -4408,9 +4438,11 @@ async def _migrate_external_job_register(db: aiosqlite.Connection) -> None:
             phase TEXT,
             detail TEXT,
             snapshot_json TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            event_order INTEGER
         )"""
     )
+    await _migrate_external_job_event_order(db)
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_external_jobs_project_status "
         "ON external_jobs(project_id, status, last_observed_at DESC)"
@@ -4420,6 +4452,67 @@ async def _migrate_external_job_register(db: aiosqlite.Connection) -> None:
         "ON external_job_events(external_job_id, created_at ASC)"
     )
     await db.commit()
+
+
+async def _migrate_external_job_event_order(db: aiosqlite.Connection) -> None:
+    """Give tied external-job event timestamps a stable insertion-order tie-breaker."""
+    async with db.execute("PRAGMA table_info(external_job_events)") as cur:
+        columns = await cur.fetchall()
+    if not any(row[1] == "event_order" for row in columns):
+        await db.execute("ALTER TABLE external_job_events ADD COLUMN event_order INTEGER")
+
+    # Assign any unnumbered legacy rows above the existing high-water mark.
+    # Rowid only supplies a one-time deterministic scan order; it is not a
+    # durable counter because VACUUM and deletion can renumber/reuse rowids.
+    await db.execute(
+        "WITH numbered AS ("
+        "    SELECT rowid AS event_rowid, ROW_NUMBER() OVER (ORDER BY rowid) AS position "
+        "    FROM external_job_events WHERE event_order IS NULL"
+        "), high_water AS ("
+        "    SELECT COALESCE(MAX(event_order), 0) AS max_order FROM external_job_events"
+        ") "
+        "UPDATE external_job_events SET event_order = ("
+        "    SELECT high_water.max_order + numbered.position "
+        "    FROM numbered CROSS JOIN high_water "
+        "    WHERE numbered.event_rowid = external_job_events.rowid"
+        ") WHERE event_order IS NULL"
+    )
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS external_job_event_order_counter ("
+        "    id INTEGER PRIMARY KEY CHECK (id = 1),"
+        "    last_order INTEGER NOT NULL"
+        ")"
+    )
+    await db.execute(
+        "INSERT OR IGNORE INTO external_job_event_order_counter (id, last_order) VALUES (1, 0)"
+    )
+    await db.execute(
+        "UPDATE external_job_event_order_counter "
+        "SET last_order = MAX(last_order, COALESCE(("
+        "    SELECT MAX(event_order) FROM external_job_events"
+        "), 0)) WHERE id = 1"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_external_job_events_job_order "
+        "ON external_job_events(external_job_id, created_at ASC, event_order ASC)"
+    )
+    # Replace the earlier rowid-based trigger body on an existing database.
+    await db.execute("DROP TRIGGER IF EXISTS trg_external_job_events_event_order")
+    await db.execute(
+        """CREATE TRIGGER trg_external_job_events_event_order
+        AFTER INSERT ON external_job_events
+        FOR EACH ROW
+        BEGIN
+            UPDATE external_job_event_order_counter
+            SET last_order = last_order + 1
+            WHERE id = 1;
+            UPDATE external_job_events
+            SET event_order = (
+                SELECT last_order FROM external_job_event_order_counter WHERE id = 1
+            )
+            WHERE rowid = NEW.rowid;
+        END"""
+    )
 
 
 async def _migrate_scratch_research_runs(db: aiosqlite.Connection) -> None:

@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 import pytest
 
 from meridian import db as db_module
 from meridian import external_job_register as model
 from meridian.db import external_jobs as job_db
+from meridian.db import migrations as db_migrations
+from meridian import pg_adapter
 import meridian.mcp_tools as mcp_tools
 import meridian.server as server
 
@@ -65,8 +68,20 @@ def test_external_job_snapshot_is_atomic_and_readable(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_register_update_history_and_terminal_guard(db):
+async def test_register_update_history_and_terminal_guard(db, monkeypatch):
     project, session = await _session(db, "external-register-lifecycle")
+    # Windows clocks can return the same microsecond for nearby DB operations.
+    # Make the tie deterministic and ensure random UUID order cannot reorder history.
+    monkeypatch.setattr(model, "utcnow_iso", lambda: "2026-01-01T00:00:00.000000+00:00")
+    ids = iter(
+        (
+            uuid.UUID("10000000-0000-0000-0000-000000000000"),
+            uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            uuid.UUID("00000000-0000-0000-0000-000000000000"),
+            uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"),
+        )
+    )
+    monkeypatch.setattr(job_db.uuid, "uuid4", lambda: next(ids))
     job = await job_db.register_external_job(
         db,
         project["id"],
@@ -105,6 +120,143 @@ async def test_register_update_history_and_terminal_guard(db):
         await job_db.update_external_job(
             db, project["id"], session["id"], job_key="gps-slam-build", status="running"
         )
+
+
+@pytest.mark.asyncio
+async def test_external_job_event_order_migration_backfills_and_tracks_inserts(tmp_path):
+    import aiosqlite
+
+    db = await aiosqlite.connect(tmp_path / "legacy-external-events.db")
+    try:
+        await db.execute(
+            "CREATE TABLE external_job_events ("
+            "id TEXT PRIMARY KEY, external_job_id TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        timestamp = "2026-01-01T00:00:00.000000+00:00"
+        await db.execute(
+            "INSERT INTO external_job_events (id, external_job_id, created_at) VALUES (?, ?, ?)",
+            ("z-first", "job", timestamp),
+        )
+        await db.execute(
+            "INSERT INTO external_job_events (id, external_job_id, created_at) VALUES (?, ?, ?)",
+            ("a-second", "job", timestamp),
+        )
+        await db_migrations._migrate_external_job_register(db)
+        # Re-running the migration must replace (not preserve) the old trigger
+        # and must not reset the durable counter.
+        await db_migrations._migrate_external_job_register(db)
+
+        async with db.execute(
+            "SELECT id, event_order FROM external_job_events ORDER BY event_order ASC"
+        ) as cur:
+            existing = await cur.fetchall()
+        assert [row[0] for row in existing] == ["z-first", "a-second"]
+        assert [row[1] for row in existing] == [1, 2]
+
+        await db.execute(
+            "INSERT INTO external_job_events (id, external_job_id, created_at) VALUES (?, ?, ?)",
+            ("m-third", "job", timestamp),
+        )
+        await db.execute("DELETE FROM external_job_events WHERE id = 'm-third'")
+        await db.execute(
+            "INSERT INTO external_job_events (id, external_job_id, created_at) VALUES (?, ?, ?)",
+            ("n-fourth", "job", timestamp),
+        )
+        async with db.execute(
+            "SELECT id, event_order FROM external_job_events ORDER BY event_order ASC"
+        ) as cur:
+            all_ids = await cur.fetchall()
+        assert [row[0] for row in all_ids] == ["z-first", "a-second", "n-fourth"]
+        assert [row[1] for row in all_ids] == [1, 2, 4]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_external_job_event_order_migration_handles_partial_backfill(tmp_path):
+    import aiosqlite
+
+    db = await aiosqlite.connect(tmp_path / "partial-external-events.db")
+    try:
+        await db.execute(
+            "CREATE TABLE external_job_events ("
+            "id TEXT PRIMARY KEY, external_job_id TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, event_order INTEGER)"
+        )
+        timestamp = "2026-01-01T00:00:00.000000+00:00"
+        await db.executemany(
+            "INSERT INTO external_job_events "
+            "(id, external_job_id, created_at, event_order) VALUES (?, ?, ?, ?)",
+            [
+                ("legacy-first", "job", timestamp, None),
+                ("already-numbered", "job", timestamp, 50),
+                ("legacy-second", "job", timestamp, None),
+            ],
+        )
+        # Simulate the earlier migration trigger so this rollout must replace
+        # its rowid-derived behavior without modifying existing rows.
+        await db.execute(
+            """CREATE TRIGGER trg_external_job_events_event_order
+            AFTER INSERT ON external_job_events
+            FOR EACH ROW WHEN NEW.event_order IS NULL
+            BEGIN
+                UPDATE external_job_events SET event_order = NEW.rowid
+                WHERE rowid = NEW.rowid;
+            END"""
+        )
+
+        await db_migrations._migrate_external_job_register(db)
+        async with db.execute(
+            "SELECT id, event_order FROM external_job_events ORDER BY event_order ASC"
+        ) as cur:
+            rows = await cur.fetchall()
+        assert rows == [
+            ("already-numbered", 50),
+            ("legacy-first", 51),
+            ("legacy-second", 52),
+        ]
+
+        await db.execute(
+            "INSERT INTO external_job_events (id, external_job_id, created_at) VALUES (?, ?, ?)",
+            ("new-event", "job", timestamp),
+        )
+        async with db.execute(
+            "SELECT event_order FROM external_job_events WHERE id = 'new-event'"
+        ) as cur:
+            assert (await cur.fetchone())[0] == 53
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_external_job_event_order_migration_adds_sequence():
+    class ScriptCapture:
+        script = ""
+
+        async def executescript(self, script):
+            self.script = script
+
+    connection = ScriptCapture()
+    await pg_adapter._migrate_pg_external_job_register(connection)
+
+    assert "pg_advisory_xact_lock(5062994, 88277)" in connection.script
+    assert (
+        "CREATE SEQUENCE IF NOT EXISTS external_job_events_event_order_seq"
+        in connection.script
+    )
+    assert "event_order BIGINT NOT NULL" in connection.script
+    assert "ADD COLUMN IF NOT EXISTS event_order BIGINT" in connection.script
+    assert "ADD COLUMN IF NOT EXISTS event_order BIGSERIAL" not in connection.script
+    assert "ALTER COLUMN event_order SET DEFAULT" in connection.script
+    assert "ALTER SEQUENCE external_job_events_event_order_seq" in connection.script
+    assert "CREATE TABLE IF NOT EXISTS external_job_event_order_migration" in connection.script
+    assert "WITH missing AS" in connection.script
+    assert "ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC)" in connection.script
+    assert "SELECT setval('external_job_events_event_order_seq'::regclass" in connection.script
+    assert "GREATEST(sequence_state.last_value, COALESCE(event_state.max_order, 1))" in connection.script
+    assert "ON CONFLICT (id) DO NOTHING" in connection.script
+    assert "ALTER COLUMN event_order SET NOT NULL" in connection.script
+    assert "event_order ASC NULLS FIRST, id ASC" in connection.script
 
 
 @pytest.mark.asyncio

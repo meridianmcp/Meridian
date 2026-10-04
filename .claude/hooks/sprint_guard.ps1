@@ -98,8 +98,13 @@ $reqUrl = "$live/projects/$ProjectId/sprint/pending_count"
 if ($payload -and $payload.session_id) {
     $reqUrl = "${reqUrl}?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
 }
+$authHeaders = @{}
+$authToken = if ($env:MERIDIAN_TOKEN) { [string]$env:MERIDIAN_TOKEN } else { [string]$env:BEARER_TOKEN }
+if ($authToken -match '^[A-Za-z0-9._~+/-]+=*$') {
+    $authHeaders["Authorization"] = "Bearer $authToken"
+}
 try {
-    $r = Invoke-RestMethod -Method GET -Uri $reqUrl -TimeoutSec 5
+    $r = Invoke-RestMethod -Method GET -Uri $reqUrl -Headers $authHeaders -TimeoutSec 5
 } catch {
     [Console]::Error.WriteLine("Meridian (41f26499): could not reach $Url to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again.")
     exit 0

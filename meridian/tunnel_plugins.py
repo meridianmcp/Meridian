@@ -45,10 +45,34 @@ _MERIDIAN_OUTPUTS_LOCAL_PATH: str = str(
     Path(__file__).parent.parent / "extensions" / "meridian-outputs"
 )
 
+_MERIDIAN_EXTENSION_GIT_URL = "git+https://github.com/meridianmcp/Meridian.git"
+_MERIDIAN_EXTENSION_ENTRYPOINTS = {
+    "meridian-docs": "meridian-docs-mcp",
+    "meridian-outputs": "meridian-outputs-mcp",
+}
+
+
+def extension_uvx_command(extension: str, *, repo_root: Path | None = None) -> list[str]:
+    """Build a checkout-free uvx command, preferring this checkout when present.
+
+    Packaged Meridian installs do not carry the monorepo extensions directory.
+    In that case install from the canonical monorepo subdirectory; source
+    checkouts keep the no-cache local path so edits take effect on next spawn.
+    """
+    if extension not in _MERIDIAN_EXTENSION_ENTRYPOINTS:
+        raise ValueError(f"unsupported Meridian extension: {extension}")
+    root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent.parent
+    local_path = root / "extensions" / extension
+    entrypoint = _MERIDIAN_EXTENSION_ENTRYPOINTS[extension]
+    if (local_path / "pyproject.toml").is_file():
+        return ["uvx", "--no-cache", "--from", str(local_path), entrypoint]
+    source = f"{_MERIDIAN_EXTENSION_GIT_URL}#subdirectory=extensions/{extension}"
+    return ["uvx", "--from", source, entrypoint]
+
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug", "latex")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
@@ -83,6 +107,10 @@ DEFAULT_OUTPUTS_PORT = 8820
 # outputs (8820); _CUSTOM_PORT_START is bumped to 8822 below so auto-assigned
 # custom ports never collide with this slot.
 DEFAULT_DEBUG_PORT = 8821
+
+# LaTeX helper slot. The npm package is published from the Meridian monorepo;
+# its MCP server is started with the explicit mcp subcommand.
+DEFAULT_LATEX_PORT = 8822
 
 # 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
 # plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
@@ -355,9 +383,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # deliberately NOT applied to the PyPI-installed plugins below (docx-mcp,
         # powerpoint-mcp, zotero-mcp, mcp-debugger), which aren't locally edited and
         # would only pay the cost for no correctness benefit.
-        "command": [
-            "uvx", "--no-cache", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp",
-        ],
+        "command": extension_uvx_command("meridian-docs"),
         # 4b5b1a74 — root cause of a "meridian-docs was not found in the package
         # registry" crash seen live on 2026-07-19 even though the default above is
         # already correct: unlike the `code-extractor`/`word` slots, this entry
@@ -383,6 +409,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "previous_defaults": [
             ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs"],
             ["uvx", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp"],
+            ["uvx", "--no-cache", "--from", _MERIDIAN_DOCS_LOCAL_PATH, "meridian-docs-mcp"],
         ],
         "env": {},
         # meridian-docs exposes bare tool names (document_outline, parse_document,
@@ -445,9 +472,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # PyPI-installed plugins in this file (docx-mcp, powerpoint-mcp, zotero-mcp,
         # mcp-debugger) — those aren't edited locally, so forcing a rebuild would
         # only add spawn latency for no correctness benefit.
-        "command": [
-            "uvx", "--no-cache", "--from", _MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp",
-        ],
+        "command": extension_uvx_command("meridian-outputs"),
         # f886d37a — backfill previous_defaults with the pre-cache-fix form of the
         # current entry-point (no "--no-cache" flag) so a tenant override saved
         # before this fix was applied is flagged `stale_override` via the ordinary
@@ -455,6 +480,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # the cache-busting flag with zero dashboard signal.
         "previous_defaults": [
             ["uvx", "--from", _MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp"],
+            ["uvx", "--no-cache", "--from", _MERIDIAN_OUTPUTS_LOCAL_PATH, "meridian-outputs-mcp"],
         ],
         # ff8d1b2f — root cause of a live "search_outputs unreachable,
         # tunnel_tried=true" failure (2026-07-20): the default `--from` path above
@@ -509,6 +535,23 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # bridge namespaces them via SLOT_DISPLAY_NAMES ("debug" → "mcp-debugger__…").
         "prefix": None,
         "description": "Debugging — 7-language DAP debugger (mcp-debugger)",
+        "description_overrides": {},
+    },
+    {
+        "name": "meridian-latex",
+        "slot": "latex",
+        "port": DEFAULT_LATEX_PORT,
+        "url_prefix": "/latex",
+        "enabled": False,
+        "builtin": True,
+        "core": False,
+        "command": [
+            "npx", "-y", "--package", "@meridianmcp/mcp", "meridian-latex", "mcp",
+        ],
+        "env": {},
+        "prefix": None,
+        "session_mode": "stateless",
+        "description": "Local LaTeX and Overleaf workflows (meridian-latex)",
         "description_overrides": {},
     },
 ]
@@ -708,6 +751,26 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
         ),
     },
     {
+        # The LaTeX/Overleaf MCP engine is a first-class built-in on the `latex`
+        # slot. Keep the catalog inventory aligned with mcp-server.ts's TOOLS.
+        "name": "meridian-latex",
+        "package": "@meridianmcp/mcp",
+        "runtime": "npx",
+        "slot": "latex",
+        "bundled": True,
+        "owner_item": None,
+        "description": (
+            "Local LaTeX and Overleaf workflows. Engine tools: "
+            "outline_tex, outline_tex_file, claim_node, lease_document, "
+            "release_claim, get_live_claims, record_provenance, list_provenance, "
+            "mark_provenance_synced, lookup_citation_key, list_project_docs, "
+            "pull_doc_expanded, get_bibliography, expand_section_aliases, "
+            "list_local_snapshots, overleaf_login_status, list_citation_keys, "
+            "snapshot_document, lint_tex, lint_tex_file, get_style_guide, "
+            "check_section_style, lookup_published_framing."
+        ),
+    },
+    {
         # 88dbb675 — Context7 (by Upstash): general-purpose library/framework docs MCP.
         # Indexes React, Tailwind, Next.js, and thousands of other libraries so agents
         # get up-to-date API docs without web search. Complements paper_search (academic)
@@ -845,6 +908,32 @@ def _iter_plugin_items(raw: Any) -> list[dict]:
     return items
 
 
+def sanitize_plugin_config_secrets(raw_config: Any) -> Any:
+    """Copy plugin config while stripping Zotero keys from every env mapping.
+
+    The server accepts workstation plugin settings over its hosted API. A
+    Zotero API key belongs in the local OS vault, so scrub both new config and
+    legacy config before it is returned to any client.
+    """
+    if isinstance(raw_config, list):
+        return [sanitize_plugin_config_secrets(value) for value in raw_config]
+    if not isinstance(raw_config, dict):
+        return raw_config
+    cleaned: dict[Any, Any] = {}
+    for key, value in raw_config.items():
+        if str(key).casefold() == "env" and isinstance(value, dict):
+            cleaned[key] = {
+                env_key: env_value
+                for env_key, env_value in value.items()
+                if str(env_key).casefold() != "zotero_api_key"
+            }
+        elif isinstance(value, (dict, list)):
+            cleaned[key] = sanitize_plugin_config_secrets(value)
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
 def normalize_plugins_config(raw: Any) -> dict[str, dict]:
     """Validate stored config into ``{plugin_name: override_dict}``.
 
@@ -854,7 +943,7 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
     take effect in :func:`resolve_plugins`. Malformed input yields ``{}``.
     """
     out: dict[str, dict] = {}
-    for it in _iter_plugin_items(raw):
+    for it in _iter_plugin_items(sanitize_plugin_config_secrets(raw)):
         name = str(it.get("name") or "").strip()
         if not name:
             continue
@@ -875,7 +964,10 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
             }
         env = it.get("env")
         if isinstance(env, dict):
-            ov["env"] = {str(k): str(v) for k, v in env.items() if str(k)}
+            ov["env"] = {
+                str(k): str(v) for k, v in env.items()
+                if str(k) and str(k).casefold() != "zotero_api_key"
+            }
         # 39aae23f — per-slot elastic-pool override. Accept an int ("pool up to N
         # copies" shorthand) or a {"enabled"?, "min"/"min_copies", "max"/
         # "max_copies"} dict; normalize into a canonical dict here so downstream
@@ -1028,6 +1120,7 @@ _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
     DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT, DEFAULT_DOCS_PORT,
     DEFAULT_ZOTERO_PORT, DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT,
+    DEFAULT_LATEX_PORT,
 })
 
 # 9811d04c — first port a freshly-added custom plugin (from the browse "Add"
@@ -1037,7 +1130,7 @@ _BUILTIN_DEFAULT_PORTS = frozenset({
 # auto-assigned port never collides with a built-in slot.
 # 469d89b4 — bumped from 8820 to 8821 to make room for DEFAULT_OUTPUTS_PORT.
 # 121e6a27 — bumped from 8821 to 8822 to make room for DEFAULT_DEBUG_PORT.
-_CUSTOM_PORT_START = 8822
+_CUSTOM_PORT_START = 8823
 
 # 9811d04c — the built-in *slot* names (fs/code/extract/ppt/word/dc). A custom
 # plugin's name must not collide with a built-in slot name (task rule) nor with a
@@ -1187,7 +1280,7 @@ def resolve_custom_plugins(raw_config: Any) -> list[dict]:
     seen: set[str] = set()
     # Walk the raw items in their original order (not via normalize_plugins_config,
     # whose dict collapse would make the *last* duplicate win) so dedup is first-wins.
-    for it in _iter_plugin_items(raw_config):
+    for it in _iter_plugin_items(sanitize_plugin_config_secrets(raw_config)):
         name = str(it.get("name") or "").strip()
         if not name or name in builtins or name in seen:
             continue

@@ -75,8 +75,18 @@ def test_settings_guard_registration_shape():
     start = _group_for("SessionStart", "meridian_guard_brief.ps1")
     sub = _group_for("SubagentStart", "meridian_guard_brief.ps1")
     assert [len(pre), len(post), len(start), len(sub)] == [1, 1, 1, 1]
-    for group, timeout in ((pre, 3), (post, 3), (start, 10), (sub, 10)):
-        (hook,) = group[0]["hooks"]
+    for group, timeout, script in (
+        (pre, 3, "meridian_guard.ps1"),
+        (post, 3, "meridian_guard_post.ps1"),
+        (start, 10, "meridian_guard_brief.ps1"),
+        (sub, 10, "meridian_guard_brief.ps1"),
+    ):
+        matching_hooks = [
+            hook for hook in group[0]["hooks"]
+            if script in hook.get("command", "")
+        ]
+        assert len(matching_hooks) == 1
+        (hook,) = matching_hooks
         assert hook["type"] == "command"
         assert hook["shell"] == "powershell"
         # $env: form -- the bare $CLAUDE_PROJECT_DIR is an unset PowerShell variable

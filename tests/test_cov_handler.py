@@ -2030,21 +2030,33 @@ def test_strict_evidence_override_with_reason_completes_and_is_audited():
         item = _run(mh._dispatch_mcp_tool(
             "add_sprint_item",
             {"project_id": pid, "title": "Strict override audited", "version": "v1"}, db, "/tmp"))
-        done = _run(mh._dispatch_mcp_tool(
+        approval = _run(mh._dispatch_mcp_tool(
             "complete_sprint_item",
             {"project_id": pid, "item_id": item["id"], "strict_evidence": True,
              "override_strict_evidence": True,
              "override_reason": "verified outside Meridian, evidence not machine-declared",
              "actor": "executor-1"}, db, "/tmp"))
+        assert approval.get("error") == "HUMAN_APPROVAL_REQUIRED"
+        _run(db_module.answer_hitl_request(
+            db, approval["hitl_id"], "Yes — approve this override", answered_by="human-reviewer",
+        ))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True,
+             "override_strict_evidence": True,
+             "override_reason": "verified outside Meridian, evidence not machine-declared",
+             "completion_override_hitl_id": approval["hitl_id"],
+             "actor": "executor-1"}, db, "/tmp"))
         assert done.get("error") is None
         assert done["status"] == "done"
         assert "strict_evidence_override" in done
-        assert done["strict_evidence_override"]["actor"] == "executor-1"
+        assert done["strict_evidence_override"]["hitl_id"] == approval["hitl_id"]
 
         log = _run(db_module.get_action_audit_log(
             db, project_id=pid, event_type="sprint_item_strict_evidence_override",
         ))
         assert len(log) == 1
+        assert log[0]["actor"] == "executor-1"
         assert "verified outside Meridian" in log[0]["detail"]
     finally:
         _run(db.close())
@@ -2187,20 +2199,32 @@ def test_merge_approval_strict_override_with_reason_completes_and_is_audited():
             db, sess["id"], pid, "worktree/strict-aud", "../repo-worktree-strict-aud",
             item_id=item["id"],
         ))
-        done = _run(mh._dispatch_mcp_tool(
+        approval = _run(mh._dispatch_mcp_tool(
             "complete_sprint_item",
             {"project_id": pid, "item_id": item["id"], "session_id": sess["id"],
              "override_merge_approval": True,
              "override_merge_approval_reason": "merged manually outside Meridian, verified by hand",
              "actor": "executor-2"}, db, "/tmp"))
+        assert approval.get("error") == "HUMAN_APPROVAL_REQUIRED"
+        _run(db_module.answer_hitl_request(
+            db, approval["hitl_id"], "Yes — approve this override", answered_by="human-reviewer",
+        ))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+             "override_merge_approval": True,
+             "override_merge_approval_reason": "merged manually outside Meridian, verified by hand",
+             "completion_override_hitl_id": approval["hitl_id"],
+             "actor": "executor-2"}, db, "/tmp"))
         assert done.get("error") is None
         assert done["status"] == "done"
-        assert done["merge_warning"]["override"]["actor"] == "executor-2"
+        assert done["merge_warning"]["override"]["hitl_id"] == approval["hitl_id"]
 
         log = _run(db_module.get_action_audit_log(
             db, project_id=pid, event_type="sprint_item_merge_approval_override",
         ))
         assert len(log) == 1
+        assert log[0]["actor"] == "executor-2"
         assert "merged manually outside Meridian" in log[0]["detail"]
     finally:
         _run(db.close())

@@ -547,12 +547,41 @@ def test_fetch_dead_worktree_paths_parses_path_list(monkeypatch):
             return payload
 
     def _fake_urlopen(url, timeout=5.0):
-        assert "/worktrees/pending_cleanup" in url
+        assert "/worktrees/pending_cleanup" in url.full_url
         return _FakeResp()
 
     monkeypatch.setattr(orphan_reaper.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.delenv("MERIDIAN_TOKEN", raising=False)
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
     paths = orphan_reaper.fetch_dead_worktree_paths("http://localhost:7878", "proj1")
     assert paths == [r"C:\repo\.claude\worktrees\w1", r"C:\repo\.claude\worktrees\w2"]
+
+
+def test_fetch_dead_worktree_paths_sends_hosted_bearer_header(monkeypatch):
+    import json
+
+    monkeypatch.setenv("MERIDIAN_TOKEN", "meridian-test-token")
+    monkeypatch.setenv("BEARER_TOKEN", "fallback-token")
+    captured = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return json.dumps([]).encode("utf-8")
+
+    def _fake_urlopen(request, timeout=5.0):
+        captured["url"] = request.full_url
+        captured["headers"] = {key.casefold(): value for key, value in request.header_items()}
+        return _FakeResp()
+
+    monkeypatch.setattr(orphan_reaper.urllib.request, "urlopen", _fake_urlopen)
+
+    assert orphan_reaper.fetch_dead_worktree_paths("https://usemeridian.us", "proj1") == []
+    assert captured["url"].endswith("/projects/proj1/worktrees/pending_cleanup")
+    assert captured["headers"]["authorization"] == "Bearer meridian-test-token"
 
 
 def test_fetch_dead_worktree_paths_network_error_returns_empty(monkeypatch):

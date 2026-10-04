@@ -8,8 +8,8 @@ gated agent could satisfy on its own say-so:
   * ``complete_wave_gate``: a hand-typed ``{"status": "ok", "exit_code": 0}``
     unlocked the next wave; nothing tied it to a real ``run_verification`` run.
   * Override flags (``override_ci``, ``force_foreign_claim``,
-    ``prospect_bypass`` set by an agent) needed no reason and left no audit
-    trail; and an override HITL could be auto-answered.
+    ``prospect_bypass`` set by an agent) could be self-approved with only a
+    reason; and an override HITL could be auto-answered.
 
 Coverage (every test below fails against the pre-fix code):
 
@@ -18,8 +18,9 @@ Coverage (every test below fails against the pre-fix code):
   B. complete_wave_gate is bound to a stored run_verification record; a raw
      dict is refused unless carried by a human-approved, audited override whose
      approval HITL is filed require_human=True.
-  C. Every override needs a non-empty reason and leaves an action_audit_log row
-     (override_ci, force_foreign_claim, prospect_bypass).
+  C. Every override needs a non-empty reason, a human-approved require_human
+     HITL, and an action_audit_log row (override_ci, force_foreign_claim,
+     prospect_bypass).
 """
 from __future__ import annotations
 
@@ -509,14 +510,35 @@ async def test_override_ci_needs_a_reason_and_is_audited(db, monkeypatch):
     assert (await db_module.get_sprint_item(db, item["id"]))["status"] != "done"
     assert await _audit(db, p["id"], gate_override.CI_OVERRIDE_EVENT_TYPE) == []
 
-    done = await srv._dispatch_mcp_tool(
+    approval = await srv._dispatch_mcp_tool(
         "complete_sprint_item", {**base, "override_reason": "flaky unrelated job"}, db, "/tmp",
+    )
+    assert approval["error"] == "HUMAN_APPROVAL_REQUIRED"
+    hitl = await db_module.get_hitl_request(db, approval["hitl_id"])
+    assert hitl["status"] == "pending"
+    assert json.loads(hitl["payload"])["require_human"] is True
+    await db_module.answer_hitl_request(db, approval["hitl_id"], _YES, answered_by="human-reviewer")
+    changed_reason = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {**base, "override_reason": "different reason",
+         "completion_override_hitl_id": approval["hitl_id"]},
+        db, "/tmp",
+    )
+    assert changed_reason["error"] == "HITL_INVALID"
+    assert (await db_module.get_sprint_item(db, item["id"]))["status"] != "done"
+    done = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {**base, "override_reason": "flaky unrelated job",
+         "completion_override_hitl_id": approval["hitl_id"]},
+        db, "/tmp",
     )
     assert done["status"] == "done"
     assert done["ci_override"]["reason"] == "flaky unrelated job"
+    assert done["ci_override"]["hitl_id"] == approval["hitl_id"]
     rows = await _audit(db, p["id"], gate_override.CI_OVERRIDE_EVENT_TYPE)
     assert len(rows) == 1 and rows[0]["actor"] == "exec-1"
     assert json.loads(rows[0]["detail"])["reason"] == "flaky unrelated job"
+    assert json.loads(rows[0]["detail"])["hitl_id"] == approval["hitl_id"]
 
 
 @pytest.mark.asyncio
@@ -533,9 +555,23 @@ async def test_force_foreign_claim_needs_a_reason_and_is_audited(db):
     assert (await db_module.get_sprint_item(db, item["id"]))["status"] == "in_progress"
     assert await _audit(db, p["id"], gate_override.FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE) == []
 
+    with pytest.raises(gate_override.GateOverrideError) as no_approval:
+        await db_module.complete_sprint_item(
+            db, p["id"], item["id"], actor="someone-else", force_foreign_claim=True,
+            override_reason="owner went offline", tenant_id="tenant-1",
+        )
+    assert no_approval.value.code == "HUMAN_APPROVAL_REQUIRED"
+    assert (await db_module.get_sprint_item(db, item["id"]))["status"] == "in_progress"
+
+    approval = await gate_override.request_gate_override_hitl(
+        db, p["id"], gate=gate_override.FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE,
+        subject_id=item["id"], reason="owner went offline", description="test",
+    )
+    await db_module.answer_hitl_request(db, approval["id"], _YES, answered_by="human-reviewer")
     done = await db_module.complete_sprint_item(
         db, p["id"], item["id"], actor="someone-else", force_foreign_claim=True,
         override_reason="owner went offline", tenant_id="tenant-1",
+        foreign_claim_override_hitl_id=approval["id"],
     )
     assert done["status"] == "done"
     assert done["foreign_claim_override"]["claim_owner"] == owner["id"]
@@ -543,6 +579,7 @@ async def test_force_foreign_claim_needs_a_reason_and_is_audited(db):
     assert len(rows) == 1
     assert rows[0]["actor"] == "someone-else" and rows[0]["tenant_id"] == "tenant-1"
     assert json.loads(rows[0]["detail"])["reason"] == "owner went offline"
+    assert json.loads(rows[0]["detail"])["hitl_id"] == approval["id"]
 
 
 @pytest.mark.asyncio
@@ -558,22 +595,34 @@ async def test_an_unneeded_force_flag_overrides_nothing_and_writes_no_audit(db):
 
 
 @pytest.mark.asyncio
-async def test_force_foreign_claim_via_mcp_is_refused_without_a_reason(db):
+async def test_force_foreign_claim_via_mcp_requires_a_human_approval(db):
     p = await db_module.create_project(db, "force-mcp")
     item = await db_module.add_sprint_item(db, p["id"], "v1", "handed off")
     owner = await db_module.register_session(db, p["id"], "owner")
     await db_module.claim_sprint_item(db, p["id"], item["id"], actor=owner["id"])
+    base = {
+        "project_id": p["id"], "item_id": item["id"], "actor": "someone-else",
+        "force_foreign_claim": True, "override_reason": "owner is unavailable",
+    }
     res = await srv._dispatch_mcp_tool(
         "complete_sprint_item",
-        {"project_id": p["id"], "item_id": item["id"], "actor": "someone-else",
-         "force_foreign_claim": True},
+        dict(base),
         db, "/tmp",
     )
-    assert res["error"] == "CLAIM_MISMATCH" and "override_reason" in res["message"]
+    assert res["error"] == "HUMAN_APPROVAL_REQUIRED"
+    hitl = await db_module.get_hitl_request(db, res["hitl_id"])
+    assert hitl["status"] == "pending"
+    assert json.loads(hitl["payload"])["require_human"] is True
+    await db_module.answer_hitl_request(db, res["hitl_id"], _YES, answered_by="human-reviewer")
+    done = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {**base, "foreign_claim_override_hitl_id": res["hitl_id"]}, db, "/tmp",
+    )
+    assert done["status"] == "done"
 
 
 @pytest.mark.asyncio
-async def test_prospect_bypass_by_an_agent_needs_a_reason_and_is_audited(db):
+async def test_prospect_bypass_by_an_agent_needs_human_approval_and_is_audited(db):
     p = await db_module.create_project(db, "bypass-audit")
     item = await db_module.add_sprint_item(db, p["id"], "v1", "unprospected work")
     base = {"project_id": p["id"], "item_id": item["id"], "prospect_bypass": True,
@@ -584,13 +633,25 @@ async def test_prospect_bypass_by_an_agent_needs_a_reason_and_is_audited(db):
     assert not (await db_module.get_sprint_item(db, item["id"])).get("prospect_bypass")
     assert await _audit(db, p["id"], gate_override.PROSPECT_BYPASS_OVERRIDE_EVENT_TYPE) == []
 
-    ok = await srv._dispatch_mcp_tool(
+    approval = await srv._dispatch_mcp_tool(
         "update_sprint_item", {**base, "override_reason": "planner-approved spike"}, db, "/tmp",
+    )
+    assert approval["error"] == "HUMAN_APPROVAL_REQUIRED"
+    hitl = await db_module.get_hitl_request(db, approval["hitl_id"])
+    assert hitl["status"] == "pending"
+    assert json.loads(hitl["payload"])["require_human"] is True
+    await db_module.answer_hitl_request(db, approval["hitl_id"], _YES, answered_by="human-reviewer")
+    ok = await srv._dispatch_mcp_tool(
+        "update_sprint_item",
+        {**base, "override_reason": "planner-approved spike",
+         "override_hitl_id": approval["hitl_id"]},
+        db, "/tmp",
     )
     assert ok.get("error") is None and int(ok["prospect_bypass"]) == 1
     rows = await _audit(db, p["id"], gate_override.PROSPECT_BYPASS_OVERRIDE_EVENT_TYPE)
     assert len(rows) == 1 and rows[0]["actor"] == "agent-7"
     assert json.loads(rows[0]["detail"])["reason"] == "planner-approved spike"
+    assert json.loads(rows[0]["detail"])["hitl_id"] == approval["hitl_id"]
 
     # Clearing the bypass re-enables the gate: no reason, no audit row.
     cleared = await srv._dispatch_mcp_tool(

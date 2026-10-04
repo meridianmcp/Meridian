@@ -389,6 +389,63 @@ def test_refresh_subtree_detects_deletion_within_subtree(tmp_path):
     assert index.get_convergence_state()["total_indexed"] == 0
 
 
+def test_code_index_refresh_subtree_prunes_deleted_file_chunks(tmp_path):
+    from meridian_codeindex import code_index as ci
+
+    ci._INDEX_CACHE.clear()
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    victim = sub / "victim.py"
+    _write(victim, "def stale_subtree_marker():\n    return 'stalesubtreeuniquetoken'\n")
+
+    first = bi.refresh_subtree(str(tmp_path), "sub")
+    assert first["indexed"] == 1
+    before = bi.bm25_fallback_search(
+        str(tmp_path), "stalesubtreeuniquetoken", reindex=False,
+    )
+    assert before["hits"]
+
+    victim.unlink()
+    refreshed = bi.refresh_subtree(str(tmp_path), "sub")
+    assert refreshed["indexed"] == 0
+    assert not refreshed.get("error")
+    after = bi.bm25_fallback_search(
+        str(tmp_path), "stalesubtreeuniquetoken", reindex=False,
+    )
+    assert after["hits"] == []
+
+
+def test_code_index_refresh_subtree_respects_gitignore(tmp_path):
+    import shutil
+    import subprocess
+
+    from meridian_codeindex import code_index as ci
+
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("Git is required to verify the ignore-engine integration")
+    subprocess.run(
+        [git, "-C", str(tmp_path), "init"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _write(tmp_path / ".gitignore", "sub/ignored.py\n")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    ignored = sub / "ignored.py"
+    _write(ignored, "def ignored_subtree_marker():\n    return 'ignoredsubtreeuniquetoken'\n")
+    ci._INDEX_CACHE.clear()
+
+    refreshed = bi.refresh_subtree(str(tmp_path), "sub")
+    assert refreshed["indexed"] == 0
+    assert not refreshed.get("error")
+    result = bi.bm25_fallback_search(
+        str(tmp_path), "ignoredsubtreeuniquetoken", reindex=False,
+    )
+    assert result["hits"] == []
+
+
 def test_refresh_subtree_rejects_directory_outside_outputs_dir(tmp_path):
     outputs_dir = tmp_path / "outputs"
     outputs_dir.mkdir()

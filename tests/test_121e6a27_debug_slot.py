@@ -25,8 +25,8 @@ def test_debug_port_no_collision_with_other_builtins():
 
 
 def test_debug_custom_port_start_above_debug_port():
-    # _CUSTOM_PORT_START was bumped from 8821 to 8822 to make room for debug.
-    assert tp._CUSTOM_PORT_START == 8822
+    # 8822 is reserved for the built-in LaTeX MCP slot.
+    assert tp._CUSTOM_PORT_START == 8823
     assert tp.DEFAULT_DEBUG_PORT < tp._CUSTOM_PORT_START
 
 

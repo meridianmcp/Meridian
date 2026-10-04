@@ -209,9 +209,10 @@ _SELECTOR_TYPES = frozenset(
     {
         "range", "symbol", "node_id", "zotero_key", "text_quote", "finding_id",
         # 62640241 — typed external pointer targets: directory / git /
-        # remote_fs / artifact. See the module docstring for the full shape
-        # of each.
-        "directory", "git", "remote_fs", "artifact",
+        # remote_fs / artifact. 2197fb73 adds metadata-only provider references.
+        # project_state_milestone points to immutable recovery state.
+        "directory", "git", "remote_fs", "artifact", "project_state_milestone",
+        "provider_conversation", "provider_artifact",
     }
 )
 
@@ -626,10 +627,59 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
                         f"{what} artifact {field!r} must be a non-empty string"
                     )
                 out[field] = val.strip()
+    elif stype in {"provider_conversation", "provider_artifact"}:
+        # 2197fb73 — provider-native ids are durable references only. Never
+        # accept transcript/artifact bytes here; a selected range is permitted
+        # only when bound to the local export's content hash below.
+        provider = _require_str_field(
+            selector, "provider", what=what, stype=stype
+        )
+        if provider not in {"claude.ai", "codex", "chatgpt"}:
+            raise PointerValidationError(
+                f"{what} {stype} provider must be one of claude.ai, codex, chatgpt"
+            )
+        out["provider"] = provider
+        out["conversation_id"] = _require_str_field(
+            selector, "conversation_id", what=what, stype=stype
+        )
+        hash_field = "transcript_hash"
+        if stype == "provider_artifact":
+            out["artifact_id"] = _require_str_field(
+                selector, "artifact_id", what=what, stype=stype
+            )
+            hash_field = "content_hash"
+        digest = selector.get(hash_field)
+        if digest is not None:
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise PointerValidationError(
+                    f"{what} {stype} {hash_field} must be a SHA-256 hex digest"
+                )
+            out[hash_field] = digest
+    elif stype == "project_state_milestone":
+        out["id"] = _require_str_field(
+            selector, "id", what=what, stype="project_state_milestone"
+        )
+        digest = selector.get("content_hash")
+        if digest is not None:
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise PointerValidationError(
+                    f"{what} project_state_milestone content_hash must be a SHA-256 hex digest"
+                )
+            out["content_hash"] = digest
 
     # W3C hasSubSelector — optional, recursive, validated by the same rules.
     sub = selector.get("subSelector")
     if sub is not None:
+        if stype in {"provider_conversation", "provider_artifact"}:
+            hash_field = "transcript_hash" if stype == "provider_conversation" else "content_hash"
+            if not isinstance(sub, dict) or sub.get("type") != "range":
+                raise PointerValidationError(
+                    f"{what} {stype} subSelector must be a range; provider references store only IDs and ranges"
+                )
+            if hash_field not in out:
+                raise PointerValidationError(
+                    f"{what} {stype} range subSelector requires {hash_field} to bind the selected bytes"
+                )
         out["subSelector"] = _validate_selector(sub, is_sub=True)
     return out
 
@@ -1466,7 +1516,99 @@ async def _resolve_selector(
         return await _resolve_remote_fs(selector, uri, remote_fs_resolver)
     if stype == "artifact":
         return await _resolve_artifact(selector, uri, artifact_resolver)
+    if stype == "project_state_milestone":
+        return await _resolve_project_state_milestone(db, project_id, selector, uri)
+    if stype in {"provider_conversation", "provider_artifact"}:
+        # A provider-native pointer resolves its identity only. This deliberately
+        # performs no provider/API call and does not imply that transcript or
+        # artifact contents were fetched or verified.
+        result = {
+            "uri": uri,
+            "selector_type": stype,
+            "resolved": True,
+            "provider": selector["provider"],
+            "conversation_id": selector["conversation_id"],
+            "resolution_source": "provider_native_reference",
+            "resolution_scope": "identity_only",
+            "content_loaded": False,
+        }
+        if stype == "provider_conversation" and selector.get("transcript_hash"):
+            result["transcript_hash"] = selector["transcript_hash"]
+        if stype == "provider_artifact":
+            result["artifact_id"] = selector["artifact_id"]
+            if selector.get("content_hash"):
+                result["content_hash"] = selector["content_hash"]
+        return result
     return _unresolved(f"unknown selector.type {stype!r}", uri=uri)
+
+
+async def _resolve_project_state_milestone(
+    db: Any, project_id: str, selector: dict[str, Any], uri: str
+) -> dict[str, Any]:
+    """Resolve a milestone only in its owning project and verify its hash."""
+    if not project_id:
+        return _unresolved("project scope is required", uri=uri)
+    milestone_id = selector.get("id")
+    if not isinstance(milestone_id, str) or not milestone_id:
+        return _unresolved("project state milestone id is missing", uri=uri)
+    from .db import get_project_state_milestone  # noqa: PLC0415
+
+    try:
+        row = await get_project_state_milestone(db, project_id, milestone_id)
+    except Exception:  # noqa: BLE001 — pointer resolution is best-effort
+        row = None
+    if not isinstance(row, dict):
+        return _unresolved("project state milestone not found", uri=uri)
+    expected = selector.get("content_hash")
+    if row.get("integrity_verified") is not True or (
+        expected is not None and expected != row.get("content_hash")
+    ):
+        return _unresolved("project state milestone hash verification failed", uri=uri)
+    return {
+        "uri": uri,
+        "selector_type": "project_state_milestone",
+        "resolved": True,
+        "project_id": project_id,
+        "milestone_id": row.get("id"),
+        "sequence": row.get("sequence"),
+        "content_hash": row.get("content_hash"),
+        "captured_at": row.get("captured_at"),
+    }
+
+
+def build_project_state_milestone_pointer(record: dict[str, Any]) -> dict[str, Any]:
+    """Build a typed, project-scoped pointer to one hashed milestone record."""
+    if not isinstance(record, dict):
+        raise PointerValidationError("project state milestone record must be an object")
+    project_id = record.get("project_id")
+    milestone_id = record.get("id")
+    content_hash = record.get("content_hash")
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise PointerValidationError("project state milestone requires a project id")
+    if not isinstance(milestone_id, str) or not milestone_id.strip():
+        raise PointerValidationError("project state milestone requires an id")
+    if not isinstance(content_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", content_hash):
+        raise PointerValidationError("project state milestone requires a SHA-256 content hash")
+    return validate_pointer(
+        {
+            "source_type": "project_state_milestone",
+            "label": f"Project state milestone {record.get('sequence', '')}".strip(),
+            "targets": [
+                {
+                    "uri": (
+                        f"meridian://project/{project_id.strip()}"
+                        f"/state-milestones/{milestone_id.strip()}"
+                    ),
+                    "selector": {
+                        "type": "project_state_milestone",
+                        "id": milestone_id.strip(),
+                        "content_hash": content_hash,
+                    },
+                    "target_kind": "existing",
+                }
+            ],
+        }
+    )
 
 
 def _freshness_state_for_target(

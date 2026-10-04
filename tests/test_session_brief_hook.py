@@ -1138,7 +1138,12 @@ def test_settings_wires_the_brief_for_sessionstart_and_subagentstart():
         ours = [e for e in _entries(settings, event) if "meridian_guard_brief" in json.dumps(e)]
         assert len(ours) == 1, event
         assert ours[0]["matcher"] == matcher
-        (hook,) = ours[0]["hooks"]
+        brief_hooks = [
+            hook for hook in ours[0]["hooks"]
+            if "meridian_guard_brief.ps1" in hook.get("command", "")
+        ]
+        assert len(brief_hooks) == 1, event
+        (hook,) = brief_hooks
         assert hook == {"type": "command", "shell": "powershell", "command": expected_cmd, "timeout": 10}
     # the brief is registered only on the two start events, never on a tool event
     for event in ("PreToolUse", "PostToolUse"):
@@ -1147,15 +1152,18 @@ def test_settings_wires_the_brief_for_sessionstart_and_subagentstart():
 
 
 def test_settings_leaves_post_compact_refresh_untouched():
-    """Its own entry stays separate and unchanged except for the launcher
-    repair (bare $CLAUDE_PROJECT_DIR never resolved under PowerShell)."""
+    """Keep the compact refresh hook intact alongside other SessionStart hooks."""
     settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
     compact = [e for e in _entries(settings, "SessionStart") if e.get("matcher") == "compact"]
-    assert compact == [{
-        "matcher": "compact",
-        "hooks": [{
-            "type": "command", "shell": "powershell",
-            "command": ('& "$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1"'
-                        "; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"),
-        }],
-    }]
+    assert len(compact) == 1
+    refresh_hooks = [
+        hook for hook in compact[0]["hooks"]
+        if "post_compact_refresh.ps1" in hook.get("command", "")
+    ]
+    assert len(refresh_hooks) == 1
+    assert refresh_hooks[0] == {
+        "type": "command",
+        "shell": "powershell",
+        "command": ('& "$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\post_compact_refresh.ps1" -Event compact'
+                    "; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1"),
+    }

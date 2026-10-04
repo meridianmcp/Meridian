@@ -2320,6 +2320,12 @@ def test_run_tunnel_no_staleness_warning_masks_no_plugins_error(monkeypatch, tmp
     monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
     monkeypatch.setattr(tc, "_tunnel_client_commit_hash_sync", lambda *a, **k: "cafef00d1234")
     monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
+    # run_tunnel's startup orphan sweep is unrelated to the no-plugins guard.
+    # Keep this integration test away from the developer's durable PID registry
+    # and its Serena lease files; those have dedicated focused coverage.
+    monkeypatch.setattr(
+        tc, "_all_spawned_registry_path", lambda: tmp_path / "spawned_pids.json"
+    )
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={
@@ -2808,6 +2814,27 @@ def test_run_tunnel_wires_outputs_slot_when_enabled(monkeypatch, tmp_path):
     assert len(procs) == 4
     outputs_spawns = [p for p in procs if any("meridian-outputs-mcp" in str(t) for t in p.cmd)]
     assert outputs_spawns, "outputs slot (meridian-outputs-mcp) was not spawned"
+
+
+def test_run_tunnel_wires_latex_slot_when_enabled(monkeypatch, tmp_path):
+    """Enabling meridian-latex must spawn it and use the latex reconnect slot."""
+    procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "tid-latex", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "meridian-latex", "enabled": True},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    latex_spawns = [p for p in procs if "meridian-latex" in p.cmd]
+    assert latex_spawns, "latex slot was not spawned"
+    assert latex_spawns[0].cmd[-2:] == ["meridian-latex", "mcp"]
 
 
 def test_run_tunnel_wires_debug_slot_when_enabled(monkeypatch, tmp_path):

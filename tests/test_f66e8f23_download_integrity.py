@@ -221,6 +221,37 @@ case "$1" in
   *)  echo "$FAKE_UNAME_S" ;;
 esac
 """
+_FAKE_UNAME_RUNNER = r"""
+uname() {
+  case "$1" in
+    -m) printf '%s\n' "$FAKE_UNAME_M" ;;
+    *)  printf '%s\n' "$FAKE_UNAME_S" ;;
+  esac
+}
+fakebin_path="$(cygpath -u "$1")"
+fake_home="$(cygpath -u "$2")"
+script_path="$3"
+curl_shim_path="$(cygpath -u "$4")"
+shift 4
+export PATH="$fakebin_path:$PATH"
+export HOME="$fake_home"
+if [ -n "${MERIDIAN_BIN_DIR:-}" ]; then
+  MERIDIAN_BIN_DIR="$(cygpath -u "$MERIDIAN_BIN_DIR")"
+  export MERIDIAN_BIN_DIR
+fi
+if [ -n "${FAKE_SERVE:-}" ]; then
+  FAKE_SERVE="$(cygpath -u "$FAKE_SERVE")"
+  export FAKE_SERVE
+fi
+if [ -n "${FAKE_CURL_LOG:-}" ]; then
+  FAKE_CURL_LOG="$(cygpath -u "$FAKE_CURL_LOG")"
+  export FAKE_CURL_LOG
+fi
+curl() {
+  sh "$curl_shim_path" "$@"
+}
+. "$script_path" "$@"
+"""
 
 # Serves files out of $FAKE_SERVE by URL basename; api.github.com answers with a tag.
 _FAKE_CURL = """#!/bin/sh
@@ -289,8 +320,23 @@ class _Sandbox:
         }
         env.pop(_OPT_OUT, None)
         env.update(extra_env)
+        argv = [_SH, _INSTALL_SH.as_posix(), *args]
+        if os.name == "nt":
+            # Keep simulated uname values in the shell itself; MSYS path
+            # conversion can otherwise bypass the fake executable in PATH.
+            argv = [
+                _SH,
+                "-c",
+                _FAKE_UNAME_RUNNER,
+                "meridian-install-test",
+                self.fakebin.as_posix(),
+                self.home.as_posix(),
+                _INSTALL_SH.as_posix(),
+                (self.fakebin / "curl").as_posix(),
+                *args,
+            ]
         return subprocess.run(
-            [_SH, _INSTALL_SH.as_posix(), *args],
+            argv,
             cwd=self.root, env=env, capture_output=True, text=True, timeout=120,
         )
 
@@ -566,6 +612,9 @@ Write-Output ('CASE optout result=' + $r + ' exists=' + (Test-Path $f))
     hp = work / "harness.ps1"
     hp.write_bytes(b"\xef\xbb\xbf" + harness.encode("utf-8"))  # BOM: 5.1 must read it as UTF-8
     env = {k: v for k, v in os.environ.items() if k != _OPT_OUT}
+    # Codex may put its PowerShell 7 modules first; Windows PowerShell 5.1
+    # cannot load that module tree, so point this PS5-only harness at PSHome.
+    env["PSModulePath"] = str(Path(_POWERSHELL).parent / "Modules")
     proc = subprocess.run(
         [_POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(hp)],
         capture_output=True, text=True, timeout=180, env=env,

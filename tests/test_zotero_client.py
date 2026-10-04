@@ -18,6 +18,13 @@ import asyncio
 import pytest
 
 from meridian import zotero_client
+from meridian import tunnel_config
+
+
+@pytest.fixture(autouse=True)
+def _default_to_whole_library_scope(monkeypatch):
+    """Keep user-machine preferences from changing unscoped resolver tests."""
+    monkeypatch.setattr(tunnel_config, "get_zotero_collection_keys", lambda: [])
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +103,21 @@ def test_doi_prefix_resolves_case_insensitive_doi_match():
         "item_type": "journalArticle",
     }
     # Exactly one search request was made.
+    assert len(client.requests) == 1
+
+
+def test_doi_lookup_uses_selected_local_collection_scope(monkeypatch):
+    monkeypatch.setattr(tunnel_config, "get_zotero_collection_keys", lambda: ["COLL1234"])
+
+    def handler(url, params):
+        assert url.endswith("/users/0/collections/COLL1234/items")
+        assert params.get("q") == "10.5555/scoped"
+        return _MockResponse(json_body=[_item("SCOPED1", doi="10.5555/scoped")])
+
+    client = _MockClient(handler)
+    result = _run(zotero_client.resolve_citation_ref("10.5555/scoped", client=client))
+
+    assert result["zotero_key"] == "SCOPED1"
     assert len(client.requests) == 1
 
 
@@ -190,14 +212,15 @@ def test_zotero_key_direct_get_unwraps_single_element_list():
 # bare citekey dispatch — best-effort q= search top hit
 # ---------------------------------------------------------------------------
 
-def test_bare_citekey_does_q_search_top_hit():
+def test_bare_citekey_resolves_only_through_exact_better_bibtex_tag():
     def handler(url, params):
+        if url.endswith("/users/0/tags"):
+            assert params == {"start": 0, "limit": 100}
+            return _MockResponse(json_body=[{"tag": "0:key:knuth1984"}])
         assert url.endswith("/users/0/items")
-        assert params.get("q") == "knuth1984"
-        # Top hit is returned even without a DOI match (fuzzy, best-effort).
+        assert params == {"tag": "0:key:knuth1984"}
         return _MockResponse(json_body=[
             _item("TOP1", doi=None, title="The TeXbook", item_type="book"),
-            _item("TOP2", doi=None, title="Another"),
         ])
 
     client = _MockClient(handler)
@@ -217,6 +240,109 @@ def test_bare_citekey_no_hits_returns_none():
     client = _MockClient(handler)
     result = _run(zotero_client.resolve_citation_ref("nonexistent_key", client=client))
     assert result is None
+
+
+def test_lookup_citation_key_preserves_local_engine_tristate():
+    def handler(url, params):
+        if url.endswith("/users/0/tags"):
+            return _MockResponse(json_body=[{"tag": "0:key:knuth1984"}])
+        return _MockResponse(json_body=[_item("TOP1", title="The TeXbook")])
+
+    client = _MockClient(handler)
+    result = _run(zotero_client.lookup_citation_key("knuth1984", client=client))
+    assert result == {
+        "resolved": True,
+        "status": "resolved",
+        "tag": "0:key:knuth1984",
+        "title": "The TeXbook",
+    }
+
+
+def test_lookup_citation_key_uses_selected_local_collection_scope(monkeypatch):
+    monkeypatch.setattr(tunnel_config, "get_zotero_collection_keys", lambda: ["COLL1234"])
+
+    def handler(url, params):
+        if url.endswith("/users/0/collections/COLL1234/tags"):
+            return _MockResponse(json_body=[{"tag": "0:key:scopedkey"}])
+        assert url.endswith("/users/0/collections/COLL1234/items")
+        assert params == {"tag": "0:key:scopedkey"}
+        return _MockResponse(json_body=[_item("SCOPED1", title="Scoped paper")])
+
+    client = _MockClient(handler)
+    result = _run(zotero_client.lookup_citation_key("scopedkey", client=client))
+
+    assert result == {
+        "resolved": True,
+        "status": "resolved",
+        "tag": "0:key:scopedkey",
+        "title": "Scoped paper",
+    }
+    assert [request[0] for request in client.requests] == [
+        "http://127.0.0.1:23119/api/users/0/collections/COLL1234/tags",
+        "http://127.0.0.1:23119/api/users/0/collections/COLL1234/items",
+    ]
+
+
+def test_lookup_citation_key_does_not_match_substrings():
+    client = _MockClient(
+        lambda _url, _params: _MockResponse(json_body=[{"tag": "0:key:knuth1984x"}])
+    )
+    result = _run(zotero_client.lookup_citation_key("knuth1984", client=client))
+    assert result == {"resolved": False, "status": "unresolved"}
+    assert len(client.requests) == 1
+
+
+def test_lookup_citation_key_reports_duplicate_tags_as_ambiguous():
+    client = _MockClient(
+        lambda _url, _params: _MockResponse(json_body=[
+            {"tag": "0:key:knuth1984"},
+            {"tag": "group7:key:knuth1984"},
+        ])
+    )
+    result = _run(zotero_client.lookup_citation_key("knuth1984", client=client))
+    assert result["resolved"] is None
+    assert result["status"] == "ambiguous"
+    assert len(client.requests) == 1
+
+
+def test_lookup_citation_key_reports_duplicate_items_as_ambiguous():
+    def handler(url, _params):
+        if url.endswith("/users/0/tags"):
+            return _MockResponse(json_body=[{"tag": "0:key:knuth1984"}])
+        return _MockResponse(json_body=[_item("TOP1"), _item("TOP2")])
+
+    client = _MockClient(handler)
+    result = _run(zotero_client.lookup_citation_key("knuth1984", client=client))
+    assert result["resolved"] is None
+    assert result["status"] == "ambiguous"
+    assert "multiple Zotero items" in result["reason"]
+
+
+def test_lookup_citation_key_reports_local_api_failure_as_unavailable():
+    def handler(_url, _params):
+        raise OSError("offline")
+
+    client = _MockClient(handler)
+    result = _run(zotero_client.lookup_citation_key("knuth1984", client=client))
+    assert result["resolved"] is None
+    assert result["status"] == "unavailable"
+    assert "unavailable" in result["reason"]
+
+
+def test_lookup_citation_key_bounds_tag_pagination(monkeypatch):
+    monkeypatch.setattr(zotero_client, "_TAG_PAGE_SIZE", 2)
+    monkeypatch.setattr(zotero_client, "_MAX_TAG_PAGES", 2)
+    client = _MockClient(
+        lambda _url, _params: _MockResponse(json_body=[
+            {"tag": "0:key:first"},
+            {"tag": "0:key:second"},
+        ])
+    )
+    result = _run(zotero_client.lookup_citation_key("missing", client=client))
+    assert result["resolved"] is None
+    assert result["status"] == "unavailable"
+    assert "pagination bound" in result["reason"]
+    assert len(client.requests) == 2
 
 
 # ---------------------------------------------------------------------------

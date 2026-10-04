@@ -2470,7 +2470,8 @@ function g10(    fpn, p, base, par, what, nn, cur, on, ed, i, o2, n2) {
 
 function research_host(h, path,    i) {
     h = tolower(h)
-    if (h == "github.com" || endswith(h, ".github.com")) return startswith(path, "/search")
+    if (h == "github.com" || h == "www.github.com") return path == "/" || startswith(path, "/search")
+    if (endswith(h, ".github.com")) return startswith(path, "/search")
     if (contains(path, "/blob/") || contains(path, "/raw/")) return 0
     for (i = 1; i <= NRH; i++) if (h == RHOSTS[i] || endswith(h, "." RHOSTS[i])) return 1
     return h == "pubmed.ncbi.nlm.nih.gov" || (endswith(h, "ncbi.nlm.nih.gov") && contains(tolower(path), "/pubmed"))
@@ -2573,7 +2574,7 @@ function research_shaped(    url, q, qv, doms, i, d, h, pa, si) {
         qv = ti_get("query")
         q = tolower(jtruthy(qv) ? pystr(qv) : "")
         if (contains(q, "bibtex")) return 0
-        if (contains(q, "site:arxiv") || contains(q, "prior art") || contains(q, "papers on") || has_word(q, "et al")) return 1
+        if (contains(q, "site:arxiv") || q ~ /(^|[^[:alnum:]_.-])site:(www\.)?github\.com([^[:alnum:]_.-]|$)/ || contains(q, "prior art") || contains(q, "papers on") || has_word(q, "et al")) return 1
         doms = ti_get("allowed_domains")
         if (JT[doms] == "a") for (i = 1; i <= JN[doms]; i++) {
             if (!jis_str(JC[doms, i])) continue

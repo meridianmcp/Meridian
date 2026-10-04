@@ -179,7 +179,7 @@ async def test_zotero_search_group_library_hits_groups_endpoint(monkeypatch):
     assert seen["url"] == f"{zs._ZOTERO_API_BASE}/groups/999/items"
 
 
-async def test_zotero_search_passes_explicit_api_key_header(monkeypatch):
+async def test_zotero_search_ignores_server_environment_api_key(monkeypatch):
     import httpx
     import meridian.zotero_search as zs
 
@@ -203,37 +203,9 @@ async def test_zotero_search_passes_explicit_api_key_header(monkeypatch):
             return _FakeResp()
 
     monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    await zs.zotero_search("x", library_id="123", api_key="secret-key")
-    assert seen["headers"]["Zotero-API-Key"] == "secret-key"
-
-
-async def test_zotero_search_falls_back_to_env_var_api_key(monkeypatch):
-    import httpx
-    import meridian.zotero_search as zs
-
-    seen = {}
-
-    class _FakeResp:
-        def raise_for_status(self):
-            return None
-        def json(self):
-            return []
-
-    class _FakeClient:
-        def __init__(self, **kwargs):
-            pass
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *a):
-            return False
-        async def get(self, url, params=None, headers=None):
-            seen["headers"] = headers
-            return _FakeResp()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    monkeypatch.setenv("ZOTERO_API_KEY", "env-key")
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-only-server-secret")
     await zs.zotero_search("x", library_id="123")
-    assert seen["headers"]["Zotero-API-Key"] == "env-key"
+    assert "Zotero-API-Key" not in seen["headers"]
 
 
 async def test_zotero_search_date_sort_passes_sort_params(monkeypatch):
@@ -288,7 +260,7 @@ async def test_zotero_search_403_degrades_to_helpful_error(monkeypatch):
     out = await zs.zotero_search("x", library_id="123")
     assert "error" in out
     assert "403" in out["error"]
-    assert "api_key" in out["error"]
+    assert "Zotero MCP connection" in out["error"]
 
 
 async def test_zotero_search_network_error_degrades_to_error_dict(monkeypatch):
@@ -329,7 +301,7 @@ def test_zotero_search_registered_and_read_only():
 async def test_handle_zotero_search_dispatches_to_zotero_search(monkeypatch):
     from meridian.mcp.handlers.session_tools import handle_zotero_search
 
-    async def _fake_zotero_search(query, library_type="user", library_id="", api_key=None, limit=10, sort_by="relevance"):
+    async def _fake_zotero_search(query, library_type="user", library_id="", limit=10, sort_by="relevance"):
         return {"query": query, "count": 0, "results": [], "seen_library_id": library_id}
 
     import meridian.zotero_search as zs

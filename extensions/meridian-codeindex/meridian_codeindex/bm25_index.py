@@ -153,29 +153,144 @@ def _safe_walk_errors(root_dir: str) -> list[str]:
 
 
 def _iter_subtree_indexable_files(
-    subtree_dir: str, *, errors_out: list[str] | None = None,
+    subtree_dir: str,
+    *,
+    root_dir: str | None = None,
+    errors_out: list[str] | None = None,
+    max_files: int = 20_000,
+    max_file_bytes: int = 4_000_000,
+    max_total_bytes: int = 512_000_000,
+    max_seconds: float = 30.0,
 ) -> list[str]:
     """Absolute paths of every indexable file under ``subtree_dir`` ONLY.
 
-    Same pruning as :func:`meridian_codeindex.code_index._iter_indexable_files`
-    (reused directly, not re-implemented), but bounded to ``subtree_dir``
-    instead of walking a whole ``root_dir`` -- the primitive
-    :func:`refresh_subtree` needs to discover its bounded file set without
-    the caller having to enumerate paths itself. Optionally records any
-    per-directory walk error into ``errors_out``.
+    Applies the code-index file and directory exclusions within
+    ``subtree_dir`` and filters candidates through Git's ignore engine before
+    returning them. The narrower walk lets :func:`refresh_subtree` discover
+    its bounded file set without the caller having to enumerate paths itself.
+    Optionally records walk or filter errors into ``errors_out``.
     """
+
+    import subprocess
+    import time
+
+    started = time.monotonic()
+    root = impl.normalize_root_dir(root_dir or subtree_dir)
+    scope = impl.normalize_root_dir(subtree_dir)
+    excluded = impl._SKIP_DIRS | {
+        ".codex", ".serena", ".cache", "cache", "caches",
+        "OneDrive", "Dropbox", "Google Drive", "iCloud Drive", "iCloudDrive",
+    }
+    excluded_folded = {name.casefold() for name in excluded}
+
+    def _report(reason: str) -> None:
+        if errors_out is not None:
+            errors_out.append(reason)
 
     def _onerror(exc: OSError) -> None:
         if errors_out is not None:
             errors_out.append(str(exc))
 
     found: list[str] = []
-    for cur, dirs, files in os.walk(subtree_dir, onerror=_onerror):
-        dirs[:] = [d for d in dirs if d not in impl._SKIP_DIRS]
-        for fn in files:
+    total_bytes = 0
+    for cur, dirs, files in os.walk(scope, onerror=_onerror, followlinks=False):
+        if time.monotonic() - started > max_seconds:
+            _report("time_budget_exceeded")
+            return []
+        dirs[:] = sorted(
+            d for d in dirs
+            if d.casefold() not in excluded_folded
+            and not os.path.islink(os.path.join(cur, d))
+        )
+        for fn in sorted(files):
+            if time.monotonic() - started > max_seconds:
+                _report("time_budget_exceeded")
+                return []
             if impl.is_indexable(fn):
-                found.append(os.path.join(cur, fn))
-    return found
+                path = os.path.join(cur, fn)
+                resolved = os.path.realpath(path)
+                try:
+                    if os.path.commonpath([scope, resolved]) != scope:
+                        continue
+                    size = os.path.getsize(path)
+                except (OSError, ValueError):
+                    _report("file_stat_failed")
+                    continue
+                if size > max_file_bytes:
+                    _report("file_size_budget_exceeded")
+                    continue
+                if total_bytes + size > max_total_bytes:
+                    _report("total_size_budget_exceeded")
+                    return []
+                if len(found) >= max_files:
+                    _report("file_count_budget_exceeded")
+                    return []
+                total_bytes += size
+                found.append(path)
+
+    # The whole-tree index uses Git's ignore engine (including nested
+    # .gitignore, .git/info/exclude, and core.excludesFile). Keep a targeted
+    # refresh from reintroducing ignored files through its narrower walk.
+    try:
+        git_root = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=max(0.25, min(3.0, max_seconds)),
+        )
+    except subprocess.TimeoutExpired:
+        _report("git_scope_probe_timed_out")
+        return []
+    except OSError:
+        if os.path.exists(os.path.join(root, ".git")):
+            _report("git_ignore_filter_unavailable")
+            return []
+        return found
+    if git_root.returncode != 0 or not git_root.stdout.strip():
+        if os.path.exists(os.path.join(root, ".git")):
+            _report("git_ignore_filter_unavailable")
+            return []
+        return found
+
+    repo_root = impl.normalize_root_dir(git_root.stdout.strip())
+    rel_paths: list[str] = []
+    for path in found:
+        try:
+            if os.path.commonpath([repo_root, os.path.realpath(path)]) != repo_root:
+                _report("git_scope_path_outside_repo")
+                return []
+        except (OSError, ValueError):
+            _report("git_scope_path_outside_repo")
+            return []
+        rel_paths.append(os.path.relpath(path, repo_root).replace(os.sep, "/"))
+    if not rel_paths:
+        return found
+    remaining = max_seconds - (time.monotonic() - started)
+    if remaining <= 0:
+        _report("time_budget_exceeded")
+        return []
+    try:
+        ignored = subprocess.run(
+            ["git", "-C", repo_root, "check-ignore", "--no-index", "--stdin", "-z"],
+            input=b"\0".join(os.fsencode(path) for path in rel_paths) + b"\0",
+            capture_output=True,
+            check=False,
+            timeout=remaining,
+        )
+    except subprocess.TimeoutExpired:
+        _report("time_budget_exceeded")
+        return []
+    if ignored.returncode not in (0, 1):
+        _report("ignored_path_filter_unavailable")
+        return []
+    ignored_paths = {
+        os.fsdecode(part).replace("\\", "/")
+        for part in ignored.stdout.split(b"\0") if part
+    }
+    return [path for path, rel in zip(found, rel_paths) if rel not in ignored_paths]
 
 
 # ---------------------------------------------------------------------------
@@ -410,10 +525,14 @@ def refresh_subtree(
             "error": f"root_dir does not exist: {root}",
         }
     abs_subtree = subtree if os.path.isabs(subtree) else os.path.join(root, subtree)
-    abs_subtree = os.path.normpath(abs_subtree)
-    abs_root = os.path.normpath(root)
+    abs_subtree = impl.normalize_root_dir(abs_subtree)
+    abs_root = impl.normalize_root_dir(root)
     try:
-        within = os.path.commonpath([abs_subtree, abs_root]) == abs_root
+        normalized_subtree = os.path.normcase(abs_subtree)
+        normalized_root = os.path.normcase(abs_root)
+        within = os.path.commonpath(
+            [normalized_subtree, normalized_root]
+        ) == normalized_root
     except ValueError:  # different drive on Windows
         within = False
     if not within or not os.path.isdir(abs_subtree):
@@ -424,11 +543,24 @@ def refresh_subtree(
         }
 
     walk_errors: list[str] = []
-    paths = _iter_subtree_indexable_files(abs_subtree, errors_out=walk_errors)
+    paths = _iter_subtree_indexable_files(
+        abs_subtree, root_dir=root, errors_out=walk_errors,
+    )
+    if walk_errors:
+        return {
+            "root_dir": root,
+            "subtree": subtree,
+            "indexed": 0,
+            "skipped": 0,
+            "paths": [],
+            "walk_errors": walk_errors,
+            "inconclusive": True,
+            "error": "subtree_walk_incomplete",
+        }
     idx = impl.get_code_index(root, db_path=db_path)
-    outcome = idx.index_paths(paths)
+    outcome = idx.index_paths(paths, prune_root=abs_subtree)
     outcome["root_dir"] = root
     outcome["subtree"] = subtree
     outcome["walk_errors"] = walk_errors
-    outcome["inconclusive"] = bool(walk_errors)
+    outcome["inconclusive"] = bool(outcome.get("error"))
     return outcome

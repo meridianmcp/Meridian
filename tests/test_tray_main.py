@@ -514,6 +514,933 @@ def test_main_without_flag_runs_the_tray(monkeypatch):
     assert tray_main.main([]) is sentinel
 
 
+def test_main_second_windows_launch_opens_dashboard_without_another_tray(monkeypatch):
+    monkeypatch.setattr(
+        tray_main, "_acquire_windows_tray_lock", lambda: ("already_running", None),
+    )
+    opened = []
+    monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
+    monkeypatch.setattr(
+        tray_main, "_run_tray", lambda: pytest.fail("a second icon must not start"),
+    )
+
+    assert tray_main.main([]) == 0
+    assert opened == [tray_main._dashboard_url()]
+
+
+def test_windows_tray_instance_lock_releases_its_byte_range(monkeypatch, tmp_path):
+    fake_msvcrt = mock.MagicMock()
+    fake_msvcrt.LK_NBLCK = 1
+    fake_msvcrt.LK_UNLCK = 2
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    state, handle = tray_main._acquire_windows_tray_lock()
+
+    assert state == "acquired"
+    assert handle is not None
+    assert (tmp_path / "Meridian" / "tray-instance.lock").read_bytes() == b"\0"
+    tray_main._release_windows_tray_lock(handle)
+    assert fake_msvcrt.locking.call_args_list[0].args[1:] == (1, 1)
+    assert fake_msvcrt.locking.call_args_list[1].args[1:] == (2, 1)
+    assert handle.closed
+
+
+def test_windows_tray_instance_lock_treats_a_busy_lock_as_an_existing_instance(
+    monkeypatch, tmp_path,
+):
+    import errno
+
+    fake_msvcrt = mock.MagicMock()
+    fake_msvcrt.LK_NBLCK = 1
+    fake_msvcrt.locking.side_effect = OSError(errno.EACCES, "lock is held")
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert tray_main._acquire_windows_tray_lock() == ("already_running", None)
+
+
+def test_main_reports_single_instance_lock_errors(monkeypatch):
+    monkeypatch.setattr(
+        tray_main, "_acquire_windows_tray_lock", mock.Mock(side_effect=OSError("lock unavailable")),
+    )
+    show_error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
+    monkeypatch.setattr(
+        tray_main, "_run_tray", lambda: pytest.fail("tray cannot start without its lock"),
+    )
+
+    assert tray_main.main([]) == 1
+    show_error.assert_called_once_with(
+        "Meridian tray could not start",
+        "Could not establish the single-instance lock: lock unavailable",
+    )
+
+
+def test_run_tray_uses_the_tk_cocoa_main_loop_on_macos(monkeypatch):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: None)
+    monkeypatch.setattr(tray_main.sys, "platform", "darwin")
+
+    fake_root = mock.MagicMock()
+    fake_tk = mock.MagicMock()
+    fake_tk.Tk.return_value = fake_root
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    appkit = mock.MagicMock()
+    cocoa_app = object()
+    appkit.NSApplication.sharedApplication.return_value = cocoa_app
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    assert tray_main._run_tray() == 0
+
+    fake_tk.Tk.assert_called_once_with()
+    fake_icon.run_detached.assert_called_once_with()
+    fake_icon.run.assert_not_called()
+    fake_root.mainloop.assert_called_once_with()
+    fake_root.destroy.assert_called_once_with()
+    assert fake_pystray.Icon.call_args.kwargs["darwin_nsapplication"] is cocoa_app
+
+
+def test_run_tray_cleans_up_macos_root_when_startup_is_not_ready(monkeypatch):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.COLD_START_TIMEOUT)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.sys, "platform", "darwin")
+    monkeypatch.setattr(tray_main, "_show_error_dialog", mock.Mock())
+
+    fake_root = mock.MagicMock()
+    fake_tk = mock.MagicMock()
+    fake_tk.Tk.return_value = fake_root
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    appkit = mock.MagicMock()
+    appkit.NSApplication.sharedApplication.return_value = object()
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    assert tray_main._run_tray() == 1
+
+    fake_root.destroy.assert_called_once_with()
+    fake_pystray.Icon.assert_not_called()
+
+
+def test_run_tray_reports_startup_exception_and_closes_macos_root(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.side_effect = RuntimeError("startup failed")
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.sys, "platform", "darwin")
+    show_error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
+
+    fake_root = mock.MagicMock()
+    fake_tk = mock.MagicMock()
+    fake_tk.Tk.return_value = fake_root
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    appkit = mock.MagicMock()
+    appkit.NSApplication.sharedApplication.return_value = object()
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    assert tray_main._run_tray() == 1
+
+    show_error.assert_called_once_with("Meridian failed to start", "startup failed", parent=fake_root)
+    fake_root.destroy.assert_called_once_with()
+
+
+def test_run_tray_closes_macos_root_when_existing_runner_status_fails(monkeypatch):
+    _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    record = mock.MagicMock(pid=123, run_id="existing")
+    fake_runner.start.side_effect = tray_main.RunnerAlreadyRunningError("default", record)
+    fake_runner.status.return_value = _fake_status(tray_main.LocalMcpState.COLD_START_TIMEOUT)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.sys, "platform", "darwin")
+
+    fake_root = mock.MagicMock()
+    fake_tk = mock.MagicMock()
+    fake_tk.Tk.return_value = fake_root
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    appkit = mock.MagicMock()
+    appkit.NSApplication.sharedApplication.return_value = object()
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    assert tray_main._run_tray() == 1
+
+    fake_runner.status.assert_called_once_with()
+    fake_root.destroy.assert_called_once_with()
+
+
+def test_run_tray_falls_back_to_a_solid_icon_when_the_asset_is_missing(monkeypatch):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    image_module = sys.modules["PIL.Image"]
+    image_module.open.side_effect = OSError("missing image")
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: None)
+
+    assert tray_main._run_tray() == 0
+
+    image_module.new.assert_called_once_with("RGBA", (64, 64), (0, 102, 204, 255))
+    fake_pystray.Icon.assert_called_once()
+    fake_icon.run.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("failure", "title"),
+    [
+        (tray_main.ZoteroSetupError("credential vault unavailable"), "Zotero setup unavailable"),
+        (RuntimeError("unexpected setup failure"), "Zotero setup failed"),
+    ],
+)
+def test_run_tray_reports_zotero_setup_errors(monkeypatch, failure, title):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: None)
+    monkeypatch.setattr(tray_main, "run_zotero_setup_dialog", mock.Mock(side_effect=failure))
+    show_error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.name = name
+            self.args = args
+
+        def start(self):
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+    assert tray_main._run_tray() == 0
+    callbacks = {
+        call.args[0]: call.args[1]
+        for call in fake_pystray.MenuItem.call_args_list
+        if isinstance(call.args[0], str)
+    }
+    callbacks["Zotero connection…"](mock.MagicMock(), None)
+
+    show_error.assert_called_once_with(title, str(failure), parent=None)
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin"])
+def test_run_tray_menu_actions_use_the_platform_ui_dispatcher(monkeypatch, platform):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    fake_tunnel_runner = mock.MagicMock()
+    monkeypatch.setattr(tray_main, "_build_tunnel_runner", lambda: fake_tunnel_runner)
+    hosted_status = {
+        "state": "disconnected",
+        "detail": "No active hosted tunnel socket is reported.",
+        "last_error": None,
+        "base_url": "https://usemeridian.us",
+        "diagnostics_url": "https://usemeridian.us/tunnel/diagnostics/tenant-123",
+    }
+    monkeypatch.setattr(tray_main, "_hosted_tunnel_status", lambda: hosted_status)
+    monkeypatch.setattr(tray_main.webbrowser, "open", mock.Mock())
+    monkeypatch.setattr(tray_main.sys, "platform", platform)
+
+    parent = None
+    if platform == "darwin":
+        parent = mock.MagicMock()
+        fake_tk = mock.MagicMock()
+        fake_tk.Tk.return_value = parent
+        monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+        appkit = mock.MagicMock()
+        appkit.NSApplication.sharedApplication.return_value = object()
+        monkeypatch.setitem(sys.modules, "AppKit", appkit)
+
+    monkeypatch.setattr(tray_main, "_show_status_dialog", mock.Mock())
+    monkeypatch.setattr(tray_main, "_show_logs_window", mock.Mock())
+    monkeypatch.setattr(tray_main, "_load_tunnel_watchdog_enabled", lambda: True)
+    save_watchdog = mock.Mock()
+    monkeypatch.setattr(tray_main, "_save_tunnel_watchdog_enabled", save_watchdog)
+    monkeypatch.setattr(tray_main, "run_zotero_setup_dialog", mock.Mock())
+    errors = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", errors)
+    monkeypatch.setattr(
+        tray_main, "_choose_project_root",
+        mock.Mock(side_effect=["C:/work/project", None, None]),
+    )
+    choose_tex = mock.Mock(return_value="C:/papers/draft paper.tex")
+    monkeypatch.setattr(tray_main, "_choose_tex_file", choose_tex)
+    choose_overleaf_id = mock.Mock(side_effect=["project_123", "", None])
+    monkeypatch.setattr(tray_main, "_choose_overleaf_project_id", choose_overleaf_id)
+    latex_launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_meridian_latex_cli", latex_launch)
+    launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
+    fake_runner.restart.side_effect = RuntimeError("restart failed")
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.name = name
+            self.args = args
+
+        def start(self):
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+
+    def click_actions(*_args):
+        callbacks = {
+            call.args[0]: call.args[1]
+            for call in fake_pystray.MenuItem.call_args_list
+            if isinstance(call.args[0], str)
+        }
+        for label in (
+            "Open Dashboard", "Status", "View Logs", "Zotero connection…",
+            "Set up a local project…", "Check a local project…",
+            "Compile a LaTeX file locally…",
+            "Catalog local sessions", "Artifact capture commands", "Restart",
+            "Automatic tunnel recovery", "Quit",
+        ):
+            callbacks[label](fake_icon, None)
+        callbacks["Compile a LaTeX file locally…"](fake_icon, None)
+        callbacks["Compile a LaTeX file locally…"](fake_icon, None)
+        # A second setup-menu invocation covers the user's picker-cancel path.
+        callbacks["Set up a local project…"](fake_icon, None)
+
+    if platform == "darwin":
+        fake_icon.run_detached.side_effect = click_actions
+        parent.mainloop.side_effect = lambda: parent.after.call_args_list[0].args[1]()
+    else:
+        fake_icon.run.side_effect = click_actions
+
+    assert tray_main._run_tray() == 0
+
+    status_call = tray_main._show_status_dialog.call_args
+    assert status_call.args == (fake_runner,)
+    assert status_call.kwargs["parent"] is parent
+    assert status_call.kwargs["tunnel_runner"] is fake_tunnel_runner
+    assert status_call.kwargs["hosted_tunnel_status"] == hosted_status
+    expected_watchdog_status = (
+        "enabled; waiting for the tunnel to be enabled"
+        if platform == "win32" else "disabled by user"
+    )
+    assert status_call.kwargs["watchdog_status"] == expected_watchdog_status
+    tray_main._show_logs_window.assert_called_once_with(fake_runner, parent=parent)
+    tray_main.run_zotero_setup_dialog.assert_called_once_with(parent=parent)
+    assert tray_main._choose_project_root.call_count == 3
+    assert choose_tex.call_args_list == [
+        mock.call("Choose a LaTeX source file to compile locally", parent=parent),
+        mock.call("Choose a LaTeX source file to compile locally", parent=parent),
+        mock.call("Choose a LaTeX source file to compile locally", parent=parent),
+    ]
+    assert choose_overleaf_id.call_args_list == [
+        mock.call(parent=parent), mock.call(parent=parent), mock.call(parent=parent),
+    ]
+    assert latex_launch.call_args_list == [
+        mock.call("compile", "C:/papers/draft paper.tex", "--project-id=project_123", parent=parent),
+        mock.call("compile", "C:/papers/draft paper.tex", parent=parent),
+    ]
+    setup = mock.call("setup", "--repo", "C:/work/project", cwd="C:/work/project")
+    recovery = mock.call("recovery", "catalog")
+    artifacts = mock.call("artifacts", "--help")
+    assert launch.call_args_list == (
+        [setup, recovery, artifacts] if platform == "win32" else [recovery, artifacts, setup]
+    )
+    fake_runner.restart.assert_called_once_with()
+    save_watchdog.assert_called_once_with(False)
+    errors.assert_called_once_with("Meridian restart failed", "restart failed", parent=parent)
+    fake_runner.stop.assert_called_once_with()
+    fake_icon.stop.assert_called_once_with()
+
+
+def test_run_tray_exposes_hosted_tunnel_enable_reconnect_disable_and_diagnostics(monkeypatch):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    fake_tunnel_runner = mock.MagicMock(command=None)
+    fake_tunnel_runner.status.return_value.child.state = mock.sentinel.not_running
+    fake_tunnel_runner.restart.side_effect = [ValueError("no prior tunnel command"), None]
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main, "_build_tunnel_runner", lambda: fake_tunnel_runner)
+    monkeypatch.setattr(tray_main, "_hosted_tunnel_status", lambda: {
+        "state": "connected",
+        "detail": "active",
+        "last_error": None,
+        "base_url": "https://usemeridian.us",
+        "diagnostics_url": "https://usemeridian.us/tunnel/diagnostics/tenant-123",
+    })
+    monkeypatch.setattr(tray_main, "_choose_project_root", mock.Mock(return_value="C:/work/project"))
+    monkeypatch.setattr(tray_main.webbrowser, "open", mock.Mock())
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.name = name
+            self.args = args
+
+        def start(self):
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+
+    def click_tunnel_actions(*_args):
+        callbacks = {
+            call.args[0]: call.args[1]
+            for call in fake_pystray.MenuItem.call_args_list
+            if isinstance(call.args[0], str)
+        }
+        for label in (
+            "Enable tunnel…", "Reconnect tunnel", "Disable tunnel",
+            "Open tunnel diagnostics", "Quit",
+        ):
+            callbacks[label](fake_icon, None)
+
+    fake_icon.run.side_effect = click_tunnel_actions
+    assert tray_main._run_tray() == 0
+
+    tray_main._choose_project_root.assert_called_once_with(
+        "Choose a local project to share through the Meridian tunnel", parent=None,
+    )
+    assert fake_tunnel_runner.command == [
+        sys.executable,
+        "-m",
+        "meridian.tunnel_main",
+        "--repo",
+        str(Path("C:/work/project").resolve()),
+    ]
+    fake_tunnel_runner.start.assert_called_once_with()
+    assert fake_tunnel_runner.restart.call_args_list == [
+        mock.call(reason="manual tunnel enable"),
+        mock.call(reason="manual tunnel reconnect"),
+    ]
+    fake_tunnel_runner.stop.assert_called_once_with()
+    tray_main.webbrowser.open.assert_any_call("https://usemeridian.us/tunnel/diagnostics/tenant-123")
+
+
+def test_run_tray_dispatches_enable_picker_after_runner_lock_is_released(monkeypatch):
+    fake_pystray, fake_icon = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    fake_tunnel_runner = mock.MagicMock(command=None)
+    fake_tunnel_runner.status.return_value.child.state = mock.sentinel.not_running
+
+    def no_saved_command(*, reason):
+        assert reason == "manual tunnel enable"
+        raise ValueError("no prior tunnel command")
+
+    fake_tunnel_runner.restart.side_effect = no_saved_command
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main, "_build_tunnel_runner", lambda: fake_tunnel_runner)
+    monkeypatch.setattr(tray_main, "_hosted_tunnel_status", lambda: {
+        "state": "unknown",
+        "detail": "not checked",
+        "last_error": None,
+        "base_url": "https://usemeridian.us",
+        "diagnostics_url": "https://usemeridian.us/tunnel/diagnostics/tenant-123",
+    })
+    monkeypatch.setattr(tray_main, "_choose_project_root", mock.Mock(return_value="C:/work/project"))
+    monkeypatch.setattr(tray_main.webbrowser, "open", mock.Mock())
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+
+    watchdogs = []
+    original_watchdog_init = tray_main._TunnelWatchdog.__init__
+
+    def capture_watchdog(watchdog, *args, **kwargs):
+        original_watchdog_init(watchdog, *args, **kwargs)
+        watchdogs.append(watchdog)
+
+    monkeypatch.setattr(tray_main._TunnelWatchdog, "__init__", capture_watchdog)
+    real_thread = tray_main.threading.Thread
+    asynchronous_ui_threads = []
+
+    class SplitThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.daemon = daemon
+            self.name = name
+            self.args = args
+
+        def start(self):
+            if self.name == "meridian-tunnel-watchdog":
+                return
+            if getattr(self.target, "__name__", None) == "_start":
+                # Keep runner work deterministic, while letting the UI dispatch
+                # itself run on a real asynchronous thread below.
+                self.target(*self.args)
+                return
+
+            assert watchdogs
+            assert not watchdogs[0]._runner_operation_lock.locked(), (
+                "UI picker callback was launched while a runner operation held its lock"
+            )
+            thread = real_thread(
+                target=self.target,
+                args=self.args,
+                daemon=self.daemon,
+                name=self.name,
+            )
+            asynchronous_ui_threads.append(thread)
+            thread.start()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", SplitThread)
+
+    def click_enable(*_args):
+        callbacks = {
+            call.args[0]: call.args[1]
+            for call in fake_pystray.MenuItem.call_args_list
+            if isinstance(call.args[0], str)
+        }
+        callbacks["Enable tunnel…"](fake_icon, None)
+
+    fake_icon.run.side_effect = click_enable
+    assert tray_main._run_tray() == 0
+
+    for thread in asynchronous_ui_threads:
+        thread.join(3)
+        assert not thread.is_alive(), "asynchronous UI picker callback did not finish"
+
+    tray_main._choose_project_root.assert_called_once_with(
+        "Choose a local project to share through the Meridian tunnel", parent=None,
+    )
+    fake_tunnel_runner.restart.assert_called_once_with(reason="manual tunnel enable")
+    fake_tunnel_runner.start.assert_called_once_with()
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_tunnel_command_uses_the_supervised_entrypoint(monkeypatch, tmp_path, frozen):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(tray_main.sys, "frozen", frozen, raising=False)
+    command = tray_main._tunnel_command(str(project))
+    prefix = [sys.executable, "--run-tunnel"] if frozen else [
+        sys.executable, "-m", "meridian.tunnel_main",
+    ]
+    assert command == [*prefix, "--repo", str(project.resolve())]
+
+
+@pytest.mark.parametrize(
+    ("argv", "forwarded"),
+    [
+        (["--run-tunnel", "--repo", "C:/work/project"], ["--repo", "C:/work/project"]),
+        (["--_tunnel-child", "--repo", "C:/work/project"], ["--_tunnel-child", "--repo", "C:/work/project"]),
+    ],
+)
+def test_frozen_tunnel_flags_dispatch_to_tunnel_main(monkeypatch, argv, forwarded):
+    from types import SimpleNamespace
+
+    tunnel_main = mock.Mock(return_value=7)
+    monkeypatch.setitem(sys.modules, "meridian.tunnel_main", SimpleNamespace(main=tunnel_main))
+    assert tray_main.main(argv) == 7
+    tunnel_main.assert_called_once_with(forwarded)
+
+
+def test_tk_ui_dispatcher_keeps_rescheduling_after_callback_error():
+    root = mock.MagicMock()
+    dispatcher = tray_main._TkUiDispatcher(root)
+    failing = mock.Mock(side_effect=RuntimeError("menu action failed"))
+    following = mock.Mock()
+    dispatcher.submit(failing)
+    dispatcher.submit(following)
+
+    first_tick = root.after.call_args.args[1]
+    with pytest.raises(RuntimeError, match="menu action failed"):
+        first_tick()
+
+    second_tick = root.after.call_args.args[1]
+    second_tick()
+    failing.assert_called_once()
+    following.assert_called_once()
+
+
+def test_local_cli_command_uses_the_tray_executable_when_frozen(monkeypatch):
+    monkeypatch.setattr(tray_main.sys, "executable", "C:/Meridian/meridian-tray.exe")
+    monkeypatch.setattr(tray_main.sys, "frozen", True, raising=False)
+
+    assert tray_main._local_cli_command("recovery", "catalog") == [
+        "C:/Meridian/meridian-tray.exe", "recovery", "catalog",
+    ]
+
+
+def test_local_cli_command_uses_current_python_in_source_mode(monkeypatch):
+    monkeypatch.setattr(tray_main.sys, "executable", "C:/Python/python.exe")
+    monkeypatch.setattr(tray_main.sys, "frozen", False, raising=False)
+
+    assert tray_main._local_cli_command("doctor", "--repo", "C:/work/project") == [
+        "C:/Python/python.exe", "-m", "meridian", "doctor", "--repo", "C:/work/project",
+    ]
+
+
+def test_launch_local_cli_uses_a_visible_windows_console(monkeypatch):
+    popen = mock.Mock()
+    monkeypatch.setattr(tray_main.subprocess, "Popen", popen)
+    monkeypatch.setattr(tray_main.sys, "platform", "win32")
+    monkeypatch.setattr(tray_main.subprocess, "CREATE_NEW_CONSOLE", 0x10, raising=False)
+    monkeypatch.setattr(tray_main, "_local_cli_command", lambda *args: ["meridian", *args])
+
+    tray_main._launch_local_cli("recovery", "catalog")
+
+    popen.assert_called_once_with(
+        ["meridian", "recovery", "catalog"], cwd=None, creationflags=0x10,
+    )
+
+
+def test_choose_project_root_returns_the_selected_local_path(monkeypatch):
+    fake_tkinter = mock.MagicMock()
+    fake_filedialog = mock.MagicMock()
+    fake_tkinter.Tk.return_value = mock.MagicMock()
+    fake_tkinter.filedialog = fake_filedialog
+    fake_filedialog.askdirectory.return_value = "C:/work/project"
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    assert tray_main._choose_project_root("Choose project") == "C:/work/project"
+    fake_filedialog.askdirectory.assert_called_once_with(
+        parent=fake_tkinter.Tk.return_value, title="Choose project", mustexist=True,
+    )
+    fake_tkinter.Tk.return_value.destroy.assert_called_once_with()
+
+
+def test_choose_tex_file_filters_tex_sources_and_supports_cancel(monkeypatch):
+    fake_tkinter = mock.MagicMock()
+    fake_filedialog = mock.MagicMock()
+    fake_tkinter.filedialog = fake_filedialog
+    fake_filedialog.askopenfilename.side_effect = ["C:/papers/draft paper.tex", ""]
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    assert tray_main._choose_tex_file("Choose source") == "C:/papers/draft paper.tex"
+    assert tray_main._choose_tex_file("Choose source") is None
+    assert fake_filedialog.askopenfilename.call_args_list == [
+        mock.call(
+            parent=fake_tkinter.Tk.return_value,
+            title="Choose source",
+            filetypes=(("LaTeX source files", "*.tex"), ("All files", "*.*")),
+        ),
+        mock.call(
+            parent=fake_tkinter.Tk.return_value,
+            title="Choose source",
+            filetypes=(("LaTeX source files", "*.tex"), ("All files", "*.*")),
+        ),
+    ]
+    assert fake_tkinter.Tk.return_value.destroy.call_count == 2
+
+
+def test_choose_tex_file_rejects_non_tex_selection(monkeypatch):
+    import pytest
+
+    fake_tkinter = mock.MagicMock()
+    fake_filedialog = mock.MagicMock()
+    fake_tkinter.filedialog = fake_filedialog
+    fake_filedialog.askopenfilename.return_value = "C:/papers/references.bib"
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    with pytest.raises(ValueError, match="Choose a .tex source file"):
+        tray_main._choose_tex_file("Choose source")
+
+
+def test_choose_overleaf_project_id_validates_trims_and_distinguishes_blank_from_cancel(monkeypatch):
+    import pytest
+
+    fake_tkinter = mock.MagicMock()
+    fake_dialog = mock.MagicMock()
+    fake_tkinter.simpledialog = fake_dialog
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    parent = mock.MagicMock()
+    fake_dialog.askstring.side_effect = [" project_123 ", "   ", None]
+
+    assert tray_main._choose_overleaf_project_id(parent=parent) == "project_123"
+    assert tray_main._choose_overleaf_project_id(parent=parent) == ""
+    assert tray_main._choose_overleaf_project_id(parent=parent) is None
+    assert fake_dialog.askstring.call_count == 3
+    assert all(call.kwargs["parent"] is parent for call in fake_dialog.askstring.call_args_list)
+    assert "Leave blank to compile without linking" in fake_dialog.askstring.call_args.args[1]
+    assert "Cancel to cancel the compile" in fake_dialog.askstring.call_args.args[1]
+
+    fake_dialog.askstring.side_effect = None
+    fake_dialog.askstring.return_value = "../invalid"
+    with pytest.raises(ValueError, match="valid Overleaf project ID"):
+        tray_main._choose_overleaf_project_id(parent=parent)
+
+
+def test_meridian_latex_cli_command_resolves_external_node_and_windows_npm_shim(monkeypatch, tmp_path):
+    import shutil
+    from pathlib import Path
+
+    checkout = tmp_path / "source checkout"
+    (checkout / "meridian").mkdir(parents=True)
+    monkeypatch.setattr(tray_main, "__file__", str(checkout / "meridian" / "tray_main.py"))
+    monkeypatch.setattr(tray_main.sys, "frozen", False, raising=False)
+    fake_home = tmp_path / "isolated home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    for key in ("NPM_CONFIG_PREFIX", "npm_config_prefix", "APPDATA", "NODE_PATH"):
+        monkeypatch.delenv(key, raising=False)
+
+    npm_prefix = tmp_path / "custom npm prefix"
+    shim = npm_prefix / "meridian-latex.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("npm cmd shim is only a locator", encoding="utf-8")
+    cli = npm_prefix / "node_modules" / "@meridianmcp" / "mcp" / "latex" / "cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    node = tmp_path / "Node Runtime" / "node.exe"
+
+    def which(name):
+        if name == "node":
+            return str(node)
+        if name in {"meridian-latex", "meridian-latex.cmd"}:
+            return str(shim)
+        return None
+
+    monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(tray_main.subprocess, "run", mock.Mock(return_value=mock.Mock(returncode=0, stdout="v22.12.0\n", stderr="")))
+    source = str(tmp_path / "paper path" / "draft paper & notes.tex")
+    expected = [str(node), str(cli.resolve()), "compile", source]
+
+    for frozen in (False, True):
+        monkeypatch.setattr(tray_main.sys, "frozen", frozen, raising=False)
+        assert tray_main._meridian_latex_cli_command("compile", source) == expected
+
+    assert tray_main.subprocess.run.call_args_list == [
+        mock.call([str(node), "--version"], capture_output=True, text=True, timeout=5, check=False, shell=False),
+        mock.call([str(node), "--version"], capture_output=True, text=True, timeout=5, check=False, shell=False),
+    ]
+
+
+def test_meridian_latex_cli_command_reports_missing_or_old_node(monkeypatch):
+    import pytest
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    with pytest.raises(FileNotFoundError, match="Node.js 22 or newer"):
+        tray_main._meridian_latex_cli_command("compile", "draft.tex")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "C:/node.exe" if name == "node" else None)
+    monkeypatch.setattr(tray_main.subprocess, "run", mock.Mock(return_value=mock.Mock(returncode=0, stdout="v20.11.0\n", stderr="")))
+    with pytest.raises(FileNotFoundError, match="found v20.11.0"):
+        tray_main._meridian_latex_cli_command("compile", "draft.tex")
+
+
+def test_frozen_tray_missing_cli_message_only_offers_global_install(monkeypatch, tmp_path):
+    import shutil
+    from pathlib import Path
+
+    node = tmp_path / "Node Runtime" / "node.exe"
+    monkeypatch.setattr(shutil, "which", lambda name: str(node) if name == "node" else None)
+    monkeypatch.setattr(tray_main.subprocess, "run", mock.Mock(return_value=mock.Mock(returncode=0, stdout="v22.12.0\n", stderr="")))
+    monkeypatch.setattr(tray_main, "__file__", str(tmp_path / "tray" / "tray_main.py"))
+    monkeypatch.setattr(tray_main.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "isolated home")
+    for key in ("NPM_CONFIG_PREFIX", "npm_config_prefix", "APPDATA", "NODE_PATH"):
+        monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        tray_main._meridian_latex_cli_command("compile", "draft.tex")
+
+    assert "npm install -g @meridianmcp/mcp" in str(exc_info.value)
+    assert "npm run build" not in str(exc_info.value)
+
+
+def test_launch_meridian_latex_cli_uses_shell_free_argv_and_reports_missing_cli(monkeypatch):
+    tex_path = "C:/papers/draft paper & notes.tex"
+    command = ["C:/Node Runtime/node.exe", "C:/npm/latex/cli.js", "compile", tex_path]
+    resolver = mock.Mock(return_value=command)
+    popen = mock.Mock()
+    monkeypatch.setattr(tray_main, "_meridian_latex_cli_command", resolver)
+    monkeypatch.setattr(tray_main.subprocess, "Popen", popen)
+    monkeypatch.setattr(tray_main.sys, "platform", "linux")
+
+    tray_main._launch_meridian_latex_cli("compile", tex_path)
+
+    resolver.assert_called_once_with("compile", tex_path)
+    popen.assert_called_once_with(command, creationflags=0, shell=False)
+
+    parent = object()
+    error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_meridian_latex_cli_command", mock.Mock(side_effect=FileNotFoundError("install Node.js 22+")))
+    monkeypatch.setattr(tray_main, "_show_error_dialog", error)
+    tray_main._launch_meridian_latex_cli("compile", tex_path, parent=parent)
+    error.assert_called_once_with("Local LaTeX workflow unavailable", "install Node.js 22+", parent=parent)
+
+
+def test_choose_project_root_returns_none_when_dialog_is_cancelled(monkeypatch):
+    fake_tkinter = mock.MagicMock()
+    fake_filedialog = mock.MagicMock()
+    fake_tkinter.filedialog = fake_filedialog
+    fake_filedialog.askdirectory.return_value = ""
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    assert tray_main._choose_project_root("Choose project") is None
+    fake_tkinter.Tk.return_value.destroy.assert_called_once_with()
+
+
+def test_launch_local_cli_reports_process_start_failure(monkeypatch):
+    monkeypatch.setattr(tray_main, "_local_cli_command", lambda *args: ["missing", *args])
+    monkeypatch.setattr(tray_main.subprocess, "Popen", mock.Mock(side_effect=OSError("not found")))
+    show_error = mock.Mock()
+    monkeypatch.setattr(tray_main, "_show_error_dialog", show_error)
+
+    tray_main._launch_local_cli("doctor")
+
+    show_error.assert_called_once_with("Meridian local tool failed to open", "not found")
+
+
+def test_run_tray_exposes_local_workstation_tools(monkeypatch):
+    fake_pystray, fake_icon_instance = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+
+    assert tray_main._run_tray() == 0
+
+    labels = [call.args[0] for call in fake_pystray.MenuItem.call_args_list]
+    assert "Local workstation tools" in labels
+    assert "Set up a local project…" in labels
+    assert "Automatic tunnel recovery" in labels
+    assert "Check a local project…" in labels
+    assert "Compile a LaTeX file locally…" in labels
+    assert "Catalog local sessions" in labels
+    assert "Artifact capture commands" in labels
+    fake_icon_instance.run.assert_called_once()
+
+
+def test_local_project_setup_menu_uses_the_selected_root(monkeypatch):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+    monkeypatch.setattr(
+        tray_main, "_choose_project_root", lambda _title, parent=None: "C:/work/project",
+    )
+    choose_tex = mock.Mock(side_effect=["C:/papers/draft paper.tex", None])
+    monkeypatch.setattr(tray_main, "_choose_tex_file", choose_tex)
+    launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
+    latex_launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_meridian_latex_cli", latex_launch)
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.name = name
+            self.args = args
+
+        def start(self):
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+    tray_main._run_tray()
+    setup_item = next(
+        call for call in fake_pystray.MenuItem.call_args_list
+        if call.args[0] == "Set up a local project…"
+    )
+    setup_item.args[1](None, None)
+
+    launch.assert_called_once_with(
+        "setup", "--repo", "C:/work/project", cwd="C:/work/project",
+    )
+
+
+def test_local_tools_launch_check_recovery_and_artifact_commands(monkeypatch):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+    monkeypatch.setattr(
+        tray_main, "_choose_project_root", lambda _title, parent=None: "C:/work/project",
+    )
+    launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_local_cli", launch)
+    choose_tex = mock.Mock(side_effect=["C:/papers/draft paper.tex", None])
+    monkeypatch.setattr(tray_main, "_choose_tex_file", choose_tex)
+    monkeypatch.setattr(tray_main, "_choose_overleaf_project_id", lambda parent=None: "project_123")
+    latex_launch = mock.Mock()
+    monkeypatch.setattr(tray_main, "_launch_meridian_latex_cli", latex_launch)
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.name = name
+            self.args = args
+
+        def start(self):
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+    tray_main._run_tray()
+    callbacks = {
+        call.args[0]: call.args[1]
+        for call in fake_pystray.MenuItem.call_args_list
+    }
+    callbacks["Check a local project…"](None, None)
+    callbacks["Catalog local sessions"](None, None)
+    callbacks["Artifact capture commands"](None, None)
+    callbacks["Compile a LaTeX file locally…"](None, None)
+    callbacks["Compile a LaTeX file locally…"](None, None)
+
+    assert launch.call_args_list == [
+        mock.call("doctor", "--repo", "C:/work/project", cwd="C:/work/project"),
+        mock.call("recovery", "catalog"),
+        mock.call("artifacts", "--help"),
+    ]
+    assert choose_tex.call_count == 2
+    latex_launch.assert_called_once_with(
+        "compile", "C:/papers/draft paper.tex", "--project-id=project_123", parent=None,
+    )
+
+
+def test_local_project_menu_reports_picker_errors_without_stopping_tray(monkeypatch):
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+    monkeypatch.setattr(
+        tray_main, "_choose_project_root", mock.Mock(side_effect=RuntimeError("dialog unavailable")),
+    )
+    errors = []
+    monkeypatch.setattr(
+        tray_main, "_show_error_dialog",
+        lambda title, message, parent=None: errors.append((title, message)),
+    )
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.name = name
+            self.args = args
+
+        def start(self):
+            if self.name != "meridian-tunnel-watchdog":
+                self.target(*self.args)
+
+    monkeypatch.setattr(tray_main.threading, "Thread", ImmediateThread)
+    assert tray_main._run_tray() == 0
+    callbacks = {
+        call.args[0]: call.args[1]
+        for call in fake_pystray.MenuItem.call_args_list
+    }
+    callbacks["Set up a local project…"](None, None)
+    callbacks["Check a local project…"](None, None)
+
+    assert errors == [
+        ("Meridian project setup failed", "dialog unavailable"),
+        ("Meridian project check failed", "dialog unavailable"),
+    ]
+
+
 def test_run_server_flag_is_hidden_from_help(capsys):
     with pytest.raises(SystemExit):
         tray_main.main(["--help"])
@@ -549,11 +1476,139 @@ def test_show_status_dialog_reads_runner_status_without_raising(monkeypatch):
     status.warnings = ()
     runner.status.return_value = status
 
-    tray_main._show_status_dialog(runner)
+    tunnel_runner = mock.MagicMock()
+    tunnel_status = mock.MagicMock()
+    tunnel_status.child.state.value = "running"
+    tunnel_status.child.pid = 5678
+    tunnel_runner.status.return_value = tunnel_status
+    hosted_status = {
+        "state": "connected",
+        "detail": "Hosted diagnostics report an active tunnel.",
+        "last_error": "filesystem: previous proxy error",
+    }
+
+    tray_main._show_status_dialog(
+        runner,
+        tunnel_runner=tunnel_runner,
+        hosted_tunnel_status=hosted_status,
+    )
     assert fake_messagebox.showinfo.called
     title, message = fake_messagebox.showinfo.call_args[0][:2]
     assert "running" in message
     assert "1234" in message
+    assert "Hosted tunnel: connected" in message
+    assert "Tunnel supervisor: running" in message
+    assert "Last error: filesystem: previous proxy error" in message
+
+
+def test_hosted_tunnel_status_uses_the_authenticated_hosted_diagnostics(monkeypatch):
+    import json
+
+    from meridian import tunnel_client
+
+    monkeypatch.setattr(tunnel_client, "_resolve_base_url", lambda: "https://example.test")
+    monkeypatch.setattr(tunnel_client, "_resolve_token", lambda: "test-token")
+    monkeypatch.setattr(tunnel_client, "_read_cached_token", lambda _base_url: None)
+    payloads = iter([
+        {"tenant_id": "tenant-123"},
+        {
+            "tunnel_process": {"any_active": True},
+            "slots": {"filesystem": {"last_error": "proxy start failed"}},
+        },
+    ])
+    requests = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(request)
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(next(payloads)).encode("utf-8")
+        response.__enter__.return_value = response
+        return response
+
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", fake_urlopen)
+    result = tray_main._hosted_tunnel_status()
+
+    assert result["state"] == "connected"
+    assert result["last_error"] == "filesystem: proxy start failed"
+    assert result["diagnostics_url"] == "https://example.test/tunnel/diagnostics/tenant-123"
+    assert [request.full_url for request in requests] == [
+        "https://example.test/me",
+        "https://example.test/tunnel/diagnostics/tenant-123",
+    ]
+    assert all(request.get_header("Authorization") == "Bearer test-token" for request in requests)
+
+
+def test_hosted_tunnel_status_reports_missing_auth_without_network_calls(monkeypatch):
+    from meridian import tunnel_client
+
+    monkeypatch.setattr(tunnel_client, "_resolve_base_url", lambda: "https://example.test")
+    monkeypatch.setattr(tunnel_client, "_resolve_token", lambda: "")
+    monkeypatch.setattr(tunnel_client, "_read_cached_token", lambda _base_url: None)
+    network = mock.Mock(side_effect=AssertionError("must not contact hosted service without a token"))
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", network)
+
+    result = tray_main._hosted_tunnel_status()
+
+    assert result["state"] == "not signed in"
+    assert result["base_url"] == "https://example.test"
+    network.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    [
+        {},
+        {"tunnel_process": {}, "slots": {}},
+        {"tunnel_process": {"any_active": "false"}, "slots": {}},
+        {"slots": {"filesystem": {"process_active": "false"}}},
+    ],
+)
+def test_hosted_tunnel_status_is_unknown_without_valid_activity_evidence(monkeypatch, diagnostics):
+    import json
+
+    from meridian import tunnel_client
+
+    monkeypatch.setattr(tunnel_client, "_resolve_base_url", lambda: "https://example.test")
+    monkeypatch.setattr(tunnel_client, "_resolve_token", lambda: "test-token")
+    monkeypatch.setattr(tunnel_client, "_read_cached_token", lambda _base_url: None)
+    payloads = iter([{"tenant_id": "tenant-123"}, diagnostics])
+
+    def fake_urlopen(_request, *, timeout):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(next(payloads)).encode("utf-8")
+        response.__enter__.return_value = response
+        return response
+
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", fake_urlopen)
+
+    result = tray_main._hosted_tunnel_status()
+
+    assert result["state"] == "unknown"
+    assert "valid activity evidence" in result["detail"]
+
+
+def test_hosted_tunnel_status_accepts_complete_legacy_slot_activity(monkeypatch):
+    import json
+
+    from meridian import tunnel_client
+
+    monkeypatch.setattr(tunnel_client, "_resolve_base_url", lambda: "https://example.test")
+    monkeypatch.setattr(tunnel_client, "_resolve_token", lambda: "test-token")
+    monkeypatch.setattr(tunnel_client, "_read_cached_token", lambda _base_url: None)
+    payloads = iter([
+        {"tenant_id": "tenant-123"},
+        {"slots": {"filesystem": {"process_active": False}}},
+    ])
+
+    def fake_urlopen(_request, *, timeout):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(next(payloads)).encode("utf-8")
+        response.__enter__.return_value = response
+        return response
+
+    monkeypatch.setattr(tray_main.urllib.request, "urlopen", fake_urlopen)
+
+    assert tray_main._hosted_tunnel_status()["state"] == "disconnected"
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +1709,8 @@ def test_run_tray_does_not_auto_open_when_server_fails_to_start(monkeypatch):
     monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
     dialog_calls = []
     monkeypatch.setattr(
-        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+        tray_main, "_show_error_dialog",
+        lambda title, msg, parent=None: dialog_calls.append((title, msg))
     )
 
     rc = tray_main._run_tray()
@@ -681,7 +1737,8 @@ def test_run_tray_does_not_auto_open_on_cold_start_timeout(monkeypatch):
     monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
     dialog_calls = []
     monkeypatch.setattr(
-        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+        tray_main, "_show_error_dialog",
+        lambda title, msg, parent=None: dialog_calls.append((title, msg))
     )
 
     rc = tray_main._run_tray()
@@ -725,6 +1782,15 @@ def test_run_tray_opens_dashboard_when_local_mcp_not_configured(monkeypatch):
 
     assert rc == 0
     assert opened == [tray_main._dashboard_url()]
+
+
+def test_configure_zotero_flag_opens_setup_without_starting_tray(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tray_main, "run_zotero_setup_dialog", lambda: calls.append("setup"))
+    monkeypatch.setattr(tray_main, "_run_tray", lambda: pytest.fail("tray should not start"))
+
+    assert tray_main.main(["--configure-zotero"]) == 0
+    assert calls == ["setup"]
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1973,7 @@ class TestTraySpecPreShipConsistency:
             "pystray._win32",  # _run_tray()'s lazily-imported `import pystray`
             "PIL",  # _run_tray()'s lazily-imported `from PIL import Image`
             "PIL.Image",
+            "keyring.backends.macOS" if sys.platform == "darwin" else "keyring.backends.Windows",
         ],
     )
     def test_spec_hiddenimports_covers_tray_mains_real_dependencies(self, required_entry):
@@ -978,7 +2045,8 @@ def test_run_tray_does_not_auto_open_on_cold_start_timeout(monkeypatch):
     monkeypatch.setattr(tray_main.webbrowser, "open", opened.append)
     dialog_calls = []
     monkeypatch.setattr(
-        tray_main, "_show_error_dialog", lambda title, msg: dialog_calls.append((title, msg))
+        tray_main, "_show_error_dialog",
+        lambda title, msg, parent=None: dialog_calls.append((title, msg))
     )
 
     rc = tray_main._run_tray()
@@ -1022,3 +2090,332 @@ def test_run_tray_opens_dashboard_when_local_mcp_not_configured(monkeypatch):
 
     assert rc == 0
     assert opened == [tray_main._dashboard_url()]
+
+def test_tunnel_watchdog_requires_confirmed_failures_and_exposes_restart_reason():
+    now = [100.0]
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "No active tunnel socket"})
+    runner = mock.Mock()
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    watchdog.arm()
+
+    assert watchdog.tick() is None
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+    reason = watchdog.tick()
+
+    assert reason == "Hosted tunnel diagnostics reported disconnected: No active tunnel socket"
+    runner.restart.assert_called_once_with(reason=reason)
+    assert reason in watchdog.status_text
+
+
+def test_tunnel_watchdog_ignores_indeterminate_health_and_can_be_disabled():
+    probe = mock.Mock(return_value={"state": "unavailable", "detail": "hosted service unavailable"})
+    runner = mock.Mock()
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe)
+    watchdog.arm()
+
+    watchdog.tick()
+    watchdog.tick()
+    assert runner.restart.call_count == 0
+
+    watchdog.set_enabled(False)
+    probe.reset_mock()
+    probe.return_value = {"state": "disconnected", "detail": "no socket"}
+    watchdog.tick()
+    probe.assert_not_called()
+    assert watchdog.status_text == "disabled by user"
+
+
+def test_tunnel_watchdog_caps_restart_attempts_until_manual_rearm():
+    now = [0.0]
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "no active socket"})
+    runner = mock.Mock()
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    watchdog.arm()
+
+    for _ in range(len(tray_main._TUNNEL_WATCHDOG_BACKOFF_SECONDS)):
+        assert watchdog.tick() is None
+        now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+        reason = watchdog.tick()
+        assert reason is not None
+        now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+
+    assert runner.restart.call_count == len(tray_main._TUNNEL_WATCHDOG_BACKOFF_SECONDS)
+    assert watchdog.tick() is None
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+    paused = watchdog.tick()
+    assert paused is not None and "paused" in paused
+    assert runner.restart.call_count == len(tray_main._TUNNEL_WATCHDOG_BACKOFF_SECONDS)
+
+    watchdog.arm(reset_budget=True)
+    assert "paused" not in watchdog.status_text
+
+
+def test_tunnel_watchdog_preference_defaults_on_and_persists(tmp_path):
+    path = tmp_path / "preferences" / "tunnel-watchdog.json"
+
+    assert tray_main._load_tunnel_watchdog_enabled(path) is True
+    tray_main._save_tunnel_watchdog_enabled(False, path)
+    assert tray_main._load_tunnel_watchdog_enabled(path) is False
+    tray_main._save_tunnel_watchdog_enabled(True, path)
+    assert tray_main._load_tunnel_watchdog_enabled(path) is True
+
+
+def test_tunnel_watchdog_disable_supersedes_an_inflight_restart():
+    import threading
+
+    now = [100.0]
+    entered_restart = threading.Event()
+    release_restart = threading.Event()
+
+    def restart(*, reason):
+        entered_restart.set()
+        assert release_restart.wait(3), "test did not release the blocked restart"
+
+    runner = mock.Mock()
+    runner.restart.side_effect = restart
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "no active socket"})
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    watchdog.arm()
+    watchdog.tick()
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+
+    recovery = threading.Thread(target=watchdog.tick)
+    recovery.start()
+    try:
+        assert entered_restart.wait(2), "watchdog did not begin its recovery restart"
+        disarm_finished = threading.Event()
+
+        def disable_recovery():
+            watchdog.disarm()
+            disarm_finished.set()
+
+        disable = threading.Thread(target=disable_recovery)
+        disable.start()
+        assert disarm_finished.wait(1), "disarm blocked behind LocalRunner.restart"
+    finally:
+        release_restart.set()
+        recovery.join(3)
+        if "disable" in locals():
+            disable.join(3)
+
+    assert not recovery.is_alive()
+    assert not disable.is_alive()
+    runner.restart.assert_called_once()
+    runner.stop.assert_called_once_with()
+    assert "waiting for the tunnel to be enabled" in watchdog.status_text
+
+
+def test_tunnel_watchdog_restart_coalesces_with_pending_manual_reconnect():
+    import threading
+
+    now = [100.0]
+    entered_restart = threading.Event()
+    release_restart = threading.Event()
+    child_running = threading.Event()
+
+    def restart(*, reason):
+        entered_restart.set()
+        assert release_restart.wait(3), "test did not release the blocked restart"
+        child_running.set()
+
+    runner = mock.Mock()
+    runner.restart.side_effect = restart
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "no active socket"})
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    watchdog.arm()
+    watchdog.tick()
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+
+    recovery = threading.Thread(target=watchdog.tick)
+    recovery.start()
+    manual_action_started = threading.Event()
+    manual_action_entered = threading.Event()
+    reused_restart = []
+
+    try:
+        assert entered_restart.wait(2), "watchdog did not begin its recovery restart"
+        action_generation, starting_sequence = watchdog.begin_manual_action()
+
+        def manual_reconnect():
+            manual_action_started.set()
+
+            def run_manual_action():
+                manual_action_entered.set()
+                reused = watchdog.manual_action_can_reuse_restart(
+                    action_generation,
+                    starting_sequence,
+                    child_running=child_running.is_set(),
+                )
+                reused_restart.append(reused)
+                if not reused:
+                    runner.restart(reason="manual tunnel reconnect")
+                watchdog.finish_manual_action(
+                    action_generation, succeeded=True, reset_budget=True,
+                )
+
+            watchdog.serialize_runner_operation(run_manual_action)
+
+        manual = threading.Thread(target=manual_reconnect)
+        manual.start()
+        assert manual_action_started.wait(1)
+        assert not manual_action_entered.wait(0.1), "manual operation overlapped watchdog recovery"
+    finally:
+        release_restart.set()
+        recovery.join(3)
+        if "manual" in locals():
+            manual.join(3)
+
+    assert not recovery.is_alive()
+    assert not manual.is_alive()
+    assert reused_restart == [True]
+    runner.restart.assert_called_once()
+    runner.stop.assert_not_called()
+
+
+def test_queued_watchdog_restart_is_superseded_by_manual_reconnect():
+    import threading
+
+    class GatedRunnerOperationLock:
+        """Hold a queued watchdog request outside the lock until manual wins."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.watchdog_waiting = threading.Event()
+            self.allow_watchdog = threading.Event()
+            self.gate_timed_out = threading.Event()
+            self.acquisition_order = []
+
+        def __enter__(self):
+            name = threading.current_thread().name
+            if name == "queued-watchdog-tick":
+                self.watchdog_waiting.set()
+                if not self.allow_watchdog.wait(3):
+                    self.gate_timed_out.set()
+            self._lock.acquire()
+            self.acquisition_order.append(name)
+            return self
+
+        def __exit__(self, *_exc_info):
+            self._lock.release()
+
+    now = [100.0]
+    runner = mock.Mock()
+    probe = mock.Mock(return_value={"state": "disconnected", "detail": "no active socket"})
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=probe, clock=lambda: now[0])
+    operation_lock = GatedRunnerOperationLock()
+    watchdog._runner_operation_lock = operation_lock
+    watchdog.arm()
+    watchdog.tick()
+    now[0] += tray_main._TUNNEL_WATCHDOG_INTERVAL_SECONDS
+
+    tick_result = []
+    queued_tick = threading.Thread(
+        target=lambda: tick_result.append(watchdog.tick()),
+        name="queued-watchdog-tick",
+    )
+    queued_tick.start()
+    manual = None
+    try:
+        assert operation_lock.watchdog_waiting.wait(2), "watchdog did not queue its restart request"
+        action_generation, starting_sequence = watchdog.begin_manual_action()
+        manual_finished = threading.Event()
+
+        def run_manual_reconnect():
+            def restart_manually():
+                if not watchdog.manual_action_can_reuse_restart(
+                    action_generation,
+                    starting_sequence,
+                    child_running=False,
+                ):
+                    runner.restart(reason="manual tunnel reconnect")
+                watchdog.finish_manual_action(
+                    action_generation, succeeded=True, reset_budget=True,
+                )
+                manual_finished.set()
+
+            watchdog.serialize_runner_operation(restart_manually)
+
+        manual = threading.Thread(target=run_manual_reconnect, name="manual-reconnect")
+        manual.start()
+        assert manual_finished.wait(2), "manual reconnect did not acquire the runner lock first"
+        operation_lock.allow_watchdog.set()
+    finally:
+        operation_lock.allow_watchdog.set()
+        queued_tick.join(3)
+        if manual is not None:
+            manual.join(3)
+
+    assert not operation_lock.gate_timed_out.is_set()
+    assert not queued_tick.is_alive()
+    assert manual is not None and not manual.is_alive()
+    assert operation_lock.acquisition_order == ["manual-reconnect", "queued-watchdog-tick"]
+    assert tick_result == [None]
+    runner.restart.assert_called_once_with(reason="manual tunnel reconnect")
+
+
+def test_manual_action_during_slow_probe_discards_stale_disconnected_result():
+    import threading
+
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    probe_calls = [0]
+
+    def status_probe():
+        probe_calls[0] += 1
+        if probe_calls[0] == 2:
+            probe_started.set()
+            assert release_probe.wait(3), "test did not release the slow diagnostics probe"
+        return {"state": "disconnected", "detail": "stale no active socket"}
+
+    def restart(*, reason):
+        if reason == "manual tunnel reconnect":
+            raise RuntimeError("manual reconnect failed")
+
+    runner = mock.Mock()
+    runner.restart.side_effect = restart
+    watchdog = tray_main._TunnelWatchdog(runner, status_probe=status_probe)
+    watchdog.arm()
+    assert watchdog.tick() is None
+    assert watchdog._consecutive_failures == 1
+
+    tick_result = []
+    slow_tick = threading.Thread(target=lambda: tick_result.append(watchdog.tick()))
+    slow_tick.start()
+    manual = None
+    try:
+        assert probe_started.wait(2), "watchdog did not enter the slow diagnostics probe"
+        action_generation, starting_sequence = watchdog.begin_manual_action()
+        manual_finished = threading.Event()
+
+        def run_manual_reconnect():
+            def restart_manually():
+                assert not watchdog.manual_action_can_reuse_restart(
+                    action_generation,
+                    starting_sequence,
+                    child_running=False,
+                )
+                try:
+                    runner.restart(reason="manual tunnel reconnect")
+                except RuntimeError:
+                    watchdog.finish_manual_action(action_generation, succeeded=False)
+                else:
+                    watchdog.finish_manual_action(action_generation, succeeded=True)
+                finally:
+                    manual_finished.set()
+
+            watchdog.serialize_runner_operation(restart_manually)
+
+        manual = threading.Thread(target=run_manual_reconnect)
+        manual.start()
+        assert manual_finished.wait(2), "manual reconnect did not finish during the probe"
+    finally:
+        release_probe.set()
+        slow_tick.join(3)
+        if manual is not None:
+            manual.join(3)
+
+    assert not slow_tick.is_alive()
+    assert manual is not None and not manual.is_alive()
+    assert tick_result == [None]
+    assert watchdog._consecutive_failures == 1
+    runner.restart.assert_called_once_with(reason="manual tunnel reconnect")

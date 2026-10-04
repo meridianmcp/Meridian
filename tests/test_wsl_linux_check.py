@@ -25,39 +25,80 @@ from pathlib import Path
 
 import pytest
 
-_BASH = shutil.which("bash")
 _GIT = shutil.which("git")
 
+
+def _find_git_bash() -> str | None:
+    """Find Git for Windows' Bash without ever selecting the WSL launcher."""
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        return None
+
+    roots: list[Path] = []
+    try:
+        result = subprocess.run(
+            [git_executable, "--exec-path"], capture_output=True, text=True, check=True
+        )
+        # Git for Windows reports <root>/mingw64/libexec/git-core.
+        exec_path = Path(result.stdout.strip())
+        if len(exec_path.parents) >= 3:
+            roots.append(exec_path.parents[2])
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    # Also support Git for Windows layouts where --exec-path is unavailable or
+    # customized, deriving the installation root from cmd/git.exe or
+    # mingw64/bin/git.exe.
+    git_path = Path(git_executable)
+    for parent in git_path.parents:
+        if parent.name.casefold() in {"cmd", "mingw64", "bin"}:
+            roots.append(parent.parent)
+
+    seen: set[str] = set()
+    for root in roots:
+        root_key = str(root).casefold()
+        if root_key in seen:
+            continue
+        seen.add(root_key)
+        for relative in (Path("bin") / "bash.exe", Path("usr") / "bin" / "bash.exe"):
+            candidate = root / relative
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+if os.name == "nt":
+    # A bare bash.exe may resolve to %SystemRoot%\\System32\\bash.exe, which
+    # starts WSL and cannot consume the Windows script path used below. Locate
+    # Bash relative to the Git for Windows installation instead.
+    _BASH = _find_git_bash()
+else:
+    _BASH = shutil.which("bash")
+
+if _GIT is None:
+    _SKIP_REASON = "requires git on PATH"
+elif _BASH is None and os.name == "nt":
+    _SKIP_REASON = (
+        "requires Git for Windows Bash on Windows; the System32 bash.exe is "
+        "the WSL launcher and cannot run this Windows script path"
+    )
+elif _BASH is None:
+    _SKIP_REASON = "requires native bash on PATH"
+else:
+    _SKIP_REASON = None
+
 pytestmark = pytest.mark.skipif(
-    _BASH is None or _GIT is None,
-    reason="requires bash + git on PATH (present on CI's ubuntu-latest and "
-    "on dev machines with Git for Windows / WSL / native Linux installed)",
+    _SKIP_REASON is not None,
+    reason=_SKIP_REASON or "required shell tools are unavailable",
 )
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "wsl-linux-check.sh"
 # MSYS/Git-for-Windows bash's argv handling treats a backslash as an escape
 # character even in a plain filename argument, so a raw Windows-style path
 # (C:\Users\...) gets silently mangled into "C:Users..." (backslashes eaten)
-# before bash ever sees it. Forward slashes round-trip fine on both Windows
-# bash and real Linux/WSL bash, so use those for every path handed to `bash`.
+# before bash ever sees it. Forward slashes round-trip fine on Git Bash and
+# native Linux bash, so use those for every path handed to `bash`.
 _SCRIPT_POSIX = _SCRIPT.as_posix()
-
-# On Windows, a bare "bash" command resolves inconsistently: Windows'
-# CreateProcess (used by subprocess.run with a list/no shell) checks fixed
-# system directories -- including %SystemRoot%\System32, which on a machine
-# with the legacy WSL launcher installed contains its own bash.exe -- BEFORE
-# it ever consults the PATH environment variable, unlike shutil.which's
-# PATH-only search. Confirmed live 2026-09-24: shutil.which("bash") reported
-# Git for Windows' bash.EXE, but subprocess.run(["bash", ...]) actually
-# launched System32's bash.exe -> the DEFAULT WSL distro ("Ubuntu", the
-# daily-driver one) instead -- silently running against a totally different
-# machine/filesystem than intended, with real side effects (it cloned a real
-# checkout and ran a real `pixi install` in that distro's $HOME before this
-# was caught and cleaned up). Passing the fully-resolved bash path (from
-# shutil.which, which mirrors how a real `wsl.exe -d Ubuntu-20.04 -- bash
-# script.sh` invocation is unambiguous) avoids that ambiguity entirely for
-# these tests.
-
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(

@@ -13,9 +13,7 @@ free, MIT-licensed, no third-party dependencies for parsing (`python-docx` is
 ## Install
 
 ```bash
-uvx meridian-docs          # run without installing
-# or
-uv tool install meridian-docs
+uvx --from "git+https://github.com/meridianmcp/Meridian.git#subdirectory=extensions/meridian-docs" meridian-docs-mcp
 ```
 
 ## Tools
@@ -33,8 +31,9 @@ uv tool install meridian-docs
 
 Meridian's paid value-add is coordination + persistent memory. The document
 parser is genuinely useful on its own (e.g. mapping a thesis chapter's structure
-before reading it), so it's distributed free here. The Meridian `word` tunnel
-slot can default to `uvx meridian-docs`.
+before reading it), so it's distributed free here. The Meridian Docs tunnel can
+launch this package from a source checkout or install it from the canonical
+monorepo subdirectory shown above.
 
 ## License
 

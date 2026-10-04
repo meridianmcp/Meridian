@@ -84,14 +84,19 @@ import json
 import os
 import re
 import shutil
+import asyncio
+import hashlib
+import inspect
+import logging
 import tempfile
 import threading
 import time
 import uuid
-import hashlib
-import logging
+import weakref
 import zipfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Awaitable, Callable, Iterable
 
 from lxml import etree as _LET
@@ -100,6 +105,122 @@ from . import fallbacks
 from .zotero_client import resolve_citation_ref
 
 _log = logging.getLogger(__name__)
+
+
+class _AsyncReentrantLock:
+    """A task-reentrant gate for the connection-wide SQLite transaction state."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[Any] | None = None
+        self._depth = 0
+
+    async def __aenter__(self) -> "_AsyncReentrantLock":
+        task = asyncio.current_task()
+        if task is not None and task is self._owner:
+            self._depth += 1
+            return self
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+
+_SQLITE_DOC_STORE_LOCKS: weakref.WeakKeyDictionary[Any, _AsyncReentrantLock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _sqlite_doc_store_lock(db: Any) -> _AsyncReentrantLock:
+    """Return the one task gate shared by every store wrapper for this connection."""
+    lock = _SQLITE_DOC_STORE_LOCKS.get(db)
+    if lock is None:
+        lock = _AsyncReentrantLock()
+        _SQLITE_DOC_STORE_LOCKS[db] = lock
+    return lock
+
+
+def _is_postgres_connection(db: Any) -> bool:
+    return callable(getattr(db, "begin_transaction", None))
+
+
+def _serialize_sqlite_doc_store_methods(cls: type) -> type:
+    """Keep one cached aiosqlite connection's multi-statement calls task-atomic.
+
+    SQLite connection transactions are connection-wide, so a second handler
+    using the same cached connection could otherwise read an intermediate
+    document replacement or commit another handler's transaction. PostgreSQL
+    uses a pooled connection pinned per task and does not need this gate.
+    """
+    for name, method in tuple(cls.__dict__.items()):
+        if name == "resolve_zotero_edges" or not inspect.iscoroutinefunction(method):
+            # Resolve may await Zotero's local HTTP API for an arbitrary time;
+            # its DB phases call the separately gated store methods below.
+            continue
+
+        @wraps(method)
+        async def _serialized(
+            self: Any, *args: Any, __method: Any = method, **kwargs: Any
+        ) -> Any:
+            if _is_postgres_connection(self._db):
+                return await __method(self, *args, **kwargs)
+            async with _sqlite_doc_store_lock(self._db):
+                return await __method(self, *args, **kwargs)
+
+        setattr(cls, name, _serialized)
+    return cls
+
+
+@asynccontextmanager
+async def _doc_store_write_transaction(db: Any):
+    """Pin a write transaction and its lock across document/edge mutations."""
+    if _is_postgres_connection(db):
+        async with db.begin_transaction():
+            try:
+                yield
+                await db.commit()
+            except BaseException:
+                # PostgresConnection deliberately leaves a failed transaction
+                # pinned until the caller explicitly chooses rollback/commit.
+                try:
+                    await db.rollback()
+                except BaseException:  # noqa: BLE001 — preserve the original failure
+                    _log.exception("Failed to roll back document-store transaction")
+                raise
+        return
+
+    # All SQLite store methods share this lock, including reads and commits, so
+    # no other handler can observe or prematurely commit this transaction.
+    async with _sqlite_doc_store_lock(db):
+        nested = bool(getattr(db, "in_transaction", False))
+        savepoint = f"doc_store_{uuid.uuid4().hex}"
+        if nested:
+            await db.execute(f"SAVEPOINT {savepoint}")
+        else:
+            # Reserve SQLite's single writer before the first validation read.
+            await db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            if nested:
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                await db.commit()
+        except BaseException:
+            try:
+                if nested:
+                    await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    await db.rollback()
+            except BaseException:  # noqa: BLE001 — preserve the original failure
+                _log.exception("Failed to roll back document-store transaction")
+            raise
 
 # Cross-store resolve-through seam (d2a3537a): a callable that maps a figure's
 # ``file_path`` to its ``outputs_index`` row (or ``None`` when the path names no
@@ -2546,6 +2667,7 @@ def _table_similarity(a: str, b: str) -> float:
 # The store
 # ---------------------------------------------------------------------------
 
+@_serialize_sqlite_doc_store_methods
 class DocStructureStore:
     """Persistent, backend-agnostic store for parsed document structure.
 
@@ -2558,6 +2680,48 @@ class DocStructureStore:
 
     def __init__(self, db: Any) -> None:
         self._db = db
+
+    async def _lock_document_row(self, project_id: str, document_id: str) -> bool:
+        """Lock one document row on PostgreSQL; SQLite uses BEGIN IMMEDIATE."""
+        if not _is_postgres_connection(self._db):
+            return True
+        async with self._db.execute(
+            "SELECT id FROM doc_documents WHERE project_id = ? AND id = ? "
+            "FOR UPDATE",
+            (project_id, document_id),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def _fetch_and_lock_document_row(
+        self, project_id: str, source: str
+    ) -> dict[str, Any] | None:
+        """Serialize a source upsert, then re-read its row after locking it."""
+        source = source.strip() if isinstance(source, str) else source
+        if _is_postgres_connection(self._db):
+            # A row lock cannot serialize the first insert because no row
+            # exists yet. A transaction-scoped advisory lock on the natural
+            # key makes first insert, replacement, and delete mutually
+            # exclusive without serializing unrelated sources in a project.
+            lock_key = hashlib.sha256(
+                f"meridian.doc_documents.source\0{project_id}\0{source}".encode(
+                    "utf-8"
+                )
+            ).digest()[:8]
+            advisory_id = int.from_bytes(lock_key, byteorder="big", signed=True)
+            async with self._db.execute(
+                "SELECT pg_advisory_xact_lock(?)", (advisory_id,)
+            ) as cur:
+                await cur.fetchone()
+
+        existing = await self._fetch_document_row(project_id, source)
+        while existing is not None:
+            document_id = existing["id"]
+            locked = await self._lock_document_row(project_id, document_id)
+            latest = await self._fetch_document_row(project_id, source)
+            if locked and latest is not None and latest["id"] == document_id:
+                return latest
+            existing = latest
+        return None
 
     # -- schema --------------------------------------------------------------
 
@@ -2752,6 +2916,29 @@ class DocStructureStore:
         content_hash: str | None = None,
         link_status: str | None = None,
     ) -> dict[str, Any]:
+        """Store or replace one document under the Zotero writer lock."""
+        async with _doc_store_write_transaction(self._db):
+            return await self._put_document_in_transaction(
+                project_id,
+                doc_type,
+                elements,
+                source=source,
+                title=title,
+                content_hash=content_hash,
+                link_status=link_status,
+            )
+
+    async def _put_document_in_transaction(
+        self,
+        project_id: str,
+        doc_type: str,
+        elements: list[dict[str, Any]],
+        *,
+        source: str | None = None,
+        title: str | None = None,
+        content_hash: str | None = None,
+        link_status: str | None = None,
+    ) -> dict[str, Any]:
         """Store (or replace) a document's structure and return its doc dict.
 
         Upsert semantics: when ``source`` is resolvable and a document already
@@ -2775,20 +2962,19 @@ class DocStructureStore:
         PRESERVES the existing row's status rather than silently reverting a
         deprecated/independent doc back to live.
 
-        NB: the delete-then-reinsert upsert is NOT wrapped in a single
-        transaction — the shared adapter runs each ``execute`` on its own pooled
-        connection under autocommit (matching the ~140 existing call sites), so a
-        crash mid-upsert can leave a torn write. This is acceptable because
-        structure persistence is best-effort (all call sites guard it and never
-        surface a failure) and self-healing: the next ``ingest``/parse of the
-        same source re-derives and re-upserts the full structure.
+        The caller holds a transaction across the upsert. The parent
+        ``doc_documents`` row is locked before old edges/elements are removed,
+        serializing it with a concurrent Zotero resolution for the same marker.
         """
         src = source.strip() if isinstance(source, str) and source.strip() else None
         now = _now_iso()
         ordered = list(elements or [])
         ch = content_hash if content_hash is not None else compute_content_hash(ordered)
 
-        existing = await self._fetch_document_row(project_id, src) if src else None
+        existing = (
+            await self._fetch_and_lock_document_row(project_id, src)
+            if src else None
+        )
         if existing is not None:
             doc_id = existing["id"]
             created_at = existing.get("created_at") or now
@@ -2859,7 +3045,6 @@ class DocStructureStore:
         # store the fresh doc_id guarantees no pre-existing edges to collide with.
         await self._materialize_citation_edges(project_id, prepared, now)
 
-        await self._db.commit()
         stored = await self._fetch_document_row(project_id, src) if src else None
         if stored is not None:
             return stored
@@ -2878,7 +3063,7 @@ class DocStructureStore:
     # -- cross-document resolution (opt-in, network) -------------------------
 
     async def _citation_elements_needing_zotero(
-        self, project_id: str
+        self, project_id: str, *, max_items: int | None = None
     ) -> list[dict[str, Any]]:
         """Return this project's ``kind='citation'`` elements with a non-blank
         ``ref`` that do NOT already carry a resolved ``zotero_item`` edge.
@@ -2903,7 +3088,11 @@ class DocStructureStore:
             ") "
             "ORDER BY e.document_id ASC, e.ordinal ASC, e.id ASC"
         )
-        async with self._db.execute(sql, (project_id,)) as cur:
+        params: tuple[Any, ...] = (project_id,)
+        if isinstance(max_items, int) and not isinstance(max_items, bool) and max_items >= 0:
+            sql += " LIMIT ?"
+            params += (max_items,)
+        async with self._db.execute(sql, params) as cur:
             rows = await cur.fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -2916,6 +3105,21 @@ class DocStructureStore:
                 }
             )
         return out
+
+    async def get_pending_zotero_citations(
+        self, project_id: str, *, max_items: int = 100
+    ) -> dict[str, Any]:
+        """Return a bounded, deterministic page of unresolved citation markers."""
+        if not isinstance(max_items, int) or isinstance(max_items, bool) or max_items < 1:
+            raise ValueError("max_items must be a positive integer")
+        pending = await self._citation_elements_needing_zotero(
+            project_id, max_items=max_items + 1,
+        )
+        return {
+            "markers": pending[:max_items],
+            "has_more": len(pending) > max_items,
+            "max_items": max_items,
+        }
 
     async def _find_document_for_doi(
         self, project_id: str, doi: str, title: str | None
@@ -2973,6 +3177,126 @@ class DocStructureStore:
                 return doc_id
         return None
 
+    async def _zotero_edge_write_status(
+        self, project_id: str, element_id: str, expected_ref: str
+    ) -> str:
+        """Classify an idempotent Zotero edge insert that wrote no row."""
+        async with self._db.execute(
+            "SELECT e.ref AS current_ref "
+            "FROM doc_elements e "
+            "JOIN doc_documents d ON d.id = e.document_id "
+            "WHERE d.project_id = ? AND e.id = ? AND e.kind = 'citation'",
+            (project_id, element_id),
+        ) as cur:
+            marker = await cur.fetchone()
+        if marker is None or _row_get(marker, "current_ref") != expected_ref:
+            return "stale"
+
+        async with self._db.execute(
+            "SELECT 1 AS linked FROM doc_edges "
+            "WHERE project_id = ? AND source_element_id = ? "
+            "AND target_kind = 'zotero_item' LIMIT 1",
+            (project_id, element_id),
+        ) as cur:
+            linked = await cur.fetchone()
+        return "already_resolved" if linked is not None else "rejected"
+
+    async def _insert_zotero_edge_if_current(
+        self,
+        project_id: str,
+        element_id: str,
+        expected_ref: str,
+        target_ref: str,
+        target_document_id: str | None,
+    ) -> str:
+        """Serialize with document replacement and insert one current Zotero edge.
+
+        PostgreSQL locks the marker's parent document row before re-reading its
+        exact ref. SQLite begins an immediate transaction before the same check.
+        Document replacement/deletion takes the matching lock before edge
+        cleanup, so either ordering leaves no edge attached to a stale marker.
+        Stable ids and the legacy-edge predicate preserve idempotency/data.
+        """
+        edge_id = uuid.uuid5(
+            uuid.NAMESPACE_URL, f"meridian-zotero-edge:{project_id}:{element_id}"
+        ).hex
+        now = _now_iso()
+        postgres = _is_postgres_connection(self._db)
+        lock_parent_sql = (
+            "SELECT d.id FROM doc_documents d "
+            "JOIN doc_elements e ON e.document_id = d.id "
+            "WHERE d.project_id = ? AND e.id = ? AND e.kind = 'citation'"
+            + (" FOR UPDATE OF d" if postgres else "")
+        )
+        exact_marker_sql = (
+            "SELECT 1 AS current FROM doc_documents d "
+            "JOIN doc_elements e ON e.document_id = d.id "
+            "WHERE d.project_id = ? AND e.id = ? AND e.kind = 'citation' "
+            "AND e.ref = ?"
+        )
+        sql = (
+            "INSERT INTO doc_edges "
+            "(id, project_id, source_element_id, edge_kind, target_kind, "
+            "target_ref, target_element_id, target_document_id, "
+            "resolved_at, created_at) "
+            "SELECT ?, ?, e.id, 'cites', 'zotero_item', ?, NULL, ?, ?, ? "
+            "FROM doc_elements e "
+            "JOIN doc_documents d ON d.id = e.document_id "
+            "WHERE d.project_id = ? AND e.id = ? AND e.kind = 'citation' "
+            "AND e.ref = ? "
+            "AND NOT EXISTS (SELECT 1 FROM doc_edges existing "
+            "WHERE existing.project_id = ? "
+            "AND existing.source_element_id = e.id "
+            "AND existing.target_kind = 'zotero_item') "
+            "ON CONFLICT (id) DO NOTHING"
+        )
+        try:
+            async with _doc_store_write_transaction(self._db):
+                async with self._db.execute(
+                    lock_parent_sql, (project_id, element_id)
+                ) as cur:
+                    parent = await cur.fetchone()
+                if parent is None:
+                    return "stale"
+
+                # Re-read the marker after any PostgreSQL row-lock wait. The
+                # first SELECT only locates/locks the parent; it does not rely
+                # on its statement snapshot for the content/ref validation.
+                async with self._db.execute(
+                    exact_marker_sql, (project_id, element_id, expected_ref)
+                ) as cur:
+                    marker = await cur.fetchone()
+                if marker is None:
+                    return "stale"
+
+                params = (
+                    edge_id,
+                    project_id,
+                    target_ref,
+                    target_document_id,
+                    now,
+                    now,
+                    project_id,
+                    element_id,
+                    expected_ref,
+                    project_id,
+                )
+                async with self._db.execute(sql, params) as cur:
+                    inserted = cur.rowcount
+                if inserted == 1:
+                    return "applied"
+                return await self._zotero_edge_write_status(
+                    project_id, element_id, expected_ref,
+                )
+        except Exception:  # noqa: BLE001 — classify benign races, report other write failures
+            _log.debug(
+                "Zotero edge insert failed for element=%s", element_id,
+                exc_info=True,
+            )
+            return await self._zotero_edge_write_status(
+                project_id, element_id, expected_ref,
+            )
+
     async def resolve_zotero_edges(
         self,
         project_id: str,
@@ -3010,9 +3334,9 @@ class DocStructureStore:
 
         Returns ``{"resolved", "unresolved", "cross_doc_linked"}`` counts.
         """
-        pending = await self._citation_elements_needing_zotero(project_id)
-        if isinstance(max_items, int) and max_items >= 0:
-            pending = pending[:max_items]
+        pending = await self._citation_elements_needing_zotero(
+            project_id, max_items=max_items,
+        )
 
         resolved = 0
         unresolved = 0
@@ -3038,28 +3362,18 @@ class DocStructureStore:
                     target_document_id = await self._find_document_for_doi(
                         project_id, doi, item.get("title")
                     )
-                now = _now_iso()
-                await self._db.execute(
-                    "INSERT INTO doc_edges "
-                    "(id, project_id, source_element_id, edge_kind, target_kind, "
-                    "target_ref, target_element_id, target_document_id, "
-                    "resolved_at, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        uuid.uuid4().hex,
-                        project_id,
-                        el["id"],
-                        "cites",
-                        "zotero_item",
-                        target_ref,
-                        None,
-                        target_document_id,
-                        now,
-                        now,
-                    ),
+                state = await self._insert_zotero_edge_if_current(
+                    project_id,
+                    el["id"],
+                    str(ref),
+                    target_ref,
+                    target_document_id,
                 )
-                await self._db.commit()
-                resolved += 1
+                if state in {"applied", "already_resolved"}:
+                    resolved += 1
+                else:
+                    unresolved += 1
+                    continue
                 if target_document_id is not None:
                     cross_doc_linked += 1
             except Exception:  # noqa: BLE001 — a write failure skips this marker only
@@ -3073,6 +3387,149 @@ class DocStructureStore:
             "resolved": resolved,
             "unresolved": unresolved,
             "cross_doc_linked": cross_doc_linked,
+        }
+
+    async def apply_resolved_zotero_edges(
+        self,
+        project_id: str,
+        resolutions: list[dict[str, Any]],
+        *,
+        max_items: int = 500,
+    ) -> dict[str, int]:
+        """Apply local workstation resolutions to this project's markers.
+
+        Every result is rebound to a citation marker in ``project_id`` and its
+        exact current ``ref`` before a ``doc_edges`` row is written. The
+        workstation never receives a database handle; hosted callers provide
+        only the marker id/ref and normalized Zotero item identity.
+        """
+        if not isinstance(resolutions, list) or len(resolutions) > max_items:
+            raise ValueError(f"resolutions must contain at most {max_items} items")
+        if not resolutions:
+            return {
+                "applied": 0,
+                "cross_doc_linked": 0,
+                "stale": 0,
+                "already_resolved": 0,
+                "rejected": 0,
+            }
+
+        ids = list(dict.fromkeys(
+            value.get("element_id")
+            for value in resolutions
+            if isinstance(value, dict)
+            and isinstance(value.get("element_id"), str)
+            and value["element_id"].strip()
+        ))
+        if not ids:
+            return {
+                "applied": 0,
+                "cross_doc_linked": 0,
+                "stale": 0,
+                "already_resolved": 0,
+                "rejected": len(resolutions),
+            }
+
+        placeholders = ", ".join("?" for _ in ids)
+        marker_sql = (
+            "SELECT e.id AS id, e.ref AS ref "
+            "FROM doc_elements e "
+            "JOIN doc_documents d ON d.id = e.document_id "
+            f"WHERE d.project_id = ? AND e.kind = 'citation' AND e.id IN ({placeholders})"
+        )
+        async with self._db.execute(marker_sql, (project_id, *ids)) as cur:
+            marker_rows = await cur.fetchall()
+        markers = {
+            _row_get(row, "id"): _row_get(row, "ref")
+            for row in marker_rows
+        }
+
+        edge_sql = (
+            "SELECT source_element_id FROM doc_edges "
+            "WHERE project_id = ? AND target_kind = 'zotero_item' "
+            f"AND source_element_id IN ({placeholders})"
+        )
+        async with self._db.execute(edge_sql, (project_id, *ids)) as cur:
+            edge_rows = await cur.fetchall()
+        already_linked = {
+            _row_get(row, "source_element_id") for row in edge_rows
+        }
+
+        applied = cross_doc_linked = stale = already_resolved = rejected = 0
+        seen: set[str] = set()
+        for result in resolutions:
+            if not isinstance(result, dict):
+                rejected += 1
+                continue
+            element_id = result.get("element_id")
+            ref = result.get("ref")
+            key = result.get("zotero_key")
+            if (
+                not isinstance(element_id, str)
+                or not element_id.strip()
+                or element_id in seen
+                or not isinstance(ref, str)
+                or len(ref) > 500
+                or not isinstance(key, str)
+                or len(key) != 8
+                or not key.isalnum()
+            ):
+                rejected += 1
+                continue
+            seen.add(element_id)
+            current_ref = markers.get(element_id)
+            if current_ref is None or current_ref != ref:
+                stale += 1
+                continue
+            if element_id in already_linked:
+                already_resolved += 1
+                continue
+
+            doi_value = result.get("doi")
+            doi = doi_value.strip() if isinstance(doi_value, str) else ""
+            if len(doi) > 500 or (doi and not all(char.isprintable() for char in doi)):
+                rejected += 1
+                continue
+            doi = doi or None
+            title_value = result.get("title")
+            title = title_value.strip() if isinstance(title_value, str) else None
+            if title is not None and (len(title) > 1000 or not all(char.isprintable() for char in title)):
+                rejected += 1
+                continue
+            target_ref = doi if doi else f"zotero:{key}"
+            target_document_id: str | None = None
+            if doi:
+                target_document_id = await self._find_document_for_doi(
+                    project_id, doi, title
+                )
+            try:
+                state = await self._insert_zotero_edge_if_current(
+                    project_id, element_id, ref, target_ref, target_document_id,
+                )
+            except Exception:  # noqa: BLE001 — one marker must not abort a batch
+                _log.debug(
+                    "local Zotero edge write failed for element=%s", element_id,
+                    exc_info=True,
+                )
+                rejected += 1
+                continue
+            if state == "applied":
+                applied += 1
+                if target_document_id is not None:
+                    cross_doc_linked += 1
+            elif state == "already_resolved":
+                already_resolved += 1
+            elif state == "stale":
+                stale += 1
+            else:
+                rejected += 1
+
+        return {
+            "applied": applied,
+            "cross_doc_linked": cross_doc_linked,
+            "stale": stale,
+            "already_resolved": already_resolved,
+            "rejected": rejected,
         }
 
     # -- read ----------------------------------------------------------------
@@ -3313,7 +3770,13 @@ class DocStructureStore:
 
     async def delete_document(self, project_id: str, source: str) -> bool:
         """Delete a document (its elements + edges) by source. Return True if removed."""
-        doc = await self.get_document(project_id, source)
+        async with _doc_store_write_transaction(self._db):
+            return await self._delete_document_in_transaction(project_id, source)
+
+    async def _delete_document_in_transaction(
+        self, project_id: str, source: str
+    ) -> bool:
+        doc = await self._fetch_and_lock_document_row(project_id, source)
         if doc is None:
             return False
         # Drop edges FIRST (subquery over the still-present elements) so deleting a
@@ -3323,7 +3786,6 @@ class DocStructureStore:
         await self._db.execute(
             "DELETE FROM doc_documents WHERE id = ?", (doc["id"],)
         )
-        await self._db.commit()
         return True
 
     async def set_link_status(
