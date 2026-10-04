@@ -1485,7 +1485,9 @@ class CodeIndex:
     def _insert_chunks(self, con: Any, chunks: list[CodeChunk]) -> None:
         for c in chunks:
             con.execute(
-                "INSERT OR REPLACE INTO code_chunks VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO code_chunks "
+                "(chunk_id, path, language, kind, name, line_start, line_end, "
+                "content, content_hash) VALUES (?,?,?,?,?,?,?,?,?)",
                 [
                     c.chunk_id, c.path, c.language, c.kind, c.name,
                     c.line_start, c.line_end, c.content, c.content_hash,

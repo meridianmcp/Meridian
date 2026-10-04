@@ -777,6 +777,48 @@ def test_full_reindex_prunes_deleted_file_chunks(tmp_path):
         idx.close()
 
 
+def test_incremental_reindex_inserts_with_vss_embedding_column(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'oldembeddingmarker'\n")
+
+    class DisabledEmbedder:
+        model_name = "disabled-test-embedder"
+
+        @staticmethod
+        def available():
+            return False
+
+    idx = ci.CodeIndex(
+        str(root),
+        db_path=str(tmp_path / "cache.duckdb"),
+        embedder=DisabledEmbedder(),
+    )
+    try:
+        first = idx.reindex()
+        assert first["scan_complete"] is True
+        assert idx.search("oldembeddingmarker")
+
+        # VSS adds this nullable schema column to the persisted chunk table.
+        # Simulate that schema safely without depending on model/VSS availability.
+        con = idx._connect()
+        con.execute("ALTER TABLE code_chunks ADD COLUMN embedding FLOAT[2]")
+        _write(source, "def newmarker():\n    return 'newembeddingmarker'\n")
+
+        updated = idx.reindex()
+
+        assert updated["scan_complete"] is True
+        assert updated["rebuilt"] is True
+        assert idx.search("newembeddingmarker")
+        assert not idx.search("oldembeddingmarker")
+        embeddings = con.execute("SELECT embedding FROM code_chunks").fetchall()
+        assert embeddings
+        assert all(row[0] is None for row in embeddings)
+    finally:
+        idx.close()
+
+
 def test_bounded_git_path_reader_stops_at_entry_limit():
     import sys
     import time
