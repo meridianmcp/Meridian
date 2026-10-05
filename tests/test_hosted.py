@@ -534,6 +534,8 @@ async def test_create_neon_pool_project_omits_suspend_timeout(monkeypatch):
     seen: dict[str, object] = {}
 
     class FakeResponse:
+        is_success = True
+
         def raise_for_status(self):
             return None
 
@@ -556,12 +558,86 @@ async def test_create_neon_pool_project_omits_suspend_timeout(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda timeout=30: FakeClient())
+    monkeypatch.delenv("NEON_ORG_ID", raising=False)
 
     neon_project_id, conn_uri = await hosted_module._create_neon_pool_project("key", "free")
     assert neon_project_id == "neon-proj-1"
     assert conn_uri == "postgresql://tenant-db"
+    assert "org_id" not in seen["json"]["project"]
     endpoint_settings = seen["json"]["project"]["default_endpoint_settings"]
     assert "suspend_timeout_seconds" not in endpoint_settings
+
+
+@pytest.mark.asyncio
+async def test_create_neon_pool_project_includes_configured_org_id(monkeypatch):
+    import httpx
+
+    import meridian.hosted as hosted_module
+
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        is_success = True
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "project": {"id": "neon-proj-1"},
+                "connection_uris": [{"connection_uri": "postgresql://tenant-db"}],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, headers=None, json=None):
+            seen["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda timeout=30: FakeClient())
+    monkeypatch.setenv("NEON_ORG_ID", "org-standard-456")
+
+    await hosted_module._create_neon_pool_project("key", "free")
+
+    assert seen["json"]["project"]["org_id"] == "org-standard-456"
+
+
+@pytest.mark.asyncio
+async def test_create_neon_pool_project_reports_neon_validation_detail(monkeypatch):
+    import httpx
+
+    import meridian.hosted as hosted_module
+
+    class FakeResponse:
+        is_success = False
+        status_code = 400
+        text = '{"error":"org_id is required","echo":"api-secret"}'
+
+        def raise_for_status(self):
+            raise AssertionError("helper should include the provider response")
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, headers=None, json=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda timeout=30: FakeClient())
+    monkeypatch.delenv("NEON_ORG_ID", raising=False)
+
+    with pytest.raises(RuntimeError, match="org_id is required") as exc_info:
+        await hosted_module._create_neon_pool_project("api-secret", "free")
+
+    assert "api-secret" not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -585,6 +661,8 @@ async def test_create_neon_pool_project_nests_quota_under_settings(monkeypatch):
     seen: dict[str, object] = {}
 
     class FakeResponse:
+        is_success = True
+
         def raise_for_status(self):
             return None
 
@@ -607,9 +685,12 @@ async def test_create_neon_pool_project_nests_quota_under_settings(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda timeout=30: FakeClient())
 
+    monkeypatch.setenv("NEON_ORG_ID_PRO", "org-pro-123")
+    monkeypatch.setenv("NEON_ORG_ID", "org-standard-456")
     await hosted_module._create_neon_pool_project("key", "pro")
 
     project = seen["json"]["project"]
+    assert project["org_id"] == "org-pro-123"
     assert "quota" not in project, (
         "quota must NOT be a direct property of `project` -- Neon's API "
         "rejects it there with 400 Bad Request"
