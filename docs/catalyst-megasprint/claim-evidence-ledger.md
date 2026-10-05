@@ -1,6 +1,6 @@
 # CATALYST 01 — claim evidence ledger
 
-Companion: [planner evacuation, executor return, and bounded exploration contract](handoff-lifecycle-contract.md).
+Companion documents: [application review copy](application-review-copy.md), [human submission checklist](application-human-checklist.md), [criteria review](application-criteria-review.md), [demo rehearsal](demo-rehearsal.md), and [planner evacuation, executor return, and bounded exploration contract](handoff-lifecycle-contract.md).
 
 Reviewed 2026-10-05 against the application draft at
 `C:\Users\13144\Documents\dnabert-error-correction\CATALYST_GRANT_APPLICATION_DRAFT_2026-10-04.md`,
