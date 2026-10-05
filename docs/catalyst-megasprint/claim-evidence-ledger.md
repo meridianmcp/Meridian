@@ -1,5 +1,7 @@
 # CATALYST 01 — claim evidence ledger
 
+Companion: [planner evacuation, executor return, and bounded exploration contract](handoff-lifecycle-contract.md).
+
 Reviewed 2026-10-05 against the application draft at
 `C:\Users\13144\Documents\dnabert-error-correction\CATALYST_GRANT_APPLICATION_DRAFT_2026-10-04.md`,
 the Meridian `origin/dev` source at `f0c798ee`, the existing Catalyst criteria/demo reviews,
