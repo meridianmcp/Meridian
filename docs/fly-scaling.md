@@ -33,6 +33,18 @@ The atomic claim path (`claim_pool_project_slot`, item 38) guarantees the
 soft cap is never violated under concurrent signups. The hard cap is
 enforced by `check_capacity` raising before provisioning begins.
 
+### Neon API key scope
+
+When a personal Neon API key is used to create a new pool project, set
+`NEON_ORG_ID` to the organization that owns the Meridian pool projects. Neon
+requires this organization ID on the project-creation request for personal
+keys; organization-scoped API keys infer it automatically and can leave the
+setting unset. If Pro uses a different Neon organization, set
+`NEON_ORG_ID_PRO`; otherwise Pro falls back to `NEON_ORG_ID`. The ID is
+available from Neon’s `GET /users/me/organizations` API. Configure these as
+runtime environment variables (Fly secrets in hosted deployments), never in
+committed `.env` files.
+
 ## Load drill (item 38)
 
 `scripts/load_drill_signup.py` fires N concurrent signups at a preview
