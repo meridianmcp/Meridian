@@ -163,6 +163,63 @@ def test_local_project_creation_persists_across_server_restart(monkeypatch, tmp_
         )
 
 
+def test_local_mcp_project_creation_persists_across_server_restart(
+    monkeypatch, tmp_path
+):
+    """The local MCP create_project path must persist the same durable record."""
+    import importlib
+    import json
+
+    from fastapi.testclient import TestClient
+
+    db_path = tmp_path / "local-mcp-meridian.sqlite"
+    monkeypatch.setenv("MERIDIAN_DB", str(db_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_HOSTED", "0")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DOC_STORE_URL", ":memory:")
+
+    import meridian.server as server_module
+
+    server_module = importlib.reload(server_module)
+    with TestClient(server_module.app) as client:
+        async def create_local_token():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "local-mcp@example.com")
+            raw_token, _ = await db_module.create_api_token(db, tenant["id"])
+            return raw_token
+
+        raw_token = asyncio.run(create_local_token())
+        response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_project",
+                    "arguments": {"name": "Local MCP first project"},
+                },
+            },
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert response.status_code == 200, response.text
+        created = json.loads(response.json()["result"]["content"][0]["text"])
+        assert created["name"] == "Local MCP first project"
+
+    server_module = importlib.reload(server_module)
+    with TestClient(server_module.app) as client:
+        projects = client.get("/projects").json()
+        assert any(
+            project["id"] == created["id"]
+            and project["name"] == "Local MCP first project"
+            for project in projects
+        )
+
+
 def test_create_project_provisions_on_demand_for_unprovisioned_tenant(monkeypatch, tmp_path):
     """A tenant with no neon_project_id (e.g. an accepted workspace member whose
     OAuth-login background provisioning never ran) must self-heal on the one
