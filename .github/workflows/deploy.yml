@@ -268,10 +268,19 @@ jobs:
   #     push/dispatch, hotfix, or tag — a `workflow_run` event matches none of
   #     those. Exactly ONE prod deploy per promote: the main-ref dispatch.
   auto-promote:
+    # Provenance guard: `workflow_run.head_branch` is only a branch NAME. test.yml
+    # also runs on `pull_request` (to main), and a fork can open a PR from a branch
+    # that is literally called `dev`; without the two extra terms below that green
+    # fork run would satisfy the gate and this job would merge the fork's
+    # `head_sha` into main. Require the triggering run to be a `push` event whose
+    # head repository is THIS repository. The legitimate path (a push to this
+    # repo's dev branch -> test.yml success) satisfies both terms.
     if: >
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'dev'
+      github.event.workflow_run.head_branch == 'dev' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write
