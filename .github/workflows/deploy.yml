@@ -66,15 +66,15 @@ jobs:
     # suite; re-running it here would be wasteful and pointless. (427b7902)
     if: inputs.hotfix != 'yes' && github.event_name != 'workflow_run'
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.9.3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
         with:
           pixi-version: v0.79.0
           cache: true
       - run: pixi install
       - name: Cache Playwright browsers
         id: playwright-cache
-        uses: actions/cache@v4.2.3
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
@@ -98,15 +98,15 @@ jobs:
     # Skip on the workflow_run auto-promote event (test.yml already covers UX). (427b7902)
     if: github.event_name != 'workflow_run'
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.9.3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
         with:
           pixi-version: v0.79.0
           cache: true
       - run: pixi install
       - name: Cache Playwright browsers
         id: playwright-cache
-        uses: actions/cache@v4.2.3
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
@@ -131,8 +131,8 @@ jobs:
     if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master
       - name: Deploy to meridian-preview
         run: flyctl deploy --remote-only --config fly-preview.toml --build-arg MERIDIAN_GIT_SHA=$(git rev-parse --short=12 HEAD)
         env:
@@ -198,7 +198,7 @@ jobs:
       contents: write
       actions: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -268,16 +268,25 @@ jobs:
   #     push/dispatch, hotfix, or tag — a `workflow_run` event matches none of
   #     those. Exactly ONE prod deploy per promote: the main-ref dispatch.
   auto-promote:
+    # Provenance guard: `workflow_run.head_branch` is only a branch NAME. test.yml
+    # also runs on `pull_request` (to main), and a fork can open a PR from a branch
+    # that is literally called `dev`; without the two extra terms below that green
+    # fork run would satisfy the gate and this job would merge the fork's
+    # `head_sha` into main. Require the triggering run to be a `push` event whose
+    # head repository is THIS repository. The legitimate path (a push to this
+    # repo's dev branch -> test.yml success) satisfies both terms.
     if: >
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'dev'
+      github.event.workflow_run.head_branch == 'dev' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -373,8 +382,8 @@ jobs:
     outputs:
       deployed_version: ${{ steps.deploy.outputs.deployed_version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master
 
       - name: Record pre-deploy image
         id: pre_deploy
@@ -472,7 +481,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master
       # 4da86be7 -- `flyctl scale count 2 --region iad,ord` (a single combined
       # invocation) does NOT force redistribution when the app is already
       # concentrated in one region: confirmed live that with 7 existing iad
@@ -512,11 +521,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: prefix-dev/setup-pixi@v0.9.3
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
         with:
           pixi-version: v0.79.0
           cache: true

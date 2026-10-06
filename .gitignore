@@ -169,6 +169,9 @@ activemq-data/
 
 # Environments
 .env
+# Suffixed local env files (.env_prod, .env_test, ...) can hold live secrets.
+# .env.example and .env.local.example stay tracked: they do not match `.env_*`.
+.env_*
 .envrc
 .venv
 env/
@@ -307,8 +310,16 @@ extensions/claude-mcp/
 # Codex CLI local config - contains a live bearer token, never commit 
 .codex/config.toml 
  
-# Ephemeral scheduled-task lock file - runtime state, not source 
+# Ephemeral scheduled-task lock file - runtime state, not source
 .claude/scheduled_tasks.lock
+
+# Per-developer Claude Code permissions/overrides: carry local absolute paths and
+# machine-specific allow-lists, so they are never shared via the public repo.
+# (.claude/settings.json stays tracked: it registers the shared guard hooks.)
+.claude/settings.local.json
+
+# Cygwin/MSYS crash dumps (bash.exe.stackdump etc.) - local debugging output
+*.stackdump
 
 # Codex CLI worktrees/config -- keep out of code-intel indexes
 .codex/
