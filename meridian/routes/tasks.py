@@ -7,7 +7,7 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db
+from .._deps import _db, _require_project_in_scope
 from .. import db as db_module
 from ..models import ClaimTaskRequest, ClaimTaskResponse, Task, TaskCreate, TaskUpdate
 
@@ -185,6 +185,8 @@ async def release_task_endpoint(
 @router.post("/tasks", response_model=Task, status_code=201)
 async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
     """Append a task-log entry."""
+    # RT-TI-005 — the project is in the body, outside the /projects/{uuid} middleware.
+    await _require_project_in_scope(request, body.project_id)
     _req_db = await _db(request)
     project = await db_module.get_project(_req_db, body.project_id)
     if project is None:
@@ -208,6 +210,7 @@ async def patch_task(task_id: str, body: TaskUpdate, request: Request) -> dict[s
     existing = await db_module.get_task(await _db(request), task_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="task not found")
+    await _require_project_in_scope(request, existing["project_id"])  # RT-TI-005
     try:
         updated = await db_module.update_task(
             await _db(request), task_id,
@@ -224,6 +227,12 @@ async def patch_task(task_id: str, body: TaskUpdate, request: Request) -> dict[s
 async def delete_task_endpoint(task_id: str, request: Request) -> Response:
     """Hard-delete a task-log entry."""
     db = await _db(request)
+    # RT-TI-005 — /tasks/{id} is outside the /projects/{uuid} middleware: resolve
+    # the task's project and apply the scope rule. An unknown id stays a 204
+    # no-op, as before.
+    existing = await db_module.get_task(db, task_id)
+    if existing is not None:
+        await _require_project_in_scope(request, existing["project_id"])
     await db.execute("DELETE FROM task_log WHERE id = ?", (task_id,))
     await db.commit()
     return Response(status_code=204)

@@ -112,7 +112,7 @@ async def update_pinned_decision_endpoint(
         try:
             return await db_module.supersede_pinned_decision(
                 db, decision_id, new_title, new_body, body.get("category"),
-                priority=body.get("priority"),
+                priority=body.get("priority"), project_id=project_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -122,6 +122,7 @@ async def update_pinned_decision_endpoint(
         category=body.get("category"), status=body.get("status"),
         superseded_by=body.get("superseded_by"),
         priority=body.get("priority"),
+        project_id=project_id,  # RT-TI-004: the decision must belong to the URL's project
     )
     if result is None:
         raise HTTPException(status_code=404, detail="decision not found")
@@ -133,7 +134,9 @@ async def delete_pinned_decision_endpoint(
     project_id: str, decision_id: str, request: Request
 ) -> None:
     """Hard-delete a pinned decision. Use update (status=superseded) to archive instead."""
-    deleted = await db_module.delete_pinned_decision(await _db(request), decision_id)
+    deleted = await db_module.delete_pinned_decision(
+        await _db(request), decision_id, project_id=project_id,  # RT-TI-004
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="decision not found")
 

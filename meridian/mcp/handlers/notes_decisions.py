@@ -122,10 +122,13 @@ async def handle_update_decision(
     """MCP tool: update_decision."""
     new_title = args.get("new_title")
     new_body = args.get("new_body")
+    # RT-TI-004 — when the caller names a project, the decision must belong to it
+    # (a mismatch is answered like a missing decision).
+    _bound_pid = (args.get("project_id") or "").strip() or None
     if new_title and new_body:
         return await db_module.supersede_pinned_decision(
             db, args["decision_id"], new_title, new_body, args.get("category"),
-            priority=args.get("priority"),
+            priority=args.get("priority"), project_id=_bound_pid,
         )
     result = await db_module.update_pinned_decision(
         db, args["decision_id"],
@@ -137,6 +140,7 @@ async def handle_update_decision(
         priority=args.get("priority"),
         assumption=args.get("assumption"),
         assumption_status=args.get("assumption_status"),
+        project_id=_bound_pid,
     )
     if result is None:
         raise ValueError("decision not found")
@@ -195,7 +199,11 @@ async def handle_archive_decision(
     _mcp_tenant_id: Any,
 ) -> Any:
     """MCP tool: archive_decision."""
-    deleted = await db_module.delete_pinned_decision(db, args["decision_id"])
+    # RT-TI-004 — bind to the named project when one is given.
+    deleted = await db_module.delete_pinned_decision(
+        db, args["decision_id"],
+        project_id=(args.get("project_id") or "").strip() or None,
+    )
     if not deleted:
         raise ValueError("decision not found")
     return {"deleted": True, "decision_id": args["decision_id"]}
@@ -492,7 +500,15 @@ async def handle_delete_note(
     _mcp_tenant_id: Any,
 ) -> Any:
     """MCP tool: delete_note."""
-    ok = await db_module.delete_project_note(db, args["note_id"])
+    # RT-TI-003 — bind to the named project when one is given. A caller that names
+    # a project is asserting "this note is in it": when nothing was deleted that
+    # assertion failed, so refuse explicitly (the same answer whether the note
+    # lives in another project or does not exist). Callers that name no project
+    # keep the historical idempotent {"deleted": False}.
+    _bound_pid = (args.get("project_id") or "").strip() or None
+    ok = await db_module.delete_project_note(db, args["note_id"], project_id=_bound_pid)
+    if not ok and _bound_pid is not None:
+        raise ValueError("note not found")
     return {"deleted": ok}
 
 

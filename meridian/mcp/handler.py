@@ -7219,6 +7219,17 @@ _PROJECT_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
 )
 
+#: RT-TI-003/004 — tools that mutate a note or decision by its own id and whose
+#: schema carries no project_id. tool name -> (argument holding the object id,
+#: name of the db function that loads the object with its project_id). Used by
+#: _dispatch_mcp_tool to scope-check a project-scoped caller against the
+#: OBJECT's project instead of an argument the tool does not have.
+_SCOPED_OBJECT_ID_TOOLS: "dict[str, tuple[str, str]]" = {
+    "delete_note": ("note_id", "get_project_note"),
+    "update_decision": ("decision_id", "get_pinned_decision"),
+    "archive_decision": ("decision_id", "get_pinned_decision"),
+}
+
 
 async def _resolve_project_reference(
     db: Any,
@@ -7372,10 +7383,28 @@ async def _dispatch_mcp_tool(
     # that gate and then have this resolver silently swap in the out-of-scope
     # project. Same error shape/message as the pre-check gate so callers can't
     # distinguish which layer caught it.
+    # RT-TI-006 — never trust a caller-supplied scope list: drop it, then (for a
+    # scoped caller only) inject the real one for the discovery tools to filter on.
+    if name in ("list_projects", "get_project_by_name"):
+        args = {k: v for k, v in args.items() if k != "_scoped_project_ids"}
+        if scoped_project_ids is not None:
+            args = {**args, "_scoped_project_ids": list(scoped_project_ids)}
     if scoped_project_ids is not None:
         _final_pid = (args.get("project_id") or "").strip()
         if _final_pid and _final_pid not in scoped_project_ids:
             raise ValueError("project is outside your access scope")
+        # RT-TI-003/004 — tools that act on a note or decision BY ID alone carry
+        # no project_id in their schema, so the check above sees nothing to
+        # compare. For a project-scoped caller, look the object up and require
+        # its project to be in scope (same opaque error as the gate above).
+        _by_id = _SCOPED_OBJECT_ID_TOOLS.get(name)
+        if _by_id is not None:
+            _id_key, _lookup = _by_id
+            _obj_id = str(args.get(_id_key) or "").strip()
+            if _obj_id:
+                _obj = await getattr(db_module, _lookup)(db, _obj_id)
+                if _obj is not None and _obj.get("project_id") not in scoped_project_ids:
+                    raise ValueError("project is outside your access scope")
     _groups = (
         _handle_project_tools,
         _handle_task_tools,

@@ -609,7 +609,15 @@ async def handle_list_projects(
     _mcp_tenant_id: Any,
 ) -> Any:
     """MCP tool: list_projects."""
-    return await db_module.list_project_summaries(db)
+    projects = await db_module.list_project_summaries(db)
+    # RT-TI-006 — a project-scoped caller only discovers the projects in scope
+    # (the dispatcher injects the caller's scope; HTTP GET /projects filters the
+    # same way). Absent / None means the caller is not scoped.
+    scoped = args.get("_scoped_project_ids")
+    if scoped is not None:
+        allowed = set(scoped)
+        projects = [p for p in projects if p.get("id") in allowed]
+    return projects
 
 
 async def handle_get_project_by_name(
@@ -621,6 +629,11 @@ async def handle_get_project_by_name(
 ) -> Any:
     """MCP tool: get_project_by_name."""
     project = await db_module.get_project_by_name(db, args["name"])
+    # RT-TI-006 — an out-of-scope project is reported exactly like a missing one,
+    # so discovery by name cannot confirm that it exists.
+    scoped = args.get("_scoped_project_ids")
+    if project is not None and scoped is not None and project["id"] not in set(scoped):
+        project = None
     if project is None:
         raise ValueError(f"no project found matching '{args['name']}'")
     return {

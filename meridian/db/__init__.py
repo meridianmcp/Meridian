@@ -9170,9 +9170,14 @@ async def update_pinned_decision(
     priority: str | None = None,
     assumption: str | None = None,
     assumption_status: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Patch any combination of body / category / title / status / superseded_by /
     priority / assumption / assumption_status.
+
+    RT-TI-004 — ``project_id`` binds the decision to the project the caller
+    named; a decision owned by a different project is answered like a missing
+    one (``None``).
 
     Use ``status='superseded'`` + ``superseded_by=<new_id>`` to retire a
     decision while preserving the audit trail. Pass only the fields you
@@ -9187,6 +9192,8 @@ async def update_pinned_decision(
     from datetime import datetime, timezone
     existing = await get_pinned_decision(db, decision_id)
     if existing is None:
+        return None
+    if project_id is not None and existing.get("project_id") != project_id:
         return None
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     fields: dict[str, Any] = {}
@@ -9240,15 +9247,19 @@ async def supersede_pinned_decision(
     new_body: str,
     category: str | None = None,
     priority: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Atomic supersede: create a new active decision and mark the old as superseded.
 
     Returns the new decision row. The old row keeps the back-link via
     ``superseded_by`` so the dashboard can render the chain. The new row inherits
     the old decision's priority unless ``priority`` overrides it (366317e9).
+
+    RT-TI-004 — ``project_id`` binds the old decision to the project the caller
+    named (a mismatch raises the same "decision not found" as a missing id).
     """
     old = await get_pinned_decision(db, old_decision_id)
-    if old is None:
+    if old is None or (project_id is not None and old.get("project_id") != project_id):
         raise ValueError("decision not found")
     new = await pin_decision(
         db,
@@ -9277,12 +9288,22 @@ async def count_decisions(db: aiosqlite.Connection, project_id: str) -> int:
 
 
 async def delete_pinned_decision(
-    db: aiosqlite.Connection, decision_id: str
+    db: aiosqlite.Connection, decision_id: str, *, project_id: str | None = None
 ) -> bool:
-    """Hard-delete a pinned decision by id. Returns True if deleted, False if not found."""
-    cur = await db.execute(
-        "DELETE FROM decisions_pinned WHERE id = ?", (decision_id,)
-    )
+    """Hard-delete a pinned decision by id. Returns True if deleted, False if not found.
+
+    RT-TI-004 — with ``project_id`` the delete only matches a decision that
+    belongs to that project (a mismatch is answered like a missing decision).
+    """
+    if project_id is None:
+        cur = await db.execute(
+            "DELETE FROM decisions_pinned WHERE id = ?", (decision_id,)
+        )
+    else:
+        cur = await db.execute(
+            "DELETE FROM decisions_pinned WHERE id = ? AND project_id = ?",
+            (decision_id, project_id),
+        )
     await db.commit()
     return cur.rowcount > 0
 
@@ -10975,10 +10996,19 @@ async def update_project_note(
     body: str | None = None,
     tags: str | None = None,
     priority: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Patch any combination of title/body/tags/priority. Returns updated row."""
+    """Patch any combination of title/body/tags/priority. Returns updated row.
+
+    RT-TI-003 — ``project_id`` binds the note to the project the caller named:
+    a note that belongs to a different project is answered exactly like a
+    missing one (``None``). Omit it only for callers that already resolved the
+    note through their own project-scoped lookup.
+    """
     existing = await get_project_note(db, note_id)
     if existing is None:
+        return None
+    if project_id is not None and existing.get("project_id") != project_id:
         return None
     fields: dict[str, Any] = {}
     if title is not None:
@@ -11005,12 +11035,22 @@ async def update_project_note(
 
 
 async def delete_project_note(
-    db: aiosqlite.Connection, note_id: str
+    db: aiosqlite.Connection, note_id: str, *, project_id: str | None = None
 ) -> bool:
-    """Hard-delete a note. Returns True if a row was removed."""
-    async with db.execute(
-        "DELETE FROM project_notes WHERE id = ?", (note_id,)
-    ) as cur:
+    """Hard-delete a note. Returns True if a row was removed.
+
+    RT-TI-003 — with ``project_id`` the delete only matches a note that belongs
+    to that project, so naming one project while passing another project's note
+    id removes nothing (same answer as a missing note).
+    """
+    if project_id is None:
+        sql, params = "DELETE FROM project_notes WHERE id = ?", (note_id,)
+    else:
+        sql, params = (
+            "DELETE FROM project_notes WHERE id = ? AND project_id = ?",
+            (note_id, project_id),
+        )
+    async with db.execute(sql, params) as cur:
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
