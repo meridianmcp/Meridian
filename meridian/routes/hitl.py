@@ -6,23 +6,44 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from .. import _deps
 from .._deps import _db, _get_tenant_from_request
 from .. import db as db_module
+from .sessions import _deny_unless_in_scope
 
 router = APIRouter()
+
+# urgency order used by db.list_hitl_requests; reused when merging per-project lists.
+_URGENCY_RANK = {"blocking": 0, "high": 1}
 
 
 @router.get("/hitl")
 async def list_all_hitl(
     request: Request, status: str = "pending", limit: int = 50
 ) -> list[dict[str, Any]]:
-    """Pending HITL requests across all projects (top-level dashboard panel)."""
+    """Pending HITL requests across all projects (top-level dashboard panel).
+
+    RT-TI-005 (wave 2) — a project-scoped member only sees HITL requests of the
+    projects in their scope (pinned decision 6fe5210c). Owners, workspace-wide
+    members, self-hosted and demo callers see every project, as before.
+    """
+    db = await _db(request)
+    _status = status if status != "all" else None
+    scoped = await _deps._scoped_project_ids_for_request(request)
     try:
-        return await db_module.list_hitl_requests(
-            await _db(request), None,
-            status=status if status != "all" else None,
-            limit=limit,
-        )
+        if scoped is None:
+            return await db_module.list_hitl_requests(db, None, status=_status, limit=limit)
+        # One query per scoped project (a scope is a handful of ids), merged back
+        # into the same order the single query uses, so the LIMIT applies to the
+        # caller's own requests and not to rows that would be filtered out.
+        merged: list[dict[str, Any]] = []
+        for pid in dict.fromkeys(scoped):
+            merged.extend(
+                await db_module.list_hitl_requests(db, pid, status=_status, limit=limit)
+            )
+        merged.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        merged.sort(key=lambda r: _URGENCY_RANK.get(r.get("urgency"), 2))
+        return merged[:limit] if limit >= 0 else merged
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -91,9 +112,14 @@ async def create_hitl_endpoint(
 @router.get("/hitl/{request_id}")
 async def get_hitl_endpoint(request_id: str, request: Request) -> dict[str, Any]:
     """Single HITL request lookup — sessions poll this to get the answer."""
+    # RT-TI-005 (wave 2) — /hitl/{id} is outside the /projects/{uuid} middleware, so
+    # the request's own project decides whether a project-scoped caller may see it.
+    scoped = await _deps._scoped_project_ids_for_request(request)
     r = await db_module.get_hitl_request(await _db(request), request_id)
     if r is None:
+        _deny_unless_in_scope(scoped, None)  # scoped callers: same 403 as a foreign id
         raise HTTPException(status_code=404, detail="hitl request not found")
+    _deny_unless_in_scope(scoped, r.get("project_id"))
     return r
 
 
@@ -103,6 +129,14 @@ async def patch_hitl_endpoint(
 ) -> dict[str, Any]:
     """Answer or dismiss a HITL request."""
     db = await _db(request)
+    # RT-TI-005 (wave 2) — answering/dismissing applies side effects (an approved
+    # gate-override or md_section_update HITL acts on its own project), so a
+    # project-scoped caller must own the request's project BEFORE anything runs.
+    # Owners / self-hosted / demo callers resolve no scope and pay no extra SELECT.
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None:
+        existing = await db_module.get_hitl_request(db, request_id)
+        _deny_unless_in_scope(scoped, existing.get("project_id") if existing else None)
     action = (body.get("action") or "answer").lower()
     if action == "answer":
         answer = body.get("answer", "").strip()

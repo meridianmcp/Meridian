@@ -7,9 +7,11 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
+from .. import _deps
 from .._deps import _db, _require_project_in_scope
 from .. import db as db_module
 from ..models import ClaimTaskRequest, ClaimTaskResponse, Task, TaskCreate, TaskUpdate
+from .sessions import _deny_unless_in_scope
 
 router = APIRouter()
 
@@ -192,10 +194,15 @@ async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     async with _req_db.execute(
-        "SELECT id FROM sessions WHERE id = ?", (body.session_id,)
+        "SELECT id, project_id FROM sessions WHERE id = ?", (body.session_id,)
     ) as cur:
         row = await cur.fetchone()
-    if row is None:
+    # RT-TI-005 (wave 2) — the session must belong to the project the task is
+    # logged against. db.log_task touches that session (last_seen, run
+    # transcript) and publishes task_created, so a caller who passed its own
+    # in-scope project_id with a foreign session_id would otherwise write into
+    # another project's session. A mismatch is answered like a missing session.
+    if row is None or row["project_id"] != body.project_id:
         raise HTTPException(status_code=404, detail="session not found")
     return await db_module.log_task(
         _req_db, body.session_id, body.project_id,
@@ -207,10 +214,12 @@ async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
 @router.patch("/tasks/{task_id}", response_model=Task)
 async def patch_task(task_id: str, body: TaskUpdate, request: Request) -> dict[str, Any]:
     """Update a task's status and/or description in place."""
+    scoped = await _deps._scoped_project_ids_for_request(request)  # H7: scope first
     existing = await db_module.get_task(await _db(request), task_id)
     if existing is None:
+        _deny_unless_in_scope(scoped, None)  # scoped callers: same 403 as a foreign id
         raise HTTPException(status_code=404, detail="task not found")
-    await _require_project_in_scope(request, existing["project_id"])  # RT-TI-005
+    _deny_unless_in_scope(scoped, existing["project_id"])  # RT-TI-005
     try:
         updated = await db_module.update_task(
             await _db(request), task_id,
@@ -228,11 +237,14 @@ async def delete_task_endpoint(task_id: str, request: Request) -> Response:
     """Hard-delete a task-log entry."""
     db = await _db(request)
     # RT-TI-005 — /tasks/{id} is outside the /projects/{uuid} middleware: resolve
-    # the task's project and apply the scope rule. An unknown id stays a 204
-    # no-op, as before.
-    existing = await db_module.get_task(db, task_id)
-    if existing is not None:
-        await _require_project_in_scope(request, existing["project_id"])
+    # the task's project and apply the scope rule. H7 — the scope is resolved
+    # FIRST and the task is only loaded for a project-scoped caller (the delete
+    # needs no row otherwise). For an unscoped caller an unknown id stays a 204
+    # no-op, as before; a scoped caller gets the same 403 for unknown and foreign.
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None:
+        existing = await db_module.get_task(db, task_id)
+        _deny_unless_in_scope(scoped, existing["project_id"] if existing is not None else None)
     await db.execute("DELETE FROM task_log WHERE id = ?", (task_id,))
     await db.commit()
     return Response(status_code=204)

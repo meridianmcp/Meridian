@@ -19,6 +19,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from .. import _deps
 from .._deps import _db
 from .. import db as db_module
 from .. import profile_contract as profile_contract_module
@@ -26,17 +27,67 @@ from .. import profile_contract as profile_contract_module
 router = APIRouter()
 
 
+def _is_project_layer(scope_type: Any) -> bool:
+    """True when ``scope_type`` names the ``project`` layer.
+
+    Normalised exactly like ``profile_contract.normalize_scope_type`` (strip +
+    lowercase) so ``"PROJECT"`` or ``" project "`` cannot slip past the scope
+    check and still be stored as the project layer.
+    """
+    return isinstance(scope_type, str) and scope_type.strip().lower() == "project"
+
+
+async def _require_layer_scopes_in_scope(
+    request: Request, *layers: "tuple[Any, Any]"
+) -> None:
+    """RT-TI-005 (wave 2) — a ``project`` profile layer is keyed by a project id.
+
+    ``/profile-layers/...`` is top-level (outside the /projects/{uuid}
+    middleware), so a project-scoped workspace member could otherwise read,
+    overwrite, reset or clone another project's executor/capability profile by
+    naming its id (pinned decision 6fe5210c). Every ``(scope_type, scope_id)``
+    pair that is a project layer must be inside the caller's scope (403, same
+    message as the middleware). Other scope types (hosted_default, workspace,
+    user, session) are not project-keyed and are left unchanged — whether a
+    project-scoped member may touch them is an open product question.
+
+    The scope is only resolved when a project layer is involved, so the other
+    layer types and every unscoped caller pay nothing extra.
+    """
+    project_ids = [
+        str(sid).strip() for stype, sid in layers if _is_project_layer(stype) and str(sid).strip()
+    ]
+    if not project_ids:
+        return
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None and any(pid not in scoped for pid in project_ids):
+        raise HTTPException(status_code=403, detail="Project is outside your access scope.")
+
+
 @router.get("/profile-layers")
 async def list_profile_layers_route(
     request: Request, scope_type: str | None = None
 ) -> list[dict[str, Any]]:
     """List every persisted profile_layers row, optionally filtered by
-    ``scope_type``. Mirrors the ``list_profile_layers`` MCP tool."""
+    ``scope_type``. Mirrors the ``list_profile_layers`` MCP tool.
+
+    RT-TI-005 (wave 2) — for a project-scoped caller the ``project`` layers of
+    projects outside their scope are dropped (the other layer types are not
+    project-keyed and are returned as before).
+    """
     db = await _db(request)
     try:
-        return await db_module.list_profile_layers(db, scope_type)
+        rows = await db_module.list_profile_layers(db, scope_type)
     except (profile_contract_module.ProfileContractError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None:
+        allowed = set(scoped)
+        rows = [
+            r for r in rows
+            if not _is_project_layer(r.get("scope_type")) or r.get("scope_id") in allowed
+        ]
+    return rows
 
 
 @router.get("/profile-layers/{scope_id}/revisions")
@@ -75,6 +126,7 @@ async def get_profile_layer_route(
         raise HTTPException(status_code=400, detail="scope_type is required")
     if not scope_id.strip():
         raise HTTPException(status_code=400, detail="scope_id is required")
+    await _require_layer_scopes_in_scope(request, (scope_type, scope_id))  # RT-TI-005
     db = await _db(request)
     try:
         return await db_module.get_profile_layer(db, scope_type, scope_id)
@@ -96,6 +148,7 @@ async def save_profile_layer_route(
         raise HTTPException(status_code=400, detail="scope_type is required")
     if not scope_id.strip():
         raise HTTPException(status_code=400, detail="scope_id is required")
+    await _require_layer_scopes_in_scope(request, (scope_type, scope_id))  # RT-TI-005
     db = await _db(request)
     try:
         return await db_module.set_profile_layer(
@@ -128,6 +181,7 @@ async def reset_profile_layer_route(
         raise HTTPException(status_code=400, detail="scope_type is required")
     if not scope_id.strip():
         raise HTTPException(status_code=400, detail="scope_id is required")
+    await _require_layer_scopes_in_scope(request, (scope_type, scope_id))  # RT-TI-005
     db = await _db(request)
     try:
         return await db_module.reset_profile_layer(db, scope_type, scope_id)
@@ -154,6 +208,11 @@ async def clone_profile_layer_route(
         raise HTTPException(status_code=400, detail="target_scope_type is required")
     if not target_scope_id:
         raise HTTPException(status_code=400, detail="target_scope_id is required")
+    # RT-TI-005 — both ends of a clone: reading another project's layer (source)
+    # and overwriting another project's layer (target) are each refused.
+    await _require_layer_scopes_in_scope(
+        request, (scope_type, scope_id), (target_scope_type, target_scope_id)
+    )
     db = await _db(request)
     try:
         return await db_module.clone_profile_layer(

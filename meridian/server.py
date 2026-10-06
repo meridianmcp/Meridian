@@ -1043,6 +1043,15 @@ async def project_scope_enforcement(request: Request, call_next):
         try:
             scoped = await _scoped_project_ids_for_request(request)
         except Exception:  # noqa: BLE001 — a scope-check failure must never 500 a request
+            # RT-TI-005 (wave 2) — fail CLOSED for a caller that may be project-scoped.
+            # Scoping can only apply when X-Workspace-Tenant-Id rides along (see
+            # _scoped_project_ids_for_request), so that header is the one case
+            # where "the lookup errored" must not be read as "not scoped": a
+            # transient auth-DB error would otherwise hand a scoped member every
+            # project. Requests without the header keep the historical fail-open
+            # behaviour (they can never be scoped, so there is nothing to lose).
+            if request.headers.get("x-workspace-tenant-id", "").strip():
+                return JSONResponse({"detail": "scope check unavailable"}, status_code=503)
             scoped = None
         if scoped is not None and m.group(1) not in scoped:
             return JSONResponse(
@@ -8709,17 +8718,36 @@ async def _remote_mcp_inner(
     # rides along (the claude.ai connector never sends it → no-op, no DB hit).
     _scoped_pids = None
     if request.headers.get("x-workspace-tenant-id", "").strip():
+        # RT-TI-005 (wave 2) — fail CLOSED. These lookups used to swallow any error
+        # and carry on with role=None / scope=None, i.e. "owner of everything": a
+        # transient auth-DB error handed a project-scoped member every project and
+        # every write tool. The header is the only case where the caller can be
+        # scoped, so only here an error answers 503 instead of waving the call
+        # through (the SSE transport, _mcp_sse_request_context, never caught
+        # these either). Requests without the header are untouched.
         try:
             _ctx = await _enforcement_context(request)
             if _ctx is not None:
                 _enf_role = _ctx[2]
-        except Exception:
-            _enf_role = None
-        try:
             from ._deps import _scoped_project_ids_for_request as _scoped_fn  # noqa: PLC0415
             _scoped_pids = await _scoped_fn(request)
-        except Exception:
-            _scoped_pids = None
+        except Exception:  # noqa: BLE001 — answered below, never treated as unscoped
+            await _log_connection_event(
+                _conn_db,
+                tenant_id=_conn_tenant_id,
+                method=(body.get("method", "") if isinstance(body, dict) else "batch"),
+                auth_result="success",
+                client_user_agent=_conn_ua,
+                response_status=503,
+            )
+            return JSONResponse(
+                _jsonrpc_err(
+                    body.get("id") if isinstance(body, dict) else None,
+                    -32603,
+                    "scope check unavailable",
+                ),
+                status_code=503,
+            )
 
     if _prof:
         _t_now = time.perf_counter()

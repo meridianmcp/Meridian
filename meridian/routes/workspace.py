@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db, _get_tenant_from_request
+from .._deps import _db, _get_tenant_from_request, _require_project_in_scope
 from .. import db as db_module
 
 router = APIRouter()
@@ -86,6 +86,11 @@ async def move_workspace_note_endpoint(
     project_id = (body.get("project_id") or "").strip()
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id required")
+    # RT-TI-005 (wave 2) — the destination project comes from the body, outside the
+    # /projects/{uuid} middleware, and the db helper only checks that it exists:
+    # a project-scoped member could otherwise plant a note in any other project
+    # (and delete it from the workspace store). Same rule the MCP twin applies.
+    await _require_project_in_scope(request, project_id)
     moved = await db_module.move_workspace_note_to_project(
         await _db(request), note_id, project_id,
         tenant_id=await _tenant_id(request),

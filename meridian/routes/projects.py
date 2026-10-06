@@ -8,12 +8,14 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
+from .. import _deps
 from .._deps import (
     _db,
     _data_dir,
     _enforcement_context,
     _get_tenant_from_request,
     _hosted_mode,
+    _require_project_in_scope,
     _scoped_project_ids_for_request,
     validate_input_size,
 )
@@ -128,6 +130,11 @@ async def create_project(
     body: ProjectCreate, request: Request
 ) -> dict[str, Any]:
     """Create a new project. 409 if the name is already in use."""
+    # RT-TI-005 (wave 2) — body.parent_project_id names another project outside the
+    # /projects/{uuid} middleware: a project-scoped member may only nest a new
+    # project under a parent inside their own scope. A no-op without a parent and
+    # for owners / workspace-wide members / self-hosted / demo callers.
+    await _require_project_in_scope(request, body.parent_project_id)
     tenant = await _get_tenant_from_request(request)
     try:
         db = await _db(request)
@@ -222,11 +229,23 @@ async def get_project_by_name(name: str, request: Request) -> dict[str, Any]:
     can confirm it found the right project without a second round-trip.
     """
     db = await _db(request)
+    # RT-TI-005 (wave 2) — this route sits outside the /projects/{uuid}
+    # middleware (it is keyed by NAME), so a project-scoped member is held to
+    # their scope here. Out-of-scope projects are dropped BEFORE the exact match
+    # is accepted and the substring fallback only ever sees in-scope projects,
+    # which makes an out-of-scope name answer exactly like a name that does not
+    # exist (404) — no 403 that would confirm the project is there.
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    allowed = set(scoped) if scoped is not None else None
     # Exact match first (most common case).
     project = await db_module.get_project_by_name(db, name)
+    if project is not None and allowed is not None and project.get("id") not in allowed:
+        project = None
     if project is None:
         # Case-insensitive substring fallback.
         all_projects = await db_module.list_projects(db)
+        if allowed is not None:
+            all_projects = [p for p in all_projects if p.get("id") in allowed]
         lower = name.lower()
         matches = [p for p in all_projects if lower in p["name"].lower()]
         if matches:
@@ -684,6 +703,11 @@ async def set_project_parent(
         raise HTTPException(400, "parent_project_id is required (pass null to detach)")
     raw = body.get("parent_project_id")
     parent_project_id = str(raw).strip() if raw else None
+    # RT-TI-005 (wave 2) — {project_id} is checked by the middleware, but the
+    # parent comes from the body: a project-scoped member may not nest a project
+    # under (or re-parent it into) a project outside their scope. Detaching
+    # (parent None) needs no extra check.
+    await _require_project_in_scope(request, parent_project_id)
     db = await _db(request)
     try:
         updated = await db_module.set_parent_project(
@@ -771,6 +795,15 @@ async def delete_projects_batch(
             f"Workspace role '{ctx[2]}' lacks permission '{PERM_SETTINGS}'",
         )
     project_ids = list(dict.fromkeys(project_id))  # de-dupe, preserve order
+    # RT-TI-005 (wave 2) — the ids arrive as a query list on a bare /projects
+    # path, which the /projects/{uuid} middleware never sees. A project-scoped
+    # member (an admin/owner role is possible, see 3f4ba195) may delete only
+    # projects inside their scope. Checked BEFORE any existence lookup, so an
+    # unknown id and a foreign id are both the same 403 and nothing is deleted
+    # when any one id is out of scope.
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None and any(pid not in scoped for pid in project_ids):
+        raise HTTPException(403, "Project is outside your access scope.")
     db = await _db(request)
     missing = [pid for pid in project_ids if await db_module.get_project(db, pid) is None]
     if missing:
@@ -1345,7 +1378,11 @@ async def delete_worktree(
     that reclaims anything left behind.
     """
     db = await _db(request)
-    wt = await db_module.get_worktree(db, worktree_id)
+    # RT-TI-005 (wave 2) — the worktree must belong to the project in the PATH
+    # (the only project the scope middleware checks). A worktree id from another
+    # project is answered exactly like a missing one and is never touched,
+    # neither on disk nor in the DB nor in the active-repo cache below.
+    wt = await db_module.get_worktree(db, worktree_id, project_id=project_id)
     if wt is None or wt.get("removed_at") is not None:
         raise HTTPException(status_code=404, detail="worktree not found or already removed")
     if not _hosted_mode():
@@ -1365,7 +1402,7 @@ async def delete_worktree(
             _l.getLogger("meridian.server").warning(
                 "delete_worktree: on-disk cleanup failed for %s: %s", wt["path"], exc
             )
-    removed = await db_module.remove_worktree(db, worktree_id)
+    removed = await db_module.remove_worktree(db, worktree_id, project_id=project_id)
     if not removed:
         raise HTTPException(status_code=404, detail="worktree not found or already removed")
     # 32ba4125 — clean up the code-intel context tied to this worktree: a
@@ -1496,7 +1533,16 @@ async def get_team_summary_endpoint(
     ``project_id`` optional — omit to roll up across all projects.
     Returns ``{period_days, humans:[...], active_count}``. Used by the
     Team tab cards, swimlane timeline, and standup digest.
+
+    RT-TI-005 (wave 2) — ``/team/summary`` is outside the /projects/{uuid}
+    middleware and, without a ``project_id``, rolls up every project's task
+    log. A project-scoped member must therefore name a project inside their own
+    scope (the dashboard's Team tab always does); an omitted or foreign id is a
+    403, never a workspace-wide fallback (same rule as /control-plane/proposals).
     """
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None and (not project_id or project_id not in scoped):
+        raise HTTPException(status_code=403, detail="Project is outside your access scope.")
     return await db_module.get_team_summary(await _db(request), project_id, days)
 
 

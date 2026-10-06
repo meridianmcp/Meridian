@@ -8788,11 +8788,22 @@ async def register_worktree(
 async def get_worktree(
     db: aiosqlite.Connection,
     worktree_id: str,
+    *,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Return a single active_worktrees row by id, or None."""
-    async with db.execute(
-        "SELECT * FROM active_worktrees WHERE id = ?", (worktree_id,)
-    ) as cur:
+    """Return a single active_worktrees row by id, or None.
+
+    RT-TI-005 (wave 2) — ``project_id`` optionally binds the lookup to the
+    project the caller named: a worktree owned by another project is answered
+    exactly like a missing one. ``None`` (the default) keeps the historical
+    id-only lookup for callers that have no project in hand.
+    """
+    sql = "SELECT * FROM active_worktrees WHERE id = ?"
+    params: tuple[Any, ...] = (worktree_id,)
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        params = (worktree_id, project_id)
+    async with db.execute(sql, params) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row) if row is not None else None
 
@@ -8800,13 +8811,24 @@ async def get_worktree(
 async def remove_worktree(
     db: aiosqlite.Connection,
     worktree_id: str,
+    *,
+    project_id: str | None = None,
 ) -> bool:
-    """Mark a worktree as removed. Returns True when a row was updated."""
-    cursor = await db.execute(
+    """Mark a worktree as removed. Returns True when a row was updated.
+
+    RT-TI-005 (wave 2) — ``project_id`` optionally binds the UPDATE to the
+    owning project, so a worktree id from another project can never be marked
+    removed through a path that names a different project.
+    """
+    sql = (
         "UPDATE active_worktrees SET removed_at = datetime('now') "
-        "WHERE id = ? AND removed_at IS NULL",
-        (worktree_id,),
+        "WHERE id = ? AND removed_at IS NULL"
     )
+    params: tuple[Any, ...] = (worktree_id,)
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        params = (worktree_id, project_id)
+    cursor = await db.execute(sql, params)
     await db.commit()
     return (cursor.rowcount or 0) > 0
 
