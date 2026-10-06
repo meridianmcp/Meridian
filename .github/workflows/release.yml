@@ -14,8 +14,8 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -24,7 +24,7 @@ jobs:
       - name: Build Windows executable
         run: pixi run -e dev build-exe
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-windows
           path: dist/meridian.exe
@@ -39,8 +39,8 @@ jobs:
   build-tray:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -49,7 +49,7 @@ jobs:
       - name: Build Windows tray executable
         run: pixi run -e dev build-tray
       - name: Upload tray artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-tray-windows
           path: dist/meridian-tray.exe
@@ -73,8 +73,8 @@ jobs:
   build-tray-mac:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -95,7 +95,7 @@ jobs:
       # DMG packaging is optional: preserve the ZIP if hdiutil fails afterward.
       - name: Upload tray artifact
         if: ${{ always() && steps.zip_app.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-tray-mac
           path: |
@@ -105,8 +105,8 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -117,7 +117,7 @@ jobs:
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-linux
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-linux
           path: dist/meridian-linux
@@ -125,8 +125,8 @@ jobs:
   build-mac-arm64:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -135,7 +135,7 @@ jobs:
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-mac-arm64
       - name: Upload macOS arm64 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-mac-arm64
           path: dist/meridian-mac-arm64
@@ -167,8 +167,8 @@ jobs:
             artifact: meridian-connect-x86_64-windows.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -180,7 +180,7 @@ jobs:
       - name: Stage artifact (Windows)
         if: runner.os == 'Windows'
         run: mv dist/meridian-connect.exe ${{ matrix.artifact }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -195,9 +195,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist-artifacts
       # f66e8f23 — publish SHA-256 checksums for every binary this release ships.
@@ -240,7 +240,7 @@ jobs:
           fi
           cat release-assets/SHA256SUMS
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           # 80f1d4bc — ship whatever built; a missing platform artifact (transient
           # runner outage) must not fail the whole release. macos-x86 is no longer
@@ -264,7 +264,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # 80f1d4bc — skip Docker Hub publish cleanly when creds aren't configured
       # (repo without DOCKER_USERNAME/DOCKER_TOKEN) instead of failing the run.
       # The ghcr image (docker-ghcr, via GITHUB_TOKEN) still publishes regardless.
@@ -278,13 +278,13 @@ jobs:
         run: echo "has=${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
       - name: Log in to Docker Hub
         if: steps.dockercreds.outputs.has == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Build and push Docker image
         if: steps.dockercreds.outputs.has == 'true'
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: true
@@ -299,13 +299,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: true
@@ -317,8 +317,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           # '22', not '20': @meridianmcp/mcp now bundles the meridian-latex
           # engine in as a real subpath (npm/scripts/bundle-latex.mjs, run
@@ -361,8 +361,8 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       - name: Publish to MCP Registry
@@ -374,8 +374,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           version: latest
       - name: Build and publish to PyPI
