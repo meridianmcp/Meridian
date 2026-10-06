@@ -24,7 +24,11 @@ jobs:
     # 343cb26d — hard ceiling so a hung test (lingering asyncio loop / xdist
     # worker) can never keep the job "in progress" indefinitely. --timeout=60
     # below kills the individual test first; this is the backstop for the job.
-    timeout-minutes: 15
+    # 2026-10-06 — raised 15 -> 25: successful runs were already taking 14.4-14.5
+    # minutes, so ordinary runner-speed variance tripped the ceiling and GitHub
+    # reports a job-timeout as "cancelled", which also silently skips the dev ->
+    # main auto-promote (it needs a "success" conclusion). Not a hung-test cap.
+    timeout-minutes: 25
     env:
       # 61f891b0 — sys.monitoring, Python 3.12+: 53% relative reduction in
       # coverage overhead at comparable scale (documented, Warehouse/PyPI).
