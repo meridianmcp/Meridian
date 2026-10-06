@@ -4080,6 +4080,12 @@ async def _handle_task_tools(
         _hashes = args.get("content_hashes")
         if _hashes is not None and not isinstance(_hashes, list):
             raise ValueError("content_hashes must be a list of 'sha256:...' strings")
+        # RT-TI-001 — the artifact store is a filesystem tree keyed by project
+        # id in a data dir shared by every tenant, so the caller's own
+        # (per-tenant) database is the only authority on whether this project
+        # is theirs. Answer exactly like any other unknown project id.
+        if await db_module.get_project(db, args["project_id"]) is None:
+            raise ValueError("project not found")
         try:
             return artifact_store_module.export_artifacts(
                 data_dir, args["project_id"],
@@ -4121,6 +4127,13 @@ async def _handle_task_tools(
         # tests/test_ai_log_retention.py) that this call must not disturb.
         _events_cutoff = _parsed_cutoff.strftime("%Y-%m-%d %H:%M:%S")
         _pid = args["project_id"]
+        # RT-TI-002 — same ownership rule as export_ai_log_artifacts: the
+        # artifact sweep below deletes files under a data dir shared by every
+        # tenant, so refuse a project id the caller's own database does not
+        # know. (A project already deleted from the database therefore cannot
+        # be swept through this tool; its leftovers need an operator purge.)
+        if await db_module.get_project(db, _pid) is None:
+            raise ValueError("project not found")
         _events_deleted = await db_module.purge_events_before(db, _pid, _events_cutoff)
         _artifacts_deleted = artifact_store_module.purge_artifacts_before(
             data_dir, _pid, _cutoff_raw,
