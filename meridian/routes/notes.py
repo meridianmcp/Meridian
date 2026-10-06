@@ -412,6 +412,7 @@ async def update_project_note_endpoint(
         body=body.get("body"),
         tags=body.get("tags"),
         priority=body.get("priority"),
+        project_id=project_id,  # RT-TI-003: the note must belong to the URL's project
     )
     if result is None:
         raise HTTPException(status_code=404, detail="note not found")
@@ -423,7 +424,9 @@ async def delete_project_note_endpoint(
     project_id: str, note_id: str, request: Request
 ) -> Response:
     """Hard-delete a note. Returns 204 or 404."""
-    ok = await db_module.delete_project_note(await _db(request), note_id)
+    ok = await db_module.delete_project_note(
+        await _db(request), note_id, project_id=project_id,  # RT-TI-003
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="note not found")
     return Response(status_code=204)

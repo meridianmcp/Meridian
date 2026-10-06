@@ -2225,12 +2225,23 @@ async def openai_tunnel_diagnostics(tenant_id: str, request: Request) -> Respons
     reported_status = body.get("reported_status")
     if reported_status is not None and not isinstance(reported_status, dict):
         reported_status = None
+    # RT-TI-007 — the route stays public (the adapter diagnostics describe only
+    # what the caller itself supplies), but whether THIS tenant's Meridian tunnel
+    # socket is up is tenant state: GET /tunnel/status/{tenant_id} was hardened
+    # (4bea8629 / 5de3d422) to hide it from anyone but that tenant, so do the
+    # same here. In hosted mode an anonymous or foreign caller gets ``null``
+    # ("unknown", which combined_diagnostics never guesses), not the live flag.
+    meridian_active: "bool | None" = tenant_id in _tunnel_sockets
+    if _hosted_mode():
+        caller = await _get_tenant_from_request(request)
+        if caller is None or caller.get("id") != tenant_id:
+            meridian_active = None
     try:
         diagnostics = combined_diagnostics(
             tenant_id,
             openai_config=openai_config,
             reported_status=reported_status,
-            meridian_tunnel_active=tenant_id in _tunnel_sockets,
+            meridian_tunnel_active=meridian_active,
         )
     except OpenAITunnelAdapterError as exc:
         return _json_response({"error": str(exc)}, status_code=400)

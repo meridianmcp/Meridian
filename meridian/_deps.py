@@ -494,10 +494,13 @@ async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None
     caller at a *different* workspace than their own (a true cross-workspace
     view); a caller in their own workspace always sees everything.
 
-    This is listing-only: it filters what the dashboard shows. It does NOT
-    block direct-by-ID access to sibling projects in the same workspace —
-    airtight per-request enforcement is deferred pending the product decision
-    (pin b11c7cf6). Writes stay gated by role enforcement (393eed0a).
+    Enforcement is NOT listing-only any more: pinned decision 6fe5210c (Option
+    A) makes a project-scoped member 403 on any other project even by direct
+    id. The ``/projects/{uuid}/*`` routes get that from the
+    ``project_scope_enforcement`` middleware; routes that reach a project only
+    through another object's id (sessions, tasks) call
+    :func:`_require_project_in_scope` themselves. Writes also stay gated by
+    role enforcement (393eed0a).
     """
     if not _hosted_mode():
         return None
@@ -522,6 +525,25 @@ async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None
     return await db_module.get_scoped_project_ids_for_member(
         auth_db, ws_header, caller_email
     )
+
+
+async def _require_project_in_scope(request: Request, project_id: "str | None") -> None:
+    """RT-TI-005 — 403 when a project-scoped caller reaches ``project_id`` by another route.
+
+    The ``project_scope_enforcement`` middleware only sees ``/projects/{uuid}/...``
+    paths. Session and task routes identify their project through the session or
+    task id (or a request body), so they call this once they know the project.
+    No-op for owners, workspace-wide members, self-hosted and demo callers
+    (``_scoped_project_ids_for_request`` returns ``None`` for them). Fails closed:
+    an error resolving the scope propagates instead of waving the request through.
+    Same status and message as the middleware so callers cannot tell which
+    layer answered.
+    """
+    if not project_id:
+        return
+    scoped = await _scoped_project_ids_for_request(request)
+    if scoped is not None and project_id not in scoped:
+        raise HTTPException(status_code=403, detail="Project is outside your access scope.")
 
 
 # ---------------------------------------------------------------------------
