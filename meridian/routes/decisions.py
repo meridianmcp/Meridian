@@ -1,14 +1,47 @@
 """Pinned decisions + decision-log routes — extracted from server.py."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db, validate_input_size
+from .._deps import (
+    _authentication_required,
+    _db,
+    _get_tenant_from_request,
+    _hosted_mode,
+    validate_input_size,
+)
 from .. import db as db_module
+from ..outbound_url_guard import OutboundURLRejected, avalidate_outbound_url
 
 router = APIRouter()
+_log = logging.getLogger(__name__)
+
+_DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
+
+
+def _normalize_consolidated(raw: Any) -> list[dict[str, str]]:
+    """Keep only the three fields the preview / replace-all flow uses, as strings.
+
+    The upstream is a caller-chosen host, so its JSON is untrusted: anything
+    that is not a list of ``{title, category, body}`` objects is rejected, and
+    unexpected keys are dropped rather than echoed back to the caller.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("unexpected upstream shape")
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        title, category, text = item.get("title"), item.get("category"), item.get("body")
+        out.append({
+            "title": title[:500] if isinstance(title, str) else "",
+            "category": category[:32] if isinstance(category, str) and category else "TECHNICAL",
+            "body": text[:100_000] if isinstance(text, str) else "",
+        })
+    return out
 
 
 @router.get("/projects/{project_id}/decisions-pinned")
@@ -163,15 +196,43 @@ async def consolidate_decisions_ai(
     """Call an external LLM to deduplicate and consolidate pinned decisions.
 
     Returns a preview ``{consolidated: [...]}`` for review before applying via replace-all.
+
+    ``base_url`` (optional, OpenAI-compatible models only) is validated by
+    :mod:`meridian.outbound_url_guard`: hosted mode accepts only https URLs that
+    resolve to public addresses; self-hosted mode also accepts a loopback model
+    server (``MERIDIAN_OUTBOUND_ALLOW_PRIVATE=1`` additionally permits a private
+    LAN host). Redirects are never followed and upstream bodies are never echoed.
     """
     import json as _json
     import httpx as _httpx
 
-    api_key = (body.get("api_key") or "").strip()
+    hosted = _hosted_mode()
+    if hosted:
+        # Defence in depth: this route makes an outbound request with a
+        # caller-supplied key and URL, so it must never depend solely on the
+        # app-wide gate / demo read-only middleware. Require a resolved tenant
+        # (a forged demo cookie resolves to none).
+        tenant = await _get_tenant_from_request(request)
+        if tenant is None or not tenant.get("id"):
+            raise _authentication_required()
+
+    raw_key = body.get("api_key")
     model = body.get("model") or "claude-haiku-4-5-20251001"
+    raw_base_url = body.get("base_url")
+    if raw_key is not None and not isinstance(raw_key, str):
+        raise HTTPException(status_code=400, detail="api_key must be a string")
+    api_key = (raw_key or "").strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="api_key required")
+    if len(api_key) > 4096 or not api_key.isascii() or not api_key.isprintable():
+        raise HTTPException(status_code=400, detail="api_key contains invalid characters")
+    if not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="model must be a string")
+    if raw_base_url is not None and not isinstance(raw_base_url, str):
+        raise HTTPException(status_code=400, detail="base_url must be a string")
     db = await _db(request)
+    if await db_module.get_project(db, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
     decisions = await db_module.get_pinned_decisions(db, project_id)
     if not decisions:
         raise HTTPException(status_code=400, detail="no pinned decisions to consolidate")
@@ -192,8 +253,21 @@ async def consolidate_decisions_ai(
         '{"decisions": [{"title": "...", "category": "TECHNICAL", "body": "..."}]}\n\n'
         f"Decisions to consolidate:\n{decisions_text}"
     )
+    base_url = _DEFAULT_OPENAI_BASE_URL
+    if raw_base_url and not model.startswith("claude"):
+        try:
+            base_url = await avalidate_outbound_url(raw_base_url, hosted=hosted)
+        except OutboundURLRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    # Never follow redirects (a 3xx must not steer the request, or the caller's
+    # key, to a host that was not validated); in hosted mode also ignore
+    # environment proxies so the connection goes to the validated host.
+    client_kwargs: dict[str, Any] = {"timeout": 60.0, "follow_redirects": False}
+    if hosted:
+        client_kwargs["trust_env"] = False
     try:
-        async with _httpx.AsyncClient(timeout=60.0) as client:
+        async with _httpx.AsyncClient(**client_kwargs) as client:
             if model.startswith("claude"):
                 r = await client.post(
                     "https://api.anthropic.com/v1/messages",
@@ -208,7 +282,6 @@ async def consolidate_decisions_ai(
                 r.raise_for_status()
                 text = r.json()["content"][0]["text"]
             else:
-                base_url = (body.get("base_url") or "https://api.openai.com").rstrip("/")
                 r = await client.post(
                     f"{base_url}/v1/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
@@ -220,12 +293,17 @@ async def consolidate_decisions_ai(
         if "```" in text:
             parts = text.split("```")
             text = parts[1][4:] if parts[1].startswith("json") else parts[1]
-        consolidated = _json.loads(text.strip()).get("decisions", [])
+        consolidated = _normalize_consolidated(_json.loads(text.strip()).get("decisions", []))
         return {"consolidated": consolidated, "original_count": len(decisions)}
     except _httpx.HTTPStatusError as exc:
+        # Never reflect the upstream body, URL or exception text: with a
+        # caller-chosen host it would be a read channel into whatever answered.
+        _log.warning("consolidate: upstream returned HTTP %s", exc.response.status_code)
         raise HTTPException(
-            status_code=502,
-            detail=f"AI API error {exc.response.status_code}: {exc.response.text[:200]}"
-        ) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"AI API error: {exc}") from exc
+            status_code=502, detail=f"AI API error {exc.response.status_code}"
+        ) from None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("consolidate: upstream request failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=502, detail=f"AI API request failed ({type(exc).__name__})"
+        ) from None
