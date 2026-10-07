@@ -7453,7 +7453,12 @@ async def update_tenant(
     tenant_id: str,
     **fields: object,
 ) -> dict[str, Any] | None:
-    """Update arbitrary columns on a tenant row. Returns updated dict or None."""
+    """Update arbitrary columns on a tenant row. Returns updated dict or None.
+
+    Raises ``ValueError`` for a plan no gate recognises, and ``plans.SharedPoolError``
+    (a ``ValueError``) when an unbilled plan (playtester) is set on a tenant whose
+    database is in a Neon project other tenants use.
+    """
     allowed = {
         "neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id",
         "stripe_metered_item_id", "notification_prefs",
@@ -7472,8 +7477,15 @@ async def update_tenant(
         # tenants.plan has no CHECK constraint, so this is the one write-side
         # guard: a typo must not park a tenant on a value no gate recognises
         # (see plans.py for the legal values).
-        from ..plans import validate_plan  # noqa: PLC0415
+        from ..plans import is_unbilled_plan, validate_plan  # noqa: PLC0415
         validate_plan(updates["plan"])
+        if is_unbilled_plan(updates["plan"]):
+            # The project the database will be in once this write is done.
+            if "neon_project_id" in updates:
+                pool = updates["neon_project_id"]
+            else:
+                pool = ((await get_tenant_by_id(db, tenant_id)) or {}).get("neon_project_id")
+            await require_dedicated_pool(db, tenant_id, pool if isinstance(pool, str) else None)
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     await db.execute(
         f"UPDATE tenants SET {set_clause} WHERE id = ?",
@@ -7925,14 +7937,20 @@ async def register_pool_project(
     db: aiosqlite.Connection,
     neon_project_id: str,
     tier: str = "standard",
+    customer_count: int = 0,
 ) -> dict[str, Any]:
-    """Register a newly created Neon project as an available pool project."""
+    """Register a newly created Neon project as an available pool project.
+
+    ``customer_count`` starts at 0 for an ordinary pool that tenants are placed
+    in one by one. A project made for a single tenant (a playtester, see
+    ``plans.py``) is registered already full, so nobody else is ever placed in it.
+    """
     import uuid
     pid = str(uuid.uuid4())
     await db.execute(
         "INSERT INTO neon_pool_projects (id, neon_project_id, tier, customer_count) "
-        "VALUES (?, ?, ?, 0)",
-        (pid, neon_project_id, tier),
+        "VALUES (?, ?, ?, ?)",
+        (pid, neon_project_id, tier, customer_count),
     )
     await db.commit()
     async with db.execute(
@@ -7977,17 +7995,28 @@ async def claim_pool_project_slot(
     runs against the locked row, so the second concurrent UPDATE harmlessly
     no-ops once T1 has bumped the count to the cap.
 
+    A project that holds an unbilled-plan tenant (a playtester, see
+    ``plans.py``) is never picked, however many slots it has left: a playtester
+    stays alone on its project, which is what keeps its usage its own.
+
     Returns the updated pool project row (with the post-increment count), or
     ``None`` if no pool has room — caller should create a new pool project
     and try again.
     """
+    from ..plans import UNBILLED_PLANS  # noqa: PLC0415
+
+    unbilled = ", ".join(f"'{p}'" for p in sorted(UNBILLED_PLANS))
     async with db.execute(
         "UPDATE neon_pool_projects "
         "SET customer_count = customer_count + 1 "
         "WHERE id = ("
-        "  SELECT id FROM neon_pool_projects "
-        "  WHERE tier = ? AND customer_count < ? "
-        "  ORDER BY customer_count DESC LIMIT 1"
+        "  SELECT p.id FROM neon_pool_projects p "
+        "  WHERE p.tier = ? AND p.customer_count < ? "
+        "  AND NOT EXISTS ("
+        "    SELECT 1 FROM tenants t "
+        f"    WHERE t.neon_project_id = p.neon_project_id AND t.plan IN ({unbilled})"
+        "  ) "
+        "  ORDER BY p.customer_count DESC LIMIT 1"
         ") "
         "AND customer_count < ? "
         "RETURNING *",
@@ -8011,6 +8040,46 @@ async def decrement_pool_project_count(
         (neon_project_id,),
     )
     await db.commit()
+
+
+async def count_pool_mates(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    neon_project_id: str | None,
+) -> int:
+    """How many OTHER tenants have their database in the Neon project ``neon_project_id``.
+
+    0 when there is no project (a tenant that has no database yet is alone by
+    definition). Any plan counts: Neon reports usage per project, so staff and
+    free tenants mix into a figure just as paying ones do.
+    """
+    if not neon_project_id:
+        return 0
+    async with db.execute(
+        "SELECT COUNT(*) AS n FROM tenants WHERE neon_project_id = ? AND id != ?",
+        (neon_project_id, tenant_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return int((_row_to_dict(row) or {}).get("n") or 0) if row else 0
+
+
+async def require_dedicated_pool(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    neon_project_id: str | None,
+) -> None:
+    """Raise ``plans.SharedPoolError`` unless the tenant is alone in ``neon_project_id``.
+
+    The check behind the playtester plan: it is only granted on a project of the
+    tenant's own (or to a tenant with no database yet, which gets one). Used by
+    ``update_tenant`` for every write of an unbilled plan, and by the admin
+    action so a preview reports the refusal too.
+    """
+    mates = await count_pool_mates(db, tenant_id, neon_project_id)
+    if mates:
+        from ..plans import SharedPoolError  # noqa: PLC0415
+
+        raise SharedPoolError(tenant_id, str(neon_project_id), mates)
 
 
 async def get_pool_project_counts(

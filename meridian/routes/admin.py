@@ -337,8 +337,11 @@ async def admin_set_tenant_plan(request: Request) -> Response:
     flag when moving a staff account to playtester and is never set here.
     Without ``confirm`` nothing is written and the response says what would
     change (``applied`` is false); with it the change is applied, idempotent and
-    audited. The response carries the plan label and any warning (a pool shared
-    with paying tenants, a staff flag that still exempts the tenant).
+    audited. The response carries the plan label and any warning (a staff flag
+    that still exempts the tenant, a tenant with no database yet). A playtester
+    is refused with 409, preview included, when its database is in a Neon pool
+    project other tenants use: the message says to reset its provisioning first,
+    after which its next database is created in a project of its own.
 
     Hosted operator only (admin session + admin password), like
     reset-provisioning. See ``meridian/tenant_plan_admin.py``.

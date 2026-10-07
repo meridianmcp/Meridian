@@ -18,7 +18,9 @@ A thin wrapper over ``meridian.tenant_plan_admin.set_tenant_plan_by_email``, the
 same function the ``POST /admin/tenants/plan`` admin route calls: idempotent,
 audited (``action_audit_log``), validated against ``plans.OPERATOR_SETTABLE_PLANS``.
 Prints the result as JSON, including the plan label and any warning. Exit code
-is 0 on success (also for a preview or a no-op), 1 for a refused request.
+is 0 on success (also for a preview or a no-op), 1 for a refused request. Granting
+``playtester`` is refused (also in a preview) while the tenant's database is in a
+Neon pool project other tenants use; the message says what to do first.
 
 Deploy order: run it only after the release that knows the ``playtester`` plan
 is live. An older server treats the value as an unknown plan and gives the

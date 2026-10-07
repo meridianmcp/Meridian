@@ -51,35 +51,43 @@ an overage invoice: there is no Stripe customer behind it. Its monthly cost is
 bounded by the Pro ceilings in ``hosted.PLAN_LIMITS``: the tenant gets the
 warning at the Pro threshold and, past the compute grace allowance or the
 storage ceiling, the tenant and the owner are emailed (once a month per
-notice). Nothing is ever throttled, metered or refused for a playtester: Neon
-accounts consumption per *pool project* shared by several tenants, and the
-pool's own Neon quota is the hard stop behind the warnings.
+notice). Nothing is ever throttled, metered or refused for a playtester: the
+quota of its own Neon project is the hard stop behind the warnings.
 
-Because that consumption is per pool, a playtester's usage cannot be told from
-its pool mates'. The usage jobs therefore never judge a billed tenant on the
-total of a pool that also holds a playtester (such a tenant is skipped and the
-skip is logged), so a playtester can never raise what a paying customer is
-billed, warned or throttled for. The cost is that a paying tenant sharing a
-pool with a playtester is not metered for overage while it does; the owner is
-emailed once a month for each tenant skipped this way, and the admin action
-reports how many billed tenants share the pool, so granting the plan to a
-tenant in an unshared pool avoids it. Pool placement does not keep the two
-apart: a playtester provisioned from scratch is placed like a Pro tenant, in the
-fullest Pro pool with room.
+Neon reports consumption per pool project (which normally holds up to eight
+tenants' databases), so a playtester is only ever on a project of its own: that
+is what makes the usage figure its own, so the ceilings above are judged without
+any tenant's figure depending on another's, and no other tenant is judged
+any differently because a playtester exists. It is kept that way by
+construction, not by special cases in the usage jobs:
+
+* the plan is refused (``SharedPoolError``, raised by ``db.update_tenant`` and
+  so by the admin action, with a message saying what to do) for a tenant whose
+  database is in a project other tenants use; the operator moves the tenant
+  first, e.g. ``POST /admin/tenants/{id}/reset-provisioning`` (which drops its
+  database) and then grants the plan;
+* a playtester provisioned from scratch gets a new Neon project of its own,
+  registered as full (``hosted.provision_neon_db``);
+* the pool allocator never places a tenant in a project that holds a
+  playtester (``db.claim_pool_project_slot``), so one that was alone in its
+  project when granted stays alone.
 
 Granting it: ``set_tenant_plan_by_email`` on a tenant that has signed in at
 least once. A tenant row created with this plan before the person's first
 sign-in has no database, because sign-in only provisions one for a free-tier
 tenant (a plan that maps to Pro is assumed to be provisioned at checkout, which
-a playtester never goes through); ``POST /projects`` creates it on first use. The database
-of a tenant that already has one stays in the pool it was provisioned into
-(free, standard or pro) whatever the plan becomes. The usage jobs poll a
-playtester's pool with the key of the Neon account that pool belongs to, not
-the plan's, so the Pro ceilings are still measured there; every other plan is
-polled with its own plan's key, as before. A database drop (account deletion,
-reset-provisioning, churn, dunning) always uses the pool's key, so a playtester's
-data is really removed. The pool's autoscaling ceiling and retention are those
-of the pool it lives in.
+a playtester never goes through); ``POST /projects`` creates it on first use,
+in its own project. A tenant that already has a database keeps it where it was
+provisioned (a free, standard or pro project) whatever the plan becomes, which
+is why the grant is refused unless the tenant is alone in that project. The
+usage jobs poll a playtester's project with the key of the Neon account that
+project belongs to, not the plan's, so the Pro ceilings are still measured
+there; every other plan is polled with its own plan's key, as before. A
+database drop (account deletion, reset-provisioning, churn, dunning) always
+uses the pool's key, so a playtester's data is really removed. The project's
+autoscaling ceiling, quota and retention are those of the pool tier it was
+created in. Revoking the plan (``free``, ``standard``, ``pro``) is never
+refused.
 
 An optional end date can be kept in ``tenants.inactivity_expires_at`` (NULL =
 no end date). Once it passes, ``tenant_entitlement_plan`` reports ``free`` for
@@ -171,6 +179,30 @@ def effective_entitlement_plan(plan: Any) -> Any:
     if isinstance(plan, str):
         return ENTITLEMENT_ALIASES.get(plan, plan)
     return plan
+
+
+class SharedPoolError(ValueError):
+    """An unbilled plan (playtester) was requested for a tenant on a shared Neon project.
+
+    ``mates`` is how many other tenants have their database in ``pool`` (the
+    tenant's ``neon_project_id``). The message is written for the operator who
+    hit it, so the admin action can pass it on unchanged.
+    """
+
+    def __init__(self, tenant_id: str, pool: str, mates: int) -> None:
+        self.tenant_id = tenant_id
+        self.pool = pool
+        self.mates = mates
+        super().__init__(
+            f"refused: this tenant's database is in the Neon pool project {pool!r}, which "
+            f"{mates} other tenant(s) also use. The playtester plan is only granted on a "
+            "project of its own, because Neon reports usage per project and a playtester's "
+            "usage could not be told apart from its pool mates'. Move the tenant to a "
+            f"dedicated project first: reset its provisioning (POST /admin/tenants/{tenant_id}"
+            "/reset-provisioning with confirm=true, which DROPS its database and logs it out), "
+            "then grant the plan again; the tenant's next database is created in a dedicated "
+            "project."
+        )
 
 
 def is_known_plan(plan: Any) -> bool:

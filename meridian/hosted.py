@@ -1626,6 +1626,10 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
       - Standard tenants use NEON_API_KEY (hello@usemeridian.us).
       - Pro tenants use NEON_API_KEY_PRO (pro@usemeridian.us — future).
 
+    A playtester skips steps 2-3: its database is created in a Neon project of
+    its own (in the pool tier its entitlement maps to), registered as full so no
+    other tenant is ever placed beside it.
+
     Returns the updated tenant dict.
     """
     from . import db as db_module
@@ -1647,21 +1651,33 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     # Capacity check
     await check_capacity(db)
 
+    # A playtester gets a Neon project of its own instead of a slot in a shared
+    # pool (see plans.py): Neon reports usage per project, so a database that
+    # shared one could not be measured or bounded on its own.
+    dedicated = is_unbilled_plan(tenant.get("plan"))
+
     # Item 38 — atomic claim+increment to avoid the overprovisioning race
     # where two concurrent signups both pick a pool with 7/8 slots and bump
     # it to 9/8. claim_pool_project_slot returns the row already-incremented.
-    pool = await db_module.claim_pool_project_slot(
+    pool = None if dedicated else await db_module.claim_pool_project_slot(
         db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
     )
 
     if pool is None:
-        # All existing pool projects are full (or all last-slot races lost).
+        # All existing pool projects are full (or all last-slot races lost), or
+        # this tenant needs a project of its own.
         # Create a new one and claim a slot from it. claim() on the fresh pool
         # is still atomic, so even if a sibling signup raced to create another
         # new pool, both claims succeed harmlessly.
         neon_project_id, _first_conn_uri = await _create_neon_pool_project(api_key, pool_tier)
-        await db_module.register_pool_project(db, neon_project_id, pool_tier)
-        pool = await db_module.claim_pool_project_slot(
+        # A dedicated project is registered already full: nobody else can be
+        # placed in it before this tenant's row names it (from then on the claim
+        # query itself skips any project that holds a playtester).
+        registered = await db_module.register_pool_project(
+            db, neon_project_id, pool_tier,
+            customer_count=_MAX_CUSTOMERS_PER_PROJECT if dedicated else 0,
+        )
+        pool = registered if dedicated else await db_module.claim_pool_project_slot(
             db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
         )
         if pool is None:  # extremely unlikely — fresh pool with cap-1 capacity
@@ -2133,16 +2149,13 @@ async def _notify_playtester_over_ceiling(
     kind: str,
     now: "datetime",
     *,
-    shared_pool: bool,
     detail: str,
     subject: str,
     html: str,
 ) -> None:
     """A playtester is past a hard ceiling (past grace, for compute).
 
-    The owner is always told; the tenant is too unless the pool is shared with
-    paying tenants, where the measured usage may not be the playtester's. Once a
-    month per ``kind``.
+    The tenant and the owner are both told, once a month per ``kind``.
     """
     import logging as _logging
 
@@ -2150,11 +2163,9 @@ async def _notify_playtester_over_ceiling(
     if not await _claim_playtester_notice(db, tenant, kind, now):
         return
     _logging.getLogger(__name__).warning(
-        "Playtester %s ceiling exceeded: tenant=%s shared_pool=%s: %s",
-        kind, email, shared_pool, detail,
+        "Playtester %s ceiling exceeded: tenant=%s: %s", kind, email, detail,
     )
-    if not shared_pool:
-        await _send_overage_email(email, subject, html)
+    await _send_overage_email(email, subject, html)
     await _alert_owner_playtester_limit(email, kind, detail)
 
 
@@ -2163,16 +2174,10 @@ async def _notify_playtester_warning(
     tenant: dict[str, Any],
     now: "datetime",
     *,
-    shared_pool: bool,
     subject: str,
     html: str,
 ) -> None:
-    """Compute warning at the Pro threshold, once a month, to the tenant only.
-
-    Silent in a pool shared with paying tenants: the number is the pool's.
-    """
-    if shared_pool:
-        return
+    """Compute warning at the Pro threshold, once a month, to the tenant only."""
     if await _claim_playtester_notice(db, tenant, "compute_warning", now):
         await _send_overage_email(tenant.get("email", ""), subject, html)
 
@@ -2319,7 +2324,6 @@ async def run_storage_overage_check(db: Any) -> None:
 
     tenants = [_to_d(r) for r in rows] if rows else []
     pool_tiers = await _pool_tiers_by_project(db)
-    playtester_pools = _pools_with_unbilled_tenants(tenants)
 
     for tenant in tenants:
         # G2.10 — internal tenants are never charged for storage overage.
@@ -2329,12 +2333,6 @@ async def run_storage_overage_check(db: Any) -> None:
         if not neon_project_id:
             continue
         plan = tenant.get("plan") or "standard"
-        if not is_unbilled_plan(plan) and neon_project_id in playtester_pools:
-            # Storage is read per pool project, so with a playtester in it this
-            # tenant's share cannot be told from the playtester's: a charge
-            # would bill it for someone else's data.
-            _log_pool_not_attributable(tenant, neon_project_id)
-            continue
         # An unbilled plan's API key follows the pool the database lives in;
         # the ceiling follows the entitlement currently in force.
         try:
@@ -2480,47 +2478,6 @@ async def _set_neon_max_cu(project_id: str, api_key: str, max_cu: float) -> None
         pass
 
 
-def _pool_has_billed_neighbours(
-    tenants: "list[dict[str, Any]]", tenant: dict[str, Any]
-) -> bool:
-    """True when a paying customer's database lives in this tenant's pool project.
-
-    Neon consumption is per pool project, so the figure measured for a playtester
-    in such a pool is mostly its paying neighbours' usage. Staff (``is_internal``)
-    and unbilled plans do not count: nothing is charged for them.
-    """
-    pool = tenant.get("neon_project_id")
-    return any(
-        other.get("neon_project_id") == pool
-        and other.get("id") != tenant.get("id")
-        and not other.get("is_internal")
-        and not is_unbilled_plan(other.get("plan"))
-        for other in tenants
-    )
-
-
-def _pools_with_unbilled_tenants(tenants: "list[dict[str, Any]]") -> "set[str]":
-    """Pool projects that hold at least one unbilled-plan (playtester) database.
-
-    Decided on the stored plan, not the entitlement: a playtester past its end
-    date still has a database in the pool and still uses it.
-    """
-    return {
-        t["neon_project_id"]
-        for t in tenants
-        if t.get("neon_project_id") and is_unbilled_plan(t.get("plan"))
-    }
-
-
-def _log_pool_not_attributable(tenant: dict[str, Any], neon_project_id: str) -> None:
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
-        "Pool usage not attributable, tenant skipped: a playtester shares the pool "
-        "project (tenant=%s plan=%s pool=%s)",
-        tenant.get("email", ""), tenant.get("plan"), neon_project_id,
-    )
-
-
 async def _send_overage_email(
     email: str,
     subject: str,
@@ -2557,16 +2514,16 @@ async def run_overage_check(db: Any) -> None:
     Reset: columns are reset to 0 each month via overage_reset_at.
 
     An unbilled plan (playtester, see plans.py) is judged by the same Pro
-    ceilings but is never metered and never throttled (the throttle is a
-    per-pool Neon setting and would land on its pool mates): it gets the
-    warning at the Pro threshold, and past the grace allowance the tenant and
-    the owner are told, once a month. Its Neon API key follows the pool
-    registry; every other tenant is polled with its plan's key, as before.
+    ceilings but is never metered and never throttled (it has no budget to bill
+    instead): it gets the warning at the Pro threshold, and past the grace
+    allowance the tenant and the owner are told, once a month. Its Neon API key
+    follows the pool registry; every other tenant is polled with its plan's
+    key, as before.
 
-    Neon reports usage per pool project, so a billed tenant whose pool also
-    holds a playtester is skipped (logged): its share of the pool total cannot
-    be told from the playtester's, and judging it on the total would bill or
-    throttle it for the playtester's usage.
+    A playtester is kept out of shared pools by construction (the plan is only
+    granted on a project of its own, see ``db.require_dedicated_pool``), so
+    Neon's per-project figure is its own and no other tenant is treated any
+    differently because a playtester exists.
 
     A tenant whose consumption Neon will not return is logged and skipped.
     """
@@ -2582,7 +2539,6 @@ async def run_overage_check(db: Any) -> None:
 
     tenants = await db_module.list_tenants_with_neon(db)
     pool_tiers = await _pool_tiers_by_project(db)
-    playtester_pools = _pools_with_unbilled_tenants(tenants)
 
     for tenant in tenants:
         email = tenant.get("email", "")
@@ -2626,26 +2582,6 @@ async def run_overage_check(db: Any) -> None:
             except (ValueError, AttributeError):
                 pass
 
-        if not unbilled and neon_project_id in playtester_pools:
-            # Consumption is per pool project: with a playtester in it this
-            # tenant's share cannot be told from the playtester's, and judging
-            # it on the total would bill or throttle it for someone else's usage.
-            _log_pool_not_attributable(tenant, neon_project_id)
-            # A paying tenant going unmetered must not be silent: tell the owner,
-            # once a month.
-            if await _claim_playtester_notice(db, tenant, "pool_skip", now):
-                import html as _html
-                await _send_owner_alert(
-                    f"[Meridian] Paying tenant not metered, a playtester shares its pool: {email}",
-                    f"<p>Overage for <strong>{_html.escape(email)}</strong> ({_html.escape(str(plan))}) "
-                    "is not being metered, warned or throttled while a playtester's database is in "
-                    "the same Neon pool project: usage is reported per pool, so the two cannot be "
-                    "told apart. It resumes when the playtester plan is revoked or one of the two "
-                    "is in another pool.</p>",
-                )
-            continue
-        shared_pool = unbilled and _pool_has_billed_neighbours(tenants, tenant)
-
         # Fetch Neon consumption for current billing month
         raw = await _fetch_neon_consumption(neon_project_id, api_key, month_start, now_iso)
         if not raw:
@@ -2682,21 +2618,15 @@ async def run_overage_check(db: Any) -> None:
             charge = overage_hours * COMPUTE_OVERAGE_RATE
 
             if unbilled:
-                # Never metered and never throttled: the throttle is a per-pool
-                # Neon setting that would land on every tenant sharing the pool,
-                # and this plan has no budget to bill instead. The bound is the
-                # Pro table: the tenant and the owner are told, and Neon's own
-                # pool quota is the hard stop behind that.
+                # Never metered and never throttled: this plan has no budget to
+                # bill instead. The bound is the Pro table: the tenant and the
+                # owner are told, and the quota of the playtester's own Neon
+                # project is the hard stop behind that.
                 await _notify_playtester_over_ceiling(
-                    db, tenant, "compute", now, shared_pool=shared_pool,
+                    db, tenant, "compute", now,
                     detail=(
                         f"{cu_used:.1f} CU-hours this month (ceiling {cu_limit:.0f} + "
                         f"{limits['grace_cu_hours']:.0f} grace). Nothing was billed or throttled."
-                        + (
-                            " The pool is shared with paying tenants, so this is the pool's "
-                            "usage, not necessarily the playtester's."
-                            if shared_pool else ""
-                        )
                     ),
                     subject="Meridian: compute limit reached",
                     html=(
@@ -2736,7 +2666,7 @@ async def run_overage_check(db: Any) -> None:
         elif unbilled and cu_used >= cu_limit:
             # Grace period for a playtester: one warning a month, no budget to set.
             await _notify_playtester_warning(
-                db, tenant, now, shared_pool=shared_pool,
+                db, tenant, now,
                 subject="Meridian: compute approaching limit",
                 html=(
                     f"<p>You've used <strong>{cu_used:.1f} of {cu_limit:.0f} CU-hours</strong> "
@@ -2770,15 +2700,10 @@ async def run_overage_check(db: Any) -> None:
                 # The storage path has no write-refusal step for any tenant, so
                 # for a playtester the bound is: tell them, tell the owner.
                 await _notify_playtester_over_ceiling(
-                    db, tenant, "storage", now, shared_pool=shared_pool,
+                    db, tenant, "storage", now,
                     detail=(
                         f"{gb_used:.2f} GB stored (limit {gb_limit:.1f} GB); nothing is billed "
                         "and no write refusal exists on this path."
-                        + (
-                            " The pool is shared with paying tenants, so this is the pool's "
-                            "storage, not necessarily the playtester's."
-                            if shared_pool else ""
-                        )
                     ),
                     subject="Meridian: storage limit exceeded",
                     html=(

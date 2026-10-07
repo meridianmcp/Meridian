@@ -16,6 +16,11 @@ Guard rails, each a refusal rather than a silent fix:
   comes from here and an ``admin`` tenant is never changed here;
 * ``playtester`` is refused for a tenant with a Stripe customer, because the plan
   means "never charged" and a live subscription would keep charging;
+* ``playtester`` is refused for a tenant whose database is in a Neon pool project
+  other tenants use (``plans.SharedPoolError``, answered 409 with what to do
+  first): Neon reports usage per project, so a playtester is only ever on a
+  project of its own. A tenant with no database yet, or alone in its project,
+  passes; revoking is never refused. The preview reports the refusal too;
 * an end date is only accepted for ``playtester`` and must lie in the future (a
   past one would be a revocation in disguise).
 
@@ -38,7 +43,7 @@ from . import db as db_module
 from .plans import (
     OPERATOR_SETTABLE_PLANS,
     PLAYTESTER,
-    UNBILLED_PLANS,
+    SharedPoolError,
     plan_label,
 )
 
@@ -87,24 +92,6 @@ def normalise_end_date(raw: Any, *, now: "datetime | None" = None) -> str:
 
 def _row(tenant: Any) -> dict[str, Any]:
     return tenant if isinstance(tenant, dict) else {k: tenant[k] for k in tenant.keys()}
-
-
-async def _billed_pool_neighbours(db: Any, tenant: dict[str, Any]) -> int:
-    """Other paying tenants whose database is in this tenant's Neon pool project."""
-    pool = tenant.get("neon_project_id")
-    if not pool:
-        return 0
-    unbilled = ", ".join(f"'{p}'" for p in sorted(UNBILLED_PLANS))
-    async with db.execute(
-        "SELECT COUNT(*) AS n FROM tenants WHERE neon_project_id = ? AND id != ? "
-        "AND (is_internal IS NULL OR is_internal = 0) "
-        f"AND (plan IS NULL OR plan NOT IN ({unbilled}))",
-        (pool, tenant["id"]),
-    ) as cur:
-        found = await cur.fetchone()
-    if not found:
-        return 0
-    return int((found["n"] if hasattr(found, "keys") else found[0]) or 0)
 
 
 async def set_tenant_plan_by_email(
@@ -158,6 +145,13 @@ async def set_tenant_plan_by_email(
             "this tenant has a Stripe customer: cancel the subscription first, "
             "a playtester is never charged",
         )
+    if plan == PLAYTESTER:
+        # Checked for a preview and for an unchanged plan too, so the operator
+        # hears about a shared project before anything is written.
+        try:
+            await db_module.require_dedicated_pool(db, current["id"], current.get("neon_project_id"))
+        except SharedPoolError as exc:
+            raise PlanChangeError(409, str(exc)) from exc
 
     stored_end = current.get("inactivity_expires_at") or None
     internal_before = bool(current.get("is_internal"))
@@ -182,7 +176,6 @@ async def set_tenant_plan_by_email(
     internal_after = internal_before and not clear_internal
     changed = bool(updates) or internal_after != internal_before
 
-    neighbours = await _billed_pool_neighbours(db, current)
     warnings: list[str] = []
     if plan == PLAYTESTER:
         if internal_after:
@@ -190,16 +183,10 @@ async def set_tenant_plan_by_email(
                 "the tenant is still is_internal (staff): every usage and lifecycle job skips "
                 "it, so no ceiling applies; clear it with is_internal=false"
             )
-        if neighbours:
-            warnings.append(
-                f"{neighbours} paying tenant(s) share this tenant's database pool: while a "
-                "playtester is in it they are not metered, warned or throttled for pool "
-                "usage, because it cannot be told apart"
-            )
         if not current.get("neon_project_id"):
             warnings.append(
-                "the tenant has no database yet; it is provisioned in the Pro pool when the "
-                "first project is created"
+                "the tenant has no database yet; it is created in a Neon project of its own "
+                "when the first project is created"
             )
 
     result: dict[str, Any] = {
@@ -212,7 +199,6 @@ async def set_tenant_plan_by_email(
         "expires_at": end_after,
         "is_internal_before": internal_before,
         "is_internal": internal_after,
-        "billed_pool_neighbours": neighbours,
         "changed": changed,
         "applied": False,
         "warnings": warnings,
@@ -221,7 +207,10 @@ async def set_tenant_plan_by_email(
         return result
 
     if updates:
-        await db_module.update_tenant(db, current["id"], **updates)
+        try:
+            await db_module.update_tenant(db, current["id"], **updates)
+        except SharedPoolError as exc:  # a pool mate arrived since the check above
+            raise PlanChangeError(409, str(exc)) from exc
     if internal_after != internal_before:
         await db.execute("UPDATE tenants SET is_internal = 0 WHERE id = ?", (current["id"],))
         await db.commit()
