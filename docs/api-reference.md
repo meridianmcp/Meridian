@@ -402,7 +402,7 @@ Move to another version while staying pending (what the dashboard's arrow button
 
 Bulk move. Body: `{"item_ids": [...], "next": true}` or `{"item_ids": [...], "to_version": "v2.5"}` (at most 100 ids). Each item is moved independently; the response lists one outcome per id.
 
-> Agents: `update_sprint_item(version=...)` (the MCP twin of `PATCH /projects/{project_id}/sprint-items/{item_id}`) also re-versions a single item and keeps it pending, but it is a bare field edit, not this move: it does not work out a next version, does not carry subtasks along (a parent can end up in a newer version than its subtasks), writes no `sprint_item_version_moved` history entry and publishes no live event. The MCP `push_sprint_item` tool is the deferral above.
+> Agents: `update_sprint_item(version=...)` (the MCP twin of `PATCH /projects/{project_id}/sprint-items/{item_id}`) also re-versions a single item and keeps it pending, but it is a bare field edit, not this move: it does not work out a next version, does not carry subtasks along (a parent can end up in a newer version than its subtasks), writes no `sprint_item_version_moved` history entry (open dashboards still repaint, as for any edit). The MCP `push_sprint_item` tool is the deferral above.
 
 ### `DELETE /projects/{project_id}/sprint-items/{item_id}`
 

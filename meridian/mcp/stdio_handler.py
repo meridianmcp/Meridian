@@ -1977,7 +1977,7 @@ def build_mcp_server():
                     "version' it does not work out the next number for you, does "
                     "not carry the item's subtasks along (they stay in the old "
                     "version unless you re-version them too), writes no "
-                    "version-move history entry and publishes no live event."
+                    "version-move history entry (open dashboards still repaint, as for any edit)."
                 ),
                 inputSchema={
                     "type": "object",

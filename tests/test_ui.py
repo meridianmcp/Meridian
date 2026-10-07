@@ -167,7 +167,7 @@ def test_every_sprint_mutation_handler_repaints_all_sprint_views(js):
     """8a665a03 -- complete/skip/fail/push/edit/notes/resources/feedback/add all end in the
     shared repaint, never a Live-only refresh."""
     for name in (
-        "sprintAction", "sprintPushPrompt", "sprintResetPending", "sprintFeedback",
+        "sprintAction", "sprintResetPending", "sprintFeedback",
         "sprintFeedbackNote", "sprintItemEdit", "sprintItemNotesEdit",
         "sprintItemResourcesEdit", "addSprintItemFromInput",
     ):
@@ -175,6 +175,19 @@ def test_every_sprint_mutation_handler_repaints_all_sprint_views(js):
         assert m, f"{name} impl missing"
         assert "refreshSprintSurfaces(" in m.group(0), f"{name} must repaint through refreshSprintSurfaces"
         assert "refreshLiveTab(" not in m.group(0), f"{name} refreshes only the Live tab"
+
+    # 0c30b989 -- the arrow button's move/defer flow lives in dashboard-sprint-move.ts, which
+    # repaints the Live board, the Queue and the Goal board itself (its own vitest pins that).
+    # Here: the inline-onclick entry point must hand straight to it, and the glue must be wired
+    # to all three real loaders, so a move can never leave one of those views stale.
+    m = re.search(r"async function sprintPushPrompt\(.*?\n\}", js, re.S)
+    assert m, "sprintPushPrompt impl missing"
+    assert "_sprintMoveActions.sprintPushPrompt(" in m.group(0)
+    assert "refreshLiveTab(" not in m.group(0)
+    wiring = js[js.index("const _sprintMoveActions = createSprintMoveActions({"):]
+    wiring = wiring[: wiring.index("});")]
+    for loader in ("refreshLiveTab(projectId)", "loadQueue(projectId)", "_sprintBoardReloaders[projectId]"):
+        assert loader in wiring, f"the move actions must be wired to {loader}"
 
 
 def test_notes_tab_has_cursor_load_more(js):

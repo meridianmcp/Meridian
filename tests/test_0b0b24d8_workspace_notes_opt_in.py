@@ -1390,6 +1390,18 @@ def test_session_close_auto_save_scopes_delta_to_the_closed_session(
 # without the ownership.
 
 
+def _minutes_ago(db, minutes: int) -> str:
+    """SQL for "N minutes ago" as a value for handoffs.created_at.
+
+    handoffs.created_at is TIMESTAMPTZ on Postgres, while the adapter rewrites
+    datetime('now', ...) to a formatted TEXT expression, which Postgres refuses to assign
+    to it (DatatypeMismatch -- caught by the Postgres CI job, invisible on SQLite). The
+    same ``hasattr(db, "_pool")`` switch db.record_handoff uses picks the native form."""
+    if hasattr(db, "_pool"):
+        return f"now() - interval '{int(minutes)} minutes'"
+    return f"datetime('now', '-{int(minutes)} minutes')"
+
+
 async def _complete(db, pid: str, title: str, offset: str) -> dict:
     """A done item whose completed_at is ``offset`` from now ('-120 minutes')."""
     item = await db_module.add_sprint_item(db, pid, "v1", title, force=True)
@@ -1519,7 +1531,7 @@ async def test_window_session_id_bounds_by_the_sessions_last_handoff_not_just_it
     )
     row = await db_module.record_handoff(db, pid, "delta", "an earlier handoff", sid)
     await db.execute(
-        "UPDATE handoffs SET created_at = datetime('now', '-30 minutes') WHERE id = ?",
+        f"UPDATE handoffs SET created_at = {_minutes_ago(db, 30)} WHERE id = ?",
         (row["id"],),
     )
     await db.commit()
@@ -2063,7 +2075,7 @@ async def _session_with_an_unconsumed_goal_handoff(db, tmp_path, pid: str) -> st
         (sid,),
     )
     await db.execute(
-        "UPDATE handoffs SET created_at = datetime('now', '-200 minutes') "
+        f"UPDATE handoffs SET created_at = {_minutes_ago(db, 200)} "
         "WHERE session_id = ?",
         (sid,),
     )

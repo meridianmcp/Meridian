@@ -617,12 +617,15 @@ async def test_update_sprint_item_version_is_not_the_full_move(db, monkeypatch):
       * does NOT carry subtasks along, so a parent can end up ahead of its own
         children (the state the move exists to prevent),
       * writes NO sprint_item_version_moved history entry,
-      * publishes NO live event and does NOT bust the per-project sprint cache.
+      * does NOT work out a next version number.
 
-    These are pinned so the description in stdio_handler.py and the note in
+    Like every other edit it DOES announce itself (a plain sprint_item_updated
+    event) and refreshes the per-project sprint cache: since the live-refresh work
+    (8a665a03) patch_sprint_item publishes and busts the cache, so open dashboards
+    repaint. These are pinned so the description in stdio_handler.py and the note in
     docs/api-reference.md cannot drift back into claiming the two are the same.
-    If patch_sprint_item is ever taught to do any of this, update that wording
-    in the same change and flip the matching assertion here."""
+    If patch_sprint_item is ever taught the rest, update that wording in the same
+    change and flip the matching assertion here."""
     from meridian.mcp.handlers.sprint_tools import handle_update_sprint_item
 
     events = []
@@ -643,9 +646,10 @@ async def test_update_sprint_item_version_is_not_the_full_move(db, monkeypatch):
     assert out["version"] == "v8.0"
     assert (await db_module.get_sprint_item(db, child["id"]))["version"] == "v7.0"
     assert await _moves(db, p1["id"]) == []
-    assert events == []
-    stale = {i["id"]: i["version"] for i in await db_module.get_sprint_items_cached(db, p1["id"])}
-    assert stale[parent["id"]] == "v7.0"  # cached list still shows the old version
+    assert events == ["sprint_item_updated"]  # live-refresh (8a665a03): every mutation announces itself
+    cached = {i["id"]: i["version"] for i in await db_module.get_sprint_items_cached(db, p1["id"])}
+    assert cached[parent["id"]] == "v8.0"  # the cache is refreshed like for any edit
+    assert cached[child["id"]] == "v7.0"  # ...but the subtask is still left behind
 
     # Via the real move: the subtask goes with it, history and event are written,
     # and the cache is fresh.
