@@ -92,8 +92,18 @@ async def run(base_url: str) -> None:
             await page.screenshot(path=str(SCREENSHOTS_DIR / "demo_session.png"))
             print("  demo_session.png -> saved")
 
+            # The rail starts with every group collapsed except the active tab's, and
+            # a Playwright click waits for visibility: open a tab's group first.
+            reveal_group_js = (
+                "(tab) => { const b = document.querySelector('.vtab-btn[data-vtab=\"' + tab + '\"]');"
+                " const g = b && b.closest('.vtab-group');"
+                " if (g && g.classList.contains('collapsed')) {"
+                " const h = g.querySelector('.vtab-group-header'); if (h) h.click(); } }"
+            )
+
             # Queue tab
             try:
+                await page.evaluate(reveal_group_js, "queue")
                 await page.locator('[data-vtab="queue"], button[title*="Queue"]').first.click(timeout=5_000)
                 await asyncio.sleep(2.0)
             except Exception:
@@ -103,6 +113,7 @@ async def run(base_url: str) -> None:
 
             # HITL tab
             try:
+                await page.evaluate(reveal_group_js, "hitl")
                 await page.locator('[data-vtab="hitl"], button[title*="HITL"]').first.click(timeout=5_000)
                 await asyncio.sleep(1.5)
             except Exception:

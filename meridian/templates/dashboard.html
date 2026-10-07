@@ -122,7 +122,11 @@ if ('serviceWorker' in navigator) {
     <div id="hitl-panel" style="display:none;background:var(--surface-2);border-bottom:1px solid var(--border);padding:12px 14px;max-height:40vh;overflow-y:auto;flex-shrink:0">
       <div id="hitl-list"></div>
     </div>
-    <div class="tabs" id="tabs"></div>
+    <!-- 90952bad — top bar: dashboard-waffle.ts inserts the waffle launcher button
+         as this container's first child, left of the project tabs. -->
+    <div class="topbar" id="topbar">
+      <div class="tabs" id="tabs"></div>
+    </div>
     <div class="tab-bodies" id="tab-bodies">
       <div class="empty">no project open — pick one on the left</div>
     </div>

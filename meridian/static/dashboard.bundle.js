@@ -2531,11 +2531,11 @@
     const info = status && status.config_generation && status.config_generation.default;
     const formatted = formatTunnelConfigGenerationStatus(info);
     if (formatted.tone !== "warn") return;
-    const esc = window.escapeHtml || String;
+    const esc2 = window.escapeHtml || String;
     const banner = document.createElement("div");
     banner.id = bannerId;
     banner.style.cssText = "margin-top:18px;padding:8px 10px;border-radius:4px;font-size:10px;line-height:1.5;background:#f59e0b1a;border:1px solid #f59e0b55";
-    banner.innerHTML = `<strong style="color:#f59e0b">${esc(formatted.label)}</strong><div style="margin-top:3px;color:var(--muted)">${esc(formatted.detail)}</div>`;
+    banner.innerHTML = `<strong style="color:#f59e0b">${esc2(formatted.label)}</strong><div style="margin-top:3px;color:var(--muted)">${esc2(formatted.detail)}</div>`;
     const section = document.getElementById(`tunnel-plugins-section-${projectId}`);
     if (section && section.parentElement === host) {
       host.insertBefore(banner, section);
@@ -2550,8 +2550,8 @@
     return slug;
   }
   function _execTurnsNumberInputHtml(field, projectId, value, min, max, step) {
-    const esc = window.escapeHtml || String;
-    return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
+    const esc2 = window.escapeHtml || String;
+    return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc2(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
   }
   window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
   var DEFAULT_PARALLELISM_TARGET = 4;
@@ -2559,8 +2559,8 @@
   function claudeRcWatcherBlurb() {
     return "For <code>claude --rc</code> (headless) mode, where SessionStart hooks don't fire \u2014 installs a background watcher that fires the hook per session.";
   }
-  function codexSetupBlurb(mcpHttpUrl, esc) {
-    return `Add to <code>~/.codex/config.toml</code>, or run <code>codex mcp add meridian ${esc(mcpHttpUrl)}</code>.`;
+  function codexSetupBlurb(mcpHttpUrl, esc2) {
+    return `Add to <code>~/.codex/config.toml</code>, or run <code>codex mcp add meridian ${esc2(mcpHttpUrl)}</code>.`;
   }
   function _applySettingsRoleVisibility(projectId, guest) {
     if (!guest) return;
@@ -9757,10 +9757,17 @@ ${n2.tags || ""}`.toLowerCase();
   var createStore = ((createState) => createState ? createStoreImpl(createState) : createStoreImpl);
 
   // meridian/static/dashboard-tabgroups.ts
+  var VTAB_GROUPS_COLLAPSED_BY_DEFAULT = true;
+  var ACCORDION_ATTR = "data-vaccordion";
+  var USER_OPEN_ATTR = "data-vuser-open";
   var VTAB_GROUPS = [
     { id: "overview", label: "Overview", tabs: ["status", "live"] },
     { id: "planning", label: "Planning", tabs: ["goal", "insights", "blog"] },
-    { id: "work", label: "Work", tabs: ["queue", "hitl", "team", "sessions"] },
+    // 'experiments' was added to the rail after the grouping shipped and was never
+    // listed here, so groupForTab() returned null for it and revealGroupForTab()
+    // could not expand its group. With groups collapsed by default that would
+    // leave an active Experiments tab invisible in the rail (90952bad).
+    { id: "work", label: "Work", tabs: ["queue", "experiments", "hitl", "team", "sessions"] },
     { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
     { id: "history", label: "History", tabs: ["timeline", "rewind", "settings"] }
   ];
@@ -9772,28 +9779,774 @@ ${n2.tags || ""}`.toLowerCase();
     }
     return null;
   }
-  function wireVtabGroups(stripEl) {
-    const setExpanded = (groupEl, expanded) => {
-      groupEl.classList.toggle("collapsed", !expanded);
-      const header = groupEl.querySelector(".vtab-group-header");
-      if (header) header.setAttribute("aria-expanded", String(expanded));
-      const tabs = groupEl.querySelector(".vtab-group-tabs");
-      if (tabs) tabs.style.display = expanded ? "flex" : "none";
-    };
+  function setGroupExpanded(groupEl, expanded) {
+    groupEl.classList.toggle("collapsed", !expanded);
+    const header = groupEl.querySelector(".vtab-group-header");
+    if (header) header.setAttribute("aria-expanded", String(expanded));
+    const tabs = groupEl.querySelector(".vtab-group-tabs");
+    if (tabs) tabs.style.display = expanded ? "flex" : "none";
+  }
+  function revealGroupInStrip(stripEl, tab) {
+    const groupId = groupForTab(tab);
+    if (!groupId) return;
+    const groupEl = stripEl.querySelector(`.vtab-group[data-vgroup="${groupId}"]`);
+    if (!groupEl) return;
+    setGroupExpanded(groupEl, true);
+    const strip = stripEl;
+    if (typeof strip.hasAttribute === "function" && strip.hasAttribute(ACCORDION_ATTR)) {
+      stripEl.querySelectorAll(".vtab-group").forEach((other) => {
+        if (other === groupEl || other.hasAttribute(USER_OPEN_ATTR)) return;
+        if (!other.classList.contains("collapsed")) setGroupExpanded(other, false);
+      });
+    }
+  }
+  function wireVtabGroups(stripEl, opts = {}) {
+    const collapseByDefault = opts.collapseByDefault ?? VTAB_GROUPS_COLLAPSED_BY_DEFAULT;
     stripEl.querySelectorAll(".vtab-group-header").forEach((header) => {
       header.onclick = () => {
         const groupEl = header.closest(".vtab-group");
         if (!groupEl) return;
-        setExpanded(groupEl, groupEl.classList.contains("collapsed"));
+        const willExpand = groupEl.classList.contains("collapsed");
+        setGroupExpanded(groupEl, willExpand);
+        if (willExpand) groupEl.setAttribute(USER_OPEN_ATTR, "1");
+        else groupEl.removeAttribute(USER_OPEN_ATTR);
       };
     });
-    const revealGroupForTab = (tab) => {
-      const groupId = groupForTab(tab);
-      if (!groupId) return;
-      const groupEl = stripEl.querySelector(`.vtab-group[data-vgroup="${groupId}"]`);
-      if (groupEl) setExpanded(groupEl, true);
-    };
+    if (collapseByDefault) {
+      stripEl.setAttribute(ACCORDION_ATTR, "1");
+      const activeTab = stripEl.querySelector(".vtab-btn.active")?.dataset.vtab;
+      const activeGroup = groupForTab(activeTab);
+      stripEl.querySelectorAll(".vtab-group").forEach((groupEl) => {
+        setGroupExpanded(groupEl, groupEl.getAttribute("data-vgroup") === activeGroup);
+      });
+    }
+    const revealGroupForTab = (tab) => revealGroupInStrip(stripEl, tab);
     return { revealGroupForTab };
+  }
+
+  // meridian/static/dashboard-waffle.ts
+  var WAFFLE_TABS = [
+    { id: "status", label: "Status", icon: "status", keywords: ["overview", "active sessions", "health"] },
+    { id: "live", label: "Live", icon: "live", keywords: ["right now", "in progress", "parallel", "waves"] },
+    { id: "goal", label: "Goal", icon: "goal", keywords: ["north star", "target", "targets", "version", "sprint", "focus", "decisions"] },
+    { id: "insights", label: "Insights", icon: "insights", keywords: ["strategy", "understanding", "ideas"] },
+    { id: "blog", label: "Blog", icon: "blog", keywords: ["posts", "drafts", "publish", "writing"] },
+    { id: "queue", label: "Queue", icon: "queue", keywords: ["active work", "sprint items", "todo", "backlog", "tasks"] },
+    { id: "experiments", label: "Experiments", icon: "experiments", keywords: ["trials", "runs", "registry", "research"] },
+    { id: "hitl", label: "HITL", icon: "hitl", keywords: ["review", "approvals", "questions", "human in the loop", "researcher"] },
+    { id: "team", label: "Team", icon: "team", keywords: ["people", "humans", "members", "activity"] },
+    { id: "sessions", label: "Sessions", icon: "sessions", keywords: ["run history", "runs", "history"] },
+    { id: "files", label: "Files", icon: "files", keywords: ["repo", "code", "browse", "folders"] },
+    { id: "notes", label: "Notes", icon: "notes", keywords: ["wiki", "memory", "write"] },
+    { id: "devlog", label: "Dev log", icon: "devlog", keywords: ["tasks", "log", "journal", "terminal"] },
+    { id: "documents", label: "Documents", icon: "documents", keywords: ["ingested", "structure", "word", "pdf", "docx"] },
+    { id: "docs", label: "Tool docs", icon: "docs", keywords: ["mcp", "tool reference", "reference", "manual"] },
+    { id: "codeintel", label: "Code intel", icon: "codeintel", keywords: ["codebase", "index", "architecture", "graph", "symbols"] },
+    { id: "timeline", label: "Timeline", icon: "timeline", keywords: ["activity", "history", "swimlane", "events"] },
+    { id: "rewind", label: "Rewind", icon: "rewind", keywords: ["last days", "charts", "history", "replay"] },
+    { id: "settings", label: "Settings", icon: "settings", keywords: ["notifications", "hooks", "integrations", "config", "preferences"] }
+  ];
+  var WAFFLE_DEFAULT_RANK = [
+    "goal",
+    "notes",
+    "insights",
+    "queue",
+    "live",
+    "hitl",
+    "status",
+    "timeline",
+    "team",
+    "experiments",
+    "documents",
+    "docs",
+    "files",
+    "codeintel",
+    "devlog",
+    "rewind",
+    "blog",
+    "sessions",
+    "settings"
+  ];
+  var WAFFLE_DEFAULT_PINS = ["goal", "notes", "insights"];
+  var WAFFLE_USAGE_THRESHOLD = 25;
+  var WAFFLE_RECENT_MAX = 3;
+  var WAFFLE_COLUMNS = 3;
+  var WAFFLE_SUBTABS = [
+    { id: "north-star", parent: "goal", label: "North Star", keywords: ["vision", "target", "targets"] },
+    { id: "version-goal", parent: "goal", label: "Version Goal", keywords: ["milestone", "release", "target", "targets"] },
+    { id: "sprint", parent: "goal", label: "Current Focus", keywords: ["sprint", "now", "target", "targets"] },
+    { id: "decisions", parent: "goal", label: "Decisions", keywords: ["pinned", "constitution", "decide", "log"] }
+  ];
+  var ICON_PATHS = {
+    status: '<polyline points="3 12 7 12 9.5 6 14.5 18 17 12 21 12"/>',
+    live: '<path d="M13 3 6 13.5h5.5L10.5 21 18 10.5h-5.5z"/>',
+    goal: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/>',
+    insights: '<path d="M9.5 17.5h5"/><path d="M10.5 20.5h3"/><path d="M12 3.5a5.5 5.5 0 0 0-3.2 10c.7.5 1.2 1.3 1.2 2.2v1.8h4v-1.8c0-.9.5-1.7 1.2-2.2A5.5 5.5 0 0 0 12 3.5z"/>',
+    blog: '<path d="M4 20l.8-4L16.2 4.6a2 2 0 0 1 2.8 2.8L7.6 18.8z"/><path d="M14.5 6.4l3.1 3.1"/>',
+    queue: '<path d="M9 6.5h11M9 12h11M9 17.5h11"/><circle cx="4.8" cy="6.5" r=".9" fill="currentColor"/><circle cx="4.8" cy="12" r=".9" fill="currentColor"/><circle cx="4.8" cy="17.5" r=".9" fill="currentColor"/>',
+    experiments: '<path d="M9.5 3.5h5"/><path d="M10.5 3.5v5.2L5 18.6a1.6 1.6 0 0 0 1.4 2.4h11.2a1.6 1.6 0 0 0 1.4-2.4l-5.5-9.9V3.5"/><path d="M7.8 15h8.4"/>',
+    hitl: '<circle cx="12" cy="12" r="8.5"/><path d="M9.7 9.6a2.4 2.4 0 1 1 3.4 2.2c-.7.4-1.1.9-1.1 1.7"/><circle cx="12" cy="16.6" r=".9" fill="currentColor"/>',
+    team: '<circle cx="9" cy="8.5" r="3"/><path d="M3.5 19.5a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="9.5" r="2.3"/><path d="M16.2 14.2a4.6 4.6 0 0 1 4.8 4.3"/>',
+    sessions: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+    files: '<path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.2h7a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
+    notes: '<path d="M5 4.5h14v10l-5.5 5.5H5z"/><path d="M13.5 20v-5.5H19"/><path d="M8.5 9h7M8.5 12.5h4"/>',
+    devlog: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M7.5 10l3 2.2-3 2.2M12.5 15h4"/>',
+    documents: '<path d="M6.5 3.5h7.5l4.5 4.5v12.5h-12z"/><path d="M14 3.5V8h4.5"/><path d="M9.2 12.5h5.6M9.2 16h5.6"/>',
+    docs: '<path d="M3.5 6c2.6-1.1 5.6-.9 8.5.9 2.9-1.8 5.9-2 8.5-.9v12.5c-2.6-1.1-5.6-.9-8.5.9-2.9-1.8-5.9-2-8.5-.9z"/><path d="M12 6.9v12.5"/>',
+    codeintel: '<path d="M8.5 8l-4 4 4 4M15.5 8l4 4-4 4M13.3 6.5l-2.6 11"/>',
+    timeline: '<path d="M7 4.5v15"/><circle cx="7" cy="6.5" r="1.7"/><circle cx="7" cy="12" r="1.7"/><circle cx="7" cy="17.5" r="1.7"/><path d="M11.5 6.5H20M11.5 12H17M11.5 17.5H19"/>',
+    rewind: '<path d="M4.5 12a7.5 7.5 0 1 0 2.4-5.5"/><path d="M4.2 4.5v3.9h3.9"/><path d="M12 8.5V12l2.4 1.6"/>',
+    settings: '<path d="M4 7h9M18 7h2M4 17h2M11 17h9"/><circle cx="15.5" cy="7" r="2.3"/><circle cx="8.5" cy="17" r="2.3"/>',
+    generic: '<rect x="4" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5"/>'
+  };
+  function waffleIconSvg(name, size = 20) {
+    const body = ICON_PATHS[name] ?? ICON_PATHS.generic;
+    return `<svg class="waffle-icon" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${body}</svg>`;
+  }
+  function waffleGlyphSvg() {
+    const dots = [];
+    for (const cy of [6, 12, 18]) {
+      for (const cx of [6, 12, 18]) dots.push(`<circle cx="${cx}" cy="${cy}" r="1.9"/>`);
+    }
+    return `<svg class="waffle-glyph" viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true" focusable="false">${dots.join("")}</svg>`;
+  }
+  function pinSvg(filled) {
+    return `<svg class="waffle-pin-icon" viewBox="0 0 24 24" width="13" height="13" fill="${filled ? "currentColor" : "none"}" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 21v-6"/><path d="M8 4h8l-1.2 5.4L18 13v2H6v-2l3.2-3.6z"/></svg>`;
+  }
+  function searchSvg() {
+    return `<svg class="waffle-search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></svg>`;
+  }
+  function emptyState() {
+    return { pins: null, usage: {}, recent: [] };
+  }
+  var MAX_RECENT_KEPT = 8;
+  var MAX_USAGE_KEYS = 64;
+  var MAX_COUNT = 1e6;
+  function cleanId(v3) {
+    return typeof v3 === "string" && v3.length > 0 && v3.length <= 40 && /^[\w.-]+$/.test(v3) ? v3 : null;
+  }
+  function uniqueIds(list) {
+    const seen = /* @__PURE__ */ new Set();
+    const out = [];
+    for (const item of list) {
+      const id = cleanId(item);
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        out.push(id);
+      }
+    }
+    return out;
+  }
+  function parseState(raw) {
+    const out = emptyState();
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+    const r3 = raw;
+    if (Array.isArray(r3.pins)) out.pins = uniqueIds(r3.pins).slice(0, 64);
+    if (r3.usage && typeof r3.usage === "object" && !Array.isArray(r3.usage)) {
+      let kept = 0;
+      for (const [k3, v3] of Object.entries(r3.usage)) {
+        const id = cleanId(k3);
+        const n2 = Number(v3);
+        if (id && Number.isFinite(n2) && n2 > 0 && kept < MAX_USAGE_KEYS) {
+          out.usage[id] = Math.min(Math.floor(n2), MAX_COUNT);
+          kept += 1;
+        }
+      }
+    }
+    if (Array.isArray(r3.recent)) out.recent = uniqueIds(r3.recent).slice(0, MAX_RECENT_KEPT);
+    return out;
+  }
+  function safeLocalStorage() {
+    try {
+      return typeof window !== "undefined" && window.localStorage ? window.localStorage : null;
+    } catch {
+      return null;
+    }
+  }
+  function loadState(storage, key) {
+    if (!storage) return emptyState();
+    try {
+      const raw = storage.getItem(key);
+      return raw ? parseState(JSON.parse(raw)) : emptyState();
+    } catch {
+      return emptyState();
+    }
+  }
+  function saveState(storage, key, state2) {
+    if (!storage) return;
+    try {
+      storage.setItem(key, JSON.stringify({ v: 1, pins: state2.pins, usage: state2.usage, recent: state2.recent }));
+    } catch {
+    }
+  }
+  function effectivePins(state2) {
+    return state2.pins ? [...state2.pins] : [...WAFFLE_DEFAULT_PINS];
+  }
+  function recordUse(state2, tab) {
+    const id = cleanId(tab);
+    if (!id) return state2;
+    return {
+      pins: state2.pins ? [...state2.pins] : null,
+      usage: { ...state2.usage, [id]: Math.min((state2.usage[id] || 0) + 1, MAX_COUNT) },
+      recent: [id, ...state2.recent.filter((t3) => t3 !== id)].slice(0, MAX_RECENT_KEPT)
+    };
+  }
+  function togglePin(state2, tab) {
+    const id = cleanId(tab);
+    if (!id) return state2;
+    const pins = effectivePins(state2);
+    const next = pins.includes(id) ? pins.filter((t3) => t3 !== id) : [...pins, id];
+    return { ...state2, pins: next };
+  }
+  function usageTotal(usage) {
+    let total = 0;
+    for (const n2 of Object.values(usage)) total += n2;
+    return total;
+  }
+  function orderTabs(available, state2, opts = {}) {
+    const rank = opts.rank ?? WAFFLE_DEFAULT_RANK;
+    const threshold = opts.threshold ?? WAFFLE_USAGE_THRESHOLD;
+    const avail = uniqueIds([...available]);
+    const availSet = new Set(avail);
+    const pinned = effectivePins(state2).filter((id, i3, all) => availSet.has(id) && all.indexOf(id) === i3);
+    const pinnedSet = new Set(pinned);
+    const position = (id) => {
+      const i3 = rank.indexOf(id);
+      return i3 >= 0 ? i3 : rank.length + avail.indexOf(id);
+    };
+    const adaptive = usageTotal(state2.usage) >= threshold;
+    const rest = avail.filter((id) => !pinnedSet.has(id));
+    rest.sort((a3, b2) => {
+      if (adaptive) {
+        const byUse = (state2.usage[b2] || 0) - (state2.usage[a3] || 0);
+        if (byUse !== 0) return byUse;
+      }
+      return position(a3) - position(b2);
+    });
+    return { pinned, rest };
+  }
+  function recentTabs(state2, available, pinned, max = WAFFLE_RECENT_MAX) {
+    const availSet = new Set(available);
+    const pinnedSet = new Set(pinned);
+    return state2.recent.filter((id) => availSet.has(id) && !pinnedSet.has(id)).slice(0, max);
+  }
+  var META_BY_ID = new Map(WAFFLE_TABS.map((m3) => [m3.id, m3]));
+  function humanize(id) {
+    const s3 = id.replace(/[^A-Za-z0-9]+/g, " ").trim();
+    return s3 ? s3.charAt(0).toUpperCase() + s3.slice(1) : id;
+  }
+  function metaFor(id, labels) {
+    return META_BY_ID.get(id) ?? { id, label: labels?.[id] || humanize(id), icon: "generic", keywords: [] };
+  }
+  function tokenize(query) {
+    return query.toLowerCase().split(/\s+/).filter(Boolean);
+  }
+  function matchesTokens(haystack, tokens) {
+    const h3 = haystack.toLowerCase();
+    return tokens.every((t3) => h3.includes(t3));
+  }
+  function tabMatches(meta, query) {
+    const tokens = tokenize(query);
+    if (!tokens.length) return true;
+    return matchesTokens(`${meta.label} ${meta.id} ${meta.keywords.join(" ")}`, tokens);
+  }
+  function subMatches(sub, query) {
+    const tokens = tokenize(query);
+    if (!tokens.length) return true;
+    return matchesTokens(`${sub.label} ${sub.id} ${sub.keywords.join(" ")}`, tokens);
+  }
+  function cleanBadge(n2) {
+    const v3 = Number(n2);
+    return Number.isFinite(v3) && v3 > 0 ? Math.floor(v3) : 0;
+  }
+  function buildWaffleModel(input) {
+    const query = (input.query ?? "").trim();
+    const badges = input.badges ?? {};
+    const { pinned, rest } = orderTabs(input.available, input.state, {
+      rank: input.rank,
+      threshold: input.threshold
+    });
+    const pinnedSet = new Set(pinned);
+    const availSet = /* @__PURE__ */ new Set([...pinned, ...rest]);
+    const recent = recentTabs(input.state, [...availSet], pinned);
+    const tabEntry = (id) => {
+      const meta = metaFor(id, input.labels);
+      return {
+        key: `tab:${id}`,
+        kind: "tab",
+        tab: id,
+        label: meta.label,
+        icon: meta.icon,
+        group: groupForTab(id),
+        badge: cleanBadge(badges[id]),
+        pinned: pinnedSet.has(id),
+        active: input.activeTab === id
+      };
+    };
+    const subEntry = (sub) => ({
+      key: `sub:${sub.parent}:${sub.id}`,
+      kind: "sub",
+      tab: sub.parent,
+      sub: sub.id,
+      label: sub.label,
+      icon: metaFor(sub.parent, input.labels).icon,
+      group: groupForTab(sub.parent),
+      badge: 0,
+      pinned: false,
+      active: false
+    });
+    const subsFor = (tab, parentMatched) => WAFFLE_SUBTABS.filter((s3) => s3.parent === tab).filter((s3) => !query || parentMatched || subMatches(s3, query)).map(subEntry);
+    const buildRows = (ids, parentMatched) => {
+      const rows = [];
+      for (let i3 = 0; i3 < ids.length; i3 += WAFFLE_COLUMNS) {
+        const chunk = ids.slice(i3, i3 + WAFFLE_COLUMNS);
+        rows.push({ kind: "tiles", entries: chunk.map(tabEntry) });
+        for (const id of chunk) {
+          const subs = subsFor(id, parentMatched(id));
+          for (let j3 = 0; j3 < subs.length; j3 += WAFFLE_COLUMNS) {
+            rows.push({
+              kind: "subs",
+              parent: id,
+              parentLabel: metaFor(id, input.labels).label,
+              entries: subs.slice(j3, j3 + WAFFLE_COLUMNS)
+            });
+          }
+        }
+      }
+      return rows;
+    };
+    let sections;
+    if (query) {
+      const everyone = [...pinned, ...recent, ...rest.filter((id) => !recent.includes(id))];
+      const matched = everyone.filter((id) => tabMatches(metaFor(id, input.labels), query));
+      const rows = buildRows(matched, () => true);
+      const matchedSet = new Set(matched);
+      for (const tab of new Set(WAFFLE_SUBTABS.map((s3) => s3.parent))) {
+        if (!availSet.has(tab) || matchedSet.has(tab)) continue;
+        const subs = subsFor(tab, false);
+        for (let j3 = 0; j3 < subs.length; j3 += WAFFLE_COLUMNS) {
+          rows.push({
+            kind: "subs",
+            parent: tab,
+            parentLabel: metaFor(tab, input.labels).label,
+            entries: subs.slice(j3, j3 + WAFFLE_COLUMNS)
+          });
+        }
+      }
+      sections = rows.length ? [{ id: "results", label: "Results", rows }] : [];
+    } else {
+      const recentSet = new Set(recent);
+      const allIds = rest.filter((id) => !recentSet.has(id));
+      sections = [];
+      if (pinned.length) sections.push({ id: "pinned", label: "Pinned", rows: buildRows(pinned, () => true) });
+      if (recent.length) sections.push({ id: "recent", label: "Recent", rows: buildRows(recent, () => true) });
+      if (allIds.length) {
+        sections.push({
+          id: "all",
+          label: pinned.length || recent.length ? "All tabs" : "Tabs",
+          rows: buildRows(allIds, () => true)
+        });
+      }
+    }
+    const keys = sections.flatMap((s3) => s3.rows.map((r3) => r3.entries.map((e3) => e3.key)));
+    return { sections, keys, count: keys.reduce((n2, row) => n2 + row.length, 0), query };
+  }
+  function moveFocus(rows, current2, key, ctrl = false) {
+    const flat = rows.flat();
+    if (!flat.length) return null;
+    const r3 = current2 === null ? -1 : rows.findIndex((row) => row.includes(current2));
+    if (r3 < 0) {
+      return ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(key) ? flat[0] : null;
+    }
+    const cur = current2;
+    const c3 = rows[r3].indexOf(cur);
+    const at = flat.indexOf(cur);
+    switch (key) {
+      case "ArrowRight":
+        return flat[Math.min(at + 1, flat.length - 1)];
+      case "ArrowLeft":
+        return flat[Math.max(at - 1, 0)];
+      case "ArrowDown":
+        return r3 + 1 >= rows.length ? cur : rows[r3 + 1][Math.min(c3, rows[r3 + 1].length - 1)];
+      case "ArrowUp":
+        return r3 === 0 ? cur : rows[r3 - 1][Math.min(c3, rows[r3 - 1].length - 1)];
+      case "Home":
+        return ctrl ? flat[0] : rows[r3][0];
+      case "End":
+        return ctrl ? flat[flat.length - 1] : rows[r3][rows[r3].length - 1];
+      default:
+        return null;
+    }
+  }
+  function computePopoverPlacement(args) {
+    const margin = args.margin ?? 8;
+    const gap = args.gap ?? 6;
+    const minHeight = args.minHeight ?? 120;
+    const width = Math.max(0, Math.min(args.width, args.viewport.width - 2 * margin));
+    const left = Math.max(margin, Math.min(args.anchor.left, args.viewport.width - margin - width));
+    const top = Math.max(margin, Math.min(args.anchor.bottom + gap, args.viewport.height - margin - minHeight));
+    return { left, top, width, maxHeight: Math.max(0, args.viewport.height - top - margin) };
+  }
+  var ACTIVE_SPRINT_STATUSES = /* @__PURE__ */ new Set(["pending", "todo", "in_progress"]);
+  function countActiveSprintItems(items) {
+    if (!Array.isArray(items)) return 0;
+    return items.filter((it) => it && ACTIVE_SPRINT_STATUSES.has(it.status ?? "")).length;
+  }
+  function readWaffleBadges(strip, panel) {
+    const out = {};
+    const hitl = strip?.querySelector(".hitl-vtab-badge");
+    if (hitl && hitl.style.display !== "none") {
+      const n2 = parseInt(hitl.textContent || "0", 10);
+      if (n2 > 0) out.hitl = n2;
+    }
+    const q2 = cleanBadge(panel?.sprintActiveCount);
+    if (q2 > 0) out.queue = q2;
+    return out;
+  }
+  function activateWaffleTab(strip, tab, sub) {
+    const btn = Array.from(strip.querySelectorAll(".vtab-btn")).find((b2) => b2.dataset.vtab === tab);
+    if (!btn) return false;
+    revealGroupInStrip(strip, tab);
+    btn.click();
+    if (sub) {
+      const pid = strip.id.replace(/^vtab-strip-/, "");
+      const drawer = document.getElementById(`drawer-${tab}-${pid}`);
+      const subBtn = Array.from(drawer?.querySelectorAll(".goal-subtab-btn") ?? []).find(
+        (b2) => b2.dataset.gtab === sub
+      );
+      subBtn?.click();
+    }
+    return true;
+  }
+  function readRailTabs(strip) {
+    const out = { ids: [], labels: {}, active: null };
+    if (!strip) return out;
+    strip.querySelectorAll(".vtab-btn[data-vtab]").forEach((btn) => {
+      const id = btn.dataset.vtab;
+      if (!id || btn.style.display === "none") return;
+      out.ids.push(id);
+      const title = (btn.getAttribute("title") || "").split(/\s+[—-]\s+/)[0].trim();
+      if (title) out.labels[id] = title;
+      if (btn.classList.contains("active")) out.active = id;
+    });
+    return out;
+  }
+  var DEFAULT_STORAGE_KEY = "meridian_waffle.v1";
+  function esc(s3) {
+    return s3.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function tileHtml(e3) {
+    const badge = e3.badge > 0 ? `<span class="waffle-badge" data-badge-tab="${esc(e3.tab)}" aria-hidden="true">${e3.badge > 99 ? "99+" : e3.badge}</span>` : "";
+    const name = e3.label + (e3.pinned ? ", pinned" : "") + (e3.badge > 0 ? `, ${e3.badge} pending` : "");
+    return `<button type="button" class="waffle-tile" role="menuitem" tabindex="-1" data-waffle-key="${esc(e3.key)}" data-waffle-tab="${esc(e3.tab)}" data-group="${esc(e3.group ?? "")}" data-pinned="${e3.pinned}" aria-label="${esc(name)}" aria-keyshortcuts="P"${e3.active ? ' aria-current="true"' : ""}><span class="waffle-pin" data-waffle-pin="${esc(e3.tab)}" title="${e3.pinned ? "Unpin" : "Pin"} ${esc(e3.label)}" aria-hidden="true">${pinSvg(e3.pinned)}</span><span class="waffle-icon-wrap">${waffleIconSvg(e3.icon, 20)}</span><span class="waffle-label">${esc(e3.label)}</span>${badge}</button>`;
+  }
+  function subHtml(e3) {
+    return `<button type="button" class="waffle-sub" role="menuitem" tabindex="-1" data-waffle-key="${esc(e3.key)}" data-waffle-tab="${esc(e3.tab)}" data-waffle-sub="${esc(e3.sub ?? "")}" data-group="${esc(e3.group ?? "")}">${esc(e3.label)}</button>`;
+  }
+  function sectionHtml(section) {
+    let html = "";
+    let openParent = null;
+    const closeSubs = () => {
+      if (openParent !== null) html += "</div>";
+      openParent = null;
+    };
+    for (const row of section.rows) {
+      if (row.kind === "subs") {
+        if (openParent !== row.parent) {
+          closeSubs();
+          openParent = row.parent ?? "";
+          html += `<div class="waffle-subs" role="group" aria-label="${esc(row.parentLabel ?? "")} sections" data-waffle-subs-of="${esc(row.parent ?? "")}"><div class="waffle-subs-title" aria-hidden="true">${esc(row.parentLabel ?? "")}</div>`;
+        }
+        html += `<div class="waffle-row" role="none">${row.entries.map(subHtml).join("")}</div>`;
+      } else {
+        closeSubs();
+        html += `<div class="waffle-row" role="none">${row.entries.map(tileHtml).join("")}</div>`;
+      }
+    }
+    closeSubs();
+    return `<div class="waffle-section" role="group" aria-label="${esc(section.label)}" data-waffle-section="${section.id}"><div class="waffle-heading" aria-hidden="true">${esc(section.label)}</div>${html}</div>`;
+  }
+  var current = null;
+  function refreshWaffle() {
+    current?.refresh();
+  }
+  function mountWaffle(deps) {
+    const host = deps.host;
+    if (!host) return null;
+    current?.destroy();
+    const storage = deps.storage === void 0 ? safeLocalStorage() : deps.storage;
+    const storageKey = deps.storageKey ?? DEFAULT_STORAGE_KEY;
+    let state2 = loadState(storage, storageKey);
+    let isOpen = false;
+    let query = "";
+    let focusKey = null;
+    let model = { sections: [], keys: [], count: 0, query: "" };
+    const slot = document.createElement("div");
+    slot.className = "waffle-slot";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.id = "waffle-btn";
+    button.className = "waffle-btn";
+    button.setAttribute("aria-haspopup", "dialog");
+    button.setAttribute("aria-expanded", "false");
+    button.setAttribute("aria-controls", "waffle-popover");
+    button.setAttribute("aria-label", "Dashboard tabs");
+    button.title = "Jump to a tab";
+    button.innerHTML = `${waffleGlyphSvg()}<span class="waffle-dot" hidden></span>`;
+    slot.appendChild(button);
+    host.insertBefore(slot, host.firstChild);
+    const dot = button.querySelector(".waffle-dot");
+    const popover = document.createElement("div");
+    popover.id = "waffle-popover";
+    popover.className = "waffle-popover";
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("aria-modal", "true");
+    popover.setAttribute("aria-label", "Dashboard tabs");
+    popover.hidden = true;
+    popover.tabIndex = -1;
+    popover.innerHTML = `<div class="waffle-search">${searchSvg()}<input type="search" class="waffle-filter" placeholder="Filter tabs" aria-label="Filter tabs" aria-controls="waffle-menu" autocomplete="off" spellcheck="false" enterkeyhint="go"></div><div class="waffle-body" id="waffle-menu" role="menu" aria-label="Dashboard tabs"></div><div class="waffle-sr" role="status" aria-live="polite"></div><div class="waffle-hint">Arrows move, Enter opens, P pins, Esc closes</div>`;
+    document.body.appendChild(popover);
+    const input = popover.querySelector(".waffle-filter");
+    const body = popover.querySelector(".waffle-body");
+    const live = popover.querySelector(".waffle-sr");
+    const persist = () => saveState(storage, storageKey, state2);
+    const readBadges = () => {
+      try {
+        return deps.getBadges ? deps.getBadges() : {};
+      } catch {
+        return {};
+      }
+    };
+    const compute = () => {
+      const strip = deps.getStrip();
+      const rail = readRailTabs(strip);
+      return buildWaffleModel({
+        available: rail.ids,
+        state: state2,
+        query,
+        badges: readBadges(),
+        activeTab: rail.active,
+        labels: rail.labels,
+        rank: deps.rank,
+        threshold: deps.threshold
+      });
+    };
+    const updateDot = () => {
+      const hitl = cleanBadge(readBadges().hitl);
+      dot.hidden = hitl <= 0;
+      button.setAttribute(
+        "aria-label",
+        hitl > 0 ? `Dashboard tabs, ${hitl} review request${hitl === 1 ? "" : "s"} pending` : "Dashboard tabs"
+      );
+    };
+    const entryEl = (key) => {
+      if (!key) return null;
+      return Array.from(body.querySelectorAll("[data-waffle-key]")).find(
+        (el2) => el2.dataset.waffleKey === key
+      ) ?? null;
+    };
+    const setRoving = (key) => {
+      focusKey = key;
+      body.querySelectorAll("[data-waffle-key]").forEach((el2) => {
+        el2.tabIndex = el2.dataset.waffleKey === key ? 0 : -1;
+      });
+    };
+    const render = () => {
+      model = compute();
+      updateDot();
+      if (!model.sections.length) {
+        const strip = deps.getStrip();
+        body.innerHTML = query ? `<div class="waffle-empty" role="none">No tabs match &quot;${esc(query)}&quot;</div>` : `<div class="waffle-empty" role="none">${strip ? "No tabs available" : "Open a project to jump between its tabs"}</div>`;
+      } else {
+        body.innerHTML = model.sections.map(sectionHtml).join("");
+      }
+      const flat = model.keys.flat();
+      setRoving(focusKey && flat.includes(focusKey) ? focusKey : flat[0] ?? null);
+      live.textContent = query ? model.count === 1 ? "1 match" : `${model.count} matches` : "";
+    };
+    const place = () => {
+      const r3 = button.getBoundingClientRect();
+      popover.style.maxHeight = "";
+      const placement = computePopoverPlacement({
+        anchor: { left: r3.left, bottom: r3.bottom },
+        width: popover.offsetWidth || 352,
+        viewport: { width: window.innerWidth, height: window.innerHeight }
+      });
+      popover.style.left = `${placement.left}px`;
+      popover.style.top = `${placement.top}px`;
+      popover.style.maxHeight = `${placement.maxHeight}px`;
+    };
+    const focusEntry = (key) => {
+      const el2 = entryEl(key);
+      if (!el2) return;
+      setRoving(key);
+      el2.focus();
+    };
+    const onDocPointer = (ev) => {
+      const t3 = ev.target;
+      if (t3 && (popover.contains(t3) || button.contains(t3))) return;
+      close(false);
+    };
+    const onFocusIn = (ev) => {
+      const t3 = ev.target;
+      if (t3 && (popover.contains(t3) || button.contains(t3))) return;
+      close(false);
+    };
+    const onResize = () => {
+      if (isOpen) place();
+    };
+    function close(returnFocus = true) {
+      if (!isOpen) return;
+      isOpen = false;
+      popover.hidden = true;
+      button.setAttribute("aria-expanded", "false");
+      document.removeEventListener("mousedown", onDocPointer, true);
+      document.removeEventListener("touchstart", onDocPointer, true);
+      document.removeEventListener("focusin", onFocusIn, true);
+      window.removeEventListener("resize", onResize);
+      query = "";
+      input.value = "";
+      if (returnFocus) button.focus();
+    }
+    function open() {
+      if (isOpen) return;
+      isOpen = true;
+      query = "";
+      input.value = "";
+      focusKey = null;
+      popover.hidden = false;
+      button.setAttribute("aria-expanded", "true");
+      render();
+      place();
+      document.addEventListener("mousedown", onDocPointer, true);
+      document.addEventListener("touchstart", onDocPointer, true);
+      document.addEventListener("focusin", onFocusIn, true);
+      window.addEventListener("resize", onResize);
+      const fine = typeof window.matchMedia !== "function" || window.matchMedia("(pointer: fine)").matches;
+      if (fine) input.focus();
+      else focusEntry(focusKey);
+    }
+    const activateKey = (key) => {
+      if (!key) return;
+      const entry = model.sections.flatMap((s3) => s3.rows.flatMap((r3) => r3.entries)).find((e3) => e3.key === key);
+      if (!entry) return;
+      const strip = deps.getStrip();
+      if (!strip) return;
+      state2 = recordUse(state2, entry.tab);
+      persist();
+      close(true);
+      activateWaffleTab(strip, entry.tab, entry.sub);
+      updateDot();
+    };
+    const togglePinFor = (tab, keyToFocus) => {
+      state2 = togglePin(state2, tab);
+      persist();
+      const hadFocus = popover.contains(document.activeElement);
+      render();
+      if (hadFocus) focusEntry(keyToFocus);
+    };
+    button.addEventListener("click", () => isOpen ? close(true) : open());
+    button.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowDown" && !isOpen) {
+        ev.preventDefault();
+        open();
+      }
+    });
+    input.addEventListener("input", () => {
+      query = input.value;
+      focusKey = null;
+      render();
+    });
+    body.addEventListener("click", (ev) => {
+      const target = ev.target;
+      const pin = target.closest("[data-waffle-pin]");
+      if (pin) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const pinTab = pin.dataset.wafflePin || "";
+        togglePinFor(pinTab, `tab:${pinTab}`);
+        return;
+      }
+      const el2 = target.closest("[data-waffle-key]");
+      if (el2) activateKey(el2.dataset.waffleKey || null);
+    });
+    popover.addEventListener("keydown", (ev) => {
+      const target = ev.target;
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        close(true);
+        return;
+      }
+      if (ev.key === "Tab") {
+        const stops = [input, body.querySelector('[data-waffle-key][tabindex="0"]')].filter(
+          (el3) => !!el3
+        );
+        const idx = stops.indexOf(document.activeElement);
+        if (ev.shiftKey && idx <= 0) {
+          ev.preventDefault();
+          stops[stops.length - 1].focus();
+        } else if (!ev.shiftKey && idx === stops.length - 1) {
+          ev.preventDefault();
+          stops[0].focus();
+        }
+        return;
+      }
+      if (target === input) {
+        const first = model.keys[0]?.[0] ?? null;
+        if (ev.key === "ArrowDown") {
+          ev.preventDefault();
+          focusEntry(first);
+        } else if (ev.key === "Enter") {
+          ev.preventDefault();
+          activateKey(first);
+        }
+        return;
+      }
+      const el2 = target.closest("[data-waffle-key]");
+      if (!el2) return;
+      const key = el2.dataset.waffleKey || null;
+      if (ev.key === "ArrowUp" && model.keys[0]?.includes(key)) {
+        ev.preventDefault();
+        input.focus();
+        return;
+      }
+      const next = moveFocus(model.keys, key, ev.key, ev.ctrlKey || ev.metaKey);
+      if (next !== null) {
+        ev.preventDefault();
+        focusEntry(next);
+        return;
+      }
+      if ((ev.key === "p" || ev.key === "P") && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        const tab = el2.dataset.waffleTab;
+        if (tab && el2.dataset.waffleSub === void 0) {
+          ev.preventDefault();
+          togglePinFor(tab, key);
+        }
+      }
+    });
+    updateDot();
+    const controller = {
+      button,
+      popover,
+      open,
+      close,
+      isOpen: () => isOpen,
+      refresh: () => {
+        if (isOpen) render();
+        else updateDot();
+      },
+      getModel: () => model,
+      getState: () => state2,
+      destroy: () => {
+        close(false);
+        slot.remove();
+        popover.remove();
+        if (current === controller) current = null;
+      }
+    };
+    current = controller;
+    return controller;
   }
 
   // meridian/static/dashboard-folders.ts
@@ -10427,7 +11180,7 @@ ${n2.tags || ""}`.toLowerCase();
         projectApi(projectId, `/projects/${projectId}/agent-instructions/default`),
         projectApi(projectId, `/projects/${projectId}/settings`)
       ]);
-      const current = data.agent_instructions || "";
+      const current2 = data.agent_instructions || "";
       const defaultText = defaultData.default_agent_instructions || "";
       const codeIntelEnabled = settingsData ? !!settingsData.code_intel_enabled : false;
       section.innerHTML = `
@@ -10445,11 +11198,11 @@ ${n2.tags || ""}`.toLowerCase();
           rows="24"
           style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:8px;resize:vertical;outline:none;line-height:1.5"
           placeholder="Enter executor rules\u2026"
-        >${escapeHtml(current)}</textarea>
+        >${escapeHtml(current2)}</textarea>
 
         <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
 
-          <span id="agent-instructions-chars-${projectId}" style="font-size:10px;color:var(--muted)">${current.length} chars</span>
+          <span id="agent-instructions-chars-${projectId}" style="font-size:10px;color:var(--muted)">${current2.length} chars</span>
 
           <span style="display:flex;gap:6px">
 
@@ -10665,6 +11418,7 @@ ${n2.tags || ""}`.toLowerCase();
     const pid = state.activeTab;
     if (!pid || !vtab) return;
     const btn = document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${vtab}"]`);
+    revealGroupInStrip(document.getElementById(`vtab-strip-${pid}`) || document, vtab);
     if (btn) btn.click();
     if (gtab) {
       const gbtn = document.querySelector(`#drawer-goal-${pid} .goal-subtab-btn[data-gtab="${gtab}"]`);
@@ -11276,14 +12030,14 @@ ${n2.tags || ""}`.toLowerCase();
   }
   function _moveProjectToFolder(t3) {
     const assignments = loadFolderAssignments(STORAGE_KEY2("projectFolders"));
-    const current = assignments[t3.id] || "";
+    const current2 = assignments[t3.id] || "";
     const existing = knownFolderNames(state.projects, assignments);
     const hint = existing.length ? `
 
 Existing folders: ${existing.join(", ")}` : "";
     const next = window.prompt(
       `Move "${t3.project.name}" to a folder (leave blank for ${UNGROUPED_LABEL}).${hint}`,
-      current
+      current2
     );
     if (next === null) return;
     const updated = assignProjectToFolder(assignments, t3.id, next);
@@ -11569,12 +12323,12 @@ Existing folders: ${existing.join(", ")}` : "";
     setTimeout(() => document.addEventListener("click", dismiss), 0);
   }
   async function _setProjectIcon(t3) {
-    const current = t3.project.icon || "";
+    const current2 = t3.project.icon || "";
     const next = window.prompt(
       `Paste a single emoji to use as the project icon (or leave blank to clear).
 
-Current: ${current || "(none)"}`,
-      current
+Current: ${current2 || "(none)"}`,
+      current2
     );
     if (next === null) return;
     const icon = next.trim() ? next.trim().slice(0, 8) : null;
@@ -11668,6 +12422,7 @@ Current: ${current || "(none)"}`,
     }
     const switcher = document.getElementById("project-switcher");
     if (switcher) switcher.value = id;
+    refreshWaffle();
     try {
       const _panel = getPanelState(id);
       let _activeVtab = _panel && _panel.activeVtab;
@@ -12960,6 +13715,7 @@ Current: ${current || "(none)"}`,
       const sprintItemsPath = `/projects/${project.id}/sprint-items`;
       try {
         const items = await projectApi(project.id, sprintItemsPath);
+        _setWaffleQueueCount(project.id, items);
         const board = document.getElementById(`sprint-board-goal-${project.id}`);
         if (!board) return;
         if (!items || !items.length) {
@@ -13358,6 +14114,7 @@ Current: ${current || "(none)"}`,
       ]);
       if (sprintItemsResult.status === "fulfilled") {
         renderSprintProgress(projectId, sprintItemsResult.value || []);
+        _setWaffleQueueCount(projectId, sprintItemsResult.value);
         renderWaveProgress(projectId, sprintItemsResult.value || []);
       } else {
         const sprintRoot = document.getElementById(`live-sprint-progress-${projectId}`);
@@ -16156,6 +16913,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       panel.liveSessionId = liveSession ? liveSession.id : null;
       const sprintPayload = sprintItems || [];
       panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : sprintPayload.items || [];
+      _setWaffleQueueCount(projectId, panel.queueSprintItems);
       panel.queueTotalDoneCount = Array.isArray(sprintPayload) ? panel.queueSprintItems.filter((it) => it.status === "done").length : sprintPayload.total_done_count || 0;
       const renderCurrentQueue = () => {
         body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
@@ -16639,6 +17397,29 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       badge.textContent = String(count);
       badge.style.display = count > 0 ? "inline-block" : "none";
     });
+    refreshWaffle();
+  }
+  function _setWaffleQueueCount(projectId, items) {
+    try {
+      getPanelState(projectId).sprintActiveCount = countActiveSprintItems(items);
+      refreshWaffle();
+    } catch (_2) {
+    }
+  }
+  function _mountDashboardWaffle() {
+    try {
+      mountWaffle({
+        host: document.getElementById("topbar"),
+        getStrip: () => state.activeTab ? document.getElementById(`vtab-strip-${state.activeTab}`) : null,
+        getBadges: () => {
+          const pid = state.activeTab;
+          return pid ? readWaffleBadges(document.getElementById(`vtab-strip-${pid}`), state.panels[pid]) : {};
+        },
+        storageKey: STORAGE_KEY2("waffle.v1")
+      });
+    } catch (e3) {
+      console.warn("waffle launcher unavailable", e3);
+    }
   }
   async function refreshProjectCountBadges(projectId) {
     if (!projectId) return;
@@ -17567,13 +18348,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     });
   }
   async function appendToGoal(projectId, line) {
-    let current = "";
+    let current2 = "";
     try {
       const goal = await api(`/projects/${projectId}/goal`);
-      current = typeof goal.content === "string" ? goal.content : JSON.stringify(goal.content, null, 2);
+      current2 = typeof goal.content === "string" ? goal.content : JSON.stringify(goal.content, null, 2);
     } catch (e3) {
     }
-    const next = current ? current.trimEnd() + "\n" + line : line;
+    const next = current2 ? current2.trimEnd() + "\n" + line : line;
     await api(`/projects/${projectId}/goal`, { method: "POST", body: JSON.stringify({ content: next }) });
   }
   async function hitlReply(projectId, taskId, text) {
@@ -17761,6 +18542,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   (async function init() {
+    _mountDashboardWaffle();
     const _wsParam = new URLSearchParams(window.location.search).get("ws");
     if (_wsParam && !state.activeWorkspaceTenantId) {
       state.activeWorkspaceTenantId = _wsParam;
