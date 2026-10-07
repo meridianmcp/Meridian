@@ -46,6 +46,7 @@ from .. import executor_config as _executor_config  # 99c0c1be — parallelism d
 from .. import continuation_gate as _continuation_gate  # ecc8b280
 from .. import blocker_policy as _blocker_policy  # b108f2e0 (typed blocker triage)
 from .. import dependency_graph as _dependency_graph  # 05553946 (cycle detection)
+from .. import versioning as _versioning  # 0c30b989 — next-version rule + label guard
 
 _log = logging.getLogger(__name__)
 
@@ -5763,6 +5764,295 @@ async def push_sprint_item(
         db, project_id, item_id, "pushed", pushed_to=to_version,
         expected_statuses=_ACTIVE_SPRINT_STATUSES,
     )
+
+
+# 0c30b989 -- moving an item to another version (as opposed to deferring it).
+#
+# push_sprint_item above is a DEFER: the item turns terminal ('pushed'), keeps
+# its own version and only remembers the target in pushed_to, so it vanishes
+# into the Backburner and never shows up under the version it was pushed to.
+# What the board owner actually wants most of the time is a MOVE: the item stays
+# pending, simply belongs to a different version group, and its title is left
+# alone. The two coexist; push_sprint_item and its MCP/REST callers are
+# unchanged for existing rows.
+
+#: event_type written to action_audit_log for every move (the item's history).
+SPRINT_ITEM_VERSION_MOVED_AUDIT_EVENT = "sprint_item_version_moved"
+
+#: Most item ids one bulk move will take.
+MAX_BULK_MOVE_ITEMS = 100
+
+# How many levels of subtasks a move follows. add_subtask makes a child of any
+# non-terminal item, so trees can nest; the cap only guards a corrupted
+# parent_id cycle from spinning.
+_MOVE_CASCADE_MAX_DEPTH = 8
+
+
+class SprintItemVersionConflict(ValueError):
+    """The item's version is no longer the one the caller based its move on.
+
+    Raised by :func:`move_sprint_item_to_version` when ``expected_version`` does
+    not match (or a concurrent move landed between the read and the write). It
+    is what keeps a retried "move to NEXT version" request from moving the item
+    a second time: the replay's ``expected_version`` is stale by then."""
+
+    def __init__(self, item_id: str, current_version: str | None, expected_version: str | None):
+        self.item_id = item_id
+        self.current_version = current_version
+        self.expected_version = expected_version
+        super().__init__(
+            f"sprint item {item_id} is now in version {current_version!r}, not "
+            f"{expected_version!r} -- it was moved by someone else. Re-fetch the "
+            "item before retrying."
+        )
+
+
+class NextVersionUnavailable(ValueError):
+    """``use_next`` was asked of an item whose own version label has no
+    unambiguous successor (``current sprint v0.2``, an empty label, ...).
+
+    A distinct type so the REST layer can answer with a machine-readable code
+    and the dashboard can fall back to asking for an explicit version instead
+    of showing a generic validation error."""
+
+    def __init__(self, item_id: str, current_version: str):
+        self.item_id = item_id
+        self.current_version = current_version
+        super().__init__(
+            f"cannot derive the next version from {current_version!r}; "
+            "choose a specific version instead"
+        )
+
+
+async def move_sprint_item_to_version(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    *,
+    to_version: str | None = None,
+    use_next: bool = False,
+    expected_version: str | None = None,
+    actor: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Move a sprint item to another version, keeping its status and title.
+
+    Exactly one of ``use_next`` (the server computes the version following the
+    item's own via :func:`meridian.versioning.next_version`) or ``to_version``
+    (a human-typed label, validated by ``validate_version_label``) is given. The
+    result always states the version actually used, so a caller never has to
+    recompute it.
+
+    Only the ``version`` column is written -- never ``title``, ``status``,
+    ``pushed_to`` or ``completed_at`` -- so the item stays exactly as pending or
+    in-progress as it was and simply appears under the target version's group.
+    Subtasks still in the old version (``add_subtask`` makes them inherit the
+    parent's) travel with it, so a parent is never left ahead of its children;
+    a subtask deliberately placed in some other version is left where it is.
+
+    ``expected_version`` is a compare-and-swap guard: when given, the move
+    applies only while the item still carries that version
+    (:class:`SprintItemVersionConflict` otherwise). The dashboard always sends the
+    version it showed, which makes a replayed "next" request harmless.
+
+    Returns ``None`` when the item does not exist in ``project_id``. Raises
+    :class:`SprintItemStatusRace` when the item is terminal (done/failed/
+    skipped/pushed -- a finished or deferred item is not moved),
+    :class:`NextVersionUnavailable` (a ``ValueError``) when ``use_next`` cannot
+    derive a next version from the item's current label (the caller must then
+    supply one), and plain ``ValueError`` for any other bad argument. Asking
+    for the version the item already has is a no-op reported with
+    ``unchanged=True``: no write, no event, no history entry.
+
+    The move is recorded as a ``sprint_item_version_moved`` row in the
+    append-only ``action_audit_log`` (from/to version, how it was chosen, the
+    subtasks that went with it). That is the item's version history; there is
+    deliberately no per-item column for it.
+    """
+    if use_next == (to_version is not None):
+        raise ValueError("pass exactly one of use_next or to_version")
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    status = item.get("status") or "pending"
+    if status not in _ACTIVE_SPRINT_STATUSES:
+        raise SprintItemStatusRace(item_id, status, _ACTIVE_SPRINT_STATUSES)
+    from_version = item.get("version") or ""
+    if expected_version is not None and (expected_version or "") != from_version:
+        raise SprintItemVersionConflict(item_id, from_version, expected_version)
+
+    if use_next:
+        target = _versioning.next_version(from_version)
+        if target is None:
+            raise NextVersionUnavailable(item_id, from_version)
+        via = "next"
+    else:
+        target = _versioning.validate_version_label(to_version)
+        via = "specific"
+
+    if target == from_version:
+        return {
+            "item": item,
+            "from_version": from_version,
+            "to_version": target,
+            "via": via,
+            "unchanged": True,
+            "moved_children": [],
+            "history_recorded": False,
+        }
+
+    active = sorted(_ACTIVE_SPRINT_STATUSES)
+    active_marks = ", ".join("?" for _ in active)
+    # Compare-and-swap on both version and status: the SELECT above is only a
+    # read, and a concurrent complete/move could land before this UPDATE.
+    cursor = await db.execute(
+        "UPDATE sprint_items SET version = ? "
+        "WHERE id = ? AND project_id = ? AND COALESCE(version, '') = ? "
+        f"AND status IN ({active_marks})",
+        [target, item_id, project_id, from_version, *active],
+    )
+    if cursor.rowcount == 0:
+        latest = await get_sprint_item(db, item_id)
+        if latest is None or latest.get("project_id") != project_id:
+            return None
+        latest_status = latest.get("status") or "pending"
+        if latest_status not in _ACTIVE_SPRINT_STATUSES:
+            raise SprintItemStatusRace(item_id, latest_status, _ACTIVE_SPRINT_STATUSES)
+        raise SprintItemVersionConflict(item_id, latest.get("version"), from_version)
+
+    # The parent is written first (a Postgres connection autocommits every
+    # statement), so a failure below can leave a subtask behind its parent --
+    # still visible under the old version and movable on its own -- but never
+    # ahead of it.
+    moved_children: list[str] = []
+    seen = {item_id}
+    frontier = [item_id]
+    for _depth in range(_MOVE_CASCADE_MAX_DEPTH):
+        marks = ", ".join("?" for _ in frontier)
+        async with db.execute(
+            "SELECT id FROM sprint_items "
+            f"WHERE project_id = ? AND parent_id IN ({marks}) "
+            f"AND COALESCE(version, '') = ? AND status IN ({active_marks})",
+            [project_id, *frontier, from_version, *active],
+        ) as cur:
+            rows = await cur.fetchall()
+        child_ids = [
+            cid for cid in ((_row_to_dict(r) or {}).get("id") for r in rows)
+            if cid and cid not in seen
+        ]
+        if not child_ids:
+            break
+        child_marks = ", ".join("?" for _ in child_ids)
+        await db.execute(
+            f"UPDATE sprint_items SET version = ? WHERE project_id = ? AND id IN ({child_marks})",
+            [target, project_id, *child_ids],
+        )
+        seen.update(child_ids)
+        moved_children.extend(child_ids)
+        frontier = child_ids
+    await db.commit()
+    _invalidate_sprint_items_cache(project_id)
+
+    # Verify by re-reading rather than trusting the UPDATE: this is what the
+    # caller is told, and what "it verifiably moved" rests on.
+    updated = await get_sprint_item(db, item_id)
+    if updated is None or (updated.get("version") or "") != target:
+        raise RuntimeError(
+            f"sprint item {item_id} did not land in version {target!r} after the move"
+        )
+    _publish_project_event(
+        project_id, "sprint_item_updated",
+        {"item_id": item_id, "status": status, "version": target},
+    )
+
+    history_recorded = False
+    try:
+        from meridian.db import record_action_audit_event  # noqa: PLC0415
+        await record_action_audit_event(
+            db, SPRINT_ITEM_VERSION_MOVED_AUDIT_EVENT,
+            project_id=project_id, tenant_id=tenant_id, actor=actor,
+            detail=json.dumps({
+                "item_id": item_id,
+                "from_version": from_version,
+                "to_version": target,
+                "via": via,
+                "moved_children": moved_children,
+            }),
+        )
+        history_recorded = True
+    except Exception:  # noqa: BLE001 -- the move already committed; say so, don't undo it
+        _log.warning(
+            "sprint item %s moved %r -> %r but the history entry could not be written",
+            item_id, from_version, target, exc_info=True,
+        )
+    return {
+        "item": updated,
+        "from_version": from_version,
+        "to_version": target,
+        "via": via,
+        "unchanged": False,
+        "moved_children": moved_children,
+        "history_recorded": history_recorded,
+    }
+
+
+async def move_sprint_items_to_version(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_ids: list[str],
+    *,
+    to_version: str | None = None,
+    use_next: bool = False,
+    actor: str | None = None,
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Move several items; one outcome row per distinct id, in input order.
+
+    Each item is moved independently (best-effort, like ``execute_batch``'s
+    ``best_effort`` mode): a terminal or missing item reports its own error and
+    never blocks the others. With ``use_next`` every item advances from ITS OWN
+    version, so items on different versions land on different targets -- each
+    row says which. Rows are ``{item_id, ok: True, ...move result}`` or
+    ``{item_id, ok: False, error, message}``.
+    """
+    if len(item_ids) > MAX_BULK_MOVE_ITEMS:
+        raise ValueError(f"at most {MAX_BULK_MOVE_ITEMS} items can be moved at once")
+    outcomes: list[dict[str, Any]] = []
+    for item_id in dict.fromkeys(item_ids):
+        try:
+            moved = await move_sprint_item_to_version(
+                db, project_id, item_id, to_version=to_version, use_next=use_next,
+                actor=actor, tenant_id=tenant_id,
+            )
+        except SprintItemStatusRace as exc:
+            outcomes.append({
+                "item_id": item_id, "ok": False,
+                "error": "status_conflict", "message": str(exc),
+            })
+        except SprintItemVersionConflict as exc:
+            outcomes.append({
+                "item_id": item_id, "ok": False,
+                "error": "version_conflict", "message": str(exc),
+            })
+        except NextVersionUnavailable as exc:
+            outcomes.append({
+                "item_id": item_id, "ok": False,
+                "error": "next_version_unavailable", "message": str(exc),
+            })
+        except ValueError as exc:
+            outcomes.append({
+                "item_id": item_id, "ok": False,
+                "error": "invalid", "message": str(exc),
+            })
+        else:
+            if moved is None:
+                outcomes.append({
+                    "item_id": item_id, "ok": False,
+                    "error": "not_found", "message": "sprint item not found",
+                })
+            else:
+                outcomes.append({"item_id": item_id, "ok": True, **moved})
+    return outcomes
 
 
 async def patch_sprint_item(

@@ -47,6 +47,11 @@ import { wireVtabGroups } from "./dashboard-tabgroups";
 // 8a665a03 -- a repaint must never throw away what the user typed: list views that are
 // rebuilt from a fetch carry their half-written inputs across (see paintKeepingDrafts).
 import { paintKeepingDrafts, hasUnsentDrafts } from "./dashboard-utils";
+// 0c30b989 — the sprint arrow button's "move to next / specific version / defer"
+// glue (endpoints, request bodies, toast, repaint). The popover and the
+// next-version rule it previews (mirrors meridian/versioning.py) are in
+// dashboard-versions.ts.
+import { createSprintMoveActions } from "./dashboard-sprint-move";
 // d6b7da48 — client-side sidebar "folders/spheres" (localStorage-only grouping).
 import {
   loadFolderAssignments,
@@ -5821,23 +5826,23 @@ function applyBackburnerFilter(projectId: any) {
 
 
 
-async function sprintPushPrompt(projectId: any, itemId: any) {
+// 0c30b989 -- the sprint arrow button's move/defer glue lives in
+// dashboard-sprint-move.ts (unit-tested: this file cannot be imported by a test);
+// only the real api/toast/loaders are wired here. The name sprintPushPrompt is
+// kept: renderSprintProgress / renderQueue emit it in inline onclick handlers.
+const _sprintMoveActions = createSprintMoveActions({
+  api: (path, init) => api(path, init),
+  toast: (message, isError) => toast(message, isError),
+  refreshLiveTab: (projectId) => refreshLiveTab(projectId),
+  loadQueue: (projectId) => loadQueue(projectId),
+  reloadSprintBoard: (projectId) => {
+    const reload = _sprintBoardReloaders[projectId];
+    return reload ? reload() : undefined;
+  },
+});
 
-  /** Prompt for a target version then push the item. */
-
-  const toVersion = window.prompt('Push to version (e.g. v2.0):');
-
-  if (!toVersion) return;
-
-  try {
-
-    await api(`/projects/${projectId}/sprint-items/${itemId}/push`,
-
-      { method: 'POST', body: JSON.stringify({ to_version: toVersion }) });
-
-    toast('Sprint item pushed to ' + toVersion);
-    await refreshSprintSurfaces(projectId);
-  } catch(e: any) { toast(`Push failed: ${e.message}`, true); }
+async function sprintPushPrompt(projectId: any, itemId: any, anchor?: any) {
+  return _sprintMoveActions.sprintPushPrompt(projectId, itemId, anchor);
 }
 
 async function sprintResetPending(projectId: any, itemId: any) {

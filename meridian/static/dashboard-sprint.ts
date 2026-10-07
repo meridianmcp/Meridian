@@ -481,12 +481,32 @@ export function renderSprintProgress(projectId: string, items: any) {
   );
 
   // Children of displayed parents, keyed by parent id (to render under parent, not standalone).
+  // 0c30b989 — only children in the SAME version as their parent fold into the
+  // parent's collapsed subtasks block. A subtask moved to another version on its
+  // own is listed in detachedParentOf instead (child id -> its displayed parent):
+  // it renders as a top-level row under ITS version header, tagged with the
+  // parent's title, so it is visible where the human just sent it. The parent's
+  // [done/total] badge still counts it (that reads allChildrenOf, not this map).
 
   const displayChildrenOf = new Map();
+
+  const detachedParentOf = new Map<string, any>();
+
+  const displayedById = new Map<string, any>(displayItems.map((it: any) => [it.id, it]));
 
   displayItems.forEach((it: any) => {
 
     if (it.parent_id && displayedParentIds.has(it.parent_id)) {
+
+      const parent = displayedById.get(it.parent_id);
+
+      if (parent && (it.version || '') !== (parent.version || '')) {
+
+        detachedParentOf.set(it.id, parent);
+
+        return;
+
+      }
 
       if (!displayChildrenOf.has(it.parent_id)) displayChildrenOf.set(it.parent_id, []);
 
@@ -553,9 +573,9 @@ export function renderSprintProgress(projectId: string, items: any) {
 
              onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
 
-           <button class="sprint-btn sprint-btn-push" title="Push to next version"
-
-             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
+           <button class="sprint-btn sprint-btn-push" title="Move to the next version, pick one, or defer" aria-label="Move to another version" aria-haspopup="dialog"
+             data-act="move-version" data-item-id="${escapeHtml(it.id)}"
+             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this)">→</button>
 
            ${canEdit ? editBtn : ''}
 
@@ -585,6 +605,14 @@ export function renderSprintProgress(projectId: string, items: any) {
 
       : '';
 
+    // A subtask listed on its own under another version's header says whose
+    // subtask it is, since its parent sits under a different header.
+    const detachedParent = detachedParentOf.get(it.id);
+
+    const parentTag = detachedParent
+      ? `<span class="sprint-subtask-tag" data-subtask-of="${escapeHtml(detachedParent.id)}" title="Subtask of ${escapeHtml(detachedParent.title)} (${escapeHtml(detachedParent.version || 'no version')})" style="display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;margin-left:6px;font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px">subtask of ${escapeHtml(detachedParent.title)}</span>`
+      : '';
+
     const indentStyle = isChild
 
       ? 'margin-left:16px;border-left:2px solid var(--border);padding-left:8px;'
@@ -603,7 +631,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
       <div class="sprint-item-main">
 
-        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
+        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${parentTag}${_sprintHistoryBadges(it)}</span>
 
         ${notesHtml}
 
@@ -669,9 +697,12 @@ export function renderSprintProgress(projectId: string, items: any) {
 
     }
 
-    // Render only top-level items; children of displayed parents are rendered under their parent.
+    // Render only top-level items; children of displayed parents are rendered under their parent,
+    // unless they were moved to a different version than the parent (0c30b989): those stand on
+    // their own row under their own version header, tagged with the parent's title.
 
-    const topLevel = groupItems.filter((it: any) => !it.parent_id || !displayedParentIds.has(it.parent_id));
+    const topLevel = groupItems.filter((it: any) =>
+      !it.parent_id || !displayedParentIds.has(it.parent_id) || detachedParentOf.has(it.id));
 
     html += topLevel.map((it: any) => renderItem(it, false)).join('');
 
@@ -899,9 +930,9 @@ export function renderQueue(projectId: string, sprintItems: any = []) {
 
           onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
 
-        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Push to next version"
-
-          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
+        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Move to the next version, pick one, or defer" aria-label="Move to another version" aria-haspopup="dialog"
+          data-act="move-version" data-item-id="${escapeHtml(it.id)}"
+          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this)">→</button>
 
       </div>` : '';
 
@@ -918,7 +949,7 @@ export function renderQueue(projectId: string, sprintItems: any = []) {
 
       </div>` : '';
 
-    return `<div class="queue-item" data-bb-title="${escapeHtml((it.title || '').toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || '').toLowerCase())}">
+    return `<div class="queue-item" data-item-id="${escapeHtml(it.id || '')}" data-bb-title="${escapeHtml((it.title || '').toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || '').toLowerCase())}">
 
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
 

@@ -667,6 +667,80 @@ input[type=text] {
 .sprint-btn:hover { color: var(--accent-green); border-color: var(--accent-green); }
 .sprint-btn-fail:hover { color: #e05; border-color: #e05; }
 .sprint-btn-push:hover { color: var(--accent); border-color: var(--accent); }
+/* 0c30b989 — "move to a version" popover on the sprint arrow button
+   (dashboard-versions.ts). Fixed-position, placed by script under the button. */
+.version-move-popover {
+  position: fixed; z-index: 9998; box-sizing: border-box;
+  width: 300px; max-width: calc(100vw - 16px);
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-2); color: var(--text); font-size: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+.version-move-popover .vmp-head { display: flex; align-items: center; gap: 8px; }
+.version-move-popover .vmp-title {
+  flex: 1; min-width: 0; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.version-move-popover .vmp-close {
+  background: none; border: 0; padding: 2px 4px; line-height: 1;
+  color: var(--muted); font-size: 14px; cursor: pointer;
+}
+.version-move-popover .vmp-close:hover { color: var(--text); }
+.version-move-popover .vmp-current { color: var(--muted); font-size: 11px; }
+.version-move-popover .vmp-current code { color: var(--text); font-family: 'IBM Plex Mono', monospace; }
+.version-move-popover .vmp-hint { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.version-move-popover .vmp-or {
+  margin-top: 2px; color: var(--muted); font-size: 10px;
+  letter-spacing: 0.06em; text-transform: uppercase;
+}
+.version-move-popover .vmp-row { display: flex; gap: 6px; }
+.version-move-popover button {
+  border-radius: 4px; cursor: pointer;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+}
+.version-move-popover .vmp-next {
+  padding: 8px 10px; border: 1px solid var(--accent);
+  background: var(--accent); color: #001020; font-weight: 600; text-align: left;
+}
+.version-move-popover .vmp-next:hover { filter: brightness(1.1); }
+.version-move-popover .vmp-go,
+.version-move-popover .vmp-defer {
+  padding: 6px 10px; border: 1px solid var(--border);
+  background: var(--surface-1); color: var(--text);
+}
+.version-move-popover .vmp-go:hover,
+.version-move-popover .vmp-defer:hover { background: var(--border); }
+.version-move-popover .vmp-defer { color: var(--muted); text-align: left; }
+.version-move-popover .vmp-input {
+  flex: 1; min-width: 0; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface-1); color: var(--text);
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+}
+.version-move-popover .vmp-input[aria-invalid="true"] { border-color: var(--status-failed); }
+.version-move-popover .vmp-sep { margin: 2px 0; border-top: 1px solid var(--border); }
+.version-move-popover .vmp-error { color: var(--status-failed); font-size: 11px; line-height: 1.4; }
+.version-move-popover button:focus-visible,
+.version-move-popover .vmp-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Phone / touch: finger-sized targets inside the popover. */
+@media (max-width: 480px), (pointer: coarse) {
+  .version-move-popover .vmp-next,
+  .version-move-popover .vmp-go,
+  .version-move-popover .vmp-defer,
+  .version-move-popover .vmp-input { min-height: 38px; }
+  .version-move-popover .vmp-close { min-width: 36px; min-height: 36px; font-size: 16px; }
+}
+/* The row that was just moved: a short highlight, so it is easy to see it land
+   under its new version. */
+.sprint-row-moved { animation: sprintRowMoved 2.4s ease-out; }
+@keyframes sprintRowMoved {
+  0% { background: rgba(0, 212, 170, 0.28); box-shadow: inset 3px 0 0 var(--accent-green); }
+  100% { background: transparent; box-shadow: inset 3px 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sprint-row-moved { animation: none; box-shadow: inset 3px 0 0 var(--accent-green); }
+}
 .sprint-footer {
   margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 6px;
