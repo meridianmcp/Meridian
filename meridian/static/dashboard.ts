@@ -44,6 +44,9 @@ import { createStore } from "zustand/vanilla";
 // the source-scanning UI tests keep matching); this module owns the grouping
 // model + the collapse/reveal wiring.
 import { wireVtabGroups } from "./dashboard-tabgroups";
+// 8a665a03 -- a repaint must never throw away what the user typed: list views that are
+// rebuilt from a fetch carry their half-written inputs across (see paintKeepingDrafts).
+import { paintKeepingDrafts, hasUnsentDrafts } from "./dashboard-utils";
 // d6b7da48 — client-side sidebar "folders/spheres" (localStorage-only grouping).
 import {
   loadFolderAssignments,
@@ -403,6 +406,9 @@ async function ensureWorkspaceSwitcher() {
     // Close all open tabs — they belong to the old workspace.
 
     [...state.tabs].forEach(t => { try { closeTab(t.id); } catch (_) {} });
+
+    // The project-list socket follows the workspace whose projects are listed.
+    connectAccountWs();
 
     await loadProjects();
 
@@ -1895,9 +1901,9 @@ async function _refreshOnFocus() {
       refreshProjectCountBadges(pid),
 
       refreshHitl(pid),
-
-      loadSprintBoard(pid),
-
+      // 8a665a03 -- loadSprintBoard is a closure inside buildTabBody, so the bare
+      // call that used to be here threw a ReferenceError (swallowed by the catch).
+      reloadGoalSprintBoard(pid),
     ]);
 
   } catch(_) {}
@@ -3424,6 +3430,10 @@ async function _deleteProject(t: any) {
     overlay.onclick = e => { if (e.target === overlay) { overlay.remove(); resolve(); } };
     box.querySelector('#del-proj-confirm')!.onclick = async () => {
       overlay.remove();
+      // The server's project_deleted event can reach this tab before the DELETE response
+      // does; this flag keeps that handler from also announcing a delete THIS tab is
+      // already reporting itself.
+      (state.deletingProjects = state.deletingProjects || {})[t.id] = true;
       try {
         await api(`/projects/${t.id}`, { method: 'DELETE' });
         closeTab(t.id);
@@ -3437,6 +3447,8 @@ async function _deleteProject(t: any) {
         } else {
           toast(e.message.includes('409') ? 'Cannot delete — active tasks in progress.' : 'Delete failed: ' + e.message, true);
         }
+      } finally {
+        delete state.deletingProjects[t.id];
       }
       resolve();
     };
@@ -3644,10 +3656,6 @@ function buildTabBody(project: any) {
           <span style="display:flex;gap:6px;align-items:center">
 
             <button class="secondary" id="live-auto-btn-${project.id}" title="Toggle auto-refresh" style="padding:2px 8px;font-size:10px">↻ Auto</button>
-
-            <button class="secondary" id="live-pause-${project.id}" title="Pause queue (UI stub)" style="padding:2px 8px;font-size:10px">Pause</button>
-
-            <button class="secondary" id="live-run-${project.id}" title="Run all pending (UI stub)" style="padding:2px 8px;font-size:10px">Run All</button>
 
           </span>
 
@@ -4681,7 +4689,9 @@ function buildTabBody(project: any) {
         try { localStorage.setItem('meridian_last_tab_' + project.id, vtab); } catch(_) {}
 
         if (vtab === 'files') loadFilesTab(project.id);
-
+        // 8a665a03 -- the Goal tab's compact sprint board was only painted when the
+        // tab body was built, so it showed old counts after any later change.
+        if (vtab === 'goal') reloadGoalSprintBoard(project.id);
         if (vtab === 'devlog') refreshTasks(project.id);
 
         if (vtab === 'timeline') loadTimeline(project.id);
@@ -5297,18 +5307,10 @@ async function loadLiveTab(projectId: any) {
 
   panel.liveWired = panel.liveWired || false;
 
-  // Wire the [Pause]/[Run All] header stubs once.
-
+  // Wire the Live-tab controls once. (The header used to carry [Pause] / [Run All]
+  // placeholders whose only behaviour was a "stub" toast; they were removed instead
+  // of being left on screen as controls that do nothing -- 3bcb4013.)
   if (!panel.liveWired) {
-
-    const pause = document.getElementById(`live-pause-${projectId}`);
-
-    const runAll = document.getElementById(`live-run-${projectId}`);
-
-    if (pause) pause.onclick = () => toast('Pause is a stub — coming soon');
-
-    if (runAll) runAll.onclick = () => toast('Run All is a stub — coming soon');
-
     const input = document.getElementById(`live-add-input-${projectId}`);
 
     if (input) input.addEventListener('keydown', (ev) => {
@@ -5638,10 +5640,81 @@ async function refreshLiveTab(projectId: any) {
 
 
 
+// 8a665a03 -- THE sprint-board repaint. A sprint item is drawn by three views: the
+// Queue tab (#queue-body-<pid>, repainted only by loadQueue), the Live tab
+// (refreshLiveTab) and the Goal tab's compact board (#sprint-board-goal-<pid>,
+// repainted only by the loadSprintBoard closure that buildTabBody registers in
+// _sprintBoardReloaders). Every mutation handler used to refresh just the Live tab,
+// so a row deleted/pushed/skipped from the Queue tab stayed on screen until a reload.
+// Mutation handlers AND the WebSocket handlers below go through these helpers so a
+// view cannot be forgotten again.
+function reloadGoalSprintBoard(projectId: any) {
+  try {
+    const reload = _sprintBoardReloaders[projectId];
+    if (reload) Promise.resolve(reload()).catch(() => {});
+  } catch (_) { /* the board is best-effort; its own loader renders the error state */ }
+}
+
+// A batch of N item writes (MCP batch, wave assignment, fan-out) publishes N events within
+// milliseconds. Repainting once per burst instead of once per event keeps the dashboard --
+// and the server -- from refetching the whole item list N times.
+const _repaintTimers: Record<string, any> = {};
+function _debounceRepaint(key: string, fn: () => void, ms = 150) {
+  clearTimeout(_repaintTimers[key]);
+  _repaintTimers[key] = setTimeout(fn, ms);
+}
+
+function scheduleGoalBoardReload(projectId: any) {
+  const panel = state.panels[projectId];
+  if (panel && panel.activeVtab === 'goal') {
+    _debounceRepaint(`goal:${projectId}`, () => reloadGoalSprintBoard(projectId));
+  }
+}
+
+// Repaint the sprint views that are on screen right now, except the Live tab (that
+// one has its own awaited / throttled refresh). A hidden view is skipped on purpose:
+// the Queue tab reloads when it is opened, and the Goal board reloads on opening the
+// Goal tab (vtab handler in buildTabBody), so a hidden view never needs a fetch.
+function repaintVisibleSprintViews(projectId: any) {
+  const panel = state.panels[projectId];
+  if (!panel) return;
+  if (panel.activeVtab === 'queue') {
+    _debounceRepaint(`queue:${projectId}`, () => loadQueue(projectId, { quiet: true }));
+  }
+  scheduleGoalBoardReload(projectId);
+}
+async function refreshSprintSurfaces(projectId: any) {
+  /** After a sprint-item mutation made in THIS tab: repaint Queue + Goal board (when
+   * visible) and the Live tab. The server's WebSocket event repaints other tabs. */
+  repaintVisibleSprintViews(projectId);
+  await refreshLiveTab(projectId);
+}
+
+function applySprintItemDeleted(projectId: any, itemId: any) {
+  /** Drop a permanently-deleted item from the Queue tab's cache and repaint it from
+   * that cache (no refetch -- the row is gone the moment the delete is known). Shared
+   * by the local delete (sprintArchive) and the sprint_item_deleted WebSocket event. */
+  const panel = state.panels[projectId];
+  if (!panel) return;
+  if (Array.isArray(panel.queueSprintItems)) {
+    const gone = panel.queueSprintItems.find((it: any) => it.id === itemId);
+    panel.queueSprintItems = panel.queueSprintItems.filter((it: any) => it.id !== itemId);
+    if (gone && gone.status === 'done' && panel.queueTotalDoneCount > 0) panel.queueTotalDoneCount -= 1;
+  }
+  // The cache is already updated, so a search that is on screen repaints from it when
+  // the search is cleared; repainting now would wipe the results the user is reading.
+  if (panel.activeVtab === 'queue' && !queueSearchActive(projectId)) renderQueueBody(projectId);
+}
+
+function queueSearchActive(projectId: any) {
+  /** True while the Queue tab's universal-search box has text: the body then shows search
+   * results (renderSearchResults), not the queue, and a background repaint must not
+   * replace them. */
+  const box = document.getElementById(`task-search-${projectId}`) as HTMLInputElement | null;
+  return !!(box && box.value && box.value.trim());
+}
+
 // function renderSprintProgress -- moved to dashboard-sprint.js
-
-
-
 function wireSprintAddEnter(projectId: any, root: any) {
 
   /** Allow Enter in the sprint-add input to submit. */
@@ -5665,8 +5738,7 @@ async function sprintAction(projectId: any, itemId: any, action: any) {
       { method: 'POST', body: JSON.stringify({}) });
 
     toast(`Sprint item ${action}d`);
-
-    await refreshLiveTab(projectId);
+    await refreshSprintSurfaces(projectId);
 
   } catch(e: any) { toast(`Failed: ${e.message}`, true); }
 
@@ -5681,13 +5753,14 @@ async function sprintArchive(projectId: any, itemId: any) {
 
   try {
 
-    const r = await fetch(`/projects/${projectId}/sprint-items/${itemId}`, { method: 'DELETE' });
-
-    if (!r.ok && r.status !== 204) throw new Error(`${r.status}`);
-
+    // api() (not a bare fetch) so the workspace-tenant header and demo read-only
+    // handling apply like every other mutation.
+    await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: 'DELETE' });
     toast('Backburner item deleted');
-
-    await refreshLiveTab(projectId);
+    // 8a665a03 -- the trash button lives in the Queue tab, which used to be left
+    // showing the deleted row (only the Live tab was refreshed).
+    applySprintItemDeleted(projectId, itemId);
+    await refreshSprintSurfaces(projectId);
 
   } catch(e: any) { toast(`Delete failed: ${e.message}`, true); }
 
@@ -5696,15 +5769,35 @@ async function sprintArchive(projectId: any, itemId: any) {
 
 function filterBackburner(projectId: any, value: any) {
 
-  /** e62ce019 — client-side filter of the backburner section by title/group. */
+  /** e62ce019 — client-side filter of the backburner section by title/group.
+   * The text is kept in panel state (not just in the input) so every repaint of the
+   * Queue body can put it back: a delete / WebSocket repaint rebuilds the input node and
+   * used to reset the filter after every single delete. */
 
-  const q = (value || '').trim().toLowerCase();
+  const panel = state.panels[projectId];
 
-  const sec = document.querySelector('.queue-section[data-section="backburner"]');
+  if (panel) panel.backburnerFilter = value || '';
+
+  applyBackburnerFilter(projectId);
+
+}
+
+function applyBackburnerFilter(projectId: any) {
+
+  /** Hide the backburner rows that do not match the filter text held in panel state.
+   * Scoped to this project's Queue body (a second open project has its own section). */
+
+  const panel = state.panels[projectId];
+
+  const q = ((panel && panel.backburnerFilter) || '').trim().toLowerCase();
+
+  const scope = document.getElementById(`queue-body-${projectId}`) || document;
+
+  const sec = scope.querySelector('.queue-section[data-section="backburner"]');
 
   if (!sec) return;
 
-  sec.querySelectorAll('.queue-item').forEach(el => {
+  sec.querySelectorAll('.queue-item').forEach((el: any) => {
 
     const hit = !q || (el.dataset.bbTitle || '').includes(q) || (el.dataset.bbGroup || '').includes(q);
 
@@ -5712,9 +5805,9 @@ function filterBackburner(projectId: any, value: any) {
 
   });
 
-  sec.querySelectorAll('.bb-group').forEach(g => {
+  sec.querySelectorAll('.bb-group').forEach((g: any) => {
 
-    const anyVisible = Array.from(g.querySelectorAll('.queue-item')).some(el => el.style.display !== 'none');
+    const anyVisible = Array.from(g.querySelectorAll('.queue-item')).some((el: any) => el.style.display !== 'none');
 
     g.style.display = anyVisible ? '' : 'none';
 
@@ -5739,15 +5832,21 @@ async function sprintPushPrompt(projectId: any, itemId: any) {
       { method: 'POST', body: JSON.stringify({ to_version: toVersion }) });
 
     toast('Sprint item pushed to ' + toVersion);
-
-    await refreshLiveTab(projectId);
-
+    await refreshSprintSurfaces(projectId);
   } catch(e: any) { toast(`Push failed: ${e.message}`, true); }
-
 }
 
-
-
+async function sprintResetPending(projectId: any, itemId: any) {
+  /** "Back to pending" on a Needs-attention (indeterminate) item. 8a665a03 -- this was an
+   * inline onclick whose .then() read `items`/`it`, which do not exist in an inline
+   * handler's scope, so it threw after the PATCH and the board never repainted. */
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}`,
+      { method: 'PATCH', body: JSON.stringify({ status: 'pending' }) });
+    toast('Sprint item back to pending');
+    await refreshSprintSurfaces(projectId);
+  } catch(e: any) { toast(`Failed: ${e.message}`, true); }
+}
 async function sprintFeedback(projectId: any, itemId: any, thumb: any, currentThumb: any, event: any) {
 
   event && event.stopPropagation();
@@ -5759,8 +5858,7 @@ async function sprintFeedback(projectId: any, itemId: any, thumb: any, currentTh
     await api(`/projects/${projectId}/sprint-items/${itemId}`,
 
       { method: 'PATCH', body: JSON.stringify({ feedback_thumb: newThumb }) });
-
-    await refreshLiveTab(projectId);
+    await refreshSprintSurfaces(projectId);
 
   } catch(e: any) { toast('Feedback failed: ' + e.message, true); }
 
@@ -5777,8 +5875,7 @@ async function sprintFeedbackNote(projectId: any, itemId: any, note: any) {
     await api(`/projects/${projectId}/sprint-items/${itemId}`,
 
       { method: 'PATCH', body: JSON.stringify({ feedback_note: note.trim() }) });
-
-    await refreshLiveTab(projectId);
+    await refreshSprintSurfaces(projectId);
 
   } catch(e: any) { toast('Note save failed: ' + e.message, true); }
 
@@ -5855,10 +5952,12 @@ async function sprintItemEdit(projectId: any, itemId: any) {
         method: 'PATCH',
 
         body: JSON.stringify({ title: newTitle, version: newVersion || undefined }),
-
       });
-
-      await refreshLiveTab(projectId);
+      // The edit is on the server, so this editor is finished: marked so the repaint below
+      // replaces the row instead of carrying the closed editor across (renderSprintProgress
+      // keeps every row with an open editor, see _SPRINT_BOARD_DRAFTS).
+      titleInput.dataset.saved = verInput.dataset.saved = '1';
+      await refreshSprintSurfaces(projectId);
 
     } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
 
@@ -5869,6 +5968,9 @@ async function sprintItemEdit(projectId: any, itemId: any) {
     titleInput.replaceWith(titleSpan);
 
     verInput.replaceWith(verSpan);
+
+    // The row was kept as-is while the editor was open: catch it up with whatever changed.
+    refreshSprintSurfaces(projectId);
 
   };
 
@@ -5953,8 +6055,8 @@ async function sprintItemNotesEdit(projectId: any, itemId: any) {
       });
 
       row.dataset.notes = newNotes || '';
-
-      await refreshLiveTab(projectId);
+      textarea.dataset.saved = '1'; // finished: the repaint below replaces the row (see sprintItemEdit)
+      await refreshSprintSurfaces(projectId);
 
     } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
 
@@ -5965,6 +6067,8 @@ async function sprintItemNotesEdit(projectId: any, itemId: any) {
     if (existingNotesEl) textarea.replaceWith(existingNotesEl);
 
     else textarea.remove();
+
+    refreshSprintSurfaces(projectId); // catch the kept row up (see sprintItemEdit)
 
   };
 
@@ -6040,10 +6144,9 @@ async function sprintItemResourcesEdit(projectId: any, itemId: any, rawJson: any
         method: 'PATCH',
 
         body: JSON.stringify({ touches_resources: lines.length ? lines : null }),
-
       });
-
-      await refreshLiveTab(projectId);
+      textarea.dataset.saved = '1'; // finished: the repaint below replaces the row (see sprintItemEdit)
+      await refreshSprintSurfaces(projectId);
 
     } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
 
@@ -6054,6 +6157,8 @@ async function sprintItemResourcesEdit(projectId: any, itemId: any, rawJson: any
     if (existingEl) textarea.replaceWith(existingEl);
 
     else textarea.remove();
+
+    refreshSprintSurfaces(projectId); // catch the kept row up (see sprintItemEdit)
 
   };
 
@@ -6241,8 +6346,7 @@ async function addSprintItemFromInput(projectId: any) {
     inp.style.borderColor = '';
 
     toast('Sprint item added');
-
-    await refreshLiveTab(projectId);
+    await refreshSprintSurfaces(projectId);
 
   } catch(e: any) { toast('Add failed: ' + e.message, true); }
 
@@ -8654,11 +8758,14 @@ async function loadHitlTab(projectId: any) {
 
   const statusBadge: Record<string, string> = { pending: '#f59e0b', answered: '#22c55e', dismissed: 'var(--muted)' };
 
-
+  // 8a665a03 -- an answer typed into a pending card is a draft the repaint must keep. Every
+  // hitl_filed event, reconnect and Refresh click rebuilds this list; the typed text (and the
+  // caret) is carried across, and the "loading…" placeholder is not painted over it first.
+  const draftUnits = [{ selector: 'input[id^="hitl-ans-"]', key: (el: any) => el.id }];
 
   const render = async () => {
 
-    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading…</div>`;
+    if (!hasUnsentDrafts(body, draftUnits)) body.innerHTML = `<div class="empty" style="color:var(--muted)">loading…</div>`;
 
     const status = (statusFilter && statusFilter.value) || 'pending';
 
@@ -8839,7 +8946,9 @@ async function loadHitlTab(projectId: any) {
 
       }
 
-      body.innerHTML = html;
+      // Judged here, after the fetch returned: an answer typed while the request was in
+      // flight is kept too.
+      paintKeepingDrafts(body, html, draftUnits);
 
       _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, '.hitl-row');
 
@@ -9024,7 +9133,11 @@ async function loadHitlTab(projectId: any) {
 
     } catch (e: any) {
 
-      body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
+      // A transient failure (server restarting) must not wipe an answer being typed: the
+      // cards stay as they are and the next refresh repaints them.
+      if (hasUnsentDrafts(body, draftUnits)) console.warn('[meridian] HITL queue refresh failed:', e);
+
+      else body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
 
     }
 
@@ -10043,19 +10156,57 @@ async function loadRecentRuns(projectId: any) {
 
 
 
-async function loadQueue(projectId: any) {
-
-  /** Sprint queue panel sourced from sprint_items, not task_log history. */
-
+function renderQueueBody(projectId: any) {
+  /** Paint #queue-body-<pid> from panel.queueSprintItems (no fetch). Shared by
+   * loadQueue and by the sprint_item_deleted path, which repaints from the cache. */
   const body = document.getElementById(`queue-body-${projectId}`);
-
+  const panel = state.panels[projectId];
+  if (!body || !panel) return;
+  // A repaint rebuilds every node, so the view state that lives only in the DOM has to be
+  // carried across it by hand: the focused filter box (and its caret) and the scroll
+  // offset. The filter TEXT lives in panel.backburnerFilter and is re-applied below.
+  const filterId = `backburner-search-${projectId}`;
+  const active = document.activeElement as HTMLInputElement | null;
+  const hadFilterFocus = !!(active && active.id === filterId);
+  const caret = hadFilterFocus
+    ? { start: active!.selectionStart, end: active!.selectionEnd }
+    : null;
+  const scrollTop = body.scrollTop;
+  body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
+  applyBackburnerFilter(projectId);
+  if (scrollTop) body.scrollTop = scrollTop;
+  if (hadFilterFocus) {
+    const next = document.getElementById(filterId) as HTMLInputElement | null;
+    if (next) {
+      next.focus();
+      try { if (caret && caret.start != null) next.setSelectionRange(caret.start, caret.end ?? caret.start); } catch (_) { /* not a text input */ }
+    }
+  }
+  wireQueueSectionToggles(projectId);
+  const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
+  if (moreBtn) {
+    moreBtn.onclick = () => {
+      panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
+      renderQueueBody(projectId);
+    };
+  }
+}
+async function loadQueue(projectId: any, opts: any = {}) {
+  /** Sprint queue panel sourced from sprint_items, not task_log history.
+   * opts.quiet (8a665a03): a background repaint (WebSocket event, mutation made in
+   * another tab) keeps the current rows on screen until the fresh payload lands
+   * instead of flashing "loading…" over a list the user may be reading. */
+  const body = document.getElementById(`queue-body-${projectId}`);
   if (!body) return;
-
   const panel = getPanelState(projectId);
-
   if (!panel.queueDoneLimit) panel.queueDoneLimit = QUEUE_DONE_PAGE_SIZE;
-
-  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+  // A quiet repaint never blanks what is on screen: the queue rows, or the search results
+  // the user is reading (queueSearchActive) -- those are replaced only when the search is
+  // cleared, from the cache this call refreshes.
+  const quietKeep = !!(opts && opts.quiet && (body.querySelector('.queue-section') || queueSearchActive(projectId)));
+  if (!quietKeep) {
+    body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+  }
 
   try {
 
@@ -10079,31 +10230,11 @@ async function loadQueue(projectId: any) {
 
 
 
-    const renderCurrentQueue = () => {
-
-      body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
-
-      wireQueueSectionToggles(projectId);
-
-      const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
-
-      if (moreBtn) {
-
-        moreBtn.onclick = () => {
-
-          panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
-
-          renderCurrentQueue();
-
-        };
-
-      }
-
-    };
+    const renderCurrentQueue = () => renderQueueBody(projectId);
 
 
 
-    renderCurrentQueue();
+    if (!(opts && opts.quiet && queueSearchActive(projectId))) renderCurrentQueue();
 
     loadRecentSessions(projectId, sessions || []);
 
@@ -10688,6 +10819,26 @@ async function refreshGoal(projectId: any) {
   }
 }
 
+async function refreshDecisionsLog(projectId: any) {
+
+  /** Repaint only the Goal tab's Decisions table (the append-only set_decision log).
+   *
+   * An agent logging a decision announces goal_updated {field: 'decisions'}; the goal text,
+   * north star and sprint did not change, so re-running refreshGoal for it could only put
+   * the user's unsaved edits at risk for nothing. */
+
+  if (!document.getElementById(`decisions-table-${projectId}`)) return;
+
+  try {
+
+    const goal = await projectApi(projectId, `/projects/${projectId}/goal`);
+
+    renderDecisionsTable(projectId, goal.decisions || '');
+
+  } catch (_) { /* the next event or tab open repaints it */ }
+
+}
+
 
 
 function parseDecisionsBlob(blob: any) {
@@ -11088,7 +11239,11 @@ async function refreshHitl(_pid?: any) {
 
     bar.style.display = 'flex';
 
-    list.innerHTML = items.map((r: any) => {
+    // 8a665a03 -- an answer typed into a card's input is a draft: every hitl_filed event and
+    // reconnect repaints this panel, and the typed text (and the caret) must survive that.
+    const draftUnits = [{ selector: 'input.hitl-answer-input', key: (el: any) => el.dataset.hitlId }];
+
+    paintKeepingDrafts(list, items.map((r: any) => {
 
       const color = _HITL_URGENCY_COLOR[r.urgency] || _HITL_URGENCY_COLOR.normal;
 
@@ -11144,7 +11299,7 @@ async function refreshHitl(_pid?: any) {
 
       </div>`;
 
-    }).join('');
+    }).join(''), draftUnits);
 
     list.querySelectorAll('.hitl-answer-btn').forEach(btn => {
 
@@ -11285,6 +11440,12 @@ async function loadPinnedDecisions(projectId: any, { showArchived = false } = {}
     setVtabCountBadge(`.decisions-gtab-badge[data-pid="${projectId}"]`, (items || []).length);
 
     renderConstitutionWarning(projectId);
+
+    // An open inline editor holds a draft the user has not saved, and repainting the cards
+    // would close it and throw the draft away -- every goal / task / decision event and
+    // every WebSocket reconnect lands here. Skip the paint; Save and Cancel both reload
+    // the list, so nothing that arrived meanwhile is lost.
+    if (Array.from(host.querySelectorAll('.decision-edit-area')).some((el: any) => el.style.display === 'block')) return;
 
     if (!items || items.length === 0) {
 
@@ -11442,7 +11603,14 @@ async function loadPinnedDecisions(projectId: any, { showArchived = false } = {}
 
     host.querySelectorAll('.decision-edit-cancel').forEach(btn => {
 
-      btn.onclick = () => hideEdit(btn.dataset.id);
+      btn.onclick = () => {
+
+        hideEdit(btn.dataset.id);
+
+        // Catch up on whatever was held back while the editor was open (see above).
+        loadPinnedDecisions(projectId, { showArchived });
+
+      };
 
     });
 
@@ -12375,7 +12543,13 @@ function renderTasks(projectId: any) {
 
   banner!.style.display = hitl.length ? 'block' : 'none';
 
-  hitlRoot.innerHTML = hitl.map((t: any) => renderHitlRow(projectId, t)).join('');
+  // 8a665a03 -- every task event repaints this list; a reply typed into a pending-HITL row
+  // (and its caret) is carried across instead of being replaced by an empty twin.
+  paintKeepingDrafts(
+    hitlRoot,
+    hitl.map((t: any) => renderHitlRow(projectId, t)).join(''),
+    [{ selector: 'input[data-input]', key: (el: any) => el.dataset.input }],
+  );
 
   hitl.forEach((t: any) => wireHitlRow(projectId, t));
 
@@ -12504,9 +12678,10 @@ async function deleteTaskRow(e: any, taskId: any, status: any) {
   try {
 
     await api('/tasks/' + taskId, { method: 'DELETE' });
-
+    // 8a665a03 -- the cache must forget the task too, or the next task event
+    // re-renders the Devlog from it and the deleted row comes back.
+    dropTaskFromCaches(taskId);
     const row = document.getElementById('task-row-' + taskId);
-
     if (row) row.remove();
 
   } catch(e2) { console.error('Delete failed:', e2); }
@@ -12514,6 +12689,20 @@ async function deleteTaskRow(e: any, taskId: any, status: any) {
 }
 
 
+
+function dropTaskFromCaches(taskId: any, onlyProjectId?: any) {
+  /** Remove a hard-deleted task from the Devlog cache of every project panel (or just
+   * onlyProjectId). Keeps taskOffset aligned with the server's row numbering so
+   * "Load 100 more" does not skip a row. */
+  const ids = onlyProjectId ? [onlyProjectId] : Object.keys(state.panels);
+  for (const pid of ids) {
+    const p = state.panels[pid];
+    if (!p || !Array.isArray(p.taskCache)) continue;
+    const before = p.taskCache.length;
+    p.taskCache = p.taskCache.filter((t: any) => t.id !== taskId);
+    if (p.taskCache.length < before) p.taskOffset = Math.max(0, (p.taskOffset || 0) - 1);
+  }
+}
 
 function renderHitlRow(projectId: any, t: any) {
 
@@ -12677,7 +12866,32 @@ function connectWs(projectId: any) {
 
   const dot = document.getElementById(`ws-${projectId}`);
 
-  ws.onopen = () => { dot && dot.classList.add('connected'); };
+  ws.onopen = () => {
+
+    dot && dot.classList.add('connected');
+
+    // A socket that OPENS AGAIN has missed every event published while it was down
+    // (server restart, laptop sleep, network blip), and nothing replays them -- so every
+    // list view stays stale until the next event happens to touch it, or a reload. The
+    // live-view rule has two halves for that reason: events while connected, and a full
+    // resync on reconnect. The first open needs none: the tab loads fresh data itself.
+    const panel = state.panels[projectId];
+
+    if (panel) {
+
+      const reopened = !!panel.wsOpenedBefore;
+
+      panel.wsOpenedBefore = true;
+
+      if (reopened) {
+
+        try { resyncProjectViews(projectId); } catch (_) { /* a failed resync must not break the socket */ }
+
+      }
+
+    }
+
+  };
 
   ws.onclose = () => {
 
@@ -12713,8 +12927,176 @@ function connectWs(projectId: any) {
 
 
 
-function handleWsEvent(projectId: any, event: any) {
+function connectAccountWs() {
 
+  /** The page's own WebSocket, for events about the account rather than one project.
+   *
+   * connectWs opens one socket per project TAB, so a dashboard with no tab open (the last
+   * one closed, a brand-new account) held no socket at all and never heard that a project
+   * was created, renamed, merged or deleted from another tab, an agent or the API. This
+   * socket does not depend on the tabs. It carries only account-level events (see
+   * handleAccountEvent) and is keyed server-side by the database this page reads, so it
+   * follows the workspace switcher: calling this again replaces the socket. */
+
+  const previous = state.accountWs;
+
+  state.accountWs = null;
+
+  if (previous) { try { previous.close(); } catch (_) { /* already closed */ } }
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+  const workspace = state.activeWorkspaceTenantId
+    ? `?workspace=${encodeURIComponent(state.activeWorkspaceTenantId)}` : '';
+
+  let sock: any;
+
+  // A constructor that throws (a browser refusing the URL) must not take the dashboard's
+  // init down with it: the page works without live project-list updates, just as before.
+  try { sock = new WebSocket(`${proto}//${location.host}/ws-account${workspace}`); } catch (_) { return; }
+
+  state.accountWs = sock;
+
+  let opened = false;
+
+  sock.onopen = () => {
+
+    opened = true;
+
+    state.accountWsFailures = 0;
+
+    // Events published while no socket was open are never replayed, and the very first
+    // list fetch can race the connect, so every open refetches the project list once.
+    refreshProjectListFromAccount();
+
+  };
+
+  sock.onclose = (ev: any) => {
+
+    if (state.accountWs !== sock) return;   // replaced by a newer socket: nothing to restore
+
+    state.accountWs = null;
+
+    // 4401 = refused (not signed in, not a member of that workspace): retrying cannot help.
+    if (ev && ev.code === 4401) return;
+
+    // Back off while the server is unreachable instead of hammering it every 1.5 s.
+    const failures = opened ? 0 : (state.accountWsFailures || 0) + 1;
+
+    state.accountWsFailures = failures;
+
+    const delay = failures === 0 ? 1500 : Math.min(30000, 1500 * 2 ** (failures - 1));
+
+    setTimeout(() => { if (!state.accountWs) connectAccountWs(); }, delay);
+
+  };
+
+  sock.onerror = () => { /* onclose follows and reconnects */ };
+
+  sock.onmessage = (ev: any) => {
+
+    try { handleAccountEvent(JSON.parse(ev.data)); } catch (_) { /* malformed frame */ }
+
+  };
+
+}
+
+function refreshProjectListFromAccount() {
+
+  // Coalesced: a batch delete or a merge announces several times in a row.
+  _debounceRepaint('projects', async () => {
+
+    await loadProjects();
+
+    dismissEmptyAccountWizard();
+
+  });
+
+}
+
+function dismissEmptyAccountWizard() {
+
+  /** The first-run wizard is the empty state of an account with no project, and init stops
+   * there (it returns before restoring any tab). When the first project then appears from
+   * elsewhere -- an agent's create_project is the usual way -- the overlay would sit on top
+   * of a dashboard that has something to show: close it and open the project, as the
+   * wizard's own "advanced" link does. */
+
+  const wizard = document.getElementById('ez-wizard');
+
+  if (!wizard || wizard.style.display !== 'flex' || state.projects.length === 0) return;
+
+  wizard.style.display = 'none';
+
+  restoreTabs();
+
+}
+
+function handleAccountEvent(event: any) {
+
+  // The project LIST changed (a project was created, deleted, merged, renamed, reparented
+  // or re-prioritised, from another tab, an agent or the API). The event names no project:
+  // refetching GET /projects applies this caller's own workspace scoping.
+  if (event.type === 'projects_changed') {
+
+    refreshProjectListFromAccount();
+
+  }
+
+}
+
+function resyncProjectViews(projectId: any) {
+
+  /** Bring every view of one project back in step with the server without an event to
+   * say what changed: after a WebSocket reconnect (events published while the socket was
+   * down are gone for good) and after a merge (rows moved between projects wholesale).
+   * Visible views fetch now; hidden ones reload when they are opened, as they always do.
+   * Everything here is the same refresh the matching event handler would have run. */
+
+  const panel = state.panels[projectId];
+
+  if (!panel) return;
+
+  _debounceRepaint('projects', () => { loadProjects(); });
+
+  repaintVisibleSprintViews(projectId);   // Queue and the Goal tab's sprint board, when visible
+
+  // Independent refreshes: one failing (the server may still be warming up after a
+  // restart) must not stop the others, and none may surface as an unhandled rejection.
+  const jobs: any[] = [
+    refreshTab(projectId),                // goal + Active Sessions + the Devlog task list
+    loadPinnedDecisions(projectId),
+    refreshProjectCountBadges(projectId),
+    refreshHitl(),
+  ];
+
+  if (panel.activeVtab === 'live') jobs.push(refreshLiveTab(projectId));
+  if (panel.activeVtab === 'notes') jobs.push(loadNotesTab(projectId));
+  if (panel.activeVtab === 'insights') jobs.push(loadInsightsTab(projectId));
+
+  Promise.allSettled(jobs);
+
+}
+
+// THE LIVE-VIEW RULE (8a665a03): every mutation publishes exactly one event, and every
+// list view subscribes to it -- and a view that was disconnected resyncs when it
+// reconnects (ws.onopen -> resyncProjectViews), because a missed event is never replayed.
+// Server side the publish is a _publish_project_event / _publish_task / publish_global /
+// _publish_account_event call on the mutation's path (db layer or route); client side it
+// is a branch below that repaints the view(s) showing that data. Break either half and the
+// view needs a reload to catch up -- the permanently-deleted Backburner row that stayed on
+// screen was a mutation with no event and no branch. A repaint must also keep what the user
+// built up on screen: the Backburner filter text, scroll and focus live in panel state, an
+// unsaved Goal / North Star / Sprint edit carries the 'dirty' class that refreshGoal
+// honours, and an open pinned-decision editor makes loadPinnedDecisions skip its paint.
+// Events about the account rather than one project (the project LIST) are not handled here:
+// they arrive on the page's own socket (connectAccountWs), which exists with or without a
+// project tab, and are handled in handleAccountEvent.
+// tests/test_ws_event_coverage.py fails when a server-published event type has no branch
+// here or in handleAccountEvent (or an allowlist entry with a reason), when a
+// dashboard-driven mutating route publishes nothing, and when a function that writes
+// sprint_items or projects publishes nothing (or has no allowlist entry with a reason).
+function handleWsEvent(projectId: any, event: any) {
   if (event.type === 'update_available') {
 
     if (isDemoMode()) {
@@ -12754,83 +13136,147 @@ function handleWsEvent(projectId: any, event: any) {
     const proj = state.projects.find(p => p.id === event.project_id);
 
     if (proj) { proj.name = event.name; loadProjects(); }
-
     return;
-
   }
 
+  // 8a665a03 -- icon / parent changes are published globally by their routes, but no
+  // branch handled them, so a second tab or session kept the old icon / hierarchy.
+  if (event.type === 'project_icon_changed') {
+    const tab = state.tabs.find(t => t.id === event.project_id);
+    if (tab) tab.project = { ...tab.project, icon: event.icon || null };
+    const proj = state.projects.find(p => p.id === event.project_id);
+    if (proj) proj.icon = event.icon || null;
+    renderTabs();
+    return;
+  }
+
+  if (event.type === 'project_parent_changed') {
+    const tab = state.tabs.find(t => t.id === event.project_id);
+    if (tab) tab.project = { ...tab.project, parent_project_id: event.parent_project_id || null };
+    loadProjects();
+    return;
+  }
+
+  // (projects_changed -- the project LIST -- is not a project event: it rides the page's
+  // own account socket, connectAccountWs / handleAccountEvent, so it also reaches a
+  // dashboard with no project tab open.)
+
+  // THIS project no longer exists: close its tab instead of leaving a panel whose every
+  // request now 404s, and refresh the sidebar.
+  if (event.type === 'project_deleted') {
+    if (state.tabs.some((t: any) => t.id === projectId)) {
+      if (!(state.deletingProjects && state.deletingProjects[projectId])) toast('This project was deleted');
+      closeTab(projectId);
+    }
+    _debounceRepaint('projects', () => { loadProjects(); });
+    return;
+  }
+
+  // Rows were re-parented between projects wholesale: resync every view of this one.
+  if (event.type === 'project_merged') {
+    resyncProjectViews(projectId);
+    return;
+  }
   // v2.6 — sprint item / goal / session events broadcast live from server
 
   if (event.type === 'sprint_item_updated') {
-
-    const panel = state.panels[projectId];
-
-    if (panel && panel.activeVtab === 'queue') loadQueue(projectId);
-
+    // Queue (if visible) + Goal-tab board (if visible) + Live. 8a665a03: the Goal
+    // board used to be skipped here.
+    repaintVisibleSprintViews(projectId);
     scheduleLiveRefresh(projectId);
-
     return;
-
   }
 
+  // 8a665a03 -- a permanent delete (Queue trash button, REST, MCP) has its own event:
+  // drop the row from the Queue cache and repaint now, in every tab and session.
+  if (event.type === 'sprint_item_deleted') {
+    applySprintItemDeleted(projectId, event.item_id);
+    scheduleGoalBoardReload(projectId);
+    scheduleLiveRefresh(projectId);
+    return;
+  }
   if (event.type === 'goal_updated') {
     // fc779141 — the event names the changed fields and who made the change, so a
     // "Changed elsewhere" bar can say "by an agent, 2m ago" for the refresh below.
     noteGoalEvent(projectId, event);
+
+    // set_decision announces {field: 'decisions'}: only the Decisions table changed, so
+    // only it is repainted (coalesced: an agent can log several in a row).
+    if (event.field === 'decisions') {
+
+      _debounceRepaint(`decisions-log:${projectId}`, () => { refreshDecisionsLog(projectId); });
+
+      return;
+
+    }
+
     refreshGoal(projectId);
     return;
   }
 
-  if (event.type === 'session_started') {
-
+  // session_updated (8a665a03): a session closed / marked idle. Only a session starting
+  // was announced before, so ended sessions lingered in every other open dashboard.
+  if (event.type === 'session_started' || event.type === 'session_updated') {
     const panel = state.panels[projectId];
-
-    if (panel && panel.activeVtab === 'queue') loadQueue(projectId);
-
+    if (panel && panel.activeVtab === 'queue') loadQueue(projectId, { quiet: true });
     scheduleLiveRefresh(projectId);
-
+    // 8a665a03 -- the Status drawer's "Active Sessions" list is filled only by
+    // refreshSessions, which nothing called on a new session, so it stayed empty
+    // until the tab was reopened.
+    refreshSessions(projectId);
     return;
-
   }
-
   // ITEM 6 — live mutation pushes (replace 10s/30s polling)
 
-  if (event.type === 'sprint_item_added') {
-
-    const panel = state.panels[projectId];
-
-    if (panel && panel.activeVtab === 'queue') loadQueue(projectId);
-
+  // sprint_items_fanned_out (8a665a03) is the bulk-create twin of sprint_item_added and
+  // was published with no branch, so a fan-out never showed up until a reload.
+  if (event.type === 'sprint_item_added' || event.type === 'sprint_items_fanned_out') {
+    repaintVisibleSprintViews(projectId);
     scheduleLiveRefresh(projectId);
-
     refreshProjectCountBadges(projectId);
-
     return;
-
   }
-
-  if (event.type === 'note_added') {
-
+  // note_updated / note_deleted (8a665a03): edits and deletes made through the API, MCP
+  // or a handoff/ingest rewrite used to be silent, only note_added was published.
+  if (event.type === 'note_added' || event.type === 'note_updated' || event.type === 'note_deleted') {
+    _debounceRepaint(`notes:${projectId}`, () => {
+      const panel = state.panels[projectId];
+      if (panel && panel.activeVtab === 'notes') loadNotesTab(projectId);
+      refreshProjectCountBadges(projectId);
+    });
+    return;
+  }
+  // decision_updated / decision_deleted (8a665a03): edit, archive (supersede), priority
+  // and hard-delete used to publish nothing, only a new pin did.
+  if (event.type === 'decision_pinned' || event.type === 'decision_updated' || event.type === 'decision_deleted') {
+    // Coalesced: replace-all / archive-oldest / supersede publish several events in a row.
+    _debounceRepaint(`decisions:${projectId}`, () => {
+      if (state.panels[projectId]) loadPinnedDecisions(projectId);
+      refreshProjectCountBadges(projectId);
+    });
+    return;
+  }
+  // 8a665a03 -- create_insight has always published insight_added, but nothing listened:
+  // an open Insights tab stayed stale until the tab button was clicked again. (The
+  // Insights tab renders its own count header, so there is no vtab badge to refresh.)
+  if (event.type === 'insight_added') {
     const panel = state.panels[projectId];
-
-    if (panel && panel.activeVtab === 'notes') loadNotesTab(projectId);
-
-    refreshProjectCountBadges(projectId);
-
+    if (panel && panel.activeVtab === 'insights') loadInsightsTab(projectId);
     return;
-
   }
 
-  if (event.type === 'decision_pinned') {
-
-    if (state.panels[projectId]) loadPinnedDecisions(projectId);
-
-    refreshProjectCountBadges(projectId);
-
+  // 8a665a03 -- a hard-deleted Devlog task: forget it in this project's cache and
+  // repaint, so every open dashboard (not just the one that clicked x) drops the row.
+  if (event.type === 'task_deleted') {
+    dropTaskFromCaches(event.task_id, projectId);
+    const panel = state.panels[projectId];
+    if (panel) {
+      renderTasks(projectId);
+      if (panel.activeVtab === 'queue') updateLiveFeed(projectId);
+    }
+    scheduleLiveRefresh(projectId);
     return;
-
   }
-
   if (event.type === 'hitl_filed') {
 
     refreshHitl();
@@ -13032,6 +13478,12 @@ async function restoreTabs() {
       }
     } catch (_) {}
   }
+
+  // 8a665a03 -- the page's own socket for project-list events. Opened before the empty-
+  // account wizard below on purpose: a dashboard with no project (and so no tab, and so no
+  // per-project socket) is exactly the one that must hear a project being created. The
+  // demo has no signed-in tenant, so the server would refuse it.
+  if (!isDemoMode()) connectAccountWs();
 
   if (isDemoMode()) hideDemoAdminControls();
 
@@ -13236,72 +13688,13 @@ async function restoreTabs() {
 
 
 
+// 8a665a03 -- Goal-tab sprint board reload hooks, keyed by project id. buildTabBody
+// registers its loadSprintBoard closure here; reloadGoalSprintBoard() is the only caller.
+// (The four legacy helpers that used to live below -- _deleteSprintItem, _sprintAction,
+// completeSprintItem, failSprintItem -- had no caller and each refreshed just this one
+// board, which is exactly the single-view repaint this change removes.)
 const _sprintBoardReloaders: Record<string, any> = {};
-
 const _sprintSelectSyncers: Record<string, any> = {};
-
-
-
-async function _deleteSprintItem(projectId: any, itemId: any) {
-
-  if (!confirm('Remove this sprint item?')) return;
-
-  try {
-
-    await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: 'DELETE' });
-
-    if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-
-  } catch(e: any) { console.error('Delete sprint item failed:', e); }
-
-}
-
-
-
-async function _sprintAction(projectId: any, itemId: any, action: any) {
-
-  try {
-
-    await api(`/projects/${projectId}/sprint-items/${itemId}/${action}`, { method: 'POST' });
-
-    if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-
-  } catch(e: any) { console.error('Sprint action failed:', action, e); }
-
-}
-
-
-
-async function completeSprintItem(projectId: any, itemId: any) {
-
-  try {
-
-    await api(`/projects/${projectId}/sprint-items/${itemId}/complete`, { method: 'POST' });
-
-    if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-
-  } catch(e: any) { console.error('Complete sprint item failed:', e); }
-
-}
-
-
-
-async function failSprintItem(projectId: any, itemId: any) {
-
-  try {
-
-    await api(`/projects/${projectId}/sprint-items/${itemId}/fail`, { method: 'POST' });
-
-    if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-
-  } catch(e: any) { console.error('Fail sprint item failed:', e); }
-
-}
-
-
-
-
-
 // --- v0.6.6 EZ wizard ---
 
 // v0.6.6 — EZ wizard logic
@@ -13647,4 +14040,4 @@ function toggleExpand(id: any) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, flattenHierarchy, eligibleParents, state }); } catch (e: any) {}
+try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, connectAccountWs, handleAccountEvent, dismissEmptyAccountWizard, refreshDecisionsLog, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state }); } catch (e: any) {}

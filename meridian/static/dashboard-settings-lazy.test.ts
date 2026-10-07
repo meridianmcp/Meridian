@@ -409,3 +409,137 @@ describe("full flow: initial load then account tab activation", () => {
     expect(ntfyCalls).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 8a665a03 — the lazily rendered Account card must (a) have working Save
+// handlers and (b) not go stale after a save.
+//
+// 116e0245 moved the notifications card behind the Account tab, but the Save /
+// Test / acknowledge handlers stayed inside loadSettingsTab, which runs BEFORE the
+// card exists, so every `getElementById(...)` there returned null and the buttons
+// did nothing. The cache guard in _activateSettingsTab also meant a rebuilt body
+// (every project-tab switch rebuilds it) never got the card back, and the cached
+// value would have been the pre-save one anyway.
+// ---------------------------------------------------------------------------
+describe("Account card: handlers and freshness after a save (8a665a03)", () => {
+  type Call = { url: string; method: string; body: any };
+  let calls: Call[];
+  let serverNtfy: { notify_url: string; ntfy_url: string; notify_email: string };
+
+  const flush = async () => {
+    for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+  };
+
+  function installApi() {
+    calls = [];
+    serverNtfy = { notify_url: "", ntfy_url: "", notify_email: "" };
+    const stub = vi.fn(async (url: string, opts?: any) => {
+      const method = (opts && opts.method) || "GET";
+      const body = opts && opts.body ? JSON.parse(opts.body) : undefined;
+      calls.push({ url, method, body });
+      if (url === "/settings/notifications") return { prefs: { hitl: true, sprint: false } };
+      if (url === "/settings/mcp-config") return { base_url: "https://usemeridian.us" };
+      if (url.includes("/github/status")) return { connected: false };
+      if (url.endsWith("/ntfy")) {
+        if (method === "PATCH") {
+          if ("notify_url" in body) {
+            serverNtfy.notify_url = body.notify_url || "";
+            serverNtfy.ntfy_url = body.notify_url || "";
+          }
+          if ("notify_email" in body) serverNtfy.notify_email = body.notify_email || "";
+        }
+        return { ...serverNtfy };
+      }
+      return {};
+    });
+    (globalThis as any).api = stub;
+    (window as any).api = stub;
+  }
+
+  async function openAccountTab() {
+    createSettingsBody(PID);
+    await loadSettingsTab(PID, { force: true });
+    (window as any)._activateSettingsTab(PID, "account");
+    await flush();
+  }
+
+  beforeEach(() => {
+    setupGlobals([], [], []);
+    installApi();
+    // loadSettingsTab schedules a timer that calls this bare global (dashboard-utils).
+    (globalThis as any).suggestedFsRoots = () => [];
+    // The ntfy security warning is acknowledged, so Save / Test are enabled.
+    localStorage.setItem("meridian.ntfy.warn.dismissed", "1");
+  });
+
+  afterEach(() => {
+    localStorage.removeItem("meridian.ntfy.warn.dismissed");
+    delete (globalThis as any).suggestedFsRoots;
+  });
+
+  it("the ntfy Save button on the lazily rendered card sends the PATCH", async () => {
+    await openAccountTab();
+    const input = document.getElementById(`ntfy-url-${PID}`) as HTMLInputElement;
+    const save = document.getElementById(`ntfy-save-${PID}`) as HTMLButtonElement;
+    expect(input).not.toBeNull();
+    expect(save).not.toBeNull();
+    input.value = "my-topic";
+    save.click();
+    await flush();
+    const patch = calls.find((c) => c.method === "PATCH" && c.url === `/projects/${PID}/ntfy`);
+    expect(patch).toBeDefined();
+    expect(patch!.body.notify_url).toBe("my-topic");
+  });
+
+  it("the email Save button on the lazily rendered card sends the PATCH", async () => {
+    await openAccountTab();
+    const input = document.getElementById(`notify-email-${PID}`) as HTMLInputElement;
+    input.value = "ops@example.com";
+    (document.getElementById(`notify-email-save-${PID}`) as HTMLButtonElement).click();
+    await flush();
+    const patch = calls.find((c) => c.method === "PATCH" && c.body && "notify_email" in c.body);
+    expect(patch).toBeDefined();
+    expect(patch!.body.notify_email).toBe("ops@example.com");
+  });
+
+  it("a rebuilt Settings tab shows the SAVED value, not the placeholder or the pre-save cache", async () => {
+    await openAccountTab();
+    (document.getElementById(`ntfy-url-${PID}`) as HTMLInputElement).value = "my-topic";
+    (document.getElementById(`ntfy-save-${PID}`) as HTMLButtonElement).click();
+    await flush();
+    expect(serverNtfy.notify_url).toBe("my-topic");
+
+    // Switching project tabs rebuilds the settings body (loadSettingsTab force:true);
+    // opening the Account tab afterwards must repaint the card with the saved value.
+    await loadSettingsTab(PID, { force: true });
+    (window as any)._activateSettingsTab(PID, "account");
+    await flush();
+
+    expect(document.getElementById(`settings-ntfy-lazy-${PID}`)).toBeNull();
+    const input = document.getElementById(`ntfy-url-${PID}`) as HTMLInputElement;
+    expect(input).not.toBeNull();
+    expect(input.value).toBe("my-topic");
+  });
+
+  it("handlers are re-attached when the card is repainted from the cache", async () => {
+    await openAccountTab();
+    // Rebuild the body and repaint the card from cache, then save from the NEW card.
+    await loadSettingsTab(PID, { force: true });
+    (window as any)._activateSettingsTab(PID, "account");
+    await flush();
+    calls.length = 0;
+    (document.getElementById(`ntfy-url-${PID}`) as HTMLInputElement).value = "second-topic";
+    (document.getElementById(`ntfy-save-${PID}`) as HTMLButtonElement).click();
+    await flush();
+    expect(calls.some((c) => c.method === "PATCH" && c.body.notify_url === "second-topic")).toBe(true);
+  });
+
+  it("re-activating an already-loaded Account tab still does not refetch", async () => {
+    await openAccountTab();
+    const fetchedAfterFirst = calls.filter((c) => c.url === "/settings/notifications").length;
+    (window as any)._activateSettingsTab(PID, "project");
+    (window as any)._activateSettingsTab(PID, "account");
+    await flush();
+    expect(calls.filter((c) => c.url === "/settings/notifications").length).toBe(fetchedAfterFirst);
+  });
+});

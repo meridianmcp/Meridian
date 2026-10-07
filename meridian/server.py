@@ -3427,6 +3427,60 @@ async def ws_project(ws: WebSocket, project_id: str) -> None:
     await broadcaster.serve(ws, project_id)
 
 
+@app.websocket("/ws-account")
+async def ws_account(ws: WebSocket) -> None:
+    """Push project-LIST events (``projects_changed``) to a dashboard page.
+
+    8a665a03: ``/ws/{project_id}`` is one socket per open project TAB, so a dashboard with
+    no tab open (the last one closed, a brand-new account) held no socket and never heard a
+    project being created, renamed, merged or deleted from another tab, an agent or the API.
+    This is the page's own socket, independent of the tabs; it carries only account-level
+    events, so a project's data never travels on it.
+
+    The stream is keyed by the DATABASE the caller reads (``db_module.subscribe_account``),
+    resolved exactly as the HTTP routes resolve it, so a caller only ever hears about a
+    project list it can read -- the same boundary ``GET /projects`` applies (4bea8629's
+    reasoning for ``ws_project``: the per-project registry is process-wide, this one cannot
+    cross a tenant). Hosted mode needs a resolved tenant (cookie or bearer token), rejects
+    with ``code=4401`` like ``ws_project`` and the tunnel sockets, and honours the dashboard's
+    workspace switch through ``?workspace=<tenant_id>`` (a WebSocket cannot carry the
+    ``X-Workspace-Tenant-Id`` header the HTTP calls use) for a workspace-wide member, the
+    membership check ``_db`` makes. Self-hosted has no tenant concept: the one database.
+    """
+    await ws.accept()
+
+    if _hosted_mode():
+        tenant = await _get_tenant_from_request(ws)  # type: ignore[arg-type]
+        if tenant is None:
+            await ws.close(code=4401, reason="authentication required")
+            return
+        target_tenant_id = tenant["id"]
+        workspace = (ws.query_params.get("workspace") or "").strip()
+        if workspace and workspace != target_tenant_id:
+            memberships = await db_module.get_workspaces_for_email(
+                ws.app.state.db, tenant.get("email", "")
+            )
+            # A project-scoped member (project_id set) sees only their one project through
+            # GET /projects, so the owner's whole-workspace stream -- which says that SOME
+            # project was created or deleted -- is not theirs to hear.
+            if not any(
+                m["tenant_id"] == workspace and not m.get("project_id") for m in memberships
+            ):
+                await ws.close(code=4401, reason="not a workspace-wide member")
+                return
+            target_tenant_id = workspace
+        try:
+            account_db = await _open_tenant_db_by_id(ws, target_tenant_id)  # type: ignore[arg-type]
+        except HTTPException:
+            await ws.close(code=4401, reason="invalid tenant")
+            return
+    else:
+        account_db = ws.app.state.db
+
+    broadcaster: dashboard_module.WebSocketBroadcaster = (
+        ws.app.state.ws_broadcaster
+    )
+    await broadcaster.serve_account(ws, account_db)
 
 
 @app.get("/admin/login", response_class=HTMLResponse)

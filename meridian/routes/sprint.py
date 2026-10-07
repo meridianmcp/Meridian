@@ -487,13 +487,15 @@ async def fail_sprint_item_endpoint(
 async def delete_sprint_item_endpoint(
     project_id: str, item_id: str, request: Request
 ) -> None:
-    """Delete a sprint item permanently."""
+    """Delete a sprint item permanently.
+
+    8a665a03 -- goes through ``db_module.delete_sprint_item`` so the delete also busts
+    the sprint-items cache and publishes ``sprint_item_deleted``; the raw DELETE this
+    route used to run published nothing, which is why the Backburner trash button only
+    took effect on screen after a reload. Stays idempotent (204 for an unknown id).
+    """
     db = await _db(request)
-    await db.execute(
-        "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
-        (item_id, project_id),
-    )
-    await db.commit()
+    await db_module.delete_sprint_item(db, project_id, item_id)
 
 
 @router.patch("/projects/{project_id}/sprint-items/{item_id}")

@@ -2505,6 +2505,13 @@ async def link_sprint_item_github_issue(
     if cursor.rowcount == 0:
         return None
     _invalidate_sprint_items_cache(project_id)
+    # 8a665a03 -- the linked issue is part of the item payload every sprint list refetches
+    # (no dashboard row draws a badge for it yet, but API / MCP clients and the next row
+    # that does must not need a reload to see a link made by the auto-issue path).
+    _publish_project_event(
+        project_id, "sprint_item_updated",
+        {"item_id": item_id, "fields": ["github_issue_number", "github_issue_url", "github_issue_source"]},
+    )
     return await get_sprint_item(db, item_id)
 
 
@@ -5137,6 +5144,13 @@ async def clear_stale_claim_metadata(
     )
     await db.commit()
     _invalidate_sprint_items_cache(project_id)
+    # 8a665a03 -- the repair clears claimed_at / actor, columns the Live tab's
+    # in-progress-by-session panel and every item payload carry, so announce it like
+    # every other item write instead of leaving other dashboards on the stale claim.
+    _publish_project_event(
+        project_id, "sprint_item_updated",
+        {"item_id": item_id, "fields": ["claimed_at", "actor"]},
+    )
     return await get_sprint_item(db, item_id)
 
 
@@ -6134,6 +6148,17 @@ async def patch_sprint_item(
         if cursor.rowcount == 0:
             return None
         result = await get_sprint_item(db, item_id)
+        # 8a665a03 -- every mutation publishes one event: a title/version/notes/
+        # resources/feedback edit used to change the row silently, so a second
+        # dashboard tab (or an MCP-side edit) never repainted the Queue/Live/Goal
+        # views until a reload. A status change in the same call publishes its own
+        # event from _transition_status below, so only announce when none follows.
+        _invalidate_sprint_items_cache(project_id)
+        if status_value is None:
+            _publish_project_event(project_id, "sprint_item_updated", {
+                "item_id": item_id,
+                "fields": [f.split(" = ")[0] for f in ns_fields],
+            })
 
     if status_value is not None:
         # Phase 2: route the status write through _transition_status so cache
@@ -6194,6 +6219,33 @@ async def patch_sprint_item(
         # without the project.
         result = await _get_sprint_item_in_project(db, project_id, item_id)
     return result
+
+
+async def delete_sprint_item(
+    db: aiosqlite.Connection, project_id: str, item_id: str
+) -> bool:
+    """Permanently delete one sprint item. Returns True when a row was removed.
+
+    8a665a03 -- this used to be a raw ``DELETE`` inside the HTTP route, which meant
+    nothing busted the sprint-items cache and nothing told the dashboard: the
+    Backburner trash button removed the row in the database but the Queue tab kept
+    showing it until a reload. Keeping the delete, the cache bust and the
+    ``sprint_item_deleted`` event in one function means no caller (route, MCP tool,
+    future bulk path) can forget one of them -- the same consolidation
+    ``_transition_status`` does for status changes. The delete is scoped to
+    ``project_id``; an id that belongs to another project (or is already gone)
+    removes nothing and publishes nothing.
+    """
+    cursor = await db.execute(
+        "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
+        (item_id, project_id),
+    )
+    await db.commit()
+    deleted = (cursor.rowcount or 0) > 0
+    if deleted:
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_item_deleted", {"item_id": item_id})
+    return deleted
 
 
 async def add_subtask(
@@ -6270,6 +6322,11 @@ async def add_subtask(
     item = await get_sprint_item(db, iid)
     assert item is not None
     _invalidate_sprint_items_cache(project_id)
+    # 8a665a03 -- the cache bust alone told nobody: add_subtask is an MCP tool, so a
+    # subtask an agent adds never reached an open Queue / Goal board / Live tab.
+    _publish_project_event(
+        project_id, "sprint_item_added", {"item_id": iid, "parent_id": parent_id},
+    )
     return item
 
 
@@ -6405,6 +6462,15 @@ async def split_sprint_item(
         new_item = await get_sprint_item(db, nid)
         if new_item:
             new_items.append(new_item)
+    if new_items:
+        # 8a665a03 -- the original's skip event fires BEFORE these inserts, so a
+        # dashboard that refetched on it could miss the children; announce them once
+        # they all exist.
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_item_added", {
+            "item_ids": [n["id"] for n in new_items],
+            "split_from": item_id,
+        })
     return new_items
 
 
@@ -10945,6 +11011,19 @@ async def move_sprint_item_to_project(
     )
     await db.commit()
     moved_item = await get_sprint_item(db, item_id)
+    # 8a665a03 -- a move is a delete from one board and an add to another; neither
+    # board's 2 s list cache was busted and neither dashboard was told, so the row sat in
+    # the source project's Queue (and was missing from the destination's) until a reload.
+    _invalidate_sprint_items_cache(source_project_id)
+    _invalidate_sprint_items_cache(destination_project_id)
+    _publish_project_event(
+        source_project_id, "sprint_item_deleted",
+        {"item_id": item_id, "moved_to": destination_project_id},
+    )
+    _publish_project_event(
+        destination_project_id, "sprint_item_added",
+        {"item_id": item_id, "moved_from": source_project_id},
+    )
 
     try:
         # Lazy import: same circularity reason as set_project_blocker_policy's

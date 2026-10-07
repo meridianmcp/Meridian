@@ -138,6 +138,119 @@ export function suggestedFsRoots(execCfg: any, currentRoots: any): string[] {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// 8a665a03 -- a repaint must never throw away what the user typed.
+//
+// A list view that is rebuilt from a fresh fetch (innerHTML = ...) replaces every node in
+// it, including the input the user is typing into: the half-written answer, the sprint item
+// title in an open inline editor, the text of the add-item box. paintKeepingDrafts() is the
+// one way those views repaint. It carries the live node (and so its text, its undo history,
+// its handlers, and -- once re-focused -- its caret) across the repaint instead of the
+// freshly rendered twin, for every "draft unit" the caller describes.
+// ---------------------------------------------------------------------------
+export interface DraftUnit {
+  /** CSS selector (searched under the repainted root) for a node that may hold a draft. */
+  selector: string;
+  /** Identity the live node shares with its repainted twin (an id, a data attribute). */
+  key: (el: HTMLElement) => string | null | undefined;
+  /** Does this live node hold something worth keeping? Default: fieldHoldsDraft. */
+  keep?: (el: HTMLElement) => boolean;
+}
+
+const _DRAFT_FIELDS =
+  'textarea, input:not([type]), input[type="text"], input[type="search"], input[type="url"], ' +
+  'input[type="email"], input[type="tel"], input[type="number"], input[type="password"]';
+
+/** True when `el` is (or contains) a text field that has the focus or holds text the user
+ * entered (its value differs from the value the markup rendered it with). */
+export function fieldHoldsDraft(el: Element): boolean {
+  const fields: any[] = el.matches(_DRAFT_FIELDS) ? [el] : Array.from(el.querySelectorAll(_DRAFT_FIELDS));
+  return fields.some((f) => f === document.activeElement || f.value !== f.defaultValue);
+}
+
+interface _KeptDraft {
+  unit: DraftUnit;
+  key: string;
+  /** Position among the live nodes of this unit that share the key (a row can be drawn twice). */
+  ordinal: number;
+  el: HTMLElement;
+}
+
+function _collectDrafts(root: Element, units: DraftUnit[]): _KeptDraft[] {
+  const kept: _KeptDraft[] = [];
+  for (const unit of units) {
+    const seen = new Map<string, number>();
+    root.querySelectorAll<HTMLElement>(unit.selector).forEach((el) => {
+      const key = unit.key(el);
+      if (!key) return;
+      const ordinal = seen.get(key) || 0;
+      seen.set(key, ordinal + 1);
+      if ((unit.keep || fieldHoldsDraft)(el)) kept.push({ unit, key, ordinal, el });
+    });
+  }
+  return kept;
+}
+
+function _findTwin(root: Element, k: _KeptDraft): HTMLElement | null {
+  let n = 0;
+  for (const el of Array.from(root.querySelectorAll<HTMLElement>(k.unit.selector))) {
+    if (k.unit.key(el) !== k.key) continue;
+    if (n++ === k.ordinal) return el;
+  }
+  return null;
+}
+
+/** Does anything under `root` hold an unsent draft right now? Used to skip a transient
+ * "loading..." placeholder that would otherwise wipe it before the fetch even returns. */
+export function hasUnsentDrafts(root: Element | null, units: DraftUnit[]): boolean {
+  return !!root && _collectDrafts(root, units).length > 0;
+}
+
+/**
+ * Replace the content of `root` with `html`, keeping every draft unit that is live in `root`.
+ * Judged at paint time (after any fetch returned), so text typed while a request was in
+ * flight survives. A kept node takes the place of its repainted twin; one whose twin is
+ * gone (the row was deleted, the request was answered elsewhere) has nothing left to attach
+ * to and is dropped. Focus, caret and a textarea's scroll are restored on the kept node.
+ * Returns how many live nodes were carried over.
+ */
+export function paintKeepingDrafts(root: Element, html: string, units: DraftUnit[]): number {
+  const kept = _collectDrafts(root, units);
+  if (!kept.length) {
+    root.innerHTML = html;
+    return 0;
+  }
+  const active = document.activeElement as any;
+  const focused = active && kept.some((k) => k.el === active || k.el.contains(active)) ? active : null;
+  let caret: { start: number | null; end: number | null; dir: string | null } | null = null;
+  if (focused) {
+    try { caret = { start: focused.selectionStart, end: focused.selectionEnd, dir: focused.selectionDirection }; } catch (_) { /* a field with no selection API */ }
+  }
+  const scrolls = new Map<any, number>();
+  for (const k of kept) {
+    const fields: any[] = k.el.matches('textarea') ? [k.el] : Array.from(k.el.querySelectorAll('textarea'));
+    for (const f of fields) scrolls.set(f, f.scrollTop);
+  }
+
+  root.innerHTML = html;
+
+  let carried = 0;
+  for (const k of kept) {
+    const twin = _findTwin(root, k);
+    if (!twin) continue;
+    twin.replaceWith(k.el);
+    carried += 1;
+  }
+  scrolls.forEach((top, f) => { if (f.isConnected) f.scrollTop = top; });
+  if (focused && focused.isConnected) {
+    try { focused.focus({ preventScroll: true }); } catch (_) { /* detached or not focusable */ }
+    if (caret && caret.start != null && caret.end != null) {
+      try { focused.setSelectionRange(caret.start, caret.end, caret.dir || undefined); } catch (_) { /* no selection API */ }
+    }
+  }
+  return carried;
+}
+
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline handlers
 // and cross-file references keep resolving after IIFE bundling.
 try {
@@ -147,5 +260,6 @@ try {
     _colorForHuman, _PLAN_LABELS, QUEUE_DONE_PAGE_SIZE, SESSION_LIVE_WINDOW_MS,
     _HUMAN_COLORS, DEFAULT_MAX_PINNED_DECISIONS, DEFAULT_CONTEXT_THRESHOLD,
     DEFAULT_MAX_TURNS, suggestedFsRoots,
+    fieldHoldsDraft, hasUnsentDrafts, paintKeepingDrafts,
   });
 } catch (e) { /* window unavailable (non-browser) */ }
