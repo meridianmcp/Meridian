@@ -13,6 +13,8 @@ that hit the FastAPI TestClient.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from bs4 import BeautifulSoup
 
@@ -1027,6 +1029,164 @@ def test_dashboard_responsive_sprint_and_nav_media_block(css):
     # ...and the top nav tab strip.
     assert ".tabs" in tail, "responsive pass must adjust the top nav (.tabs)"
     assert ".tab {" in tail or ".tab{" in tail, "responsive pass must adjust nav tabs (.tab)"
+
+
+# ---------------------------------------------------------------------------
+# Sprint row layout contract: a long title wraps inside its OWN column and can
+# never paint over the version label or the action buttons (Live tab, "Sprint
+# progress"). The original bug: .sprint-item-title was an inline <span> in a plain
+# <div>, so its flex/overflow/text-overflow rules did nothing while
+# white-space:nowrap stopped it wrapping, and the text ran over .sprint-item-ver
+# and .sprint-item-actions. Source-scanning style, like the rest of this file; the
+# rendered-DOM + computed-style version lives in
+# meridian/static/dashboard-sprint-layout.test.ts, and the pixel overlap was
+# measured in a real browser.
+# ---------------------------------------------------------------------------
+
+
+def _css_rules(css_text):
+    """Parse flat CSS into [(media_prelude_or_None, [selectors], {prop: value})]."""
+    text = re.sub(r"/\*.*?\*/", "", css_text, flags=re.S)
+
+    def parse(chunk, media):
+        rules, i, n = [], 0, len(chunk)
+        while i < n:
+            j = chunk.find("{", i)
+            if j == -1:
+                break
+            prelude = chunk[i:j].strip()
+            depth, k = 1, j + 1
+            while k < n and depth:
+                depth += (chunk[k] == "{") - (chunk[k] == "}")
+                k += 1
+            body = chunk[j + 1 : k - 1]
+            if prelude.startswith("@media"):
+                rules.extend(parse(body, " ".join(prelude.split())))
+            elif not prelude.startswith("@"):
+                decls = {}
+                for part in body.split(";"):
+                    if ":" in part:
+                        prop, _, value = part.partition(":")
+                        decls[prop.strip().lower()] = " ".join(value.split())
+                rules.append((media, [s.strip() for s in prelude.split(",")], decls))
+            i = k
+        return rules
+
+    return parse(text, None)
+
+
+def _decls(rules, selector, media=None):
+    """Merged declarations of every rule whose selector list contains `selector`."""
+    merged = {}
+    for rule_media, selectors, decls in rules:
+        if rule_media == media and selector in selectors:
+            merged.update(decls)
+    return merged
+
+
+def test_sprint_title_is_a_wrapping_block_in_its_own_column(css):
+    """The title must be block-level, shrinkable and allowed to wrap/break, with no
+    nowrap/ellipsis truncation, in the board rows (wrapper div) AND the sibling rows
+    (needs-attention / your-tasks / backburner) where the title is a direct flex child."""
+    rules = _css_rules(css)
+    title = _decls(rules, ".sprint-item-title")
+    assert title.get("display") == "block", "title must be block-level (an inline span ignores overflow/flex)"
+    assert title.get("min-width") == "0", "title must be able to shrink below its content width"
+    assert title.get("white-space") == "normal", "title must be allowed to wrap"
+    assert title.get("overflow-wrap") == "anywhere", "a 300-char unbreakable token must break in the column"
+    assert "text-overflow" not in title and "overflow" not in title, "title wraps; it must not clip or ellipsize"
+    # the text column: the wrapper div in board rows ...
+    col = _decls(rules, ".sprint-item-main")
+    assert col.get("min-width") == "0"
+    assert col.get("flex", "").startswith("1 1 min("), "column grows and has a capped minimum basis"
+    # ... and the title span itself in the sibling rows
+    direct = _decls(rules, ".sprint-item-row > .sprint-item-title")
+    assert direct.get("min-width") == "0"
+    assert direct.get("flex") == col.get("flex"), "sibling rows must use the same column basis as board rows"
+
+
+def test_sprint_row_wraps_and_aligns_to_the_first_title_line(css):
+    """The row wraps (actions drop UNDER the text when too narrow) and baseline-aligns
+    the icon / version / buttons with the title's first line."""
+    rules = _css_rules(css)
+    row = _decls(rules, ".sprint-item-row")
+    assert row.get("display") == "flex"
+    assert row.get("flex-wrap") == "wrap", "row must wrap so the buttons can drop under the text"
+    assert row.get("align-items") == "baseline", "icon/version/buttons must sit on the first title line"
+    assert row.get("align-content") == "center", "single-line rows stay vertically centred in min-height"
+    ver = _decls(rules, ".sprint-item-ver")
+    assert ver.get("flex-shrink") == "0" and ver.get("max-width") == "100%"
+    actions = _decls(rules, ".sprint-item-actions")
+    assert actions.get("flex-shrink") == "0"
+    assert actions.get("flex-wrap") == "wrap" and actions.get("max-width") == "100%", (
+        "actions wrap inside the row instead of escaping it at narrow widths"
+    )
+    assert actions.get("margin-left") == "auto"
+    assert _decls(rules, ".sprint-item-actions:empty").get("display") == "none", (
+        "an empty actions placeholder must not take a wrapped line"
+    )
+    chip = _decls(rules, ".sprint-item-resources .resource-chip")
+    assert chip.get("max-width") == "100%" and chip.get("overflow-wrap") == "anywhere", (
+        "a long resource chip must wrap inside the column"
+    )
+
+
+def test_sprint_row_layout_rules_use_css_variables_only(css):
+    """Dark/light themes: the sprint-row layout rules carry no literal colours."""
+    rules = _css_rules(css)
+    selectors = [
+        ".sprint-item-row", ".sprint-item-main", ".sprint-item-title", ".sprint-item-ver",
+        ".sprint-item-actions", ".sprint-item-row > .sprint-item-title",
+        ".sprint-item-resources .resource-chip",
+    ]
+    for sel in selectors:
+        decls = _decls(rules, sel)
+        assert decls, f"{sel} rule missing"
+        for prop, value in decls.items():
+            assert not re.search(r"#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(", value), (
+                f"{sel} {prop}: {value!r} hard-codes a colour; use a CSS variable"
+            )
+
+
+def test_sprint_phone_media_queries_are_reconciled_with_the_base_rules(css):
+    """The 768px / 480px passes only tune the base rules: they must not re-introduce
+    nowrap/ellipsis, nor give the title flex-basis:100% (which on the direct-child rows
+    left the status icon alone on a line above the text). On a phone the action buttons
+    take their own line under the text."""
+    rules = _css_rules(css)
+    for media in ("@media (max-width: 768px)", "@media (max-width: 480px)"):
+        sprint = [(sel, d) for m, sels, d in rules if m == media for sel in sels if "sprint-item" in sel]
+        assert sprint, f"{media} must still tune the sprint rows"
+        for sel, d in sprint:
+            assert d.get("white-space") != "nowrap" and d.get("flex-wrap") != "nowrap", (media, sel)
+            assert "text-overflow" not in d and d.get("overflow") != "hidden", (media, sel)
+    phone = "@media (max-width: 768px)"
+    assert _decls(rules, ".sprint-item-row > .sprint-item-title", phone).get("flex-basis", "").startswith("min(")
+    assert _decls(rules, ".sprint-item-main", phone).get("flex-basis", "").startswith("min(")
+    assert _decls(rules, ".sprint-item-title", phone).get("flex-basis") != "100%"
+    actions = _decls(rules, ".sprint-item-actions", phone)
+    assert actions.get("flex-basis") == "100%" and actions.get("justify-content") == "flex-end"
+    # the wrap/align/title-wrapping rules are NOT viewport-gated: they live in the base sheet
+    assert _decls(rules, ".sprint-item-row").get("flex-wrap") == "wrap"
+    assert _decls(rules, ".sprint-item-title").get("white-space") == "normal"
+
+
+def test_sprint_markup_uses_the_main_column_class_and_no_inline_nowrap(js):
+    """The board-row wrapper carries class sprint-item-main (its flex/min-width now live
+    in the stylesheet, where the media queries can reach them) and no title is rendered
+    with an inline nowrap/ellipsis that would out-rank the stylesheet (the backburner rows
+    used to)."""
+    icon = js.index('class="sprint-item-icon" style="color:${color}"')
+    assert 'class="sprint-item-main"' in js[icon : icon + 400], "board-row text column must be .sprint-item-main"
+    titles = [ln for ln in js.splitlines() if 'class="sprint-item-title"' in ln]
+    assert len(titles) >= 4, "expected the board, needs-attention, your-tasks and backburner title spans"
+    for ln in titles:
+        assert "nowrap" not in ln and "ellipsis" not in ln, f"inline truncation on a sprint title: {ln.strip()[:120]}"
+    # the backburner row no longer pins its own flex layout inline (the class rules apply)
+    marker = 'data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version'
+    row = [ln for ln in js.splitlines() if marker in ln]
+    assert row, "backburner row template not found"
+    assert all("display:flex" not in ln and "align-items:center" not in ln for ln in row)
 
 
 # ---------------------------------------------------------------------------

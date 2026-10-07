@@ -564,17 +564,50 @@ input[type=text] {
   color: var(--accent); margin: 8px 0 3px; padding: 2px 0;
   border-bottom: 1px solid var(--border);
 }
+/* Sprint row layout contract: a long title wraps inside ITS OWN column and can
+   never paint over the version label or the action buttons.
+   - The title is block-level with min-width:0 and overflow-wrap:anywhere, so a
+     long phrase wraps and even a 300-character unbreakable token breaks inside
+     the column (an inline span ignores flex/overflow, which is how the old
+     nowrap title ran straight over .sprint-item-ver and .sprint-item-actions).
+   - The row wraps (flex-wrap) and the text column has a minimum width, so when
+     the row is too narrow for text + buttons the actions drop onto their own
+     line UNDER the text instead of squeezing it or overlapping it.
+   - align-items:baseline keeps the status icon, version and buttons on the
+     first line of the title, so a wrapped title reads cleanly. */
 .sprint-item-row {
-  display: flex; align-items: center; gap: 6px;
+  display: flex; align-items: baseline; align-content: center;
+  flex-wrap: wrap; gap: 3px 6px;
   padding: 3px 0; border-bottom: 1px solid var(--border);
   font-size: 12px; min-height: 28px;
 }
 .sprint-item-icon { flex-shrink: 0; width: 14px; text-align: center; font-size: 11px; }
-.sprint-item-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sprint-item-ver { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+/* The text column: the wrapper div in board rows, the title span itself in the
+   needs-attention / your-tasks / backburner rows. The basis is capped at the room
+   left beside the icon (20px = 14px icon + 6px gap) so the icon never ends up
+   alone on a line above the text. */
+.sprint-item-main,
+.sprint-item-row > .sprint-item-title {
+  flex: 1 1 min(15em, calc(100% - 20px)); min-width: 0;
+}
+.sprint-item-title {
+  display: block; min-width: 0;
+  white-space: normal; overflow-wrap: anywhere;
+}
+.sprint-item-ver {
+  color: var(--muted); font-size: 10px; flex-shrink: 0;
+  max-width: 100%; overflow-wrap: anywhere;
+}
 .sprint-item-meta { color: var(--muted); font-size: 10px; flex-shrink: 0;
   max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sprint-item-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.sprint-item-actions {
+  display: flex; flex-wrap: wrap; gap: 2px; flex-shrink: 0;
+  max-width: 100%; margin-left: auto;
+}
+.sprint-item-actions:empty { display: none; }
+/* Resource chips (touches_resources) sit under the title; a long path must wrap
+   inside the column rather than push past it. */
+.sprint-item-resources .resource-chip { max-width: 100%; overflow-wrap: anywhere; }
 .sprint-btn {
   background: none; border: 1px solid var(--border); border-radius: 3px;
   padding: 1px 5px; font-size: 11px; cursor: pointer;
@@ -896,19 +929,18 @@ select option {
   /* Leave room for the fixed hamburger so the first tab isn't hidden under it. */
   .tabs { padding-left: 44px; }
 
-  /* Sprint board: it's a single-column flex list, so the real phone breakage is
-     horizontal overflow from the meta column + action buttons crowding the
-     title. Let rows wrap, keep the title from forcing overflow, and give the
-     meta room to sit under the title instead of pushing off-screen. */
-  .sprint-item-row {
-    flex-wrap: wrap;
-    gap: 4px 6px;
-  }
-  .sprint-item-title {
-    min-width: 0;
-    flex-basis: 100%;
-    white-space: normal;
-  }
+  /* Sprint board: wrapping, the title's own-column behaviour and the baseline
+     alignment all live in the base .sprint-item-row / .sprint-item-title rules
+     (they depend on the container's width, not the viewport's); this block only
+     tunes them for a phone-width column. The title column's minimum width is a
+     little smaller, a wrapped row gets a bit more air between its lines, and the
+     action buttons ALWAYS take their own line under the text (right-aligned) so
+     every row reads the same instead of some squeezing the title and some not.
+     The meta chip gets room to sit under the title instead of pushing off-screen. */
+  .sprint-item-row { gap: 4px 6px; }
+  .sprint-item-main,
+  .sprint-item-row > .sprint-item-title { flex-basis: min(11em, calc(100% - 20px)); }
+  .sprint-item-actions { flex-basis: 100%; justify-content: flex-end; }
   .sprint-item-meta { max-width: 60%; }
   .sprint-add-row { flex-wrap: wrap; }
 }
@@ -918,8 +950,6 @@ select option {
   .tab { padding: 8px 9px; font-size: 10px; }
   .sprint-group-header { font-size: 9px; }
   .sprint-item-row { font-size: 11px; }
-  /* Actions can wrap to their own line rather than squeezing the title. */
-  .sprint-item-actions { flex-wrap: wrap; }
 }
 
 .tab-context-menu div:hover { background: var(--hover); cursor: pointer; }
