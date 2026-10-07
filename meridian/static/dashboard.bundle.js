@@ -9916,6 +9916,592 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
+  // meridian/static/dashboard-goal-conflict.ts
+  function normalizeGoalText(key, text) {
+    const t3 = String(text ?? "").replace(/\r\n?/g, "\n");
+    return key === "version_goal" ? t3.replace(/\s+$/, "") : t3.trim();
+  }
+  var GOAL_AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---";
+  function splitGoalText(text) {
+    const splitIdx = text.indexOf(GOAL_AUTO_SPLIT);
+    const mainText = splitIdx !== -1 ? text.slice(0, splitIdx).trimEnd() : text;
+    const allLines = mainText.split("\n");
+    const firstLine = allLines[0] || "";
+    const isVersionLabel = /^v\d+\.\d+/.test(firstLine.trim()) || firstLine.trim().length === 0;
+    const titleLine = isVersionLabel ? firstLine : "";
+    const body = (isVersionLabel ? allLines.slice(1) : allLines).join("\n").replace(/^\n/, "");
+    const editStart = body.search(/^(CURRENT FOCUS|KEY FILES)/m);
+    return {
+      titleLine,
+      shipped: editStart > 0 ? body.slice(0, editStart).trimEnd() : "",
+      editable: editStart > 0 ? body.slice(editStart) : body,
+      autoBlocks: splitIdx !== -1 ? text.slice(splitIdx + GOAL_AUTO_SPLIT.length).trimStart() : null
+    };
+  }
+  var MAX_DIFF_LINES = 1e3;
+  var RECENT_SAVE_MS = 2e3;
+  function diffLines(mine, theirs) {
+    const a3 = mine.split("\n");
+    const b2 = theirs.split("\n");
+    if (a3.length > MAX_DIFF_LINES || b2.length > MAX_DIFF_LINES) {
+      return [
+        ...a3.map((text) => ({ type: "mine", text })),
+        ...b2.map((text) => ({ type: "theirs", text }))
+      ];
+    }
+    const w3 = b2.length + 1;
+    const lcs = new Int32Array((a3.length + 1) * w3);
+    for (let i4 = a3.length - 1; i4 >= 0; i4--) {
+      for (let j4 = b2.length - 1; j4 >= 0; j4--) {
+        lcs[i4 * w3 + j4] = a3[i4] === b2[j4] ? lcs[(i4 + 1) * w3 + j4 + 1] + 1 : Math.max(lcs[(i4 + 1) * w3 + j4], lcs[i4 * w3 + j4 + 1]);
+      }
+    }
+    const ops = [];
+    let i3 = 0;
+    let j3 = 0;
+    while (i3 < a3.length && j3 < b2.length) {
+      if (a3[i3] === b2[j3]) {
+        ops.push({ type: "same", text: a3[i3] });
+        i3++;
+        j3++;
+      } else if (lcs[(i3 + 1) * w3 + j3] >= lcs[i3 * w3 + j3 + 1]) {
+        ops.push({ type: "mine", text: a3[i3++] });
+      } else {
+        ops.push({ type: "theirs", text: b2[j3++] });
+      }
+    }
+    while (i3 < a3.length) ops.push({ type: "mine", text: a3[i3++] });
+    while (j3 < b2.length) ops.push({ type: "theirs", text: b2[j3++] });
+    return ops;
+  }
+  function describeRemoteChange(meta, stamp) {
+    const who = meta?.kind === "agent" ? "by an agent" : meta?.kind === "human" ? "by a person" : "";
+    const when = stamp ? formatRelativeTime2(stamp) : "";
+    return [who, when].filter(Boolean).join(", ");
+  }
+  function parseGoalConflict(err) {
+    const e3 = err;
+    if (!e3 || e3.status !== 409 || typeof e3.responseText !== "string") return null;
+    try {
+      const detail = JSON.parse(e3.responseText)?.detail;
+      if (!detail || detail.error !== "goal_conflict" || !detail.current) return null;
+      return { value: detail.current.value, stamp: String(detail.current.updated_at ?? "") };
+    } catch (_2) {
+      return null;
+    }
+  }
+  function errorMessage(err) {
+    const e3 = err;
+    if (e3 && typeof e3.responseText === "string") {
+      try {
+        const d3 = JSON.parse(e3.responseText)?.detail;
+        if (typeof d3 === "string") return d3;
+        if (d3 && typeof d3.message === "string") return d3.message;
+      } catch (_2) {
+      }
+    }
+    const msg = e3 && e3.message || "request failed";
+    return msg === "demo_readonly" ? "this demo is read-only" : msg;
+  }
+  var GoalField = class {
+    constructor(cfg) {
+      /** Server text the editor content is compared against (what it was last populated with / saved as). */
+      this.base = "";
+      /** Server stamp of `base`; sent as expected_updated_at. null = not known. */
+      this.stamp = null;
+      this.pending = null;
+      this.error = null;
+      this.touched = false;
+      this.lastSavedAt = 0;
+      this.inflight = null;
+      this.recent = null;
+      this.bar = null;
+      this.diffOpen = false;
+      this.cfg = cfg;
+    }
+    // -- state ----------------------------------------------------------------
+    norm(text) {
+      return normalizeGoalText(this.cfg.key, text);
+    }
+    current() {
+      return this.norm(this.cfg.getValue());
+    }
+    /** The editor holds text that differs from `base` and the person put it there (or asked to save it). */
+    isDirty(explicit = false) {
+      return (this.touched || explicit) && this.current() !== this.norm(this.base);
+    }
+    isSaving() {
+      return this.inflight !== null;
+    }
+    /** Unsaved edits, or a save still on its way: a live update must not replace the text. */
+    isEditing() {
+      return this.isDirty() || this.isSaving();
+    }
+    isAttached() {
+      return this.cfg.el.isConnected;
+    }
+    isFocused() {
+      return this.cfg.el.ownerDocument.activeElement === this.cfg.el;
+    }
+    /** Resolves once an in-flight save (if any) has finished, whatever its outcome. */
+    async settle() {
+      if (this.inflight) {
+        try {
+          await this.inflight;
+        } catch (_2) {
+        }
+      }
+    }
+    /** Remember who made the latest remote change; matched to a refresh by its stamp. */
+    noteRemoteMeta(meta) {
+      this.recent = meta;
+    }
+    metaFor(stamp) {
+      return this.recent && this.recent.stamp && this.recent.stamp === stamp ? this.recent : null;
+    }
+    paintDirty() {
+      this.cfg.el.classList.toggle("dirty", this.isDirty());
+      this.cfg.el.classList.toggle("save-failed", this.error !== null);
+    }
+    /** Put text in the editor, keeping the caret where it was when the person is in the field. */
+    writeEditor(text) {
+      const el2 = this.cfg.el;
+      const keep = this.isFocused() && typeof el2.selectionStart === "number";
+      const start = keep ? el2.selectionStart : null;
+      const end = keep ? el2.selectionEnd : null;
+      this.cfg.setValue(text);
+      if (keep && start !== null && end !== null) {
+        try {
+          el2.setSelectionRange(Math.min(start, text.length), Math.min(end, text.length));
+        } catch (_2) {
+        }
+      }
+    }
+    adopt(text, stamp) {
+      this.base = text;
+      this.stamp = stamp;
+      this.touched = false;
+      this.pending = null;
+      this.error = null;
+      this.diffOpen = false;
+    }
+    // -- server data ----------------------------------------------------------
+    /**
+     * The only way server data reaches the editor.  `text` is the server's value
+     * for this field in editor form, `stamp` its per-field updated_at (null when
+     * the server did not say).
+     *
+     *  unchanged  the server text is what the edit is based on (another field, or
+     *             only the read-only zones, moved): adopt the stamp so the next
+     *             save is not a false conflict, touch nothing else.
+     *  converged  the person's draft already equals the server text: nothing to ask.
+     *  applied    nothing to protect: the editor takes the new text live.
+     *  conflict   unsaved edits: keep the draft, remember `text`, show the bar.
+     */
+    applyServer(text, stamp, meta) {
+      const incoming = this.norm(text);
+      const cur = this.current();
+      if (incoming === this.norm(this.base)) {
+        this.stamp = stamp;
+        if (this.pending) {
+          this.pending = null;
+          this.diffOpen = false;
+        }
+        this.renderBar();
+        this.paintDirty();
+        return "unchanged";
+      }
+      if (cur === incoming && this.isEditing()) {
+        this.adopt(text, stamp);
+        this.renderBar();
+        this.paintDirty();
+        return "converged";
+      }
+      if (!this.isEditing()) {
+        this.writeEditor(text);
+        this.adopt(text, stamp);
+        this.recent = meta ?? this.metaFor(stamp);
+        this.renderBar();
+        this.paintDirty();
+        return "applied";
+      }
+      this.pending = { text, stamp, meta: meta ?? this.metaFor(stamp) };
+      this.renderBar();
+      this.paintDirty();
+      return "conflict";
+    }
+    // -- user actions ---------------------------------------------------------
+    /** An input/change event from the person (not a programmatic setValue). */
+    onUserInput() {
+      this.touched = true;
+      if (this.pending && !this.isDirty()) {
+        const p3 = this.pending;
+        this.writeEditor(p3.text);
+        this.adopt(p3.text, p3.stamp);
+      } else if (this.error !== null) {
+        this.error = null;
+      }
+      this.renderBar();
+      this.paintDirty();
+    }
+    /** Blur / explicit save.  Never writes over an unresolved "Changed elsewhere" prompt. */
+    async saveNow(opts = {}) {
+      if (this.inflight) return this.inflight;
+      const explicit = !!opts.explicit;
+      if (this.pending) {
+        if (explicit) this.cfg.notify?.("Resolve the change from elsewhere first: Keep mine or Take theirs.", true);
+        return "blocked";
+      }
+      if (!this.isDirty(explicit)) {
+        if (explicit && Date.now() - this.lastSavedAt > RECENT_SAVE_MS) this.cfg.notify?.("No changes to save");
+        return "skipped";
+      }
+      const text = this.current();
+      if (!text && !this.cfg.allowEmpty) return "skipped";
+      if (!opts.skipConfirm && this.cfg.confirmSave && !this.cfg.confirmSave(text, this.norm(this.base))) {
+        this.writeEditor(this.base);
+        this.touched = false;
+        this.paintDirty();
+        return "skipped";
+      }
+      const run = this.runSave(text, false);
+      this.inflight = run;
+      try {
+        return await run;
+      } finally {
+        this.inflight = null;
+        this.renderBar();
+        this.paintDirty();
+      }
+    }
+    async runSave(text, retried) {
+      this.error = null;
+      this.renderBar();
+      try {
+        const res = await this.cfg.persist(text, this.stamp);
+        this.base = text;
+        this.touched = false;
+        this.error = null;
+        if (res && res.stamp) this.stamp = res.stamp;
+        this.lastSavedAt = Date.now();
+        if (this.pending && this.norm(this.pending.text) === text) this.pending = null;
+        this.cfg.onSaved?.();
+        return "saved";
+      } catch (err) {
+        const conflict = parseGoalConflict(err);
+        if (conflict) {
+          const incoming = this.cfg.fromServer ? this.cfg.fromServer(conflict.value) : String(conflict.value ?? "");
+          const outcome = this.applyServer(incoming, conflict.stamp, this.metaFor(conflict.stamp));
+          if (outcome === "converged") return "saved";
+          if (outcome === "unchanged" && !retried) return this.runSave(text, true);
+          return "conflict";
+        }
+        this.error = errorMessage(err);
+        this.cfg.notify?.("save failed: " + this.error, true);
+        return "error";
+      }
+    }
+    /** "Keep mine": the person's text stays and is saved over the remote change. */
+    async keepMine() {
+      const p3 = this.pending;
+      if (!p3) return "skipped";
+      if (this.cfg.confirmSave && !this.cfg.confirmSave(this.current(), this.norm(p3.text))) return "skipped";
+      this.base = p3.text;
+      this.stamp = p3.stamp;
+      this.pending = null;
+      this.diffOpen = false;
+      this.touched = true;
+      this.renderBar();
+      this.paintDirty();
+      return this.saveNow({ explicit: true, skipConfirm: true });
+    }
+    /** "Take theirs": the editor shows the server's text; the draft is dropped. */
+    takeTheirs() {
+      const p3 = this.pending;
+      if (!p3) return;
+      this.writeEditor(p3.text);
+      this.adopt(p3.text, p3.stamp);
+      this.renderBar();
+      this.paintDirty();
+    }
+    /** Revert the editor to the last saved (or, with a pending remote change, the current server) text. */
+    discard() {
+      const target = this.pending ? { text: this.pending.text, stamp: this.pending.stamp } : { text: this.base, stamp: this.stamp };
+      this.writeEditor(target.text);
+      this.adopt(target.text, target.stamp);
+      this.renderBar();
+      this.paintDirty();
+    }
+    /** Esc: offer to discard, but only when there is something to lose. */
+    handleEscape() {
+      if (!this.isDirty()) return "noop";
+      const ask = this.cfg.confirm ?? ((m3) => window.confirm(m3));
+      if (!ask(`Discard your unsaved changes to the ${this.cfg.label}?`)) return "cancelled";
+      this.discard();
+      return "discarded";
+    }
+    /** Attach blur-save, dirty tracking and Esc-to-discard to the editor element(s). */
+    wire(opts) {
+      for (const el2 of opts.blur) el2.addEventListener("blur", () => {
+        void this.saveNow();
+      });
+      for (const el2 of opts.input) {
+        el2.addEventListener("input", () => this.onUserInput());
+        el2.addEventListener("change", () => this.onUserInput());
+      }
+      for (const el2 of opts.keys) {
+        el2.addEventListener("keydown", (ev) => {
+          const e3 = ev;
+          if (e3.key === "Escape" && this.handleEscape() !== "noop") e3.preventDefault();
+        });
+      }
+    }
+    destroy() {
+      this.bar?.remove();
+      this.bar = null;
+    }
+    // -- the bar --------------------------------------------------------------
+    buildBar() {
+      const anchor = this.cfg.anchor();
+      if (!anchor || !anchor.parentNode) return null;
+      const doc = anchor.ownerDocument;
+      const bar = doc.createElement("div");
+      bar.className = "goal-conflict-bar";
+      bar.setAttribute("role", "alert");
+      bar.dataset.goalField = this.cfg.key;
+      bar.hidden = true;
+      const msg = doc.createElement("div");
+      msg.className = "goal-conflict-msg";
+      const lead = doc.createElement("strong");
+      lead.className = "goal-conflict-lead";
+      const detail = doc.createElement("span");
+      detail.className = "goal-conflict-detail";
+      msg.append(lead, detail);
+      const actions = doc.createElement("div");
+      actions.className = "goal-conflict-actions";
+      const button = (act, label, onClick) => {
+        const b2 = doc.createElement("button");
+        b2.type = "button";
+        b2.className = "secondary";
+        b2.dataset.act = act;
+        b2.textContent = label;
+        b2.addEventListener("click", onClick);
+        return b2;
+      };
+      actions.append(
+        button("keep", "Keep mine", () => {
+          void this.keepMine();
+        }),
+        button("take", "Take theirs", () => this.takeTheirs()),
+        button("both", "See both", () => {
+          this.diffOpen = !this.diffOpen;
+          this.renderBar();
+        }),
+        button("retry", "Retry save", () => {
+          void this.saveNow({ explicit: true });
+        })
+      );
+      const diff = doc.createElement("div");
+      diff.className = "goal-conflict-diff";
+      diff.hidden = true;
+      bar.append(msg, actions, diff);
+      anchor.parentNode.insertBefore(bar, anchor);
+      return bar;
+    }
+    /** Paint the bar from current state: conflict, failed save, or hidden. */
+    renderBar() {
+      const conflict = this.pending !== null;
+      const failed = !conflict && this.error !== null;
+      if (!this.bar || !this.bar.isConnected) {
+        if (!conflict && !failed) return;
+        this.bar = this.buildBar();
+        if (!this.bar) return;
+      }
+      const bar = this.bar;
+      bar.hidden = !conflict && !failed;
+      bar.classList.toggle("is-error", failed);
+      if (bar.hidden) return;
+      const lead = bar.querySelector(".goal-conflict-lead");
+      const detail = bar.querySelector(".goal-conflict-detail");
+      const show = (act, on) => {
+        const b2 = bar.querySelector(`button[data-act="${act}"]`);
+        if (b2) b2.hidden = !on;
+      };
+      show("keep", conflict);
+      show("take", conflict);
+      show("both", conflict);
+      show("retry", failed);
+      const diff = bar.querySelector(".goal-conflict-diff");
+      if (failed) {
+        lead.textContent = "Save failed";
+        detail.textContent = ` ${this.error}. Your text is kept.`;
+        diff.hidden = true;
+        return;
+      }
+      const p3 = this.pending;
+      const who = describeRemoteChange(p3.meta, p3.stamp);
+      lead.textContent = "Changed elsewhere";
+      detail.textContent = `${who ? ` ${who}.` : "."} Your unsaved ${this.cfg.label} is kept.`;
+      const both = bar.querySelector('button[data-act="both"]');
+      both.textContent = this.diffOpen ? "Hide diff" : "See both";
+      both.setAttribute("aria-expanded", String(this.diffOpen));
+      diff.hidden = !this.diffOpen;
+      if (this.diffOpen) this.paintDiff(diff, p3);
+    }
+    paintDiff(diff, p3) {
+      const doc = diff.ownerDocument;
+      diff.replaceChildren();
+      const legend = doc.createElement("div");
+      legend.className = "gcd-legend";
+      legend.textContent = "- only in your text    + only in the current version";
+      diff.append(legend);
+      for (const op of diffLines(this.current(), this.norm(p3.text))) {
+        const line = doc.createElement("div");
+        line.className = `gcd-line gcd-${op.type}`;
+        const mark = doc.createElement("span");
+        mark.className = "gcd-mark";
+        mark.textContent = op.type === "mine" ? "-" : op.type === "theirs" ? "+" : " ";
+        const body = doc.createElement("span");
+        body.className = "gcd-text";
+        body.textContent = op.text;
+        line.append(mark, body);
+        diff.append(line);
+      }
+    }
+  };
+  var registry = /* @__PURE__ */ new Map();
+  function registerGoalFields(projectId, fields) {
+    const old = registry.get(projectId);
+    if (old) {
+      for (const f4 of Object.values(old)) if (f4 && !Object.values(fields).includes(f4)) f4.destroy();
+    }
+    registry.set(projectId, fields);
+  }
+  function getGoalField(projectId, key) {
+    return registry.get(projectId)?.[key] ?? null;
+  }
+  function attachedFields(projectId) {
+    for (const [id, set] of registry) {
+      if (!Object.values(set).some((f4) => f4 && f4.isAttached())) registry.delete(id);
+    }
+    const sets = projectId === void 0 ? [...registry.values()] : [registry.get(projectId)].filter(Boolean);
+    return sets.flatMap((s3) => Object.values(s3)).filter((f4) => f4 && f4.isAttached());
+  }
+  function hasUnsavedGoalEdits(projectId) {
+    return attachedFields(projectId).some((f4) => f4.isDirty() || f4.isSaving());
+  }
+  function noteGoalEvent(projectId, event) {
+    const changed = event && event.changed_fields;
+    if (!Array.isArray(changed)) return;
+    const by = event.changed_by || {};
+    for (const key of changed) {
+      const f4 = getGoalField(projectId, key);
+      if (!f4) continue;
+      f4.noteRemoteMeta({
+        kind: by.kind ?? null,
+        source: by.source ?? null,
+        id: by.id ?? null,
+        stamp: event.field_updated_at ? event.field_updated_at[key] ?? null : null
+      });
+    }
+  }
+  var unloadGuardInstalled = false;
+  function installGoalUnloadGuard(win = window) {
+    if (unloadGuardInstalled) return;
+    unloadGuardInstalled = true;
+    win.addEventListener("beforeunload", (e3) => {
+      if (!hasUnsavedGoalEdits()) return;
+      e3.preventDefault();
+      e3.returnValue = "";
+    });
+  }
+  function promptGoalLeave(fields, doc = document) {
+    return new Promise((resolve) => {
+      const overlay = doc.createElement("div");
+      overlay.className = "goal-leave-overlay";
+      const dlg = doc.createElement("div");
+      dlg.className = "goal-leave-dialog";
+      dlg.setAttribute("role", "dialog");
+      dlg.setAttribute("aria-modal", "true");
+      dlg.setAttribute("aria-label", "Unsaved goal changes");
+      const h3 = doc.createElement("div");
+      h3.className = "goal-leave-title";
+      h3.textContent = "Unsaved changes";
+      const p3 = doc.createElement("div");
+      p3.className = "goal-leave-body";
+      p3.textContent = `You have unsaved changes to the ${fields.map((f4) => f4.cfg.label).join(" and the ")}.`;
+      const row = doc.createElement("div");
+      row.className = "goal-leave-actions";
+      const finish = (choice) => {
+        doc.removeEventListener("keydown", onKey, true);
+        overlay.remove();
+        resolve(choice);
+      };
+      const mk = (cls, label, choice) => {
+        const b2 = doc.createElement("button");
+        b2.type = "button";
+        b2.className = cls;
+        b2.textContent = label;
+        b2.dataset.choice = choice;
+        b2.addEventListener("click", () => finish(choice));
+        return b2;
+      };
+      const save = mk("primary", "Save", "save");
+      row.append(save, mk("secondary", "Discard", "discard"), mk("secondary", "Stay here", "stay"));
+      dlg.append(h3, p3, row);
+      overlay.append(dlg);
+      overlay.addEventListener("click", (e3) => {
+        if (e3.target === overlay) finish("stay");
+      });
+      const onKey = (e3) => {
+        if (e3.key === "Escape") {
+          e3.preventDefault();
+          e3.stopPropagation();
+          finish("stay");
+        }
+      };
+      doc.addEventListener("keydown", onKey, true);
+      doc.body.append(overlay);
+      save.focus();
+    });
+  }
+  function guardGoalLeave(projectId, proceed) {
+    const fields = attachedFields(projectId);
+    if (!fields.some((f4) => f4.isDirty() || f4.isSaving())) return false;
+    void (async () => {
+      await Promise.all(fields.map((f4) => f4.settle()));
+      const dirty = fields.filter((f4) => f4.isDirty());
+      if (!dirty.length) {
+        proceed();
+        return;
+      }
+      const choice = await promptGoalLeave(dirty);
+      if (choice === "stay") return;
+      if (choice === "discard") {
+        dirty.forEach((f4) => f4.discard());
+        proceed();
+        return;
+      }
+      const outcomes = await Promise.all(dirty.map((f4) => f4.saveNow({ explicit: true })));
+      if (outcomes.every((o3) => o3 === "saved" || o3 === "skipped")) proceed();
+    })();
+    return true;
+  }
+  try {
+    Object.assign(window, {
+      GoalField,
+      registerGoalFields,
+      getGoalField,
+      hasUnsavedGoalEdits,
+      noteGoalEvent,
+      installGoalUnloadGuard,
+      guardGoalLeave,
+      splitGoalText,
+      normalizeGoalText
+    });
+  } catch (e3) {
+  }
+
   // meridian/static/dashboard.ts
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
@@ -11493,6 +12079,7 @@ Existing folders: ${existing.join(", ")}` : "";
     close.textContent = "\xD7";
     close.onclick = (e3) => {
       e3.stopPropagation();
+      if (guardGoalLeave(t3.id, () => closeTab2(t3.id))) return;
       closeTab2(t3.id);
     };
     div.appendChild(close);
@@ -12812,6 +13399,11 @@ Current: ${current || "(none)"}`,
         btn.onclick = () => {
           const vtab = btn.dataset.vtab;
           const p3 = state.panels[project.id];
+          if (btn._goalLeaveOk) btn._goalLeaveOk = false;
+          else if (p3.activeVtab === "goal" && vtab !== "goal" && guardGoalLeave(project.id, () => {
+            btn._goalLeaveOk = true;
+            btn.click();
+          })) return;
           revealGroupForTab(vtab);
           vtabStrip.querySelectorAll(".vtab-btn").forEach((b2) => {
             b2.classList.toggle("active", b2.dataset.vtab === vtab);
@@ -13089,22 +13681,7 @@ Current: ${current || "(none)"}`,
       }
     }
     wireClaudeLaunchPanel(project.id);
-    document.getElementById(`goal-${project.id}`).addEventListener("blur", () => saveGoal(project.id));
-    document.getElementById(`goal-north-star-${project.id}`).addEventListener("blur", () => saveNorthStar(project.id));
-    document.getElementById(`goal-sprint-${project.id}`).addEventListener("blur", () => saveSprint(project.id));
-    document.getElementById(`goal-${project.id}`).addEventListener("input", function() {
-      const p3 = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p3._lastSaved || ""));
-    });
-    document.getElementById(`goal-north-star-${project.id}`).addEventListener("input", function() {
-      const p3 = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p3._serverNorthStar || ""));
-      autosizeGoalField(this);
-    });
-    document.getElementById(`goal-sprint-${project.id}`).addEventListener("input", function() {
-      const p3 = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p3._serverSprint || ""));
-    });
+    initGoalFields(project.id);
     autosizeGoalField(document.getElementById(`goal-north-star-${project.id}`));
     const fileBackBtn = document.getElementById(`file-back-${project.id}`);
     const fileSaveBtn = document.getElementById(`file-save-${project.id}`);
@@ -16421,63 +16998,31 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         state.panels[projectId].goalIsJson = true;
         text = JSON.stringify(goal.content, null, 2);
       }
-      const AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---";
-      const splitIdx = text.indexOf(AUTO_SPLIT);
-      const mainText = splitIdx !== -1 ? text.slice(0, splitIdx).trimEnd() : text;
-      const allLines = mainText.split("\n");
-      const _firstLine = allLines[0] || "";
-      const _isVersionLabel = /^v\d+\.\d+/.test(_firstLine.trim()) || _firstLine.trim().length === 0;
-      const titleLine = _isVersionLabel ? _firstLine : "";
-      const titleEl = document.getElementById(`goal-title-${projectId}`);
-      if (titleEl) {
-        titleEl.textContent = titleLine;
-        const hasTitle = !!titleLine.trim();
-        titleEl.style.display = hasTitle ? "block" : "none";
-        const taEl = document.getElementById(`goal-${projectId}`);
-        if (taEl) taEl.style.borderRadius = hasTitle ? "0 0 4px 4px" : "4px";
-      }
-      const body = (_isVersionLabel ? allLines.slice(1) : allLines).join("\n").replace(/^\n/, "");
-      const editStart = body.search(/^(CURRENT FOCUS|KEY FILES)/m);
-      if (editStart > 0) {
-        const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
-        if (shippedEl2) {
-          shippedEl2.textContent = body.slice(0, editStart).trimEnd();
-          shippedEl2.style.display = shippedEl2.textContent.trim() ? "block" : "none";
-        }
-        ta.value = body.slice(editStart);
-      } else {
-        const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
-        if (shippedEl2) shippedEl2.style.display = "none";
-        ta.value = body;
-      }
-      const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
-      if (shippedEl && !shippedEl.textContent.trim()) shippedEl.style.display = "none";
+      const parts = splitGoalText(text);
+      applyGoalZones(projectId, parts);
+      const stamps = goal.field_updated_at || {};
+      const vgField = getGoalField(projectId, "version_goal");
+      if (vgField) vgField.applyServer(parts.editable, stamps.version_goal ?? null);
+      else ta.value = parts.editable;
       autosizeGoalField(ta);
-      const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
-      if (autoBlocksEl) {
-        if (splitIdx !== -1) {
-          const abWrapper = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
-          if (abWrapper) abWrapper.style.display = "block";
-          autoBlocksEl.style.display = "block";
-          autoBlocksEl.textContent = text.slice(splitIdx + "--- AUTO BLOCKS BELOW ---".length).trimStart();
-        } else {
-          const abWrapper2 = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
-          if (abWrapper2) abWrapper2.style.display = "none";
-          autoBlocksEl.style.display = "none";
-        }
-      }
       v3.textContent = `v${goal.version}`;
       const vState = document.getElementById(`goal-state-${projectId}`);
       if (vState) vState.textContent = `v${goal.version}`;
       const nsTA = document.getElementById(`goal-north-star-${projectId}`);
       const spTA = document.getElementById(`goal-sprint-${projectId}`);
       if (nsTA && "north_star" in goal) {
-        nsTA.value = goal.north_star || "";
+        const nsField = getGoalField(projectId, "north_star");
+        if (nsField) nsField.applyServer(goal.north_star || "", stamps.north_star ?? null);
+        else nsTA.value = goal.north_star || "";
         autosizeGoalField(nsTA);
       }
       if (spTA && "sprint" in goal) {
-        spTA.value = goal.sprint || "";
-        if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || "");
+        const spField = getGoalField(projectId, "sprint");
+        if (spField) spField.applyServer(goal.sprint || "", stamps.sprint ?? null);
+        else {
+          spTA.value = goal.sprint || "";
+          if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || "");
+        }
       }
       const p3 = state.panels[projectId];
       p3._serverNorthStar = goal.north_star || "";
@@ -16499,14 +17044,6 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           nsInherited.style.display = "none";
         }
       }
-      p3._lastSaved = text;
-      if (nsTA) {
-        nsTA.classList.remove("dirty");
-      }
-      if (spTA) {
-        spTA.classList.remove("dirty");
-      }
-      ta.classList.remove("dirty");
       const tsNs = document.getElementById(`goal-ns-ts-${projectId}`);
       const tsVg = document.getElementById(`goal-vg-ts-${projectId}`);
       const tsSp = document.getElementById(`goal-sp-ts-${projectId}`);
@@ -16517,7 +17054,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       renderDecisionsTable(projectId, goal.decisions || "");
       loadPinnedDecisions(projectId);
     } catch (e3) {
-      ta.value = "";
+      const vgField = getGoalField(projectId, "version_goal");
+      if (!vgField || !vgField.isEditing()) ta.value = "";
       ta.placeholder = "Goal state failed to load.";
       v3.textContent = "(load failed)";
       const titleEl = document.getElementById(`goal-title-${projectId}`);
@@ -17284,74 +17822,156 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     });
   }
   async function saveGoal(projectId) {
-    const ta = document.getElementById(`goal-${projectId}`);
-    if (!ta) return;
+    await getGoalField(projectId, "version_goal")?.saveNow({ explicit: true });
+  }
+  async function saveNorthStar(projectId) {
+    await getGoalField(projectId, "north_star")?.saveNow({ explicit: true });
+  }
+  async function saveSprint(projectId) {
+    await getGoalField(projectId, "sprint")?.saveNow({ explicit: true });
+  }
+  function composeGoalRaw(projectId, editable) {
     const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
     const autoBlocksText = autoBlocksEl && autoBlocksEl.style.display !== "none" ? "\n--- AUTO BLOCKS BELOW ---\n" + autoBlocksEl.textContent : "";
     const titleEl = document.getElementById(`goal-title-${projectId}`);
     const titleLine = titleEl && titleEl.textContent ? titleEl.textContent + "\n" : "";
-    const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
-    const shippedText = shippedEl2 && shippedEl2.style.display !== "none" && shippedEl2.textContent ? "\n" + shippedEl2.textContent + "\n" : "";
-    const raw = titleLine + shippedText + ta.value + autoBlocksText;
-    if (raw === state.panels[projectId]._lastSaved) return;
-    let content = raw;
-    if (state.panels[projectId].goalIsJson) {
-      try {
-        content = JSON.parse(raw);
-      } catch (e3) {
+    const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+    const shippedText = shippedEl && shippedEl.style.display !== "none" && shippedEl.textContent ? "\n" + shippedEl.textContent + "\n" : "";
+    return titleLine + shippedText + editable + autoBlocksText;
+  }
+  function applyGoalZones(projectId, parts) {
+    const titleEl = document.getElementById(`goal-title-${projectId}`);
+    if (titleEl) {
+      titleEl.textContent = parts.titleLine;
+      const hasTitle = !!parts.titleLine.trim();
+      titleEl.style.display = hasTitle ? "block" : "none";
+      const taEl = document.getElementById(`goal-${projectId}`);
+      if (taEl) taEl.style.borderRadius = hasTitle ? "0 0 4px 4px" : "4px";
+    }
+    const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+    if (shippedEl) {
+      shippedEl.textContent = parts.shipped;
+      shippedEl.style.display = shippedEl.textContent.trim() ? "block" : "none";
+    }
+    const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
+    if (autoBlocksEl) {
+      const abWrapper = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
+      if (parts.autoBlocks !== null) {
+        if (abWrapper) abWrapper.style.display = "block";
+        autoBlocksEl.style.display = "block";
+        autoBlocksEl.textContent = parts.autoBlocks;
+      } else {
+        if (abWrapper) abWrapper.style.display = "none";
+        autoBlocksEl.style.display = "none";
       }
     }
-    try {
-      await api(`/projects/${projectId}/goal`, { method: "POST", body: JSON.stringify({ content }) });
-      state.panels[projectId]._lastSaved = raw;
-      toast("version goal saved");
-      refreshGoal(projectId);
-    } catch (e3) {
-      toast("save failed: " + e3.message, true);
-    }
   }
-  async function saveNorthStar(projectId) {
-    const ta = document.getElementById(`goal-north-star-${projectId}`);
-    if (!ta) return;
-    const val = ta.value.trim();
-    if (!val) return;
-    const saved = state.panels[projectId]?._serverNorthStar || "";
-    if (saved && val !== saved && !confirm("North star is intended to be stable. Save changes?")) {
-      ta.value = saved;
-      autosizeGoalField(ta);
-      ta.classList.remove("dirty");
-      return;
-    }
-    try {
-      const humanInput = document.getElementById("new-project-human");
-      const humanId = humanInput ? humanInput.value.trim() : "";
-      await api(`/projects/${projectId}/goal/north-star`, {
-        method: "POST",
-        body: JSON.stringify({ north_star: val, human_id: humanId || "owner" })
-      });
-      toast("north star saved");
-      refreshGoal(projectId);
-    } catch (e3) {
-      toast("save failed: " + e3.message, true);
-    }
-  }
-  async function saveSprint(projectId) {
-    const ta = document.getElementById(`goal-sprint-${projectId}`);
-    const sel = document.getElementById(`goal-sprint-select-${projectId}`);
-    if (!ta) return;
-    const rawVal = ta.style.display === "none" && sel && sel.value && sel.value !== "__custom__" ? sel.value : ta.value;
-    const val = rawVal.trim();
-    if (!val) return;
-    try {
-      await api(`/projects/${projectId}/goal/sprint`, {
-        method: "POST",
-        body: JSON.stringify({ sprint: val })
-      });
-      toast("sprint saved");
-      refreshGoal(projectId);
-    } catch (e3) {
-      toast("save failed: " + e3.message, true);
-    }
+  function initGoalFields(projectId) {
+    const ta = document.getElementById(`goal-${projectId}`);
+    const nsTA = document.getElementById(`goal-north-star-${projectId}`);
+    const spTA = document.getElementById(`goal-sprint-${projectId}`);
+    const spSel = document.getElementById(`goal-sprint-select-${projectId}`);
+    if (!ta || !nsTA || !spTA) return;
+    const stampOf = (res, key) => res && res.field_updated_at && res.field_updated_at[key] || void 0;
+    const send = (path, body) => api(`/projects/${projectId}${path}`, {
+      method: "POST",
+      body: JSON.stringify({ ...body, source: "dashboard" })
+    });
+    const notify = (msg, isError) => toast(msg, isError);
+    const fields = {
+      version_goal: new GoalField({
+        key: "version_goal",
+        label: "version goal",
+        el: ta,
+        anchor: () => document.getElementById(`goal-title-${projectId}`),
+        getValue: () => ta.value,
+        setValue: (t3) => {
+          ta.value = t3;
+          autosizeGoalField(ta);
+        },
+        // A 409 carries the whole stored content; resolve it to the editable zone the same way
+        // refreshGoal does, and let the read-only zones follow it.
+        fromServer: (v3) => {
+          const parts = splitGoalText(typeof v3 === "string" ? v3 : JSON.stringify(v3, null, 2));
+          applyGoalZones(projectId, parts);
+          return parts.editable;
+        },
+        allowEmpty: true,
+        persist: async (_text, stamp) => {
+          const raw = composeGoalRaw(projectId, ta.value);
+          let content = raw;
+          if (state.panels[projectId].goalIsJson) {
+            try {
+              content = JSON.parse(raw);
+            } catch (e3) {
+            }
+          }
+          const res = await send("/goal", { content, expected_updated_at: stamp ?? void 0 });
+          return { stamp: stampOf(res, "version_goal") };
+        },
+        notify,
+        onSaved: () => {
+          toast("version goal saved");
+          refreshGoal(projectId);
+        }
+      }),
+      north_star: new GoalField({
+        key: "north_star",
+        label: "north star",
+        el: nsTA,
+        anchor: () => nsTA,
+        getValue: () => nsTA.value,
+        setValue: (t3) => {
+          nsTA.value = t3;
+          autosizeGoalField(nsTA);
+        },
+        // Changing an existing north star asks first; declining reverts to the saved text.
+        confirmSave: (text, base) => !base || text === base || confirm("North star is intended to be stable. Save changes?"),
+        persist: async (text, stamp) => {
+          const humanInput = document.getElementById("new-project-human");
+          const humanId = humanInput ? humanInput.value.trim() : "";
+          const res = await send("/goal/north-star", {
+            north_star: text,
+            human_id: humanId || "owner",
+            expected_updated_at: stamp ?? void 0
+          });
+          return { stamp: stampOf(res, "north_star") };
+        },
+        notify,
+        onSaved: () => {
+          toast("north star saved");
+          refreshGoal(projectId);
+        }
+      }),
+      sprint: new GoalField({
+        key: "sprint",
+        label: "current focus",
+        el: spTA,
+        anchor: () => spTA.parentElement,
+        // The session select owns the value while the free-text input is hidden.
+        getValue: () => spTA.style.display === "none" && spSel && spSel.value && spSel.value !== "__custom__" ? spSel.value : spTA.value,
+        setValue: (t3) => {
+          spTA.value = t3;
+          if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](t3);
+        },
+        persist: async (text, stamp) => {
+          const res = await send("/goal/sprint", { sprint: text, expected_updated_at: stamp ?? void 0 });
+          return { stamp: stampOf(res, "sprint") };
+        },
+        notify,
+        onSaved: () => {
+          toast("sprint saved");
+          refreshGoal(projectId);
+        }
+      })
+    };
+    fields.version_goal.wire({ blur: [ta], input: [ta], keys: [ta] });
+    fields.north_star.wire({ blur: [nsTA], input: [nsTA], keys: [nsTA] });
+    nsTA.addEventListener("input", () => autosizeGoalField(nsTA));
+    const sprintEls = spSel ? [spTA, spSel] : [spTA];
+    fields.sprint.wire({ blur: [spTA], input: sprintEls, keys: sprintEls });
+    registerGoalFields(projectId, fields);
+    installGoalUnloadGuard();
   }
   function _sessionPresenceDot(last_seen) {
     if (!last_seen) return "\u26AB";
@@ -17657,6 +18277,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       return;
     }
     if (event.type === "goal_updated") {
+      noteGoalEvent(projectId, event);
       refreshGoal(projectId);
       return;
     }
