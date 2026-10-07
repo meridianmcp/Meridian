@@ -1077,6 +1077,13 @@ async def discover_and_link_manual_issue(
     # 4. Wave-relative velocity/anomaly check — non-blocking escalation only.
     try:
         item = await db_module.get_sprint_item(db, item_id)
+        if item is not None and item.get("project_id") != project_id:
+            # 6fe5210c (wave 2, third pass) -- the row only supplies a wave label to
+            # the velocity signal, but that signal (wave label included) is written
+            # into this project's HITL context and audit row, so another project's
+            # item must never feed it. link_sprint_item_github_issue below is
+            # already bound to project_id; this read is now too.
+            item = None
         anomaly = await db_module.check_manual_issue_action_velocity(
             db, project_id, triggering_item=item,
         )

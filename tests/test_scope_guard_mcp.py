@@ -176,6 +176,9 @@ _EXTRA: "dict[str, Callable[[_World], dict[str, Any]]]" = {
         "project_id": w.mine, "session_id": w.own["session"], "skip_handoff": True,
         "items": [{"title": "decomposed item"}],
     },
+    # pass 3 (F-C1): handlers that read the item BEFORE binding it to the project
+    "update_sprint_item": lambda w: {"project_id": w.mine, "title": "renamed own item"},
+    "claim_sprint_item": lambda w: {"project_id": w.mine, "session_id": w.own["session"]},
 }
 
 #: Tools whose handler legitimately raises for an in-scope object in this test
@@ -208,6 +211,12 @@ _SUCCESS_CHECKS: "dict[str, Callable[[Any, _World], None]]" = {
     "store_finding": lambda r, w: _assert(r.get("task_id") == w.own["task"], r),
     "start_remote_task": lambda r, w: _assert(r["job"]["sprint_item_id"] == w.own["sprint_item"], r),
     "proposal_to_handoff": lambda r, w: _assert(bool(r.get("created_item_ids")), r),
+    "update_sprint_item": lambda r, w: _assert(
+        r.get("id") == w.own["sprint_item"] and r.get("title") == "renamed own item", r,
+    ),
+    "claim_sprint_item": lambda r, w: _assert(
+        r.get("id") == w.own["sprint_item"] and r.get("status") == "in_progress", r,
+    ),
 }
 
 

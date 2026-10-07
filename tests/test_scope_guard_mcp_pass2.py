@@ -13,17 +13,28 @@ after the first MCP scope guard (tests/test_scope_guard_mcp.py).
         (tool, argument) pair instead of only tools without a project_id.
 * F-M4  session keys / the comma-separated ``session_ids`` string the first pass
         never exercised, and the one control that needs a stubbed tunnel.
+* F-C1  (pass 3) "bound" must hold on EVERY code path: update_sprint_item's no-op
+        patch and its in_progress pre-check read the item by id alone, behind a probe
+        that only ever sent one call shape. Every bound pair is now probed in its
+        minimal shape and with each optional argument alone, against a foreign object
+        in each lifecycle state, with an own-project control per probe.
+* F-C2  (pass 3) the caption-link store primitives bind to a document; the docx
+        conflict element lists keep the ids in-scope sessions hold.
 
 Owners, workspace-wide members and self-hosted callers pass
 ``scoped_project_ids=None`` and must see no change at all.
 """
 from __future__ import annotations
 
+import ast
+import contextlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
+from unittest.mock import patch
 
 import pytest
 
@@ -52,9 +63,9 @@ class W:
     name_theirs: str
 
 
-async def _world(db: Any) -> W:
-    mine = (await db_module.create_project(db, "p2-mine"))["id"]
-    theirs = (await db_module.create_project(db, "p2-theirs"))["id"]
+async def _world(db: Any, tag: str = "") -> W:
+    mine = (await db_module.create_project(db, f"p2-mine{tag}"))["id"]
+    theirs = (await db_module.create_project(db, f"p2-theirs{tag}"))["id"]
     name_mine2, name_theirs = "mine-worker-two", "foreign-worker-xyz"
     return W(
         mine=mine, theirs=theirs,
@@ -507,9 +518,10 @@ async def test_the_handler_keeps_the_callers_own_session_visible_in_a_redacted_r
         return {"ok": False, "error": "RESOURCE_LOCKED", "session_id": args["session_id"], "holder_session_id": w.s_theirs}
 
     monkeypatch.setattr(mcp_handler, "_handle_sprint_tools", _fake_sprint_tools)
+    own_item = (await db_module.add_sprint_item(db, w.mine, "v1", "claim target for the redaction check"))["id"]
     result = await _call(
         db, tmp_path, "claim_sprint_item",
-        {"project_id": w.mine, "session_id": "caller-minted-session", "item_id": "any"}, [w.mine],
+        {"project_id": w.mine, "session_id": "caller-minted-session", "item_id": own_item}, [w.mine],
     )
     assert result["session_id"] == "caller-minted-session"
     assert result["holder_session_id"] is None and result["holder_redacted"] is True
@@ -807,9 +819,14 @@ async def test_caption_links_are_bound_to_the_callers_own_document(db, tmp_path,
         # A document the project does not have is the handler's own error; nothing is touched.
         missing = await _call(db, tmp_path, tool, {**_args("mine", docs["theirs"][object_key], "el-x"), "doc": "theirs.docx"}, scoped)
         assert "error" in missing and await _caption("theirs") is None
-        # An unscoped caller is unchanged: the bare-id primitive still takes any object.
-        owner = await _call(db, tmp_path, tool, _args("mine", docs["theirs"][object_key], "el-owner"), None)
-        assert owner[object_key]["caption_element_id"] == "el-owner" and await _caption("theirs") == "el-owner"
+        # An unscoped caller still links its own document's objects ...
+        owner = await _call(db, tmp_path, tool, _args("mine", docs["mine"][object_key], "el-owner"), None)
+        assert owner[object_key]["caption_element_id"] == "el-owner" and await _caption("mine") == "el-owner"
+        # ... but is bound to the named document too since pass 3 (F-C2): the store primitive no
+        # longer takes a bare id, so another document's object is "not found" for everyone.
+        for other in ("theirs", "mine2"):
+            stray = await _call(db, tmp_path, tool, _args("mine", docs[other][object_key], "el-stray"), None)
+            assert "error" in stray and "no doc_" in stray["error"] and await _caption(other) is None
     finally:
         await doc_store.close_all_doc_stores()
 
@@ -1007,8 +1024,8 @@ _exempt(
     "bound", "sprint item / pointer id resolved within the call's project (sprint-item db functions take project_id: 'sprint item not found')",
     ("get_sprint_item_pointers", "sprint_item_id"), ("add_sprint_item_pointer", "sprint_item_id"),
     ("delete_sprint_item_pointer", "pointer_id"), ("relocate_sprint_item_pointer", "pointer_id"),
-    ("resolve_sprint_item_pointers", "sprint_item_id"), ("update_sprint_item", "item_id"),
-    ("claim_sprint_item", "item_id"), ("complete_sprint_item", "item_id"), ("release_sprint_item_claim", "item_id"),
+    ("resolve_sprint_item_pointers", "sprint_item_id"),
+    ("complete_sprint_item", "item_id"), ("release_sprint_item_claim", "item_id"),
     ("transfer_sprint_item_claim", "item_id"), ("split_sprint_item", "item_id"), ("merge_sprint_items", "item_ids"),
     ("add_subtask", "parent_id"), ("link_manual_github_issue", "item_id"), ("reconcile_stale_claims", "item_ids"),
     ("get_proposal_gates", "sprint_item_id"), ("get_effective_capability_profile", "sprint_item_id"),
@@ -1157,17 +1174,19 @@ def test_the_completeness_test_is_not_vacuous():
 # in a comment; the guard's table deliberately does not check these arguments.
 # ===========================================================================
 
-async def _foreign(db: Any, tmp_path: Any, w: W) -> SimpleNamespace:
-    """One foreign project's objects of every kind the 'bound' tools take."""
+async def _foreign(db: Any, tmp_path: Any, w: W, *, marker: str = SECRET) -> SimpleNamespace:
+    """One foreign project's objects of every kind the 'bound' tools take. ``marker`` is the text every
+    one of them carries (the control world of the shape probes uses another one, so a tool that
+    legitimately answers with the CALLER's own data is not mistaken for a leak)."""
     async def mk(tool: str, **args: Any) -> Any:
         return await _call(db, tmp_path, tool, args, None)
 
     b = SimpleNamespace()
-    b.item = await _item(db, w.theirs, f"{SECRET} rotate the production keys")
+    b.item = await _item(db, w.theirs, f"{marker} rotate the production keys")
     # (a similar title would be deduplicated into the first item; the marker rides in the notes)
-    b.item2 = (await db_module.add_sprint_item(db, w.theirs, "v1", "migrate the billing tables", notes=SECRET))["id"]
+    b.item2 = (await db_module.add_sprint_item(db, w.theirs, "v1", "migrate the billing tables", notes=marker))["id"]
     b.own_item = await _item(db, w.mine, "own tidy-up of the parser tests")
-    exp = await mk("create_experiment", project_id=w.theirs, session_id=w.s_theirs, name=f"{SECRET} experiment", hypothesis=SECRET)
+    exp = await mk("create_experiment", project_id=w.theirs, session_id=w.s_theirs, name=f"{marker} experiment", hypothesis=marker)
     b.exp = exp["experiment"]["id"]
     b.own_exp = (await mk("create_experiment", project_id=w.mine, session_id=w.s_mine, name="own experiment"))["experiment"]["id"]
     b.run = (await mk("start_experiment_run", project_id=w.theirs, session_id=w.s_theirs, experiment_id=b.exp))["run"]["id"]
@@ -1176,28 +1195,41 @@ async def _foreign(db: Any, tmp_path: Any, w: W) -> SimpleNamespace:
     ))["run"]["id"]
     b.job = (await mk(
         "register_external_job", project_id=w.theirs, session_id=w.s_theirs, job_key="jk", provider="prov",
-        external_id="ext-1", detail=SECRET,
+        external_id="ext-1", detail=marker,
     ))["job"]["id"]
-    b.rtask = (await mk("start_remote_task", project_id=w.theirs, session_id=w.s_theirs, host="h", command=f"echo {SECRET}"))["job"]["id"]
-    b.contract = (await mk("create_paper_contract", project_id=w.theirs, paper_key="pk", title=f"{SECRET} paper"))["contract"]["id"]
+    b.rtask = (await mk("start_remote_task", project_id=w.theirs, session_id=w.s_theirs, host="h", command=f"echo {marker}"))["job"]["id"]
+    b.contract = (await mk("create_paper_contract", project_id=w.theirs, paper_key="pk", title=f"{marker} paper"))["contract"]["id"]
     b.rev = (await mk(
-        "create_paper_contract_revision", project_id=w.theirs, contract_id=b.contract, content={"working_title": SECRET},
+        "create_paper_contract_revision", project_id=w.theirs, contract_id=b.contract, content={"working_title": marker},
     ))["revision"]["id"]
     b.deriv = (await mk(
         "register_docx_derivative", project_id=w.theirs, session_id=w.s_theirs, source_path="a.docx", derivative_path="b.docx",
-        source_content_hash="h1", derivative_content_hash="h2", generating_tool="gt", notes=SECRET,
+        source_content_hash="h1", derivative_content_hash="h2", generating_tool="gt", notes=marker,
     ))["derivative"]["id"]
     b.recovery = (await mk("register_session_recovery", project_id=w.theirs, session_id=w.s_theirs, transport="tunnel"))["recovery"]["id"]
     b.gate = (await mk(
-        "add_proposal_gate", project_id=w.theirs, category="product_scope", question=f"{SECRET}?", affected=[b.item],
+        "add_proposal_gate", project_id=w.theirs, category="product_scope", question=f"{marker}?", affected=[b.item],
         evidence="e", created_by="x",
     ))["id"]
-    b.watch = (await mk("save_watchlist_query", project_id=w.theirs, source_type="arxiv", query=f"{SECRET} query"))["watchlist_id"]
-    b.hook = (await mk("add_custom_hook", project_id=w.theirs, name=f"{SECRET}hook", event="PreToolUse", script_sh="echo hi"))["id"]
+    b.watch = (await mk("save_watchlist_query", project_id=w.theirs, source_type="arxiv", query=f"{marker} query"))["watchlist_id"]
+    b.hook = (await mk("add_custom_hook", project_id=w.theirs, name=f"{marker}hook", event="PreToolUse", script_sh="echo hi"))["id"]
     b.pointer = (await mk(
-        "add_sprint_item_pointer", project_id=w.theirs, sprint_item_id=b.item, source_type="doc", label=SECRET,
+        "add_sprint_item_pointer", project_id=w.theirs, sprint_item_id=b.item, source_type="doc", label=marker,
         targets=[{"uri": "file:x.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
     ))["id"]
+    from meridian.db import ai_log  # noqa: PLC0415
+
+    tag = w.theirs[:8]
+    b.corr, b.actor, b.tenant = f"corr-{tag}", f"actor-{tag}", f"tenant-{tag}"
+    root = await ai_log.append_event(
+        db, w.theirs, "tool.invoked", "session", actor_id=b.actor, session_id=w.s_theirs, tenant_id=b.tenant,
+        correlation_id=b.corr, payload={"detail": marker},
+    )
+    b.parent = root["id"]
+    await ai_log.append_event(
+        db, w.theirs, "tool.invoked", "session", actor_id=b.actor, session_id=w.s_theirs, tenant_id=b.tenant,
+        correlation_id=b.corr, parent_event_id=b.parent, payload={"detail": marker},
+    )
     return b
 
 
@@ -1267,9 +1299,8 @@ _BOUND_PROBES: "dict[tuple[str, str], Callable[[W, SimpleNamespace], tuple[str, 
         "relocate_sprint_item_pointer", {"project_id": w.mine, "pointer_id": b.pointer, "targets": [_RANGE]}),
     ("resolve_sprint_item_pointers", "sprint_item_id"): lambda w, b: (
         "resolve_sprint_item_pointers", {"project_id": w.mine, "sprint_item_id": b.item}),
-    ("update_sprint_item", "item_id"): lambda w, b: ("update_sprint_item", {"project_id": w.mine, "item_id": b.item, "title": "hijacked"}),
-    ("claim_sprint_item", "item_id"): lambda w, b: (
-        "claim_sprint_item", {"project_id": w.mine, "session_id": w.s_mine, "item_id": b.item}),
+    # (update_sprint_item.item_id and claim_sprint_item.item_id were exempted as bound
+    # in pass 2 and are guarded in scope_guard.OBJECT_ARGS since pass 3 -- see F-C1.)
     ("complete_sprint_item", "item_id"): lambda w, b: (
         "complete_sprint_item", {"project_id": w.mine, "session_id": w.s_mine, "item_id": b.item, "notes": "n"}),
     ("release_sprint_item_claim", "item_id"): lambda w, b: (
@@ -1288,6 +1319,16 @@ _BOUND_PROBES: "dict[tuple[str, str], Callable[[W, SimpleNamespace], tuple[str, 
     ("get_proposal_gates", "sprint_item_id"): lambda w, b: ("get_proposal_gates", {"project_id": w.mine, "sprint_item_id": b.item}),
     ("get_effective_capability_profile", "sprint_item_id"): lambda w, b: (
         "get_effective_capability_profile", {"project_id": w.mine, "sprint_item_id": b.item}),
+    ("generate_handoff", "selected_item_ids"): lambda w, b: (
+        "generate_handoff", {"project_id": w.mine, "selected_item_ids": [b.item]}),
+    ("generate_handoff", "force_include_ids"): lambda w, b: (
+        "generate_handoff", {"project_id": w.mine, "force_include_ids": [b.item]}),
+    ("export_ai_log", "correlation_id"): lambda w, b: ("export_ai_log", {"project_id": w.mine, "correlation_id": b.corr}),
+    ("export_ai_log", "parent_event_id"): lambda w, b: ("export_ai_log", {"project_id": w.mine, "parent_event_id": b.parent}),
+    ("search_ai_log", "tenant_id"): lambda w, b: ("search_ai_log", {"project_id": w.mine, "tenant_id": b.tenant}),
+    ("search_ai_log", "correlation_id"): lambda w, b: ("search_ai_log", {"project_id": w.mine, "correlation_id": b.corr}),
+    ("search_ai_log", "parent_event_id"): lambda w, b: ("search_ai_log", {"project_id": w.mine, "parent_event_id": b.parent}),
+    ("search_ai_log", "actor_id"): lambda w, b: ("search_ai_log", {"project_id": w.mine, "actor_id": b.actor}),
     ("resolve_proposal_gate", "gate_id"): lambda w, b: (
         "resolve_proposal_gate", {"project_id": w.mine, "gate_id": b.gate, "state": "allowed", "decision": "ok", "actor": "a"}),
     ("reopen_proposal_gate", "gate_id"): lambda w, b: (
@@ -1297,17 +1338,22 @@ _BOUND_PROBES: "dict[tuple[str, str], Callable[[W, SimpleNamespace], tuple[str, 
 #: Pairs whose proof is a dedicated test below (an extra setup, or a unit-level
 #: proof of the function that holds the project binding).
 _CUSTOM_PROOFS = {
-    ("generate_handoff", "selected_item_ids"), ("generate_handoff", "force_include_ids"),
     ("complete_sprint_item", "override_hitl_id"), ("complete_sprint_item", "completion_override_hitl_id"),
     ("complete_sprint_item", "foreign_claim_override_hitl_id"), ("update_sprint_item", "override_hitl_id"),
     ("complete_wave_gate", "override_hitl_id"), ("complete_wave_gate", "verification_run_id"),
-    ("export_ai_log", "correlation_id"), ("export_ai_log", "parent_event_id"), ("search_ai_log", "tenant_id"),
-    ("search_ai_log", "correlation_id"), ("search_ai_log", "parent_event_id"), ("search_ai_log", "actor_id"),
     ("get_citation_edges", "document_id"),
 }
 
-#: Probes whose refusal is allowed to write ONE kind of row, and why.
-_ALLOWED_WRITES: "dict[tuple[str, str], str]" = {}
+#: Probes whose call is allowed to write ONE kind of row, and why. None of them may touch the FOREIGN
+#: object: the shape test below proves that independently with row snapshots.
+_ALLOWED_WRITES: "dict[tuple[str, str], str]" = {
+    ("generate_handoff", "selected_item_ids"): "a generated handoff is stored under the CALLER's own project",
+    ("generate_handoff", "force_include_ids"): "a generated handoff is stored under the CALLER's own project",
+    ("link_manual_github_issue", "item_id"): (
+        "the raw-content log and audit rows of the CALLER's own project (the handler reports 'linked' even when "
+        "the UPDATE bound to the project matched nothing); needs the screening toggle, which only the shape test enables"
+    ),
+}
 
 
 def test_every_bound_exemption_has_a_proof_and_every_proof_is_for_a_bound_exemption():
@@ -1562,3 +1608,559 @@ async def test_malformed_argument_shapes_are_handled_without_crashing_or_leaking
     rows = [None, "x", {"scope_type": "project", "scope_id": w.mine}, {"scope_type": "project", "scope_id": w.theirs}]
     kept = await scope_guard.filter_scoped_result("list_profile_layers", rows, db, scoped)
     assert kept == [{"scope_type": "project", "scope_id": w.mine}]
+
+
+# ===========================================================================
+# F-C1 (pass 3). "bound" has to hold on EVERY code path, not for one call shape
+#
+# update_sprint_item was exempted above as "bound" because a probe that sets a title is
+# refused ("sprint item not found"). The same tool called with NO editable field took
+# patch_sprint_item's early return, which read the row by id alone and handed back the
+# whole foreign row -- over MCP and over HTTP PATCH /projects/{pid}/sprint-items/{iid} --
+# and its in_progress pre-check answered IN_PROGRESS with the foreign item's claimed_at.
+# So every pair that is exempted as bound is now sent in its MINIMAL shape (the schema's
+# required arguments, the caller's own project_id and the id) and with each optional
+# argument ALONE, against a foreign object in every lifecycle state, and each probe is
+# shown to have REACHED the id by running the very same call against an object of the
+# caller's own project: a probe that answers identically for both proves nothing.
+# ===========================================================================
+
+def _swapped(w: W) -> W:
+    """The same world seen from the foreign side: building "the foreign objects" for it
+    puts them in the caller's OWN project (the control for every probe)."""
+    return W(
+        mine=w.theirs, theirs=w.mine, s_mine=w.s_theirs, s_mine2=w.s_theirs, s_theirs=w.s_mine,
+        name_mine2=w.name_theirs, name_theirs=w.name_mine2,
+    )
+
+
+#: A claimed_at no clock can produce any more, so an echo of it is unmistakable.
+_STAMP = "2001-02-03 04:05:06"
+_STATES = ("pending", "in_progress", "done")
+_SPRINT_ITEM_ID_ARGS = frozenset({"item_id", "item_ids", "parent_id", "sprint_item_id"})
+async def _item_states(
+    db: Any, tmp_path: Any, project: str, session: str, *, stamp: "str | None" = None, marker: str = SECRET,
+) -> SimpleNamespace:
+    """One sprint item of ``project`` per lifecycle state: pending, in_progress (claimed by
+    ``session``) and done. The marker rides in the notes: a similar title is deduplicated."""
+    async def add(title: str) -> str:
+        return (await db_module.add_sprint_item(db, project, "v1", title, notes=marker))["id"]
+
+    states = SimpleNamespace(
+        pending=await add("reindex the warehouse nightly"),
+        in_progress=await add("archive the legacy exports"),
+        done=await add("rotate the staging certificates"),
+    )
+    for item in (states.in_progress, states.done):
+        await _call(db, tmp_path, "claim_sprint_item", {"project_id": project, "session_id": session, "item_id": item}, None)
+    await _call(
+        db, tmp_path, "complete_sprint_item",
+        {"project_id": project, "session_id": session, "item_id": states.done, "notes": "finished"}, None,
+    )
+    if stamp:
+        await db.execute("UPDATE sprint_items SET claimed_at = ? WHERE id = ?", (stamp, states.in_progress))
+        await db.commit()
+    got = [(await db_module.get_sprint_item(db, getattr(states, name)))["status"] for name in _STATES]
+    assert got == list(_STATES), f"the world is not what the probes assume: {got}"
+    return states
+
+
+async def _rows(db: Any, ids: "list[str]") -> "dict[str, Any]":
+    return {item_id: await db_module.get_sprint_item(db, item_id) for item_id in ids}
+
+
+def _dummy_values(prop: "dict[str, Any]", key: str, w: W) -> "list[Any]":
+    """Values of the schema's type to put in an optional argument (an enum: each of its values)."""
+    if key in scope_guard._SESSION_ARG_KEYS:
+        return [w.s_mine]
+    if "enum" in prop:
+        return list(prop["enum"])
+    kind = prop.get("type")
+    if kind == "boolean":
+        return [True, False]
+    if kind == "integer":
+        return [1]
+    if kind == "array":
+        return [[]]
+    if kind == "object":
+        return [{}]
+    return ["x"]
+
+
+def _call_shapes(tool: str, id_arg: str, id_value: Any, probe_args: "dict[str, Any]", w: W) -> "list[tuple[str, dict[str, Any]]]":
+    """Every call SHAPE a scoped caller can make with ``id_value`` in ``id_arg``: the
+    minimal one, then each optional argument alone added to it (with the single-shape
+    probe's own value for it when that probe sets one, else a dummy of the schema's type)."""
+    schema = _TOOLS[tool].get("inputSchema") or {}
+    required = list(schema.get("required") or [])
+    props = schema.get("properties") or {}
+
+    def base() -> "dict[str, Any]":
+        args: "dict[str, Any]" = {"project_id": w.mine}
+        for key in required:
+            args[key] = probe_args[key] if key in probe_args else _dummy_values(props.get(key, {}), key, w)[0]
+        args[id_arg] = id_value
+        return args
+
+    shapes = [("minimal", base())]
+    for key, prop in props.items():
+        if key in ("project_id", "project_name", id_arg) or key in required:
+            continue
+        values = _dummy_values(prop, key, w)
+        if key in probe_args:
+            values = [probe_args[key]] + [v for v in values if v != probe_args[key]]
+        shapes.extend((f"+{key}={str(value)[:24]}", {**base(), key: value}) for value in values)
+    return shapes
+
+
+async def _outcome(db: Any, tmp_path: Any, tool: str, args: "dict[str, Any]", scoped: "list[str] | None", tenant: Any = None) -> str:
+    try:
+        return _blob(await _call(db, tmp_path, tool, args, scoped, tenant=tenant))
+    except Exception as exc:  # noqa: BLE001 -- a refusal may be an exception; its text is what we inspect
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _ids_in(*containers: Any) -> "set[str]":
+    found: "set[str]" = set()
+    for container in containers:
+        if isinstance(container, str):
+            found.add(container)
+        elif isinstance(container, dict):
+            found |= _ids_in(*container.values())
+        elif isinstance(container, (list, tuple, set)):
+            found |= _ids_in(*container)
+    return {i for i in found if len(i) >= 8}
+
+
+def _squash(text: str, ids: "set[str]") -> str:
+    """``text`` with every id replaced, so two answers that differ only in WHICH object they name compare equal."""
+    for object_id in sorted(ids, key=len, reverse=True):
+        text = text.replace(object_id, "<id>")
+    return text
+
+
+async def _enable_manual_issue_screening(db: Any, project_id: str, tenant_id: str) -> None:
+    hitl = await db_module.request_hitl(
+        db, project_id, "Enable?", kind="manual_issue_screening_toggle", require_human=True, options=["Yes", "No"],
+    )
+    await db_module.answer_hitl_request(db, hitl["id"], "Yes", answered_by="human")
+    await db_module.set_manual_issue_screening_enabled(db, True, hitl_id=hitl["id"], tenant_id=tenant_id)
+
+
+async def _benign_issue(name: str, args: "dict[str, Any]", tenant: Any, db_arg: Any) -> "dict[str, Any]":
+    return {"number": 7, "title": "Bug: crash on save", "body": "Steps: click save twice", "html_url": "https://x/7", "comments": []}
+
+
+#: The marker the control world's objects carry: a tool that legitimately answers with the CALLER's own
+#: data (a generated handoff renders the own board) must not be mistaken for a leak of the foreign one.
+_OWN_MARKER = "OWN-DATA-MARKER"
+_BOUND_TOOLS = sorted({tool for tool, _ in _BOUND_PROBES})
+
+
+def _with_written_file(outcome: str) -> str:
+    """``outcome`` plus the text of the file a generate_handoff answer points at (the answer alone does
+    not show what was rendered into it)."""
+    try:
+        path = json.loads(outcome).get("file_path")
+    except (ValueError, AttributeError):
+        return outcome
+    if isinstance(path, str) and os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            return outcome + "\n" + fh.read()
+    return outcome
+
+
+def test_the_shape_generator_really_produces_minimal_and_single_optional_shapes(tmp_path):
+    w = W("p-mine", "p-theirs", "s-mine", "s-mine2", "s-theirs", "n2", "nt")
+    shapes = dict(_call_shapes("get_experiment_events", "experiment_id", "EXP-ID-0001", {"limit": 7, "run_id": "r"}, w))
+    assert shapes["minimal"] == {"project_id": "p-mine", "experiment_id": "EXP-ID-0001"}
+    assert shapes["+limit=7"] == {"project_id": "p-mine", "experiment_id": "EXP-ID-0001", "limit": 7}   # the probe's own value
+    assert shapes["+run_id=r"]["run_id"] == "r" and "limit" not in shapes["+run_id=r"]                 # each optional ALONE
+    update = dict(_call_shapes("update_sprint_item", "item_id", "ITEM-ID-0001", {}, w))
+    assert update["minimal"] == {"project_id": "p-mine", "item_id": "ITEM-ID-0001"}
+    assert update["+required_notes=True"]["required_notes"] is True and update["+required_notes=False"]["required_notes"] is False
+    assert {"+priority=urgent", "+priority=low", "+blocker_kind=manual", "+github_channel=graduated"} <= set(update)  # every enum value
+    # a required argument the probe does not set gets a dummy of its type; session pointers are the caller's own
+    assert dict(_call_shapes("release_sprint_item_claim", "item_id", "I", {}, w))["minimal"]["session_id"] == "s-mine"
+    assert dict(_call_shapes("add_sprint_item_pointer", "sprint_item_id", "I", {}, w))["minimal"]["targets"] == []
+    assert len(_BOUND_PROBES) >= 50 and "update_sprint_item" not in _BOUND_TOOLS   # that one is guarded by OBJECT_ARGS, see below
+    # a tool called with a LIST of ids gets a list
+    assert dict(_call_shapes("merge_sprint_items", "item_ids", ["A", "B"], {}, w))["minimal"]["item_ids"] == ["A", "B"]
+    # the file behind a generate_handoff answer is part of what the caller learns
+    written = tmp_path / "handoff.md"
+    written.write_text("rendered body", encoding="utf-8")
+    assert _with_written_file(json.dumps({"file_path": str(written)})).endswith("rendered body")
+    assert _with_written_file('{"file_path": "/no/such/file"}') == '{"file_path": "/no/such/file"}'
+    assert _with_written_file("not json") == "not json" and _with_written_file("[1]") == "[1]"
+
+
+async def _shape_run(
+    db: Any, tmp_path: Any, pair: "tuple[str, str]",
+    build: "Callable[[W, SimpleNamespace], tuple[str, dict[str, Any]]]", *, tag: str = "",
+) -> "tuple[list[Any], bool]":
+    """Send ``pair`` as a scoped caller in every call shape against a foreign object in every state, each
+    next to the same call on an object of the caller's own project. Returns ``(problems, reached)``:
+    what a call returned / wrote / changed that it must not have, and whether some shape answered the
+    foreign id differently than the own one (i.e. the probe really got as far as looking the id up)."""
+    tool, id_arg = pair
+    w = await _world(db, tag)
+    b = await _foreign(db, tmp_path, w)
+    bo = await _foreign(db, tmp_path, _swapped(w), marker=_OWN_MARKER)    # the same kinds of objects in the caller's own project
+    scoped = [w.mine]
+    tenant: Any = None
+    problems: "list[Any]" = []
+    reached = False
+    with contextlib.ExitStack() as stack:
+        if tool == "link_manual_github_issue":
+            tenant = {"id": "t-shapes", "github_pat": "enc"}
+            await _enable_manual_issue_screening(db, w.mine, "t-shapes")
+            stack.enter_context(patch("meridian.mcp.handler._dispatch_github_tool", side_effect=_benign_issue))
+        _, foreign_args = build(w, b)
+        _, own_args = build(w, bo)
+        foreign_item_ids = [b.item, b.item2]
+        targets: "list[tuple[str, Any, Any]]" = [("", foreign_args[id_arg], own_args[id_arg])]
+        if id_arg in _SPRINT_ITEM_ID_ARGS:
+            # "pending" is the probe's own item (the one the pointers and gates hang on); the other two
+            # states are fresh items, one claimed (with a claimed_at no clock can produce) and one done.
+            theirs = await _item_states(db, tmp_path, w.theirs, w.s_theirs, stamp=_STAMP)
+            mine = await _item_states(db, tmp_path, w.mine, w.s_mine, marker=_OWN_MARKER)
+            foreign_item_ids += [getattr(theirs, name) for name in _STATES]
+            wrap = (lambda v: [v]) if isinstance(foreign_args[id_arg], list) else (lambda v: v)
+            targets = [("pending", foreign_args[id_arg], own_args[id_arg])] + [
+                (name, wrap(getattr(theirs, name)), wrap(getattr(mine, name))) for name in _STATES[1:]
+            ]
+        for state, foreign_id, own_id in targets:
+            own_shapes = dict(_call_shapes(tool, id_arg, own_id, own_args, w))
+            for label, args in _call_shapes(tool, id_arg, foreign_id, foreign_args, w):
+                rows_before, writes_before = await _rows(db, foreign_item_ids), await _changes(db)
+                outcome = _with_written_file(await _outcome(db, tmp_path, tool, args, scoped, tenant))
+                writes_after = await _changes(db)
+                found = [m for m in (SECRET, w.theirs, w.s_theirs, _STAMP, "IN_PROGRESS") if m in outcome]
+                if found:
+                    problems.append((pair, state, label, "returned foreign data", found, outcome[:160]))
+                if writes_before is not None and writes_after != writes_before and pair not in _ALLOWED_WRITES:
+                    problems.append((pair, state, label, f"wrote {writes_after - writes_before} row(s)", outcome[:160]))
+                if await _rows(db, foreign_item_ids) != rows_before:
+                    problems.append((pair, state, label, "changed a foreign sprint item", outcome[:160]))
+                control = _with_written_file(await _outcome(db, tmp_path, tool, own_shapes[label], scoped, tenant))
+                ids = _ids_in(args, own_shapes[label], foreign_args, own_args)
+                reached = reached or _squash(outcome, ids) != _squash(control, ids)
+    return problems, reached
+
+
+@pytest.mark.parametrize("pair", sorted(_BOUND_PROBES), ids=lambda pair: ".".join(pair))
+async def test_a_bound_pair_answers_nothing_for_a_foreign_object_in_any_call_shape(db, tmp_path, pair):
+    """The foreign object is neither returned, echoed, summarised nor touched -- whichever way the
+    (own project_id, foreign id) call is shaped, and whatever state the object is in -- and the probe
+    reached the id (some shape answers differently than the same call on an object of the caller's own)."""
+    problems, reached = await _shape_run(db, tmp_path, pair, _BOUND_PROBES[pair])
+    assert not problems, problems
+    assert reached, (
+        f"{pair}: every call shape answered the foreign id exactly as it answered the caller's own object, so the "
+        "probe never got as far as looking the id up and proves nothing; fix the probe's arguments"
+    )
+
+
+async def test_the_shape_probes_catch_the_original_update_sprint_item_bug(db, tmp_path, monkeypatch):
+    """Negative control for the whole F-C1 machinery. Put the bug back (guard off, the db read unbound
+    again) and the same shapes that pass above report it: the bare call returns the foreign row, and an
+    in_progress item answers IN_PROGRESS with the foreign claimed_at. The pass-2 probe sent only a title."""
+    from meridian.db import sprint_items as sprint_items_db
+
+    async def _open(*_a: Any, **_k: Any) -> None:
+        return None
+
+    async def _unbound(db_arg: Any, project_id: str, item_id: str) -> Any:
+        return await db_module.get_sprint_item(db_arg, item_id)
+
+    pair = ("update_sprint_item", "item_id")
+
+    def build(w: W, b: SimpleNamespace) -> "tuple[str, dict[str, Any]]":
+        return "update_sprint_item", {"project_id": w.mine, "item_id": b.item, "title": "hijacked"}
+
+    fixed, reached = await _shape_run(db, tmp_path, pair, build)
+    assert fixed == [] and reached                          # today: nothing leaks, and the probe got to the id
+
+    monkeypatch.setattr(scope_guard, "enforce_scoped_call", _open)
+    monkeypatch.setattr(sprint_items_db, "_get_sprint_item_in_project", _unbound)
+    broken, _ = await _shape_run(db, tmp_path, pair, build, tag="-again")
+    leaked = {(state, label) for _pair, state, label, what, *_rest in broken if what == "returned foreign data"}
+    assert ("pending", "minimal") in leaked                  # the verifier's reproduction: no editable field at all
+    assert ("done", "minimal") in leaked
+    assert any(state == "in_progress" for state, _label in leaked)   # the pre-check that answered IN_PROGRESS
+    # ... while the pass-2 shape (a title) never revealed anything, which is why the exemption survived it
+    assert ("pending", "+title=x") not in leaked
+
+
+def test_every_override_approval_is_spent_against_the_calls_own_project():
+    """The 'bound' proof for the *override_hitl_id arguments is function-level
+    (consume_gate_override_approval(db, project_id, hitl_id, ...) answers 'not found in this
+    project'), not a call shape. It only holds while every call site passes the CALL's own
+    project as the second argument."""
+    import glob
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(mcp_handler.__file__)))
+    sites: "list[tuple[str, int, str]]" = []
+    for path in sorted(glob.glob(os.path.join(root, "**", "*.py"), recursive=True)):
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            source = fh.read()
+        if "consume_gate_override_approval" not in source:
+            continue
+        for node in ast.walk(ast.parse(source)):
+            func = getattr(node, "func", None)
+            if isinstance(node, ast.Call) and getattr(func, "attr", getattr(func, "id", "")) == "consume_gate_override_approval":
+                second = ast.unparse(node.args[1]) if len(node.args) > 1 else "<missing>"
+                sites.append((os.path.relpath(path, root), node.lineno, second))
+    assert len(sites) >= 5, sites     # the scan really sees the call sites
+    assert all("project_id" in second for _, _, second in sites), sites
+
+
+# --- update_sprint_item and claim_sprint_item: the two tools the shapes caught --------
+
+async def test_patch_sprint_item_with_nothing_to_edit_is_bound_to_the_callers_project(db, tmp_path):
+    """The verifier's reproduction at its root: a patch that edits nothing still READS the
+    row, and that read took the id alone."""
+    w = await _world(db)
+    foreign = await _item_states(db, tmp_path, w.theirs, w.s_theirs)
+    own = await _item_states(db, tmp_path, w.mine, w.s_mine)
+    for state in _STATES:
+        item_id = getattr(foreign, state)
+        before = await db_module.get_sprint_item(db, item_id)
+        assert await db_module.patch_sprint_item(db, w.mine, item_id) is None             # nothing to edit
+        assert await db_module.patch_sprint_item(db, w.mine, item_id, title="hijacked") is None
+        assert await db_module.patch_sprint_item(db, w.mine, item_id, status="pending") is None
+        assert await db_module.get_sprint_item(db, item_id) == before                     # and nothing changed
+        # the owning project still gets its row back
+        assert (await db_module.patch_sprint_item(db, w.theirs, item_id))["id"] == item_id
+    # An unknown id answers the same way, and the caller's own item is returned.
+    assert await db_module.patch_sprint_item(db, w.mine, "no-such-item") is None
+    row = await db_module.patch_sprint_item(db, w.mine, own.pending)
+    assert row["id"] == own.pending and row["project_id"] == w.mine
+
+
+def test_the_http_patch_with_an_empty_body_is_bound_to_the_url_project(client):
+    """The HTTP twin of the same read: PATCH /projects/{own}/sprint-items/{foreign} with {}
+    returned 200 and the foreign row, while the same call with a title was a 404."""
+    def project() -> str:
+        r = client.post("/projects", json={"name": f"patch-bind-{os.urandom(4).hex()}"})
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    def add(project_id: str, title: str) -> str:
+        r = client.post(f"/projects/{project_id}/sprint-items", json={"version": "v1", "title": title, "notes": SECRET})
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    mine, theirs = project(), project()
+    foreign, own = add(theirs, f"{SECRET} rotate the production keys"), add(mine, "tidy the parser tests")
+    for body in ({}, {"title": "hijacked"}, {"status": "pending"}, {"notes": "n"}):
+        r = client.patch(f"/projects/{mine}/sprint-items/{foreign}", json=body)
+        assert r.status_code == 404 and SECRET not in r.text, (body, r.status_code, r.text)
+    assert client.patch(f"/projects/{mine}/sprint-items/no-such-item", json={}).status_code == 404
+    assert client.patch(f"/projects/{theirs}/sprint-items/{foreign}", json={}).json()["id"] == foreign
+    assert client.patch(f"/projects/{mine}/sprint-items/{own}", json={}).json()["id"] == own
+
+
+async def test_update_sprint_item_never_answers_for_a_foreign_item_in_any_state(db, tmp_path, monkeypatch):
+    """The verifier's reproduction over MCP, in every state of the foreign item."""
+    w = await _world(db)
+    scoped = [w.mine]
+    foreign = await _item_states(db, tmp_path, w.theirs, w.s_theirs, stamp=_STAMP)
+    own = await _item_states(db, tmp_path, w.mine, w.s_mine, stamp="2002-03-04 05:06:07")
+    before = await _rows(db, [getattr(foreign, name) for name in _STATES])
+    # With the guard: refused in every state, whether or not the call edits anything or forces it.
+    for state in _STATES:
+        for extra in ({}, {"force": True}, {"override_reason": "r"}, {"title": "hijacked"}, {"status": "pending", "force": True}):
+            await _refused(db, tmp_path, "update_sprint_item", {"project_id": w.mine, "item_id": getattr(foreign, state), **extra}, scoped)
+    await _refused(db, tmp_path, "update_sprint_item", {"project_id": w.mine, "item_id": "no-such-item"}, scoped)   # an unknown id looks alike
+    assert await _rows(db, [getattr(foreign, name) for name in _STATES]) == before
+    # The caller's own items still answer: the row for an edit-less call, IN_PROGRESS for a claimed one.
+    kept = await _call(db, tmp_path, "update_sprint_item", {"project_id": w.mine, "item_id": own.pending}, scoped)
+    assert kept["id"] == own.pending and kept["project_id"] == w.mine
+    claimed = await _call(db, tmp_path, "update_sprint_item", {"project_id": w.mine, "item_id": own.in_progress}, scoped)
+    assert claimed["error"] == "IN_PROGRESS" and claimed["claimed_at"] == "2002-03-04 05:06:07"
+    # The owner (unscoped) is unchanged, foreign ids included.
+    owner = await _call(db, tmp_path, "update_sprint_item", {"project_id": w.theirs, "item_id": foreign.pending}, None)
+    assert owner["id"] == foreign.pending
+
+    # The handler's own binding, with the guard switched off: the db no longer hands back a foreign
+    # row for an edit-less call (pending, done, or a forced in_progress one). The un-forced in_progress
+    # pre-check lives in handlers/sprint_tools.py and is covered by the guard alone.
+    async def _open(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(scope_guard, "enforce_scoped_call", _open)
+    for state, extra in (("pending", {}), ("pending", {"force": True}), ("done", {}), ("done", {"force": True}), ("in_progress", {"force": True})):
+        out = await _call(db, tmp_path, "update_sprint_item", {"project_id": w.mine, "item_id": getattr(foreign, state), **extra}, scoped)
+        assert out == {"error": "sprint item not found"}, (state, extra, out)
+    # ... in every call shape (each optional argument alone), not just the bare one.
+    for state in _STATES:
+        for label, args in _call_shapes("update_sprint_item", "item_id", getattr(foreign, state), {}, w):
+            if state == "in_progress":
+                args = {**args, "force": True}
+            outcome = await _outcome(db, tmp_path, "update_sprint_item", args, scoped)
+            assert not [m for m in (SECRET, w.theirs, _STAMP, "IN_PROGRESS") if m in outcome], (state, label, outcome[:200])
+    assert await _rows(db, [getattr(foreign, name) for name in _STATES]) == before
+
+
+async def test_claim_sprint_item_does_not_answer_protected_for_a_foreign_item(db, tmp_path):
+    """claim_sprint_item's installer-script pre-check read the item by id alone, so a foreign
+    item whose touches_files names hooks.ps1 / hooks.sh answered PROTECTED, a fact about
+    another project's item, instead of 'sprint item not found'."""
+    w = await _world(db)
+    scoped = [w.mine]
+    foreign = await _item(db, w.theirs, "rework the foreign installer")
+    own = await _item(db, w.mine, "rework the own installer")
+    for item_id in (foreign, own):
+        await db.execute("UPDATE sprint_items SET touches_files = ? WHERE id = ?", ('["hooks.ps1"]', item_id))
+    await db.commit()
+    args = {"project_id": w.mine, "session_id": w.s_mine}
+    for extra in ({}, {"force": False}):
+        await _refused(db, tmp_path, "claim_sprint_item", {**args, "item_id": foreign, **extra}, scoped)
+    await _refused(db, tmp_path, "claim_sprint_item", {**args, "item_id": "no-such-item"}, scoped)
+    assert (await db_module.get_sprint_item(db, foreign))["status"] == "pending"
+    # An own item that touches the installer is still PROTECTED (unless forced), scoped or not.
+    for caller_scope in (scoped, None):
+        protected = await _call(db, tmp_path, "claim_sprint_item", {**args, "item_id": own}, caller_scope)
+        assert protected["error"] == "PROTECTED" and protected["protected_files"] == ["hooks.ps1"]
+    forced = await _call(db, tmp_path, "claim_sprint_item", {**args, "item_id": own, "force": True}, scoped)
+    assert forced["status"] == "in_progress"
+    # The owner may still claim for any project of the tenant, and sees PROTECTED for the foreign item.
+    owner = await _call(db, tmp_path, "claim_sprint_item", {"project_id": w.theirs, "session_id": w.s_theirs, "item_id": foreign}, None)
+    assert owner["error"] == "PROTECTED"
+
+
+async def test_the_manual_issue_velocity_signal_is_never_fed_a_foreign_item(db):
+    """discover_and_link_manual_issue read the item by id alone to take its wave label for
+    the velocity signal, and that signal (wave label included) lands in an own-project HITL
+    and audit row. link_sprint_item_github_issue was already bound to the project."""
+    from meridian.mcp.handler import discover_and_link_manual_issue
+
+    w = await _world(db)
+    foreign = (await db_module.add_sprint_item(db, w.theirs, "v1", "foreign wave item", wave="WAVE-SECRET"))["id"]
+    own = (await db_module.add_sprint_item(db, w.mine, "v1", "own wave item", wave="own-wave"))["id"]
+    await _enable_manual_issue_screening(db, w.mine, "t-velocity")
+    real = db_module.check_manual_issue_action_velocity
+    seen: "list[Any]" = []
+
+    async def _spy(db_arg: Any, project_id: str, *, triggering_item: Any = None, **kwargs: Any) -> "dict[str, Any]":
+        seen.append(triggering_item)
+        return await real(db_arg, project_id, triggering_item=triggering_item, **kwargs)
+
+    tenant = {"id": "t-velocity", "github_pat": "enc"}
+    with patch.object(db_module, "check_manual_issue_action_velocity", _spy), \
+            patch("meridian.mcp.handler._dispatch_github_tool", side_effect=_benign_issue):
+        stray = await discover_and_link_manual_issue(db, w.mine, foreign, 7, tenant)
+        mine = await discover_and_link_manual_issue(db, w.mine, own, 8, tenant)
+    assert seen[0] is None                                              # no foreign wave label reaches the signal
+    assert seen[1]["id"] == own and seen[1]["wave"] == "own-wave"       # the own item still does
+    assert stray["action"] == "linked" and stray["item"] is None        # (the UPDATE bound to the project matched nothing)
+    assert mine["item"]["github_issue_number"] == 8
+    assert (await db_module.get_sprint_item(db, foreign))["github_issue_number"] is None
+
+
+# ===========================================================================
+# F-C2. the LOW items that were cheap
+# ===========================================================================
+
+async def test_the_caption_link_primitives_are_bound_to_a_document_when_given_one(db, tmp_path, monkeypatch):
+    """The root cause behind the guard's membership check: the store primitives took a bare
+    id and updated any row. With document_id a figure / table of another document is 'not
+    found' for every caller; the handlers pass the document they resolved under the project."""
+    from meridian import doc_store
+
+    try:
+        _, store, docs = await _doc_world(db, tmp_path, monkeypatch)
+        for method, lister, key in (
+            ("set_figure_caption_link", "get_figures", "figure"), ("set_table_caption_link", "get_tables", "table"),
+        ):
+            link = getattr(store, method)
+            theirs, mine = docs["theirs"], docs["mine"]
+            assert await link(theirs[key], "el-x", document_id=mine["id"]) is None
+            assert await link(docs["mine2"][key], "el-x", document_id=mine["id"]) is None
+            assert (await getattr(store, lister)(theirs["id"]))[0]["caption_element_id"] is None
+            ok = await link(mine[key], "el-ok", document_id=mine["id"])
+            assert ok["caption_element_id"] == "el-ok" and ok["document_id"] == mine["id"]
+            # a direct caller that names no document keeps the bare-id behaviour
+            assert (await link(theirs[key], "el-bare"))["caption_element_id"] == "el-bare"
+            assert await link("", "el-blank", document_id=mine["id"]) is None
+    finally:
+        await doc_store.close_all_doc_stores()
+
+
+async def test_docx_conflict_element_lists_keep_the_ids_in_scope_sessions_hold(db, tmp_path):
+    """other_claimed_elements / conflicting_elements merge the element ids of EVERY other live
+    holder, so pass 2 dropped them for any scoped caller. Re-reading the claims attributes each
+    id: an in-scope-only conflict keeps its whole list, a mixed one keeps the in-scope ids."""
+    w = await _world(db)
+    scoped = [w.mine]
+    path = "shared/lists.docx"
+    for element in ("pA", "pB"):
+        await _hold(db, tmp_path, w.s_mine2, "claim_docx_region", file_path=path, element_id=element)
+
+    conflict = await _call(db, tmp_path, "claim_docx_region", {"session_id": w.s_mine, "file_path": path, "element_id": "pA"}, scoped)
+    assert conflict["reason"] == "element_conflict" and conflict["other_claimed_elements"] == ["pB"]
+    assert conflict["conflicts"][0]["holder_session_id"] == w.s_mine2 and "holder_redacted" not in conflict
+    lease = await _call(db, tmp_path, "acquire_docx_document_lease", {"session_id": w.s_mine, "file_path": path}, scoped)
+    assert lease["reason"] == "region_claims_active" and lease["conflicting_elements"] == ["pA", "pB"]
+    assert lease["holder_session_id"] == w.s_mine2 and "holder_redacted" not in lease
+
+    # A foreign session joins the same document: its ids are dropped, the in-scope ones stay.
+    await _hold(db, tmp_path, w.s_theirs, "claim_docx_region", file_path=path, element_id="pC")
+    mixed = await _call(db, tmp_path, "claim_docx_region", {"session_id": w.s_mine, "file_path": path, "element_id": "pA"}, scoped)
+    assert mixed["other_claimed_elements"] == ["pB"] and mixed["holder_redacted"] is True
+    assert "pC" not in _blob(mixed)
+    _assert_no_identity(mixed, w)
+    mixed_lease = await _call(db, tmp_path, "acquire_docx_document_lease", {"session_id": w.s_mine, "file_path": path}, scoped)
+    assert mixed_lease["conflicting_elements"] == ["pA", "pB"] and mixed_lease["holder_redacted"] is True
+    assert "pC" not in _blob(mixed_lease)
+    _assert_no_identity(mixed_lease, w)
+    # The owner (unscoped) still sees every id and every holder.
+    owner = await _call(db, tmp_path, "claim_docx_region", {"session_id": w.s_mine, "file_path": path, "element_id": "pA"}, None)
+    assert sorted(owner["other_claimed_elements"]) == ["pB", "pC"] and "holder_redacted" not in owner
+
+
+async def test_the_element_list_redactor_fails_closed(db, tmp_path, monkeypatch):
+    """Every way the attribution can fail drops the list instead of keeping unattributed ids."""
+    w = await _world(db)
+    scoped = [w.mine]
+    path = "shared/closed.docx"
+    await _hold(db, tmp_path, w.s_mine2, "claim_docx_region", file_path=path, element_id="pB")
+    await _hold(db, tmp_path, w.s_theirs, "claim_docx_region", file_path=path, element_id="pF")
+
+    def result(**extra: Any) -> "dict[str, Any]":
+        return {"claimed": False, "reason": "element_conflict", "file_path": path, "other_claimed_elements": ["pB", "pF"], **extra}
+
+    async def redact(res: "dict[str, Any]") -> "dict[str, Any]":
+        return await scope_guard.filter_scoped_result("claim_docx_region", res, db, scoped, args={"session_id": w.s_mine})
+
+    narrowed = await redact(result())
+    assert narrowed["other_claimed_elements"] == ["pB"] and narrowed["holder_redacted"] is True
+    # an id that an in-scope AND a foreign session both hold (rows the conflict rule never produces, but
+    # a race or a hand-edited table can) goes with the foreign holder
+    for claim_id, holder in (("dup-1", w.s_mine2), ("dup-2", w.s_theirs)):
+        await db.execute(
+            "INSERT INTO file_docx_region_claims (id, session_id, file_path, element_id) VALUES (?, ?, ?, ?)",
+            (claim_id, holder, path, "pShared"),
+        )
+    await db.commit()
+    assert (await redact(result(other_claimed_elements=["pB", "pShared"])))["other_claimed_elements"] == ["pB"]
+    # an id nobody holds any more is not attributable, so it goes too (the result only shrinks)
+    assert (await redact(result(other_claimed_elements=["pB", "ghost"])))["other_claimed_elements"] == ["pB"]
+    assert "other_claimed_elements" not in await redact(result(other_claimed_elements=["pF"]))
+    assert "other_claimed_elements" not in await redact(result(other_claimed_elements=["ghost"]))
+    # no file path, a non-list or a list of non-strings cannot be attributed at all
+    for broken in ({"file_path": None}, {"file_path": ""}, {"file_path": 7}, {"other_claimed_elements": "pB"},
+                   {"other_claimed_elements": None}, {"other_claimed_elements": ["pB", 5]}):
+        assert "other_claimed_elements" not in await redact(result(**broken)), broken
+    # a failing claims read drops the list too
+    async def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("claims unreadable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(db_module, "_live_docx_region_claims_for_file", _boom)
+        assert "other_claimed_elements" not in await redact(result())
+    # and an unscoped caller is never touched
+    untouched = result()
+    assert await scope_guard.filter_scoped_result("claim_docx_region", untouched, _ExplodingDb(), None) is untouched

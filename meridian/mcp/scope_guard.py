@@ -37,7 +37,9 @@ This module closes that class with ONE entry point,
   symbol / docx-region claim or resource lease. ``file_locks`` and friends are
   keyed by file path only, so a foreign project's session can be the holder;
   :func:`filter_scoped_result` blanks every holder identity that belongs to an
-  out-of-scope session while still reporting the conflict (pass 2, F-M2).
+  out-of-scope session while still reporting the conflict (pass 2, F-M2). The
+  merged element lists of a docx conflict keep the ids in-scope sessions hold
+  (pass 3, F-C2).
 
 Every refusal raises ``ValueError("project is outside your access scope")``,
 the same opaque message the pre-dispatch gate uses, so a caller cannot tell
@@ -58,11 +60,14 @@ member should reach them at all is a product decision for the owner:
   ``reset_profile_layer``, ``clone_profile_layer``, ``set_capability_profile``,
   ``clear_capability_profile``, ``activate_profile_layer``) and the read-only
   ``get_effective_profile`` / ``get_effective_capability_profile`` scope ids;
-* ``update_workspace_settings`` and ``get_workspace_settings``;
+* ``update_workspace_settings`` and ``get_workspace_settings``, and
+  ``request_manual_issue_screening_toggle`` (an independent verifier saw it return
+  ``applied: true`` and change the workspace settings for a scoped caller);
 * ``pin_workspace_decision`` / ``get_workspace_decisions``, workspace notes
   (``add_workspace_note``, ``get_workspace_notes``, ``move_workspace_note_to_project``
-  for a workspace note) and workspace sprint items (``add_workspace_sprint_item``
-  and friends);
+  for a workspace note), workspace proposals (``add_workspace_proposal``), workspace
+  sprint items (``add_workspace_sprint_item`` and friends), ``save_blog_post``, and the
+  WORKSPACE section ``get_context_block`` renders from the notes and decisions above;
 * ``create_project`` without a parent still creates a project that is not on the
   caller's scope list;
 * ``get_server_logs`` / ``search_server_logs`` / ``get_connection_log`` /
@@ -70,9 +75,11 @@ member should reach them at all is a product decision for the owner:
 * the tunnel-forward branch of ``_handle_mcp_request`` (it runs before this
   guard and hands the call to a tunnel plugin tool) and the ``batch_read``
   ``tunnel_research`` adapter, which reads from the tenant's own workstation;
-* ``find_orphaned_docx_staged_files``, ``check_embedded_staleness`` and
-  ``audit_figure_table_provenance`` read server-side file paths named by the
-  caller (host level, not project data).
+* ``find_orphaned_docx_staged_files``, ``check_embedded_staleness``,
+  ``audit_figure_table_provenance`` and ``get_latex_structure`` read server-side file
+  paths named by the caller (host level, not project data; the verifier read a file
+  outside the data directory through ``get_latex_structure``, which is tenant-wide
+  rather than project-scoped and worth a look on hosted servers).
 
 Invariants worth keeping when you edit this file:
 
@@ -90,6 +97,15 @@ Invariants worth keeping when you edit this file:
 * A result is only ever NARROWED (a holder blanked, a row dropped), never rewritten
   into something else, and the conflict a caller is entitled to learn about
   ("this path is locked, until T") survives the redaction.
+
+A "bound" exemption in the pass-2 completeness test means the HANDLER binds the id to
+the call's own project -- on EVERY code path, not only the one a probe happened to
+take. Pass 3 found ``update_sprint_item`` exempted as bound although a call with no
+editable field took an unbound early return (and its in_progress pre-check read the
+row unbound); the probes now send every bound pair in its minimal shape and with each
+optional argument alone, against a foreign object in each lifecycle state, and prove
+the probe reached the id by running the same call against an object of the caller's
+own project.
 
 ``tests/test_scope_guard_mcp.py`` enumerates these tables: every tool and
 argument named here must exist in the real tool schemas, and every listed tool is
@@ -305,6 +321,18 @@ OBJECT_ARGS: "dict[str, tuple[ObjectArg, ...]]" = {
     # Stored, never validated: refuse a foreign worktree, leave an unknown id to
     # the handler (it accepts any label).
     "start_experiment_run": (ObjectArg("worktree_id", "worktree", missing_ok=True),),
+    # --- sprint items whose handler reads the item BEFORE it binds it (third pass) --
+    # Both tools take the caller's own project_id plus an item_id, and the db
+    # functions behind them are bound to the project -- but the handler first reads
+    # the row by id alone: update_sprint_item's in_progress pre-check answered
+    # IN_PROGRESS with a FOREIGN item's claimed_at, and claim_sprint_item's
+    # installer-script pre-check answered PROTECTED for a foreign item. (The no-op
+    # patch_sprint_item early return that handed back the whole foreign row is
+    # fixed at its root in meridian/db/sprint_items.py.) The handlers live outside
+    # this module's remit, so the id is checked here, before they run; a foreign and
+    # an unknown id are refused alike.
+    "update_sprint_item": (ObjectArg("item_id", "sprint_item"),),
+    "claim_sprint_item": (ObjectArg("item_id", "sprint_item"),),
     # --- dispatchable but NOT in tools/list (so the schema scan cannot see them)
     # proposal_to_handoff loaded the proposal by tenant only and wrote update
     # rows and pointers against it; claim_parallel_batch's item_sessions values
@@ -712,6 +740,51 @@ class _Checker:
         if self._memo[key]:
             state.names.add(str(self._memo[key]))
 
+    async def _elements_held_in_scope(
+        self, file_path: Any, elements: Any, own: "frozenset[str]",
+    ) -> "list[str] | None":
+        """The ids in ``elements`` that only in-scope sessions hold a live docx
+        claim on, in their original order; ``None`` when the list cannot be
+        attributed (not a list of strings, no file path, or the claims cannot be
+        read).
+
+        ``elements`` is a list a docx claim / lease conflict built from every OTHER
+        session's live claims on ``file_path`` (``other_claimed_elements`` /
+        ``conflicting_elements``). The claims are read again, with the same
+        liveness rule, to see who holds each id: an id with no live holder any
+        more, or with any foreign holder, is not kept, so the result can only
+        shrink.
+        """
+        if not isinstance(elements, list) or not all(isinstance(e, str) for e in elements):
+            return None
+        if not isinstance(file_path, str) or not file_path.strip():
+            return None
+        key = ("docx_holders", file_path)
+        if key not in self._memo:
+            try:
+                # exclude_session_id="" excludes nobody: the caller's own session
+                # is never a holder of an element in these lists, and if it were
+                # it is visible anyway.
+                claims = await db_module._live_docx_region_claims_for_file(self.db, file_path, "")
+            except Exception:  # noqa: BLE001 -- unreadable claims -> unattributable -> dropped
+                self._memo[key] = None
+            else:
+                holders: "dict[str, list[str]]" = {}
+                for claim in claims:
+                    holders.setdefault(str(claim.get("element_id")), []).append(str(claim.get("session_id") or ""))
+                self._memo[key] = holders
+        holders = self._memo[key]
+        if holders is None:
+            return None
+        kept: "list[str]" = []
+        for element in elements:
+            sessions = holders.get(element)
+            if not sessions:
+                continue
+            if all([await self.session_visible(session, own) for session in sessions]):
+                kept.append(element)
+        return kept
+
     async def redact_foreign_holders(self, result: Any, own: "frozenset[str]") -> Any:
         """Blank every lock / claim holder that belongs to an out-of-scope session.
 
@@ -763,10 +836,19 @@ class _Checker:
         for key in list(out):
             value = out[key]
             if key in _UNATTRIBUTABLE_KEYS:
-                # Element ids merged across EVERY other live claimant; there is no
-                # way to tell which belong to an in-scope session.
-                del out[key]
-                state.hit = True
+                # Element ids merged across EVERY other live claimant of the file,
+                # so the list itself says nothing about who holds which. Re-read the
+                # live claims to attribute each element: the ones held only by
+                # in-scope sessions stay (an in-scope-only conflict keeps its whole
+                # list), the ones a foreign session holds go, and a list that cannot
+                # be attributed at all is dropped (fail closed).
+                kept = await self._elements_held_in_scope(out.get("file_path"), value, own)
+                if kept is None or len(kept) != len(value):
+                    state.hit = True
+                    if kept:
+                        out[key] = kept
+                    else:
+                        del out[key]
             elif key in _SESSION_ID_LIST_KEYS and isinstance(value, list) and all(
                 isinstance(v, str) for v in value
             ):
@@ -793,7 +875,9 @@ _CLAIM_DETAIL_KEYS: "tuple[str, ...]" = (
 )
 #: Lists of BARE session ids (claim_file's read_claims / readers).
 _SESSION_ID_LIST_KEYS: "tuple[str, ...]" = ("read_claims", "readers")
-#: Lists of element ids merged across every other holder of a document.
+#: Lists of element ids merged across every other holder of a document; the holder
+#: of each id is looked up again (``_Checker._elements_held_in_scope``) so the ids
+#: in-scope sessions hold survive.
 _UNATTRIBUTABLE_KEYS: "tuple[str, ...]" = ("other_claimed_elements", "conflicting_elements")
 #: Free-text keys whose strings may embed a holder's session NAME ("claimed by
 #: session X"). Names are arbitrary words, so they are only scrubbed from these.
