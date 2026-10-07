@@ -10,9 +10,15 @@
 //
 // jsdom has no layout engine, so these tests render the REAL renderSprintProgress
 // and inject the REAL dashboard.css, then assert (through getComputedStyle and the
-// parsed CSSOM) the properties that GUARANTEE no overlap: pixel overlap itself is
-// measured in a real browser (see the commit message). Every test below includes
+// parsed CSSOM) the properties that GUARANTEE no overlap. Every test below includes
 // at least one assertion that the pre-fix code violates.
+//
+// Limits, and how they are covered: jsdom resolves getComputedStyle by SOURCE ORDER
+// only (no specificity) and ignores @media, so the property checks alone cannot see a
+// rule that wins on specificity or applies only on a phone. The last describe block
+// therefore scans every rule in the stylesheet (all @media, any specificity) for a
+// declaration that could undo the contract, and the PIXEL layout itself is measured in
+// a real browser by tests/test_demo_ux.py (test_sprint_rows_never_overlap_in_a_real_browser).
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -27,6 +33,8 @@ const LONG =
   "SECURITY (reproduced, urgent): cross-tenant artifact export and purge by a caller-supplied project_id (RT-TI-001, RT-TI-002)";
 const TOKEN = "x".repeat(300); // a 300-character unbreakable token
 const LONG_RESOURCE = "file:" + "very/long/path/".repeat(12) + "x.py";
+const LONG_VERSION = "v1.2.3-" + "x".repeat(40);
+// (tests/test_demo_ux.py renders the same fixture in a real browser: keep the two in sync)
 
 const mk = (over: Record<string, unknown>) => ({ version: "v1", status: "pending", ...over });
 const ITEMS = [
@@ -57,6 +65,9 @@ const ITEMS = [
   mk({ id: "human", title: LONG, status: "pending", milestone_type: "human" }),
   // backburner-only (no active peers in its version)
   mk({ id: "bb", title: TOKEN, version: "v9", status: "pushed", pushed_to: "v10" }),
+  // a very long version label must wrap inside the row, not push the buttons out
+  mk({ id: "longver", title: LONG, version: LONG_VERSION }),
+  mk({ id: "longver_attn", title: TOKEN, version: LONG_VERSION, status: "indeterminate" }),
 ];
 
 type Kind = "board" | "attention" | "human" | "backburner";
@@ -98,11 +109,21 @@ beforeAll(() => {
   document.head.appendChild(style);
 });
 
+// The board's real ancestor chain (dashboard.ts buildTabBody: .app > main > .tab-bodies >
+// .tab-body > .vtab-drawer > .drawer-panel > .live-body > .live-section > the board root).
+// Without it a selector such as `.live-body .sprint-item-title` or `.tab-body span` could not
+// match anything, so a rule that wins on specificity through an ancestor would go unnoticed.
+const BOARD_OPEN =
+  `<div class="app"><main class="main"><div id="tab-bodies" class="tab-bodies"><div id="tab-body-${PID}" class="tab-body active">` +
+  `<div id="drawer-${PID}" class="vtab-drawer open"><div id="drawer-live-${PID}" class="drawer-panel active">` +
+  `<div id="live-body-${PID}" class="live-body"><div class="live-section">`;
+const BOARD_CLOSE = `</div></div></div></div></div></div></main></div>`;
+
 beforeEach(() => {
   // renderSprintProgress wires the add-input through these ambient globals.
   (globalThis as any).wireSprintAddEnter = () => {};
   (globalThis as any).addSprintItemFromInput = () => {};
-  document.body.innerHTML = `<div id="live-sprint-progress-${PID}"></div>`;
+  document.body.innerHTML = `${BOARD_OPEN}<div id="live-sprint-progress-${PID}" class="live-sprint-progress"></div>${BOARD_CLOSE}`;
   renderSprintProgress(PID, JSON.parse(JSON.stringify(ITEMS)));
 });
 
@@ -304,6 +325,191 @@ describe("sprint row layout contract: media queries and the parsed stylesheet", 
     expect(title, ".sprint-item-title base rule").toBeDefined();
     expect(title!.style!.getPropertyValue("white-space")).toBe("normal");
     expect(title!.style!.getPropertyValue("overflow-wrap")).toBe("anywhere");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cascade-independent scan. A rule that is MORE SPECIFIC than the contract rules (an
+// ancestor-qualified `.live-body .sprint-item-title { white-space: nowrap }`) or that only
+// applies at a phone width (`@media (max-width: 768px) { .live-body span { white-space:
+// nowrap } }`) re-breaks the layout in a browser, yet passes every getComputedStyle
+// assertion above (jsdom: source order only, no @media) and every source-text check that
+// asks for one exact selector. This scan therefore does not resolve the cascade at all: it
+// takes EVERY style rule (nested @media / @supports included, hover/focus states stripped),
+// asks the DOM which board elements the rule could match (so ancestors, types, ids and
+// attribute selectors all count), and rejects any declaration that could undo the contract,
+// whatever the rule's specificity, position or viewport gate.
+// ---------------------------------------------------------------------------
+describe("sprint row layout contract: nothing in the stylesheet or markup can undo it", () => {
+  type Flat = { selector: string; gate: string; decls: Array<[string, string]> };
+  const flatten = (rules: any[], gate = ""): Flat[] =>
+    rules.flatMap((r: any): Flat[] => {
+      if (r.cssRules && (r.media || r.conditionText !== undefined)) {
+        const g = r.media ? `@media ${r.media.mediaText}` : `@supports ${r.conditionText}`;
+        return flatten(Array.from(r.cssRules), gate ? `${gate} ${g}` : g);
+      }
+      if (!r.selectorText) return [];
+      const decls: Array<[string, string]> = [];
+      for (let i = 0; i < r.style.length; i++) decls.push([r.style[i], r.style.getPropertyValue(r.style[i])]);
+      return [{ selector: r.selectorText, gate, decls }];
+    });
+
+  // The "→ v2" pill and the buttons carry short fixed labels and are truncated / kept on
+  // one line on purpose.
+  const DELIBERATE = ".sprint-item-meta, .sprint-btn";
+  const TEXT_BOXES = ".sprint-item-title, .sprint-item-main, .sprint-item-ver, .resource-chip";
+  const COLUMN = ".sprint-item-title, .sprint-item-main";
+  const WATCHED = new Set([
+    "white-space", "text-overflow", "overflow", "overflow-x", "flex-wrap", "overflow-wrap",
+    "word-wrap", "word-break", "display", "min-width", "position",
+  ]);
+
+  /** Why `prop: raw` is harmful on `el`, or null when it is harmless. */
+  const harm = (el: Element, prop: string, raw: string): string | null => {
+    const value = raw.replace(/!important/i, "").trim().toLowerCase();
+    const deliberate = () => el.matches(DELIBERATE);
+    switch (prop) {
+      case "white-space":
+        return /^(nowrap|pre)$/.test(value) && !deliberate() ? "stops the text wrapping" : null;
+      case "text-overflow":
+        return !/^(clip|initial|unset|inherit)$/.test(value) && !deliberate() ? "ellipsizes (hides) text" : null;
+      case "overflow":
+      case "overflow-x":
+        return /\b(hidden|clip|scroll|auto)\b/.test(value) && !deliberate() ? "clips its content" : null;
+      case "flex-wrap":
+        return value === "nowrap" && el.matches(".sprint-item-row, .sprint-item-actions") ? "stops the row wrapping" : null;
+      case "overflow-wrap":
+      case "word-wrap":
+        return value === "normal" && el.matches(TEXT_BOXES) ? "stops a long token breaking" : null;
+      case "word-break":
+        return value === "keep-all" ? "stops a long token breaking" : null;
+      case "display":
+        return !/^(block|flex|grid|flow-root|inline-block|list-item)$/.test(value) && el.matches(COLUMN)
+          ? "makes the text column inline (ignores width / overflow) or hides it" : null;
+      case "min-width":
+        return !/^0(px)?$/.test(value) && el.matches(COLUMN) ? "stops the text column shrinking" : null;
+      case "position":
+        return /^(absolute|fixed)$/.test(value) ? "takes a board element out of flow (it can paint over its neighbours)" : null;
+      default:
+        return null;
+    }
+  };
+
+  const STATE = /:(hover|focus|focus-visible|focus-within|active|visited|target)\b/g;
+  /** Could `selector` apply to `el` at some point (any state)? Unparseable here => assume yes. */
+  const couldMatch = (el: Element, selector: string): boolean => {
+    try {
+      return el.matches(selector.replace(STATE, "").trim() || "*");
+    } catch {
+      return true;
+    }
+  };
+  const label = (el: Element) => el.tagName.toLowerCase() + (el.className ? "." + String(el.className).trim().split(/\s+/)[0] : "");
+
+  const boardElements = () =>
+    Array.from(document.getElementById(`live-sprint-progress-${PID}`)!.querySelectorAll(".sprint-item-row, .sprint-item-row *"));
+  const realSheetRules = (): Flat[] =>
+    flatten(Array.from(((document.getElementById("real-dashboard-css") as HTMLStyleElement).sheet as any).cssRules));
+
+  /** Every harmful declaration, in `css` or in the markup's own inline styles, that can reach a board element. */
+  const scan = (css: string | null): string[] => {
+    const els = boardElements();
+    const found = new Set<string>();
+    if (css !== null) {
+      const style = document.createElement("style");
+      style.textContent = css;
+      document.head.appendChild(style);
+      try {
+        for (const rule of flatten(Array.from((style.sheet as any).cssRules))) {
+          for (const [prop, raw] of rule.decls) {
+            if (!WATCHED.has(prop)) continue;
+            for (const el of els) {
+              const why = harm(el, prop, raw);
+              if (why && couldMatch(el, rule.selector)) {
+                found.add(`${rule.gate ? rule.gate + " " : ""}${rule.selector} { ${prop}: ${raw} } ${why} (<${label(el)}>)`);
+              }
+            }
+          }
+        }
+      } finally {
+        style.remove();
+      }
+    }
+    for (const el of els) {
+      const s = (el as HTMLElement).style;
+      for (let i = 0; i < s.length; i++) {
+        const why = WATCHED.has(s[i]) ? harm(el, s[i], s.getPropertyValue(s[i])) : null;
+        if (why) found.add(`inline style on <${label(el)}> { ${s[i]}: ${s.getPropertyValue(s[i])} } ${why}`);
+      }
+    }
+    return Array.from(found).sort();
+  };
+  const realCss = () => (document.getElementById("real-dashboard-css") as HTMLStyleElement).textContent || "";
+
+  it("no rule in dashboard.css, whatever its specificity, order or @media gate, and no inline style can undo the wrapping contract", () => {
+    expect(scan(realCss())).toEqual([]);
+  });
+
+  it("the scan is not vacuous: it reaches the contract rules and tolerates the deliberately truncated pill", () => {
+    const els = boardElements();
+    expect(els.length).toBeGreaterThan(60);
+    // the exception is real (a pushed row's "→ v2" pill) and is allowed to truncate
+    expect(els.some((e) => e.matches(".sprint-item-meta"))).toBe(true);
+    expect(scan(".sprint-item-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }")).toEqual([]);
+    // the real sheet really does reach the board: the base contract rules ...
+    const reaching = realSheetRules().filter((r) => els.some((e) => couldMatch(e, r.selector)));
+    expect(reaching.filter((r) => !r.gate && r.decls.some(([p]) => WATCHED.has(p))).length).toBeGreaterThanOrEqual(6);
+    // ... and the @media-gated ones, which getComputedStyle in jsdom never applies
+    expect(reaching.filter((r) => r.gate.includes("max-width: 768px")).length).toBeGreaterThanOrEqual(3);
+    expect(reaching.filter((r) => r.gate.includes("max-width: 480px")).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it.each<[string, string, RegExp]>([
+    ["an earlier, more specific rule (ancestor-qualified nowrap on the title)",
+      ".live-body .sprint-item-title { white-space: nowrap; }", /\.live-body \.sprint-item-title \{ white-space: nowrap \} stops the text wrapping/],
+    ["a non-sprint selector inside the phone @media block",
+      "@media (max-width: 768px) { .live-body span { white-space: nowrap; } }", /@media \(max-width: 768px\) \.live-body span \{ white-space: nowrap \}/],
+    ["a bare element selector inside the narrow-phone @media block",
+      "@media (max-width: 480px) { span { white-space: pre; } }", /@media \(max-width: 480px\) span \{ white-space: pre \}/],
+    ["a rule nested in @supports",
+      "@supports (display: grid) { .tab-body .sprint-item-row span { white-space: nowrap } }", /@supports/],
+    ["an ellipsis + clip on the title",
+      ".sprint-item-title { overflow: hidden; text-overflow: ellipsis; }", /text-overflow: ellipsis/],
+    ["overflow-x clip through a descendant combinator",
+      ".sprint-item-row * { overflow-x: clip; }", /overflow-x: clip/],
+    ["!important",
+      ".sprint-item-row .sprint-item-title { white-space: nowrap !important; }", /\.sprint-item-row \.sprint-item-title \{ white-space: nowrap \} stops the text wrapping/],
+    ["a hover state",
+      ".sprint-item-title:hover { white-space: nowrap; }", /\.sprint-item-title:hover \{ white-space: nowrap \}/],
+    ["a row that stops wrapping on a phone",
+      "@media (max-width: 480px) { .sprint-item-row { flex-wrap: nowrap; } }", /flex-wrap: nowrap \} stops the row wrapping/],
+    ["action buttons that stop wrapping",
+      ".sprint-item-actions { flex-wrap: nowrap; }", /\.sprint-item-actions \{ flex-wrap: nowrap \}/],
+    ["an inline title again",
+      "@media (max-width: 768px) { .sprint-item-title { display: inline; } }", /display: inline \} makes the text column inline/],
+    ["a text column that cannot shrink",
+      ".sprint-item-main { min-width: auto; }", /min-width: auto \} stops the text column shrinking/],
+    ["a long token that cannot break",
+      ".sprint-item-ver { overflow-wrap: normal; }", /overflow-wrap: normal \} stops a long token breaking/],
+    ["a resource chip that cannot wrap",
+      ".sprint-item-resources .resource-chip { white-space: nowrap; }", /\.resource-chip \{ white-space: nowrap \}/],
+    ["a title taken out of flow",
+      ".sprint-item-title { position: absolute; }", /position: absolute \} takes a board element out of flow/],
+  ])("catches %s", (_name, css, expected) => {
+    expect(scan(css).join("\n")).toMatch(expected);
+  });
+
+  it("does not cry wolf at rules that cannot reach the board", () => {
+    expect(scan(".tabs span { white-space: nowrap; } .sidebar button { overflow: hidden; } .sprint-item-row { gap: 10px; color: red; }")).toEqual([]);
+    expect(scan("@media (max-width: 768px) { .vtab-strip .vtab-btn { white-space: nowrap; overflow: hidden; } }")).toEqual([]);
+  });
+
+  it("catches a harmful inline style written into the markup", () => {
+    const title = document.querySelector(".sprint-item-row .sprint-item-title") as HTMLElement;
+    title.style.whiteSpace = "nowrap";
+    expect(scan(null).join("\n")).toMatch(/inline style on <span\.sprint-item-title> \{ white-space: nowrap \}/);
+    title.removeAttribute("style");
+    expect(scan(null)).toEqual([]);
   });
 });
 

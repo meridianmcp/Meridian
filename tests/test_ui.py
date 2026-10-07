@@ -1039,8 +1039,8 @@ def test_dashboard_responsive_sprint_and_nav_media_block(css):
 # white-space:nowrap stopped it wrapping, and the text ran over .sprint-item-ver
 # and .sprint-item-actions. Source-scanning style, like the rest of this file; the
 # rendered-DOM + computed-style version lives in
-# meridian/static/dashboard-sprint-layout.test.ts, and the pixel overlap was
-# measured in a real browser.
+# meridian/static/dashboard-sprint-layout.test.ts, and the pixel overlap is asserted
+# in a real browser by tests/test_demo_ux.py.
 # ---------------------------------------------------------------------------
 
 
@@ -1060,7 +1060,7 @@ def _css_rules(css_text):
                 depth += (chunk[k] == "{") - (chunk[k] == "}")
                 k += 1
             body = chunk[j + 1 : k - 1]
-            if prelude.startswith("@media"):
+            if prelude.startswith(("@media", "@supports")):
                 rules.extend(parse(body, " ".join(prelude.split())))
             elif not prelude.startswith("@"):
                 decls = {}
@@ -1187,6 +1187,200 @@ def test_sprint_markup_uses_the_main_column_class_and_no_inline_nowrap(js):
     row = [ln for ln in js.splitlines() if marker in ln]
     assert row, "backburner row template not found"
     assert all("display:flex" not in ln and "align-items:center" not in ln for ln in row)
+
+
+# ---------------------------------------------------------------------------
+# Cascade-independent scan. The exact-selector checks above (`_decls` merges only
+# rules whose selector text EQUALS the one asked for) and the jsdom contract (source
+# order only, no @media) are blind to a rule that wins on specificity or applies only on
+# a phone, and two such mutations re-broke the layout in a real browser while every
+# test passed: an earlier `.live-body .sprint-item-title { white-space: nowrap }` and a
+# `@media (max-width: 768px) { .live-body span { white-space: nowrap } }`. This scan
+# ignores specificity, order and viewport gates: for EVERY rule (any @media / @supports)
+# it asks which sprint-row elements the selector could style, and rejects any declaration
+# that could undo the contract on one of them. The pixel layout is asserted in a real
+# browser by tests/test_demo_ux.py (test_sprint_rows_never_overlap_in_a_real_browser).
+# ---------------------------------------------------------------------------
+
+
+def _sprint_static(name):
+    """A file of meridian/static read from disk (no app boot: these checks are pure text)."""
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parent.parent / "meridian" / "static" / name).read_text(encoding="utf-8")
+
+
+# Classes of the elements INSIDE a .sprint-item-row (renderSprintProgress + _sprintHistoryBadges).
+_SPRINT_ROW_CLASSES = frozenset({
+    "sprint-item-row", "sprint-item-icon", "sprint-item-main", "sprint-item-title", "sprint-item-ver",
+    "sprint-item-meta", "sprint-item-actions", "sprint-item-notes", "sprint-item-resources", "resource-chip",
+    "sprint-btn", "sprint-btn-fail", "sprint-btn-push", "sprint-stall-badge", "sprint-retried-badge",
+    "sprint-live-dot",
+})
+# The board's ancestors (dashboard.ts buildTabBody): a selector may qualify itself with these.
+_SPRINT_CHAIN_CLASSES = frozenset({
+    "app", "main", "tab-bodies", "tab-body", "vtab-drawer", "drawer-panel", "live-body", "live-section",
+    "live-sprint-progress", "active", "open",
+})
+# Which row classes a bare element selector (`span`, `div`, `button`) can hit.
+_SPRINT_TYPE_CLASSES = {
+    "span": frozenset({
+        "sprint-item-icon", "sprint-item-title", "sprint-item-ver", "sprint-item-meta", "sprint-item-actions",
+        "resource-chip", "sprint-stall-badge", "sprint-retried-badge", "sprint-live-dot",
+    }),
+    "div": frozenset({"sprint-item-row", "sprint-item-main", "sprint-item-notes", "sprint-item-resources"}),
+    "button": frozenset({"sprint-btn", "sprint-btn-fail", "sprint-btn-push"}),
+}
+# Short fixed labels that are kept on one line / truncated on purpose.
+_SPRINT_DELIBERATE = frozenset({"sprint-item-meta", "sprint-btn", "sprint-btn-fail", "sprint-btn-push"})
+_SPRINT_TEXT_BOXES = frozenset({"sprint-item-title", "sprint-item-main", "sprint-item-ver", "resource-chip"})
+_SPRINT_COLUMN = frozenset({"sprint-item-title", "sprint-item-main"})
+
+
+def _sprint_reach(selector):
+    """The row-element classes `selector` could style (conservative: state pseudo-classes
+    are ignored, any ancestor/sibling combinator counts as an ancestor), or an empty set
+    when it cannot match anything inside a sprint row."""
+    every = frozenset(_SPRINT_ROW_CLASSES)
+    sel = re.sub(r"::?[\w-]+(\([^)]*\))?", "", selector).strip()
+    compounds = [c for c in re.split(r"\s*[>+~]\s*|\s+", sel) if c]
+    if not compounds:
+        return every  # a bare ':hover'
+    for comp in compounds[:-1]:  # ancestors must be satisfiable by the board's own chain
+        classes, ids = re.findall(r"\.([\w-]+)", comp), re.findall(r"#([\w-]+)", comp)
+        tag = re.match(r"[a-zA-Z][\w-]*|\*", comp)
+        if any(c not in _SPRINT_ROW_CLASSES | _SPRINT_CHAIN_CLASSES for c in classes) or any(i != "tab-bodies" for i in ids):
+            return frozenset()
+        if not classes and not ids and tag and tag.group(0) not in ("*", "div", "main", "body", "html", "span"):
+            return frozenset()
+    last = compounds[-1]
+    classes, ids = re.findall(r"\.([\w-]+)", last), re.findall(r"#([\w-]+)", last)
+    if ids or any(c not in _SPRINT_ROW_CLASSES for c in classes):
+        return frozenset()
+    if classes:
+        return frozenset(classes)
+    if "[" in last:  # an attribute selector alone: can't tell, assume every kind
+        return every
+    tag = re.match(r"[a-zA-Z][\w-]*|\*", last)
+    name = tag.group(0) if tag else "*"
+    return every if name == "*" else _SPRINT_TYPE_CLASSES.get(name, frozenset())
+
+
+def _sprint_harm(prop, raw, kinds):
+    """Why `prop: raw` could re-break the wrapping contract on one of `kinds`, else None."""
+    v = raw.replace("!important", "").strip().lower()
+    truncating = kinds - _SPRINT_DELIBERATE
+    if prop == "white-space" and v in ("nowrap", "pre") and truncating:
+        return "stops the text wrapping"
+    if prop == "text-overflow" and v not in ("clip", "initial", "unset", "inherit") and truncating:
+        return "ellipsizes (hides) text"
+    if prop in ("overflow", "overflow-x") and re.search(r"\b(hidden|clip|scroll|auto)\b", v) and truncating:
+        return "clips its content"
+    if prop == "flex-wrap" and v == "nowrap" and kinds & {"sprint-item-row", "sprint-item-actions"}:
+        return "stops the row wrapping"
+    if prop in ("overflow-wrap", "word-wrap") and v == "normal" and kinds & _SPRINT_TEXT_BOXES:
+        return "stops a long token breaking"
+    if prop == "word-break" and v == "keep-all":
+        return "stops a long token breaking"
+    if prop == "display" and not re.fullmatch(r"block|flex|grid|flow-root|inline-block|list-item", v) and kinds & _SPRINT_COLUMN:
+        return "makes the text column inline (ignores width / overflow) or hides it"
+    if prop == "min-width" and not re.fullmatch(r"0(px)?", v) and kinds & _SPRINT_COLUMN:
+        return "stops the text column shrinking"
+    if prop == "position" and v in ("absolute", "fixed"):
+        return "takes a row element out of flow (it can paint over its neighbours)"
+    return None
+
+
+def _sprint_cascade_offenders(css_text):
+    out = []
+    for media, selectors, decls in _css_rules(css_text):
+        for sel in selectors:
+            kinds = _sprint_reach(sel)
+            for prop, value in decls.items():
+                why = kinds and _sprint_harm(prop, value, kinds)
+                if why:
+                    out.append(f"{media + ' ' if media else ''}{sel} {{ {prop}: {value} }} {why}")
+    return out
+
+
+def test_no_stylesheet_rule_can_undo_the_sprint_row_wrapping_contract():
+    """Whatever its specificity, source position or @media gate, no rule in dashboard.css
+    may stop a sprint row's text wrapping, clip or ellipsize it, stop the row wrapping,
+    make the title column inline / unshrinkable, or take a row element out of flow."""
+    assert _sprint_cascade_offenders(_sprint_static("dashboard.css")) == []
+
+
+def test_sprint_cascade_scan_reaches_the_rules_it_must_judge():
+    """The scan is not vacuous: the real sheet's contract rules and its @media-gated
+    rules reach row elements, and the deliberately truncated '-> v2' pill is tolerated."""
+    rules = _css_rules(_sprint_static("dashboard.css"))
+    reaching = [(m, s) for m, sels, _ in rules for s in sels if _sprint_reach(s)]
+    assert sum(1 for m, _ in reaching if m is None) >= 10
+    assert sum(1 for m, _ in reaching if m == "@media (max-width: 768px)") >= 3
+    assert sum(1 for m, _ in reaching if m == "@media (max-width: 480px)") >= 1
+    meta = _decls(rules, ".sprint-item-meta")
+    assert meta.get("white-space") == "nowrap" and meta.get("text-overflow") == "ellipsis"
+    assert _sprint_cascade_offenders(".sprint-item-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }") == []
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        # the two that used to survive every suite
+        ".live-body .sprint-item-title { white-space: nowrap; }",
+        "@media (max-width: 768px) { .live-body span { white-space: nowrap; } }",
+        # other shapes of the same regression
+        "@media (max-width: 480px) { span { white-space: pre; } }",
+        "@supports (display: grid) { .tab-body .sprint-item-row span { white-space: nowrap; } }",
+        ".sprint-item-title { overflow: hidden; text-overflow: ellipsis; }",
+        ".sprint-item-row * { overflow-x: clip; }",
+        ".sprint-item-row .sprint-item-title { white-space: nowrap !important; }",
+        ".sprint-item-title:hover { white-space: nowrap; }",
+        "@media (max-width: 480px) { .sprint-item-row { flex-wrap: nowrap; } }",
+        ".sprint-item-actions { flex-wrap: nowrap; }",
+        "@media (max-width: 768px) { .sprint-item-title { display: inline; } }",
+        ".sprint-item-main { min-width: auto; }",
+        ".sprint-item-ver { overflow-wrap: normal; }",
+        ".sprint-item-resources .resource-chip { white-space: nowrap; }",
+        ".sprint-item-title { position: absolute; }",
+        "#tab-bodies div { white-space: nowrap; }",
+        "[class*='sprint-item'] { white-space: nowrap; }",
+    ],
+)
+def test_sprint_cascade_scan_catches_each_regression_shape(mutant):
+    assert _sprint_cascade_offenders(mutant), f"scan is blind to: {mutant}"
+    assert _sprint_cascade_offenders(_sprint_static("dashboard.css") + "\n" + mutant), f"scan is blind to (appended): {mutant}"
+
+
+@pytest.mark.parametrize(
+    "benign",
+    [
+        ".tabs span { white-space: nowrap; }",
+        ".sidebar button { overflow: hidden; }",
+        "@media (max-width: 768px) { .vtab-strip .vtab-btn { white-space: nowrap; overflow: hidden; } }",
+        ".sprint-item-row { gap: 10px; color: red; }",
+        "button { white-space: nowrap; }",
+        ".sprint-btn { white-space: nowrap; overflow: hidden; }",
+        ".live-session-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+    ],
+)
+def test_sprint_cascade_scan_does_not_cry_wolf(benign):
+    assert _sprint_cascade_offenders(benign) == [], benign
+
+
+def test_sprint_cascade_scan_knows_every_class_the_row_markup_renders():
+    """Drift guard for _SPRINT_ROW_CLASSES: the scan can only judge the classes it
+    knows; every static class in the row markup must be listed, and none may be stale."""
+    src = _sprint_static("dashboard-sprint.ts")
+    board = src[src.index("export function renderSprintProgress") : src.index("export function renderQueue")]
+    helper = src[src.index("function _sprintHistoryBadges") : src.index("function _sprintHistoryBadges") + 1700]
+    rendered = set()
+    for chunk in (board, helper):
+        for attr in re.findall(r'class="([^"$]*)"', chunk):
+            rendered.update(attr.split())
+    row_like = {c for c in rendered if c.startswith(("sprint-item-", "sprint-btn", "sprint-stall", "sprint-retried", "sprint-live-dot")) or c == "resource-chip"}
+    assert row_like <= _SPRINT_ROW_CLASSES, f"row classes missing from _SPRINT_ROW_CLASSES: {sorted(row_like - _SPRINT_ROW_CLASSES)}"
+    assert _SPRINT_ROW_CLASSES <= rendered, f"stale classes in _SPRINT_ROW_CLASSES: {sorted(_SPRINT_ROW_CLASSES - rendered)}"
 
 
 # ---------------------------------------------------------------------------

@@ -1521,3 +1521,283 @@ def test_set_project_parent_route(client):
         "/projects/00000000-0000-0000-0000-000000000000/parent",
         json={"parent_project_id": a_id},
     ).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Sprint row layout: REAL-browser guard (Live tab, "Sprint progress").
+#
+# The source-scanning tests in test_ui.py and the jsdom contract in
+# meridian/static/dashboard-sprint-layout.test.ts can only see CSS *properties*: jsdom
+# has no layout engine, resolves the cascade by source order alone and ignores
+# @media. Two mutations survived both suites while fully re-breaking the bug in a
+# browser: an earlier ``.live-body .sprint-item-title{white-space:nowrap}`` (wins on
+# specificity) and ``.live-body span{white-space:nowrap}`` inside the max-width:768px
+# block (wins on the phone). So this test measures LAYOUT: it opens the real dashboard,
+# renders the real renderSprintProgress into the real Live-tab container (real ancestors,
+# the real stylesheet, every @media rule live) and asserts that, at phone/tablet/desktop
+# viewports and a range of board widths, no title text paints past its column, over the
+# version label or over the buttons, nothing is clipped or escapes its row, and the
+# icon/version/buttons sit on the title's first line. Mutants are then injected to
+# prove the probe would notice each class of regression.
+# ---------------------------------------------------------------------------
+
+_SPRINT_LONG = (
+    "SECURITY (reproduced, urgent): cross-tenant artifact export and purge by a "
+    "caller-supplied project_id (RT-TI-001, RT-TI-002)"
+)
+_SPRINT_TOKEN = "x" * 300  # a 300-character unbreakable token
+_SPRINT_LONG_PATH = "file:" + "very/long/path/" * 12 + "x.py"
+_SPRINT_LONG_VER = "v1.2.3-" + "x" * 40
+
+
+def _sprint_layout_items():
+    """One row per kind/status with long and unbreakable titles (keep in sync with
+    ITEMS in meridian/static/dashboard-sprint-layout.test.ts)."""
+
+    def mk(**over):
+        return {"version": "v1", "status": "pending", **over}
+
+    return [
+        mk(
+            id="pending", title=_SPRINT_LONG,
+            notes="Notes with an unbreakable token " + "N" * 200 + " and some ordinary words.",
+            touches_resources=json.dumps([
+                "file:meridian/static/dashboard.css", "note:" + "n" * 120, "decision:abcdef12", _SPRINT_LONG_PATH,
+            ]),
+        ),
+        mk(id="todo", title=_SPRINT_TOKEN, status="todo"),
+        mk(id="in_progress", title=_SPRINT_LONG, status="in_progress", claimed_at="2026-01-01T00:00:00Z", stall_count=2),
+        mk(id="retried", title=_SPRINT_LONG, claimed_at="2026-01-01T00:00:00Z"),
+        mk(id="done", title=_SPRINT_TOKEN, status="done"),
+        mk(id="failed", title=_SPRINT_LONG, status="failed"),
+        mk(id="skipped", title=_SPRINT_LONG, status="skipped"),
+        mk(id="pushed_board", title=_SPRINT_LONG, status="pushed", pushed_to="v2"),
+        mk(id="short", title="Short title"),
+        mk(id="parent", title=_SPRINT_LONG, status="in_progress"),
+        mk(
+            id="kid1", parent_id="parent", title=_SPRINT_TOKEN,
+            notes="kid notes " + "K" * 150, touches_resources=json.dumps([_SPRINT_LONG_PATH]),
+        ),
+        mk(id="kid2", parent_id="parent", title="short child", status="done"),
+        mk(id="ind", title=_SPRINT_LONG, status="indeterminate"),
+        mk(id="human", title=_SPRINT_LONG, milestone_type="human"),
+        mk(id="bb", title=_SPRINT_TOKEN, version="v9", status="pushed", pushed_to="v10"),
+        # a very long version label must wrap inside the row, not push the buttons out
+        mk(id="longver", title=_SPRINT_LONG, version=_SPRINT_LONG_VER),
+        mk(id="longver_attn", title=_SPRINT_TOKEN, version=_SPRINT_LONG_VER, status="indeterminate"),
+    ]
+
+
+# Defines window.__sprintLayoutProbe(items, columnWidth): renders the board for real into
+# the real Live-tab container, then measures every row with the browser's own layout.
+_SPRINT_LAYOUT_PROBE_JS = r"""
+() => {
+  const EPS = 0.5;
+  const hit = (a, b) => a.left < b.right - EPS && a.right > b.left + EPS && a.top < b.bottom - EPS && a.bottom > b.top + EPS;
+  const box = (el) => el.getBoundingClientRect();
+  const shown = (el) => !!el && el.getClientRects().length > 0;
+  const textBoxes = (node) => {
+    const r = document.createRange();
+    r.selectNodeContents(node);
+    return Array.from(r.getClientRects()).filter((b) => b.width > 0 && b.height > 0);
+  };
+  const mid = (b) => (b.top + b.bottom) / 2;
+  const name = (el) => el.tagName.toLowerCase() + (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/)[0] : '');
+  window.__sprintLayoutProbe = (items, columnWidth) => {
+    const root = document.querySelector('[id^="live-sprint-progress-"]');
+    const pid = root.id.slice('live-sprint-progress-'.length);
+    root.style.width = columnWidth + 'px';
+    window.renderSprintProgress(pid, JSON.parse(JSON.stringify(items)));
+    root.querySelectorAll('.sprint-dag-wrap').forEach((n) => n.remove());
+    root.querySelectorAll('details').forEach((d) => { d.open = true; });
+    const rows = Array.from(root.querySelectorAll('.sprint-item-row'));
+    const out = { width: window.innerWidth, column: box(root).width, rows: rows.length, measured: 0, maxLines: 0, problems: [] };
+    const bad = (id, msg) => out.problems.push(id + ': ' + msg);
+    for (const row of rows) {
+      const id = row.dataset.item || '(row)';
+      if (!shown(row)) { bad(id, 'row has no layout box (is the Live drawer open?)'); continue; }
+      out.measured++;
+      const title = row.querySelector('.sprint-item-title');
+      const col = title.parentElement === row ? title : title.parentElement;
+      const colB = box(col), rowB = box(row);
+      const tb = textBoxes(title);
+      const first = tb.slice().sort((a, b) => a.top - b.top)[0];
+      out.maxLines = Math.max(out.maxLines, new Set(tb.map((b) => Math.round(b.top))).size);
+      // 1. the title text stays inside its own column (nothing painted or clipped past it)
+      const past = Math.max(0, Math.max(...tb.map((b) => b.right)) - colB.right);
+      if (past > EPS) bad(id, 'title text runs ' + past.toFixed(1) + 'px past its column');
+      // 2. no painted title text over the icon / version / buttons / badges beside it
+      const others = Array.from(row.children).filter((c) => c !== col && shown(c));
+      for (const o of others) {
+        if (tb.some((b) => hit(b, box(o)))) bad(id, 'title text overlaps <' + name(o) + '>');
+      }
+      // 3. the row's own boxes never overlap each other
+      const boxes = [col, ...others];
+      for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          if (hit(box(boxes[i]), box(boxes[j]))) bad(id, 'boxes overlap: <' + name(boxes[i]) + '> / <' + name(boxes[j]) + '>');
+        }
+      }
+      // 4. nothing inside the row (boxes or painted text) escapes it sideways
+      for (const el of row.querySelectorAll('*')) {
+        if (!shown(el)) continue;
+        const b = box(el);
+        if (b.right > rowB.right + EPS || b.left < rowB.left - EPS) bad(id, '<' + name(el) + '> escapes the row');
+      }
+      const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        if (!n.nodeValue.trim()) continue;
+        if (textBoxes(n).some((b) => b.right > rowB.right + EPS || b.left < rowB.left - EPS)) {
+          bad(id, 'text "' + n.nodeValue.trim().slice(0, 16) + '" in <' + name(n.parentElement) + '> paints outside the row');
+        }
+      }
+      // 5. notes stay inside the text column
+      const note = row.querySelector('.sprint-item-notes');
+      if (note) {
+        const nb = textBoxes(note);
+        if (nb.length && Math.max(...nb.map((b) => b.right)) > colB.right + EPS) bad(id, 'notes run past the column');
+      }
+      // 6. icon, version and the first button sit on the title's FIRST line
+      const lineOf = (b) => Math.abs(mid(b) - mid(first));
+      const icon = row.firstElementChild;
+      const iconB = textBoxes(icon)[0];
+      if (iconB && lineOf(iconB) > 6) bad(id, 'icon is ' + lineOf(iconB).toFixed(1) + 'px off the first title line');
+      const ver = row.querySelector(':scope > .sprint-item-ver');
+      if (shown(ver)) {
+        const vb = textBoxes(ver)[0];
+        if (vb && vb.top < first.bottom && lineOf(vb) > 6) bad(id, 'version is ' + lineOf(vb).toFixed(1) + 'px off the first title line');
+      }
+      // 7. on a phone the action buttons take their own line UNDER the text column
+      const act = row.querySelector(':scope > .sprint-item-actions');
+      if (shown(act) && act.childElementCount > 0 && window.innerWidth <= 768 && box(act).top < colB.bottom - 1) {
+        bad(id, 'phone: the action buttons should sit under the text, not beside it');
+      }
+    }
+    return out;
+  };
+}
+"""
+
+# Viewport widths pick the @media state (phone <= 480, <= 768, desktop); board widths
+# are the sprint container's own width, decoupled because in the real app the Live
+# drawer is squeezed to ~0px on a phone by the fixed 300px handoff panel.
+_SPRINT_VIEWPORTS = (320, 375, 480, 768, 1000, 1440)
+_SPRINT_BOARD_WIDTHS = (150, 260, 347, 480, 787)  # 347 / 787 = the real board at 1000 / 1440px
+
+
+def _sprint_open_live_board(p, port):
+    """Open /demo, switch to the Live drawer and install the layout probe: (browser, page)."""
+    browser = p.chromium.launch()
+    page = browser.new_page()
+    page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_function(
+        "() => typeof window.renderSprintProgress === 'function'"
+        " && !!document.querySelector('.vtab-btn[data-vtab=\"live\"]')",
+        timeout=30000,
+    )
+    # a JS click works even where the phone layout hides the vtab strip
+    page.evaluate("() => document.querySelector('.vtab-btn[data-vtab=\"live\"]').click()")
+    page.wait_for_selector('[id^="live-sprint-progress-"]', state="attached", timeout=8000)
+    page.evaluate(_SPRINT_LAYOUT_PROBE_JS)
+    return browser, page
+
+
+def _sprint_probe(page, width, column, items=None):
+    page.set_viewport_size({"width": width, "height": 900})
+    assert page.evaluate("() => window.innerWidth") == width, "viewport did not resize"
+    return page.evaluate(
+        "([items, column]) => window.__sprintLayoutProbe(items, column)", [items or _sprint_layout_items(), column]
+    )
+
+
+def _sprint_flags_with(page, css, width, column):
+    """Problems the probe reports with `css` injected after the real stylesheet."""
+    handle = page.add_style_tag(content=css)
+    try:
+        return _sprint_probe(page, width, column)["problems"]
+    finally:
+        handle.evaluate("el => el.remove()")
+
+
+@pytestmark_playwright
+def test_sprint_rows_never_overlap_in_a_real_browser(demo_client):
+    """The Live tab's Sprint progress rows keep every long title inside its own
+    column (no paint over the version label / buttons, nothing clipped or escaping)
+    at phone, tablet and desktop viewports, in every row kind, with the real
+    stylesheet cascade (specificity, source order, @media)."""
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        server, _thread, port = _start_live_server(server_module.app)
+        try:
+            browser, page = _sprint_open_live_board(p, port)
+            for width in _SPRINT_VIEWPORTS:
+                for column in _SPRINT_BOARD_WIDTHS:
+                    res = _sprint_probe(page, width, column)
+                    where = f"viewport {width}px, board {column}px"
+                    assert res["rows"] >= 20, f"{where}: fixture did not render ({res['rows']} rows)"
+                    assert res["measured"] == res["rows"], f"{where}: rows never laid out: {res['problems'][:3]}"
+                    assert res["problems"] == [], f"{where}: " + "; ".join(res["problems"][:8])
+            # the probe really exercised wrapping: a 300-char token takes many lines in a narrow board
+            assert _sprint_probe(page, 320, 150)["maxLines"] >= 8
+            assert _sprint_probe(page, 1440, 787)["maxLines"] >= 2
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_sprint_row_probe_notices_the_regressions_css_property_tests_cannot_see(demo_client):
+    """Sensitivity guard for the test above: inject each class of regression after the
+    real stylesheet and require the layout probe to flag it. The first two are the
+    mutations that used to survive every source/jsdom test (an earlier, more specific
+    rule; a non-sprint selector inside the phone @media block)."""
+    from meridian import server as server_module
+
+    # (name, css, [(viewport, board width) where the probe MUST report a problem])
+    mutants = [
+        ("ancestor-qualified nowrap on the title",
+         ".live-body .sprint-item-title{white-space:nowrap}", [(1000, 347), (320, 260), (1440, 787)]),
+        ("span nowrap inside the phone @media",
+         "@media (max-width:768px){.live-body span{white-space:nowrap}}", [(320, 260), (480, 347), (768, 480)]),
+        ("span nowrap inside the narrow-phone @media only",
+         "@media (max-width:480px){.sprint-item-row span{white-space:nowrap}}", [(320, 260), (480, 347)]),
+        ("title clipped with an ellipsis",
+         ".sprint-item-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}", [(1000, 347), (375, 260)]),
+        ("title inline + nowrap again",
+         ".sprint-item-title{display:inline;white-space:nowrap}", [(1000, 347), (375, 260)]),
+        ("300-char token cannot break",
+         ".sprint-item-title{overflow-wrap:normal}", [(1000, 347), (320, 260)]),
+        ("row not baseline-aligned",
+         ".sprint-item-row{align-items:center}", [(1000, 347), (375, 260)]),
+        ("row cannot wrap",
+         ".sprint-item-row{flex-wrap:nowrap}", [(1000, 150), (375, 260)]),
+        ("version label cannot wrap",
+         ".sprint-item-ver{white-space:nowrap}", [(1000, 150), (320, 150)]),
+        ("resource chips cannot wrap",
+         ".sprint-item-resources .resource-chip{white-space:nowrap}", [(1000, 347), (320, 260)]),
+        ("notes cannot break a long token",
+         ".sprint-item-notes{white-space:pre!important;word-break:normal!important}", [(1000, 347), (320, 260)]),
+        ("action buttons cannot wrap",
+         ".sprint-item-actions{flex-wrap:nowrap}", [(1000, 100), (320, 100)]),
+        ("phone action buttons beside the text",
+         "@media (max-width:768px){.sprint-item-actions{flex-basis:auto}}", [(375, 480), (768, 787)]),
+    ]
+
+    with sync_playwright() as p:
+        server, _thread, port = _start_live_server(server_module.app)
+        try:
+            browser, page = _sprint_open_live_board(p, port)
+            for name, css, must_flag in mutants:
+                for width, column in must_flag:
+                    assert _sprint_flags_with(page, css, width, column), (
+                        f"layout probe is blind to {name!r} at viewport {width}px, board {column}px"
+                    )
+            # a @media mutant is genuinely viewport-gated: harmless on a desktop viewport
+            assert _sprint_flags_with(page, mutants[1][1], 1000, 347) == []
+            assert _sprint_flags_with(page, mutants[2][1], 768, 347) == []
+            # and every mutant was removed again: the real board is clean
+            assert _sprint_probe(page, 320, 260)["problems"] == []
+            browser.close()
+        finally:
+            server.should_exit = True
