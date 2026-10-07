@@ -75,6 +75,11 @@ async def create_hitl_endpoint(
     question = (body.get("question") or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="question required")
+    # RT-TI-005 (pass 3, F-D6) -- a request is filed against the project in the path; a
+    # session of another project must not be attached to it (404, like POST /tasks).
+    _hitl_sid = body.get("session_id")
+    if isinstance(_hitl_sid, str):
+        await _deps._reject_foreign_session(db, _hitl_sid, project_id)
     try:
         result = await db_module.request_hitl(
             db, project_id, question,

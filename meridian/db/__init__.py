@@ -8853,7 +8853,10 @@ async def list_active_worktrees(
     async with db.execute(
         "SELECT aw.*, s.name AS session_name "
         "FROM active_worktrees aw "
-        "LEFT JOIN sessions s ON s.id = aw.session_id "
+        # RT-TI-005 (pass 3, F-D6) -- join the session only within the worktree's own
+        # project, so a row that (wrongly) carries another project's session id can never
+        # surface that session's name.
+        "LEFT JOIN sessions s ON s.id = aw.session_id AND s.project_id = aw.project_id "
         "WHERE aw.project_id = ? AND aw.removed_at IS NULL "
         "ORDER BY aw.created_at DESC",
         (project_id,),
@@ -12084,6 +12087,7 @@ async def export_tenant_data(
     db: aiosqlite.Connection,
     tenant_id: str,
     project_db: aiosqlite.Connection | None = None,
+    project_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Collect all data belonging to a tenant as a plain dict for GDPR export.
 
@@ -12092,10 +12096,18 @@ async def export_tenant_data(
     per-tenant Neon DB — pass it as ``project_db`` so the export actually
     contains the projects. When omitted (self-hosted, single DB) the project
     data is read from ``db`` like before.
+
+    ``project_ids`` (RT-TI-005 pass 3, F-D2) -- ``None`` (the default, and what every
+    owner / workspace-wide / self-hosted caller passes) exports every project exactly
+    as before. A list restricts the export to those projects and leaves out the
+    workspace-global notes and decisions, which belong to no project: a project-scoped
+    workspace member downloading "their" data must not receive the other projects (or
+    the workspace notebook) of the workspace they were invited into.
     """
     from datetime import datetime, timezone
 
     pdb = project_db if project_db is not None else db
+    _only_projects = set(project_ids) if project_ids is not None else None
 
     async with db.execute(
         "SELECT id, email, google_sub, microsoft_sub, plan, created_at FROM tenants WHERE id = ?",
@@ -12125,6 +12137,8 @@ async def export_tenant_data(
     for pr in project_rows:
         p = _row_to_dict(pr)
         pid = p["id"]
+        if _only_projects is not None and pid not in _only_projects:
+            continue
 
         async with pdb.execute(
             "SELECT content, goal_north_star, goal_sprint, version, updated_at FROM goal_states WHERE project_id = ?",
@@ -12176,15 +12190,19 @@ async def export_tenant_data(
         p["hitl_requests"] = hitl
         projects.append(p)
 
-    # Workspace-global notes/decisions live in the project DB too.
-    try:
-        ws_notes = await get_workspace_notes(pdb)
-    except Exception:
-        ws_notes = []
-    try:
-        ws_decisions = await get_workspace_decisions(pdb)
-    except Exception:
-        ws_decisions = []
+    # Workspace-global notes/decisions live in the project DB too (and are not part of
+    # a project-restricted export, see ``project_ids`` above).
+    ws_notes: list[dict[str, Any]] = []
+    ws_decisions: list[dict[str, Any]] = []
+    if _only_projects is None:
+        try:
+            ws_notes = await get_workspace_notes(pdb)
+        except Exception:
+            ws_notes = []
+        try:
+            ws_decisions = await get_workspace_decisions(pdb)
+        except Exception:
+            ws_decisions = []
 
     return {
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -12759,12 +12777,22 @@ async def amend_handoff(
 
 
 async def get_handoff(
-    db: aiosqlite.Connection, handoff_id: str
+    db: aiosqlite.Connection, handoff_id: str, *, project_id: str | None = None
 ) -> dict[str, Any] | None:
-    """Fetch a single handoff row by id."""
-    async with db.execute(
-        "SELECT * FROM handoffs WHERE id = ?", (handoff_id,)
-    ) as cur:
+    """Fetch a single handoff row by id.
+
+    ``project_id`` (RT-TI-005 pass 3, F-D5) binds the lookup to one project: a handoff
+    of another project then behaves exactly like an unknown id (``None``). Every caller
+    that took the id from a request (a correction's ``source_handoff_id``) passes it;
+    ``None`` (the default) keeps the historical unbound lookup for internal callers that
+    already hold a row they own.
+    """
+    if project_id is None:
+        sql, params = "SELECT * FROM handoffs WHERE id = ?", (handoff_id,)
+    else:
+        sql = "SELECT * FROM handoffs WHERE id = ? AND project_id = ?"
+        params = (handoff_id, project_id)
+    async with db.execute(sql, params) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
 

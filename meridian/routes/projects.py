@@ -1296,6 +1296,15 @@ async def create_worktree(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    # RT-TI-005 (pass 3, F-D6) -- the session and the sprint item in the body must belong to
+    # the project in the path. They were stored unchecked, and GET /projects/{pid}/worktrees
+    # then joined the foreign session's NAME back to the caller. A session / item of another
+    # project is answered like a missing one (404), for every caller.
+    await _deps._reject_foreign_session(db, body.session_id, project_id)
+    if body.item_id:
+        _wt_item = await db_module.get_sprint_item(db, body.item_id)
+        if _wt_item is not None and _wt_item.get("project_id") != project_id:
+            raise HTTPException(status_code=404, detail="sprint item not found")
     wt = await db_module.register_worktree(
         db,
         body.session_id,

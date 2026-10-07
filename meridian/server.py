@@ -3864,36 +3864,10 @@ def _is_demo_request(request: Request) -> bool:
     return env_demo or cookie_demo
 
 
-# to routes/export.py and routes/github.py respectively.
-# NOTE: export_my_data stays in server.py because slowapi @_rate_limit does not
-# wire correctly for routes included via APIRouter (same constraint as magic-link).
-@app.get("/export/my-data")
-@_rate_limit("3/minute")
-async def export_my_data(request: Request) -> Response:
-    """GDPR data portability — returns a JSON file of all account data."""
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    if _is_demo_request(request):
-        return JSONResponse(
-            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
-            status_code=403,
-        )
-    from .hosted import get_current_tenant
-    tenant = await get_current_tenant(request)
-    # Account rows (tenant/tokens/members) live in the auth DB; the tenant's
-    # project data lives in its own per-tenant DB. Pass both so the export
-    # actually contains projects (hosted mode previously exported empty arrays).
-    data = await db_module.export_tenant_data(
-        request.app.state.db, tenant["id"], project_db=await _db(request),
-    )
-    payload = json.dumps(data, indent=2, default=str).encode()
-    email_slug = (tenant.get("email") or "user").split("@")[0][:20]
-    filename = f"meridian-export-{email_slug}.json"
-    return Response(
-        content=payload,
-        media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+# GET /export/my-data lives in routes/export.py (its router is included before any
+# decorator in this module runs, so it is the only handler that ever served the path).
+# A second copy used to sit here, shadowed and dead; RT-TI-005 (pass 3, F-D2) removed it
+# so the scope rule for the export cannot be fixed in one copy and forgotten in the other.
 
 
 
@@ -3904,7 +3878,11 @@ async def get_mcp_config(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=404)
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
-    projects = await db_module.list_projects(await _db(request))
+    # RT-TI-005 (pass 3, F-D3) — a project-scoped member sees only their own projects here,
+    # exactly like GET /projects; the unfiltered list handed them the id and name of every
+    # project of the workspace they were invited into one project of.
+    from ._deps import _projects_in_scope  # noqa: PLC0415
+    projects = await _projects_in_scope(request, await _db(request))
     return {
         "projects": [{"id": p["id"], "name": p["name"]} for p in projects],
         "base_url": os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us"),
@@ -4396,6 +4374,20 @@ async def api_reference_doc() -> str:
         " the whole call is a `403` and nothing is deleted.\n"
         "- `GET /projects/{project_id}/effective-profile?session_id=` is a `403` unless the"
         " session belongs to `{project_id}`.\n"
+        "- `GET /settings/mcp-config` lists only in-scope projects, and the tunnel routes"
+        " (`GET /tunnel/launch-matrix/{tenant_id}`, `GET`/`POST`/`DELETE"
+        " /tunnel/filesystem-roots`) read and write the executor config of in-scope"
+        " projects only.\n"
+        "- `GET /export/my-data` exports only the in-scope projects, and no workspace-level"
+        " notes or decisions (they belong to no project).\n"
+        "- `POST /hooks/session-start` and `POST /hooks/stop`, when called with a browser"
+        " session plus `X-Workspace-Tenant-Id` (a call with a Bearer token goes to the"
+        " token's own workspace and is not scoped): a body `project_id` outside the scope is"
+        " a `403`, project auto-routing by `cwd` / `hostname` only considers in-scope"
+        " projects, and the stop hook's `session_id` must belong to the project it acts on.\n"
+        "- `POST /projects/{project_id}/sprint-batch`: a `session_id` (the batch default or a"
+        " `notes` entry's own) that is outside the scope, or unknown, is a `403` before"
+        " anything runs.\n"
         "- If the scope cannot be resolved (for example the auth database is briefly"
         " unavailable) the request fails closed with `503 {\"detail\": \"scope check"
         " unavailable\"}` (a JSON-RPC error with code `-32603` on `POST /mcp`) instead of"
@@ -4411,8 +4403,30 @@ async def api_reference_doc() -> str:
         " another project is a `404`.\n"
         "- `POST /projects/{project_id}/tasks/release` -- a task of another project is a"
         " `404`, the same answer as a task the session does not hold.\n"
+        "- `GET /projects/{project_id}/sessions/{session_id}/tasks/live` -- a task whose"
+        " recorded session belongs to another project is listed without a `session_name` or"
+        " `human_id` (the session is joined only within the task's own project).\n"
         "- `DELETE /projects/{project_id}/worktrees/{worktree_id}` -- a worktree of another"
         " project is a `404`.\n"
+        "- `POST /projects/{project_id}/worktrees` -- a `session_id` or `item_id` that belongs"
+        " to another project is a `404`.\n"
+        "- `POST /projects/{project_id}/hitl` -- a `session_id` that belongs to another"
+        " project is a `404`.\n"
+        "- `POST /projects/{project_id}/sprint-batch` (`notes`) -- an entry whose `session_id`"
+        " belongs to another project fails with a `NOT_FOUND` entry result and writes"
+        " nothing.\n"
+        "- `POST /projects/{project_id}/handoff/corrections` -- a `source_handoff_id` of"
+        " another project is answered exactly like an unknown handoff id (`422`), and no"
+        " handoff of another project is ever invalidated or regenerated.\n"
+        "\n"
+        "Not restricted by project scope (open product questions, not project-keyed): the"
+        " workspace-level objects (`/workspace/notes`, `/workspace/decisions`,"
+        " `/workspace/sprint-items`, workspace settings), the `workspace`, `user` and"
+        " `hosted_default` profile layers, whether a scoped member may create projects, and"
+        " the OAuth `/mcp` endpoint (it opens the tenant's own database, so it cannot be"
+        " project-scoped). A subproject inherits context from its parent project, and a"
+        " parent's search reaches its subprojects, so grant a member a parent or a"
+        " subproject only when that sharing is intended.\n"
         "\n"
         "---\n"
         "\n"
@@ -6513,6 +6527,35 @@ async def _resolve_hook_db(request: Request) -> Any:
     return conn
 
 
+async def _hook_scoped_project_ids(request: Request) -> "list[str] | None":
+    """RT-TI-005 (pass 3, F-D1) -- the project scope that applies to a hook request, or ``None``.
+
+    The hook routes sit outside the ``/projects/{uuid}`` middleware and take the project
+    from the request BODY, and without a Bearer token ``_resolve_hook_db`` falls back to
+    ``_db(request)``, which honours ``X-Workspace-Tenant-Id``. A project-scoped member
+    driving a hook with their browser session + that header therefore reached any project
+    of the workspace by writing its id into the body (the session-start context carried the
+    other project's sprint items and recent tasks; the stop hook wrote a handoff for it).
+
+    ``None`` means "no scoping applies": a Bearer caller (``_resolve_hook_db`` routes it to
+    the token's OWN tenant DB, where the scope of someone else's workspace says nothing), an
+    owner, a workspace-wide member, a self-hosted or demo caller. Fails CLOSED: when the
+    caller carries ``X-Workspace-Tenant-Id`` and the scope cannot be resolved the hook
+    answers 503 instead of treating the caller as unscoped (requests without that header
+    can never be scoped, so they keep the old behaviour).
+    """
+    if request.headers.get("Authorization", "").startswith("Bearer "):
+        return None
+    from . import _deps  # noqa: PLC0415 -- late: one patch point (_deps) for every scope check
+
+    try:
+        return await _deps._scoped_project_ids_for_request(request)
+    except Exception as exc:  # noqa: BLE001
+        if request.headers.get("x-workspace-tenant-id", "").strip():
+            raise HTTPException(status_code=503, detail="scope check unavailable") from exc
+        return None
+
+
 def _hook_is_executor(body: dict[str, Any]) -> bool:
     """True when a SessionStart hook payload denotes an executor session.
 
@@ -6555,6 +6598,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     # in the control-plane DB. Unknown hostname/token MUST fail open to an empty
     # context (Claude Code must always start cleanly) — never 401.
     _has_bearer = request.headers.get("Authorization", "").startswith("Bearer ")
+    hook_scope: "list[str] | None" = None  # F-D1: only the browser-session path can be scoped
     if not _has_bearer and registration_token:
         _auth_db = request.app.state.db
         _tid = await db_module.resolve_hostname_registration(
@@ -6578,6 +6622,13 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                 return {"hookSpecificOutput": {
                     "hookEventName": "SessionStart", "additionalContext": ""}}
             raise
+        # RT-TI-005 (pass 3, F-D1) -- a project-scoped member is held to their scope on the
+        # body project_id; an out-of-scope AND an unknown id answer the same 403 (no
+        # existence leak). Everyone else resolves to None here and is untouched.
+        hook_scope = await _hook_scoped_project_ids(request)
+        if hook_scope is not None and project_id:
+            from ._deps import _deny_unless_in_scope  # noqa: PLC0415
+            _deny_unless_in_scope(hook_scope, project_id)
 
     def _normalize_hook_cwd(path: str) -> str:
         value = (path or "").strip().replace("\\", "/")
@@ -6601,6 +6652,11 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     if not project_id:
         # No project_id in payload -- auto-route by cwd/hostname match
         projects = await db_module.list_projects(db)
+        if hook_scope is not None:
+            # F-D1 -- a scoped member routes (and files the project-select HITL) over their
+            # own projects only; the HITL payload below lists every project it is given.
+            _allowed_hook_projects = set(hook_scope)
+            projects = [p for p in projects if p.get("id") in _allowed_hook_projects]
         if not projects:
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=400, content={"error": "no projects found -- create a project first"})
@@ -6941,7 +6997,7 @@ def _normalize_hook_cwd_path(path: str) -> str:
 
 
 async def _resolve_hook_project_id(
-    db: Any, cwd: str, hostname: str
+    db: Any, cwd: str, hostname: str, allowed_project_ids: "list[str] | None" = None
 ) -> str | None:
     """Resolve a project id from a hook's cwd/hostname (best-effort, never raises).
 
@@ -6953,6 +7009,9 @@ async def _resolve_hook_project_id(
     * Pass 2 — hostname registered in any project's machine ``hostnames`` list.
     * Fallback — if exactly one project exists, route to it.
 
+    ``allowed_project_ids`` (RT-TI-005 pass 3, F-D1) restricts every pass above to a
+    project-scoped caller's own projects (``None`` = all projects, unchanged).
+
     Returns the project id, or ``None`` when nothing matches.
     """
     norm_cwd = _normalize_hook_cwd_path(cwd).lower()
@@ -6963,6 +7022,9 @@ async def _resolve_hook_project_id(
         projects = await db_module.list_projects(db)
     except Exception:  # noqa: BLE001
         return None
+    if allowed_project_ids is not None:
+        _allowed = set(allowed_project_ids)
+        projects = [p for p in projects if p.get("id") in _allowed]
     if not projects:
         return None
 
@@ -7075,12 +7137,33 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
         ).startswith("Bearer "):
             return {"ok": True, "handoff": None, "reason": "unauthenticated"}
         raise
+    # RT-TI-005 (pass 3, F-D1) -- see _hook_scoped_project_ids: a project-scoped member
+    # (browser session + X-Workspace-Tenant-Id) is held to their scope on the body
+    # project_id AND session_id; None (Bearer / owner / wide / self-hosted / demo) = unchanged.
+    hook_scope = await _hook_scoped_project_ids(request)
+    if hook_scope is not None and project_id:
+        from ._deps import _deny_unless_in_scope  # noqa: PLC0415
+        _deny_unless_in_scope(hook_scope, project_id)
     # No explicit project — try to route by cwd/hostname like session-start does.
     if not project_id:
-        project_id = await _resolve_hook_project_id(db, hook_cwd, hook_hostname) or ""
+        project_id = await _resolve_hook_project_id(
+            db, hook_cwd, hook_hostname, allowed_project_ids=hook_scope
+        ) or ""
     if not project_id:
         # Nothing identifies a project (no id, no cwd/hostname match) — can't act.
         return {"ok": False, "error": "project_id required"}
+    if hook_scope is not None and session_id:
+        # The session must exist AND belong to the (in-scope) project the hook acts on: the
+        # delta handoff and the auto-capture below read and write that session's data. An
+        # unknown, foreign or other-project session id answers the same 403 as a foreign project.
+        from ._deps import _deny_unless_in_scope  # noqa: PLC0415
+        async with db.execute(
+            "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+        ) as _sess_cur:
+            _sess_row = await _sess_cur.fetchone()
+        _deny_unless_in_scope(
+            [project_id], _sess_row["project_id"] if _sess_row is not None else None
+        )
     # Resolve the session to hand off: explicit id wins, else most-recent active.
     if not session_id:
         try:

@@ -562,6 +562,75 @@ async def _require_project_in_scope(request: Request, project_id: "str | None") 
     _deny_unless_in_scope(await _scoped_project_ids_for_request(request), project_id)
 
 
+async def _projects_in_scope(request: Request, db: Any) -> "list[dict[str, Any]]":
+    """RT-TI-005 (pass 3, F-D3) — ``list_projects(db)`` restricted to the caller's scope.
+
+    Every route that enumerates the projects of the workspace DB it was handed
+    (``GET /settings/mcp-config``, the tunnel launch-matrix / filesystem-root routes,
+    the hook auto-router) must not hand a project-scoped member the id, name or
+    executor config of a project outside their scope. This is the one place that
+    does the filtering, exactly like ``GET /projects`` (a list of ids from
+    :func:`_scoped_project_ids_for_request`; ``None`` = owner / workspace-wide /
+    self-hosted / demo = every project, unchanged). Fails closed: an error resolving
+    the scope propagates instead of returning the unfiltered list.
+    """
+    from . import db as db_module
+
+    projects = await db_module.list_projects(db)
+    scoped = await _scoped_project_ids_for_request(request)
+    if scoped is None:
+        return projects
+    allowed = set(scoped)
+    return [p for p in projects if p.get("id") in allowed]
+
+
+async def _reject_foreign_session(db: Any, session_id: "str | None", project_id: str) -> None:
+    """404 ``session not found`` when ``session_id`` names a session of ANOTHER project.
+
+    RT-TI-005 (pass 3, F-D6) -- the integrity rule for a request that names a project in
+    its path and a session in its body (``POST /projects/{pid}/worktrees``, ``POST
+    /projects/{pid}/hitl``): the session must belong to that project. Same answer as the
+    sibling routes (``POST /tasks``, the claim route). An id that names no session (or no id
+    at all) is not this helper's business and is left to the route's own handling, unchanged.
+    Applies to every caller -- a session of one project acting inside another is never
+    legitimate -- so the owner / self-hosted / demo paths pay one primary-key SELECT.
+    """
+    if not session_id:
+        return
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is not None and row["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="session not found")
+
+
+async def _session_projects(request: Request, session_ids: "list[str]") -> "dict[str, str]":
+    """``{session_id: project_id}`` for every id in ``session_ids`` that names a session.
+
+    One ``IN (...)`` lookup per 400 ids (not a query per id); an id that names no session
+    is simply absent from the result. The bulk sibling of :func:`_session_project_id` for
+    routes that receive many session ids at once (the batch endpoint). Like it, call this
+    only once the scope is known to be non-``None`` (or an integrity check is wanted): the
+    owner / self-hosted / demo hot paths must not pay for it.
+    """
+    ids = [s for s in dict.fromkeys(session_ids) if isinstance(s, str) and s]
+    found: "dict[str, str]" = {}
+    if not ids:
+        return found
+    _req_db = await _db(request)
+    for start in range(0, len(ids), 400):
+        chunk = ids[start:start + 400]
+        placeholders = ", ".join("?" for _ in chunk)
+        async with _req_db.execute(
+            f"SELECT id, project_id FROM sessions WHERE id IN ({placeholders})",
+            tuple(chunk),
+        ) as cur:
+            for row in await cur.fetchall():
+                found[row["id"]] = row["project_id"]
+    return found
+
+
 async def _session_project_id(request: Request, session_id: str) -> "str | None":
     """Project a session belongs to (``sessions.project_id``), or ``None`` for an unknown id.
 

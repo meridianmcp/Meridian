@@ -41,7 +41,10 @@ from .. import db as db_module
 from .. import process_registry as process_registry_module
 from .. import profile_contract as profile_contract_module
 from .. import redis_bridge as _redis_bridge  # 2cf57fde — runtime diagnostics
-from .._deps import _hosted_mode, _get_tenant_from_request, _db, _authentication_required
+from .._deps import (
+    _hosted_mode, _get_tenant_from_request, _db, _authentication_required,
+    _projects_in_scope,
+)
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
     migrate_retired_overrides, config_fingerprint,
@@ -3032,7 +3035,10 @@ async def tunnel_launch_matrix(tenant_id: str, request: Request) -> Response:
     hostname = (request.query_params.get("hostname") or "").strip() or None
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        # RT-TI-005 (pass 3, F-D3) -- only the projects in the caller's scope: the matrix
+        # carries every project's id, name and executor config. A scope-resolution error
+        # degrades to the empty project set below (fails closed, never unfiltered).
+        projects = await _projects_in_scope(request, db)
     except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → diagnostics-only
         projects = []
     return _json_response(build_launch_matrix(tenant, hostname, projects))
@@ -3492,7 +3498,10 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
         })
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        # RT-TI-005 (pass 3, F-D3) -- the unions below are built from executor configs
+        # (repo paths, filesystem roots): a project-scoped member only gets their own
+        # projects' paths. Scope errors fall to the empty defaults (fail closed).
+        projects = await _projects_in_scope(request, db)
     except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → defaults
         projects = []
     return _json_response({
@@ -3780,7 +3789,10 @@ async def add_tunnel_filesystem_root(request: Request) -> Response:
         return _json_response({"error": "path is required"}, status_code=400)
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        # RT-TI-005 (pass 3, F-D3) -- the root is written into a project's executor_config
+        # (the newest one handed to the helper): for a project-scoped member that must be
+        # one of THEIR projects, never another project of the workspace.
+        projects = await _projects_in_scope(request, db)
         roots = await _persist_add_filesystem_root(db, projects, path)
     except Exception as exc:  # noqa: BLE001
         return _json_response({"error": f"could not persist root: {exc}"}, status_code=500)
@@ -3816,7 +3828,9 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
         return _json_response({"error": "path is required"}, status_code=400)
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        # RT-TI-005 (pass 3, F-D3) -- strip the root only from the caller's in-scope
+        # projects (see the POST route above).
+        projects = await _projects_in_scope(request, db)
         roots = await _persist_remove_filesystem_root(db, projects, path)
     except Exception as exc:  # noqa: BLE001
         return _json_response({"error": f"could not persist removal: {exc}"}, status_code=500)
