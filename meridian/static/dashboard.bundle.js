@@ -193,6 +193,81 @@
     add(cfg.repo_path);
     return out;
   }
+  var _DRAFT_FIELDS = 'textarea, input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="tel"], input[type="number"], input[type="password"]';
+  function fieldHoldsDraft(el2) {
+    const fields = el2.matches(_DRAFT_FIELDS) ? [el2] : Array.from(el2.querySelectorAll(_DRAFT_FIELDS));
+    return fields.some((f4) => f4 === document.activeElement || f4.value !== f4.defaultValue);
+  }
+  function _collectDrafts(root, units) {
+    const kept = [];
+    for (const unit of units) {
+      const seen = /* @__PURE__ */ new Map();
+      root.querySelectorAll(unit.selector).forEach((el2) => {
+        const key = unit.key(el2);
+        if (!key) return;
+        const ordinal = seen.get(key) || 0;
+        seen.set(key, ordinal + 1);
+        if ((unit.keep || fieldHoldsDraft)(el2)) kept.push({ unit, key, ordinal, el: el2 });
+      });
+    }
+    return kept;
+  }
+  function _findTwin(root, k3) {
+    let n2 = 0;
+    for (const el2 of Array.from(root.querySelectorAll(k3.unit.selector))) {
+      if (k3.unit.key(el2) !== k3.key) continue;
+      if (n2++ === k3.ordinal) return el2;
+    }
+    return null;
+  }
+  function hasUnsentDrafts(root, units) {
+    return !!root && _collectDrafts(root, units).length > 0;
+  }
+  function paintKeepingDrafts(root, html, units) {
+    const kept = _collectDrafts(root, units);
+    if (!kept.length) {
+      root.innerHTML = html;
+      return 0;
+    }
+    const active = document.activeElement;
+    const focused = active && kept.some((k3) => k3.el === active || k3.el.contains(active)) ? active : null;
+    let caret = null;
+    if (focused) {
+      try {
+        caret = { start: focused.selectionStart, end: focused.selectionEnd, dir: focused.selectionDirection };
+      } catch (_2) {
+      }
+    }
+    const scrolls = /* @__PURE__ */ new Map();
+    for (const k3 of kept) {
+      const fields = k3.el.matches("textarea") ? [k3.el] : Array.from(k3.el.querySelectorAll("textarea"));
+      for (const f4 of fields) scrolls.set(f4, f4.scrollTop);
+    }
+    root.innerHTML = html;
+    let carried = 0;
+    for (const k3 of kept) {
+      const twin = _findTwin(root, k3);
+      if (!twin) continue;
+      twin.replaceWith(k3.el);
+      carried += 1;
+    }
+    scrolls.forEach((top, f4) => {
+      if (f4.isConnected) f4.scrollTop = top;
+    });
+    if (focused && focused.isConnected) {
+      try {
+        focused.focus({ preventScroll: true });
+      } catch (_2) {
+      }
+      if (caret && caret.start != null && caret.end != null) {
+        try {
+          focused.setSelectionRange(caret.start, caret.end, caret.dir || void 0);
+        } catch (_2) {
+        }
+      }
+    }
+    return carried;
+  }
   try {
     Object.assign(window, {
       getPanelState: getPanelState2,
@@ -211,7 +286,10 @@
       DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2,
       DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2,
       DEFAULT_MAX_TURNS: DEFAULT_MAX_TURNS2,
-      suggestedFsRoots: suggestedFsRoots2
+      suggestedFsRoots: suggestedFsRoots2,
+      fieldHoldsDraft,
+      hasUnsentDrafts,
+      paintKeepingDrafts
     });
   } catch (e3) {
   }
@@ -1591,6 +1669,19 @@
     ensureSignOutLink(me.email);
     ensureWorkspaceSwitcher();
   }
+  var _SPRINT_BOARD_DRAFTS = [
+    { selector: "input.live-add-input", key: (el2) => el2.id },
+    {
+      selector: ".sprint-item-row",
+      key: (el2) => el2.dataset.item,
+      keep: (row) => !!row.querySelector(
+        ".sprint-edit-input:not([data-saved]), .sprint-notes-textarea:not([data-saved]), .sprint-resources-textarea:not([data-saved])"
+      )
+    }
+  ];
+  function _paintSprintBoard(root, html) {
+    paintKeepingDrafts(root, html, _SPRINT_BOARD_DRAFTS);
+  }
   function renderSprintProgress2(projectId, items) {
     const root = document.getElementById(`live-sprint-progress-${projectId}`);
     if (!root) return;
@@ -1616,7 +1707,7 @@
     })[s3] || "var(--muted)";
     const activeSet = /* @__PURE__ */ new Set(["pending", "todo", "in_progress"]);
     if (items.length === 0) {
-      root.innerHTML = `
+      _paintSprintBoard(root, `
 
       <div class="live-empty">No sprint items. Add one below.</div>
 
@@ -1630,7 +1721,7 @@
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
       root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
       wireSprintAddEnter(projectId, root);
       return;
@@ -1642,7 +1733,7 @@
     );
     if (displayItems.length === 0) displayItems = items.filter((it) => activeStatuses.has(it.status));
     if (displayItems.length === 0) {
-      root.innerHTML = `
+      _paintSprintBoard(root, `
 
       <div class="live-empty" style="color:var(--accent-green)">\u{1F389} Sprint complete! All items done.</div>
 
@@ -1656,7 +1747,7 @@
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
       root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
       wireSprintAddEnter(projectId, root);
       return;
@@ -1685,7 +1776,7 @@
 
           <button class="sprint-btn" title="Back to pending"
 
-            onclick="fetch('/projects/${escapeHtml(projectId)}/sprint-items/${escapeHtml(it.id)}',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'pending'})}).then(()=>refreshLiveTab('${escapeHtml(projectId)}'))">\u21A9 Pending</button>
+            onclick="sprintResetPending('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u21A9 Pending</button>
 
           <button class="sprint-btn sprint-btn-fail" title="Mark failed"
 
@@ -1908,7 +1999,7 @@
 
     </details>`;
     }
-    root.innerHTML = html;
+    _paintSprintBoard(root, html);
     root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
     wireSprintAddEnter(projectId, root);
     try {
@@ -2061,6 +2152,8 @@
       }
       const groupNames = Object.keys(groups).sort((a3, b2) => a3.localeCompare(b2));
       const search = `<input type="text" id="backburner-search-${escapeHtml(projectId)}" placeholder="filter backburner\u2026"
+
+      value="${escapeHtml(panel.backburnerFilter || "")}"
 
       oninput="filterBackburner('${escapeHtml(projectId)}', this.value)"
 
@@ -2701,6 +2794,133 @@
     }
   }
   window._loadSettingsAccountPane = _loadSettingsAccountPane;
+  function _syncAccountCacheAfterSave(projectId, saved) {
+    const data = _settingsTabDataCache.get(`${projectId}:account`);
+    if (!data || !saved || typeof saved !== "object") return;
+    data.ntfyResult = { status: "fulfilled", value: saved };
+  }
+  function _wireAccountPaneHandlers(projectId) {
+    const body = document.getElementById(`settings-body-${projectId}`);
+    const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
+    if (ntfySaveBtn) {
+      ntfySaveBtn.onclick = async () => {
+        const inp = document.getElementById(`ntfy-url-${projectId}`);
+        const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+        const raw = (inp ? inp.value : "").trim() || null;
+        try {
+          const saved = await api(`/projects/${projectId}/ntfy`, {
+            method: "PATCH",
+            body: JSON.stringify({ notify_url: raw, ntfy_url: raw })
+          });
+          _syncAccountCacheAfterSave(projectId, saved);
+          const savedVal = saved && (saved.notify_url || saved.ntfy_url || "");
+          const shownVal = displayNotifyTarget(savedVal || "");
+          if (inp) inp.value = shownVal || "";
+          if (statusEl) {
+            statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase() ? `saved as ${shownVal}` : "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 2400);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = "error";
+        }
+      };
+    }
+    const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
+    if (notifyEmailSaveBtn) {
+      notifyEmailSaveBtn.onclick = async () => {
+        const inp = document.getElementById(`notify-email-${projectId}`);
+        const statusEl = document.getElementById(`notify-email-status-${projectId}`);
+        const raw = (inp ? inp.value : "").trim() || null;
+        try {
+          const savedEmail = await api(`/projects/${projectId}/ntfy`, {
+            method: "PATCH",
+            body: JSON.stringify({ notify_email: raw })
+          });
+          _syncAccountCacheAfterSave(projectId, savedEmail);
+          if (statusEl) {
+            statusEl.textContent = "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 2400);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = "error";
+        }
+      };
+    }
+    const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
+    if (ntfyTestBtn) {
+      ntfyTestBtn.onclick = async () => {
+        const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+        ntfyTestBtn.disabled = true;
+        try {
+          await api(`/projects/${projectId}/notify/test`, { method: "POST", body: "{}" });
+          if (statusEl) {
+            statusEl.textContent = "sent!";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 3e3);
+          }
+        } catch (e3) {
+          if (statusEl) {
+            const raw = String(e3?.message || e3 || "");
+            let msg = raw.replace(/^\d+:\s*/, "");
+            try {
+              const parsed = JSON.parse(msg);
+              msg = parsed.detail || parsed.message || parsed.error || msg;
+            } catch (_err) {
+            }
+            statusEl.textContent = msg.includes("No notify URL configured") ? "save a URL first" : msg;
+          }
+        } finally {
+          ntfyTestBtn.disabled = false;
+        }
+      };
+    }
+    const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
+    if (ntfyWarnAckCb) {
+      ntfyWarnAckCb.onchange = () => {
+        if (!ntfyWarnAckCb.checked) return;
+        try {
+          localStorage.setItem(STORAGE_KEY("ntfy.warn.dismissed"), "1");
+        } catch (e3) {
+        }
+        const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
+        if (warnEl) warnEl.style.display = "none";
+        const inp = document.getElementById(`ntfy-url-${projectId}`);
+        const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
+        const testBtn = document.getElementById(`ntfy-test-${projectId}`);
+        [inp, saveBtn, testBtn].forEach((el2) => {
+          if (el2) {
+            el2.disabled = false;
+            el2.style.opacity = "1";
+          }
+        });
+      };
+    }
+    if (body) body.querySelectorAll("input[data-pref]").forEach((cb) => {
+      cb.onchange = async () => {
+        const statusEl = document.getElementById(`settings-save-status-${projectId}`);
+        const payload = {};
+        body.querySelectorAll("input[data-pref]").forEach((c3) => {
+          payload[c3.dataset.pref] = c3.checked;
+        });
+        try {
+          await api("/settings/notifications", { method: "PATCH", body: JSON.stringify(payload) });
+          if (statusEl) {
+            statusEl.textContent = "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 1800);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
+        }
+      };
+    });
+  }
   function _applySettingsAccountPaneData(projectId, data) {
     const { notifResult, ntfyResult, mcpResult, PREFS } = data;
     const prefs = notifResult.status === "fulfilled" ? notifResult.value.prefs || {} : null;
@@ -2709,6 +2929,7 @@
     if (ntfyPlaceholder) ntfyPlaceholder.outerHTML = _settingsNotificationsCardHtml(projectId, ntfyResult);
     const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
     if (prefsPlaceholder) prefsPlaceholder.outerHTML = _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+    _wireAccountPaneHandlers(projectId);
   }
   window._applySettingsAccountPaneData = _applySettingsAccountPaneData;
   function _activateSettingsTab(projectId, key) {
@@ -2717,11 +2938,8 @@
     body.dataset.activeStab = key;
     _applyActiveTabVisibility(projectId);
     if (key === "account") {
-      const cacheKey = `${projectId}:account`;
-      if (!_settingsTabDataCache.has(cacheKey)) {
-        _loadSettingsAccountPane(projectId).catch(() => {
-        });
-      }
+      _loadSettingsAccountPane(projectId).catch(() => {
+      });
     }
   }
   window._activateSettingsTab = _activateSettingsTab;
@@ -5045,7 +5263,7 @@ project_id = "${displayPid}"`;
       html += _secHtml("account", "Account");
       html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
     <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. Notes and decisions here are injected at the top of every project's context block.</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. A session's start and the context block show only a short index of these (the newest few decisions as one-line summaries, a note count and the titles of notes tagged <code>policy</code>), not note bodies. Fetch the full text with <code>get_workspace_notes</code> and <code>get_workspace_decisions</code>.</div>
     <div style="margin-bottom:12px">
       <div style="font-size:10px;color:var(--text);margin-bottom:4px">Default settings</div>
       <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
@@ -5526,7 +5744,7 @@ project_id = "${displayPid}"`;
           </div>`;
             if (u4.overage_billing === false) {
               const capsRow = document.getElementById(`save-caps-${projectId}`)?.parentElement;
-              if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; usage past the grace allowance is restricted.</span>';
+              if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; you are emailed when usage passes them.</span>';
             }
             const saveBtn = document.getElementById(`save-caps-${projectId}`);
             const capsStatus = document.getElementById(`caps-status-${projectId}`);
@@ -6135,123 +6353,6 @@ project_id = "${displayPid}"`;
         renderHooks();
         if (tokenListEl) loadHooksTokens();
       }, 0);
-      const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
-      if (ntfySaveBtn) {
-        ntfySaveBtn.onclick = async () => {
-          const inp = document.getElementById(`ntfy-url-${projectId}`);
-          const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-          const raw = (inp ? inp.value : "").trim() || null;
-          try {
-            const saved = await api(`/projects/${projectId}/ntfy`, {
-              method: "PATCH",
-              body: JSON.stringify({ notify_url: raw, ntfy_url: raw })
-            });
-            const savedVal = saved && (saved.notify_url || saved.ntfy_url || "");
-            const shownVal = displayNotifyTarget(savedVal || "");
-            if (inp) inp.value = shownVal || "";
-            if (statusEl) {
-              statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase() ? `saved as ${shownVal}` : "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 2400);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = "error";
-          }
-        };
-      }
-      const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
-      if (notifyEmailSaveBtn) {
-        notifyEmailSaveBtn.onclick = async () => {
-          const inp = document.getElementById(`notify-email-${projectId}`);
-          const statusEl = document.getElementById(`notify-email-status-${projectId}`);
-          const raw = (inp ? inp.value : "").trim() || null;
-          try {
-            await api(`/projects/${projectId}/ntfy`, {
-              method: "PATCH",
-              body: JSON.stringify({ notify_email: raw })
-            });
-            if (statusEl) {
-              statusEl.textContent = "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 2400);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = "error";
-          }
-        };
-      }
-      const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
-      if (ntfyTestBtn) {
-        ntfyTestBtn.onclick = async () => {
-          const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-          ntfyTestBtn.disabled = true;
-          try {
-            await api(`/projects/${projectId}/notify/test`, { method: "POST", body: "{}" });
-            if (statusEl) {
-              statusEl.textContent = "sent!";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 3e3);
-            }
-          } catch (e3) {
-            if (statusEl) {
-              const raw = String(e3?.message || e3 || "");
-              let msg = raw.replace(/^\d+:\s*/, "");
-              try {
-                const parsed = JSON.parse(msg);
-                msg = parsed.detail || parsed.message || parsed.error || msg;
-              } catch (_err) {
-              }
-              statusEl.textContent = msg.includes("No notify URL configured") ? "save a URL first" : msg;
-            }
-          } finally {
-            ntfyTestBtn.disabled = false;
-          }
-        };
-      }
-      const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
-      if (ntfyWarnAckCb) {
-        ntfyWarnAckCb.onchange = () => {
-          if (!ntfyWarnAckCb.checked) return;
-          try {
-            localStorage.setItem(STORAGE_KEY("ntfy.warn.dismissed"), "1");
-          } catch (e3) {
-          }
-          const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
-          if (warnEl) warnEl.style.display = "none";
-          const inp = document.getElementById(`ntfy-url-${projectId}`);
-          const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
-          const testBtn = document.getElementById(`ntfy-test-${projectId}`);
-          [inp, saveBtn, testBtn].forEach((el2) => {
-            if (el2) {
-              el2.disabled = false;
-              el2.style.opacity = "1";
-            }
-          });
-        };
-      }
-      body.querySelectorAll("input[data-pref]").forEach((cb) => {
-        cb.onchange = async () => {
-          const statusEl = document.getElementById(`settings-save-status-${projectId}`);
-          const payload = {};
-          body.querySelectorAll("input[data-pref]").forEach((c3) => {
-            payload[c3.dataset.pref] = c3.checked;
-          });
-          try {
-            await api("/settings/notifications", { method: "PATCH", body: JSON.stringify(payload) });
-            if (statusEl) {
-              statusEl.textContent = "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 1800);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
-          }
-        };
-      });
       const ghConnectBtn = document.getElementById(`github-connect-btn-${projectId}`);
       if (ghConnectBtn) {
         ghConnectBtn.onclick = () => {
@@ -6837,9 +6938,22 @@ project_id = "${displayPid}"`;
       };
       document.getElementById(`tp-save-${projectId}`).onclick = async () => {
         try {
-          await api("/tunnel/plugins" + _hq, { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
+          const saved = await api("/tunnel/plugins" + _hq, { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
           toast(_selHost ? `Saved for ${_selHost}` : "Tunnel plugins saved");
-          setStatus("Saved \u2014 restart the tunnel to apply.");
+          const restartNotNeeded = !!(saved && saved.config_generation && saved.config_generation.restart_required === false);
+          await loadTunnelPluginsSection2(projectId, _selHost);
+          try {
+            await window._renderTunnelConfigGenerationBanner?.(projectId);
+          } catch (_2) {
+          }
+          const msg = restartNotNeeded ? "Saved." : "Saved \u2014 restart the tunnel to apply.";
+          const fresh = document.getElementById(`tp-status-${projectId}`);
+          if (fresh) {
+            fresh.textContent = msg;
+            setTimeout(() => {
+              if (fresh.textContent === msg) fresh.textContent = "";
+            }, 2500);
+          }
         } catch (e3) {
           toast("Save failed: " + e3.message, true);
         }
@@ -10674,6 +10788,7 @@ ${n2.tags || ""}`.toLowerCase();
         } catch (_2) {
         }
       });
+      connectAccountWs();
       await loadProjects();
       const active = workspaces.find((w3) => w3.tenant_id === chosen);
       sel.title = active ? active.is_own ? "My workspace" : `${active.owner_email} (${active.role})` : "";
@@ -11453,7 +11568,9 @@ ${n2.tags || ""}`.toLowerCase();
         loadNotesTab(pid),
         refreshProjectCountBadges(pid),
         refreshHitl(pid),
-        loadSprintBoard(pid)
+        // 8a665a03 -- loadSprintBoard is a closure inside buildTabBody, so the bare
+        // call that used to be here threw a ReferenceError (swallowed by the catch).
+        reloadGoalSprintBoard(pid)
       ]);
     } catch (_2) {
     }
@@ -12239,6 +12356,7 @@ Current: ${current || "(none)"}`,
       };
       box.querySelector("#del-proj-confirm").onclick = async () => {
         overlay.remove();
+        (state.deletingProjects = state.deletingProjects || {})[t3.id] = true;
         try {
           await api(`/projects/${t3.id}`, { method: "DELETE" });
           closeTab2(t3.id);
@@ -12254,6 +12372,8 @@ Current: ${current || "(none)"}`,
           } else {
             toast(e3.message.includes("409") ? "Cannot delete \u2014 active tasks in progress." : "Delete failed: " + e3.message, true);
           }
+        } finally {
+          delete state.deletingProjects[t3.id];
         }
         resolve();
       };
@@ -12431,10 +12551,6 @@ Current: ${current || "(none)"}`,
           <span style="display:flex;gap:6px;align-items:center">
 
             <button class="secondary" id="live-auto-btn-${project.id}" title="Toggle auto-refresh" style="padding:2px 8px;font-size:10px">\u21BB Auto</button>
-
-            <button class="secondary" id="live-pause-${project.id}" title="Pause queue (UI stub)" style="padding:2px 8px;font-size:10px">Pause</button>
-
-            <button class="secondary" id="live-run-${project.id}" title="Run all pending (UI stub)" style="padding:2px 8px;font-size:10px">Run All</button>
 
           </span>
 
@@ -13436,6 +13552,7 @@ Current: ${current || "(none)"}`,
           } catch (_2) {
           }
           if (vtab === "files") loadFilesTab(project.id);
+          if (vtab === "goal") reloadGoalSprintBoard(project.id);
           if (vtab === "devlog") refreshTasks(project.id);
           if (vtab === "timeline") loadTimeline2(project.id);
           if (vtab === "rewind") initRewindTab(project.id);
@@ -13567,7 +13684,7 @@ Current: ${current || "(none)"}`,
     if (saveNorthStarBtn) saveNorthStarBtn.onclick = () => saveNorthStar(project.id);
     const saveSprintBtn = document.getElementById(`save-sprint-${project.id}`);
     if (saveSprintBtn) saveSprintBtn.onclick = () => saveSprint(project.id);
-    async function loadSprintBoard2() {
+    async function loadSprintBoard() {
       const sprintItemsPath = `/projects/${project.id}/sprint-items`;
       try {
         const items = await projectApi(project.id, sprintItemsPath);
@@ -13612,8 +13729,8 @@ Current: ${current || "(none)"}`,
         wireProjectLoadRetry2(board, project.id);
       }
     }
-    _sprintBoardReloaders[project.id] = loadSprintBoard2;
-    loadSprintBoard2();
+    _sprintBoardReloaders[project.id] = loadSprintBoard;
+    loadSprintBoard();
     setTimeout(async () => {
       const sel = document.getElementById(`goal-sprint-select-${project.id}`);
       const inp = document.getElementById(`goal-sprint-${project.id}`);
@@ -13665,7 +13782,7 @@ Current: ${current || "(none)"}`,
         try {
           await api(`/projects/${project.id}/sprint-items`, { method: "POST", body: JSON.stringify({ title, version: state.panels[project.id]?.sprint || "current" }) });
           sprintAddInput.value = "";
-          loadSprintBoard2();
+          loadSprintBoard();
         } catch (e3) {
           console.error("Add sprint item failed:", e3);
         }
@@ -13814,10 +13931,6 @@ Current: ${current || "(none)"}`,
     if (!panel) return;
     panel.liveWired = panel.liveWired || false;
     if (!panel.liveWired) {
-      const pause = document.getElementById(`live-pause-${projectId}`);
-      const runAll = document.getElementById(`live-run-${projectId}`);
-      if (pause) pause.onclick = () => toast("Pause is a stub \u2014 coming soon");
-      if (runAll) runAll.onclick = () => toast("Run All is a stub \u2014 coming soon");
       const input = document.getElementById(`live-add-input-${projectId}`);
       if (input) input.addEventListener("keydown", (ev) => {
         if (ev.key !== "Enter") return;
@@ -13997,6 +14110,51 @@ Current: ${current || "(none)"}`,
     } catch (e3) {
     }
   }
+  function reloadGoalSprintBoard(projectId) {
+    try {
+      const reload = _sprintBoardReloaders[projectId];
+      if (reload) Promise.resolve(reload()).catch(() => {
+      });
+    } catch (_2) {
+    }
+  }
+  var _repaintTimers = {};
+  function _debounceRepaint(key, fn, ms = 150) {
+    clearTimeout(_repaintTimers[key]);
+    _repaintTimers[key] = setTimeout(fn, ms);
+  }
+  function scheduleGoalBoardReload(projectId) {
+    const panel = state.panels[projectId];
+    if (panel && panel.activeVtab === "goal") {
+      _debounceRepaint(`goal:${projectId}`, () => reloadGoalSprintBoard(projectId));
+    }
+  }
+  function repaintVisibleSprintViews(projectId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    if (panel.activeVtab === "queue") {
+      _debounceRepaint(`queue:${projectId}`, () => loadQueue(projectId, { quiet: true }));
+    }
+    scheduleGoalBoardReload(projectId);
+  }
+  async function refreshSprintSurfaces(projectId) {
+    repaintVisibleSprintViews(projectId);
+    await refreshLiveTab(projectId);
+  }
+  function applySprintItemDeleted(projectId, itemId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    if (Array.isArray(panel.queueSprintItems)) {
+      const gone = panel.queueSprintItems.find((it) => it.id === itemId);
+      panel.queueSprintItems = panel.queueSprintItems.filter((it) => it.id !== itemId);
+      if (gone && gone.status === "done" && panel.queueTotalDoneCount > 0) panel.queueTotalDoneCount -= 1;
+    }
+    if (panel.activeVtab === "queue" && !queueSearchActive(projectId)) renderQueueBody(projectId);
+  }
+  function queueSearchActive(projectId) {
+    const box = document.getElementById(`task-search-${projectId}`);
+    return !!(box && box.value && box.value.trim());
+  }
   function wireSprintAddEnter2(projectId, root) {
     const inp = root.querySelector(`#sprint-add-input-${projectId}`);
     if (inp) inp.onkeydown = (e3) => {
@@ -14010,7 +14168,7 @@ Current: ${current || "(none)"}`,
         { method: "POST", body: JSON.stringify({}) }
       );
       toast(`Sprint item ${action}d`);
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast(`Failed: ${e3.message}`, true);
     }
@@ -14018,17 +14176,24 @@ Current: ${current || "(none)"}`,
   async function sprintArchive(projectId, itemId) {
     if (!confirm("Permanently delete this backburner item? This cannot be undone.")) return;
     try {
-      const r3 = await fetch(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
-      if (!r3.ok && r3.status !== 204) throw new Error(`${r3.status}`);
+      await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
       toast("Backburner item deleted");
-      await refreshLiveTab(projectId);
+      applySprintItemDeleted(projectId, itemId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast(`Delete failed: ${e3.message}`, true);
     }
   }
   function filterBackburner(projectId, value) {
-    const q2 = (value || "").trim().toLowerCase();
-    const sec = document.querySelector('.queue-section[data-section="backburner"]');
+    const panel = state.panels[projectId];
+    if (panel) panel.backburnerFilter = value || "";
+    applyBackburnerFilter(projectId);
+  }
+  function applyBackburnerFilter(projectId) {
+    const panel = state.panels[projectId];
+    const q2 = (panel && panel.backburnerFilter || "").trim().toLowerCase();
+    const scope = document.getElementById(`queue-body-${projectId}`) || document;
+    const sec = scope.querySelector('.queue-section[data-section="backburner"]');
     if (!sec) return;
     sec.querySelectorAll(".queue-item").forEach((el2) => {
       const hit = !q2 || (el2.dataset.bbTitle || "").includes(q2) || (el2.dataset.bbGroup || "").includes(q2);
@@ -14048,9 +14213,21 @@ Current: ${current || "(none)"}`,
         { method: "POST", body: JSON.stringify({ to_version: toVersion }) }
       );
       toast("Sprint item pushed to " + toVersion);
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast(`Push failed: ${e3.message}`, true);
+    }
+  }
+  async function sprintResetPending(projectId, itemId) {
+    try {
+      await api(
+        `/projects/${projectId}/sprint-items/${itemId}`,
+        { method: "PATCH", body: JSON.stringify({ status: "pending" }) }
+      );
+      toast("Sprint item back to pending");
+      await refreshSprintSurfaces(projectId);
+    } catch (e3) {
+      toast(`Failed: ${e3.message}`, true);
     }
   }
   async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
@@ -14061,7 +14238,7 @@ Current: ${current || "(none)"}`,
         `/projects/${projectId}/sprint-items/${itemId}`,
         { method: "PATCH", body: JSON.stringify({ feedback_thumb: newThumb }) }
       );
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Feedback failed: " + e3.message, true);
     }
@@ -14073,7 +14250,7 @@ Current: ${current || "(none)"}`,
         `/projects/${projectId}/sprint-items/${itemId}`,
         { method: "PATCH", body: JSON.stringify({ feedback_note: note.trim() }) }
       );
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Note save failed: " + e3.message, true);
     }
@@ -14111,7 +14288,8 @@ Current: ${current || "(none)"}`,
           method: "PATCH",
           body: JSON.stringify({ title: newTitle, version: newVersion || void 0 })
         });
-        await refreshLiveTab(projectId);
+        titleInput.dataset.saved = verInput.dataset.saved = "1";
+        await refreshSprintSurfaces(projectId);
       } catch (e3) {
         toast(`Save failed: ${e3.message}`, true);
         cancel();
@@ -14120,6 +14298,7 @@ Current: ${current || "(none)"}`,
     const cancel = () => {
       titleInput.replaceWith(titleSpan);
       verInput.replaceWith(verSpan);
+      refreshSprintSurfaces(projectId);
     };
     titleInput.onkeydown = verInput.onkeydown = (e3) => {
       if (e3.key === "Enter") {
@@ -14133,6 +14312,147 @@ Current: ${current || "(none)"}`,
         if (!row.contains(document.activeElement)) save();
       }, 150);
     };
+  }
+  async function sprintItemNotesEdit(projectId, itemId) {
+    const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+    if (!row) return;
+    const curNotes = row.dataset.notes || "";
+    if (row.querySelector(".sprint-notes-textarea")) return;
+    const existingNotesEl = row.querySelector(".sprint-item-notes");
+    const textarea = document.createElement("textarea");
+    textarea.className = "sprint-notes-textarea";
+    textarea.value = curNotes;
+    textarea.placeholder = "Add context, links, or notes\u2026";
+    textarea.style.cssText = "width:100%;min-height:56px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:3px 5px;color:var(--text);font-size:10px;font-family:var(--font-mono);line-height:1.4;resize:vertical;box-sizing:border-box;margin-top:3px";
+    if (existingNotesEl) {
+      existingNotesEl.replaceWith(textarea);
+    } else {
+      const titleSpan = row.querySelector(".sprint-item-title");
+      if (titleSpan) titleSpan.parentNode.insertBefore(textarea, titleSpan.nextSibling);
+      else row.appendChild(textarea);
+    }
+    textarea.focus();
+    const save = async () => {
+      const newNotes = textarea.value.trim() || null;
+      try {
+        await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ notes: newNotes })
+        });
+        row.dataset.notes = newNotes || "";
+        textarea.dataset.saved = "1";
+        await refreshSprintSurfaces(projectId);
+      } catch (e3) {
+        toast(`Save failed: ${e3.message}`, true);
+        cancel();
+      }
+    };
+    const cancel = () => {
+      if (existingNotesEl) textarea.replaceWith(existingNotesEl);
+      else textarea.remove();
+      refreshSprintSurfaces(projectId);
+    };
+    textarea.onkeydown = (e3) => {
+      if (e3.key === "Escape") {
+        e3.preventDefault();
+        cancel();
+      }
+      if (e3.key === "Enter" && (e3.ctrlKey || e3.metaKey)) {
+        e3.preventDefault();
+        save();
+      }
+    };
+    textarea.onblur = () => setTimeout(() => {
+      if (!row.contains(document.activeElement)) save();
+    }, 150);
+  }
+  async function sprintItemResourcesEdit(projectId, itemId, rawJson) {
+    const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+    if (!row) return;
+    if (row.querySelector(".sprint-resources-textarea")) return;
+    let current = [];
+    try {
+      current = JSON.parse(rawJson || "[]");
+    } catch {
+      current = [];
+    }
+    const existingEl = row.querySelector(".sprint-item-resources");
+    const textarea = document.createElement("textarea");
+    textarea.className = "sprint-resources-textarea";
+    textarea.value = current.join("\n");
+    textarea.placeholder = "One resource per line, e.g.\nfile:meridian/db/__init__.py\nnote:my-note\ndecision:abc123";
+    textarea.style.cssText = "width:100%;min-height:56px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:3px 5px;color:var(--text);font-size:10px;font-family:var(--font-mono);line-height:1.4;resize:vertical;box-sizing:border-box;margin-top:3px";
+    if (existingEl) {
+      existingEl.replaceWith(textarea);
+    } else {
+      const notesEl = row.querySelector(".sprint-item-notes");
+      const anchor = notesEl || row.querySelector(".sprint-item-title");
+      if (anchor) anchor.parentNode.insertBefore(textarea, anchor.nextSibling);
+      else row.appendChild(textarea);
+    }
+    textarea.focus();
+    const save = async () => {
+      const lines = textarea.value.split("\n").map((s3) => s3.trim()).filter(Boolean);
+      try {
+        await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ touches_resources: lines.length ? lines : null })
+        });
+        textarea.dataset.saved = "1";
+        await refreshSprintSurfaces(projectId);
+      } catch (e3) {
+        toast(`Save failed: ${e3.message}`, true);
+        cancel();
+      }
+    };
+    const cancel = () => {
+      if (existingEl) textarea.replaceWith(existingEl);
+      else textarea.remove();
+      refreshSprintSurfaces(projectId);
+    };
+    textarea.onkeydown = (e3) => {
+      if (e3.key === "Escape") {
+        e3.preventDefault();
+        cancel();
+      }
+      if (e3.key === "Enter" && (e3.ctrlKey || e3.metaKey)) {
+        e3.preventDefault();
+        save();
+      }
+    };
+    textarea.onblur = () => setTimeout(() => {
+      if (!row.contains(document.activeElement)) save();
+    }, 150);
+  }
+  async function resourceChipClick(projectId, resourceId) {
+    const existing = document.getElementById("resource-chip-popover");
+    if (existing) existing.remove();
+    let items = [];
+    try {
+      items = await api(`/projects/${projectId}/resources/sprint-items?resource=${encodeURIComponent(resourceId)}`);
+    } catch (e3) {
+      toast(`Lookup failed: ${e3.message}`, true);
+      return;
+    }
+    const pop = document.createElement("div");
+    pop.id = "resource-chip-popover";
+    pop.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--surface-0,#1a1a1a);border:1px solid var(--border);border-radius:6px;padding:12px 14px;z-index:9999;min-width:280px;max-width:480px;max-height:320px;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.6)";
+    const esc = (s3) => (s3 || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    pop.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-size:11px;font-weight:600;color:var(--text)">Sprint items touching <code style="font-size:10px">${esc(resourceId)}</code></span>
+      <button onclick="document.getElementById('resource-chip-popover')!.remove()" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px;line-height:1;padding:0 2px">\u2715</button>
+    </div>
+    ${items.length === 0 ? `<div style="font-size:10px;color:var(--muted)">No sprint items reference this resource.</div>` : items.map((it) => `<div style="font-size:10px;padding:4px 0;border-top:1px solid var(--border);color:var(--text)"><span style="color:var(--muted);margin-right:4px">${esc(it.status)}</span>${esc(it.title)}</div>`).join("")}
+  `;
+    document.body.appendChild(pop);
+    const close = (e3) => {
+      if (!pop.contains(e3.target)) {
+        pop.remove();
+        document.removeEventListener("click", close);
+      }
+    };
+    setTimeout(() => document.addEventListener("click", close), 50);
   }
   async function loadSprintNotesPanel(projectId, sessionId) {
     const section = document.getElementById(`sprint-notes-section-${projectId}`);
@@ -14204,7 +14524,7 @@ Current: ${current || "(none)"}`,
       inp.value = "";
       inp.style.borderColor = "";
       toast("Sprint item added");
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Add failed: " + e3.message, true);
     }
@@ -15883,8 +16203,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!body) return;
     const urgencyColor = { blocking: "var(--red,#e05252)", high: "var(--yellow,#d4a017)", normal: "var(--muted)" };
     const statusBadge = { pending: "#f59e0b", answered: "#22c55e", dismissed: "var(--muted)" };
+    const draftUnits = [{ selector: 'input[id^="hitl-ans-"]', key: (el2) => el2.id }];
     const render = async () => {
-      body.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
+      if (!hasUnsentDrafts(body, draftUnits)) body.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
       const status = statusFilter && statusFilter.value || "pending";
       const qs = status === "all" ? "?status=all" : `?status=${status}`;
       try {
@@ -16014,7 +16335,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           html += `<div style="color:var(--muted);font-size:10px;margin:12px 0 6px;border-top:1px solid var(--border);padding-top:8px">RESOLVED (${resolved.length})</div>`;
           html += resolved.map(renderCard).join("");
         }
-        body.innerHTML = html;
+        paintKeepingDrafts(body, html, draftUnits);
         _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, ".hitl-row");
         body.querySelectorAll(".hitl-answer-btn").forEach((btn) => {
           btn.onclick = async () => {
@@ -16124,7 +16445,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           };
         });
       } catch (e3) {
-        body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e3))}</div>`;
+        if (hasUnsentDrafts(body, draftUnits)) console.warn("[meridian] HITL queue refresh failed:", e3);
+        else body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e3))}</div>`;
       }
     };
     if (statusFilter) statusFilter.onchange = render;
@@ -16738,12 +17060,46 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = '<div style="color:var(--muted);font-size:10px">Could not load runs.</div>';
     }
   }
-  async function loadQueue(projectId) {
+  function renderQueueBody(projectId) {
+    const body = document.getElementById(`queue-body-${projectId}`);
+    const panel = state.panels[projectId];
+    if (!body || !panel) return;
+    const filterId = `backburner-search-${projectId}`;
+    const active = document.activeElement;
+    const hadFilterFocus = !!(active && active.id === filterId);
+    const caret = hadFilterFocus ? { start: active.selectionStart, end: active.selectionEnd } : null;
+    const scrollTop = body.scrollTop;
+    body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
+    applyBackburnerFilter(projectId);
+    if (scrollTop) body.scrollTop = scrollTop;
+    if (hadFilterFocus) {
+      const next = document.getElementById(filterId);
+      if (next) {
+        next.focus();
+        try {
+          if (caret && caret.start != null) next.setSelectionRange(caret.start, caret.end ?? caret.start);
+        } catch (_2) {
+        }
+      }
+    }
+    wireQueueSectionToggles(projectId);
+    const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
+    if (moreBtn) {
+      moreBtn.onclick = () => {
+        panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
+        renderQueueBody(projectId);
+      };
+    }
+  }
+  async function loadQueue(projectId, opts = {}) {
     const body = document.getElementById(`queue-body-${projectId}`);
     if (!body) return;
     const panel = getPanelState(projectId);
     if (!panel.queueDoneLimit) panel.queueDoneLimit = QUEUE_DONE_PAGE_SIZE;
-    body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    const quietKeep = !!(opts && opts.quiet && (body.querySelector(".queue-section") || queueSearchActive(projectId)));
+    if (!quietKeep) {
+      body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    }
     try {
       const [sessions, sprintItems] = await Promise.all([
         projectApi(projectId, `/projects/${projectId}/sessions?active_only=false`).catch(() => []),
@@ -16754,18 +17110,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const sprintPayload = sprintItems || [];
       panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : sprintPayload.items || [];
       panel.queueTotalDoneCount = Array.isArray(sprintPayload) ? panel.queueSprintItems.filter((it) => it.status === "done").length : sprintPayload.total_done_count || 0;
-      const renderCurrentQueue = () => {
-        body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
-        wireQueueSectionToggles(projectId);
-        const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
-        if (moreBtn) {
-          moreBtn.onclick = () => {
-            panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
-            renderCurrentQueue();
-          };
-        }
-      };
-      renderCurrentQueue();
+      const renderCurrentQueue = () => renderQueueBody(projectId);
+      if (!(opts && opts.quiet && queueSearchActive(projectId))) renderCurrentQueue();
       loadRecentSessions(projectId, sessions || []);
       const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
       if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
@@ -17082,6 +17428,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       if (titleEl) titleEl.textContent = "Goal state unavailable";
     }
   }
+  async function refreshDecisionsLog(projectId) {
+    if (!document.getElementById(`decisions-table-${projectId}`)) return;
+    try {
+      const goal = await projectApi(projectId, `/projects/${projectId}/goal`);
+      renderDecisionsTable(projectId, goal.decisions || "");
+    } catch (_2) {
+    }
+  }
   function parseDecisionsBlob(blob) {
     if (!blob || typeof blob !== "string") return [];
     const chunks = blob.split(/\n\s*\n/).map((c3) => c3.trim()).filter(Boolean);
@@ -17258,7 +17612,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         return;
       }
       bar.style.display = "flex";
-      list.innerHTML = items.map((r3) => {
+      const draftUnits = [{ selector: "input.hitl-answer-input", key: (el2) => el2.dataset.hitlId }];
+      paintKeepingDrafts(list, items.map((r3) => {
         const color = _HITL_URGENCY_COLOR[r3.urgency] || _HITL_URGENCY_COLOR.normal;
         const ts = formatRelativeTime(r3.created_at);
         const ctx = r3.context ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--muted);font-size:10px">context</summary><pre style="margin:6px 0 0;padding:6px 8px;background:var(--surface-1);border-radius:3px;font-size:11px;white-space:pre-wrap;word-break:break-word">${escapeHtml(r3.context)}</pre></details>` : "";
@@ -17300,7 +17655,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         </div>
 
       </div>`;
-      }).join("");
+      }).join(""), draftUnits);
       list.querySelectorAll(".hitl-answer-btn").forEach((btn) => {
         btn.onclick = () => _hitlAnswer(btn.dataset.hitlId);
       });
@@ -17366,6 +17721,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       getPanelState(projectId)._pinnedDecisions = items || [];
       setVtabCountBadge2(`.decisions-gtab-badge[data-pid="${projectId}"]`, (items || []).length);
       renderConstitutionWarning2(projectId);
+      if (Array.from(host.querySelectorAll(".decision-edit-area")).some((el2) => el2.style.display === "block")) return;
       if (!items || items.length === 0) {
         host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet \u2014 call <code>pin_decision</code> from MCP)</div>`;
         return;
@@ -17495,7 +17851,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         };
       });
       host.querySelectorAll(".decision-edit-cancel").forEach((btn) => {
-        btn.onclick = () => hideEdit(btn.dataset.id);
+        btn.onclick = () => {
+          hideEdit(btn.dataset.id);
+          loadPinnedDecisions(projectId, { showArchived });
+        };
       });
       host.querySelectorAll(".decision-edit-save").forEach((btn) => {
         btn.onclick = async () => {
@@ -18076,7 +18435,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!root || !hitlRoot) return;
     const hitl = tasks.filter((t3) => t3.status === "pending-hitl");
     banner.style.display = hitl.length ? "block" : "none";
-    hitlRoot.innerHTML = hitl.map((t3) => renderHitlRow(projectId, t3)).join("");
+    paintKeepingDrafts(
+      hitlRoot,
+      hitl.map((t3) => renderHitlRow(projectId, t3)).join(""),
+      [{ selector: "input[data-input]", key: (el2) => el2.dataset.input }]
+    );
     hitl.forEach((t3) => wireHitlRow(projectId, t3));
     root.innerHTML = tasks.map((t3) => renderTaskRow(t3)).join("");
     _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, ".task");
@@ -18141,10 +18504,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!confirm(warn)) return;
     try {
       await api("/tasks/" + taskId, { method: "DELETE" });
+      dropTaskFromCaches(taskId);
       const row = document.getElementById("task-row-" + taskId);
       if (row) row.remove();
     } catch (e22) {
       console.error("Delete failed:", e22);
+    }
+  }
+  function dropTaskFromCaches(taskId, onlyProjectId) {
+    const ids = onlyProjectId ? [onlyProjectId] : Object.keys(state.panels);
+    for (const pid of ids) {
+      const p3 = state.panels[pid];
+      if (!p3 || !Array.isArray(p3.taskCache)) continue;
+      const before = p3.taskCache.length;
+      p3.taskCache = p3.taskCache.filter((t3) => t3.id !== taskId);
+      if (p3.taskCache.length < before) p3.taskOffset = Math.max(0, (p3.taskOffset || 0) - 1);
     }
   }
   function renderHitlRow(projectId, t3) {
@@ -18246,6 +18620,17 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const dot = document.getElementById(`ws-${projectId}`);
     ws.onopen = () => {
       dot && dot.classList.add("connected");
+      const panel = state.panels[projectId];
+      if (panel) {
+        const reopened = !!panel.wsOpenedBefore;
+        panel.wsOpenedBefore = true;
+        if (reopened) {
+          try {
+            resyncProjectViews(projectId);
+          } catch (_2) {
+          }
+        }
+      }
     };
     ws.onclose = () => {
       dot && dot.classList.remove("connected");
@@ -18264,6 +18649,86 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
     };
     state.panels[projectId].ws = ws;
+  }
+  function connectAccountWs() {
+    const previous = state.accountWs;
+    state.accountWs = null;
+    if (previous) {
+      try {
+        previous.close();
+      } catch (_2) {
+      }
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const workspace = state.activeWorkspaceTenantId ? `?workspace=${encodeURIComponent(state.activeWorkspaceTenantId)}` : "";
+    let sock;
+    try {
+      sock = new WebSocket(`${proto}//${location.host}/ws-account${workspace}`);
+    } catch (_2) {
+      return;
+    }
+    state.accountWs = sock;
+    let opened = false;
+    sock.onopen = () => {
+      opened = true;
+      state.accountWsFailures = 0;
+      refreshProjectListFromAccount();
+    };
+    sock.onclose = (ev) => {
+      if (state.accountWs !== sock) return;
+      state.accountWs = null;
+      if (ev && ev.code === 4401) return;
+      const failures = opened ? 0 : (state.accountWsFailures || 0) + 1;
+      state.accountWsFailures = failures;
+      const delay = failures === 0 ? 1500 : Math.min(3e4, 1500 * 2 ** (failures - 1));
+      setTimeout(() => {
+        if (!state.accountWs) connectAccountWs();
+      }, delay);
+    };
+    sock.onerror = () => {
+    };
+    sock.onmessage = (ev) => {
+      try {
+        handleAccountEvent(JSON.parse(ev.data));
+      } catch (_2) {
+      }
+    };
+  }
+  function refreshProjectListFromAccount() {
+    _debounceRepaint("projects", async () => {
+      await loadProjects();
+      dismissEmptyAccountWizard();
+    });
+  }
+  function dismissEmptyAccountWizard() {
+    const wizard = document.getElementById("ez-wizard");
+    if (!wizard || wizard.style.display !== "flex" || state.projects.length === 0) return;
+    wizard.style.display = "none";
+    restoreTabs();
+  }
+  function handleAccountEvent(event) {
+    if (event.type === "projects_changed") {
+      refreshProjectListFromAccount();
+    }
+  }
+  function resyncProjectViews(projectId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    _debounceRepaint("projects", () => {
+      loadProjects();
+    });
+    repaintVisibleSprintViews(projectId);
+    const jobs = [
+      refreshTab(projectId),
+      // goal + Active Sessions + the Devlog task list
+      loadPinnedDecisions(projectId),
+      refreshProjectCountBadges(projectId),
+      refreshHitl()
+    ];
+    if (panel.activeVtab === "live") jobs.push(refreshLiveTab(projectId));
+    if (panel.activeVtab === "notes") jobs.push(loadNotesTab(projectId));
+    if (panel.activeVtab === "insights") jobs.push(loadInsightsTab(projectId));
+    Promise.allSettled(jobs);
   }
   function handleWsEvent(projectId, event) {
     if (event.type === "update_available") {
@@ -18290,39 +18755,97 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
       return;
     }
+    if (event.type === "project_icon_changed") {
+      const tab = state.tabs.find((t3) => t3.id === event.project_id);
+      if (tab) tab.project = { ...tab.project, icon: event.icon || null };
+      const proj = state.projects.find((p3) => p3.id === event.project_id);
+      if (proj) proj.icon = event.icon || null;
+      renderTabs();
+      return;
+    }
+    if (event.type === "project_parent_changed") {
+      const tab = state.tabs.find((t3) => t3.id === event.project_id);
+      if (tab) tab.project = { ...tab.project, parent_project_id: event.parent_project_id || null };
+      loadProjects();
+      return;
+    }
+    if (event.type === "project_deleted") {
+      if (state.tabs.some((t3) => t3.id === projectId)) {
+        if (!(state.deletingProjects && state.deletingProjects[projectId])) toast("This project was deleted");
+        closeTab2(projectId);
+      }
+      _debounceRepaint("projects", () => {
+        loadProjects();
+      });
+      return;
+    }
+    if (event.type === "project_merged") {
+      resyncProjectViews(projectId);
+      return;
+    }
     if (event.type === "sprint_item_updated") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+      repaintVisibleSprintViews(projectId);
+      scheduleLiveRefresh(projectId);
+      return;
+    }
+    if (event.type === "sprint_item_deleted") {
+      applySprintItemDeleted(projectId, event.item_id);
+      scheduleGoalBoardReload(projectId);
       scheduleLiveRefresh(projectId);
       return;
     }
     if (event.type === "goal_updated") {
       noteGoalEvent(projectId, event);
+      if (event.field === "decisions") {
+        _debounceRepaint(`decisions-log:${projectId}`, () => {
+          refreshDecisionsLog(projectId);
+        });
+        return;
+      }
       refreshGoal(projectId);
       return;
     }
-    if (event.type === "session_started") {
+    if (event.type === "session_started" || event.type === "session_updated") {
       const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId, { quiet: true });
       scheduleLiveRefresh(projectId);
+      refreshSessions(projectId);
       return;
     }
-    if (event.type === "sprint_item_added") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+    if (event.type === "sprint_item_added" || event.type === "sprint_items_fanned_out") {
+      repaintVisibleSprintViews(projectId);
       scheduleLiveRefresh(projectId);
       refreshProjectCountBadges(projectId);
       return;
     }
-    if (event.type === "note_added") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "notes") loadNotesTab(projectId);
-      refreshProjectCountBadges(projectId);
+    if (event.type === "note_added" || event.type === "note_updated" || event.type === "note_deleted") {
+      _debounceRepaint(`notes:${projectId}`, () => {
+        const panel2 = state.panels[projectId];
+        if (panel2 && panel2.activeVtab === "notes") loadNotesTab(projectId);
+        refreshProjectCountBadges(projectId);
+      });
       return;
     }
-    if (event.type === "decision_pinned") {
-      if (state.panels[projectId]) loadPinnedDecisions(projectId);
-      refreshProjectCountBadges(projectId);
+    if (event.type === "decision_pinned" || event.type === "decision_updated" || event.type === "decision_deleted") {
+      _debounceRepaint(`decisions:${projectId}`, () => {
+        if (state.panels[projectId]) loadPinnedDecisions(projectId);
+        refreshProjectCountBadges(projectId);
+      });
+      return;
+    }
+    if (event.type === "insight_added") {
+      const panel2 = state.panels[projectId];
+      if (panel2 && panel2.activeVtab === "insights") loadInsightsTab(projectId);
+      return;
+    }
+    if (event.type === "task_deleted") {
+      dropTaskFromCaches(event.task_id, projectId);
+      const panel2 = state.panels[projectId];
+      if (panel2) {
+        renderTasks(projectId);
+        if (panel2.activeVtab === "queue") updateLiveFeed(projectId);
+      }
+      scheduleLiveRefresh(projectId);
       return;
     }
     if (event.type === "hitl_filed") {
@@ -18428,6 +18951,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       } catch (_2) {
       }
     }
+    if (!isDemoMode()) connectAccountWs();
     if (isDemoMode()) hideDemoAdminControls();
     if (isHostedMode()) hideHostedAdminControls();
     if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher2();
@@ -18513,39 +19037,6 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   })();
   var _sprintBoardReloaders = {};
   var _sprintSelectSyncers = {};
-  async function _deleteSprintItem(projectId, itemId) {
-    if (!confirm("Remove this sprint item?")) return;
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Delete sprint item failed:", e3);
-    }
-  }
-  async function _sprintAction(projectId, itemId, action) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/${action}`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Sprint action failed:", action, e3);
-    }
-  }
-  async function completeSprintItem(projectId, itemId) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/complete`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Complete sprint item failed:", e3);
-    }
-  }
-  async function failSprintItem(projectId, itemId) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/fail`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Fail sprint item failed:", e3);
-    }
-  }
   document.getElementById("ez-create-btn").onclick = async () => {
     const nameEl = document.getElementById("ez-project-name");
     const humanEl = document.getElementById("ez-human-name");
@@ -18692,7 +19183,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, flattenHierarchy, eligibleParents, state });
+    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, connectAccountWs, handleAccountEvent, dismissEmptyAccountWizard, refreshDecisionsLog, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state });
   } catch (e3) {
   }
 })();

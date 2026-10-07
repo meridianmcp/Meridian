@@ -899,21 +899,13 @@ describe("sprint board buttons: labels and the Needs-attention 'Pending' handler
     expect(Array.from(btn.attributes).map((a) => a.name).sort()).toEqual(["class", "onclick", "title"]);
   });
 
-  it("clicking it PATCHes the item back to pending, then refreshes the Live tab", async () => {
+  it("clicking it calls the shared sprintResetPending helper for this item (it PATCHes, then repaints Queue, Live and the Goal board; see live-refresh.test.ts)", () => {
     const row = allRows().find((r) => r.dataset.item === "ind" && kindOf(r) === "attention")!;
     const code = row.querySelector<HTMLButtonElement>('button[title="Back to pending"]')!.getAttribute("onclick")!;
-    const fetchSpy = vi.fn().mockResolvedValue({ ok: true });
-    const refreshSpy = vi.fn();
-    // an inline handler runs in global scope: give it only the two globals it may use
-    const handler = new Function("fetch", "refreshLiveTab", code);
-    handler(fetchSpy, refreshSpy);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchSpy.mock.calls[0];
-    expect(url).toBe(`/projects/${PID}/sprint-items/ind`);
-    expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body)).toEqual({ status: "pending" });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(refreshSpy).toHaveBeenCalledWith(PID);
+    const helper = vi.fn();
+    // an inline handler runs in global scope: give it only the one global it may use
+    new Function("sprintResetPending", code)(helper);
+    expect(helper).toHaveBeenCalledTimes(1);
+    expect(helper).toHaveBeenCalledWith(PID, "ind");
   });
 });

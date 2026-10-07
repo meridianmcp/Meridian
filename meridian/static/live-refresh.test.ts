@@ -1113,6 +1113,7 @@ describe("buildTabBody registers the Goal-tab sprint board reloader", () => {
       projectApi,
       wireClaudeLaunchPanel: vi.fn(),
       autosizeGoalField: vi.fn(),
+      initGoalFields: vi.fn(), // the goal lane's field editors (fc779141); not under test here
       refreshTab: vi.fn(),
       connectWs: vi.fn(),
     });

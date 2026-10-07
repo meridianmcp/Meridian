@@ -67,6 +67,7 @@ function setup(over: Mocks = {}, extraFunctions: string[] = []) {
     toast: vi.fn(),
     confirm: vi.fn(() => true), // "North star is intended to be stable. Save changes?"
     autosizeGoalField: vi.fn(),
+    noteGoalEvent: vi.fn(), // goal lane (fc779141): records who changed which field; not under test here
     formatRelativeTime: () => "just now",
     renderDecisionsTable: vi.fn(),
     loadPinnedDecisions: vi.fn(),
@@ -84,284 +85,12 @@ function setup(over: Mocks = {}, extraFunctions: string[] = []) {
   return { dom, state, m, fns };
 }
 
-describe("refreshGoal keeps an unsaved edit", () => {
-  it("control: clean fields take the server's values", async () => {
-    const { dom, fns } = setup();
-    await fns.refreshGoal(PID);
-    expect(dom.goal.value).toBe("CURRENT FOCUS\nserver focus text");
-    expect(dom.ns.value).toBe("server north star");
-    expect(dom.sprint.value).toBe("server sprint");
-    expect(dom.version.textContent).toBe("v7");
-  });
-
-  it("a dirty Goal textarea keeps its text AND its dirty marker (the verifier's repro)", async () => {
-    const { dom, state, fns } = setup();
-    await fns.refreshGoal(PID);
-    const baseline = state.panels[PID]._lastSaved;
-    type(dom.goal, "UNSAVED GOAL TEXT");
-    await fns.refreshGoal(PID);
-    expect(dom.goal.value).toBe("UNSAVED GOAL TEXT");
-    expect(dom.goal.classList.contains("dirty")).toBe(true);
-    // ...against the baseline it was typed over, so a later blur compares like with like.
-    expect(state.panels[PID]._lastSaved).toBe(baseline);
-  });
-
-  it("a dirty North Star keeps its text, marker and baseline", async () => {
-    const { dom, state, fns } = setup();
-    await fns.refreshGoal(PID);
-    type(dom.ns, "UNSAVED NS");
-    state.panels[PID]._serverNorthStar = "the baseline it was typed over";
-    await fns.refreshGoal(PID);
-    expect(dom.ns.value).toBe("UNSAVED NS");
-    expect(dom.ns.classList.contains("dirty")).toBe(true);
-    expect(state.panels[PID]._serverNorthStar).toBe("the baseline it was typed over");
-  });
-
-  it("a dirty Sprint keeps its text and does not run the select syncer over it", async () => {
-    const syncer = vi.fn();
-    const { dom, fns } = setup({ _sprintSelectSyncers: { [PID]: syncer } });
-    type(dom.sprint, "UNSAVED SPRINT");
-    await fns.refreshGoal(PID);
-    expect(dom.sprint.value).toBe("UNSAVED SPRINT");
-    expect(dom.sprint.classList.contains("dirty")).toBe(true);
-    expect(syncer).not.toHaveBeenCalled();
-  });
-
-  it("control: a clean Sprint does go through the select syncer", async () => {
-    const syncer = vi.fn();
-    const { fns } = setup({ _sprintSelectSyncers: { [PID]: syncer } });
-    await fns.refreshGoal(PID);
-    expect(syncer).toHaveBeenCalledWith("server sprint");
-  });
-
-  it("only the dirty field is kept: the others still refresh, and so do the read-only zones", async () => {
-    const { dom, fns } = setup();
-    type(dom.ns, "UNSAVED NS");
-    await fns.refreshGoal(PID);
-    expect(dom.ns.value).toBe("UNSAVED NS");
-    expect(dom.goal.value).toBe("CURRENT FOCUS\nserver focus text");
-    expect(dom.sprint.value).toBe("server sprint");
-    expect(dom.title.textContent).toBe("v1.0 — the label");
-    expect(dom.shipped.textContent).toBe("SHIPPED so far");
-    expect(dom.version.textContent).toBe("v7");
-  });
-
-  it("the decisions table and pinned decisions still refresh under a dirty field", async () => {
-    const { dom, m, fns } = setup();
-    type(dom.goal, "UNSAVED GOAL TEXT");
-    await fns.refreshGoal(PID);
-    expect(m.renderDecisionsTable).toHaveBeenCalledWith(PID, "[2026-10-07] a logged decision");
-    expect(m.loadPinnedDecisions).toHaveBeenCalledWith(PID);
-  });
-
-  it("judges 'dirty' AFTER the fetch: text typed while the request was in flight survives", async () => {
-    let release: (g: any) => void = () => {};
-    const { dom, fns } = setup({ projectApi: vi.fn(() => new Promise((r) => { release = r; })) });
-    const pending = fns.refreshGoal(PID);
-    type(dom.goal, "TYPED DURING THE FETCH"); // typed after the request left, before it returned
-    release({ ...SERVER_GOAL });
-    await pending;
-    expect(dom.goal.value).toBe("TYPED DURING THE FETCH");
-    expect(dom.goal.classList.contains("dirty")).toBe(true);
-  });
-
-  it("a fetch that fails after the goal loaded once blanks nothing (reconnect resync against a restarting server)", async () => {
-    const projectApi = vi.fn(async () => ({ ...SERVER_GOAL }));
-    const { dom, fns } = setup({ projectApi });
-    await fns.refreshGoal(PID);
-    projectApi.mockRejectedValueOnce(new Error("server warming up"));
-    type(dom.goal, "UNSAVED GOAL TEXT");
-    await fns.refreshGoal(PID);
-    expect(dom.goal.value).toBe("UNSAVED GOAL TEXT");
-    expect(dom.version.textContent).toBe("v7");
-    // and a CLEAN field keeps the last good view instead of showing "unavailable"
-    dom.goal.classList.remove("dirty");
-    dom.goal.value = "CURRENT FOCUS\nserver focus text";
-    projectApi.mockRejectedValueOnce(new Error("blip"));
-    await fns.refreshGoal(PID);
-    expect(dom.goal.value).toBe("CURRENT FOCUS\nserver focus text");
-    expect(dom.title.textContent).toBe("v1.0 — the label");
-  });
-
-  it("a goal that never loaded still reports the failure", async () => {
-    const { dom, fns } = setup({ projectApi: vi.fn(async () => { throw new Error("down"); }) });
-    await fns.refreshGoal(PID);
-    expect(dom.goal.placeholder).toBe("Goal state failed to load.");
-    expect(dom.version.textContent).toBe("(load failed)");
-    expect(dom.title.textContent).toBe("Goal state unavailable");
-  });
-
-  it("refreshTab (the reconnect resync path) keeps the unsaved edit too", async () => {
-    const { dom, fns } = setup();
-    await fns.refreshGoal(PID);
-    type(dom.goal, "UNSAVED GOAL TEXT");
-    type(dom.ns, "UNSAVED NS");
-    await fns.refreshTab(PID);
-    expect(dom.goal.value).toBe("UNSAVED GOAL TEXT");
-    expect(dom.ns.value).toBe("UNSAVED NS");
-  });
-});
-
-// A goal with NO version-label line (and no CURRENT FOCUS / KEY FILES heading) takes the
-// other branch of refreshGoal: the title bar is hidden and the whole content is the editable
-// text. That branch has its own `ta.value = ...` assignment, so it needs its own dirty guard --
-// dropping it left every test above green, because SERVER_GOAL always has a version label and
-// a CURRENT FOCUS heading.
-describe("refreshGoal keeps an unsaved edit in a free-text goal (no version-label line)", () => {
-  const FREE_TEXT = "Ship the importer first.\nThen the exporter.";
-  const freeGoal = (content: any, over: Record<string, any> = {}) => ({ ...SERVER_GOAL, content, version: 3, ...over });
-
-  it("control: a clean field takes the whole free text and no title bar is shown", async () => {
-    const { dom, fns } = setup({ projectApi: vi.fn(async () => freeGoal(FREE_TEXT)) });
-    await fns.refreshGoal(PID);
-    expect(dom.goal.value).toBe(FREE_TEXT);
-    expect(dom.title.textContent).toBe("");
-    expect(dom.title.style.display).toBe("none");
-    expect(dom.shipped.style.display).toBe("none");
-  });
-
-  it("a dirty textarea keeps its text, its dirty marker and its baseline (the user types, an agent POSTs /goal)", async () => {
-    const projectApi = vi.fn(async () => freeGoal(FREE_TEXT));
-    const { dom, state, fns } = setup({ projectApi });
-    await fns.refreshGoal(PID);
-    const baseline = state.panels[PID]._lastSaved;
-    expect(baseline).toBe(FREE_TEXT);
-
-    type(dom.goal, "MY HALF-WRITTEN GOAL");
-    projectApi.mockImplementation(async () => freeGoal("The agent rewrote the whole goal.", { version: 4 }));
-    await fns.refreshGoal(PID);
-
-    expect(dom.goal.value).toBe("MY HALF-WRITTEN GOAL");
-    expect(dom.goal.classList.contains("dirty")).toBe(true);
-    expect(state.panels[PID]._lastSaved).toBe(baseline);
-    // ...while the parts the user is not editing do move on to the agent's version.
-    expect(dom.version.textContent).toBe("v4");
-  });
-
-  it("arriving through the real goal_updated event handler (the agent's POST /goal), the edit survives", async () => {
-    const projectApi = vi.fn(async () => freeGoal(FREE_TEXT));
-    const { dom, fns } = setup({ projectApi }, ["handleWsEvent", "_debounceRepaint"]);
-    await fns.refreshGoal(PID);
-    type(dom.goal, "MY HALF-WRITTEN GOAL");
-    projectApi.mockImplementation(async () => freeGoal("The agent rewrote the whole goal.", { version: 4 }));
-
-    fns.handleWsEvent(PID, { type: "goal_updated", project_id: PID, version: 4 });
-    await new Promise((r) => setTimeout(r, 0));
-
-    expect(projectApi).toHaveBeenCalledTimes(2);
-    expect(dom.version.textContent).toBe("v4"); // the refresh did run...
-    expect(dom.goal.value).toBe("MY HALF-WRITTEN GOAL"); // ...and left the edit alone
-    expect(dom.goal.classList.contains("dirty")).toBe(true);
-  });
-
-  it("a clean field still follows the agent's rewrite (nothing is frozen)", async () => {
-    const projectApi = vi.fn(async () => freeGoal(FREE_TEXT));
-    const { dom, fns } = setup({ projectApi });
-    await fns.refreshGoal(PID);
-    projectApi.mockImplementation(async () => freeGoal("The agent rewrote the whole goal.", { version: 4 }));
-    await fns.refreshGoal(PID);
-    expect(dom.goal.value).toBe("The agent rewrote the whole goal.");
-  });
-
-  it("a goal stored as JSON has no version-label line either, and keeps the edit too", async () => {
-    const projectApi = vi.fn(async () => freeGoal({ focus: "importer", next: ["exporter"] }));
-    const { dom, fns } = setup({ projectApi });
-    await fns.refreshGoal(PID);
-    expect(dom.goal.value).toContain('"focus": "importer"');
-    type(dom.goal, "MY HALF-WRITTEN GOAL");
-    projectApi.mockImplementation(async () => freeGoal({ focus: "rewritten by an agent" }));
-    await fns.refreshGoal(PID);
-    expect(dom.goal.value).toBe("MY HALF-WRITTEN GOAL");
-    expect(dom.goal.classList.contains("dirty")).toBe(true);
-  });
-
-  it("the text typed while the request was in flight survives too (judged after the fetch)", async () => {
-    let release: (g: any) => void = () => {};
-    const { dom, fns } = setup({ projectApi: vi.fn(() => new Promise((r) => { release = r; })) });
-    const pending = fns.refreshGoal(PID);
-    type(dom.goal, "TYPED DURING THE FETCH");
-    release(freeGoal(FREE_TEXT));
-    await pending;
-    expect(dom.goal.value).toBe("TYPED DURING THE FETCH");
-    expect(dom.goal.classList.contains("dirty")).toBe(true);
-  });
-});
-
-describe("saving clears the unsaved marker, so the refresh after it shows the saved text", () => {
-  it("saveGoal: POSTs the edit, then the server's version replaces it and 'dirty' is gone", async () => {
-    const { dom, m, fns } = setup();
-    await fns.refreshGoal(PID);
-    type(dom.goal, "CURRENT FOCUS\nmy edit");
-    // After the save the server returns what was posted.
-    m.projectApi.mockImplementation(async () => ({
-      ...SERVER_GOAL, version: 8, content: "v1.0 — the label\n\nSHIPPED so far\n\nCURRENT FOCUS\nmy edit",
-    }));
-    await fns.saveGoal(PID);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(m.api).toHaveBeenCalledWith(`/projects/${PID}/goal`, expect.objectContaining({ method: "POST" }));
-    expect(dom.goal.classList.contains("dirty")).toBe(false);
-    expect(dom.version.textContent).toBe("v8");
-    expect(dom.goal.value).toBe("CURRENT FOCUS\nmy edit");
-  });
-
-  it("saveGoal: text typed while the POST was in flight stays marked unsaved", async () => {
-    let finish: (v?: any) => void = () => {};
-    const { dom, fns } = setup({ api: vi.fn(() => new Promise((r) => { finish = r; })) });
-    await fns.refreshGoal(PID);
-    type(dom.goal, "CURRENT FOCUS\nfirst edit");
-    const saving = fns.saveGoal(PID);
-    type(dom.goal, "CURRENT FOCUS\nfirst edit, and more typed during the POST");
-    finish({});
-    await saving;
-    expect(dom.goal.classList.contains("dirty")).toBe(true);
-    expect(dom.goal.value).toContain("typed during the POST");
-  });
-
-  it("saveGoal: a failed save keeps the edit marked unsaved", async () => {
-    const { dom, m, fns } = setup({ api: vi.fn(async () => { throw new Error("offline"); }) });
-    await fns.refreshGoal(PID);
-    type(dom.goal, "CURRENT FOCUS\nmy edit");
-    await fns.saveGoal(PID);
-    expect(m.toast).toHaveBeenCalledWith("save failed: offline", true);
-    expect(dom.goal.classList.contains("dirty")).toBe(true);
-    expect(dom.goal.value).toBe("CURRENT FOCUS\nmy edit");
-  });
-
-  it("saveGoal: typing and reverting to what the server has is not an unsaved edit any more", async () => {
-    const { dom, state, fns } = setup();
-    await fns.refreshGoal(PID);
-    // The shipped/title zones are display-only; with none, the textarea IS the document.
-    document.getElementById(`goal-title-${PID}`)!.textContent = "";
-    document.getElementById(`goal-shipped-${PID}`)!.style.display = "none";
-    document.getElementById(`goal-autoblocks-${PID}`)!.style.display = "none";
-    state.panels[PID]._lastSaved = "reverted text";
-    type(dom.goal, "reverted text");
-    await fns.saveGoal(PID);
-    expect(dom.goal.classList.contains("dirty")).toBe(false);
-  });
-
-  it("saveNorthStar and saveSprint clear their marker after the server has the text", async () => {
-    const { dom, m, fns } = setup();
-    await fns.refreshGoal(PID);
-    type(dom.ns, "a new north star");
-    type(dom.sprint, "a new sprint");
-    await fns.saveNorthStar(PID);
-    await fns.saveSprint(PID);
-    expect(m.api).toHaveBeenCalledWith(`/projects/${PID}/goal/north-star`, expect.anything());
-    expect(m.api).toHaveBeenCalledWith(`/projects/${PID}/goal/sprint`, expect.anything());
-    expect(dom.ns.classList.contains("dirty")).toBe(false);
-    expect(dom.sprint.classList.contains("dirty")).toBe(false);
-  });
-
-  it("saveNorthStar: a failed save keeps the edit marked unsaved", async () => {
-    const { dom, fns } = setup({ api: vi.fn(async () => { throw new Error("offline"); }) });
-    await fns.refreshGoal(PID);
-    type(dom.ns, "a new north star");
-    await fns.saveNorthStar(PID);
-    expect(dom.ns.classList.contains("dirty")).toBe(true);
-  });
-});
+// The three describe blocks that used to be here tested the Goal tab's unsaved-text protection as the
+// live-refresh lane first built it (a 'dirty' class on the textareas). The goal lane (fc779141) replaced that
+// with the GoalField editors (dashboard-goal-conflict.ts, tested in dashboard-goal-conflict.test.ts and
+// dashboard-goal-wiring.test.ts), which is the implementation that ships, so those blocks were removed at
+// integration. What remains below is independent of it: the decisions-only repaint, refreshDecisionsLog and
+// the inline pinned-decision editor.
 
 describe("handleWsEvent: goal_updated", () => {
   beforeEach(() => {
@@ -375,7 +104,7 @@ describe("handleWsEvent: goal_updated", () => {
     const state: any = { panels: { [PID]: { activeVtab: "goal", taskCache: [] } }, tabs: [], projects: [] };
     const m: Mocks = {
       state,
-      refreshGoal: vi.fn(),
+      refreshGoal: vi.fn(), noteGoalEvent: vi.fn(),
       refreshDecisionsLog: vi.fn(),
       _repaintTimers: {} as Record<string, any>,
     };
@@ -394,7 +123,7 @@ describe("handleWsEvent: goal_updated", () => {
 
   it("a burst of logged decisions repaints the table once", () => {
     const state: any = { panels: { [PID]: { activeVtab: "goal", taskCache: [] } }, tabs: [], projects: [] };
-    const m: Mocks = { state, refreshGoal: vi.fn(), refreshDecisionsLog: vi.fn(), _repaintTimers: {} };
+    const m: Mocks = { state, refreshGoal: vi.fn(), noteGoalEvent: vi.fn(), refreshDecisionsLog: vi.fn(), _repaintTimers: {} };
     const { handleWsEvent } = loadDashboardFunctions(DASH, ["handleWsEvent", "_debounceRepaint"], m);
     for (let i = 0; i < 8; i++) handleWsEvent(PID, { type: "goal_updated", project_id: PID, field: "decisions" });
     vi.advanceTimersByTime(300);
