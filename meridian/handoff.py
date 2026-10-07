@@ -145,13 +145,35 @@ async def _persist_handoff_history_and_pending_goal(
     recorded fresh (the same ``amended`` flag ``generate_handoff`` itself
     returns). Fully guarded exactly as before extraction: a failure in
     either step is swallowed, never breaking handoff generation.
+
+    0b0b24d8 — a write with no ``session_id`` (an unattended background writer:
+    the session-close auto-save and the idle-expire loop pass only
+    ``window_session_id``, and a dashboard render names no session either)
+    never amends a row a session owns. The amend keeps the row's owner but
+    bumps its ``created_at``, and ``created_at`` of a session's own row is that
+    session's "last handoff" anchor for delta's "Completed since last handoff"
+    list: an unattended amend moved the anchor to the auto-save, so the
+    session's next explicit delta silently dropped everything completed
+    between its own earlier handoff and the auto-save. Such a write records a
+    separate, unowned row instead. An unowned latest row (a previous
+    background write) is still amended, as before.
     """
     amended = False
     try:
         prior_goal = await db_module.get_pending_goal(db, project_id)
         if prior_goal is not None:
-            # Prior handoff exists and was never consumed — amend in-place.
-            amend_result = await db_module.amend_handoff(db, project_id, content, mode)
+            # Prior handoff exists and was never consumed — amend in-place,
+            # unless this write is unattended and the row belongs to a session.
+            _owned_by_a_session = False
+            if not session_id:
+                _latest = await db_module.get_latest_handoff(db, project_id)
+                _owned_by_a_session = bool(_latest and _latest.get("session_id"))
+            if _owned_by_a_session:
+                amend_result = None
+            else:
+                amend_result = await db_module.amend_handoff(
+                    db, project_id, content, mode
+                )
             if amend_result is not None:
                 amended = True
             else:
@@ -12124,6 +12146,7 @@ async def generate_handoff(
     proposal_scope: "dict[str, Any] | None" = None,
     goal_string_out: "dict[str, Any] | None" = None,
     pending_goal_receiver: "dict[str, Any] | None" = None,
+    refresh_retrospective: bool = False,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -12153,7 +12176,23 @@ async def generate_handoff(
     and a later explicit delta from it would then start its list at the
     auto-save and silently drop the work completed before it. Those two
     callers pass ``window_session_id`` instead. ``session_id`` wins when both
-    are given.
+    are given. A write with no ``session_id`` is also never allowed to amend
+    (edd9c54b) a handoffs row that a session owns -- see
+    :func:`_persist_handoff_history_and_pending_goal`.
+
+    ``refresh_retrospective`` (0b0b24d8) -- ``mode="delta"`` only; ``False`` by
+    default (zero change for every caller, including an explicit delta and
+    ``checkpoint()``, which stay free of the retrospective step per 4c7cd788).
+    The two unattended session-end writers (the session-close auto-save and the
+    idle-expire loop) pass ``True``: they used to inherit ``mode="full"``, whose
+    retrospective step (aef94e4a) refreshed the project's Sprint Retrospective
+    note on every session end, and moving them to ``delta`` silently stopped
+    that. ``True`` runs just that one step for a delta. It never makes delta
+    run the other two Haiku seams, and it never brings back the workspace
+    notes. With ``skip_ai_summary`` it uses the deterministic body and makes no
+    network call, so it needs no API key; without it, it behaves exactly as it
+    did for the old ``full`` default (Haiku when a key is configured, the same
+    deterministic body otherwise).
 
     ``pending_goal_receiver`` (0527f636) — optional, ``None`` by default (every
     pre-existing call site: zero behaviour change). An object with any subset
@@ -13806,17 +13845,29 @@ async def generate_handoff(
     # 4c7cd788 — also skipped for mode='delta': it makes another network Haiku
     # call, and a full AI retrospective does not belong on every lightweight delta /
     # checkpoint (it's a full/session-end concern). Same hang class as _ai_summary.
-    if not _ai_disabled:
+    # 0b0b24d8 — "a full/session-end concern" is exactly what the two unattended
+    # session-end writers are, and they only became delta when this lane stopped
+    # them inheriting 'full': refresh_retrospective=True lets them keep running
+    # this one step (and only this one: the summary fan-out and ai_summary above
+    # stay off for delta). skip_ai_summary then means "deterministic body, no
+    # network" instead of "no retrospective", so it needs no API key.
+    _retro_for_delta = mode == "delta" and refresh_retrospective
+    if not _ai_disabled or _retro_for_delta:
         try:
             retro_completed = [
                 it for it in sprint_items_all
                 if it.get("status") in {"done", "skipped", "failed", "pushed"}
             ]
             if retro_completed:
-                retro_text = await _generate_sprint_retrospective(
-                    retro_completed, pinned_decisions, goal.get("sprint"),
-                    summarizer=summarizer,
-                )
+                if skip_ai_summary:
+                    retro_text = _render_retro_fallback(
+                        retro_completed, goal.get("sprint")
+                    )
+                else:
+                    retro_text = await _generate_sprint_retrospective(
+                        retro_completed, pinned_decisions, goal.get("sprint"),
+                        summarizer=summarizer,
+                    )
                 await _persist_sprint_retrospective(
                     db, project_id, goal.get("sprint"), retro_text,
                     version=goal.get("version"),

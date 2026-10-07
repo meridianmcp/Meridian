@@ -1791,3 +1791,413 @@ async def test_stdio_generate_handoff_explicit_full_still_includes_everything(
 
     assert result["mode"] == "full"
     assert sorted(_leaks(result["content"])) == sorted(_SENTINELS)
+
+
+# ---------------------------------------------------------------------------
+# 10. Final pass: the retrospective, the tool/dashboard text, the unattended amend
+# ---------------------------------------------------------------------------
+#
+# (1) Moving the two background writers from the old 'full' default to 'delta'
+#     also stopped the automatic Sprint Retrospective note (aef94e4a): delta
+#     disables every Haiku seam (4c7cd788), and the retrospective step sat
+#     behind that switch. They now pass refresh_retrospective=True.
+# (2) Tool descriptions and the dashboard hint still said workspace notes and
+#     decisions are "injected at the top of every project's context block +
+#     handoff", which stopped being true when bodies became opt-in.
+# (3) An unattended write amended the latest handoffs row in place even when a
+#     session owned it, moving that session's "last handoff" anchor.
+
+
+@pytest.fixture
+def _no_api_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+
+async def _retro_notes(db, pid: str) -> list[dict]:
+    return await db_module.get_project_notes(db, pid, tag="retrospective", bodies=True)
+
+
+async def _project_with_one_done_item(db, name: str) -> str:
+    pid = await _project(db, name)
+    await _complete(db, pid, "Shipped the retro subject", "-10 minutes")
+    return pid
+
+
+@pytest.mark.asyncio
+async def test_idle_expire_loop_still_refreshes_the_retrospective_without_an_api_key(
+    db, tmp_path, spy, _no_claude_md_write, _no_api_key,
+):
+    pid = await _project_with_one_done_item(db, "0b0b24d8-retro-idle")
+    await _seed_workspace(db)
+    sess = await db_module.register_session(db, pid, "stale")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (sess["id"],),
+    )
+    await db.commit()
+    assert await _retro_notes(db, pid) == []
+
+    result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
+
+    assert result["auto_handoff_generated"] is True
+    assert [c["kwargs_mode"] for c in spy.calls] == ["delta"]
+    notes = await _retro_notes(db, pid)
+    assert len(notes) == 1
+    assert "Shipped the retro subject" in notes[0]["body"]
+    # the workspace notes did not come back with it
+    assert _leaks(_written_text(tmp_path)) == []
+    assert _leaks(spy.calls[0]["content"]) == []
+    assert _leaks(notes[0]["body"] + notes[0]["title"]) == []
+
+
+def test_session_close_auto_save_still_refreshes_the_retrospective_without_an_api_key(
+    client, spy, _no_claude_md_write, _no_api_key,
+):
+    pid = client.post("/projects", json={"name": "0b0b24d8-retro-close"}).json()["id"]
+    sid = client.post(
+        "/sessions/register", json={"project_id": pid, "name": "closer"},
+    ).json()["id"]
+    db = client.app.state.db
+
+    async def _seed() -> None:
+        await _complete(db, pid, "Shipped the retro subject", "-10 minutes")
+        await _seed_workspace(db)
+
+    asyncio.run(_seed())
+
+    assert client.post(f"/sessions/{sid}/close").status_code == 200
+    deadline = time.monotonic() + 20
+    while not spy.finished.is_set() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert spy.finished.is_set(), "close_session never ran its auto-save handoff"
+
+    assert [c["kwargs_mode"] for c in spy.calls] == ["delta"]
+    notes = asyncio.run(_retro_notes(db, pid))
+    assert len(notes) == 1
+    assert "Shipped the retro subject" in notes[0]["body"]
+    written = (
+        pathlib.Path(client.app.state.data_dir)
+        / f"{handoff_module.handoff_file_stem(pid)}_handoff.md"
+    ).read_text(encoding="utf-8")
+    assert _leaks(written) == []
+    assert _leaks(spy.calls[0]["content"]) == []
+    assert _leaks(notes[0]["body"] + notes[0]["title"]) == []
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_delta_still_skips_the_retrospective(db, tmp_path, _no_api_key):
+    """4c7cd788 stays true for everything that did not ask for the step: an
+    explicit delta (and checkpoint(), which is one) is a lightweight update."""
+    pid = await _project_with_one_done_item(db, "0b0b24d8-retro-explicit-delta")
+    sid = (await db_module.register_session(db, pid, "explicit"))["id"]
+
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta", session_id=sid,
+    )
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), mode="delta", window_session_id=sid,
+    )
+
+    assert await _retro_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_retrospective_with_skip_ai_summary_makes_no_network_call(
+    db, tmp_path, monkeypatch,
+):
+    pid = await _project_with_one_done_item(db, "0b0b24d8-retro-no-network")
+    # a key IS configured: skip_ai_summary alone must keep the step offline
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-a-real-key")
+
+    async def _must_not_be_called(*_a, **_k):
+        raise AssertionError("the AI retrospective seam ran despite skip_ai_summary")
+
+    monkeypatch.setattr(
+        handoff_module, "_generate_sprint_retrospective", _must_not_be_called
+    )
+
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta",
+        refresh_retrospective=True,
+    )
+
+    notes = await _retro_notes(db, pid)
+    assert len(notes) == 1
+    assert "Shipped the retro subject" in notes[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_retrospective_without_skip_uses_the_retrospective_generator(
+    db, tmp_path, monkeypatch,
+):
+    """What the session-close auto-save does when a key is configured: the same
+    generator the old 'full' default used (Haiku in production, stubbed here)."""
+    pid = await _project_with_one_done_item(db, "0b0b24d8-retro-generator")
+    seen: list[int] = []
+
+    async def _stub(completed, _decisions, _sprint, summarizer=None):
+        seen.append(len(completed))
+        return "STUB RETROSPECTIVE BODY"
+
+    monkeypatch.setattr(handoff_module, "_generate_sprint_retrospective", _stub)
+
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), mode="delta", refresh_retrospective=True,
+    )
+
+    assert seen == [1]
+    notes = await _retro_notes(db, pid)
+    assert [n["body"] for n in notes] == ["STUB RETROSPECTIVE BODY"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_retrospective_never_runs_the_other_delta_seams(
+    db, tmp_path, monkeypatch, _no_api_key,
+):
+    pid = await _project_with_one_done_item(db, "0b0b24d8-retro-only-that-step")
+    ran: list[str] = []
+
+    async def _no_summary(*_a, **_k):
+        ran.append("summarize_session")
+        return None
+
+    async def _no_ai_summary(*_a, **_k):
+        ran.append("ai_summary")
+        return ""
+
+    monkeypatch.setattr(db_module, "summarize_session", _no_summary)
+    monkeypatch.setattr(handoff_module, "_generate_ai_summary", _no_ai_summary)
+    await db_module.register_session(db, pid, "someone")
+
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), mode="delta", refresh_retrospective=True,
+    )
+
+    assert ran == []
+    assert len(await _retro_notes(db, pid)) == 1
+
+
+# -- (2) stale text ---------------------------------------------------------
+
+_STALE_PHRASES = (
+    "injected at the top of every project",
+    "context block + handoff",
+)
+_WORKSPACE_TOOLS = ("add_workspace_note", "pin_workspace_decision")
+
+
+def _workspace_tool_texts_http() -> "dict[str, str]":
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    return {
+        t["name"]: t["description"]
+        for t in _MCP_TOOLS_LIST
+        if t["name"] in _WORKSPACE_TOOLS
+    }
+
+
+async def _workspace_tool_texts_stdio(db, monkeypatch, tmp_path) -> "dict[str, str]":
+    import mcp.types as mcp_types
+
+    server = _stdio_server(monkeypatch, db, tmp_path)
+    listed = await server.request_handlers[mcp_types.ListToolsRequest](
+        mcp_types.ListToolsRequest()
+    )
+    return {
+        t.name: t.description
+        for t in listed.root.tools
+        if t.name in _WORKSPACE_TOOLS
+    }
+
+
+def _assert_truthful_workspace_text(texts: "dict[str, str]") -> None:
+    assert set(texts) == set(_WORKSPACE_TOOLS)
+    for name, text in texts.items():
+        low = text.lower()
+        for phrase in _STALE_PHRASES:
+            assert phrase not in low, (name, phrase)
+        assert "index" in low, name
+        assert "include_workspace_context" in text, name
+        # the explicit full handoff is the one place a handoff carries them
+        assert 'mode="full"' in text, name
+    assert "get_workspace_notes" in texts["add_workspace_note"]
+    assert "get_workspace_decisions" in texts["pin_workspace_decision"]
+
+
+def test_http_workspace_tool_descriptions_are_truthful_about_inlining():
+    _assert_truthful_workspace_text(_workspace_tool_texts_http())
+
+
+@pytest.mark.asyncio
+async def test_stdio_workspace_tool_descriptions_are_truthful_about_inlining(
+    db, monkeypatch, tmp_path,
+):
+    _assert_truthful_workspace_text(
+        await _workspace_tool_texts_stdio(db, monkeypatch, tmp_path)
+    )
+
+
+def test_dashboard_workspace_hint_is_truthful_about_inlining():
+    src = (_ROOT / "meridian" / "static" / "dashboard-settings.ts").read_text(
+        encoding="utf-8"
+    )
+    low = src.lower()
+    for phrase in _STALE_PHRASES:
+        assert phrase not in low, phrase
+    assert "get_workspace_notes" in src and "get_workspace_decisions" in src
+
+
+# -- (3) the unattended amend ----------------------------------------------
+
+
+async def _session_with_an_unconsumed_goal_handoff(db, tmp_path, pid: str) -> str:
+    """S started 5h ago and owns a goal handoff stamped 200 minutes ago whose
+    pending_goal nobody has consumed (the state the amend path acts on)."""
+    sid = (await db_module.register_session(db, pid, "owner-of-a-goal"))["id"]
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path / "own"), skip_ai_summary=True, mode="goal",
+        session_id=sid,
+    )
+    await db.execute(
+        "UPDATE sessions SET created_at = datetime('now', '-300 minutes') WHERE id = ?",
+        (sid,),
+    )
+    await db.execute(
+        "UPDATE handoffs SET created_at = datetime('now', '-200 minutes') "
+        "WHERE session_id = ?",
+        (sid,),
+    )
+    await db.commit()
+    assert await db_module.get_pending_goal(db, pid) is not None
+    return sid
+
+
+@pytest.mark.asyncio
+async def test_unattended_delta_never_amends_a_row_a_session_owns(db, tmp_path):
+    """The verifier's probe: S owns a goal handoff at -200m, Alpha completes at
+    -100m, a background delta (window_session_id only) runs, Bravo completes, S
+    asks for a delta. Alpha used to be lost: the background write amended S's
+    row in place and moved its created_at, S's anchor, to the auto-save."""
+    pid = await _project(db, "0b0b24d8-amend-probe")
+    sid = await _session_with_an_unconsumed_goal_handoff(db, tmp_path, pid)
+    own_before = await db_module.get_handoffs(db, pid, limit=5, session_id=sid)
+    assert len(own_before) == 1
+    await _complete(db, pid, "Alpha before the background write", "-100 minutes")
+
+    _, auto_content, amended = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta",
+        window_session_id=sid,
+    )
+
+    assert amended is False
+    assert "Alpha before the background write" in _completed_section(auto_content)
+    own_after = await db_module.get_handoffs(db, pid, limit=5, session_id=sid)
+    # S's own row is untouched: same body, same anchor
+    assert [(r["id"], r["body"], r["created_at"]) for r in own_after] == [
+        (r["id"], r["body"], r["created_at"]) for r in own_before
+    ]
+    rows = await db_module.get_handoffs(db, pid, limit=5)
+    assert len(rows) == 2
+    assert [r["session_id"] for r in rows if r["id"] != own_before[0]["id"]] == [None]
+
+    await _complete(db, pid, "Bravo after the background write", "+1 minutes")
+    section = _completed_section(await _explicit_delta_for(db, tmp_path, pid, sid))
+
+    assert "Alpha before the background write" in section
+    assert "Bravo after the background write" in section
+
+
+@pytest.mark.asyncio
+async def test_idle_expire_loop_does_not_move_the_expired_sessions_anchor(
+    db, tmp_path, _no_claude_md_write,
+):
+    """The same probe through the real writer (the idle-expire loop)."""
+    pid = await _project(db, "0b0b24d8-amend-idle")
+    sid = await _session_with_an_unconsumed_goal_handoff(db, tmp_path, pid)
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (sid,),
+    )
+    await db.commit()
+    await _complete(db, pid, "Alpha before the idle expiry", "-100 minutes")
+
+    result = await srv._expire_and_generate_handoffs(db, str(tmp_path / "loop"))
+
+    assert result["auto_handoff_generated"] is True
+    await _complete(db, pid, "Bravo after the resume", "+1 minutes")
+    section = _completed_section(await _explicit_delta_for(db, tmp_path, pid, sid))
+
+    assert "Alpha before the idle expiry" in section
+    assert "Bravo after the resume" in section
+
+
+def test_session_close_auto_save_does_not_move_the_closed_sessions_anchor(
+    client, _no_claude_md_write, tmp_path,
+):
+    """The same probe through the other writer (session close). No spy here: the
+    setup itself calls generate_handoff, so the wait is on the new handoffs row."""
+    pid = client.post("/projects", json={"name": "0b0b24d8-amend-close"}).json()["id"]
+    db = client.app.state.db
+
+    async def _setup() -> str:
+        sid = await _session_with_an_unconsumed_goal_handoff(db, tmp_path, pid)
+        await _complete(db, pid, "Alpha before the close", "-100 minutes")
+        return sid
+
+    sid = asyncio.run(_setup())
+
+    assert client.post(f"/sessions/{sid}/close").status_code == 200
+    deadline = time.monotonic() + 20
+    rows: list[dict] = []
+    while time.monotonic() < deadline:
+        rows = asyncio.run(db_module.get_handoffs(db, pid, limit=5))
+        if len(rows) >= 2:
+            break
+        time.sleep(0.05)
+    # the auto-save wrote a SEPARATE unowned row instead of amending S's own
+    assert sorted(str(r["session_id"]) for r in rows) == sorted([sid, "None"]), rows
+
+    async def _after() -> str:
+        await _complete(db, pid, "Bravo after the reopen", "+1 minutes")
+        return await _explicit_delta_for(db, tmp_path, pid, sid)
+
+    section = _completed_section(asyncio.run(_after()))
+
+    assert "Alpha before the close" in section
+    assert "Bravo after the reopen" in section
+
+
+@pytest.mark.asyncio
+async def test_unattended_writes_still_amend_an_unowned_row_in_place(db, tmp_path):
+    """The amend itself is kept: two background writes are one row, as before."""
+    pid = await _project(db, "0b0b24d8-amend-unowned")
+    sid = (await db_module.register_session(db, pid, "bystander"))["id"]
+
+    _, _, first = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta",
+        window_session_id=sid,
+    )
+    _, _, second = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta",
+        window_session_id=sid,
+    )
+
+    assert (first, second) == (False, True)
+    assert len(await db_module.get_handoffs(db, pid, limit=5)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_session_still_amends_its_own_unconsumed_row(db, tmp_path):
+    pid = await _project(db, "0b0b24d8-amend-own")
+    sid = (await db_module.register_session(db, pid, "self"))["id"]
+
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="goal", session_id=sid,
+    )
+    _, _, amended = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta", session_id=sid,
+    )
+
+    assert amended is True
+    rows = await db_module.get_handoffs(db, pid, limit=5)
+    assert [(r["mode"], r["session_id"]) for r in rows] == [("delta", sid)]

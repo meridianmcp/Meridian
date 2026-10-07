@@ -88,12 +88,17 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     # status=active), and an unattended write attributed to it would become its
     # "last handoff", so its next explicit delta would silently drop everything
     # completed before this close.
+    # refresh_retrospective=True: the old 'full' default also refreshed the
+    # project's Sprint Retrospective note (aef94e4a) on every session close;
+    # delta skips that step, so without this the note silently stopped updating.
+    # It does not bring back the Haiku summary calls or any workspace text.
     async def _auto_save_handoff() -> None:
         try:
             await asyncio.wait_for(
                 handoff_module.generate_handoff(
                     await _db(request), project_id, request.app.state.data_dir,
                     mode="delta", window_session_id=session_id,
+                    refresh_retrospective=True,
                 ),
                 timeout=30.0,
             )

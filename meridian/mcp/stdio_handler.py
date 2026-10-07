@@ -1572,8 +1572,15 @@ def build_mcp_server():
                 description=(
                     "v3.1 — add a workspace-level note that applies across ALL "
                     "projects (onboarding, shared conventions, cross-cutting "
-                    "infra). Injected at the top of every project's context "
-                    "block + handoff. Tags are comma-separated."
+                    "infra). Its body is NOT inlined by default: session start "
+                    "and get_context_block carry only a short index (a note "
+                    "count plus the titles of notes tagged policy or "
+                    "workspace-policy), and a handoff carries notes only when "
+                    "generate_handoff(mode=\"full\") is requested explicitly. "
+                    "Read bodies with get_workspace_notes (tag=\"policy\" for "
+                    "the policy-tagged ones); the operator setting "
+                    "include_workspace_context inlines them into session "
+                    "start and get_context_block. Tags are comma-separated."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1607,8 +1614,14 @@ def build_mcp_server():
                 description=(
                     "v3.1 — pin a workspace-level decision that applies across "
                     "ALL projects (shared architecture, org-wide standards). "
-                    "Injected at the top of every project's context block + "
-                    "handoff. category is free-text."
+                    "Session start and get_context_block show only a short "
+                    "index of the newest few decisions (one clipped line each, "
+                    "plus a count of the rest); a handoff carries none unless "
+                    "generate_handoff(mode=\"full\") is requested explicitly. "
+                    "Read the full text with get_workspace_decisions; the "
+                    "operator setting include_workspace_context inlines it "
+                    "into session start and get_context_block. category is "
+                    "free-text."
                 ),
                 inputSchema={
                     "type": "object",

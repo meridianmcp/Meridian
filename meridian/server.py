@@ -5016,10 +5016,14 @@ async def _expire_and_generate_handoffs(
             # and an unattended write attributed to it would become its "last
             # handoff", so its next explicit delta would silently drop
             # everything completed before this pass.
+            # refresh_retrospective=True: the old 'full' default also refreshed
+            # the Sprint Retrospective note (aef94e4a) on every pass and delta
+            # skips that step. With no API key (_skip) the note is written from
+            # its deterministic body instead of being skipped altogether.
             _expired = (result.get("session_ids_by_project") or {}).get(pid) or [None]
             await handoff_module.generate_handoff(
                 db, pid, data_dir, skip_ai_summary=_skip, mode="delta",
-                window_session_id=_expired[0],
+                window_session_id=_expired[0], refresh_retrospective=True,
             )
             generated = True
         except Exception:  # noqa: BLE001
