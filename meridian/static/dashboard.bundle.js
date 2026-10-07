@@ -1684,7 +1684,7 @@
 
           <button class="sprint-btn" title="Back to pending"
 
-            onclick="fetch('/projects/${escapeHtml(projectId)}/sprint-items/${escapeHtml(it.id)}',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'pending'})}).then(()=>renderSprintProgress(${JSON.stringify(projectId)},items.map(x=>x.id===it.id?{...x,status:'pending'}:x)))">\u21A9 Pending</button>
+            onclick="fetch('/projects/${escapeHtml(projectId)}/sprint-items/${escapeHtml(it.id)}',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'pending'})}).then(()=>refreshLiveTab('${escapeHtml(projectId)}'))">\u21A9 Pending</button>
 
           <button class="sprint-btn sprint-btn-fail" title="Mark failed"
 
@@ -1809,7 +1809,7 @@
 
       <span class="sprint-item-icon" style="color:${color}">${icon}</span>
 
-      <div style="flex:1;min-width:0">
+      <div class="sprint-item-main">
 
         <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
 
@@ -1889,13 +1889,13 @@
 
       <div style="padding:4px 10px 8px">
 
-        ${pushedItems.map((it) => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || "")}" style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
+        ${pushedItems.map((it) => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || "")}" style="border-top:1px solid var(--border)">
 
           <span style="color:var(--muted);font-size:10px;flex-shrink:0">\u2192</span>
 
-          <span class="sprint-item-title" style="font-family:var(--font-mono);font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
+          <span class="sprint-item-title" style="font-family:var(--font-mono);font-size:10px;color:var(--muted)" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
 
-          ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ""}
+          ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;max-width:100%;overflow-wrap:anywhere;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ""}
 
           <span class="sprint-item-ver" style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(it.version || "")}</span>
 

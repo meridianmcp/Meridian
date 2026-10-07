@@ -13,6 +13,8 @@ that hit the FastAPI TestClient.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from bs4 import BeautifulSoup
 
@@ -1027,6 +1029,672 @@ def test_dashboard_responsive_sprint_and_nav_media_block(css):
     # ...and the top nav tab strip.
     assert ".tabs" in tail, "responsive pass must adjust the top nav (.tabs)"
     assert ".tab {" in tail or ".tab{" in tail, "responsive pass must adjust nav tabs (.tab)"
+
+
+# ---------------------------------------------------------------------------
+# Sprint row layout contract: a long title wraps inside its OWN column and can
+# never paint over the version label or the action buttons (Live tab, "Sprint
+# progress"). The original bug: .sprint-item-title was an inline <span> in a plain
+# <div>, so its flex/overflow/text-overflow rules did nothing while
+# white-space:nowrap stopped it wrapping, and the text ran over .sprint-item-ver
+# and .sprint-item-actions. Source-scanning style, like the rest of this file; the
+# rendered-DOM + computed-style version lives in
+# meridian/static/dashboard-sprint-layout.test.ts, and the pixel overlap is asserted
+# in a real browser by tests/test_demo_ux.py.
+# ---------------------------------------------------------------------------
+
+
+def _css_split(text, sep):
+    """Split `text` on `sep` at nesting depth 0 (outside (), [], {} and quoted strings)."""
+    parts, depth, quote, start, i = [], 0, None, 0, 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(0, depth - 1)
+        elif c == sep and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
+def _css_items(text):
+    """The top-level items of a CSS block body: ("stmt", "prop: value" | "@import ...") for each
+    ``;``-terminated statement and ("block", prelude, body) for each ``prelude { body }``."""
+    items, depth, quote, start, brace, i = [], 0, None, 0, None, 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif brace is not None:
+            if c == "{":
+                brace += 1
+            elif c == "}":
+                brace -= 1
+                if brace == 0:
+                    items.append(("block", text[start:body_start].strip(), text[body_start + 1 : i]))
+                    start, brace = i + 1, None
+        elif c in "([":
+            depth += 1
+        elif c in ")]":
+            depth = max(0, depth - 1)
+        elif depth == 0 and c == ";":
+            if text[start:i].strip():
+                items.append(("stmt", text[start:i].strip()))
+            start = i + 1
+        elif depth == 0 and c == "{":
+            body_start, brace = i, 1
+        i += 1
+    if brace is None and text[start:].strip():
+        items.append(("stmt", text[start:].strip()))
+    return items
+
+
+# At-rules whose block holds ordinary rules (or, nested in a style rule, declarations for it).
+_CSS_GROUP_AT_RULES = ("@media", "@supports", "@container", "@layer", "@scope", "@document", "@starting-style")
+
+
+def _css_nest(parents, children):
+    """Resolve nested selectors against their parents (CSS nesting: ``&`` or an implicit descendant)."""
+    if parents is None:
+        return children
+    return [c.replace("&", p) if "&" in c else f"{p} {c}" for p in parents for c in children]
+
+
+def _css_rules(css_text):
+    """Parse CSS into [(gate_or_None, [selectors], {prop: value})] in source order.
+
+    Handles what the dashboard's cascade can contain, not just flat rules: CSS nesting (``&`` and
+    implicit descendants, nested @media), conditional / layer groups at any depth (@media,
+    @supports, @container, @layer, @scope; the gate is their prelude), selector lists containing
+    commas inside :is()/:where(), and declarations holding ``;`` inside url()/strings. Statement
+    at-rules (@import, @layer a, b;) are skipped without swallowing the rule that follows them,
+    and rule-less at-rules (@keyframes, @font-face) are skipped whole."""
+    text = re.sub(r"/\*.*?\*/", "", css_text, flags=re.S)
+    out = []
+
+    def walk(body, selectors, gate):
+        decls = {}
+        for item in _css_items(body):
+            if item[0] == "stmt":
+                if not item[1].startswith("@") and ":" in item[1]:
+                    prop, _, value = item[1].partition(":")
+                    decls[prop.strip().lower()] = " ".join(value.split())
+                continue
+            _, prelude, inner = item
+            prelude = " ".join(prelude.split())
+            if prelude.startswith("@"):
+                if prelude.lower().startswith(_CSS_GROUP_AT_RULES):
+                    group = f"{gate} {prelude}" if gate else prelude
+                    nested = walk(inner, selectors, group)
+                    if nested and selectors is not None:  # `.a { @media (..) { color: red } }`
+                        out.append((group, list(selectors), nested))
+                continue
+            resolved = _css_nest(selectors, [s.strip() for s in _css_split(prelude, ",") if s.strip()])
+            slot = len(out)
+            out.append(None)
+            out[slot] = (gate, resolved, walk(inner, resolved, gate))
+        return decls
+
+    walk(text, None, None)
+    return [rule for rule in out if rule is not None]
+
+
+def _decls(rules, selector, media=None):
+    """Merged declarations of every rule whose selector list contains `selector`."""
+    merged = {}
+    for rule_media, selectors, decls in rules:
+        if rule_media == media and selector in selectors:
+            merged.update(decls)
+    return merged
+
+
+def test_sprint_title_is_a_wrapping_block_in_its_own_column(css):
+    """The title must be block-level, shrinkable and allowed to wrap/break, with no
+    nowrap/ellipsis truncation, in the board rows (wrapper div) AND the sibling rows
+    (needs-attention / your-tasks / backburner) where the title is a direct flex child."""
+    rules = _css_rules(css)
+    title = _decls(rules, ".sprint-item-title")
+    assert title.get("display") == "block", "title must be block-level (an inline span ignores overflow/flex)"
+    assert title.get("min-width") == "0", "title must be able to shrink below its content width"
+    assert title.get("white-space") == "normal", "title must be allowed to wrap"
+    assert title.get("overflow-wrap") == "anywhere", "a 300-char unbreakable token must break in the column"
+    assert "text-overflow" not in title and "overflow" not in title, "title wraps; it must not clip or ellipsize"
+    # the text column: the wrapper div in board rows ...
+    col = _decls(rules, ".sprint-item-main")
+    assert col.get("min-width") == "0"
+    assert col.get("flex") == "1 1 auto", (
+        "the text column is sized by its content: a fixed minimum basis (it was 15em) reserved a long "
+        "title's room for every row, so at the real 347px desktop board the buttons of even a "
+        "10-character title wrapped onto a second line (28px rows became 43px)"
+    )
+    assert col.get("max-width") == "calc(100% - 20px)", (
+        "the column is capped at the room left beside the 14px icon + 6px gap, so a long title takes "
+        "the row's width instead of overflowing it and the icon is never left alone above the text"
+    )
+    # ... and the title span itself in the sibling rows
+    direct = _decls(rules, ".sprint-item-row > .sprint-item-title")
+    assert direct.get("min-width") == "0"
+    assert direct.get("flex") == col.get("flex"), "sibling rows must use the same column basis as board rows"
+    assert direct.get("max-width") == col.get("max-width")
+
+
+def test_sprint_row_wraps_and_aligns_to_the_first_title_line(css):
+    """The row wraps (actions drop UNDER the text when too narrow) and baseline-aligns
+    the icon / version / buttons with the title's first line."""
+    rules = _css_rules(css)
+    row = _decls(rules, ".sprint-item-row")
+    assert row.get("display") == "flex"
+    assert row.get("flex-wrap") == "wrap", "row must wrap so the buttons can drop under the text"
+    assert row.get("align-items") == "baseline", "icon/version/buttons must sit on the first title line"
+    assert row.get("align-content") == "center", "single-line rows stay vertically centred in min-height"
+    ver = _decls(rules, ".sprint-item-ver")
+    assert ver.get("flex-shrink") == "0" and ver.get("max-width") == "100%"
+    actions = _decls(rules, ".sprint-item-actions")
+    assert actions.get("flex-shrink") == "0"
+    assert actions.get("flex-wrap") == "wrap" and actions.get("max-width") == "100%", (
+        "actions wrap inside the row instead of escaping it at narrow widths"
+    )
+    assert actions.get("margin-left") == "auto"
+    assert _decls(rules, ".sprint-item-actions:empty").get("display") == "none", (
+        "an empty actions placeholder must not take a wrapped line"
+    )
+    chip = _decls(rules, ".sprint-item-resources .resource-chip")
+    assert chip.get("max-width") == "100%" and chip.get("overflow-wrap") == "anywhere", (
+        "a long resource chip must wrap inside the column"
+    )
+
+
+def test_sprint_row_layout_rules_use_css_variables_only(css):
+    """Dark/light themes: the sprint-row layout rules carry no literal colours."""
+    rules = _css_rules(css)
+    selectors = [
+        ".sprint-item-row", ".sprint-item-main", ".sprint-item-title", ".sprint-item-ver",
+        ".sprint-item-actions", ".sprint-item-row > .sprint-item-title",
+        ".sprint-item-resources .resource-chip",
+    ]
+    for sel in selectors:
+        decls = _decls(rules, sel)
+        assert decls, f"{sel} rule missing"
+        for prop, value in decls.items():
+            assert not re.search(r"#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(", value), (
+                f"{sel} {prop}: {value!r} hard-codes a colour; use a CSS variable"
+            )
+
+
+def test_sprint_phone_media_queries_are_reconciled_with_the_base_rules(css):
+    """The 768px / 480px passes only tune the base rules: they must not re-introduce
+    nowrap/ellipsis, nor give the title flex-basis:100% (which on the direct-child rows
+    left the status icon alone on a line above the text). On a phone the action buttons
+    take their own line under the text."""
+    rules = _css_rules(css)
+    for media in ("@media (max-width: 768px)", "@media (max-width: 480px)"):
+        sprint = [(sel, d) for m, sels, d in rules if m == media for sel in sels if "sprint-item" in sel]
+        assert sprint, f"{media} must still tune the sprint rows"
+        for sel, d in sprint:
+            assert d.get("white-space") != "nowrap" and d.get("flex-wrap") != "nowrap", (media, sel)
+            assert "text-overflow" not in d and d.get("overflow") != "hidden", (media, sel)
+    phone = "@media (max-width: 768px)"
+    assert _decls(rules, ".sprint-item-row > .sprint-item-title", phone).get("flex-basis", "").startswith("min(")
+    assert _decls(rules, ".sprint-item-main", phone).get("flex-basis", "").startswith("min(")
+    assert _decls(rules, ".sprint-item-title", phone).get("flex-basis") != "100%"
+    actions = _decls(rules, ".sprint-item-actions", phone)
+    assert actions.get("flex-basis") == "100%" and actions.get("justify-content") == "flex-end"
+    # the wrap/align/title-wrapping rules are NOT viewport-gated: they live in the base sheet
+    assert _decls(rules, ".sprint-item-row").get("flex-wrap") == "wrap"
+    assert _decls(rules, ".sprint-item-title").get("white-space") == "normal"
+
+
+def test_sprint_markup_uses_the_main_column_class_and_no_inline_nowrap(js):
+    """The board-row wrapper carries class sprint-item-main (its flex/min-width now live
+    in the stylesheet, where the media queries can reach them) and no title is rendered
+    with an inline nowrap/ellipsis that would out-rank the stylesheet (the backburner rows
+    used to)."""
+    icon = js.index('class="sprint-item-icon" style="color:${color}"')
+    assert 'class="sprint-item-main"' in js[icon : icon + 400], "board-row text column must be .sprint-item-main"
+    titles = [ln for ln in js.splitlines() if 'class="sprint-item-title"' in ln]
+    assert len(titles) >= 4, "expected the board, needs-attention, your-tasks and backburner title spans"
+    for ln in titles:
+        assert "nowrap" not in ln and "ellipsis" not in ln, f"inline truncation on a sprint title: {ln.strip()[:120]}"
+    # the backburner row no longer pins its own flex layout inline (the class rules apply)
+    marker = 'data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version'
+    row = [ln for ln in js.splitlines() if marker in ln]
+    assert row, "backburner row template not found"
+    assert all("display:flex" not in ln and "align-items:center" not in ln for ln in row)
+
+
+# ---------------------------------------------------------------------------
+# Cascade-independent scan. The exact-selector checks above (`_decls` merges only
+# rules whose selector text EQUALS the one asked for) and the jsdom contract (source
+# order only, no @media) are blind to a rule that wins on specificity or applies only on
+# a phone, and two such mutations re-broke the layout in a real browser while every
+# test passed: an earlier `.live-body .sprint-item-title { white-space: nowrap }` and a
+# `@media (max-width: 768px) { .live-body span { white-space: nowrap } }`. This scan
+# ignores specificity, order, layers and viewport gates: for EVERY rule (any @media /
+# @supports / @container / @layer, CSS nesting resolved, :is()/:where() groups unrolled)
+# it asks which sprint-row elements the selector could style, and rejects any declaration
+# that could undo the contract on one of them. A value built from var()/env()/attr()
+# cannot be judged from text, so it counts as harmful wherever the property could do
+# harm; and a rule inside @layer is judged like any other (it can still win: an
+# `!important` layered declaration beats unlayered ones, and a layered declaration of a
+# property no unlayered rule sets on that element applies), so the scan flags it with the
+# rule named rather than guess at the cascade. The pixel layout is asserted in a real
+# browser by tests/test_demo_ux.py (test_sprint_rows_never_overlap_in_a_real_browser).
+# ---------------------------------------------------------------------------
+
+
+def _sprint_static(name):
+    """A file of meridian/static read from disk (no app boot: these checks are pure text)."""
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parent.parent / "meridian" / "static" / name).read_text(encoding="utf-8")
+
+
+# Classes of the elements INSIDE a .sprint-item-row (renderSprintProgress + _sprintHistoryBadges).
+_SPRINT_ROW_CLASSES = frozenset({
+    "sprint-item-row", "sprint-item-icon", "sprint-item-main", "sprint-item-title", "sprint-item-ver",
+    "sprint-item-meta", "sprint-item-actions", "sprint-item-notes", "sprint-item-resources", "resource-chip",
+    "sprint-btn", "sprint-btn-fail", "sprint-btn-push", "sprint-stall-badge", "sprint-retried-badge",
+    "sprint-live-dot",
+})
+# The board's ancestors (dashboard.ts buildTabBody): a selector may qualify itself with these.
+_SPRINT_CHAIN_CLASSES = frozenset({
+    "app", "main", "tab-bodies", "tab-body", "vtab-drawer", "drawer-panel", "live-body", "live-section",
+    "live-sprint-progress", "active", "open",
+})
+# Which row classes a bare element selector (`span`, `div`, `button`) can hit.
+_SPRINT_TYPE_CLASSES = {
+    "span": frozenset({
+        "sprint-item-icon", "sprint-item-title", "sprint-item-ver", "sprint-item-meta", "sprint-item-actions",
+        "resource-chip", "sprint-stall-badge", "sprint-retried-badge", "sprint-live-dot",
+    }),
+    "div": frozenset({"sprint-item-row", "sprint-item-main", "sprint-item-notes", "sprint-item-resources"}),
+    "button": frozenset({"sprint-btn", "sprint-btn-fail", "sprint-btn-push"}),
+}
+# Short fixed labels that are kept on one line / truncated on purpose.
+_SPRINT_DELIBERATE = frozenset({"sprint-item-meta", "sprint-btn", "sprint-btn-fail", "sprint-btn-push"})
+_SPRINT_TEXT_BOXES = frozenset({"sprint-item-title", "sprint-item-main", "sprint-item-ver", "resource-chip"})
+_SPRINT_COLUMN = frozenset({"sprint-item-title", "sprint-item-main"})
+# Boxes that hold wrapping text (or text-bearing children). Pinning one to a fixed height, squashing its
+# line box or shifting it out of the flow paints its content over the NEXT row. The icon, the live dot, the
+# badges and the buttons are fixed-size on purpose and are not in this set.
+_SPRINT_FLOW_BOXES = frozenset({
+    "sprint-item-row", "sprint-item-main", "sprint-item-title", "sprint-item-ver", "sprint-item-actions",
+    "sprint-item-notes", "sprint-item-resources", "resource-chip",
+})
+_SPRINT_ROW_BOXES = frozenset({"sprint-item-row", "sprint-item-actions"})
+# A value taken from a custom property / environment / attribute cannot be judged from the text alone.
+_SPRINT_UNRESOLVED = re.compile(r"\b(?:var|env|attr)\(")
+_SPRINT_GROUP_PSEUDO = r":(?:is|where|matches|-webkit-any|-moz-any)\("
+
+
+def _sprint_alternatives(selector):
+    """`selector` with its :is()/:where() groups unrolled into plain alternatives; None when a
+    group is too nested or too large to unroll."""
+    pending, done = [selector], []
+    while pending:
+        sel = pending.pop()
+        found = re.search(_SPRINT_GROUP_PSEUDO + r"([^()]*)\)", sel, flags=re.I)
+        if found is None:
+            done.append(sel)
+        elif len(pending) + len(done) > 256:
+            return None
+        else:
+            pending.extend(
+                sel[: found.start()] + alt.strip() + sel[found.end() :] for alt in _css_split(found.group(1), ",")
+            )
+    return done
+
+
+def _sprint_strip_pseudos(selector):
+    """`selector` without its pseudo-classes / -elements (their argument lists included, balanced)."""
+    out, i = [], 0
+    while i < len(selector):
+        found = re.compile(r"::?[\w-]+").match(selector, i)
+        if found is None:
+            out.append(selector[i])
+            i += 1
+            continue
+        i = found.end()
+        if i < len(selector) and selector[i] == "(":
+            depth = 0
+            while i < len(selector):
+                depth += (selector[i] == "(") - (selector[i] == ")")
+                i += 1
+                if depth == 0:
+                    break
+    return "".join(out).strip()
+
+
+def _sprint_reach_one(selector):
+    every = frozenset(_SPRINT_ROW_CLASSES)
+    sel = _sprint_strip_pseudos(selector)
+    compounds = [c for c in re.split(r"\s*[>+~]\s*|\s+", sel) if c]
+    if not compounds:
+        return every  # a bare ':hover'
+    for comp in compounds[:-1]:  # ancestors must be satisfiable by the board's own chain
+        classes, ids = re.findall(r"\.([\w-]+)", comp), re.findall(r"#([\w-]+)", comp)
+        tag = re.match(r"[a-zA-Z][\w-]*|\*", comp)
+        if any(c not in _SPRINT_ROW_CLASSES | _SPRINT_CHAIN_CLASSES for c in classes) or any(i != "tab-bodies" for i in ids):
+            return frozenset()
+        if not classes and not ids and tag and tag.group(0) not in ("*", "div", "main", "body", "html", "span"):
+            return frozenset()
+    last = compounds[-1]
+    classes, ids = re.findall(r"\.([\w-]+)", last), re.findall(r"#([\w-]+)", last)
+    if ids or any(c not in _SPRINT_ROW_CLASSES for c in classes):
+        return frozenset()
+    if classes:
+        return frozenset(classes)
+    if "[" in last:  # an attribute selector alone: can't tell, assume every kind
+        return every
+    tag = re.match(r"[a-zA-Z][\w-]*|\*", last)
+    name = tag.group(0) if tag else "*"
+    return every if name == "*" else _SPRINT_TYPE_CLASSES.get(name, frozenset())
+
+
+def _sprint_reach(selector):
+    """The row-element classes `selector` could style (conservative: state pseudo-classes
+    and :not()/:has() arguments are ignored, :is()/:where() groups are unrolled, any
+    ancestor/sibling combinator counts as an ancestor), or an empty set when it cannot match
+    anything inside a sprint row."""
+    alternatives = _sprint_alternatives(selector)
+    if alternatives is None or any(re.search(_SPRINT_GROUP_PSEUDO, a, flags=re.I) for a in alternatives):
+        return frozenset(_SPRINT_ROW_CLASSES)  # too tangled to unroll: assume it can reach anything
+    return frozenset().union(*(_sprint_reach_one(a) for a in alternatives))
+
+
+def _sprint_squashes(line_height):
+    """True when a line-height is small enough to paint wrapped lines over each other."""
+    found = re.fullmatch(r"([0-9.]+)(px|pt|em|rem|%)?", line_height)
+    if not found:
+        return False
+    floor = {None: 1, "px": 9, "pt": 7, "em": 0.75, "rem": 0.75, "%": 75}[found.group(2)]
+    return float(found.group(1)) < floor
+
+
+def _sprint_harm(prop, raw, kinds):
+    """Why `prop: raw` could re-break the layout contract on one of `kinds`, else None. A value
+    built from a custom property cannot be judged here, so it counts as harmful wherever the
+    property could do harm (the real-browser test judges what it really resolves to)."""
+    v = " ".join(raw.replace("!important", "").lower().split())
+    unresolved = bool(_SPRINT_UNRESOLVED.search(v))
+    truncating = kinds - _SPRINT_DELIBERATE
+    flow = kinds & _SPRINT_FLOW_BOXES
+
+    def verdict(applies, harmful, message):
+        if not applies:
+            return None
+        if unresolved:
+            return f"{message} (its value is built from a custom property, which cannot be resolved here)"
+        return message if harmful else None
+
+    if prop == "white-space":
+        return verdict(truncating, v in ("nowrap", "pre"), "stops the text wrapping")
+    if prop in ("text-wrap", "text-wrap-mode"):
+        return verdict(truncating, "nowrap" in v.split(), "stops the text wrapping")
+    if prop == "text-overflow":
+        return verdict(truncating, v not in ("clip", "initial", "unset", "inherit"), "ellipsizes (hides) text")
+    if prop in ("overflow", "overflow-x", "overflow-y", "overflow-block", "overflow-inline"):
+        return verdict(truncating, bool(re.search(r"\b(hidden|clip|scroll|auto)\b", v)), "clips its content")
+    if prop == "flex-wrap":
+        return verdict(kinds & _SPRINT_ROW_BOXES, v == "nowrap", "stops the row wrapping")
+    if prop == "flex-flow":
+        return verdict(kinds & _SPRINT_ROW_BOXES, "nowrap" in v.split(), "stops the row wrapping")
+    if prop in ("overflow-wrap", "word-wrap"):
+        return verdict(kinds & _SPRINT_TEXT_BOXES, v == "normal", "stops a long token breaking")
+    if prop == "word-break":
+        return verdict(kinds, v == "keep-all", "stops a long token breaking")
+    if prop == "display":
+        return verdict(
+            kinds & _SPRINT_COLUMN,
+            not re.fullmatch(r"block|flex|grid|flow-root|inline-block|list-item", v),
+            "makes the text column inline (ignores width / overflow) or hides it",
+        )
+    if prop == "min-width":
+        return verdict(kinds & _SPRINT_COLUMN, not re.fullmatch(r"0(px)?", v), "stops the text column shrinking")
+    if prop == "position":
+        return verdict(kinds, v in ("absolute", "fixed"), "takes a row element out of flow (it can paint over its neighbours)")
+    if prop in ("height", "block-size"):
+        return verdict(
+            flow, not re.fullmatch(r"auto|fit-content|min-content|max-content|initial|unset|revert|revert-layer", v),
+            "pins a text box to a fixed height, so wrapped content paints over the next row",
+        )
+    if prop in ("max-height", "max-block-size"):
+        return verdict(
+            flow, v not in ("none", "initial", "unset", "revert", "revert-layer"),
+            "caps a text box's height, so wrapped content paints over the next row",
+        )
+    if prop == "line-height":
+        return verdict(flow, _sprint_squashes(v), "squashes wrapped lines onto each other")
+    if prop == "font":
+        slash = re.search(r"/\s*([^\s,/]+)", v)
+        return verdict(flow, bool(slash) and _sprint_squashes(slash.group(1)), "squashes wrapped lines onto each other")
+    if prop in ("top", "bottom", "inset", "inset-block", "inset-block-start", "inset-block-end"):
+        return verdict(
+            flow, not re.fullmatch(r"auto|0(px|%|em|rem)?|initial|unset|revert", v),
+            "offsets a text box from its place in the flow (it can paint over the previous row)",
+        )
+    if prop in ("transform", "translate"):
+        return verdict(flow, v not in ("none", "initial", "unset", "revert"), "moves a text box out of its place in the flow")
+    if prop in ("margin", "margin-top", "margin-bottom", "margin-block", "margin-block-start", "margin-block-end"):
+        return verdict(flow, bool(re.search(r"(^|\s)-[0-9.]", v)), "pulls a text box over its neighbours with a negative margin")
+    if prop == "all":
+        return verdict(truncating, True, "resets every property, including the wrapping contract")
+    return None
+
+
+def _sprint_cascade_offenders(css_text):
+    out = []
+    for media, selectors, decls in _css_rules(css_text):
+        for sel in selectors:
+            kinds = _sprint_reach(sel)
+            for prop, value in decls.items():
+                why = kinds and _sprint_harm(prop, value, kinds)
+                if why:
+                    out.append(f"{media + ' ' if media else ''}{sel} {{ {prop}: {value} }} {why}")
+    return out
+
+
+def test_no_stylesheet_rule_can_undo_the_sprint_row_wrapping_contract():
+    """Whatever its specificity, source position or @media gate, no rule in dashboard.css
+    may stop a sprint row's text wrapping, clip or ellipsize it, stop the row wrapping,
+    make the title column inline / unshrinkable, or take a row element out of flow."""
+    assert _sprint_cascade_offenders(_sprint_static("dashboard.css")) == []
+
+
+def test_sprint_cascade_scan_reaches_the_rules_it_must_judge():
+    """The scan is not vacuous: the real sheet's contract rules and its @media-gated
+    rules reach row elements, and the deliberately truncated '-> v2' pill is tolerated."""
+    rules = _css_rules(_sprint_static("dashboard.css"))
+    reaching = [(m, s) for m, sels, _ in rules for s in sels if _sprint_reach(s)]
+    assert sum(1 for m, _ in reaching if m is None) >= 10
+    assert sum(1 for m, _ in reaching if m == "@media (max-width: 768px)") >= 3
+    assert sum(1 for m, _ in reaching if m == "@media (max-width: 480px)") >= 1
+    meta = _decls(rules, ".sprint-item-meta")
+    assert meta.get("white-space") == "nowrap" and meta.get("text-overflow") == "ellipsis"
+    assert _sprint_cascade_offenders(".sprint-item-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }") == []
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        # the two that used to survive every suite
+        ".live-body .sprint-item-title { white-space: nowrap; }",
+        "@media (max-width: 768px) { .live-body span { white-space: nowrap; } }",
+        # other shapes of the same regression
+        "@media (max-width: 480px) { span { white-space: pre; } }",
+        "@supports (display: grid) { .tab-body .sprint-item-row span { white-space: nowrap; } }",
+        ".sprint-item-title { overflow: hidden; text-overflow: ellipsis; }",
+        ".sprint-item-row * { overflow-x: clip; }",
+        ".sprint-item-row .sprint-item-title { white-space: nowrap !important; }",
+        ".sprint-item-title:hover { white-space: nowrap; }",
+        "@media (max-width: 480px) { .sprint-item-row { flex-wrap: nowrap; } }",
+        ".sprint-item-actions { flex-wrap: nowrap; }",
+        "@media (max-width: 768px) { .sprint-item-title { display: inline; } }",
+        ".sprint-item-main { min-width: auto; }",
+        ".sprint-item-ver { overflow-wrap: normal; }",
+        ".sprint-item-resources .resource-chip { white-space: nowrap; }",
+        ".sprint-item-title { position: absolute; }",
+        "#tab-bodies div { white-space: nowrap; }",
+        "[class*='sprint-item'] { white-space: nowrap; }",
+        # --- syntax the scan used to be blind to (every one of these re-breaks a real browser) ---
+        # CSS nesting: the child rule inherits its parent's selector
+        ".live-body { .sprint-item-title { white-space: nowrap; } }",
+        ".sprint-item-row { & .sprint-item-title { white-space: nowrap; } }",
+        ".sprint-item-row { > .sprint-item-title { overflow: hidden; } }",
+        ".sprint-item-title { @media (max-width: 768px) { white-space: nowrap; } }",
+        # a value taken from a custom property cannot be judged from the text
+        ".sprint-item-title { white-space: var(--ws); }",
+        ".sprint-item-row { display: flex; flex-wrap: var(--wrap); }",
+        # :is() / :where() groups (their commas used to split the selector list apart)
+        ":is(.live-body, .tab-body) :is(.sprint-item-title) { white-space: nowrap; }",
+        ".sprint-item-row :where(.sprint-item-title, .sprint-item-ver) { white-space: nowrap; }",
+        ":is(.sprint-item-title) { white-space: nowrap; }",
+        ".sprint-item-title:not(.x) { white-space: nowrap; }",
+        ".sprint-item-row:has(> .sprint-item-ver) .sprint-item-title { white-space: nowrap; }",
+        # layers / containers, and statement at-rules that used to swallow the rule after them
+        "@layer base { .sprint-item-title { white-space: nowrap !important; } }",
+        "@container (min-width: 1px) { .sprint-item-title { white-space: nowrap; } }",
+        "@layer base, theme;\n.sprint-item-title { white-space: nowrap; }",
+        "@import url('x.css');\n.sprint-item-title { white-space: nowrap; }",
+        # --- vertical and spacing: rows pinned / squashed / shifted so their content paints over the next row ---
+        ".sprint-item-row { height: 28px; }",
+        ".sprint-item-row { max-height: 28px; }",
+        "@media (max-width: 768px) { .sprint-item-row { block-size: 28px; } }",
+        ".sprint-item-actions { height: 0; }",
+        ".sprint-item-main { max-height: 1.4em; }",
+        ".sprint-item-title { line-height: 0.5; }",
+        ".sprint-item-title { line-height: 4px; }",
+        ".sprint-item-title { font: 12px/0.5 sans-serif; }",
+        ".sprint-item-title { position: relative; top: -22px; }",
+        ".sprint-item-title { transform: translateY(-20px); }",
+        ".sprint-item-ver { translate: 0 -20px; }",
+        ".sprint-item-title { margin-top: -20px; }",
+        ".sprint-item-row { margin: 0 0 -10px; }",
+        # shorthands and newer longhands of the properties already watched
+        ".sprint-item-row { flex-flow: row nowrap; }",
+        ".sprint-item-title { text-wrap: nowrap; }",
+        ".sprint-item-title { text-wrap-mode: nowrap; }",
+        ".sprint-item-row { overflow-y: hidden; }",
+        ".sprint-item-title { all: unset; }",
+    ],
+)
+def test_sprint_cascade_scan_catches_each_regression_shape(mutant):
+    assert _sprint_cascade_offenders(mutant), f"scan is blind to: {mutant}"
+    assert _sprint_cascade_offenders(_sprint_static("dashboard.css") + "\n" + mutant), f"scan is blind to (appended): {mutant}"
+
+
+@pytest.mark.parametrize(
+    "benign",
+    [
+        ".tabs span { white-space: nowrap; }",
+        ".sidebar button { overflow: hidden; }",
+        "@media (max-width: 768px) { .vtab-strip .vtab-btn { white-space: nowrap; overflow: hidden; } }",
+        ".sprint-item-row { gap: 10px; color: red; }",
+        "button { white-space: nowrap; }",
+        ".sprint-btn { white-space: nowrap; overflow: hidden; }",
+        ".live-session-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+        # fixed-size parts of a row are not text boxes
+        ".sprint-btn { height: 20px; line-height: 1; }",
+        ".sprint-item-icon { height: 14px; line-height: 1; transform: scale(1.1); }",
+        ".sprint-live-dot { width: 7px; height: 7px; }",
+        "@keyframes sprintPulse { from { height: 0; top: -4px; } to { height: 7px; top: 0; } }",
+        # values that are fine on a text box
+        ".sprint-item-row { min-height: 28px; line-height: 1.4; margin: 0 0 2px; height: auto; max-height: none; }",
+        ".sprint-item-title { line-height: normal; transform: none; top: auto; margin-top: 2px; font: 12px/1.4 sans-serif; }",
+        ".sprint-item-actions { margin-left: auto; gap: 2px; flex-wrap: wrap; }",
+        ".sprint-item-row { padding: var(--row-pad); gap: var(--gap); color: var(--text); }",
+        # the same rules written with nesting, groups, layers or custom properties, but not reaching a row
+        ".sidebar { .tab { white-space: nowrap; } }",
+        ".tabs { span { white-space: nowrap; } }",
+        ".tabs { @media (max-width: 768px) { white-space: nowrap; } }",
+        ":is(.tabs, .sidebar) span { white-space: nowrap; }",
+        ".vtab-btn:is(.a, .b), .tab:where(.x) { white-space: nowrap; overflow: hidden; }",
+        "@layer base { .tabs span { white-space: nowrap; } }",
+        "@container (min-width: 1px) { .sidebar button { overflow: hidden; } }",
+        ".tabs span { white-space: var(--ws); }",
+        "@font-face { font-family: X; src: url(data:font/woff2;base64,AAAA) format('woff2'); }",
+        "@import url('x.css');\n.tabs span { white-space: nowrap; }",
+    ],
+)
+def test_sprint_cascade_scan_does_not_cry_wolf(benign):
+    assert _sprint_cascade_offenders(benign) == [], benign
+
+
+def test_css_rules_parser_models_nesting_groups_and_statement_at_rules():
+    """The scan is only as good as the parser feeding it: it must resolve nesting, keep the
+    conditional gate of every rule, split selector lists only on top-level commas, not stop at a
+    `;` inside url()/strings, and not lose the rule that follows a statement at-rule."""
+    rules = _css_rules(
+        "@import url('x.css');\n"
+        "@layer base, theme;\n"
+        ".a, :is(.b, .c) > .d { color: red; background: url(data:image/png;base64,AAA=); content: 'a;b'; }\n"
+        ".live-body { .sprint-item-title { white-space: nowrap } &:hover { color: blue } > .x { top: 1px }\n"
+        "  @media (max-width: 768px) { gap: 2px } }\n"
+        "@media (max-width: 768px) { @supports (display: grid) { .g { display: grid } } }\n"
+        "@keyframes k { from { height: 0 } to { height: 5px } }\n"
+        "@font-face { font-family: F; src: url(f.woff2) }\n"
+        "@layer base { .layered { white-space: pre } }\n"
+        ".last { color: green }"
+    )
+    by_selector = {tuple(sels): (gate, decls) for gate, sels, decls in rules}
+    assert by_selector[(".a", ":is(.b, .c) > .d")][1] == {
+        "color": "red", "background": "url(data:image/png;base64,AAA=)", "content": "'a;b'",
+    }
+    assert by_selector[(".live-body .sprint-item-title",)][1] == {"white-space": "nowrap"}
+    assert by_selector[(".live-body:hover",)][1] == {"color": "blue"}
+    assert by_selector[(".live-body > .x",)][1] == {"top": "1px"}
+    assert by_selector[(".live-body",)] == ("@media (max-width: 768px)", {"gap": "2px"}), (
+        "a nested @media must style its parent selector under that gate"
+    )
+    assert by_selector[(".g",)] == ("@media (max-width: 768px) @supports (display: grid)", {"display": "grid"})
+    assert by_selector[(".layered",)] == ("@layer base", {"white-space": "pre"})
+    assert by_selector[(".last",)] == (None, {"color": "green"}), "the rule after statement at-rules must survive"
+    assert all("k" not in sels and "from" not in sels for _, sels, _ in rules), "@keyframes steps are not rules"
+    assert not any("font-family" in decls for _, _, decls in rules), "@font-face has no selector: skipped"
+
+
+def test_sprint_reach_unrolls_is_and_where_groups_and_strips_other_pseudo_classes():
+    assert _sprint_reach(":is(.live-body, .tab-body) :is(.sprint-item-title)") == {"sprint-item-title"}
+    assert _sprint_reach(".sprint-item-row :where(.sprint-item-title, .sprint-item-ver)") == {
+        "sprint-item-title", "sprint-item-ver",
+    }
+    assert _sprint_reach(".sprint-item-row:has(> .sprint-item-ver):not(.x)") == {"sprint-item-row"}
+    assert _sprint_reach(":is(.sidebar, .tabs) .sprint-item-title") == frozenset(), "ancestors outside the board's chain"
+    assert _sprint_reach(":is(.tabs, .sidebar) span") == frozenset()
+    assert _sprint_reach(":is(:is(.sprint-item-title))") == {"sprint-item-title"}
+    # too deeply nested to unroll: assume it can reach anything rather than miss it
+    assert _sprint_reach(":is(:not(.a)) .b") == frozenset(_SPRINT_ROW_CLASSES)
+
+
+def test_sprint_cascade_scan_knows_every_class_the_row_markup_renders():
+    """Drift guard for _SPRINT_ROW_CLASSES: the scan can only judge the classes it
+    knows; every static class in the row markup must be listed, and none may be stale."""
+    src = _sprint_static("dashboard-sprint.ts")
+    board = src[src.index("export function renderSprintProgress") : src.index("export function renderQueue")]
+    helper = src[src.index("function _sprintHistoryBadges") : src.index("function _sprintHistoryBadges") + 1700]
+    rendered = set()
+    for chunk in (board, helper):
+        for attr in re.findall(r'class="([^"$]*)"', chunk):
+            rendered.update(attr.split())
+    row_like = {c for c in rendered if c.startswith(("sprint-item-", "sprint-btn", "sprint-stall", "sprint-retried", "sprint-live-dot")) or c == "resource-chip"}
+    assert row_like <= _SPRINT_ROW_CLASSES, f"row classes missing from _SPRINT_ROW_CLASSES: {sorted(row_like - _SPRINT_ROW_CLASSES)}"
+    assert _SPRINT_ROW_CLASSES <= rendered, f"stale classes in _SPRINT_ROW_CLASSES: {sorted(_SPRINT_ROW_CLASSES - rendered)}"
 
 
 # ---------------------------------------------------------------------------
