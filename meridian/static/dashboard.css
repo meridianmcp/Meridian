@@ -570,9 +570,10 @@ input[type=text] {
      long phrase wraps and even a 300-character unbreakable token breaks inside
      the column (an inline span ignores flex/overflow, which is how the old
      nowrap title ran straight over .sprint-item-ver and .sprint-item-actions).
-   - The row wraps (flex-wrap) and the text column has a minimum width, so when
-     the row is too narrow for text + buttons the actions drop onto their own
-     line UNDER the text instead of squeezing it or overlapping it.
+   - The row wraps (flex-wrap) and the text column is content-sized (capped at the
+     row width), so when the row is too narrow for text + buttons the actions drop
+     onto their own line UNDER the text instead of squeezing it or overlapping it,
+     while a short title keeps its buttons beside it.
    - align-items:baseline keeps the status icon, version and buttons on the
      first line of the title, so a wrapped title reads cleanly. */
 .sprint-item-row {
@@ -583,12 +584,17 @@ input[type=text] {
 }
 .sprint-item-icon { flex-shrink: 0; width: 14px; text-align: center; font-size: 11px; }
 /* The text column: the wrapper div in board rows, the title span itself in the
-   needs-attention / your-tasks / backburner rows. The basis is capped at the room
-   left beside the icon (20px = 14px icon + 6px gap) so the icon never ends up
-   alone on a line above the text. */
+   needs-attention / your-tasks / backburner rows. It is sized by its CONTENT
+   (flex-basis:auto), so a short title takes only the room it needs and the version
+   label and buttons stay beside it on one line; a title that is too long to share the
+   line with them takes the whole line and they drop UNDER it. (A fixed minimum basis
+   reserved room even for a 10-character title, which pushed the buttons of every
+   row onto a second line at the real desktop board width.) The max-width cap is the
+   room left beside the icon (20px = 14px icon + 6px gap), so the text never outgrows
+   the row and the icon is never left alone on a line above it. */
 .sprint-item-main,
 .sprint-item-row > .sprint-item-title {
-  flex: 1 1 min(15em, calc(100% - 20px)); min-width: 0;
+  flex: 1 1 auto; min-width: 0; max-width: calc(100% - 20px);
 }
 .sprint-item-title {
   display: block; min-width: 0;
@@ -932,11 +938,14 @@ select option {
   /* Sprint board: wrapping, the title's own-column behaviour and the baseline
      alignment all live in the base .sprint-item-row / .sprint-item-title rules
      (they depend on the container's width, not the viewport's); this block only
-     tunes them for a phone-width column. The title column's minimum width is a
-     little smaller, a wrapped row gets a bit more air between its lines, and the
-     action buttons ALWAYS take their own line under the text (right-aligned) so
-     every row reads the same instead of some squeezing the title and some not.
-     The meta chip gets room to sit under the title instead of pushing off-screen. */
+     tunes them for a phone-width column. A wrapped row gets a bit more air between
+     its lines, and the action buttons ALWAYS take their own line under the text
+     (right-aligned) so every row reads the same instead of some squeezing the
+     title and some not. Because the buttons never sit beside the text here, the
+     text column can start from a small fixed basis (instead of its full content
+     width, which would push the version label onto a line of its own between a
+     long title and the buttons), so the version label stays beside the title. The
+     meta chip gets room to sit under the title instead of pushing off-screen. */
   .sprint-item-row { gap: 4px 6px; }
   .sprint-item-main,
   .sprint-item-row > .sprint-item-title { flex-basis: min(11em, calc(100% - 20px)); }

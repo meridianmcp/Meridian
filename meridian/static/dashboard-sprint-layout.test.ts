@@ -15,10 +15,15 @@
 //
 // Limits, and how they are covered: jsdom resolves getComputedStyle by SOURCE ORDER
 // only (no specificity) and ignores @media, so the property checks alone cannot see a
-// rule that wins on specificity or applies only on a phone. The last describe block
-// therefore scans every rule in the stylesheet (all @media, any specificity) for a
-// declaration that could undo the contract, and the PIXEL layout itself is measured in
-// a real browser by tests/test_demo_ux.py (test_sprint_rows_never_overlap_in_a_real_browser).
+// rule that wins on specificity or applies only on a phone. The scan describe block
+// therefore reads every rule of the raw stylesheet (nesting, @layer, @container, :is()
+// groups and all @media resolved; var() values judged as harmful where the property can
+// harm) for a declaration that could undo the contract, and the PIXEL layout itself is
+// measured in a real browser by tests/test_demo_ux.py
+// (test_sprint_rows_never_overlap_in_a_real_browser, which also pins that SHORT rows keep
+// their buttons beside the title: test_sprint_short_rows_keep_their_buttons_beside_the_title...).
+// jsdom rejects a sheet with CSS nesting or @layer outright, so such a sheet is flattened
+// before jsdom sees it (toJsdomCss); a flat sheet is fed through unchanged.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -100,13 +105,159 @@ const columnOf = (row: HTMLElement) => {
   return title.parentElement === row ? title : (title.parentElement as HTMLElement);
 };
 
+// ---------------------------------------------------------------------------
+// A small CSS reader, shared by the cascade scan below and by the jsdom loader.
+//
+// jsdom's CSSOM is not a safe thing to read declarations from: it rejects the WHOLE sheet
+// ("Could not parse CSS stylesheet") when it meets CSS nesting or @layer, and its style
+// declaration silently drops properties it does not know (text-wrap, ...). So the scan reads
+// the raw text itself (rules, nesting, @media / @supports / @container / @layer gates,
+// `;` inside url() and strings), and asks the DOM only which elements a selector could match.
+// ---------------------------------------------------------------------------
+type Rule = { gates: string[]; selectors: string[]; decls: Array<[string, string]> };
+type Item = { kind: "stmt"; text: string } | { kind: "block"; prelude: string; body: string };
+
+/** Split `text` on `sep` at nesting depth 0 (outside (), [], {} and quoted strings). */
+function splitTop(text: string, sep: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let quote = "";
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = "";
+    } else if (c === '"' || c === "'") quote = c;
+    else if ("([{".includes(c)) depth++;
+    else if (")]}".includes(c)) depth = Math.max(0, depth - 1);
+    else if (c === sep && depth === 0) {
+      parts.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/** The top-level items of a CSS block body: `;`-terminated statements and `prelude { body }` blocks. */
+function cssItems(text: string): Item[] {
+  const items: Item[] = [];
+  let depth = 0;
+  let quote = "";
+  let start = 0;
+  let brace = 0;
+  let bodyStart = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = "";
+    } else if (c === '"' || c === "'") quote = c;
+    else if (brace > 0) {
+      if (c === "{") brace++;
+      else if (c === "}" && --brace === 0) {
+        items.push({ kind: "block", prelude: text.slice(start, bodyStart).trim(), body: text.slice(bodyStart + 1, i) });
+        start = i + 1;
+      }
+    } else if (c === "(" || c === "[") depth++;
+    else if (c === ")" || c === "]") depth = Math.max(0, depth - 1);
+    else if (depth === 0 && c === ";") {
+      const stmt = text.slice(start, i).trim();
+      if (stmt) items.push({ kind: "stmt", text: stmt });
+      start = i + 1;
+    } else if (depth === 0 && c === "{") {
+      bodyStart = i;
+      brace = 1;
+    }
+  }
+  if (brace === 0 && text.slice(start).trim()) items.push({ kind: "stmt", text: text.slice(start).trim() });
+  return items;
+}
+
+const GROUP_AT_RULE = /^@(media|supports|container|layer|scope|document|starting-style)\b/i;
+const squash = (s: string) => s.split(/\s+/).filter(Boolean).join(" ");
+
+/**
+ * Every style rule of `css`, in source order, with nesting resolved (`&` or an implicit
+ * descendant) and the preludes of the conditional / layer groups it sits in. Statement
+ * at-rules (@import, `@layer a, b;`) are skipped without swallowing the rule after them, and
+ * rule-less at-rules (@keyframes, @font-face) are skipped whole.
+ */
+function parseCss(css: string): { rules: Rule[]; nested: boolean; layered: boolean } {
+  const text = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const out: Array<Rule | null> = [];
+  let nested = false;
+  let layered = false;
+  const walk = (body: string, selectors: string[] | null, gates: string[]): Array<[string, string]> => {
+    const decls: Array<[string, string]> = [];
+    for (const item of cssItems(body)) {
+      if (item.kind === "stmt") {
+        const colon = item.text.indexOf(":");
+        if (!item.text.startsWith("@") && colon > 0) {
+          decls.push([item.text.slice(0, colon).trim().toLowerCase(), squash(item.text.slice(colon + 1))]);
+        }
+        continue;
+      }
+      const prelude = squash(item.prelude);
+      if (prelude.startsWith("@")) {
+        if (GROUP_AT_RULE.test(prelude)) {
+          if (/^@layer\b/i.test(prelude)) layered = true;
+          const group = [...gates, prelude];
+          const inner = walk(item.body, selectors, group);
+          if (inner.length && selectors) {
+            nested = true; // `.a { @media (..) { color: red } }`: the declarations style the parent
+            out.push({ gates: group, selectors: [...selectors], decls: inner });
+          }
+        }
+        continue;
+      }
+      const own = splitTop(prelude, ",").map((s) => s.trim()).filter(Boolean);
+      const resolved = selectors
+        ? selectors.flatMap((parent) => own.map((child) => (child.includes("&") ? child.split("&").join(parent) : `${parent} ${child}`)))
+        : own;
+      if (selectors) nested = true;
+      const slot = out.length;
+      out.push(null);
+      out[slot] = { gates, selectors: resolved, decls: walk(item.body, resolved, gates) };
+    }
+    return decls;
+  };
+  walk(text, null, []);
+  return { rules: out.filter((r): r is Rule => r !== null), nested, layered };
+}
+
+/**
+ * The text to hand jsdom. A flat sheet goes in exactly as written. A sheet jsdom cannot parse
+ * (CSS nesting, @layer: it would drop ALL of the dashboard's CSS and fail every computed-style
+ * test) is flattened first: nesting resolved, @layer blocks unwrapped and hoisted ahead of the
+ * unlayered rules (a layered rule loses to an unlayered one in every browser, and jsdom resolves
+ * the cascade by source order), @container / @scope rules dropped (jsdom cannot evaluate them).
+ * @keyframes / @font-face / @import are dropped too: no computed-style test reads them.
+ */
+function toJsdomCss(css: string): string {
+  const { rules, nested, layered } = parseCss(css);
+  if (!nested && !layered) return css;
+  const isLayer = (r: Rule) => r.gates.some((g) => /^@layer\b/i.test(g));
+  const emit = (r: Rule): string => {
+    if (r.gates.some((g) => /^@(container|scope|document|starting-style)\b/i.test(g))) return "";
+    const body = `${r.selectors.join(", ")} { ${r.decls.map(([p, v]) => `${p}: ${v};`).join(" ")} }`;
+    return r.gates.filter((g) => /^@(media|supports)\b/i.test(g)).reduceRight((inner, gate) => `${gate} { ${inner} }`, body);
+  };
+  return [...rules.filter(isLayer), ...rules.filter((r) => !isLayer(r))].map(emit).filter(Boolean).join("\n");
+}
+
+const REAL_CSS = readFileSync(resolve(process.cwd(), "meridian/static/dashboard.css"), "utf8");
+
 beforeAll(() => {
   // Same cascade the dashboard gets: the REAL stylesheet text.
-  const css = readFileSync(resolve(process.cwd(), "meridian/static/dashboard.css"), "utf8");
   const style = document.createElement("style");
   style.id = "real-dashboard-css";
-  style.textContent = css;
+  style.textContent = toJsdomCss(REAL_CSS);
   document.head.appendChild(style);
+  // jsdom must really have loaded it (a sheet it cannot parse is silently dropped, and every
+  // computed-style assertion below would then be reading nothing)
+  expect(style.sheet, "jsdom could not parse dashboard.css").not.toBeNull();
 });
 
 // The board's real ancestor chain (dashboard.ts buildTabBody: .app > main > .tab-bodies >
@@ -209,6 +360,13 @@ describe("sprint row layout contract: the row reflows around the title", () => {
       expect(row.querySelector(".sprint-item-title")).not.toBeNull();
       expect(row.querySelector(".sprint-item-ver")).not.toBeNull();
       expect(row.querySelector(".sprint-item-actions")).not.toBeNull();
+    }
+    // reading order of a board row: status icon, text column, version label, THEN the buttons (the
+    // stylesheet's margin-left:auto pushes the buttons right; a row that lists them before the version
+    // label would put the label on the wrong side of them)
+    for (const row of rowsOf("board")) {
+      const order = Array.from(row.children).map((c) => Array.from(c.classList).find((k) => k.startsWith("sprint-item-")));
+      expect(order, `board row ${row.dataset.item}`).toEqual(["sprint-item-icon", "sprint-item-main", "sprint-item-ver", "sprint-item-actions"]);
     }
     for (const row of rowsOf("backburner")) {
       for (const attr of ["data-item", "data-title", "data-version"]) expect(row.hasAttribute(attr)).toBe(true);
@@ -314,9 +472,21 @@ describe("sprint row layout contract: media queries and the parsed stylesheet", 
     expect(actions!.style!.getPropertyValue("flex-basis")).toBe("100%");
   });
 
+  it("the text column is sized by its content, capped at the room beside the icon (a fixed minimum basis wrapped the buttons of every short row)", () => {
+    const base = parseCss(REAL_CSS).rules.filter((r) => r.gates.length === 0);
+    for (const selector of [".sprint-item-main", ".sprint-item-row > .sprint-item-title"]) {
+      const decls = new Map(base.filter((r) => r.selectors.includes(selector)).flatMap((r) => r.decls));
+      expect(decls.get("flex"), `${selector} flex`).toBe("1 1 auto");
+      expect(decls.get("min-width"), `${selector} min-width`).toBe("0");
+      expect(decls.get("max-width"), `${selector} max-width`).toBe("calc(100% - 20px)");
+    }
+  });
+
   it("the wrapping / alignment rules live in the base stylesheet, so they hold at every width", () => {
     const base = Array.from((sheet().sheet as unknown as { cssRules: AnyRule[] }).cssRules).filter((r) => !r.media);
-    const rule = (sel: string) => base.find((r) => (r.selectorText || "").trim() === sel);
+    // the LAST matching rule: jsdom resolves the cascade by source order, and a layered rule (which loses
+    // to every unlayered one in a browser) is hoisted ahead of the unlayered rules when the sheet is flattened
+    const rule = (sel: string) => base.filter((r) => (r.selectorText || "").trim() === sel).pop();
     const row = rule(".sprint-item-row");
     expect(row, ".sprint-item-row base rule").toBeDefined();
     expect(row!.style!.getPropertyValue("flex-wrap")).toBe("wrap");
@@ -335,61 +505,119 @@ describe("sprint row layout contract: media queries and the parsed stylesheet", 
 // nowrap } }`) re-breaks the layout in a browser, yet passes every getComputedStyle
 // assertion above (jsdom: source order only, no @media) and every source-text check that
 // asks for one exact selector. This scan therefore does not resolve the cascade at all: it
-// takes EVERY style rule (nested @media / @supports included, hover/focus states stripped),
-// asks the DOM which board elements the rule could match (so ancestors, types, ids and
+// reads EVERY style rule of the raw stylesheet text (nesting resolved, every @media /
+// @supports / @container / @layer gate, hover/focus states stripped), asks the DOM which
+// board elements the rule could match (so ancestors, types, ids, :is()/:where() groups and
 // attribute selectors all count), and rejects any declaration that could undo the contract,
-// whatever the rule's specificity, position or viewport gate.
+// whatever the rule's specificity, position, layer or viewport gate. A value it cannot
+// resolve (var(), env(), attr()) counts as harmful wherever the property could do harm.
+// The pixel layout itself is measured in a real browser by tests/test_demo_ux.py.
 // ---------------------------------------------------------------------------
 describe("sprint row layout contract: nothing in the stylesheet or markup can undo it", () => {
   type Flat = { selector: string; gate: string; decls: Array<[string, string]> };
-  const flatten = (rules: any[], gate = ""): Flat[] =>
-    rules.flatMap((r: any): Flat[] => {
-      if (r.cssRules && (r.media || r.conditionText !== undefined)) {
-        const g = r.media ? `@media ${r.media.mediaText}` : `@supports ${r.conditionText}`;
-        return flatten(Array.from(r.cssRules), gate ? `${gate} ${g}` : g);
-      }
-      if (!r.selectorText) return [];
-      const decls: Array<[string, string]> = [];
-      for (let i = 0; i < r.style.length; i++) decls.push([r.style[i], r.style.getPropertyValue(r.style[i])]);
-      return [{ selector: r.selectorText, gate, decls }];
-    });
+  const flatten = (css: string): Flat[] =>
+    parseCss(css).rules.flatMap((r) => r.selectors.map((selector) => ({ selector, gate: r.gates.join(" "), decls: r.decls })));
 
   // The "→ v2" pill and the buttons carry short fixed labels and are truncated / kept on
   // one line on purpose.
   const DELIBERATE = ".sprint-item-meta, .sprint-btn";
   const TEXT_BOXES = ".sprint-item-title, .sprint-item-main, .sprint-item-ver, .resource-chip";
   const COLUMN = ".sprint-item-title, .sprint-item-main";
+  // Boxes holding wrapping text: pinning one to a fixed height, squashing its line box or
+  // shifting it out of the flow paints its content over the NEXT row. The icon, the live dot,
+  // the badges and the buttons are fixed-size on purpose.
+  const FLOW =
+    ".sprint-item-row, .sprint-item-main, .sprint-item-title, .sprint-item-ver, .sprint-item-actions, .sprint-item-notes, .sprint-item-resources, .resource-chip";
+  const ROW_BOXES = ".sprint-item-row, .sprint-item-actions";
+  const UNRESOLVED = /\b(?:var|env|attr)\(/;
   const WATCHED = new Set([
-    "white-space", "text-overflow", "overflow", "overflow-x", "flex-wrap", "overflow-wrap",
-    "word-wrap", "word-break", "display", "min-width", "position",
+    "white-space", "text-wrap", "text-wrap-mode", "text-overflow", "overflow", "overflow-x", "overflow-y",
+    "overflow-block", "overflow-inline", "flex-wrap", "flex-flow", "overflow-wrap", "word-wrap", "word-break",
+    "display", "min-width", "position", "height", "block-size", "max-height", "max-block-size", "line-height",
+    "font", "top", "bottom", "inset", "inset-block", "inset-block-start", "inset-block-end", "transform",
+    "translate", "margin", "margin-top", "margin-bottom", "margin-block", "margin-block-start",
+    "margin-block-end", "all",
   ]);
+  /** True when a line-height is small enough to paint wrapped lines over each other. */
+  const squashes = (lineHeight: string): boolean => {
+    const m = /^([0-9.]+)(px|pt|em|rem|%)?$/.exec(lineHeight);
+    if (!m) return false;
+    const floor = ({ "": 1, px: 9, pt: 7, em: 0.75, rem: 0.75, "%": 75 } as Record<string, number>)[m[2] ?? ""];
+    return parseFloat(m[1]) < floor;
+  };
 
   /** Why `prop: raw` is harmful on `el`, or null when it is harmless. */
   const harm = (el: Element, prop: string, raw: string): string | null => {
-    const value = raw.replace(/!important/i, "").trim().toLowerCase();
-    const deliberate = () => el.matches(DELIBERATE);
+    const value = squash(raw.replace(/!important/i, "").trim().toLowerCase());
+    const unresolved = UNRESOLVED.test(value);
+    const is = (selector: string) => el.matches(selector);
+    const truncating = !is(DELIBERATE);
+    const verdict = (applies: boolean, harmful: boolean, message: string): string | null =>
+      !applies ? null : unresolved ? `${message} (its value is built from a custom property, which cannot be resolved here)` : harmful ? message : null;
     switch (prop) {
       case "white-space":
-        return /^(nowrap|pre)$/.test(value) && !deliberate() ? "stops the text wrapping" : null;
+        return verdict(truncating, /^(nowrap|pre)$/.test(value), "stops the text wrapping");
+      case "text-wrap":
+      case "text-wrap-mode":
+        return verdict(truncating, value.split(" ").includes("nowrap"), "stops the text wrapping");
       case "text-overflow":
-        return !/^(clip|initial|unset|inherit)$/.test(value) && !deliberate() ? "ellipsizes (hides) text" : null;
+        return verdict(truncating, !/^(clip|initial|unset|inherit)$/.test(value), "ellipsizes (hides) text");
       case "overflow":
       case "overflow-x":
-        return /\b(hidden|clip|scroll|auto)\b/.test(value) && !deliberate() ? "clips its content" : null;
+      case "overflow-y":
+      case "overflow-block":
+      case "overflow-inline":
+        return verdict(truncating, /\b(hidden|clip|scroll|auto)\b/.test(value), "clips its content");
       case "flex-wrap":
-        return value === "nowrap" && el.matches(".sprint-item-row, .sprint-item-actions") ? "stops the row wrapping" : null;
+        return verdict(is(ROW_BOXES), value === "nowrap", "stops the row wrapping");
+      case "flex-flow":
+        return verdict(is(ROW_BOXES), value.split(" ").includes("nowrap"), "stops the row wrapping");
       case "overflow-wrap":
       case "word-wrap":
-        return value === "normal" && el.matches(TEXT_BOXES) ? "stops a long token breaking" : null;
+        return verdict(is(TEXT_BOXES), value === "normal", "stops a long token breaking");
       case "word-break":
-        return value === "keep-all" ? "stops a long token breaking" : null;
+        return verdict(true, value === "keep-all", "stops a long token breaking");
       case "display":
-        return !/^(block|flex|grid|flow-root|inline-block|list-item)$/.test(value) && el.matches(COLUMN)
-          ? "makes the text column inline (ignores width / overflow) or hides it" : null;
+        return verdict(is(COLUMN), !/^(block|flex|grid|flow-root|inline-block|list-item)$/.test(value),
+          "makes the text column inline (ignores width / overflow) or hides it");
       case "min-width":
-        return !/^0(px)?$/.test(value) && el.matches(COLUMN) ? "stops the text column shrinking" : null;
+        return verdict(is(COLUMN), !/^0(px)?$/.test(value), "stops the text column shrinking");
       case "position":
-        return /^(absolute|fixed)$/.test(value) ? "takes a board element out of flow (it can paint over its neighbours)" : null;
+        return verdict(true, /^(absolute|fixed)$/.test(value), "takes a row element out of flow (it can paint over its neighbours)");
+      case "height":
+      case "block-size":
+        return verdict(is(FLOW), !/^(auto|fit-content|min-content|max-content|initial|unset|revert|revert-layer)$/.test(value),
+          "pins a text box to a fixed height, so wrapped content paints over the next row");
+      case "max-height":
+      case "max-block-size":
+        return verdict(is(FLOW), !/^(none|initial|unset|revert|revert-layer)$/.test(value),
+          "caps a text box's height, so wrapped content paints over the next row");
+      case "line-height":
+        return verdict(is(FLOW), squashes(value), "squashes wrapped lines onto each other");
+      case "font": {
+        const slash = /\/\s*([^\s,/]+)/.exec(value);
+        return verdict(is(FLOW), !!slash && squashes(slash[1]), "squashes wrapped lines onto each other");
+      }
+      case "top":
+      case "bottom":
+      case "inset":
+      case "inset-block":
+      case "inset-block-start":
+      case "inset-block-end":
+        return verdict(is(FLOW), !/^(auto|0(px|%|em|rem)?|initial|unset|revert)$/.test(value),
+          "offsets a text box from its place in the flow (it can paint over the previous row)");
+      case "transform":
+      case "translate":
+        return verdict(is(FLOW), !/^(none|initial|unset|revert)$/.test(value), "moves a text box out of its place in the flow");
+      case "margin":
+      case "margin-top":
+      case "margin-bottom":
+      case "margin-block":
+      case "margin-block-start":
+      case "margin-block-end":
+        return verdict(is(FLOW), /(^|\s)-[0-9.]/.test(value), "pulls a text box over its neighbours with a negative margin");
+      case "all":
+        return verdict(truncating, true, "resets every property, including the wrapping contract");
       default:
         return null;
     }
@@ -408,46 +636,40 @@ describe("sprint row layout contract: nothing in the stylesheet or markup can un
 
   const boardElements = () =>
     Array.from(document.getElementById(`live-sprint-progress-${PID}`)!.querySelectorAll(".sprint-item-row, .sprint-item-row *"));
-  const realSheetRules = (): Flat[] =>
-    flatten(Array.from(((document.getElementById("real-dashboard-css") as HTMLStyleElement).sheet as any).cssRules));
 
   /** Every harmful declaration, in `css` or in the markup's own inline styles, that can reach a board element. */
   const scan = (css: string | null): string[] => {
     const els = boardElements();
     const found = new Set<string>();
     if (css !== null) {
-      const style = document.createElement("style");
-      style.textContent = css;
-      document.head.appendChild(style);
-      try {
-        for (const rule of flatten(Array.from((style.sheet as any).cssRules))) {
-          for (const [prop, raw] of rule.decls) {
-            if (!WATCHED.has(prop)) continue;
-            for (const el of els) {
-              const why = harm(el, prop, raw);
-              if (why && couldMatch(el, rule.selector)) {
-                found.add(`${rule.gate ? rule.gate + " " : ""}${rule.selector} { ${prop}: ${raw} } ${why} (<${label(el)}>)`);
-              }
+      for (const rule of flatten(css)) {
+        for (const [prop, raw] of rule.decls) {
+          if (!WATCHED.has(prop)) continue;
+          for (const el of els) {
+            const why = harm(el, prop, raw);
+            if (why && couldMatch(el, rule.selector)) {
+              found.add(`${rule.gate ? rule.gate + " " : ""}${rule.selector} { ${prop}: ${raw} } ${why} (<${label(el)}>)`);
             }
           }
         }
-      } finally {
-        style.remove();
       }
     }
     for (const el of els) {
-      const s = (el as HTMLElement).style;
-      for (let i = 0; i < s.length; i++) {
-        const why = WATCHED.has(s[i]) ? harm(el, s[i], s.getPropertyValue(s[i])) : null;
-        if (why) found.add(`inline style on <${label(el)}> { ${s[i]}: ${s.getPropertyValue(s[i])} } ${why}`);
+      // the style attribute is read as text: jsdom's style declaration drops properties it does not know
+      for (const part of splitTop(el.getAttribute("style") || "", ";")) {
+        const colon = part.indexOf(":");
+        if (colon < 1) continue;
+        const prop = part.slice(0, colon).trim().toLowerCase();
+        const raw = squash(part.slice(colon + 1));
+        const why = WATCHED.has(prop) ? harm(el, prop, raw) : null;
+        if (why) found.add(`inline style on <${label(el)}> { ${prop}: ${raw} } ${why}`);
       }
     }
     return Array.from(found).sort();
   };
-  const realCss = () => (document.getElementById("real-dashboard-css") as HTMLStyleElement).textContent || "";
 
-  it("no rule in dashboard.css, whatever its specificity, order or @media gate, and no inline style can undo the wrapping contract", () => {
-    expect(scan(realCss())).toEqual([]);
+  it("no rule in dashboard.css, whatever its specificity, order, layer or @media gate, and no inline style can undo the wrapping contract", () => {
+    expect(scan(REAL_CSS)).toEqual([]);
   });
 
   it("the scan is not vacuous: it reaches the contract rules and tolerates the deliberately truncated pill", () => {
@@ -457,7 +679,7 @@ describe("sprint row layout contract: nothing in the stylesheet or markup can un
     expect(els.some((e) => e.matches(".sprint-item-meta"))).toBe(true);
     expect(scan(".sprint-item-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }")).toEqual([]);
     // the real sheet really does reach the board: the base contract rules ...
-    const reaching = realSheetRules().filter((r) => els.some((e) => couldMatch(e, r.selector)));
+    const reaching = flatten(REAL_CSS).filter((r) => els.some((e) => couldMatch(e, r.selector)));
     expect(reaching.filter((r) => !r.gate && r.decls.some(([p]) => WATCHED.has(p))).length).toBeGreaterThanOrEqual(6);
     // ... and the @media-gated ones, which getComputedStyle in jsdom never applies
     expect(reaching.filter((r) => r.gate.includes("max-width: 768px")).length).toBeGreaterThanOrEqual(3);
@@ -478,7 +700,7 @@ describe("sprint row layout contract: nothing in the stylesheet or markup can un
     ["overflow-x clip through a descendant combinator",
       ".sprint-item-row * { overflow-x: clip; }", /overflow-x: clip/],
     ["!important",
-      ".sprint-item-row .sprint-item-title { white-space: nowrap !important; }", /\.sprint-item-row \.sprint-item-title \{ white-space: nowrap \} stops the text wrapping/],
+      ".sprint-item-row .sprint-item-title { white-space: nowrap !important; }", /\.sprint-item-row \.sprint-item-title \{ white-space: nowrap !important \} stops the text wrapping/],
     ["a hover state",
       ".sprint-item-title:hover { white-space: nowrap; }", /\.sprint-item-title:hover \{ white-space: nowrap \}/],
     ["a row that stops wrapping on a phone",
@@ -494,14 +716,67 @@ describe("sprint row layout contract: nothing in the stylesheet or markup can un
     ["a resource chip that cannot wrap",
       ".sprint-item-resources .resource-chip { white-space: nowrap; }", /\.resource-chip \{ white-space: nowrap \}/],
     ["a title taken out of flow",
-      ".sprint-item-title { position: absolute; }", /position: absolute \} takes a board element out of flow/],
+      ".sprint-item-title { position: absolute; }", /position: absolute \} takes a row element out of flow/],
+    // --- syntax the scan used to be blind to: every one of these re-breaks a real browser ---
+    ["CSS nesting (implicit descendant)",
+      ".live-body { .sprint-item-title { white-space: nowrap; } }", /\.live-body \.sprint-item-title \{ white-space: nowrap \} stops the text wrapping/],
+    ["CSS nesting with &",
+      ".sprint-item-row { & .sprint-item-title { white-space: nowrap; } }", /\.sprint-item-row \.sprint-item-title \{ white-space: nowrap \}/],
+    ["a nested @media that styles its parent",
+      ".sprint-item-title { @media (max-width: 768px) { white-space: nowrap; } }", /@media \(max-width: 768px\) \.sprint-item-title \{ white-space: nowrap \}/],
+    ["a value taken from a custom property",
+      ".sprint-item-title { white-space: var(--ws); }", /white-space: var\(--ws\) \} stops the text wrapping \(its value is built from a custom property/],
+    ["a custom-property flex-wrap",
+      ".sprint-item-row { flex-wrap: var(--wrap); }", /flex-wrap: var\(--wrap\) \} stops the row wrapping \(its value is built/],
+    [":is() groups on both sides",
+      ":is(.live-body, .tab-body) :is(.sprint-item-title) { white-space: nowrap; }", /:is\(\.live-body, \.tab-body\) :is\(\.sprint-item-title\) \{ white-space: nowrap \}/],
+    [":where() group of row elements",
+      ".sprint-item-row :where(.sprint-item-title, .sprint-item-ver) { white-space: nowrap; }", /:where\(.*\) \{ white-space: nowrap \}/],
+    ["a rule inside @layer (important layered rules beat unlayered ones)",
+      "@layer base { .sprint-item-title { white-space: nowrap !important; } }", /@layer base \.sprint-item-title \{ white-space: nowrap !important \}/],
+    ["a rule inside @container",
+      "@container (min-width: 1px) { .sprint-item-title { white-space: nowrap; } }", /@container \(min-width: 1px\) \.sprint-item-title/],
+    ["a rule right after a statement at-rule",
+      "@layer base, theme;\n@import url('x.css');\n.sprint-item-title { white-space: nowrap; }", /\.sprint-item-title \{ white-space: nowrap \}/],
+    ["a row pinned to one line (height)",
+      ".sprint-item-row { height: 28px; }", /\.sprint-item-row \{ height: 28px \} pins a text box to a fixed height/],
+    ["a row pinned to one line (max-height)",
+      ".sprint-item-row { max-height: 28px; }", /max-height: 28px \} caps a text box's height/],
+    ["a zero-height buttons box",
+      ".sprint-item-actions { height: 0; }", /\.sprint-item-actions \{ height: 0 \} pins a text box/],
+    ["squashed lines (line-height)",
+      ".sprint-item-title { line-height: 0.5; }", /line-height: 0\.5 \} squashes wrapped lines/],
+    ["squashed lines (font shorthand)",
+      ".sprint-item-title { font: 12px/0.5 sans-serif; }", /font: 12px\/0\.5 sans-serif \} squashes wrapped lines/],
+    ["a title lifted onto the previous row",
+      ".sprint-item-title { position: relative; top: -22px; }", /top: -22px \} offsets a text box/],
+    ["a transformed title",
+      ".sprint-item-title { transform: translateY(-20px); }", /transform: translateY\(-20px\) \} moves a text box/],
+    ["a negative margin",
+      ".sprint-item-row { margin: 0 0 -10px; }", /margin: 0 0 -10px \} pulls a text box over its neighbours/],
+    ["flex-flow nowrap",
+      ".sprint-item-row { flex-flow: row nowrap; }", /flex-flow: row nowrap \} stops the row wrapping/],
+    ["text-wrap nowrap (a property jsdom's style declaration drops)",
+      ".sprint-item-title { text-wrap: nowrap; }", /text-wrap: nowrap \} stops the text wrapping/],
+    ["all: unset",
+      ".sprint-item-title { all: unset; }", /all: unset \} resets every property/],
   ])("catches %s", (_name, css, expected) => {
     expect(scan(css).join("\n")).toMatch(expected);
   });
 
-  it("does not cry wolf at rules that cannot reach the board", () => {
+  it("does not cry wolf at rules that cannot reach the board, or at values that are fine", () => {
     expect(scan(".tabs span { white-space: nowrap; } .sidebar button { overflow: hidden; } .sprint-item-row { gap: 10px; color: red; }")).toEqual([]);
     expect(scan("@media (max-width: 768px) { .vtab-strip .vtab-btn { white-space: nowrap; overflow: hidden; } }")).toEqual([]);
+    // fixed-size parts of a row are not text boxes
+    expect(scan(".sprint-btn { height: 20px; line-height: 1; } .sprint-live-dot { width: 7px; height: 7px; }")).toEqual([]);
+    expect(scan("@keyframes sprintPulse { from { height: 0; top: -4px; } to { height: 7px; top: 0; } }")).toEqual([]);
+    // values that are fine on a text box
+    expect(scan(".sprint-item-row { min-height: 28px; line-height: 1.4; margin: 0 0 2px; height: auto; max-height: none; padding: var(--pad); }")).toEqual([]);
+    expect(scan(".sprint-item-title { line-height: normal; transform: none; top: auto; margin-top: 2px; font: 12px/1.4 sans-serif; }")).toEqual([]);
+    // nesting, groups, layers and custom properties that do not reach a row
+    expect(scan(".sidebar { .tab { white-space: nowrap; } } .tabs { @media (max-width: 768px) { white-space: nowrap; } }")).toEqual([]);
+    expect(scan(":is(.tabs, .sidebar) span { white-space: nowrap; } @layer base { .tabs span { white-space: nowrap; } }")).toEqual([]);
+    expect(scan(".tabs span { white-space: var(--ws); } @import url('x.css'); @font-face { font-family: X; src: url(data:font/woff2;base64,AAAA); }")).toEqual([]);
   });
 
   it("catches a harmful inline style written into the markup", () => {
@@ -510,6 +785,90 @@ describe("sprint row layout contract: nothing in the stylesheet or markup can un
     expect(scan(null).join("\n")).toMatch(/inline style on <span\.sprint-item-title> \{ white-space: nowrap \}/);
     title.removeAttribute("style");
     expect(scan(null)).toEqual([]);
+    // a longhand jsdom's style declaration would drop is still read from the attribute text
+    title.setAttribute("style", "text-wrap: nowrap; height: 14px");
+    const found = scan(null).join("\n");
+    expect(found).toMatch(/inline style on <span\.sprint-item-title> \{ text-wrap: nowrap \}/);
+    expect(found).toMatch(/\{ height: 14px \} pins a text box/);
+    title.removeAttribute("style");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The CSS reader itself (the scan above is only as good as what it reads) and the jsdom
+// loader: jsdom drops the WHOLE sheet when it meets nesting or @layer, which used to fail
+// every computed-style test above for a rule that is harmless in a browser.
+// ---------------------------------------------------------------------------
+describe("sprint row layout contract: the CSS reader and the jsdom loader", () => {
+  it("resolves nesting, keeps every gate, splits selector lists only on top-level commas and survives ; in url()/strings", () => {
+    const { rules, nested, layered } = parseCss(
+      "@import url('x.css');\n@layer base, theme;\n" +
+        ".a, :is(.b, .c) > .d { color: red; background: url(data:image/png;base64,AAA=); content: 'a;b'; }\n" +
+        ".live-body { .sprint-item-title { white-space: nowrap } &:hover { color: blue } > .x { top: 1px }\n" +
+        "  @media (max-width: 768px) { gap: 2px } }\n" +
+        "@media (max-width: 768px) { @supports (display: grid) { .g { display: grid } } }\n" +
+        "@keyframes k { from { height: 0 } to { height: 5px } }\n@font-face { font-family: F; src: url(f.woff2) }\n" +
+        "@layer base { .layered { white-space: pre } }\n.last { color: green }",
+    );
+    const bySelector = new Map(rules.map((r) => [r.selectors.join(" | "), r]));
+    expect(bySelector.get(".a | :is(.b, .c) > .d")!.decls).toEqual([
+      ["color", "red"], ["background", "url(data:image/png;base64,AAA=)"], ["content", "'a;b'"],
+    ]);
+    expect(bySelector.get(".live-body .sprint-item-title")!.decls).toEqual([["white-space", "nowrap"]]);
+    expect(bySelector.get(".live-body:hover")!.decls).toEqual([["color", "blue"]]);
+    expect(bySelector.get(".live-body > .x")!.decls).toEqual([["top", "1px"]]);
+    expect(bySelector.get(".live-body")).toMatchObject({ gates: ["@media (max-width: 768px)"], decls: [["gap", "2px"]] });
+    expect(bySelector.get(".g")!.gates).toEqual(["@media (max-width: 768px)", "@supports (display: grid)"]);
+    expect(bySelector.get(".layered")!.gates).toEqual(["@layer base"]);
+    expect(bySelector.get(".last")).toMatchObject({ gates: [], decls: [["color", "green"]] });
+    expect(rules.some((r) => r.selectors.includes("from") || r.decls.some(([p]) => p === "font-family"))).toBe(false);
+    expect(nested && layered).toBe(true);
+  });
+
+  it("feeds a flat sheet to jsdom exactly as written (keyframes, font-face and all), and flattens only what it must", () => {
+    const flat = "@import url('x.css');\n.a { color: red; }\n@media (max-width: 1px) { .b { color: blue; } }\n@keyframes k { from { top: 0 } }\n";
+    expect(parseCss(flat)).toMatchObject({ nested: false, layered: false });
+    expect(toJsdomCss(flat)).toBe(flat);
+    expect(parseCss(".a { .b { color: red } }").nested).toBe(true);
+    expect(parseCss("@layer x { .a { color: red } }").layered).toBe(true);
+  });
+
+  const load = (css: string) => {
+    const style = document.createElement("style");
+    style.textContent = css;
+    document.head.appendChild(style);
+    return style;
+  };
+  const whiteSpace = (el: Element) => getComputedStyle(el).getPropertyValue("white-space");
+
+  it("flattens a sheet jsdom cannot parse so a harmless layered or nested rule does not drop the whole cascade", () => {
+    const title = document.querySelector(".sprint-item-row .sprint-item-title") as HTMLElement;
+    expect(whiteSpace(title)).toBe("normal");
+    // a layered nowrap loses to the unlayered `white-space: normal` of the real sheet in every browser
+    const layered = load(toJsdomCss(REAL_CSS + "\n@layer base { .sprint-item-title { white-space: nowrap; } }"));
+    try {
+      expect(layered.sheet, "the flattened sheet must be parseable").not.toBeNull();
+      expect(whiteSpace(title)).toBe("normal");
+    } finally {
+      layered.remove();
+    }
+    // nesting is resolved (the nested rule is the LAST rule, so it wins in source order, as in a browser)
+    const nestedStyle = load(toJsdomCss(REAL_CSS + "\n.live-body { .sprint-item-title { white-space: nowrap; } }"));
+    try {
+      expect(nestedStyle.sheet).not.toBeNull();
+      expect(whiteSpace(title)).toBe("nowrap");
+    } finally {
+      nestedStyle.remove();
+    }
+    expect(whiteSpace(title)).toBe("normal");
+  });
+
+  it("keeps @media blocks in the flattened sheet (the parsed-stylesheet tests read them) and drops what jsdom cannot evaluate", () => {
+    const css = toJsdomCss(".a { color: red; } @layer x { .b { color: blue; } } .c { @media (max-width: 1px) { color: green } } @container (min-width: 1px) { .d { color: pink } }");
+    expect(css).toContain("@media (max-width: 1px) { .c { color: green; } }");
+    expect(css.indexOf(".b {")).toBeLessThan(css.indexOf(".a {"));
+    expect(css).not.toContain("@layer");
+    expect(css).not.toContain(".d");
   });
 });
 

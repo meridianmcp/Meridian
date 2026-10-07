@@ -43,6 +43,11 @@ def _start_live_server(app, startup_sleep: float = 1.5):
     thread = threading.Thread(target=server.run, args=([sock],), daemon=True)
     thread.start()
     time.sleep(startup_sleep)
+    # A cold start (first import of the app, demo seeding) can outlast the fixed sleep, which
+    # showed up as ERR_CONNECTION_REFUSED on the first navigation: also wait for uvicorn itself.
+    deadline = time.monotonic() + 30
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.1)
     return server, thread, port
 
 
@@ -1537,8 +1542,13 @@ def test_set_project_parent_route(client):
 # the real stylesheet, every @media rule live) and asserts that, at phone/tablet/desktop
 # viewports and a range of board widths, no title text paints past its column, over the
 # version label or over the buttons, nothing is clipped or escapes its row, and the
-# icon/version/buttons sit on the title's first line. Mutants are then injected to
-# prove the probe would notice each class of regression.
+# icon/version/buttons sit on the title's first line. The probe also measures the
+# VERTICAL axis (a row pinned to one line, a zero-height buttons box or a squashed
+# line-height paints a row's content over the NEXT row's text while nothing overlaps
+# sideways) and the reading order (version label before the buttons), and a separate
+# density test pins that a row with a SHORT title keeps its label and buttons beside it
+# (a layout can be overlap-free and still waste a line on every row). Mutants are then
+# injected to prove the probe would notice each class of regression.
 # ---------------------------------------------------------------------------
 
 _SPRINT_LONG = (
@@ -1645,11 +1655,43 @@ _SPRINT_LAYOUT_PROBE_JS = r"""
         if (b.right > rowB.right + EPS || b.left < rowB.left - EPS) bad(id, '<' + name(el) + '> escapes the row');
       }
       const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+      const painted = Array.from(row.querySelectorAll('*')).filter(shown).map(box); // everything this row paints
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
         if (!n.nodeValue.trim()) continue;
-        if (textBoxes(n).some((b) => b.right > rowB.right + EPS || b.left < rowB.left - EPS)) {
+        const nb = textBoxes(n);
+        painted.push(...nb);
+        // ... sideways AND vertically (a fixed height / squashed line-height paints text below the row)
+        if (nb.some((b) => b.right > rowB.right + EPS || b.left < rowB.left - EPS || b.top < rowB.top - EPS || b.bottom > rowB.bottom + EPS)) {
           bad(id, 'text "' + n.nodeValue.trim().slice(0, 16) + '" in <' + name(n.parentElement) + '> paints outside the row');
         }
+      }
+      // 4b. ... and no box sticks out of the row vertically, nor out of its own parent box
+      //     (a zero-height buttons box paints its buttons over the NEXT row's text)
+      for (const el of row.querySelectorAll('*')) {
+        if (!shown(el)) continue;
+        const b = box(el), par = el.parentElement, pb = box(par);
+        if (b.top < rowB.top - EPS || b.bottom > rowB.bottom + EPS) bad(id, '<' + name(el) + '> sticks out of the row vertically');
+        if (par !== row && getComputedStyle(el).display !== 'inline' && getComputedStyle(par).display !== 'inline'
+            && (b.top < pb.top - 1 || b.bottom > pb.bottom + 1)) {
+          bad(id, '<' + name(el) + '> sticks out of its parent <' + name(par) + '> vertically');
+        }
+      }
+      // 4c. nothing this row paints lands on ANOTHER row (text over text, whatever the cause)
+      for (const other of rows) {
+        if (other === row || other.contains(row) || row.contains(other) || !shown(other)) continue;
+        const ob = box(other);
+        if (painted.some((b) => hit(b, ob))) bad(id, 'paints over row ' + (other.dataset.item || '(row)'));
+      }
+      // 4d. the lines of a wrapped title never overlap each other (a squashed line-height)
+      const lines = [];
+      for (const b of tb.slice().sort((x, y) => mid(x) - mid(y))) {
+        const last = lines[lines.length - 1];
+        if (last && Math.abs(mid(b) - last.mid) < 4) { last.top = Math.min(last.top, b.top); last.bottom = Math.max(last.bottom, b.bottom); }
+        else lines.push({ mid: mid(b), top: b.top, bottom: b.bottom });
+      }
+      for (let i = 1; i < lines.length; i++) {
+        const overlap = lines[i - 1].bottom - lines[i].top;
+        if (overlap > 1.5) bad(id, 'title line ' + i + ' overlaps line ' + (i + 1) + ' by ' + overlap.toFixed(1) + 'px');
       }
       // 5. notes stay inside the text column
       const note = row.querySelector('.sprint-item-notes');
@@ -1672,8 +1714,31 @@ _SPRINT_LAYOUT_PROBE_JS = r"""
       if (shown(act) && act.childElementCount > 0 && window.innerWidth <= 768 && box(act).top < colB.bottom - 1) {
         bad(id, 'phone: the action buttons should sit under the text, not beside it');
       }
+      // 8. reading order: the version label comes BEFORE the buttons (left of them, or on a line above)
+      if (shown(ver) && shown(act) && act.childElementCount > 0) {
+        const vB = box(ver), aB = box(act);
+        if (!(vB.right <= aB.left + EPS || vB.bottom <= aB.top + EPS)) bad(id, 'the version label comes after the action buttons');
+      }
     }
     return out;
+  };
+  // Density: a row whose title is SHORT must keep its version label and buttons beside it on
+  // one line (a fixed minimum width for the text column pushed the buttons of every row onto a
+  // second line at the real desktop board width while no probe above noticed: nothing overlapped).
+  window.__sprintDensityProbe = (items, columnWidth) => {
+    const root = document.querySelector('[id^="live-sprint-progress-"]');
+    const pid = root.id.slice('live-sprint-progress-'.length);
+    root.style.width = columnWidth + 'px';
+    window.renderSprintProgress(pid, JSON.parse(JSON.stringify(items)));
+    root.querySelectorAll('.sprint-dag-wrap').forEach((n) => n.remove());
+    root.querySelectorAll('details').forEach((d) => { d.open = true; });
+    return Array.from(root.querySelectorAll('.sprint-item-row')).filter(shown).map((row) => {
+      const title = row.querySelector('.sprint-item-title');
+      const act = row.querySelector(':scope > .sprint-item-actions');
+      const ver = row.querySelector(':scope > .sprint-item-ver');
+      const beside = (el) => !shown(el) || (el === act && !el.childElementCount) || box(el).top < box(title).bottom - 1;
+      return { id: row.dataset.item || '(row)', height: Math.round(box(row).height), actionsBeside: beside(act), versionBeside: beside(ver) };
+    });
   };
 }
 """
@@ -1689,6 +1754,9 @@ def _sprint_open_live_board(p, port):
     """Open /demo, switch to the Live drawer and install the layout probe: (browser, page)."""
     browser = p.chromium.launch()
     page = browser.new_page()
+    # The board needs none of the charting / markdown CDN libraries: their blocking <script>
+    # tags only make this test depend on the network (a slow CDN timed the navigation out).
+    page.route("https://cdn.jsdelivr.net/**", lambda route: route.abort())
     page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded", timeout=60000)
     page.wait_for_function(
         "() => typeof window.renderSprintProgress === 'function'"
@@ -1717,6 +1785,82 @@ def _sprint_flags_with(page, css, width, column):
         return _sprint_probe(page, width, column)["problems"]
     finally:
         handle.evaluate("el => el.remove()")
+
+
+def _sprint_short_items():
+    """Rows with SHORT titles (<= 10 characters), one per kind of row: at the real desktop
+    board widths each must stay on a single line with its version label and buttons."""
+
+    def mk(**over):
+        return {"version": "v1", "status": "pending", **over}
+
+    return [
+        mk(id="s_pending", title="Add retry"),
+        mk(id="s_todo", title="Write docs", status="todo"),
+        mk(id="s_prog", title="Fix login", status="in_progress", claimed_at="2026-01-01T00:00:00Z"),
+        mk(id="s_done", title="Ship v2", status="done"),
+        mk(id="s_failed", title="Old spike", status="failed"),
+        mk(id="s_human", title="Review PR", milestone_type="human"),
+    ]
+
+
+# (viewport, board width): the real desktop board is 347px at a 1000px viewport, 787px at 1440px
+_SPRINT_DESKTOP_CELLS = ((1000, 347), (1000, 480), (1440, 787))
+
+
+def _sprint_density(page, width, column):
+    """Per-row {id, height, actionsBeside, versionBeside} for the short-title fixture."""
+    page.set_viewport_size({"width": width, "height": 900})
+    assert page.evaluate("() => window.innerWidth") == width, "viewport did not resize"
+    return page.evaluate(
+        "([items, column]) => window.__sprintDensityProbe(items, column)", [_sprint_short_items(), column]
+    )
+
+
+def _sprint_cramped(rows):
+    """The short-title rows that did NOT stay on one line with their version label and buttons."""
+    return [r for r in rows if r["height"] > 32 or not r["actionsBeside"] or not r["versionBeside"]]
+
+
+@pytestmark_playwright
+def test_sprint_short_rows_keep_their_buttons_beside_the_title_in_a_real_browser(demo_client):
+    """A short title must NOT reserve a long title's room: at the real desktop board widths a
+    row with a ten-character title is one 28px line with its version label and buttons beside
+    it. (An earlier fix gave the text column a fixed 15em minimum, which pushed the buttons of
+    every short row onto a second line at the real 347px board - 28px rows became 43px, the
+    board 18% taller - while every overlap probe stayed green because nothing overlapped.)
+    The same short rows still drop their buttons UNDER the text where there is genuinely no
+    room for both (a 150px board), instead of squeezing the title."""
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        server, _thread, port = _start_live_server(server_module.app)
+        try:
+            browser, page = _sprint_open_live_board(p, port)
+            for width, column in _SPRINT_DESKTOP_CELLS:
+                rows = _sprint_density(page, width, column)
+                assert len(rows) >= len(_sprint_short_items()), f"{width}/{column}: fixture did not render ({rows})"
+                assert _sprint_cramped(rows) == [], f"viewport {width}px, board {column}px: {_sprint_cramped(rows)}"
+            # sensitivity: re-introduce the fixed minimum basis and the rows are reported as cramped
+            for name, css in (
+                ("a 15em minimum for the text column",
+                 ".sprint-item-main,.sprint-item-row>.sprint-item-title{flex:1 1 min(15em,calc(100% - 20px))}"),
+                ("a full-width text column",
+                 ".sprint-item-main,.sprint-item-row>.sprint-item-title{flex-basis:100%}"),
+                ("the buttons always on their own line", ".sprint-item-actions{flex-basis:100%}"),
+            ):
+                handle = page.add_style_tag(content=css)
+                try:
+                    assert _sprint_cramped(_sprint_density(page, 1000, 347)), f"density probe is blind to {name}"
+                finally:
+                    handle.evaluate("el => el.remove()")
+            # genuinely no room beside a 10-character title: the buttons wrap under it, nothing overlaps
+            narrow = _sprint_density(page, 1000, 150)
+            assert any(not r["actionsBeside"] for r in narrow)
+            assert _sprint_probe(page, 1000, 150, _sprint_short_items())["problems"] == []
+            browser.close()
+        finally:
+            server.should_exit = True
 
 
 @pytestmark_playwright
@@ -1782,6 +1926,22 @@ def test_sprint_row_probe_notices_the_regressions_css_property_tests_cannot_see(
          ".sprint-item-actions{flex-wrap:nowrap}", [(1000, 100), (320, 100)]),
         ("phone action buttons beside the text",
          "@media (max-width:768px){.sprint-item-actions{flex-basis:auto}}", [(375, 480), (768, 787)]),
+        # --- vertical: the sideways checks alone let all of these through while a row's content
+        # painted over the NEXT row's text (rows pinned to one line, a zero-height buttons box) ---
+        ("row pinned to one line (height)",
+         ".sprint-item-row{height:28px}", [(1000, 347), (1440, 787), (375, 260)]),
+        ("row pinned to one line (max-height)",
+         ".sprint-item-row{max-height:28px}", [(1000, 347), (1440, 787), (375, 260)]),
+        ("zero-height buttons box",
+         ".sprint-item-actions{height:0}", [(1000, 347), (1440, 787), (375, 260)]),
+        ("text column pinned to one line",
+         ".sprint-item-main,.sprint-item-row>.sprint-item-title{max-height:1.4em}", [(1000, 347), (375, 260)]),
+        ("title lines squashed onto each other",
+         ".sprint-item-title{line-height:.5}", [(1000, 347), (375, 260)]),
+        ("title lifted onto the previous row",
+         ".sprint-item-title{position:relative;top:-22px}", [(1000, 347), (1440, 787), (375, 260)]),
+        ("version label after the buttons",
+         ".sprint-item-ver{order:9}", [(1000, 347), (1440, 787), (375, 260)]),
     ]
 
     with sync_playwright() as p:
