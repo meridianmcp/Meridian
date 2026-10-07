@@ -56,7 +56,7 @@ async def test_second_generate_handoff_amends_when_unconsumed(db, tmp_path):
 
     # First call — fresh insert (no pending_goal yet).
     _, _, amended_first = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert amended_first is False, "first call must always be fresh (no prior record)"
 
@@ -70,7 +70,7 @@ async def test_second_generate_handoff_amends_when_unconsumed(db, tmp_path):
 
     # Second call — prior handoff unconsumed → must AMEND, not insert.
     _, _, amended_second = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert amended_second is True, "second call must amend when pending_goal was not popped"
 
@@ -99,19 +99,19 @@ async def test_amended_flag_is_true_when_unconsumed(db, tmp_path):
 
     # First call → fresh → amended=False.
     _, _, am1 = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert am1 is False
 
     # Second call with pending_goal still set → amend → amended=True.
     _, _, am2 = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert am2 is True
 
     # Third call still no start_session → still amending.
     _, _, am3 = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert am3 is True
 
@@ -131,7 +131,7 @@ async def test_generate_handoff_fresh_after_start_session_pops(db, tmp_path):
 
     # First call — fresh.
     _, _, am1 = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert am1 is False
 
@@ -148,7 +148,7 @@ async def test_generate_handoff_fresh_after_start_session_pops(db, tmp_path):
 
     # Second call — prior handoff was consumed → must be FRESH, not amend.
     _, _, am2 = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert am2 is False, "second call after pop must be fresh (amended=False)"
 
@@ -180,7 +180,7 @@ async def test_very_first_generate_handoff_is_fresh(db, tmp_path):
     assert pg_before is None
 
     _, _, amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert amended is False, "first-ever call must be fresh (no row to amend)"
 
@@ -201,7 +201,7 @@ async def test_amended_field_present_in_both_paths(db, tmp_path):
     await db_module.set_goal(db, p["id"], "check fields", sprint="se")
 
     result_fresh = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     # Must be a 3-tuple.
     assert len(result_fresh) == 3, f"expected 3-tuple, got {len(result_fresh)}-tuple"
@@ -212,7 +212,7 @@ async def test_amended_field_present_in_both_paths(db, tmp_path):
 
     # Second call without consuming → amend path.
     result_amend = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert len(result_amend) == 3
     path_a, content_a, amended_a = result_amend
@@ -275,7 +275,7 @@ async def test_amend_path_still_updates_pending_goal(db, tmp_path):
 
     # First call sets pending_goal.
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     pg_after_first = await db_module.get_pending_goal(db, p["id"])
     assert pg_after_first is not None
@@ -285,7 +285,7 @@ async def test_amend_path_still_updates_pending_goal(db, tmp_path):
 
     # Second call amends but ALSO updates pending_goal.
     _, _, amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert amended is True
 
@@ -311,7 +311,7 @@ async def _seed_handoff(db, name: str, tmp_path, *, session_id=None, sprint="s1"
     p = await db_module.create_project(db, name)
     await db_module.set_goal(db, p["id"], "ship it", sprint=sprint)
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=session_id,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=session_id, mode="full",
     )
     rows = await db_module.get_handoffs(db, p["id"], limit=1)
     return p, rows[0]
@@ -345,7 +345,7 @@ async def test_amend_handoff_rejects_cross_session_source(db, tmp_path):
     session_a = await db_module.register_session(db, p["id"], "executor-a")
     session_b = await db_module.register_session(db, p["id"], "executor-b")
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=session_a["id"],
+        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=session_a["id"], mode="full",
     )
     h = (await db_module.get_handoffs(db, p["id"], limit=1))[0]
 
@@ -364,7 +364,7 @@ async def test_amend_handoff_version_mismatch_raises(db, tmp_path):
         db, p["id"], "executor-v1", sprint_version="v1",
     )
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=session["id"],
+        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=session["id"], mode="full",
     )
     h = (await db_module.get_handoffs(db, p["id"], limit=1))[0]
 

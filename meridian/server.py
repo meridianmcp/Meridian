@@ -64,6 +64,7 @@ from ._deps import (
     _enforcement_context,
     _required_perm_for_request,
     _render_workspace_block,
+    _build_workspace_context_block,
     _render_context_block,
 )
 from .pid_probe import pid_is_alive
@@ -5079,8 +5080,26 @@ async def _expire_and_generate_handoffs(
         try:
             # v2.4 — auto-generated handoffs from the idle-expire loop
             # skip the Haiku ai_summary unless the key is set.
+            # 0b0b24d8 — explicit mode="delta": omitting it inherited 'full'
+            # and rewrote every cross-project workspace decision/note into
+            # each affected project's handoff on every idle-expire pass.
+            # delta (not goal) keeps refreshing <stem>_handoff.md, the file
+            # start_session reports as handoff_path.
+            # The most recently seen expired session bounds delta's "completed
+            # since" list: with no session it is unbounded and would show the
+            # OLDEST 20 items the project ever completed. It is passed as
+            # window_session_id, NOT session_id: an idle session can resume,
+            # and an unattended write attributed to it would become its "last
+            # handoff", so its next explicit delta would silently drop
+            # everything completed before this pass.
+            # refresh_retrospective=True: the old 'full' default also refreshed
+            # the Sprint Retrospective note (aef94e4a) on every pass and delta
+            # skips that step. With no API key (_skip) the note is written from
+            # its deterministic body instead of being skipped altogether.
+            _expired = (result.get("session_ids_by_project") or {}).get(pid) or [None]
             await handoff_module.generate_handoff(
-                db, pid, data_dir, skip_ai_summary=_skip
+                db, pid, data_dir, skip_ai_summary=_skip, mode="delta",
+                window_session_id=_expired[0], refresh_retrospective=True,
             )
             generated = True
         except Exception:  # noqa: BLE001
@@ -6299,10 +6318,11 @@ async def _start_session_composite(
     # v3.4 — inject workspace-level decisions + notes so a cold executor sees
     # tenant-global conventions on entry without a separate get_context_block
     # round-trip. Same source + renderer as get_context_block.
+    # 0b0b24d8 — a bounded index by default (capped decision summaries, a note
+    # count, policy-note titles, the fetch calls); the full text only when
+    # include_workspace_context is on. See _build_workspace_context_block.
     try:
-        ws_decisions = await db_module.get_workspace_decisions(db)
-        ws_notes = await db_module.get_workspace_notes(db)
-        workspace_context = _render_workspace_block(ws_decisions, ws_notes)
+        workspace_context = await _build_workspace_context_block(db)
     except Exception:
         workspace_context = ""
 

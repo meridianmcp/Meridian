@@ -170,7 +170,7 @@ async def test_generate_handoff_stale_sprint_warns_in_content(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v0.2", "Fix the bug")
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     # The staleness warning must appear in both the readiness block and the L1 section
@@ -193,7 +193,7 @@ async def test_generate_handoff_fresh_sprint_no_staleness_warning(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v0.2", "Implement feature X")
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     assert "STALE" not in content
@@ -217,7 +217,7 @@ async def test_generate_handoff_no_items_sprint_shown_verbatim(db, tmp_path):
     # No sprint items added
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     # No items → sprint text shown at full weight, no staleness warning

@@ -941,9 +941,12 @@ def _render_workspace_block(
 ) -> str:
     """v3.1 — render workspace-level decisions + notes as a compact text block.
 
-    Workspace decisions/notes are tenant-global (above any single project), so
-    they are prepended to every project's context block + handoff. Returns an
-    empty string when there is nothing to show, so callers can skip the join.
+    Workspace decisions/notes are tenant-global (above any single project).
+    This is the FULL renderer (bodies inline): since 0b0b24d8 a cold session
+    start and get_context_block use it only when ``include_workspace_context``
+    is on, via :func:`_build_workspace_context_block`; the default is the
+    bounded :func:`_render_workspace_index_block`. Returns an empty string
+    when there is nothing to show, so callers can skip the join.
     """
     if not decisions and not notes:
         return ""
@@ -957,6 +960,118 @@ def _render_workspace_block(
         suffix = f" ({tags})" if tags else ""
         lines.append(f"  • NOTE {n.get('title', '')}: {n.get('body', '')}{suffix}")
     return "\n".join(lines)
+
+
+# 0b0b24d8 — bounded workspace index. The full block above used to be prepended
+# unconditionally to every cold session start and every get_context_block, so
+# unrelated workspace notes (interview notes, another project's findings, ...)
+# led every session. The index keeps the owner's standing policy (decisions)
+# visible but capped, and reduces notes to a count plus policy-tagged titles.
+_WORKSPACE_INDEX_MAX_DECISIONS = 5
+_WORKSPACE_INDEX_DECISION_CHARS = 160
+# Decision title and category are free text too (REST caps neither, MCP caps
+# only the title), so they are clipped like the body: an unclipped one let five
+# decisions with 90k-char titles turn a cold session start into 455k chars.
+_WORKSPACE_INDEX_DECISION_TITLE_CHARS = 120
+_WORKSPACE_INDEX_CATEGORY_CHARS = 40
+_WORKSPACE_INDEX_MAX_POLICY_TITLES = 5
+_WORKSPACE_INDEX_TITLE_CHARS = 80
+# A note is "policy" when any comma-separated tag equals one of these.
+_WORKSPACE_POLICY_TAGS = frozenset({"policy", "workspace-policy"})
+
+
+def _is_policy_note(note: dict) -> bool:
+    tags = {t.strip().lower() for t in (note.get("tags") or "").split(",")}
+    return bool(tags & _WORKSPACE_POLICY_TAGS)
+
+
+def _render_workspace_index_block(
+    decisions: list[dict], notes: list[dict]
+) -> str:
+    """0b0b24d8 — bounded stand-in for :func:`_render_workspace_block`.
+
+    Decisions are the owner's standing policy, so they stay, but capped at
+    ``_WORKSPACE_INDEX_MAX_DECISIONS`` one-line summaries (title, category and
+    body each clipped to their ``_WORKSPACE_INDEX_*_CHARS`` limit). Notes are
+    NOT inlined at all: a count, the titles of up to
+    ``_WORKSPACE_INDEX_MAX_POLICY_TITLES`` policy-tagged ones, and the exact
+    tool calls that fetch the rest. Empty string when there is nothing to
+    show, same as the full renderer. Every variable-length field is clipped,
+    so output size is bounded by the constants above regardless of how many
+    records exist or how long any one of them is, which is the point.
+    """
+    if not decisions and not notes:
+        return ""
+    lines = [
+        "WORKSPACE (applies to all projects) - index only, note bodies not included:"
+    ]
+    fetch: list[str] = []
+    if decisions:
+        shown = decisions[:_WORKSPACE_INDEX_MAX_DECISIONS]
+        clipped = False
+        for d in shown:
+            # Flatten first and compare lengths, so a clipped field also
+            # triggers the "fetch the rest" hint below.
+            cat = " ".join(str(d.get("category") or "").split())
+            title = " ".join(str(d.get("title") or "").split())
+            body = " ".join(str(d.get("body") or "").split())
+            clipped = clipped or (
+                len(cat) > _WORKSPACE_INDEX_CATEGORY_CHARS
+                or len(title) > _WORKSPACE_INDEX_DECISION_TITLE_CHARS
+                or len(body) > _WORKSPACE_INDEX_DECISION_CHARS
+            )
+            cat = _md_one_line(cat, _WORKSPACE_INDEX_CATEGORY_CHARS)
+            prefix = f"[{cat}] " if cat else ""
+            lines.append(
+                f"  - DECISION {prefix}"
+                f"{_md_one_line(title, _WORKSPACE_INDEX_DECISION_TITLE_CHARS)}: "
+                f"{_md_one_line(body, _WORKSPACE_INDEX_DECISION_CHARS)}"
+            )
+        hidden = len(decisions) - len(shown)
+        if hidden > 0:
+            lines.append(f"  - (+{hidden} more decision(s))")
+        if hidden > 0 or clipped:
+            fetch.append("get_workspace_decisions()")
+    if notes:
+        policy = [n for n in notes if _is_policy_note(n)]
+        titles = [
+            _md_one_line(n.get("title") or "(untitled)", _WORKSPACE_INDEX_TITLE_CHARS)
+            for n in policy[:_WORKSPACE_INDEX_MAX_POLICY_TITLES]
+        ]
+        line = f"  - {len(notes)} workspace note(s), bodies not included"
+        if titles:
+            more = len(policy) - len(titles)
+            line += (
+                "; policy-tagged: " + "; ".join(titles)
+                + (f" (+{more} more)" if more > 0 else "")
+            )
+        lines.append(line)
+        if policy:
+            fetch.append('get_workspace_notes(tag="policy")')
+        fetch.append("get_workspace_notes()")
+    if fetch:
+        lines.append("  - Fetch the rest: " + " | ".join(fetch))
+    return "\n".join(lines)
+
+
+async def _build_workspace_context_block(
+    db: Any, *, tenant_id: "str | None" = None
+) -> str:
+    """0b0b24d8 — the workspace block for a cold session start and
+    ``get_context_block``: the bounded index by default, the full text of every
+    decision and note (:func:`_render_workspace_block`, i.e. the behaviour
+    before this change) only when ``include_workspace_context`` is on (see
+    ``toml_config.get_include_workspace_context`` for the sources and for why
+    it is not a ``workspace_settings`` column).
+    """
+    from . import db as _db_module
+    from . import toml_config as _toml_config
+
+    ws_decisions = await _db_module.get_workspace_decisions(db, tenant_id=tenant_id)
+    ws_notes = await _db_module.get_workspace_notes(db, tenant_id=tenant_id)
+    if _toml_config.get_include_workspace_context():
+        return _render_workspace_block(ws_decisions, ws_notes)
+    return _render_workspace_index_block(ws_decisions, ws_notes)
 
 
 def _render_context_block(

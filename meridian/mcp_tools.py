@@ -2507,8 +2507,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "add_workspace_note", "description":
         "Add a workspace-level wiki note that applies across ALL projects in this "
         "workspace (onboarding, cross-cutting conventions, shared infra). Unlike "
-        "add_note, it is not tied to a project and is injected at the top of every "
-        "project's context block + handoff. Comma-separated tags optional.",
+        "add_note, it is not tied to a project. Its body is NOT inlined by default: "
+        "session start and get_context_block carry only a short index (a note "
+        "count plus the titles of notes tagged policy or workspace-policy), and a "
+        "handoff carries notes only when generate_handoff(mode=\"full\") is "
+        "requested explicitly. Read bodies with get_workspace_notes "
+        "(tag=\"policy\" for the policy-tagged ones); the operator setting "
+        "include_workspace_context inlines them into session start and "
+        "get_context_block. Comma-separated tags optional.",
      "inputSchema": {"type": "object", "properties": {
          "title": {"type": "string"},
          "body": {"type": "string"},
@@ -2535,9 +2541,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["note_id"]}},
     {"name": "pin_workspace_decision", "description":
         "Pin a workspace-level decision that applies across ALL projects (shared "
-        "architecture, org-wide standards). Injected at the top of every project's "
-        "context block + handoff. category is free-text (STRATEGIC, TECHNICAL, "
-        "ARCHITECTURAL, PRODUCT, ...).",
+        "architecture, org-wide standards). Session start and get_context_block show "
+        "only a short index of the newest few decisions (one clipped line each, plus "
+        "a count of the rest); a handoff carries none unless "
+        "generate_handoff(mode=\"full\") is requested explicitly. Read the full text "
+        "with get_workspace_decisions; the operator setting include_workspace_context "
+        "inlines it into session start and get_context_block. category is free-text "
+        "(STRATEGIC, TECHNICAL, ARCHITECTURAL, PRODUCT, ...).",
      "inputSchema": {"type": "object", "properties": {
          "title": {"type": "string"},
          "body": {"type": "string"},

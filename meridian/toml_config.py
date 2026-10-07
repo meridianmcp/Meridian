@@ -304,6 +304,39 @@ def get_default_project_id() -> str | None:
     return None
 
 
+def get_include_workspace_context() -> bool:
+    """Return the ``include_workspace_context`` flag (default ``False``).
+
+    0b0b24d8 — whether a cold session start (``start_session``'s
+    ``workspace_context``) and ``get_context_block`` carry the FULL text of
+    every workspace decision and note (``True``, the pre-0b0b24d8 behaviour)
+    or only a bounded index (``False``, the default): decisions capped to a
+    few one-line summaries, notes reduced to a count plus the titles of the
+    policy-tagged ones, and the exact tool call that fetches the rest.
+
+    Precedence, same env-first style as every other reader here::
+
+        MERIDIAN_INCLUDE_WORKSPACE_CONTEXT env  >  [meridian] include_workspace_context  >  False
+
+    Why env/toml and not a ``workspace_settings`` column: that table has one
+    typed column per key, so a new key is a schema migration on SQLite AND on
+    every hosted tenant's Postgres DB (``db/migrations.py``, ``pg_adapter.py``,
+    ``db/workspace.py``, the MCP tool schema, the dashboard form). Both
+    sources are read in THIS process, which makes it a self-host switch; on
+    the hosted tier the env var is operator-wide (all tenants), the toml is
+    not shipped, and a per-tenant switch needs that column. A caller on any
+    tier can still fetch everything on demand through ``get_workspace_notes``
+    / ``get_workspace_decisions``, which the index itself names.
+    """
+    env_val = os.environ.get("MERIDIAN_INCLUDE_WORKSPACE_CONTEXT")
+    if env_val is not None and env_val.strip():
+        return _coerce_bool(env_val)
+    toml_tbl = _read_table("meridian")
+    if "include_workspace_context" in toml_tbl:
+        return _coerce_bool(toml_tbl["include_workspace_context"])
+    return False
+
+
 def get_self_host_defaults() -> dict[str, Any]:
     """Return misc self-host default seeds (env > toml > hardcoded default).
 

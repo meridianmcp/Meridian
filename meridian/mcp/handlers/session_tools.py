@@ -20,7 +20,7 @@ from typing import Any, TYPE_CHECKING
 import meridian.server as _server
 from meridian import db as db_module
 from meridian import session_brief as session_brief_module
-from meridian._deps import validate_input_size
+from meridian._deps import _build_workspace_context_block, validate_input_size
 
 _ITEM_RECOVERY_XML_MAX_BYTES = 1800
 
@@ -569,9 +569,9 @@ async def handle_get_context_block(
     )
     # v3.1 — workspace decisions + notes apply across all projects; surface
     # them at the very top so a fresh session sees org-wide truth first.
-    ws_decisions = await db_module.get_workspace_decisions(db, tenant_id=_mcp_tenant_id)
-    ws_notes = await db_module.get_workspace_notes(db, tenant_id=_mcp_tenant_id)
-    ws_block = _server._render_workspace_block(ws_decisions, ws_notes)
+    # 0b0b24d8 — a bounded index by default, full text only when
+    # include_workspace_context is on (see _build_workspace_context_block).
+    ws_block = await _build_workspace_context_block(db, tenant_id=_mcp_tenant_id)
     if ws_block:
         text = f"{ws_block}\n\n{text}"
     xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'

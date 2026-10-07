@@ -900,8 +900,14 @@ async def commit_proposal_promotion(
                 "— pass the caller's own data_dir through."
             )
         try:
+            # 0b0b24d8 — explicit mode="goal": this handoff exists to give an
+            # executor exactly the one just-promoted item, so it must be the
+            # bounded /goal block (same default proposal_handoff.py uses),
+            # not the 'full' archival dump an omitted mode used to inherit
+            # (which also prepended every workspace decision and note).
             path, content, amended = await handoff_module.generate_handoff(
                 db, project_id, data_dir,
+                mode="goal",
                 session_id=session_id,
                 selected_item_ids=[sprint_item_id],
                 skip_ai_summary=True,

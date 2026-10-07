@@ -265,7 +265,7 @@ async def test_generate_handoff_renders_resolved_pointers_inline(db, tmp_path):
     )
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Resolved pointers:" in content
     assert "meridian/db/migrations.py:100-120" in content
@@ -292,7 +292,7 @@ async def test_generate_handoff_omits_resolved_pointers_when_flag_off(db, tmp_pa
     await db_module.update_workspace_settings(db, handoff_inline_pointers=False)
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Resolved pointers:" not in content
     assert "meridian/db/migrations.py:100-120" not in content
@@ -324,7 +324,7 @@ async def test_generate_handoff_survives_pointer_resolve_blowup(db, tmp_path, mo
 
     # Must not raise, and must still produce a handoff.
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "resilient item" in content
     assert "Resolved pointers:" not in content
@@ -377,10 +377,10 @@ async def test_generate_handoff_pointer_rendering_deterministic_across_repeated_
     )
 
     _, content_a, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     _, content_b, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
     for c in (content_a, content_b):
@@ -413,7 +413,7 @@ async def test_resolved_pointer_text_matches_executor_contract_structured_target
     )
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     fresh = await db_module.get_sprint_item(db, item["id"])

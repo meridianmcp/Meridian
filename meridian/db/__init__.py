@@ -6307,20 +6307,27 @@ async def expire_idle_sessions(
 ) -> dict[str, Any]:
     """Mark sessions idle when their last_seen is older than *max_age_minutes*.
 
-    Returns ``{"count": n, "project_ids": [...]}`` where ``project_ids`` is
-    the list of distinct projects that had at least one session expire. The
-    caller can use this to trigger handoff generation for affected projects
-    (v0.4.5). Only 'active' sessions are considered; 'idle' and 'closed'
+    Returns ``{"count": n, "project_ids": [...], "session_ids_by_project":
+    {...}}`` where ``project_ids`` is the list of distinct projects that had at
+    least one session expire. The caller can use this to trigger handoff
+    generation for affected projects (v0.4.5). ``session_ids_by_project`` maps
+    each of those projects to the sessions that expired, most recently seen
+    first (0b0b24d8): a delta handoff needs a session to bound its "completed
+    since" list. Only 'active' sessions are considered; 'idle' and 'closed'
     sessions are left untouched.
     """
     async with db.execute(
-        "SELECT DISTINCT project_id FROM sessions "
+        "SELECT id, project_id FROM sessions "
         "WHERE status = 'active' "
-        "AND last_seen < datetime('now', ? || ' minutes')",
+        "AND last_seen < datetime('now', ? || ' minutes') "
+        "ORDER BY last_seen DESC",
         (f"-{max_age_minutes}",),
     ) as cur:
         rows = await cur.fetchall()
-    affected_project_ids: list[str] = [row["project_id"] for row in rows]
+    session_ids_by_project: dict[str, list[str]] = {}
+    for row in rows:
+        session_ids_by_project.setdefault(row["project_id"], []).append(row["id"])
+    affected_project_ids: list[str] = list(session_ids_by_project)
 
     cursor = await db.execute(
         "UPDATE sessions SET status = 'idle' "
@@ -6329,7 +6336,11 @@ async def expire_idle_sessions(
         (f"-{max_age_minutes}",),
     )
     await db.commit()
-    return {"count": cursor.rowcount, "project_ids": affected_project_ids}
+    return {
+        "count": cursor.rowcount,
+        "project_ids": affected_project_ids,
+        "session_ids_by_project": session_ids_by_project,
+    }
 
 
 async def expire_inactive_sessions(

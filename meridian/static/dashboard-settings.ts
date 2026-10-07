@@ -3483,7 +3483,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
   html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
     <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. Notes and decisions here are injected at the top of every project's context block.</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. A session's start and the context block show only a short index of these (the newest few decisions as one-line summaries, a note count and the titles of notes tagged <code>policy</code>), not note bodies. Fetch the full text with <code>get_workspace_notes</code> and <code>get_workspace_decisions</code>.</div>
     <div style="margin-bottom:12px">
       <div style="font-size:10px;color:var(--text);margin-bottom:4px">Default settings</div>
       <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
