@@ -27,14 +27,18 @@ import {
   mountWaffle,
   moveFocus,
   orderTabs,
+  parseRawState,
   parseState,
   readRailTabs,
+  readRawState,
   readWaffleBadges,
   recentTabs,
   recordUse,
   recordWaffleUse,
   refreshWaffle,
   saveState,
+  serializeState,
+  setPinned,
   togglePin,
   waffleIconSvg,
   withoutWaffleUse,
@@ -234,8 +238,50 @@ describe("pins, usage and recents", () => {
       setItem: (k: string, v: string) => void store.set(k, v),
     } as unknown as Storage;
     const s = recordUse(togglePin(emptyState(), "queue"), "live");
-    saveState(storage, "k", s);
+    expect(saveState(storage, "k", s)).toBe(true);
+    expect(store.get("k")).toBe(serializeState(s));
     expect(loadState(storage, "k")).toEqual(s);
+  });
+
+  it("saveState reports whether the write landed; readRawState tells empty from unreadable", () => {
+    const store = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+    } as unknown as Storage;
+    const blocked = {
+      getItem: () => {
+        throw new Error("blocked");
+      },
+      setItem: () => {
+        throw new Error("quota");
+      },
+    } as unknown as Storage;
+    expect(saveState(null, "k", emptyState())).toBe(false);
+    expect(saveState(blocked, "k", emptyState())).toBe(false);
+    expect(readRawState(storage, "k")).toBeNull(); // nothing stored: an answer
+    expect(readRawState(null, "k")).toBeUndefined(); // no storage: no answer
+    expect(readRawState(blocked, "k")).toBeUndefined(); // getItem throws: no answer
+    saveState(storage, "k", emptyState());
+    expect(readRawState(storage, "k")).toBe(serializeState(emptyState()));
+    expect(parseRawState(undefined)).toEqual(emptyState());
+    expect(parseRawState(null)).toEqual(emptyState());
+    expect(parseRawState("{not json")).toEqual(emptyState());
+  });
+
+  it("setPinned adds or removes exactly one pin and is a no-op when already in that state", () => {
+    const base = state({ pins: ["goal", "queue"], usage: { live: 2 }, recent: ["live"] });
+    const pinned = setPinned(base, "notes", true);
+    expect(pinned.pins).toEqual(["goal", "queue", "notes"]);
+    expect(pinned.usage).toEqual({ live: 2 });
+    expect(pinned.recent).toEqual(["live"]);
+    expect(base.pins).toEqual(["goal", "queue"]); // input untouched
+    expect(setPinned(base, "queue", false).pins).toEqual(["goal"]);
+    expect(setPinned(base, "queue", true)).toBe(base);
+    expect(setPinned(base, "notes", false)).toBe(base);
+    expect(setPinned(base, "not a valid id!", true)).toBe(base);
+    // From the owner's defaults (pins === null) a first unpin materialises the user's own list.
+    expect(setPinned(emptyState(), "goal", false).pins).toEqual(["notes", "insights"]);
   });
 });
 
@@ -1228,6 +1274,283 @@ describe("launcher: usage is learned from the rail as well as the waffle", () =>
     recordWaffleUse("live");
     expect(w.getState().usage).toEqual({ live: 1 });
     w.destroy();
+  });
+});
+
+// Pins, usage and recents are ONE localStorage value shared by every open tab of
+// the dashboard. A tab that loaded it at mount and later wrote its whole in-memory
+// copy back silently erased what another tab had pinned or counted since (the
+// reproduced blocker): every write must be a read-modify-write against the latest
+// stored value, and an open popover must follow what other tabs write.
+//
+// Two launchers share one fake localStorage here. mountWaffle keeps a module-level
+// "current" launcher, so tab B is mounted from a second copy of the module
+// (vi.resetModules); both live in one jsdom window. Tab A is driven through the
+// real UI (pin glyph, rail clicks). "Another tab writes" is saveState(togglePin(...)),
+// byte for byte what a launcher's own write puts in storage.
+type WaffleModule = typeof import("./dashboard-waffle");
+
+describe("launcher: two tabs share one stored state (cross-tab)", () => {
+  let page: Page;
+  let tabA: WaffleController;
+  let tabB: WaffleController;
+  let modB: WaffleModule;
+
+  const DEFAULT_PINS = ["goal", "notes", "insights"];
+  const railBtn = (tab: string) => page.strip.querySelector<HTMLElement>(`.vtab-btn[data-vtab="${tab}"]`)!;
+  const stored = () => JSON.parse(page.store.get("k")!);
+  const tileIn = (c: WaffleController, tab: string) =>
+    c.popover.querySelector<HTMLElement>(`.waffle-tile[data-waffle-tab="${tab}"]`);
+  const tabsIn = (c: WaffleController, section: string) =>
+    Array.from(c.popover.querySelectorAll<HTMLElement>(`[data-waffle-section="${section}"] .waffle-tile`)).map(
+      (t) => t.dataset.waffleTab,
+    );
+  const pinGlyph = (c: WaffleController, tab: string) =>
+    (tileIn(c, tab)!.querySelector("[data-waffle-pin]") as HTMLElement).click();
+  /** What another tab's launcher leaves in storage after one of its own changes. */
+  const otherTabWrites = (change: (s: WaffleState) => WaffleState) =>
+    saveState(page.storage, "k", change(loadState(page.storage, "k")));
+  /** The browser tells every OTHER tab; in this one-window harness it reaches both launchers, which is harmless. */
+  const storageEvent = (k: string | null = "k") => window.dispatchEvent(new StorageEvent("storage", { key: k }));
+
+  beforeEach(async () => {
+    page = buildPage();
+    tabA = page.mount();
+    vi.resetModules();
+    modB = await import("./dashboard-waffle");
+    const b = modB.mountWaffle({
+      host: document.getElementById("topbar"),
+      getStrip: () => document.getElementById("vtab-strip-p1"),
+      getBadges: () => page.badges,
+      storage: page.storage,
+      storageKey: "k",
+    });
+    expect(b).not.toBeNull();
+    tabB = b as WaffleController;
+  });
+
+  afterEach(() => {
+    tabB.destroy();
+    tabA.destroy();
+    document.body.innerHTML = "";
+  });
+
+  it("CROSS-TAB 1: a pin made in tab A survives an ordinary rail click in a stale tab B", () => {
+    tabA.open();
+    pinGlyph(tabA, "queue");
+    tabA.close(false);
+    expect(stored().pins).toEqual([...DEFAULT_PINS, "queue"]);
+    expect(tabB.getState().pins).toBeNull(); // B loaded before the pin and was never told
+    modB.recordWaffleUse("timeline"); // what the rail's shared onclick calls in tab B
+    expect(stored()).toMatchObject({ pins: [...DEFAULT_PINS, "queue"], usage: { timeline: 1 }, recent: ["timeline"] });
+    expect(tabB.getState().pins).toEqual([...DEFAULT_PINS, "queue"]);
+  });
+
+  it("CROSS-TAB 2: pins made in two tabs are both kept (A pins Queue, stale B opens the waffle and pins Sessions)", () => {
+    tabA.open();
+    pinGlyph(tabA, "queue");
+    tabA.close(false);
+    tabB.open();
+    pinGlyph(tabB, "sessions");
+    expect(stored().pins).toEqual([...DEFAULT_PINS, "queue", "sessions"]);
+    expect(tabsIn(tabB, "pinned")).toEqual([...DEFAULT_PINS, "queue", "sessions"]);
+  });
+
+  it("CROSS-TAB 2b: the same holds when B's popover was already open and never heard about A's pin", () => {
+    tabB.open();
+    otherTabWrites((s) => togglePin(s, "queue")); // no storage event reaches B
+    expect(tabsIn(tabB, "pinned")).toEqual(DEFAULT_PINS); // B really is stale
+    pinGlyph(tabB, "sessions");
+    expect(stored().pins).toEqual([...DEFAULT_PINS, "queue", "sessions"]);
+    expect(tabsIn(tabB, "pinned")).toEqual([...DEFAULT_PINS, "queue", "sessions"]);
+  });
+
+  it("CROSS-TAB 3: usage counted in tab A survives a click in a stale tab B", () => {
+    for (let i = 0; i < 5; i++) railBtn("sessions").click();
+    expect(stored().usage).toEqual({ sessions: 5 });
+    expect(tabB.getState().usage).toEqual({}); // B never heard
+    modB.recordWaffleUse("status");
+    expect(stored().usage).toEqual({ sessions: 5, status: 1 });
+    expect(stored().recent).toEqual(["status", "sessions"]);
+  });
+
+  it("each write changes only its own item: B's pin keeps A's counts, A's use keeps B's pins", () => {
+    tabB.open();
+    pinGlyph(tabB, "queue");
+    tabB.close(false);
+    expect(stored().pins).toEqual([...DEFAULT_PINS, "queue"]);
+    railBtn("sessions").click(); // tab A (stale: it still thinks pins are the defaults)
+    expect(tabA.getState().pins).toEqual([...DEFAULT_PINS, "queue"]);
+    expect(stored()).toMatchObject({ pins: [...DEFAULT_PINS, "queue"], usage: { sessions: 1 } });
+    tabB.open();
+    pinGlyph(tabB, "goal"); // unpin one default: nothing else moves
+    expect(stored()).toMatchObject({ pins: ["notes", "insights", "queue"], usage: { sessions: 1 }, recent: ["sessions"] });
+  });
+
+  it("the tab that wrote reaches the other one through the storage event", () => {
+    modB.recordWaffleUse("timeline");
+    storageEvent();
+    expect(tabA.getState().usage).toEqual({ timeline: 1 });
+    expect(tabA.getState().recent).toEqual(["timeline"]);
+  });
+
+  it("an open popover redraws when another tab changes the stored state: Pinned, Recent and the usage order", () => {
+    tabB.open();
+    expect(tabsIn(tabB, "pinned")).toEqual(DEFAULT_PINS);
+    expect(tabsIn(tabB, "recent")).toEqual([]);
+    otherTabWrites((s) => recordUse(togglePin(s, "queue"), "sessions"));
+    otherTabWrites((s) => ({ ...s, usage: { ...s.usage, sessions: WAFFLE_USAGE_THRESHOLD } }));
+    expect(tabsIn(tabB, "pinned")).toEqual(DEFAULT_PINS); // nothing until the event arrives
+    storageEvent();
+    expect(tabB.isOpen()).toBe(true);
+    expect(tabsIn(tabB, "pinned")).toEqual([...DEFAULT_PINS, "queue"]);
+    expect(tileIn(tabB, "queue")!.dataset.pinned).toBe("true");
+    expect(tabsIn(tabB, "recent")).toEqual(["sessions"]);
+    expect(tabB.getState().usage).toEqual({ sessions: WAFFLE_USAGE_THRESHOLD });
+    // Past the threshold the usage order applies: the most used tab leads "All tabs".
+    expect(tabsIn(tabB, "all")[0]).toBe("live");
+    otherTabWrites((s) => ({ ...s, recent: [], usage: { ...s.usage, status: WAFFLE_USAGE_THRESHOLD + 5 } }));
+    storageEvent();
+    expect(tabsIn(tabB, "all")[0]).toBe("status");
+  });
+
+  it("keeps the keyboard focus on the same tile when the redraw comes from another tab", () => {
+    tabB.open();
+    const q = tileIn(tabB, "queue")!;
+    q.focus();
+    expect(document.activeElement).toBe(q);
+    otherTabWrites((s) => togglePin(s, "queue"));
+    storageEvent();
+    expect(tileIn(tabB, "queue")!.dataset.pinned).toBe("true");
+    expect(document.activeElement).toBe(tileIn(tabB, "queue"));
+    expect(tabB.isOpen()).toBe(true);
+  });
+
+  it("a closed tab adopts the change too, so its next open already shows it", () => {
+    otherTabWrites((s) => togglePin(s, "queue"));
+    expect(tabB.getState().pins).toBeNull();
+    storageEvent();
+    expect(tabB.getState().pins).toEqual([...DEFAULT_PINS, "queue"]);
+    expect(tabB.isOpen()).toBe(false);
+    tabB.open();
+    expect(tabsIn(tabB, "pinned")).toEqual([...DEFAULT_PINS, "queue"]);
+  });
+
+  it("opening re-reads storage, so a tab that missed the event still shows the other tab's pins", () => {
+    otherTabWrites((s) => togglePin(s, "queue")); // no event delivered
+    expect(tabB.getState().pins).toBeNull();
+    tabB.open();
+    expect(tabsIn(tabB, "pinned")).toEqual([...DEFAULT_PINS, "queue"]);
+    expect(tabB.getState().pins).toEqual([...DEFAULT_PINS, "queue"]);
+  });
+
+  it("only this launcher's key matters; a cleared store (key null) takes the tab back to the defaults", () => {
+    tabB.open();
+    otherTabWrites((s) => togglePin(s, "queue"));
+    storageEvent("some_other_key");
+    expect(tabB.getState().pins).toBeNull(); // not our key: ignored
+    storageEvent(); // our key
+    expect(tabB.getState().pins).toEqual([...DEFAULT_PINS, "queue"]);
+    page.store.clear();
+    storageEvent(null); // localStorage.clear() in another tab
+    expect(tabB.getState()).toEqual(emptyState());
+    expect(tabsIn(tabB, "pinned")).toEqual(DEFAULT_PINS);
+  });
+
+  it("an identical or spurious event changes nothing and does not rebuild the grid", () => {
+    tabB.open();
+    const before = tileIn(tabB, "queue");
+    storageEvent();
+    storageEvent();
+    expect(tileIn(tabB, "queue")).toBe(before); // same node: no swap
+    expect(tabB.getState()).toEqual(emptyState());
+  });
+
+  it("destroying a launcher removes its storage listener", () => {
+    tabB.destroy();
+    otherTabWrites((s) => togglePin(s, "queue"));
+    storageEvent();
+    expect(tabB.getState().pins).toBeNull(); // frozen: nothing listens any more
+    expect(tabA.getState().pins).toEqual([...DEFAULT_PINS, "queue"]); // the live one still does
+  });
+
+  it("unpinning what the grid showed is not flipped into a pin when another tab already unpinned it", () => {
+    tabB.open(); // shows Goal pinned
+    otherTabWrites((s) => togglePin(s, "goal")); // another tab unpinned it; the event is missed
+    pinGlyph(tabB, "goal");
+    expect(stored().pins).toEqual(["notes", "insights"]);
+    expect(tileIn(tabB, "goal")!.dataset.pinned).toBe("false");
+  });
+});
+
+describe("launcher: storage that fails mid-session still lets the page work", () => {
+  let page: Page;
+  let waffle: WaffleController | null = null;
+  /** Readable and writable until a flag flips: blocked site data / a full quota appearing after mount. */
+  function flakyStorage() {
+    const flags = { readBlocked: false, writeBlocked: false };
+    const store = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => {
+        if (flags.readBlocked) throw new DOMException("blocked", "SecurityError");
+        return store.get(k) ?? null;
+      },
+      setItem: (k: string, v: string) => {
+        if (flags.writeBlocked) throw new DOMException("quota", "QuotaExceededError");
+        store.set(k, v);
+      },
+    } as unknown as Storage;
+    return { flags, store, storage };
+  }
+
+  beforeEach(() => {
+    page = buildPage();
+  });
+
+  afterEach(() => {
+    waffle?.destroy();
+    waffle = null;
+    document.body.innerHTML = "";
+  });
+
+  it("unreadable storage keeps the in-memory state, accumulating changes for this page load", () => {
+    const { flags, storage } = flakyStorage();
+    waffle = page.mount({ storage });
+    waffle.recordUse("queue");
+    flags.readBlocked = true;
+    flags.writeBlocked = true;
+    waffle.recordUse("live");
+    waffle.recordUse("live");
+    expect(waffle.getState().usage).toEqual({ queue: 1, live: 2 });
+    waffle.open();
+    (tile("sessions")!.querySelector("[data-waffle-pin]") as HTMLElement).click();
+    expect(waffle.getState().pins).toEqual([...WAFFLE_DEFAULT_PINS, "sessions"]);
+    expect(tileOrder().slice(0, 4)).toEqual([...WAFFLE_DEFAULT_PINS, "sessions"]);
+  });
+
+  it("a full store (writes fail, reads work) keeps accumulating, then saves everything once writes work again", () => {
+    const { flags, store, storage } = flakyStorage();
+    waffle = page.mount({ storage });
+    waffle.recordUse("queue");
+    flags.writeBlocked = true;
+    waffle.recordUse("live");
+    waffle.recordUse("live");
+    expect(waffle.getState().usage).toEqual({ queue: 1, live: 2 });
+    expect(JSON.parse(store.get("k")!).usage).toEqual({ queue: 1 }); // the failed writes never landed
+    flags.writeBlocked = false;
+    waffle.recordUse("live");
+    expect(JSON.parse(store.get("k")!).usage).toEqual({ queue: 1, live: 3 });
+  });
+
+  it("with no storage at all the in-memory state still accumulates and a storage event is harmless", () => {
+    waffle = page.mount({ storage: null });
+    waffle.recordUse("queue");
+    waffle.open();
+    (tile("sessions")!.querySelector("[data-waffle-pin]") as HTMLElement).click();
+    window.dispatchEvent(new StorageEvent("storage", { key: "k" }));
+    expect(waffle.getState().usage).toEqual({ queue: 1 });
+    expect(waffle.getState().pins).toEqual([...WAFFLE_DEFAULT_PINS, "sessions"]);
+    expect(waffle.isOpen()).toBe(true);
   });
 });
 

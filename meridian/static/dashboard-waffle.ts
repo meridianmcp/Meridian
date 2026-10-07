@@ -29,6 +29,11 @@
 //     on load, the tour) runs inside withoutWaffleUse and does not.
 //   * Per-user state (pins, click counts, recents) lives in localStorage ONLY,
 //     every access wrapped in try/catch; the launcher works with storage blocked.
+//   * Several tabs share that one localStorage value, so every write is a
+//     read-modify-write: re-read the latest stored value, apply only the one
+//     change (one pin added or removed, one usage count, the recents), save. A
+//     window 'storage' listener (and a re-read on open) keeps an open popover
+//     and the in-memory state current with what other tabs wrote.
 //
 // Standalone on purpose: it imports only the group model from
 // dashboard-tabgroups. dashboard.ts supplies the strip and the badge data.
@@ -284,22 +289,49 @@ export function safeLocalStorage(): Storage | null {
   }
 }
 
-export function loadState(storage: Storage | null, key: string): WaffleState {
-  if (!storage) return emptyState();
+/**
+ * The raw stored string: null when nothing is stored under `key`, undefined when
+ * there is no storage to ask (none supplied, blocked, or getItem throws). Callers
+ * that merge with other tabs need that difference: "empty" is an answer,
+ * "unreadable" is not.
+ */
+export function readRawState(storage: Storage | null, key: string): string | null | undefined {
+  if (!storage) return undefined;
   try {
-    const raw = storage.getItem(key);
-    return raw ? parseState(JSON.parse(raw)) : emptyState();
+    return storage.getItem(key);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Defensive parse of a raw stored string (or its absence): never throws. */
+export function parseRawState(raw: string | null | undefined): WaffleState {
+  if (!raw) return emptyState();
+  try {
+    return parseState(JSON.parse(raw));
   } catch {
     return emptyState();
   }
 }
 
-export function saveState(storage: Storage | null, key: string, state: WaffleState): void {
-  if (!storage) return;
+export function loadState(storage: Storage | null, key: string): WaffleState {
+  return parseRawState(readRawState(storage, key));
+}
+
+/** The exact string saveState writes. */
+export function serializeState(state: WaffleState): string {
+  return JSON.stringify({ v: 1, pins: state.pins, usage: state.usage, recent: state.recent });
+}
+
+/** Write the state. Returns whether it was stored: false when storage is absent, full or blocked. */
+export function saveState(storage: Storage | null, key: string, state: WaffleState): boolean {
+  if (!storage) return false;
   try {
-    storage.setItem(key, JSON.stringify({ v: 1, pins: state.pins, usage: state.usage, recent: state.recent }));
+    storage.setItem(key, serializeState(state));
+    return true;
   } catch {
     // Storage full or blocked: the launcher still works for this page load.
+    return false;
   }
 }
 
@@ -319,13 +351,24 @@ export function recordUse(state: WaffleState, tab: string): WaffleState {
   };
 }
 
+/**
+ * Make `tab` pinned (or unpinned): adds or removes exactly that one pin and
+ * leaves every other pin, the usage counts and Recent alone. A new pin goes
+ * last. Already in the wanted state returns the state unchanged.
+ */
+export function setPinned(state: WaffleState, tab: string, pinned: boolean): WaffleState {
+  const id = cleanId(tab);
+  if (!id) return state;
+  const pins = effectivePins(state);
+  if (pins.includes(id) === pinned) return state;
+  return { ...state, pins: pinned ? [...pins, id] : pins.filter((t) => t !== id) };
+}
+
 /** Pin the tab if it is not pinned, unpin it if it is. A new pin goes last. */
 export function togglePin(state: WaffleState, tab: string): WaffleState {
   const id = cleanId(tab);
   if (!id) return state;
-  const pins = effectivePins(state);
-  const next = pins.includes(id) ? pins.filter((t) => t !== id) : [...pins, id];
-  return { ...state, pins: next };
+  return setPinned(state, id, !effectivePins(state).includes(id));
 }
 
 export function usageTotal(usage: Record<string, number>): number {
@@ -886,7 +929,13 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
 
   const storage = deps.storage === undefined ? safeLocalStorage() : deps.storage;
   const storageKey = deps.storageKey ?? DEFAULT_STORAGE_KEY;
-  let state = loadState(storage, storageKey);
+  // `synced` is what storage held the last time THIS page read or wrote it (null =
+  // nothing stored). It lets a mutation tell "another tab changed storage since
+  // I looked" (adopt that) from "storage is unchanged" (keep the in-memory state,
+  // which is the only complete copy when storage is blocked or full).
+  const initialRaw = readRawState(storage, storageKey);
+  let synced: string | null = initialRaw === undefined ? null : initialRaw;
+  let state = parseRawState(initialRaw);
   let isOpen = false;
   let query = "";
   let focusKey: string | null = null;
@@ -929,7 +978,31 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
   const body = popover.querySelector<HTMLElement>(".waffle-body")!;
   const live = popover.querySelector<HTMLElement>(".waffle-sr")!;
 
-  const persist = () => saveState(storage, storageKey, state);
+  /**
+   * Bring `state` up to date with storage when another tab (or window) has
+   * written since this page last read or wrote it. Returns true when it did.
+   * Storage that cannot be read, or that is unchanged since our own last sync,
+   * leaves the in-memory state alone.
+   */
+  const syncFromStorage = (): boolean => {
+    const raw = readRawState(storage, storageKey);
+    if (raw === undefined || raw === synced) return false;
+    synced = raw;
+    state = parseRawState(raw);
+    return true;
+  };
+
+  /**
+   * Every write goes through here as a read-modify-write: re-read the LATEST
+   * stored value, apply only this one change to it, then save. Writing the state
+   * this page loaded at mount would silently drop whatever another open tab has
+   * pinned or counted since (the whole blob is one localStorage value).
+   */
+  const mutate = (change: (latest: WaffleState) => WaffleState): void => {
+    syncFromStorage();
+    state = change(state);
+    if (saveState(storage, storageKey, state)) synced = serializeState(state);
+  };
 
   // A badge source that throws must never take the launcher down with it.
   const readBadges = (): Record<string, number> => {
@@ -1062,6 +1135,13 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
   const onResize = () => {
     if (isOpen) place();
   };
+  // Another tab changed our key (or cleared storage, key === null): adopt it and,
+  // when the grid is open, redraw so its Pinned section, Recent section and
+  // usage order follow. A change to some other key is none of our business.
+  const onStorage = (ev: StorageEvent) => {
+    if (ev.key !== null && ev.key !== storageKey) return;
+    if (syncFromStorage() && isOpen) render();
+  };
   // Escape is handled at the document, not on the popover: if focus ever ends up
   // on <body> while the dialog is open (an element removed under it, a click on a
   // gap) a popover-level listener would never hear it and Esc would be dead.
@@ -1096,6 +1176,9 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
     focusKey = null;
     popover.hidden = false;
     button.setAttribute("aria-expanded", "true");
+    // A page restored from the back/forward cache, or one whose tab was frozen,
+    // can have missed storage events: look at storage again before showing it.
+    syncFromStorage();
     render();
     place();
     document.addEventListener("keydown", onDocKey, true);
@@ -1113,8 +1196,7 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
   // One use of a tab, from any path (see recordWaffleUse). A scripted use can land
   // while the grid is open, so keep an open grid's Recent section current.
   const noteUse = (tab: string) => {
-    state = recordUse(state, tab);
-    persist();
+    mutate((latest) => recordUse(latest, tab));
     if (isOpen) render();
   };
 
@@ -1133,8 +1215,11 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
   };
 
   const togglePinFor = (tab: string, keyToFocus: string) => {
-    state = togglePin(state, tab);
-    persist();
+    // The user acted on what the grid showed: decide pin-or-unpin from that, then
+    // apply that one pin change to the latest stored list. (Flipping whatever the
+    // latest list says could turn "unpin" into "pin" if another tab got there first.)
+    const wantPinned = !effectivePins(state).includes(tab);
+    mutate((latest) => setPinned(latest, tab, wantPinned));
     // Re-rendering replaces the tile under the cursor (and may move it to another
     // section): if focus was inside the popover, put it back on the same tile so
     // keyboard users do not fall out of the dialog.
@@ -1224,6 +1309,9 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
   });
 
   updateDot();
+  // Listening from mount, not only while open: a closed launcher in a long-lived
+  // tab should already hold the other tabs' pins when it is next opened.
+  window.addEventListener("storage", onStorage);
 
   const controller: WaffleController = {
     button,
@@ -1240,6 +1328,7 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
     getState: () => state,
     destroy: () => {
       close(false);
+      window.removeEventListener("storage", onStorage);
       slot.remove();
       popover.remove();
       if (current === controller) current = null;

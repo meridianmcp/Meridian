@@ -9963,20 +9963,32 @@ ${n2.tags || ""}`.toLowerCase();
       return null;
     }
   }
-  function loadState(storage, key) {
-    if (!storage) return emptyState();
+  function readRawState(storage, key) {
+    if (!storage) return void 0;
     try {
-      const raw = storage.getItem(key);
-      return raw ? parseState(JSON.parse(raw)) : emptyState();
+      return storage.getItem(key);
+    } catch {
+      return void 0;
+    }
+  }
+  function parseRawState(raw) {
+    if (!raw) return emptyState();
+    try {
+      return parseState(JSON.parse(raw));
     } catch {
       return emptyState();
     }
   }
+  function serializeState(state2) {
+    return JSON.stringify({ v: 1, pins: state2.pins, usage: state2.usage, recent: state2.recent });
+  }
   function saveState(storage, key, state2) {
-    if (!storage) return;
+    if (!storage) return false;
     try {
-      storage.setItem(key, JSON.stringify({ v: 1, pins: state2.pins, usage: state2.usage, recent: state2.recent }));
+      storage.setItem(key, serializeState(state2));
+      return true;
     } catch {
+      return false;
     }
   }
   function effectivePins(state2) {
@@ -9991,12 +10003,12 @@ ${n2.tags || ""}`.toLowerCase();
       recent: [id, ...state2.recent.filter((t3) => t3 !== id)].slice(0, MAX_RECENT_KEPT)
     };
   }
-  function togglePin(state2, tab) {
+  function setPinned(state2, tab, pinned) {
     const id = cleanId(tab);
     if (!id) return state2;
     const pins = effectivePins(state2);
-    const next = pins.includes(id) ? pins.filter((t3) => t3 !== id) : [...pins, id];
-    return { ...state2, pins: next };
+    if (pins.includes(id) === pinned) return state2;
+    return { ...state2, pins: pinned ? [...pins, id] : pins.filter((t3) => t3 !== id) };
   }
   function usageTotal(usage) {
     let total = 0;
@@ -10289,7 +10301,9 @@ ${n2.tags || ""}`.toLowerCase();
     current?.destroy();
     const storage = deps.storage === void 0 ? safeLocalStorage() : deps.storage;
     const storageKey = deps.storageKey ?? DEFAULT_STORAGE_KEY;
-    let state2 = loadState(storage, storageKey);
+    const initialRaw = readRawState(storage, storageKey);
+    let synced = initialRaw === void 0 ? null : initialRaw;
+    let state2 = parseRawState(initialRaw);
     let isOpen = false;
     let query = "";
     let focusKey = null;
@@ -10322,7 +10336,18 @@ ${n2.tags || ""}`.toLowerCase();
     const input = popover.querySelector(".waffle-filter");
     const body = popover.querySelector(".waffle-body");
     const live = popover.querySelector(".waffle-sr");
-    const persist = () => saveState(storage, storageKey, state2);
+    const syncFromStorage = () => {
+      const raw = readRawState(storage, storageKey);
+      if (raw === void 0 || raw === synced) return false;
+      synced = raw;
+      state2 = parseRawState(raw);
+      return true;
+    };
+    const mutate = (change) => {
+      syncFromStorage();
+      state2 = change(state2);
+      if (saveState(storage, storageKey, state2)) synced = serializeState(state2);
+    };
     const readBadges = () => {
       try {
         return deps.getBadges ? deps.getBadges() : {};
@@ -10429,6 +10454,10 @@ ${n2.tags || ""}`.toLowerCase();
     const onResize = () => {
       if (isOpen) place();
     };
+    const onStorage = (ev) => {
+      if (ev.key !== null && ev.key !== storageKey) return;
+      if (syncFromStorage() && isOpen) render();
+    };
     const onDocKey = (ev) => {
       if (ev.key !== "Escape" || ev.isComposing) return;
       ev.preventDefault();
@@ -10457,6 +10486,7 @@ ${n2.tags || ""}`.toLowerCase();
       focusKey = null;
       popover.hidden = false;
       button.setAttribute("aria-expanded", "true");
+      syncFromStorage();
       render();
       place();
       document.addEventListener("keydown", onDocKey, true);
@@ -10469,8 +10499,7 @@ ${n2.tags || ""}`.toLowerCase();
       else focusEntry(focusKey);
     }
     const noteUse = (tab) => {
-      state2 = recordUse(state2, tab);
-      persist();
+      mutate((latest) => recordUse(latest, tab));
       if (isOpen) render();
     };
     const activateKey = (key) => {
@@ -10485,8 +10514,8 @@ ${n2.tags || ""}`.toLowerCase();
       updateDot();
     };
     const togglePinFor = (tab, keyToFocus) => {
-      state2 = togglePin(state2, tab);
-      persist();
+      const wantPinned = !effectivePins(state2).includes(tab);
+      mutate((latest) => setPinned(latest, tab, wantPinned));
       const hadFocus = popover.contains(document.activeElement);
       render();
       if (hadFocus) focusEntry(keyToFocus);
@@ -10566,6 +10595,7 @@ ${n2.tags || ""}`.toLowerCase();
       }
     });
     updateDot();
+    window.addEventListener("storage", onStorage);
     const controller = {
       button,
       popover,
@@ -10581,6 +10611,7 @@ ${n2.tags || ""}`.toLowerCase();
       getState: () => state2,
       destroy: () => {
         close(false);
+        window.removeEventListener("storage", onStorage);
         slot.remove();
         popover.remove();
         if (current === controller) current = null;

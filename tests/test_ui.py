@@ -1258,6 +1258,40 @@ def test_waffle_refresh_keeps_focus_and_skips_identical_swaps():
     assert 'document.removeEventListener("keydown", onDocKey, true)' in waffle
 
 
+def test_waffle_state_writes_are_read_modify_write_and_follow_other_tabs():
+    """90952bad - pins, usage and recents are ONE localStorage value shared by every
+    open dashboard tab. A launcher that loaded it at mount and wrote its whole
+    in-memory copy back lost whatever another tab had pinned or counted since. Every
+    write must re-read the latest stored value and apply only its own change, and a
+    window 'storage' listener (plus a re-read on open) must keep an open popover
+    current. Behaviour is covered by vitest ("two tabs share one stored state");
+    this guards the source contract."""
+    waffle = _static_text("dashboard-waffle.ts")
+    start = waffle.index("const mutate = (")
+    mutate = waffle[start : waffle.index("};", start)]
+    assert mutate.index("syncFromStorage()") < mutate.index("state = change(state)"), (
+        "the latest stored value must be read BEFORE the one change is applied"
+    )
+    assert mutate.index("state = change(state)") < mutate.index("saveState(storage, storageKey, state)")
+    # The only save in the launcher is that read-modify-write: no path persists a stale copy.
+    assert waffle.count("saveState(storage, storageKey") == 1
+    assert "persist()" not in waffle
+    start = waffle.index("const noteUse = (tab: string) => {")
+    assert "mutate((latest) => recordUse(latest, tab))" in waffle[start : start + 300]
+    start = waffle.index("const togglePinFor = (")
+    assert "mutate((latest) => setPinned(latest, tab, wantPinned))" in waffle[start : start + 900]
+    # Other tabs' writes arrive through the storage event, and opening re-reads too.
+    on_storage = waffle[waffle.index("const onStorage = (") : waffle.index("const onDocKey")]
+    assert "ev.key !== storageKey" in on_storage and "render()" in on_storage
+    assert 'window.addEventListener("storage", onStorage)' in waffle
+    assert 'window.removeEventListener("storage", onStorage)' in waffle
+    opened = waffle[waffle.index("function open(): void {") :]
+    assert opened.index("syncFromStorage()") < opened.index("render()")
+    # Reading storage stays guarded: unreadable storage is "no answer", never a throw.
+    raw = waffle[waffle.index("export function readRawState") : waffle.index("export function parseRawState")]
+    assert "try {" in raw and "catch" in raw
+
+
 def test_waffle_usage_is_recorded_from_the_shared_rail_onclick():
     """90952bad - usage adaptation must learn from every way of opening a tab, not
     only waffle activations: the rail's shared .vtab-btn onclick calls
