@@ -435,3 +435,55 @@ describe("opening, toggling and failing to open", () => {
     expect(h.toast).toHaveBeenCalledWith("Move failed: database is locked", true);
   });
 });
+
+describe("moving a SUBTASK on its own (the row must land where the toast says)", () => {
+  const family = () => [
+    mk({ id: "p1", title: "Parent alpha" }),
+    mk({ id: "c1", title: "Child one of alpha", parent_id: "p1" }),
+    mk({ id: "c2", title: "Child two of alpha", parent_id: "p1" }),
+    mk({ id: "s1", title: "Standalone beta" }),
+    mk({ id: "e1", title: "Existing in v2.2", version: "v2.2" }),
+  ];
+  const liveRow = (id: string) =>
+    document.querySelector<HTMLElement>(`#live-sprint-progress-${PID} .sprint-item-row[data-item="${id}"]`)!;
+  /** Text of the version header the row sits under; null if the row is folded
+   *  inside a parent's subtasks block instead of standing on the board. */
+  const headerOf = (el: HTMLElement) => {
+    if (el.parentElement !== document.getElementById(`live-sprint-progress-${PID}`)) return null;
+    let sib = el.previousElementSibling;
+    while (sib && !sib.classList.contains("sprint-group-header")) sib = sib.previousElementSibling;
+    return sib ? sib.textContent : "";
+  };
+
+  it("arrow on the subtask -> Move to v2.2 (next): it is repainted under the v2.2 header and that visible row is the one highlighted", async () => {
+    const h = harness(family());
+    h.refreshLiveTab.mockImplementation(async () => h.paint());
+    // Before the move the subtask is folded under its parent's v2.1 header, collapsed.
+    expect(headerOf(liveRow("c1"))).toBeNull();
+    expect(liveRow("c1").closest("details")).not.toBeNull();
+
+    await openFrom("live", "c1");
+    expect(q(".vmp-next").textContent).toBe("Move to v2.2 (next)");
+    q<HTMLButtonElement>(".vmp-next").click();
+    await vi.waitFor(() => expect(document.querySelectorAll(".sprint-row-moved").length).toBe(2));
+
+    // The server changed only the child: version moved, title/status/parent untouched.
+    const c1 = h.items.find((i) => i.id === "c1")!;
+    expect([c1.version, c1.title, c1.status, c1.parent_id]).toEqual(["v2.2", "Child one of alpha", "pending", "p1"]);
+    expect(h.items.find((i) => i.id === "c2")!.version).toBe("v2.1");
+
+    // On the board it now stands under v2.2, as its own row, outside any collapsed block...
+    const moved = liveRow("c1");
+    expect(headerOf(moved)).toBe("v2.2");
+    expect(moved.closest("details")).toBeNull();
+    expect(moved.querySelector(".sprint-subtask-tag")!.textContent).toBe("subtask of Parent alpha");
+    // ...the sibling that did not move is still folded under the parent...
+    expect(liveRow("c2").closest("details")).not.toBeNull();
+    expect(headerOf(liveRow("p1"))).toBe("v2.1");
+    // ...the parent's badge still counts both...
+    expect(liveRow("p1").querySelector(".sprint-item-title")!.textContent).toContain("[0/2]");
+    // ...and the highlight landed on that visible row (and on its Queue card).
+    expect(document.querySelector(`#live-sprint-progress-${PID} .sprint-row-moved`)).toBe(moved);
+    expect(document.querySelector(`#${queueBodyId(PID)} .sprint-row-moved`)!.getAttribute("data-item-id")).toBe("c1");
+  });
+});

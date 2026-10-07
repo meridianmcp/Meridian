@@ -1736,8 +1736,15 @@
       displayItems.map((it) => it.id).filter((id) => allChildrenOf.has(id))
     );
     const displayChildrenOf = /* @__PURE__ */ new Map();
+    const detachedParentOf = /* @__PURE__ */ new Map();
+    const displayedById = new Map(displayItems.map((it) => [it.id, it]));
     displayItems.forEach((it) => {
       if (it.parent_id && displayedParentIds.has(it.parent_id)) {
+        const parent = displayedById.get(it.parent_id);
+        if (parent && (it.version || "") !== (parent.version || "")) {
+          detachedParentOf.set(it.id, parent);
+          return;
+        }
         if (!displayChildrenOf.has(it.parent_id)) displayChildrenOf.set(it.parent_id, []);
         displayChildrenOf.get(it.parent_id).push(it);
       }
@@ -1798,6 +1805,8 @@
       const kidDone = allKids.filter((c3) => c3.status === "done").length;
       const childBadge = allKids.length > 0 ? `<span style="font-size:10px;color:var(--muted);margin-left:4px">[${kidDone}/${allKids.length}]</span>` : "";
       const indBadge = it.status === "indeterminate" ? `<span style="color:#fbbf24;margin-left:4px;font-size:11px">\u26A0</span>` : "";
+      const detachedParent = detachedParentOf.get(it.id);
+      const parentTag = detachedParent ? `<span class="sprint-subtask-tag" data-subtask-of="${escapeHtml(detachedParent.id)}" title="Subtask of ${escapeHtml(detachedParent.title)} (${escapeHtml(detachedParent.version || "no version")})" style="display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;margin-left:6px;font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px">subtask of ${escapeHtml(detachedParent.title)}</span>` : "";
       const indentStyle = isChild ? "margin-left:16px;border-left:2px solid var(--border);padding-left:8px;" : "";
       const rowHtml = `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}"
 
@@ -1811,7 +1820,7 @@
 
       <div style="flex:1;min-width:0">
 
-        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
+        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${parentTag}${_sprintHistoryBadges(it)}</span>
 
         ${notesHtml}
 
@@ -1853,7 +1862,7 @@
       if (groupName) {
         html += `<div class="sprint-group-header">${escapeHtml(groupName)}</div>`;
       }
-      const topLevel = groupItems.filter((it) => !it.parent_id || !displayedParentIds.has(it.parent_id));
+      const topLevel = groupItems.filter((it) => !it.parent_id || !displayedParentIds.has(it.parent_id) || detachedParentOf.has(it.id));
       html += topLevel.map((it) => renderItem(it, false)).join("");
     }
     const total = displayItems.length;
