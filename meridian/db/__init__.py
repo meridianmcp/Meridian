@@ -6242,17 +6242,29 @@ async def release_stale_task_claims(
 
 
 async def release_task(
-    db: aiosqlite.Connection, task_id: str, session_id: str
+    db: aiosqlite.Connection,
+    task_id: str,
+    session_id: str,
+    *,
+    project_id: str | None = None,
 ) -> bool:
     """Release a claim previously taken by ``session_id``.
 
     Returns True if a claim was released; False if the task wasn't held
     by that session (someone else's claim is left untouched).
+
+    ``project_id`` (RT-TI-005 wave 2) is an optional binding, like
+    :func:`update_task`'s: when supplied, the UPDATE (and the linked sprint-item
+    reset) only matches rows of that project, so a task id of another project
+    behaves exactly like a task that is not claimed by this session. The HTTP
+    route passes the path project; without it (stdio, tests) nothing changes.
     """
+    bound = " AND project_id = ?" if project_id is not None else ""
+    bound_params: tuple[Any, ...] = (project_id,) if project_id is not None else ()
     cursor = await db.execute(
         "UPDATE task_log SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
-        "WHERE id = ? AND claimed_by = ?",
-        (task_id, session_id),
+        "WHERE id = ? AND claimed_by = ?" + bound,
+        (task_id, session_id, *bound_params),
     )
     await db.commit()
     if cursor.rowcount == 0:
@@ -6261,8 +6273,8 @@ async def release_task(
     if updated is not None and updated.get("sprint_item_id"):
         await db.execute(
             "UPDATE sprint_items SET status = 'pending', completed_at = NULL "
-            "WHERE id = ? AND status = 'in_progress'",
-            (updated["sprint_item_id"],),
+            "WHERE id = ? AND status = 'in_progress'" + bound,
+            (updated["sprint_item_id"], *bound_params),
         )
         await db.commit()
         updated = await get_task(db, task_id)

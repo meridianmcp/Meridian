@@ -60,6 +60,30 @@ def _register_session(client, project_id: str, name: str = "s") -> str:
     return r.json()["id"]
 
 
+def _db_write(client, sql: str, params: tuple = ()) -> None:
+    """Run one write against the test app's DB (same pattern as tests/test_core.py)."""
+    db = client.app.state.db
+
+    async def _go():
+        await db.execute(sql, params)
+        await db.commit()
+
+    asyncio.run(_go())
+
+
+def _db_read(client, sql: str, params: tuple = ()) -> dict:
+    """Read one row back from the test app's DB, bypassing every scope check."""
+    db = client.app.state.db
+
+    async def _go():
+        async with db.execute(sql, params) as cur:
+            return await cur.fetchone()
+
+    row = asyncio.run(_go())
+    assert row is not None
+    return dict(row)
+
+
 # ---------------------------------------------------------------------------
 # H1. /hitl list, get, answer/dismiss
 # ---------------------------------------------------------------------------
@@ -467,6 +491,11 @@ def test_session_routes_look_the_session_up_only_for_scoped_callers(client, monk
 
     monkeypatch.setattr(sessions_routes, "_session_project_id", _spy)
 
+    # A stale last_seen (older than heartbeat_session's 5 minute "fresh" window), so a
+    # heartbeat that got through WOULD rewrite it -- the refused ones below must not.
+    stale = "2001-01-01 00:00:00"
+    _db_write(client, "UPDATE sessions SET last_seen = ? WHERE id = ?", (stale, foreign))
+
     # Unscoped (owner / self-hosted / demo): zero extra SELECTs on the hot routes.
     _scope_to(monkeypatch, None)
     assert client.post(f"/sessions/{own}/heartbeat").status_code == 200
@@ -479,19 +508,24 @@ def test_session_routes_look_the_session_up_only_for_scoped_callers(client, monk
 
     # Scoped: the lookup happens, a foreign session is a 403, an unknown id the SAME 403.
     _scope_to(monkeypatch, [mine])
-    assert client.post(f"/sessions/{own}/heartbeat").status_code in (200, 404)
+    # The caller's own session is idle (patched above) but not closed: a deterministic 200.
+    assert client.post(f"/sessions/{own}/heartbeat").status_code == 200
     assert client.get(f"/sessions/{own}/notes").status_code == 200
     for sid in (foreign, "no-such-session"):
         assert client.post(f"/sessions/{sid}/heartbeat").status_code == 403
         assert client.get(f"/sessions/{sid}/notes").status_code == 403
         assert client.patch(f"/sessions/{sid}", json={"status": "closed"}).status_code == 403
         assert client.post(f"/sessions/{sid}/close").status_code == 403
-    assert len(lookups) >= 7
+    # Exactly one lookup per gated call: own heartbeat + own notes (2), then
+    # heartbeat / notes / patch for each of the two ids (6). /close does its own inline
+    # SELECT, so it is not counted here.
+    assert len(lookups) == 8
 
-    # The refused patch/close did not touch the foreign session.
+    # The refused calls did not touch the foreign session: still active, and the
+    # refused heartbeats left last_seen exactly where it was.
     _scope_to(monkeypatch, None)
-    live = {s["id"]: s for s in client.get(f"/projects/{theirs}/sessions").json()}
-    assert live[foreign]["status"] == "active"
+    row = _db_read(client, "SELECT status, last_seen FROM sessions WHERE id = ?", (foreign,))
+    assert (row["status"], row["last_seen"]) == ("active", stale)
 
 
 def test_task_routes_look_the_task_up_only_for_scoped_callers(client, monkeypatch):
@@ -732,3 +766,112 @@ def test_hosted_scope_resolution_errors_fail_closed_for_http_and_mcp(monkeypatch
         assert c.get(f"/projects/{a}", headers=own).status_code in (200, 404)
         listing = c.post("/mcp", headers=own, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         assert listing.status_code == 200 and "tools" in listing.json()["result"]
+
+
+def test_hosted_role_lookup_errors_fail_closed_on_mcp(monkeypatch, tmp_path):
+    """The role gate (393eed0a) is computed in the same try block as the scope.
+
+    ``_remote_mcp_inner`` used to swallow a role-lookup error and carry on with
+    ``enforce_role=None``, i.e. no role gate at all: a transient auth-DB error handed a
+    read-only member every write tool. A header-bearing caller must now get the 503
+    JSON-RPC error and the tool must NOT run, exactly as for a scope-lookup error.
+    """
+    with _boot_hosted_client(monkeypatch, tmp_path) as c:
+        db = c.app.state.db
+        w = asyncio.run(_seed_hosted_workspace(db))
+        hdr = {"Authorization": f"Bearer {w['tok_scoped']}", "X-Workspace-Tenant-Id": w["owner_id"]}
+        a = w["a"]
+
+        def _add_note(title: str, rid: int = 11):
+            return c.post("/mcp", headers=hdr, json={
+                "jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                "params": {"name": "add_note", "arguments": {
+                    "project_id": a, "title": title, "body": "probe"}}})
+
+        def _titles() -> list[str]:
+            return [n["title"] for n in asyncio.run(db_module.get_project_notes(db, a))]
+
+        # Control: with a working role lookup the in-scope admin writes a note.
+        ok = _add_note("before-outage")
+        assert ok.status_code == 200 and "error" not in ok.json(), ok.text
+        assert _titles() == ["before-outage"]
+
+        # The role lookup (resolve_member_role) now breaks, the scope lookup still works.
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("auth db unavailable")
+
+        with monkeypatch.context() as outage:
+            outage.setattr(db_module, "resolve_member_role", _boom)
+
+            refused = _add_note("during-outage", rid=12)
+            assert refused.status_code == 503, refused.text
+            payload = refused.json()
+            assert payload["id"] == 12 and payload["error"]["code"] == -32603
+            assert payload["error"]["message"] == "scope check unavailable"
+            assert "result" not in payload
+            # A JSON-RPC batch gets the same answer, and neither call ran the tool.
+            batch = c.post("/mcp", headers=hdr, json=[{
+                "jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                "params": {"name": "add_note", "arguments": {
+                    "project_id": a, "title": "batched-during-outage", "body": "probe"}}}])
+            assert batch.status_code == 503, batch.text
+            assert _titles() == ["before-outage"], "the tool must not run when the role lookup fails"
+
+        # The lookup recovers (patch undone): the same caller works again.
+        again = _add_note("after-outage", rid=14)
+        assert again.status_code == 200 and "error" not in again.json(), again.text
+        assert sorted(_titles()) == ["after-outage", "before-outage"]
+
+
+def test_hosted_scoped_member_cannot_reach_session_layers_or_foreign_task_ids(monkeypatch, tmp_path):
+    """Pass 2 (F-H1, F-H2) end to end: a REAL project-scoped admin token, the real resolver."""
+    with _boot_hosted_client(monkeypatch, tmp_path) as c:
+        db = c.app.state.db
+
+        async def _setup():
+            w = await _seed_hosted_workspace(db)
+            w["sess_a"] = (await db_module.register_session(db, w["a"], "w2-sess-a"))["id"]
+            w["sess_b"] = (await db_module.register_session(db, w["b"], "w2-sess-b"))["id"]
+            for sid in (w["sess_a"], w["sess_b"]):
+                await db_module.set_profile_layer(
+                    db, "session", sid, fields={"tool_priority_map": {"code_search": "Serena: find_symbol"}})
+            task = await db_module.log_task(db, w["sess_b"], w["b"], "b work", "pending")
+            await db_module.claim_task(db, task["id"], w["sess_b"])
+            w["task_b"] = task["id"]
+            return w
+
+        w = asyncio.run(_setup())
+        s = {"Authorization": f"Bearer {w['tok_scoped']}", "X-Workspace-Tenant-Id": w["owner_id"]}
+        wide = {"Authorization": f"Bearer {w['tok_wide']}", "X-Workspace-Tenant-Id": w["owner_id"]}
+        a, b, sess_a, sess_b = w["a"], w["b"], w["sess_a"], w["sess_b"]
+
+        # F-H2 -- session-type profile layers follow the session's project
+        assert c.get(f"/profile-layers/session/{sess_a}", headers=s).status_code == 200
+        assert c.get(f"/profile-layers/session/{sess_b}", headers=s).status_code == 403
+        assert c.get(f"/profile-layers/session/{sess_b}", headers=wide).status_code == 200
+        assert c.put(f"/profile-layers/session/{sess_b}", headers=s, json={"fields": {}}).status_code == 403
+        assert c.delete(f"/profile-layers/session/{sess_b}", headers=s).status_code == 403
+        assert c.post(f"/profile-layers/session/{sess_b}/clone", headers=s, json={
+            "target_scope_type": "session", "target_scope_id": sess_a}).status_code == 403
+        assert c.get("/profile-layers/session/no-such-session", headers=s).status_code == 403
+        assert {x["scope_id"] for x in c.get("/profile-layers", headers=s,
+                                              params={"scope_type": "session"}).json()} == {sess_a}
+        assert {x["scope_id"] for x in c.get("/profile-layers", headers=wide,
+                                              params={"scope_type": "session"}).json()} == {sess_a, sess_b}
+        assert c.get(f"/projects/{a}/effective-profile", headers=s, params={"session_id": sess_a}).status_code == 200
+        assert c.get(f"/projects/{a}/effective-profile", headers=s, params={"session_id": sess_b}).status_code == 403
+        assert c.get(f"/projects/{a}/effective-profile", headers=wide, params={"session_id": sess_b}).status_code == 200
+        still = c.get(f"/profile-layers/session/{sess_b}", headers=wide).json()
+        assert still["revision"] == 1 and still["fields"]  # the refused write/reset changed nothing
+
+        # F-H1 -- release / claim cannot name another project's task or session
+        refused = c.post(f"/projects/{a}/tasks/release", headers=s,
+                         json={"task_id": w["task_b"], "session_id": sess_b})
+        assert refused.status_code == 404
+        assert c.post(f"/projects/{a}/tasks/claim", headers=s,
+                      json={"task_id": w["task_b"], "session_id": sess_b}).status_code == 404
+        held = [t for t in c.get(f"/projects/{b}/tasks", headers=wide).json() if t["id"] == w["task_b"]]
+        assert [(t["status"], t["claimed_by"]) for t in held] == [("in_progress", sess_b)]
+        # The task's own project (as the wide member) can still release it.
+        assert c.post(f"/projects/{b}/tasks/release", headers=wide,
+                      json={"task_id": w["task_b"], "session_id": sess_b}).status_code == 200

@@ -16,7 +16,6 @@ from .._deps import (
     _get_tenant_from_request,
     _hosted_mode,
     _require_project_in_scope,
-    _scoped_project_ids_for_request,
     validate_input_size,
 )
 from .. import db as db_module
@@ -115,10 +114,12 @@ async def list_projects(request: Request) -> list[dict[str, Any]]:
     d116642e — project-scoped workspace members (invited to a single project,
     not the whole workspace) only see their scoped project(s) here. Workspace
     owners and workspace-wide members see everything. This is listing-only
-    scoping; see _scoped_project_ids_for_request.
+    scoping; see _scoped_project_ids_for_request. The resolver is reached through
+    the ``_deps`` module (like every other scope check in this file), so one
+    patch point covers them all.
     """
     projects = await db_module.list_projects(await _db(request))
-    scoped = await _scoped_project_ids_for_request(request)
+    scoped = await _deps._scoped_project_ids_for_request(request)
     if scoped is not None:
         allowed = set(scoped)
         projects = [p for p in projects if p.get("id") in allowed]

@@ -527,6 +527,24 @@ async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None
     )
 
 
+def _deny_unless_in_scope(scoped: "list[str] | None", project_id: "str | None") -> None:
+    """RT-TI-005 — 403 when a project-scoped caller reaches an object outside their scope.
+
+    ``scoped`` is what :func:`_scoped_project_ids_for_request` returned (``None`` =
+    owner / workspace-wide / self-hosted / demo: nothing to enforce). A
+    ``project_id`` of ``None`` (the object does not exist) gets the SAME 403 as a
+    foreign one for a scoped caller, so existence is not leaked; unscoped callers
+    never get here and keep the historical 404. Same status and message as
+    :func:`_require_project_in_scope` and the project middleware.
+
+    Split from :func:`_require_project_in_scope` so a route that already resolved
+    the scope (to skip an object lookup for unscoped callers) does not resolve it
+    a second time.
+    """
+    if scoped is not None and (project_id is None or project_id not in scoped):
+        raise HTTPException(status_code=403, detail="Project is outside your access scope.")
+
+
 async def _require_project_in_scope(request: Request, project_id: "str | None") -> None:
     """RT-TI-005 — 403 when a project-scoped caller reaches ``project_id`` by another route.
 
@@ -541,9 +559,24 @@ async def _require_project_in_scope(request: Request, project_id: "str | None") 
     """
     if not project_id:
         return
-    scoped = await _scoped_project_ids_for_request(request)
-    if scoped is not None and project_id not in scoped:
-        raise HTTPException(status_code=403, detail="Project is outside your access scope.")
+    _deny_unless_in_scope(await _scoped_project_ids_for_request(request), project_id)
+
+
+async def _session_project_id(request: Request, session_id: str) -> "str | None":
+    """Project a session belongs to (``sessions.project_id``), or ``None`` for an unknown id.
+
+    A session belongs to exactly one project, so any route that receives only a
+    session id (heartbeat, notes, a session-type profile layer, ...) resolves its
+    project here and applies :func:`_deny_unless_in_scope`. Call it only AFTER the
+    scope is known to be non-``None``: owners, self-hosted and demo callers must
+    not pay for this SELECT.
+    """
+    _req_db = await _db(request)
+    async with _req_db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row["project_id"] if row is not None else None
 
 
 # ---------------------------------------------------------------------------

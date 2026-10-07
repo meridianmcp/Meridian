@@ -7,9 +7,8 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from .. import _deps
-from .._deps import _db, _get_tenant_from_request
+from .._deps import _db, _deny_unless_in_scope, _get_tenant_from_request
 from .. import db as db_module
-from .sessions import _deny_unless_in_scope
 
 router = APIRouter()
 

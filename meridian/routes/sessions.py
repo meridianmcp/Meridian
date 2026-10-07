@@ -7,36 +7,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from .. import _deps
-from .._deps import _db, _require_project_in_scope
+from .._deps import _db, _deny_unless_in_scope, _require_project_in_scope, _session_project_id
 from .. import db as db_module
 from .. import handoff as handoff_module
 from ..models import Session, SessionRegister
 
 router = APIRouter()
-
-
-async def _session_project_id(request: Request, session_id: str) -> "str | None":
-    """Project a session belongs to, or ``None`` for an unknown session id."""
-    _req_db = await _db(request)
-    async with _req_db.execute(
-        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
-    ) as cur:
-        row = await cur.fetchone()
-    return row["project_id"] if row is not None else None
-
-
-def _deny_unless_in_scope(scoped: "list[str] | None", project_id: "str | None") -> None:
-    """RT-TI-005 — 403 when a project-scoped caller reaches a session outside their scope.
-
-    ``scoped`` is what ``_scoped_project_ids_for_request`` returned (``None`` =
-    owner / workspace-wide / self-hosted / demo: nothing to enforce). An id that
-    resolves to no session (``project_id is None``) gets the SAME 403 as a
-    foreign one for a scoped caller, so existence is not leaked; unscoped
-    callers keep the historical 404. Same status and message as
-    ``_deps._require_project_in_scope`` and the project middleware.
-    """
-    if scoped is not None and (project_id is None or project_id not in scoped):
-        raise HTTPException(status_code=403, detail="Project is outside your access scope.")
 
 
 async def _require_session_in_scope(request: Request, session_id: str) -> None:

@@ -8,10 +8,9 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
 from .. import _deps
-from .._deps import _db, _require_project_in_scope
+from .._deps import _db, _deny_unless_in_scope, _require_project_in_scope
 from .. import db as db_module
 from ..models import ClaimTaskRequest, ClaimTaskResponse, Task, TaskCreate, TaskUpdate
-from .sessions import _deny_unless_in_scope
 
 router = APIRouter()
 
@@ -19,6 +18,21 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Helper (previously in server.py)
 # ---------------------------------------------------------------------------
+
+async def _session_of_another_project(
+    db: aiosqlite.Connection, session_id: str, project_id: str
+) -> bool:
+    """True when ``session_id`` is a REAL session whose project is not ``project_id``.
+
+    An unknown session id is ``False`` (not foreign), so callers that claim with an
+    id that was never registered keep working exactly as before.
+    """
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row is not None and row["project_id"] != project_id
+
 
 async def _claim_task_result(
     db: aiosqlite.Connection,
@@ -121,10 +135,16 @@ async def get_session_tasks_live(
     running Claude Code session is doing in real-time (polling every 5s).
     """
     db = await _db(request)
+    # RT-TI-005 (wave 2, pass 2) — the session joined in for its name / human_id
+    # must belong to the SAME project as the task row (``s.project_id = t.project_id``).
+    # {session_id} comes from the URL and the middleware only vets {project_id}, so
+    # naming a foreign session id next to an in-scope project must never surface
+    # that session's name or human_id (a legacy row whose session_id points at
+    # another project's session would otherwise be an enumeration oracle).
     async with db.execute(
         "SELECT t.*, s.name AS session_name, s.human_id AS human_id "
         "FROM task_log t "
-        "LEFT JOIN sessions s ON s.id = t.session_id "
+        "LEFT JOIN sessions s ON s.id = t.session_id AND s.project_id = t.project_id "
         "WHERE t.project_id = ? AND t.session_id = ? "
         "ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?",
         (project_id, session_id, limit),
@@ -160,11 +180,21 @@ async def claim_task_endpoint(
 ) -> dict[str, Any]:
     """Atomically claim a pending task. Returns ``claimed=False`` when
     another worker holds the lock."""
-    project = await db_module.get_project(await _db(request), project_id)
+    _req_db = await _db(request)
+    project = await db_module.get_project(_req_db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    # RT-TI-005 (wave 2, pass 2) — the claiming session must not belong to ANOTHER
+    # project. The task and sprint item are already bound to the path project by
+    # _claim_task_result, but body.session_id is stored as claimed_by (get_tasks
+    # joins that id back to the session's name and human_id), and log_task touches
+    # the session (last_seen, run transcript). A session of a different project is
+    # answered like a missing one, for every caller; an UNKNOWN session id keeps
+    # its historical behaviour.
+    if await _session_of_another_project(_req_db, body.session_id, project_id):
+        raise HTTPException(status_code=404, detail="session not found")
     return await _claim_task_result(
-        await _db(request), project_id, body.task_id, body.session_id
+        _req_db, project_id, body.task_id, body.session_id
     )
 
 
@@ -176,8 +206,14 @@ async def release_task_endpoint(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    # RT-TI-005 (wave 2, pass 2) — the task must belong to the project in the PATH
+    # (the only project the scope middleware vets). Without the binding a scoped
+    # caller could pair its own project with a foreign task id plus the claimant's
+    # session id and reset that task and its linked sprint item. A task of another
+    # project is answered exactly like a task this session does not hold (404), for
+    # every caller, and is left untouched.
     released = await db_module.release_task(
-        await _db(request), body.task_id, body.session_id
+        await _db(request), body.task_id, body.session_id, project_id=project_id
     )
     if not released:
         raise HTTPException(status_code=404, detail="task not claimed by this session")
