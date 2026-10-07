@@ -4214,7 +4214,9 @@ async def _resolve_ingest_doc_store(
         plan: str | None = None
         tenant_pg_url: str | None = None
         if tenant:
-            plan = tenant.get("plan")
+            from ..plans import tenant_entitlement_plan  # noqa: PLC0415
+
+            plan = tenant_entitlement_plan(tenant, default="")  # playtester -> pro
             enc = tenant.get("neon_db_url")
             tid = tenant.get("id")
             if enc and tid:

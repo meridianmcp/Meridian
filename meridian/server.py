@@ -52,6 +52,7 @@ from ._deps import (
     _tenant_rl_hits,
     _tenant_rl_plan_cache,
     _tenant_rl_over_limit,
+    _tenant_rl_plan,
     _shared_rate_limit_enabled,
     _get_authenticated_tenant,
     _authentication_required,
@@ -1343,7 +1344,8 @@ async def _tenant_rate_limit_decision_shared(
 #
 # Executors poll get_sprint_progress between tasks; this meters the programmatic
 # (Bearer-token) surface per tenant per minute by plan — free=500, standard=2000,
-# pro/admin=unlimited. Dashboard/cookie, demo, unauthenticated, /health and
+# pro/admin=unlimited (a playtester is metered as pro). Dashboard/cookie, demo,
+# unauthenticated, /health and
 # /static traffic is never metered. FAIL-OPEN: any error resolving the tenant or
 # counting hits lets the request through, so a limiter bug can never take down
 # live traffic. In-memory sliding window (process-local, no Redis), matching the
@@ -1376,7 +1378,7 @@ async def _tenant_rate_limit_decision(request: Request):
         if not tenant:
             return None  # unknown token — let the route's own auth reject it
         tenant_id = tenant.get("id") or token_hash
-        plan = (tenant.get("plan") or "free").lower()
+        plan = _tenant_rl_plan(tenant)  # entitlement plan (playtester -> pro)
         _tenant_rl_plan_cache[token_hash] = (now, (tenant_id, plan))
 
     limit = _TENANT_RL_PER_MINUTE.get(plan, _TENANT_RL_PER_MINUTE["free"])
@@ -2190,6 +2192,12 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
                 days_remaining = max(0, 30 - _elapsed)
             except (ValueError, TypeError):
                 pass
+    # A playtester has no trial clock; inactivity_expires_at is its optional end
+    # date (NULL = none). Use the same verdict the gates use so the banner and
+    # the entitlement can never disagree (an unparseable value counts as expired).
+    from .plans import is_playtester, playtester_access_expired, tenant_entitlement_plan
+    if is_playtester(plan):
+        expired = playtester_access_expired(tenant)
     # G2.10 — internal tenants never see the "expired" / "days remaining"
     # banner. The lifecycle jobs already skip them, but a positive UX cue
     # is cleaner than leaving the expired flag set with no consequence.
@@ -2207,6 +2215,11 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     )
     return {
         "plan": plan,
+        # The plan whose entitlements apply right now (playtester -> 'pro', a
+        # lapsed playtester -> 'free'). Clients gate features on this; `plan`
+        # stays the stored value for labels. Same verdict as the server's gates.
+        "entitlement_plan": tenant_entitlement_plan(tenant, default="standard"),
+        "is_playtester": is_playtester(plan),
         # Tunnel client reads this to nudge an upgrade when it's behind the
         # deployed server (see tunnel_client._update_notice). Single source:
         # meridian.__version__.
@@ -3635,7 +3648,10 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
     project_id = raw_project_id.strip() if isinstance(raw_project_id, str) else None
     project_id = project_id or None
     db = request.app.state.db
-    limit = _WORKSPACE_MEMBER_LIMITS.get(tenant.get("plan", "standard"), 25)
+    from .plans import tenant_entitlement_plan  # noqa: PLC0415
+    limit = _WORKSPACE_MEMBER_LIMITS.get(
+        tenant_entitlement_plan(tenant, default="standard"), 25
+    )
     count = await db_module.count_workspace_members(db, tenant["id"])
     if count >= limit:
         raise HTTPException(status_code=402, detail=f"Team member limit ({limit}) reached for your plan")
@@ -3909,9 +3925,12 @@ async def get_usage_settings(request: Request) -> dict[str, Any]:
     if not _hosted_mode():
         raise HTTPException(status_code=404)
     from .hosted import get_current_tenant, PLAN_LIMITS, COMPUTE_OVERAGE_RATE, STORAGE_OVERAGE_RATE
+    from .plans import is_unbilled_plan, tenant_entitlement_plan  # noqa: PLC0415
     tenant = await get_current_tenant(request)
     plan = tenant.get("plan") or "standard"
-    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    limits = PLAN_LIMITS.get(
+        tenant_entitlement_plan(tenant, default="standard"), PLAN_LIMITS["free"]
+    )
     unlimited = math.isinf(limits["cu_hours"])
     # float('inf') is not valid JSON for the browser's JSON.parse — emit null + a flag.
     cu_limit = None if math.isinf(limits["cu_hours"]) else limits["cu_hours"]
@@ -3919,6 +3938,9 @@ async def get_usage_settings(request: Request) -> dict[str, Any]:
     gb_limit = None if math.isinf(limits["storage_gb"]) else limits["storage_gb"]
     return {
         "plan": plan,
+        # False for an unbilled plan (playtester): the ceilings are hard, there
+        # is no overage budget to set, and nothing is ever metered.
+        "overage_billing": not is_unbilled_plan(plan),
         "unlimited": unlimited,
         "compute": {
             "used": float(tenant.get("compute_cu_hours_used") or 0),
@@ -3945,7 +3967,13 @@ async def update_usage_caps(request: Request) -> dict[str, Any]:
     if not _hosted_mode():
         raise HTTPException(status_code=404)
     from .hosted import get_current_tenant
+    from .plans import is_unbilled_plan  # noqa: PLC0415
     tenant = await get_current_tenant(request)
+    if is_unbilled_plan(tenant.get("plan")):
+        raise HTTPException(
+            status_code=400,
+            detail="this account has fixed usage limits and no overage budget",
+        )
     body = await request.json()
     compute_cap = float(body.get("compute_cap") or 0)
     storage_cap = float(body.get("storage_cap") or 0)

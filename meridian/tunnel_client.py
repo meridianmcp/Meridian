@@ -7700,7 +7700,13 @@ async def run_tunnel(
         return 1
 
     plan = me.get("plan") or "free"
-    if plan not in ("pro", "admin") and not me.get("is_internal"):
+    # /me reports the server's own entitlement verdict (a playtester reads as
+    # 'pro' until its optional end date); an older server omits it, so fall
+    # back to the local alias map.
+    from .plans import effective_entitlement_plan  # noqa: PLC0415
+
+    entitlement = me.get("entitlement_plan") or effective_entitlement_plan(plan)
+    if entitlement not in ("pro", "admin") and not me.get("is_internal"):
         print(
             f"error: the tunnel is a Pro feature; your plan is '{plan}'. "
             "Upgrade at " + base_url + "/pricing",

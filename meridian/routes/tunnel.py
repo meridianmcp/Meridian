@@ -42,6 +42,7 @@ from .. import process_registry as process_registry_module
 from .. import profile_contract as profile_contract_module
 from .. import redis_bridge as _redis_bridge  # 2cf57fde — runtime diagnostics
 from .._deps import _hosted_mode, _get_tenant_from_request, _db, _authentication_required
+from ..plans import tenant_entitlement_plan
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
     migrate_retired_overrides, config_fingerprint,
@@ -727,8 +728,8 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
 
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
-    """Return True for Pro, admin, and internal tenants."""
-    plan = tenant.get("plan") or "free"
+    """Return True for Pro, admin, and internal tenants (a playtester shares Pro's entitlement)."""
+    plan = tenant_entitlement_plan(tenant, default="free")
     return plan in ("pro", "admin") or bool(tenant.get("is_internal"))
 
 
@@ -2359,8 +2360,10 @@ async def get_tunnel_plugins(request: Request) -> Response:
             **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
-        # uses this to gate the Tunnel Plugins card.
-        "plan": tenant.get("plan") or "free",
+        # uses this to gate the Tunnel Plugins card, so it reports the plan
+        # whose entitlements apply (a playtester reads as 'pro', a lapsed one
+        # as 'free'), the same verdict _is_tunnel_allowed gives.
+        "plan": tenant_entitlement_plan(tenant, default="free"),
         "is_admin": bool(tenant.get("is_internal")),
         # 9a8645c1 — per-slot health + diagnostic so the dashboard can render a
         # warning badge (e.g. Serena access-denied) on a degraded slot's row.

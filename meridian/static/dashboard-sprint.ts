@@ -38,7 +38,7 @@ if (typeof window !== 'undefined') window._sprintHistoryBadges = _sprintHistoryB
 
 export function _renderPlanBadge(me: any) {
 
-  const planColors: Record<string, string> = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af' };
+  const planColors: Record<string, string> = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af', playtester: '#0891b2' };
 
   const planLabels = _PLAN_LABELS;
 
@@ -56,9 +56,12 @@ export function _renderPlanBadge(me: any) {
 
     const badgeColor = planColors[plan] || '#9ca3af';
 
+    // A playtester with an end date shows how long it has left, like the trial badge.
     const badgeLabel = plan === 'free' && me.days_remaining != null
       ? `Free · ${me.days_remaining}d left`
-      : (planLabels[plan] || plan);
+      : (plan === 'playtester' && me.days_remaining != null && !me.expired
+        ? `Playtester · ${me.days_remaining}d left`
+        : (planLabels[plan] || plan));
 
     badge.title = `${planLabels[plan] || plan} plan`;
 
@@ -80,7 +83,8 @@ export function _renderPlanBadge(me: any) {
 
   // billing affordance when there's a real Stripe customer to manage.
 
-  const noUpgrade = plan === 'admin' || !!me.is_internal;
+  // A playtester has no Stripe relationship either: nothing to upgrade or manage.
+  const noUpgrade = plan === 'admin' || plan === 'playtester' || !!me.is_internal;
 
   const planBadge = document.getElementById('plan-badge');
 

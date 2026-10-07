@@ -473,7 +473,7 @@ function _renderWorkspaceContextBadge(wrap: any, workspaces: any) {
   }
   const active = (workspaces || []).find((w: any) =>
     state.activeWorkspaceTenantId ? w.tenant_id === state.activeWorkspaceTenantId : w.is_own);
-  const colors: Record<string, string> = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af', invite: '#f59e0b' };
+  const colors: Record<string, string> = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af', playtester: '#0891b2', invite: '#f59e0b' };
   let label, color;
   if (active && !active.is_own) {
     label = `invite · ${active.role || 'member'}`;
@@ -1981,7 +1981,11 @@ function updateTunnelConnectionIndicator(me: any) {
 
   if (!wrap || !me) return;
 
-  const isPro = me.plan === 'pro' || me.plan === 'admin' || me.is_internal;
+  // The server's entitlement verdict (a playtester reads as 'pro'); older
+  // servers omit the field, so fall back to the stored plan.
+  const _ent = me.entitlement_plan || me.plan;
+
+  const isPro = _ent === 'pro' || _ent === 'admin' || me.is_internal;
 
   if (!isPro) { wrap.style.display = 'none'; return; }
 

@@ -8,6 +8,7 @@
 
 export const _PLAN_LABELS: Record<string, string> = {
   solo: 'Standard', free: 'Free Trial', standard: 'Standard', pro: 'Pro', trial: 'Trial', admin: 'Admin',
+  playtester: 'Playtester',
 };
 
 export const QUEUE_DONE_PAGE_SIZE = 10;

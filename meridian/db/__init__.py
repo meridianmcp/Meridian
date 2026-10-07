@@ -7468,6 +7468,12 @@ async def update_tenant(
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return await get_tenant_by_id(db, tenant_id)
+    if "plan" in updates:
+        # tenants.plan has no CHECK constraint, so this is the one write-side
+        # guard: a typo must not park a tenant on a value no gate recognises
+        # (see plans.py for the legal values).
+        from ..plans import validate_plan  # noqa: PLC0415
+        validate_plan(updates["plan"])
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     await db.execute(
         f"UPDATE tenants SET {set_clause} WHERE id = ?",
