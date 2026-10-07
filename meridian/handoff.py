@@ -12094,6 +12094,7 @@ async def generate_handoff(
     skip_ai_summary: bool = False,
     mode: str | None = None,
     session_id: str | None = None,
+    window_session_id: str | None = None,
     commit_messages: list[str] | None = None,
     graph_searcher: Callable[[str], Any] | None = None,
     pointer_symbol_resolver: Callable[..., Any] | None = None,
@@ -12138,6 +12139,21 @@ async def generate_handoff(
     silently inherited the archival dump. ``mode="full"`` stays fully
     available, but only as an explicit request. An unrecognized string still
     raises ``ValueError`` below rather than degrading quietly.
+
+    ``window_session_id`` (0b0b24d8) — ``mode="delta"`` only; ``None`` by
+    default (zero change for every caller). Bounds the "Completed since last
+    handoff" list, and scopes the session-span footer, to this session's
+    window (its last handoff, else its own start) WITHOUT attributing the
+    handoff to it. ``session_id`` does both jobs at once: it also becomes the
+    row's owner, the session's "last handoff" anchor, its resumed-session
+    marker (an omitted mode from it then resolves to ``delta``) and the point
+    its goal compliance is recorded. That is right for the session's own
+    handoff and wrong for an unattended background write: the session-close
+    auto-save and the idle-expire loop run while the session can still resume,
+    and a later explicit delta from it would then start its list at the
+    auto-save and silently drop the work completed before it. Those two
+    callers pass ``window_session_id`` instead. ``session_id`` wins when both
+    are given.
 
     ``pending_goal_receiver`` (0527f636) — optional, ``None`` by default (every
     pre-existing call site: zero behaviour change). An object with any subset
@@ -13482,6 +13498,11 @@ async def generate_handoff(
             goal = {**goal, "sprint": f"{_effective_version} — {_version_desc}"}
             _sprint_stale = None
 
+    # 0b0b24d8 — whose window bounds a delta: the owning session, else the
+    # session a background writer named for the bound only (see the
+    # ``window_session_id`` docstring). Reads only: nothing below records
+    # this id, so a background write is never the session's "last handoff".
+    _window_sid = session_id or window_session_id
     if mode == "delta":
         # 00dbeed0 — since_ts MUST be durable, not the in-memory
         # _SESSION_HANDOFF_STATE dict, which is a plain per-process Python dict:
@@ -13497,11 +13518,11 @@ async def generate_handoff(
         # run BEFORE this call's own record_handoff() below, or it would see
         # itself. Fail-open to the in-memory value (then None) on any DB error
         # so a lookup failure degrades to "full history" rather than raising.
-        since_ts = _SESSION_HANDOFF_STATE.get(session_id, None) if session_id else None
-        if session_id:
+        since_ts = _SESSION_HANDOFF_STATE.get(_window_sid, None) if _window_sid else None
+        if _window_sid:
             try:
                 _prior = await db_module.get_handoffs(
-                    db, project_id, limit=1, session_id=session_id
+                    db, project_id, limit=1, session_id=_window_sid
                 )
                 if _prior:
                     since_ts = _prior[0].get("created_at") or since_ts
@@ -13521,8 +13542,8 @@ async def generate_handoff(
         # completed_items cap below (mirroring bc834237's pending cap) is a
         # second, independent bound for pathological cases (e.g. a long-lived
         # session that has been open for weeks).
-        if since_ts is None and session_id:
-            _sess_row = next((s for s in sessions if s.get("id") == session_id), None)
+        if since_ts is None and _window_sid:
+            _sess_row = next((s for s in sessions if s.get("id") == _window_sid), None)
             if _sess_row:
                 since_ts = _sess_row.get("created_at")
         completed_items = [
@@ -13634,10 +13655,10 @@ async def generate_handoff(
     # keeps the project-wide span (it IS a whole-project state dump), but delta
     # is a per-session update, so scope its footer to just this session: only
     # this session's own task_log rows plus its own created_at/last_seen.
-    if mode == "delta" and session_id:
-        _span_sess_row = next((s for s in sessions if s.get("id") == session_id), None)
+    if mode == "delta" and _window_sid:
+        _span_sess_row = next((s for s in sessions if s.get("id") == _window_sid), None)
         _span_timestamps = [
-            t.get("created_at") for t in tasks if t.get("session_id") == session_id
+            t.get("created_at") for t in tasks if t.get("session_id") == _window_sid
         ]
         if _span_sess_row:
             _span_timestamps += [

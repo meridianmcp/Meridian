@@ -189,10 +189,15 @@ The same invariant now holds for the Python API (0b0b24d8):
 that never go through a transport pass an explicit bounded mode: the
 session-close auto-save and the idle-expire loop use `delta` (they refresh
 `<stem>_handoff.md`), proposal promotion's `executable_handoff` depth uses
-`goal`. Both `delta` callers also pass a `session_id` (the closed session; for
-the idle-expire loop, the most recently seen session that just expired): a
-delta takes the lower bound of its "Completed since last handoff" list from
-its session, and without one that list is unbounded.
+`goal`. Both `delta` callers also pass a `window_session_id` (the closed session;
+for the idle-expire loop, the most recently seen session that just expired): a
+delta takes the lower bound of its "Completed since last handoff" list from a
+session, and without one that list is unbounded. It is `window_session_id`, not
+`session_id`, on purpose: `session_id` also makes the unattended write that
+session's own handoff (its row, its "last handoff" anchor, its resumed-session
+marker, its goal-compliance record), and a session that resumes after an idle
+expiry or a reopened close would then get an explicit delta that starts at the
+auto-save and drops the work completed before it.
 `tests/test_0b0b24d8_workspace_notes_opt_in.py` runs every call site
 and source-scans for any `generate_handoff(` call that omits `mode=`.
 

@@ -21,8 +21,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
-import os
 import pathlib
+import shutil
+import subprocess
 import threading
 import time
 
@@ -121,6 +122,7 @@ class _Spy:
             "kwargs_mode": kwargs.get("mode"),
             "mode_passed": "mode" in kwargs,
             "session_id": kwargs.get("session_id"),
+            "window_session_id": kwargs.get("window_session_id"),
             # Resolved BEFORE the call: the call itself marks the session as
             # having produced a handoff, which changes the answer.
             "effective_mode": handoff_module.resolve_handoff_mode(
@@ -443,26 +445,50 @@ def _calls_omitting_mode(path: pathlib.Path) -> list[int]:
     return hits
 
 
-def _non_test_python_files():
-    # os.walk with pruning: rglob would still descend into node_modules/.pixi.
-    skip = {"node_modules", ".git", "tests", "__pycache__", ".pixi", ".venv", "venv"}
-    for dirpath, dirnames, filenames in os.walk(_ROOT):
-        dirnames[:] = [d for d in dirnames if d not in skip]
-        for name in filenames:
-            if name.endswith(".py"):
-                yield pathlib.Path(dirpath) / name
+def _package_python_files(root: pathlib.Path = _ROOT, *, use_git: bool = True):
+    """The ``meridian`` package's own source, and nothing else.
+
+    Git-tracked files only (``git ls-files``). A whole-root walk also finds
+    every executor worktree under ``.claude/worktrees`` (gitignored, one full
+    copy of the repo per session): a stale copy from an older session carries
+    the very calls these scans exist to reject, so it failed the suite on an
+    otherwise clean checkout. Without git (an sdist, a container with no
+    ``.git``) it falls back to the package directory alone, which is where
+    every handoff caller lives; tests are excluded by design (they exercise
+    the default on purpose)."""
+    package = root / "meridian"
+    names: "list[str]" = []
+    if use_git and shutil.which("git"):
+        try:
+            listed = subprocess.run(
+                ["git", "-C", str(root), "ls-files", "-z", "--", "meridian"],
+                capture_output=True, check=True, timeout=60,
+            ).stdout.decode("utf-8")
+            names = [n for n in listed.split("\0") if n.endswith(".py")]
+        except (OSError, subprocess.SubprocessError):
+            names = []
+    if names:
+        # a tracked file deleted in the working tree is listed but unreadable
+        return sorted(p for p in (root / n for n in names) if p.is_file())
+    skip = {"__pycache__", "node_modules"}
+    return sorted(
+        p for p in package.rglob("*.py") if not skip.intersection(p.parts)
+    )
+
+
+def _omitting_mode_offenders(root: pathlib.Path = _ROOT, **kw) -> "dict[str, list[int]]":
+    return {
+        str(p.relative_to(root)): lines
+        for p in _package_python_files(root, **kw)
+        if (lines := _calls_omitting_mode(p))
+    }
 
 
 def test_no_generate_handoff_call_omits_mode():
     """A call that leaves ``mode`` off silently depends on the default, which
     is exactly how three internal callers once inherited 'full'. The function's
-    own ``def`` is a FunctionDef, not a Call, so it needs no allowlist entry;
-    tests are excluded by design (they exercise the default on purpose)."""
-    offenders = {
-        str(p.relative_to(_ROOT)): lines
-        for p in _non_test_python_files()
-        if (lines := _calls_omitting_mode(p))
-    }
+    own ``def`` is a FunctionDef, not a Call, so it needs no allowlist entry."""
+    offenders = _omitting_mode_offenders()
     assert offenders == {}, (
         "generate_handoff( calls without mode= (pass an explicit bounded mode, "
         f"or mode=None when deliberately forwarding an omitted one): {offenders}"
@@ -508,15 +534,24 @@ def _is_full_const(node: ast.AST) -> bool:
 
 
 def _falls_back_to_full(expr: ast.AST) -> bool:
-    """``x or "full"``, ``x or y or "full"`` and ``x if c else "full"``: an
-    expression that turns "not specified" into 'full'. A plain ``"full"``
-    constant is an explicit request and is allowed."""
+    """``x or "full"``, ``x or y or "full"``, ``x if c else "full"`` and
+    ``body.get("mode", "full")`` (also ``pop``/``setdefault``): an expression
+    that turns "not specified" into 'full'. A plain ``"full"`` constant is an
+    explicit request and is allowed."""
     if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.Or):
         return any(_is_full_const(v) or _falls_back_to_full(v) for v in expr.values)
     if isinstance(expr, ast.IfExp):
         return any(
             _is_full_const(b) or _falls_back_to_full(b) for b in (expr.body, expr.orelse)
         )
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr in {"get", "pop", "setdefault"}
+        and len(expr.args) >= 2
+    ):
+        # the second argument is the value used when the key is absent
+        return _is_full_const(expr.args[1]) or _falls_back_to_full(expr.args[1])
     return False
 
 
@@ -544,36 +579,54 @@ def _full_by_default_sites(path: pathlib.Path) -> list[int]:
         ]:
             if arg.arg == "mode" and default is not None and _is_full_const(default):
                 hits.add(fn.lineno)
-        # (2) ``generate_handoff(..., mode=<x or "full">)``
+        # names bound to a fall-back-to-full expression, with the assignment line:
+        # ``m = body.get("mode", "full")`` followed by ``generate_handoff(mode=m)``
+        fallback_names: "dict[str, int]" = {}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign) and _falls_back_to_full(node.value):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        fallback_names[target.id] = node.lineno
+
+        def _fallback_site(expr: ast.AST) -> "int | None":
+            """Line to report when ``expr`` is, or is a name bound to, a
+            fall-back-to-full expression."""
+            if _falls_back_to_full(expr):
+                return expr.lineno
+            if isinstance(expr, ast.Name):
+                return fallback_names.get(expr.id)
+            return None
+
+        # (2) ``generate_handoff(..., mode=<x or "full">)``, or a name holding it
         for call in calls:
             for kw in call.keywords:
-                if kw.arg == "mode" and _falls_back_to_full(kw.value):
-                    hits.add(kw.value.lineno)
+                if kw.arg == "mode" and (site := _fallback_site(kw.value)) is not None:
+                    hits.add(site)
             # (4) ``resolve_handoff_mode(<x or "full">, ...)``: its first
             # parameter is the requested mode, positional or by keyword
             if _call_name(call) == "resolve_handoff_mode":
                 requested = [kw.value for kw in call.keywords if kw.arg == "requested_mode"]
                 requested += call.args[:1]
                 for expr in requested:
-                    if _falls_back_to_full(expr):
-                        hits.add(expr.lineno)
-        # (3) ``mode = <x or "full">`` computed before the call
-        for node in ast.walk(fn):
-            if (
-                isinstance(node, ast.Assign)
-                and any(isinstance(t, ast.Name) and t.id == "mode" for t in node.targets)
-                and _falls_back_to_full(node.value)
-            ):
-                hits.add(node.lineno)
+                    if (site := _fallback_site(expr)) is not None:
+                        hits.add(site)
+        # (3) ``mode = <x or "full">`` computed before the call, even when the
+        # name is not (visibly) the one forwarded
+        if "mode" in fallback_names:
+            hits.add(fallback_names["mode"])
     return sorted(hits)
 
 
-def test_no_handoff_caller_defaults_or_falls_back_to_full():
-    offenders = {
-        str(p.relative_to(_ROOT)): lines
-        for p in _non_test_python_files()
+def _full_default_offenders(root: pathlib.Path = _ROOT, **kw) -> "dict[str, list[int]]":
+    return {
+        str(p.relative_to(root)): lines
+        for p in _package_python_files(root, **kw)
         if (lines := _full_by_default_sites(p))
     }
+
+
+def test_no_handoff_caller_defaults_or_falls_back_to_full():
+    offenders = _full_default_offenders()
     assert offenders == {}, (
         "a function forwarding mode to generate_handoff / "
         "regenerate_handoff_correction / amend_handoff defaults it to, or falls "
@@ -612,6 +665,56 @@ def test_no_handoff_caller_defaults_or_falls_back_to_full():
         "async def f(m, *, mode: str = 'full'):\n"
         "    await m.generate_handoff(db, 'p', 'd', mode=mode)\n",
         [1], id="kwonly-parameter-default-full",
+    ),
+    pytest.param(  # the most natural spelling of the same bug
+        "async def f(m, body):\n"
+        "    await m.generate_handoff(db, 'p', 'd', mode=body.get('mode', 'full'))\n",
+        [2], id="keyword-get-default-full",
+    ),
+    pytest.param(
+        "async def f(m, body):\n"
+        "    await m.generate_handoff(db, 'p', 'd', mode=body.pop('mode', 'full'))\n",
+        [2], id="keyword-pop-default-full",
+    ),
+    pytest.param(  # two steps, under a name other than ``mode``
+        "async def f(m, body):\n"
+        "    chosen = body.get('mode', 'full')\n"
+        "    await m.generate_handoff(db, 'p', 'd', mode=chosen)\n",
+        [2], id="name-bound-to-get-default-full",
+    ),
+    pytest.param(
+        "async def f(m, x):\n"
+        "    chosen = 'full' if not x else x\n"
+        "    await m.generate_handoff(db, 'p', 'd', mode=chosen)\n",
+        [2], id="name-bound-to-ternary-full",
+    ),
+    pytest.param(
+        "async def f(m, arguments):\n"
+        "    wanted = arguments.get('mode', 'full')\n"
+        "    mode = m.resolve_handoff_mode(wanted, None)\n",
+        [2], id="resolve-name-bound-to-get-default-full",
+    ),
+    pytest.param(
+        "async def f(m, body):\n"
+        "    await m.generate_handoff(db, 'p', 'd', mode=body.get('mode'))\n",
+        [], id="keyword-get-without-default",
+    ),
+    pytest.param(
+        "async def f(m, body):\n"
+        "    await m.generate_handoff(db, 'p', 'd', mode=body.get('mode', None))\n",
+        [], id="keyword-get-default-none",
+    ),
+    pytest.param(
+        "async def f(m, body):\n"
+        "    chosen = body.get('mode', 'goal')\n"
+        "    await m.generate_handoff(db, 'p', 'd', mode=chosen)\n",
+        [], id="name-bound-to-get-default-goal",
+    ),
+    pytest.param(  # a fall-back-to-full name that never reaches a handoff call
+        "async def f(m, body):\n"
+        "    label = body.get('mode', 'full')\n"
+        "    await m.generate_handoff(db, 'p', 'd', mode='goal')\n",
+        [], id="full-fallback-name-not-forwarded",
     ),
     pytest.param(  # the stdio transport's form: no mode= keyword at all
         "async def f(m, arguments):\n"
@@ -669,6 +772,88 @@ def test_full_by_default_scan_detects_each_form(tmp_path, source, expected):
     target = tmp_path / "case.py"
     target.write_text(source)
     assert _full_by_default_sites(target) == expected
+
+
+# The scans read the package, not the checkout. Executor worktrees live in
+# .claude/worktrees (gitignored, a full copy of the repo each), and a stale one
+# carries the exact calls the scans reject.
+
+_CLEAN_SOURCE = "async def f(db, m):\n    await m.generate_handoff(db, 'p', 'd', mode='goal')\n"
+_BARE_CALL = "async def f(db, m):\n    await m.generate_handoff(db, 'p', 'd')\n"
+_FULL_FALLBACK = (
+    "async def f(db, m, body):\n"
+    "    await m.generate_handoff(db, 'p', 'd', mode=body.get('mode') or 'full')\n"
+)
+
+
+def _checkout_with_a_stale_worktree(tmp_path: pathlib.Path, *, git: bool) -> pathlib.Path:
+    root = tmp_path / "checkout"
+    (root / "meridian").mkdir(parents=True)
+    (root / "meridian" / "ok.py").write_text(_CLEAN_SOURCE)
+    for old in (
+        root / ".claude" / "worktrees" / "older-session" / "meridian" / "routes",
+        root / "node_modules" / "somepkg",
+    ):
+        old.mkdir(parents=True)
+        (old / "sessions.py").write_text(_BARE_CALL)
+        (old / "handoff.py").write_text(_FULL_FALLBACK)
+    if git:
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "add", "meridian/ok.py"], cwd=root, check=True)
+    return root
+
+
+@pytest.mark.parametrize("git", [
+    pytest.param(
+        True, id="git-tracked",
+        marks=pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+    ),
+    pytest.param(False, id="package-directory-fallback"),
+])
+def test_source_scans_ignore_a_stale_worktree_copy(tmp_path, git):
+    root = _checkout_with_a_stale_worktree(tmp_path, git=git)
+
+    assert [p.relative_to(root).as_posix() for p in _package_python_files(
+        root, use_git=git,
+    )] == ["meridian/ok.py"]
+    assert _omitting_mode_offenders(root, use_git=git) == {}
+    assert _full_default_offenders(root, use_git=git) == {}
+
+
+@pytest.mark.parametrize("git", [
+    pytest.param(
+        True, id="git-tracked",
+        marks=pytest.mark.skipif(shutil.which("git") is None, reason="git not installed"),
+    ),
+    pytest.param(False, id="package-directory-fallback"),
+])
+def test_source_scans_still_reject_a_real_offender_in_the_package(tmp_path, git):
+    """The pruning above must not blind the scans: the same two sources inside
+    the package are flagged, so the clean result there is not vacuous."""
+    root = _checkout_with_a_stale_worktree(tmp_path, git=git)
+    (root / "meridian" / "routes").mkdir()
+    (root / "meridian" / "routes" / "sessions.py").write_text(_BARE_CALL)
+    (root / "meridian" / "routes" / "handoff.py").write_text(_FULL_FALLBACK)
+    if git:
+        subprocess.run(["git", "add", "meridian/routes"], cwd=root, check=True)
+
+    def _posix(offenders: "dict[str, list[int]]") -> "dict[str, list[int]]":
+        return {k.replace("\\", "/"): v for k, v in offenders.items()}
+
+    assert _posix(_omitting_mode_offenders(root, use_git=git)) == {
+        "meridian/routes/sessions.py": [2]
+    }
+    assert _posix(_full_default_offenders(root, use_git=git)) == {
+        "meridian/routes/handoff.py": [2]
+    }
+
+
+def test_source_scans_cover_the_real_package_and_only_it():
+    files = _package_python_files()
+    package = _ROOT / "meridian"
+    assert all(package in p.parents for p in files)
+    assert {"handoff.py", "server.py", "sessions.py"} <= {p.name for p in files}
+    assert not [p for p in files if ".claude" in p.parts or "tests" in p.parts]
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +938,61 @@ def test_index_block_without_policy_notes_names_only_the_plain_fetch():
     assert "policy-tagged" not in block
     assert 'tag="policy"' not in block
     assert "get_workspace_notes()" in block
+
+
+def test_index_block_policy_tag_must_equal_policy_not_merely_contain_it():
+    block = _deps._render_workspace_index_block([], [
+        {"title": "Exactly policy", "body": "b", "tags": "ops, POLICY"},
+        {"title": "Only contains it", "body": "b", "tags": "non-policy, policyish, policy-draft"},
+    ])
+    assert "Exactly policy" in block
+    assert "Only contains it" not in block
+
+
+def test_index_block_says_how_many_policy_notes_are_not_listed():
+    cap = _deps._WORKSPACE_INDEX_MAX_POLICY_TITLES
+    total = cap + 3
+    block = _deps._render_workspace_index_block([], [
+        {"title": f"Policy note {i}", "body": "b", "tags": "policy"} for i in range(total)
+    ])
+    assert sum(f"Policy note {i}" in block for i in range(total)) == cap
+    assert "(+3 more)" in block
+
+
+def test_index_block_caps_are_the_documented_ones():
+    """docs/configuration.md states these numbers, and the size bound rests on
+    them; a widened cap should be a deliberate edit of both, not a drive-by."""
+    assert _deps._WORKSPACE_INDEX_MAX_DECISIONS == 5
+    assert _deps._WORKSPACE_INDEX_MAX_POLICY_TITLES == 5
+    assert _deps._WORKSPACE_INDEX_DECISION_CHARS == 160
+    assert _deps._WORKSPACE_INDEX_DECISION_TITLE_CHARS == 120
+    assert _deps._WORKSPACE_INDEX_CATEGORY_CHARS == 40
+    assert _deps._WORKSPACE_INDEX_TITLE_CHARS == 80
+
+
+@pytest.mark.asyncio
+async def test_printed_policy_fetch_call_returns_every_note_the_index_lists(db):
+    """The index matches policy tags case-insensitively and prints
+    get_workspace_notes(tag="policy") as the way to fetch them. Postgres' LIKE
+    is case-sensitive (SQLite's is not), so the filter has to fold case itself
+    or a note tagged 'Policy' is listed but not returned on the hosted tier.
+    case_sensitive_like makes SQLite behave like Postgres for this check."""
+    await db_module.add_workspace_note(db, "Mixed case", "body", "ops, Policy")
+    await db_module.add_workspace_note(db, "Lower case", "body", "policy")
+    await db_module.add_workspace_note(db, "Unrelated", "body", "research")
+    index = _deps._render_workspace_index_block(
+        [], await db_module.get_workspace_notes(db),
+    )
+    assert "Mixed case" in index and "Lower case" in index
+    assert 'get_workspace_notes(tag="policy")' in index
+
+    await db.execute("PRAGMA case_sensitive_like = ON")
+    try:
+        for tag in ("policy", "POLICY", "Policy"):
+            fetched = await db_module.get_workspace_notes(db, tag=tag)
+            assert {n["title"] for n in fetched} == {"Mixed case", "Lower case"}, tag
+    finally:
+        await db.execute("PRAGMA case_sensitive_like = OFF")
 
 
 def test_index_block_caps_decisions_and_clips_bodies():
@@ -1044,7 +1284,10 @@ async def test_idle_expire_loop_scopes_delta_to_the_expired_session(
     result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
 
     assert result["auto_handoff_generated"] is True
-    assert [(c["kwargs_mode"], c["session_id"]) for c in spy.calls] == [("delta", sess["id"])]
+    # bounded by the expired session, attributed to none
+    assert [
+        (c["kwargs_mode"], c["session_id"], c["window_session_id"]) for c in spy.calls
+    ] == [("delta", None, sess["id"])]
     _assert_completed_section_is_this_sessions_work(spy.calls[0]["content"], recent)
     written = (tmp_path / f"{handoff_module.handoff_file_stem(pid)}_handoff.md").read_text(
         encoding="utf-8"
@@ -1068,7 +1311,9 @@ async def test_idle_expire_loop_writes_one_handoff_per_project_for_the_freshest_
 
     await srv._expire_and_generate_handoffs(db, str(tmp_path))
 
-    assert [c["session_id"] for c in spy.calls] == [fresher["id"]]
+    assert [(c["session_id"], c["window_session_id"]) for c in spy.calls] == [
+        (None, fresher["id"])
+    ]
 
 
 @pytest.mark.asyncio
@@ -1119,13 +1364,235 @@ def test_session_close_auto_save_scopes_delta_to_the_closed_session(
         time.sleep(0.05)
     assert spy.finished.is_set(), "close_session never ran its auto-save handoff"
 
-    assert [(c["kwargs_mode"], c["session_id"]) for c in spy.calls] == [("delta", sess["id"])]
+    assert [
+        (c["kwargs_mode"], c["session_id"], c["window_session_id"]) for c in spy.calls
+    ] == [("delta", None, sess["id"])]
     _assert_completed_section_is_this_sessions_work(spy.calls[0]["content"], recent)
     written = (
         pathlib.Path(client.app.state.data_dir)
         / f"{handoff_module.handoff_file_stem(pid)}_handoff.md"
     ).read_text(encoding="utf-8")
     _assert_completed_section_is_this_sessions_work(written, recent)
+
+
+# ---------------------------------------------------------------------------
+# 7b. Bounded is not attributed
+# ---------------------------------------------------------------------------
+#
+# f9dc387a bounded the two background writers by passing them a session_id.
+# That also made the unattended write the session's "last handoff": its
+# handoffs row, its in-memory anchor, its resumed-session marker (an omitted
+# mode from it then resolves to delta instead of goal) and its goal-compliance
+# record. A session that resumes after an idle expiry (or after a close that
+# is later reopened) then got an explicit delta whose "Completed since last
+# handoff" list started AT THE AUTO-SAVE and silently dropped everything
+# completed before it. The writers now pass window_session_id: the bound
+# without the ownership.
+
+
+async def _complete(db, pid: str, title: str, offset: str) -> dict:
+    """A done item whose completed_at is ``offset`` from now ('-120 minutes')."""
+    item = await db_module.add_sprint_item(db, pid, "v1", title, force=True)
+    await db.execute(
+        "UPDATE sprint_items SET status = 'done', completed_at = datetime('now', ?) "
+        "WHERE id = ?",
+        (offset, item["id"]),
+    )
+    await db.commit()
+    return item
+
+
+def _completed_section(content: str) -> str:
+    assert "Completed since last handoff:" in content
+    return content.split("Completed since last handoff:", 1)[1]
+
+
+async def _assert_not_attributed_to(db, pid: str, sid: str) -> None:
+    """Nothing a background write did may be readable as ``sid``'s own handoff."""
+    assert await db_module.get_handoffs(db, pid, limit=20, session_id=sid) == []
+    assert sid not in handoff_module._SESSION_HANDOFF_STATE
+    assert handoff_module.resolve_handoff_mode(None, sid) == "goal"
+    assert await db_module.get_session_goal_compliance(db, sid) is None
+
+
+async def _explicit_delta_for(db, tmp_path, pid: str, sid: str) -> str:
+    _, content, _ = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path / "explicit"), skip_ai_summary=True,
+        mode="delta", session_id=sid,
+    )
+    return content
+
+
+@pytest.mark.asyncio
+async def test_idle_expire_auto_save_is_bounded_but_not_attributed_to_the_expired_session(
+    db, tmp_path, spy, _no_claude_md_write,
+):
+    """The verifier's reproduction. S started 3h ago, Alpha was completed 2h
+    ago, S idles out and the loop writes its auto-save, S resumes and completes
+    Bravo, S asks for a delta. Alpha and Bravo are both S's work."""
+    pid = await _project(db, "0b0b24d8-idle-resume")
+    sess = await db_module.register_session(db, pid, "resumable")
+    sid = sess["id"]
+    await db.execute(
+        "UPDATE sessions SET created_at = datetime('now', '-180 minutes'), "
+        "last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (sid,),
+    )
+    await db.commit()
+    await _complete(db, pid, "Alpha before the idle expiry", "-120 minutes")
+
+    result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
+
+    assert result["auto_handoff_generated"] is True
+    auto_save = spy.calls[0]
+    assert auto_save["kwargs_mode"] == "delta"
+    assert auto_save["session_id"] is None
+    assert auto_save["window_session_id"] == sid
+    # the unattended write is still bounded to the session's window
+    assert "Alpha before the idle expiry" in _completed_section(auto_save["content"])
+    await _assert_not_attributed_to(db, pid, sid)
+
+    await _complete(db, pid, "Bravo after the resume", "+1 minutes")
+    section = _completed_section(await _explicit_delta_for(db, tmp_path, pid, sid))
+
+    assert "Alpha before the idle expiry" in section
+    assert "Bravo after the resume" in section
+
+
+def test_session_close_auto_save_is_bounded_but_not_attributed_to_the_closed_session(
+    client, spy, _no_claude_md_write, tmp_path,
+):
+    """Same loss through the other writer: a closed session can be reopened
+    (PATCH /sessions/{id} status=active), and its next explicit delta must
+    still list what it completed before the close."""
+    pid = client.post("/projects", json={"name": "0b0b24d8-close-resume"}).json()["id"]
+    sid = client.post(
+        "/sessions/register", json={"project_id": pid, "name": "reopened"},
+    ).json()["id"]
+    db = client.app.state.db
+
+    async def _seed() -> None:
+        await db.execute(
+            "UPDATE sessions SET created_at = datetime('now', '-180 minutes') "
+            "WHERE id = ?",
+            (sid,),
+        )
+        await db.commit()
+        await _complete(db, pid, "Alpha before the close", "-120 minutes")
+
+    asyncio.run(_seed())
+
+    assert client.post(f"/sessions/{sid}/close").status_code == 200
+    deadline = time.monotonic() + 20
+    while not spy.finished.is_set() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert spy.finished.is_set(), "close_session never ran its auto-save handoff"
+
+    assert len(spy.calls) == 1
+    auto_save = spy.calls[0]
+    assert auto_save["kwargs_mode"] == "delta"
+    assert auto_save["session_id"] is None
+    assert auto_save["window_session_id"] == sid
+    assert "Alpha before the close" in _completed_section(auto_save["content"])
+
+    async def _after_reopen() -> str:
+        await _assert_not_attributed_to(db, pid, sid)
+        await _complete(db, pid, "Bravo after the reopen", "+1 minutes")
+        return await _explicit_delta_for(db, tmp_path, pid, sid)
+
+    assert client.patch(f"/sessions/{sid}", json={"status": "active"}).status_code == 200
+    section = _completed_section(asyncio.run(_after_reopen()))
+
+    assert "Alpha before the close" in section
+    assert "Bravo after the reopen" in section
+
+
+@pytest.mark.asyncio
+async def test_window_session_id_bounds_by_the_sessions_last_handoff_not_just_its_start(
+    db, tmp_path,
+):
+    pid = await _project(db, "0b0b24d8-window-last-handoff")
+    sid = (await db_module.register_session(db, pid, "windowed"))["id"]
+    await db.execute(
+        "UPDATE sessions SET created_at = datetime('now', '-180 minutes') WHERE id = ?",
+        (sid,),
+    )
+    row = await db_module.record_handoff(db, pid, "delta", "an earlier handoff", sid)
+    await db.execute(
+        "UPDATE handoffs SET created_at = datetime('now', '-30 minutes') WHERE id = ?",
+        (row["id"],),
+    )
+    await db.commit()
+    await _complete(db, pid, "Done before that handoff", "-90 minutes")
+    await _complete(db, pid, "Done after that handoff", "-10 minutes")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta",
+        window_session_id=sid,
+    )
+
+    section = _completed_section(content)
+    assert "Done after that handoff" in section
+    assert "Done before that handoff" not in section
+
+
+@pytest.mark.asyncio
+async def test_window_session_id_writes_an_unowned_row_and_session_id_still_attributes(
+    db, tmp_path,
+):
+    pid = await _project(db, "0b0b24d8-window-vs-owner")
+    sid = (await db_module.register_session(db, pid, "owner"))["id"]
+
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta",
+        window_session_id=sid,
+    )
+    rows = await db_module.get_handoffs(db, pid, limit=5)
+    assert [(r["mode"], r["session_id"]) for r in rows] == [("delta", None)]
+    await _assert_not_attributed_to(db, pid, sid)
+
+    # control: the same call with session_id is the session's own handoff. A
+    # start_session consumes the pending goal first; otherwise the unconsumed
+    # row above would be amended in place (edd9c54b) and keep its NULL owner.
+    await db_module.pop_pending_goal(db, pid)
+    await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta", session_id=sid,
+    )
+    assert len(await db_module.get_handoffs(db, pid, limit=5, session_id=sid)) == 1
+    assert sid in handoff_module._SESSION_HANDOFF_STATE
+    assert handoff_module.resolve_handoff_mode(None, sid) == "delta"
+
+
+@pytest.mark.asyncio
+async def test_window_session_id_scopes_the_span_footer_to_that_session(db, tmp_path):
+    """Delta's span footer is per-session (7732e096); a background write that
+    names a window session keeps that scope instead of reporting the whole
+    project's history."""
+    pid = await _project(db, "0b0b24d8-window-span")
+    old = await db_module.register_session(db, pid, "old")
+    new = await db_module.register_session(db, pid, "new")
+    await db_module.log_task(db, old["id"], pid, "ancient work", status="done")
+    await db_module.log_task(db, new["id"], pid, "recent work", status="done")
+    await db.execute(
+        "UPDATE sessions SET created_at = '2020-01-01 00:00:00', "
+        "last_seen = '2020-01-01 00:00:00' WHERE id = ?",
+        (old["id"],),
+    )
+    await db.execute(
+        "UPDATE task_log SET created_at = '2020-01-01 00:00:00' WHERE session_id = ?",
+        (old["id"],),
+    )
+    await db.commit()
+
+    async def _first_activity(**kw) -> str:
+        _, content, _ = await handoff_module.generate_handoff(
+            db, pid, str(tmp_path), skip_ai_summary=True, mode="delta", **kw,
+        )
+        span = content.split("## Session span", 1)[1]
+        return [ln for ln in span.splitlines() if ln.startswith("- First activity:")][0]
+
+    assert "2020-01-01" in await _first_activity()  # control: project-wide
+    assert "2020-01-01" not in await _first_activity(window_session_id=new["id"])
 
 
 # ---------------------------------------------------------------------------
@@ -1209,6 +1676,32 @@ async def test_get_context_block_is_scoped_to_the_callers_tenant(db, monkeypatch
             {"project_id": pid}, db, "/tmp", None, "tenant-a",
         )
         _assert_only_tenant_a(result["text"])
+
+
+@pytest.mark.asyncio
+async def test_get_context_block_tool_call_is_scoped_by_the_dispatchers_tenant(
+    db, monkeypatch, tmp_path,
+):
+    """The same guarantee through the real dispatcher, which is what derives
+    the tenant id from the authenticated caller's tenant record. A handler test
+    that passes the id positionally cannot see that link break."""
+    pid = await _project(db, "0b0b24d8-cb-dispatch-tenants")
+    await _seed_two_tenants(db)
+
+    for flag in (None, "1"):
+        if flag:
+            monkeypatch.setenv(_FLAG_ENV, flag)
+        scoped = await srv._dispatch_mcp_tool(
+            "get_context_block", {"project_id": pid}, db, str(tmp_path),
+            tenant={"id": "tenant-a"},
+        )
+        _assert_only_tenant_a(scoped["text"])
+        # non-vacuity: with no tenant (self-host) both tenants' rows are listed
+        unscoped = await srv._dispatch_mcp_tool(
+            "get_context_block", {"project_id": pid}, db, str(tmp_path),
+        )
+        assert _TENANT_B_POLICY_NOTE in unscoped["text"]
+        assert _TENANT_B_DECISION in unscoped["text"]
 
 
 # ---------------------------------------------------------------------------

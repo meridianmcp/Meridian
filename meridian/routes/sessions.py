@@ -80,16 +80,20 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     # delta (not goal) because it still writes the <stem>_handoff.md file this
     # auto-save exists to keep fresh (goal writes a different file), it is
     # bounded, and it skips the Haiku summary calls this 30s budget raced.
-    # session_id is passed because delta's "Completed since last handoff" list
-    # takes its lower bound from the session (its prior handoff, else its own
-    # start); without one the list has no bound and shows the OLDEST 20 items
-    # the project ever completed under a "since last handoff" label.
+    # window_session_id is passed because delta's "Completed since last
+    # handoff" list takes its lower bound from a session (its prior handoff,
+    # else its own start); without one the list has no bound and shows the
+    # OLDEST 20 items the project ever completed under a "since last handoff"
+    # label. It is NOT session_id: a closed session can be reopened (PATCH
+    # status=active), and an unattended write attributed to it would become its
+    # "last handoff", so its next explicit delta would silently drop everything
+    # completed before this close.
     async def _auto_save_handoff() -> None:
         try:
             await asyncio.wait_for(
                 handoff_module.generate_handoff(
                     await _db(request), project_id, request.app.state.data_dir,
-                    mode="delta", session_id=session_id,
+                    mode="delta", window_session_id=session_id,
                 ),
                 timeout=30.0,
             )

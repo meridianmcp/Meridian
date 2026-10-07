@@ -262,6 +262,10 @@ MERIDIAN_INCLUDE_WORKSPACE_CONTEXT=1          # env wins over the toml
 include_workspace_context = true              # meridian.toml
 ```
 
+Saving or deleting a connection from the dashboard rewrites `meridian.toml` from the
+connection list alone, which drops the `[meridian]` table (and `[project]`); if you
+manage connections there, set the env var instead.
+
 On the hosted tier the env var would apply to every tenant and `meridian.toml` is not
 shipped, so there it is an operator-level switch only; callers fetch what they need
 with the tools above. A `generate_handoff` call includes workspace decisions and notes

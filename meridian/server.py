@@ -5011,11 +5011,15 @@ async def _expire_and_generate_handoffs(
             # start_session reports as handoff_path.
             # The most recently seen expired session bounds delta's "completed
             # since" list: with no session it is unbounded and would show the
-            # OLDEST 20 items the project ever completed.
+            # OLDEST 20 items the project ever completed. It is passed as
+            # window_session_id, NOT session_id: an idle session can resume,
+            # and an unattended write attributed to it would become its "last
+            # handoff", so its next explicit delta would silently drop
+            # everything completed before this pass.
             _expired = (result.get("session_ids_by_project") or {}).get(pid) or [None]
             await handoff_module.generate_handoff(
                 db, pid, data_dir, skip_ai_summary=_skip, mode="delta",
-                session_id=_expired[0],
+                window_session_id=_expired[0],
             )
             generated = True
         except Exception:  # noqa: BLE001
