@@ -46,14 +46,20 @@ an overage invoice: there is no Stripe customer behind it. Usage is still
 bounded by the Pro ceilings in ``hosted.PLAN_LIMITS``. Past the compute grace
 allowance the daily overage job throttles Neon compute (the same path an
 unbilled tenant already takes) instead of metering a charge, and the owner is
-alerted by email; storage past the ceiling is logged and emailed (the existing
-storage path has no write-refusal step).
+alerted by email; the throttle is lifted at the monthly reset. Consumption and
+the compute cap belong to a Neon *pool project* shared by several tenants, so
+while a paying customer lives in the same pool the job does not throttle (it
+would land on them) and only alerts the owner, at most once a month. Storage
+past the ceiling is logged and emailed (the existing storage path has no
+write-refusal step).
 
 An optional end date can be kept in ``tenants.inactivity_expires_at`` (NULL =
 no end date). Once it passes, ``tenant_entitlement_plan`` reports ``free`` for
 that tenant, so every gate that resolves its plan through that helper lapses
 together; no data is deleted. A value that cannot be parsed counts as expired
-(fail closed).
+(fail closed). Only a plan in ``END_DATED_PLANS`` (free, trial, playtester) can
+expire: a playtester who goes on to pay keeps the stale date in the column, and
+it is ignored.
 
 ``is_internal`` is a separate flag (staff) and is not a plan: it keeps its own
 meaning wherever it is checked.
@@ -98,6 +104,12 @@ UNBILLED_PLANS: frozenset[str] = frozenset({PLAYTESTER})
 # alias -> the canonical plan whose entitlements it shares.
 ENTITLEMENT_ALIASES: dict[str, str] = {PLAYTESTER: PRO}
 
+# Plans whose tenants.inactivity_expires_at is an end date the product acts on:
+# the free-tier trial window and a playtester's optional end date. Every other
+# plan never expires, so a date left behind by a trial or a playtester period
+# must not read as "expired" once the tenant is on a paying plan.
+END_DATED_PLANS: frozenset[str] = frozenset({FREE, TRIAL, PLAYTESTER})
+
 
 def effective_entitlement_plan(plan: Any) -> Any:
     """Map ``plan`` onto the canonical plan whose entitlements it shares.
@@ -136,6 +148,11 @@ def is_playtester(plan: Any) -> bool:
 def is_unbilled_plan(plan: Any) -> bool:
     """True for a plan that must never be charged, dunned or churned."""
     return isinstance(plan, str) and plan in UNBILLED_PLANS
+
+
+def plan_has_end_date(plan: Any) -> bool:
+    """True when ``tenants.inactivity_expires_at`` can expire a tenant on ``plan``."""
+    return isinstance(plan, str) and plan in END_DATED_PLANS
 
 
 def _parse_end_date(raw: Any) -> "datetime | None":

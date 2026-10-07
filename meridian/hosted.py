@@ -1218,6 +1218,15 @@ _ALERT_THRESHOLD_STANDARD = int(os.environ.get("ALERT_THRESHOLD_STANDARD", "85")
 _ALERT_THRESHOLD_PRO = int(os.environ.get("ALERT_THRESHOLD_PRO", "90"))
 
 
+def _pool_max_cu(tier: str) -> float:
+    """Autoscaling ceiling (CU) a pool project of ``tier`` is created with.
+
+    Also the value a compute throttle is lifted back to at the monthly reset,
+    so the two cannot drift apart.
+    """
+    return 4.0 if tier == "pro" else 2.0
+
+
 def _neon_api_key_for_tier(tier: str) -> str:
     """Return the Neon API key for the given tier.  Raises if not configured.
 
@@ -1281,13 +1290,12 @@ async def _create_neon_pool_project(
             "active_time_seconds": 300 * 3600,  # 300 CU-hrs
             "compute_time_seconds": 300 * 3600,
         }
-        autoscaling_limit_max_cu = 4.0
     else:
         quota = {
             "active_time_seconds": 100 * 3600,   # 100 CU-hrs
             "compute_time_seconds": 100 * 3600,
         }
-        autoscaling_limit_max_cu = 2.0
+    autoscaling_limit_max_cu = _pool_max_cu(tier)
 
     payload: dict[str, Any] = {
         "project": {
@@ -1549,6 +1557,16 @@ async def _provision_tenant_background(tenant_id: str, db: Any) -> None:
         )
 
 
+def pool_tier_for(tenant: dict[str, Any]) -> str:
+    """The plan whose Neon pool a tenant is provisioned into.
+
+    An aliased plan (playtester) lands in its canonical plan's pool, because the
+    pool-tier CHECK constraint only knows free/standard/pro; a lapsed playtester
+    lands in free's. A tenant with no plan is provisioned as standard.
+    """
+    return tenant_entitlement_plan(tenant, default="standard")
+
+
 async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     """Provision a Neon database for a tenant using the pool architecture.
 
@@ -1576,9 +1594,7 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     if tenant.get("plan") == "admin":
         return tenant  # admin accounts use manually-assigned DBs, never auto-provisioned
 
-    # An aliased plan (playtester) is provisioned into its canonical plan's
-    # pool; the pool-tier CHECK constraint only knows free/standard/pro.
-    tier = tenant_entitlement_plan(tenant, default="standard")
+    tier = pool_tier_for(tenant)
     # Treat free-tier as standard for pool allocation (same API key, smaller quota pool)
     pool_tier = "free" if tier == "free" else tier
     api_key = _neon_api_key_for_tier("standard" if tier == "free" else tier)
@@ -2018,16 +2034,22 @@ async def _alert_owner_playtester_limit(
     over-limit account to the person who granted it. When ``db`` and ``tenant``
     are given the alert is sent at most once per calendar month per ``kind``,
     tracked in the tenant's ``notification_prefs`` blob (like the Redis flags);
-    callers that are already one-shot (the compute throttle) omit them.
+    callers that are already one-shot (a compute throttle that stamps
+    ``compute_throttled_at``) omit them.
     """
     import html as _html
     import json as _json
+    from . import db as db_module  # noqa: PLC0415
 
     month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
     flag = f"playtester_{kind}_alert_month"
     prefs: "dict[str, Any] | None" = None
     if db is not None and tenant is not None:
-        prefs = _parse_notification_prefs(tenant)
+        # Read the blob fresh: an earlier alert for this tenant in the same job
+        # run (compute, then storage) has already written its own month flag,
+        # and writing back the caller's stale copy would erase it.
+        fresh = await db_module.get_tenant_by_id(db, tenant["id"]) or tenant
+        prefs = _parse_notification_prefs(fresh)
         if prefs.get(flag) == month:
             return
     await _send_owner_alert(
@@ -2038,7 +2060,6 @@ async def _alert_owner_playtester_limit(
     if prefs is not None:
         prefs[flag] = month
         try:
-            from . import db as db_module  # noqa: PLC0415
             await db_module.update_tenant(
                 db, tenant["id"], notification_prefs=_json.dumps(prefs)  # type: ignore[index]
             )
@@ -2103,6 +2124,13 @@ async def check_capacity(db: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _PLAN_STORAGE_LIMIT_GB = {"standard": 1.0, "pro": 10.0}
+
+
+def storage_limit_gb_for(tenant: dict[str, Any]) -> float:
+    """Hourly storage-job ceiling (GB) for the entitlement in force on ``tenant``."""
+    return _PLAN_STORAGE_LIMIT_GB.get(
+        tenant_entitlement_plan(tenant, default="standard"), 1.0
+    )
 
 
 async def get_neon_storage_gb(neon_project_id: str, neon_api_key: str) -> float:
@@ -2191,9 +2219,7 @@ async def run_storage_overage_check(db: Any) -> None:
             continue
 
         usage_gb = await get_neon_storage_gb(neon_project_id, api_key)
-        limit_gb = _PLAN_STORAGE_LIMIT_GB.get(
-            tenant_entitlement_plan(tenant, default="standard"), 1.0
-        )
+        limit_gb = storage_limit_gb_for(tenant)
 
         if usage_gb > limit_gb:
             overage_gb = usage_gb - limit_gb
@@ -2223,6 +2249,19 @@ PLAN_LIMITS: dict[str, dict[str, float]] = {
 # drift). Lookups also go through effective_entitlement_plan; this row keeps a
 # direct PLAN_LIMITS[plan] correct for any caller that skips the helper.
 PLAN_LIMITS["playtester"] = dict(PLAN_LIMITS["pro"])
+
+
+def plan_limits_for(tenant: dict[str, Any]) -> dict[str, float]:
+    """Compute/storage ceilings for the entitlement in force on ``tenant``.
+
+    A playtester reads as Pro and a lapsed one as Free; a plan no table knows
+    gets the lowest tier's ceilings.
+    """
+    return PLAN_LIMITS.get(
+        tenant_entitlement_plan(tenant, default="standard"), PLAN_LIMITS["free"]
+    )
+
+
 COMPUTE_OVERAGE_RATE = 0.16   # $/CU-hour
 STORAGE_OVERAGE_RATE = 0.50   # $/GB-month
 
@@ -2309,6 +2348,49 @@ async def _set_neon_max_cu(project_id: str, api_key: str, max_cu: float) -> None
         pass
 
 
+async def _restore_neon_max_cu(
+    db: Any, neon_project_id: str, api_key: str, plan: Any
+) -> None:
+    """Lift a compute throttle: put the pool's autoscaling ceiling back.
+
+    The value is what the pool project was created with, by its registered tier
+    (the tenant's own plan tier when the pool row cannot be found). Best-effort,
+    like the throttle it undoes.
+    """
+    tier: Any = effective_entitlement_plan(plan)
+    try:
+        async with db.execute(
+            "SELECT tier FROM neon_pool_projects WHERE neon_project_id = ?",
+            (neon_project_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is not None:
+            found = row if isinstance(row, dict) else {k: row[k] for k in row.keys()}
+            tier = found.get("tier") or tier
+    except Exception:  # noqa: BLE001
+        pass
+    await _set_neon_max_cu(neon_project_id, api_key, _pool_max_cu(str(tier)))
+
+
+def _pool_has_billed_neighbours(
+    tenants: "list[dict[str, Any]]", tenant: dict[str, Any]
+) -> bool:
+    """True when a paying customer's database lives in this tenant's pool project.
+
+    Neon consumption and the compute cap are per pool project, so a throttle
+    aimed at one tenant lands on everyone in it. Staff (``is_internal``) and
+    unbilled plans do not count: nothing is charged for them.
+    """
+    pool = tenant.get("neon_project_id")
+    return any(
+        other.get("neon_project_id") == pool
+        and other.get("id") != tenant.get("id")
+        and not other.get("is_internal")
+        and not is_unbilled_plan(other.get("plan"))
+        for other in tenants
+    )
+
+
 async def _send_overage_email(
     email: str,
     subject: str,
@@ -2347,7 +2429,12 @@ async def run_overage_check(db: Any) -> None:
     An unbilled plan (playtester, see plans.py) is bounded by the same Pro
     ceilings but is never metered: warnings and compute throttling fire as for
     any unbilled tenant, wording carries no budget/price text, and the owner
-    is alerted when the ceiling is crossed.
+    is alerted when the ceiling is crossed. Compute is not throttled while
+    paying customers share the tenant's pool project (the cap is per pool, so
+    it would land on them); the owner is alerted instead.
+
+    A compute throttle is lifted at the monthly reset (the pool's autoscaling
+    ceiling goes back to what it was created with).
     """
     from datetime import datetime, timezone as _tz, timedelta as _td
     from . import db as db_module
@@ -2378,9 +2465,7 @@ async def run_overage_check(db: Any) -> None:
         unbilled = is_unbilled_plan(plan)
         # Ceilings follow the entitlement in force (a lapsed playtester drops to
         # free); the API key follows the pool the database actually lives in.
-        limits = PLAN_LIMITS.get(
-            tenant_entitlement_plan(tenant, default="standard"), PLAN_LIMITS["free"]
-        )
+        limits = plan_limits_for(tenant)
 
         try:
             api_key = _neon_api_key_for_tier(plan)
@@ -2395,6 +2480,7 @@ async def run_overage_check(db: Any) -> None:
             try:
                 last_reset = datetime.fromisoformat(reset_at_raw.replace("Z", "+00:00"))
                 if last_reset.year < now.year or last_reset.month < now.month:
+                    was_throttled = bool(tenant.get("compute_throttled_at"))
                     await db_module.update_tenant(
                         db, tenant["id"],
                         compute_cu_hours_used=0.0,
@@ -2402,6 +2488,12 @@ async def run_overage_check(db: Any) -> None:
                         overage_reset_at=now_iso,
                         compute_throttled_at=None,
                     )
+                    tenant["compute_throttled_at"] = None
+                    if was_throttled:
+                        # The throttle email promises "until next month": lift
+                        # the cap, otherwise the DB flag clears but Neon stays
+                        # at 0.25 CU for good.
+                        await _restore_neon_max_cu(db, neon_project_id, api_key, plan)
             except (ValueError, AttributeError):
                 pass
 
@@ -2448,6 +2540,24 @@ async def run_overage_check(db: Any) -> None:
                     )
                 except Exception:  # noqa: BLE001
                     pass
+            elif unbilled and _pool_has_billed_neighbours(tenants, tenant):
+                # Consumption and the cap are per pool project: throttling here
+                # would also throttle the paying customers sharing it (some of
+                # whom have a budget so that they are billed instead), so the
+                # owner decides what to do about the playtester.
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "Playtester compute ceiling exceeded in a shared pool, not throttled: "
+                    "tenant=%s pool_usage=%.1f CU-hours limit=%.0f",
+                    email, cu_used, cu_limit,
+                )
+                await _alert_owner_playtester_limit(
+                    email, "compute",
+                    f"pool compute is at {cu_used:.1f} CU-hours (ceiling {cu_limit:.0f} + "
+                    f"{limits['grace_cu_hours']:.0f} grace) and the pool is shared with paying "
+                    "tenants, so it was NOT throttled; usage is metered per pool, not per tenant.",
+                    db=db, tenant=tenant, now=now,
+                )
             elif not tenant.get("compute_throttled_at"):
                 # Throttle compute to 0.25 CU and email
                 await _set_neon_max_cu(neon_project_id, api_key, 0.25)
@@ -2490,7 +2600,7 @@ async def run_overage_check(db: Any) -> None:
                     f"this month. You have {remaining:.1f} grace hours remaining before throttling.</p>"
                     + (
                         "<p>Playtester accounts are not billed, so there is no overage budget; "
-                        "compute is throttled once the grace hours are used.</p>"
+                        "usage past the grace hours is restricted.</p>"
                         if unbilled
                         else f"<p><a href='{base}/dashboard'>Set an overage budget to avoid throttling →</a></p>"
                     )

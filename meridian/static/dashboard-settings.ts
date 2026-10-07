@@ -4146,7 +4146,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         // budget row is replaced by a note (the Save wiring below then finds no button).
         if (u.overage_billing === false) {
           const capsRow = document.getElementById(`save-caps-${projectId}`)?.parentElement;
-          if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; compute is throttled once the grace allowance is used.</span>';
+          if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; usage past the grace allowance is restricted.</span>';
         }
 
         const saveBtn = document.getElementById(`save-caps-${projectId}`);
