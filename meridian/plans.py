@@ -49,9 +49,21 @@ unbilled tenant already takes) instead of metering a charge, and the owner is
 alerted by email; the throttle is lifted at the monthly reset. Consumption and
 the compute cap belong to a Neon *pool project* shared by several tenants, so
 while a paying customer lives in the same pool the job does not throttle (it
-would land on them) and only alerts the owner, at most once a month. Storage
-past the ceiling is logged and emailed (the existing storage path has no
-write-refusal step).
+would land on them) and only alerts the owner, at most once a month. Because
+Neon reports usage per pool project and not per tenant, such an alert can name a
+playtester whose own usage is small. Storage past the ceiling is logged and
+emailed (the existing storage path has no write-refusal step).
+
+Granting it: change the plan of a tenant that has signed in at least once. A
+tenant row created with this plan before the person's first sign-in has no
+database, because sign-in only provisions one for a free-tier tenant (a plan
+that maps to Pro is assumed to be provisioned at checkout, which a playtester
+never goes through); ``POST /projects`` creates it on first use. The database
+of a tenant that already has one stays in the pool it was provisioned into
+(free, standard or pro) whatever the plan becomes. The usage jobs poll it with
+the key of the Neon account that pool belongs to, not the plan's, so the Pro
+ceilings are still enforced there; the pool's autoscaling ceiling and
+retention are those of the pool it lives in.
 
 An optional end date can be kept in ``tenants.inactivity_expires_at`` (NULL =
 no end date). Once it passes, ``tenant_entitlement_plan`` reports ``free`` for

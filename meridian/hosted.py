@@ -1244,6 +1244,43 @@ def _neon_api_key_for_tier(tier: str) -> str:
     return _require_cfg("NEON_API_KEY")
 
 
+async def _pool_tiers_by_project(db: Any) -> dict[str, str]:
+    """neon_project_id -> registered tier ('free' / 'standard' / 'pro') of every pool project.
+
+    The tier names the Neon account that owns the project, so it decides which
+    API key can see it. Empty on any error: callers then fall back to the plan.
+    """
+    try:
+        async with db.execute("SELECT neon_project_id, tier FROM neon_pool_projects") as cur:
+            rows = await cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Pool registry unreadable, Neon keys fall back to each tenant's plan: %s",
+            type(exc).__name__,
+        )
+        return {}
+    tiers: dict[str, str] = {}
+    for row in rows or []:
+        found = row if isinstance(row, dict) else {k: row[k] for k in row.keys()}
+        if found.get("neon_project_id") and found.get("tier"):
+            tiers[found["neon_project_id"]] = found["tier"]
+    return tiers
+
+
+def _neon_api_key_for_tenant(tenant: dict[str, Any], pool_tiers: dict[str, str]) -> str:
+    """Neon API key of the account the tenant's database actually lives in.
+
+    The database stays in the pool it was provisioned into when the plan
+    changes later (free -> playtester or pro, pro -> standard), so the plan is
+    only the fallback for a database that is not a registered pool project.
+    Asking the wrong account is refused by Neon and the usage jobs then skip the
+    tenant: nothing is measured, throttled or lifted for it.
+    """
+    tier = pool_tiers.get(tenant.get("neon_project_id") or "") or tenant.get("plan") or "standard"
+    return _neon_api_key_for_tier(tier)
+
+
 def _neon_org_id_for_tier(tier: str) -> str | None:
     """Return the optional Neon organization id for project creation.
 
@@ -2152,7 +2189,12 @@ async def get_neon_storage_gb(neon_project_id: str, neon_api_key: str) -> float:
             bytes_hour = float(data.get("data_storage_bytes_hour", 0) or 0)
             # bytes_hour is cumulative GB-hours; treat as proxy for GB
             return bytes_hour / 1e9
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # 0.0 reads as "nothing stored": leave a trace that it was not measured.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Neon storage unavailable: pool=%s (%s)", neon_project_id, type(exc).__name__
+        )
         return 0.0
 
 
@@ -2203,6 +2245,7 @@ async def run_storage_overage_check(db: Any) -> None:
         return r if isinstance(r, dict) else {k: r[k] for k in r.keys()}
 
     tenants = [_to_d(r) for r in rows] if rows else []
+    pool_tiers = await _pool_tiers_by_project(db)
 
     for tenant in tenants:
         # G2.10 — internal tenants are never charged for storage overage.
@@ -2212,9 +2255,18 @@ async def run_storage_overage_check(db: Any) -> None:
         if not neon_project_id:
             continue
         plan = tenant.get("plan") or "standard"
-        # The API key follows where the database lives (the plan's own pool);
-        # the ceiling follows the entitlement currently in force.
-        api_key = _neon_api_key_for_tier(plan)
+        # The API key follows the pool the database lives in; the ceiling
+        # follows the entitlement currently in force.
+        try:
+            api_key = _neon_api_key_for_tenant(tenant, pool_tiers)
+        except RuntimeError as exc:
+            # One account's key missing must not end the pass for every tenant after it.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Storage check skipped, no Neon key for the pool: tenant=%s plan=%s pool=%s (%s)",
+                tenant["email"], plan, neon_project_id, exc,
+            )
+            continue
         if not api_key:
             continue
 
@@ -2339,10 +2391,18 @@ async def _set_neon_max_cu(project_id: str, api_key: str, max_cu: float) -> None
     import httpx
     try:
         async with httpx.AsyncClient(timeout=15) as http:
-            await http.patch(
+            resp = await http.patch(
                 f"https://console.neon.tech/api/v2/projects/{project_id}",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={"project": {"autoscaling_limit_max_cu": max_cu}},
+            )
+        if resp.status_code >= 400:
+            # A refused cap is otherwise invisible: the tenant row says throttled
+            # (or restored) while Neon kept the old ceiling.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Neon refused the compute cap: pool=%s max_cu=%s status=%s",
+                project_id, max_cu, resp.status_code,
             )
     except Exception:  # noqa: BLE001
         pass
@@ -2435,6 +2495,11 @@ async def run_overage_check(db: Any) -> None:
 
     A compute throttle is lifted at the monthly reset (the pool's autoscaling
     ceiling goes back to what it was created with).
+
+    The Neon API key is that of the account owning the tenant's pool project
+    (neon_pool_projects.tier), not of the tenant's plan: a plan can change after
+    the database was provisioned. A tenant whose consumption Neon will not
+    return is logged and skipped.
     """
     from datetime import datetime, timezone as _tz, timedelta as _td
     from . import db as db_module
@@ -2447,6 +2512,7 @@ async def run_overage_check(db: Any) -> None:
     base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
 
     tenants = await db_module.list_tenants_with_neon(db)
+    pool_tiers = await _pool_tiers_by_project(db)
 
     for tenant in tenants:
         email = tenant.get("email", "")
@@ -2464,11 +2530,12 @@ async def run_overage_check(db: Any) -> None:
         plan = tenant.get("plan") or "standard"
         unbilled = is_unbilled_plan(plan)
         # Ceilings follow the entitlement in force (a lapsed playtester drops to
-        # free); the API key follows the pool the database actually lives in.
+        # free); the API key follows the pool the database actually lives in
+        # (a playtester made from a free or standard tenant is still in that pool).
         limits = plan_limits_for(tenant)
 
         try:
-            api_key = _neon_api_key_for_tier(plan)
+            api_key = _neon_api_key_for_tenant(tenant, pool_tiers)
         except RuntimeError:
             api_key = _cfg("NEON_API_KEY") or ""
         if not api_key:
@@ -2500,6 +2567,13 @@ async def run_overage_check(db: Any) -> None:
         # Fetch Neon consumption for current billing month
         raw = await _fetch_neon_consumption(neon_project_id, api_key, month_start, now_iso)
         if not raw:
+            # Nothing can be warned, throttled or billed for this tenant today.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Neon consumption unavailable, tenant not checked: tenant=%s plan=%s "
+                "pool=%s pool_tier=%s",
+                email, plan, neon_project_id, pool_tiers.get(neon_project_id, "unregistered"),
+            )
             continue
 
         metrics = _parse_consumption_metrics(raw)

@@ -970,6 +970,59 @@ async def _provisioned(
     )
 
 
+_POOL_KEY = {"free": "key-standard", "standard": "key-standard", "pro": "key-pro"}
+
+
+class _FakeNeon:
+    """Neon as the overage jobs see it: a project only answers to the API key of
+    the account that owns it, which is the pool tier it was created under (a
+    free or standard pool belongs to the standard account, a pro pool to the pro
+    one). Anything else is refused the way the real API refuses it: an empty
+    consumption answer, a PATCH that changes nothing."""
+
+    def __init__(self) -> None:
+        self.owner_key: dict[str, str] = {}
+        self.fetches: list[tuple[str, str]] = []   # (project, key) of every consumption read
+        self.cap_attempts: list[tuple[str, str, float]] = []  # (project, key, max_cu)
+        self.refused_caps: list[tuple[str, str, float]] = []
+
+    def accepts(self, project: str, key: str) -> bool:
+        return self.owner_key.get(project, key) == key
+
+
+@pytest.fixture
+def neon(calls, monkeypatch):
+    from meridian import hosted
+
+    fake = _FakeNeon()
+    real_fetch, real_cap = hosted._fetch_neon_consumption, hosted._set_neon_max_cu
+
+    async def _consumption(project, key, from_dt, to_dt):
+        fake.fetches.append((project, key))
+        if not fake.accepts(project, key):
+            return {}
+        return await real_fetch(project, key, from_dt, to_dt)
+
+    async def _cap(project, key, max_cu):
+        fake.cap_attempts.append((project, key, max_cu))
+        if not fake.accepts(project, key):
+            fake.refused_caps.append((project, key, max_cu))
+            return
+        await real_cap(project, key, max_cu)
+
+    monkeypatch.setattr(hosted, "_fetch_neon_consumption", _consumption)
+    monkeypatch.setattr(hosted, "_set_neon_max_cu", _cap)
+    return fake
+
+
+async def _neon_pool(db, neon: _FakeNeon, project: str, tier: str) -> str:
+    """Register ``project`` as a pool project of ``tier`` and make Neon answer
+    only to that tier's account key."""
+    await db_module.register_pool_project(db, project, tier)
+    neon.owner_key[project] = _POOL_KEY[tier]
+    return project
+
+
 async def test_playtester_over_the_ceiling_is_throttled_and_alerted_never_billed(db, calls):
     from meridian import hosted
 
@@ -1164,6 +1217,248 @@ async def test_playtester_is_throttled_when_no_paying_customer_shares_its_pool(
     await hosted.run_overage_check(db)
     assert calls.throttles and {p for p, _ in calls.throttles} == {"np-alone"}
     assert calls.meter == []
+
+
+async def test_a_paying_customer_in_another_pool_does_not_stop_the_throttle(db, calls):
+    """Only a paying customer in the playtester's OWN pool project can be hurt by
+    the throttle. Without the pool match, any paying customer anywhere would
+    switch the throttle off for every playtester."""
+    from meridian import hosted
+
+    calls.cu_hours = 260.0
+    await _provisioned(db, "far-pro@example.com", "pro", pool="np-far")
+    await _provisioned(db, "own-pt@example.com", "playtester", pool="np-own")
+    await hosted.run_overage_check(db)
+
+    assert calls.throttles == [("np-own", 0.25)]  # the playtester's pool, and only it
+    assert [e for e, s, _h in calls.emails if "throttled" in s] == ["own-pt@example.com"]
+    assert len(calls.meter) == 1  # the paying customer is billed, as always
+    assert [s for s, _h in calls.owner_alerts] == [
+        "[Meridian] Playtester over compute limit: own-pt@example.com"
+    ]
+    assert "NOT throttled" not in calls.owner_alerts[0][1]
+
+
+def test_billed_neighbour_check_is_scoped_to_the_pool_and_to_who_is_billed():
+    from meridian import hosted
+
+    me = {"id": "pt", "neon_project_id": "np-1", "plan": "playtester"}
+
+    def other(**kw):
+        return {"id": "o", "neon_project_id": "np-1", "plan": "pro", **kw}
+
+    assert hosted._pool_has_billed_neighbours([me, other()], me) is True
+    assert hosted._pool_has_billed_neighbours([me, other(plan="standard")], me) is True
+    # a paying customer somewhere else is not a neighbour
+    assert hosted._pool_has_billed_neighbours([me, other(neon_project_id="np-2")], me) is False
+    # staff and other playtesters are not customers anyone is billing
+    assert hosted._pool_has_billed_neighbours([me, other(is_internal=1)], me) is False
+    assert hosted._pool_has_billed_neighbours([me, other(plan="playtester")], me) is False
+    # the tenant is not its own neighbour
+    assert hosted._pool_has_billed_neighbours([{**me, "plan": "pro"}], {**me, "plan": "pro"}) is False
+
+
+@pytest.mark.parametrize(
+    "plan, pool_tier",
+    [
+        ("playtester", "standard"),  # signed up as free/standard, flipped afterwards
+        ("playtester", "free"),
+        ("playtester", "pro"),
+        ("pro", "standard"),         # same mismatch for an ordinary upgrade
+        ("standard", "pro"),         # and for a downgrade
+        ("free", "pro"),
+    ],
+)
+async def test_overage_job_polls_the_account_that_owns_the_database(
+    db, calls, neon, plan, pool_tier
+):
+    """The Neon key follows the pool project the database lives in, not the plan
+    the tenant is on today. Polling a standard-account project with the Pro key
+    is refused by Neon, and the job used to move on without a trace."""
+    from meridian import hosted
+
+    pool = await _neon_pool(db, neon, f"np-key-{plan}-{pool_tier}", pool_tier)
+    calls.cu_hours = 1.0
+    await _provisioned(db, f"key-{plan}-{pool_tier}@example.com", plan, pool=pool)
+    await hosted.run_overage_check(db)
+    assert neon.fetches == [(pool, _POOL_KEY[pool_tier])]
+    # and the usage really was read: it was persisted on the tenant
+    row = (await db_module.list_tenants_with_neon(db))[0]
+    assert row["compute_cu_hours_used"] == 1.0
+
+
+async def test_playtester_flipped_from_a_standard_pool_is_still_throttled(db, calls, neon):
+    """The way a playtester is normally made: the person signs in (a free tenant,
+    database in the standard account), then the plan is changed. The ceiling must
+    still bite: usage is read and the cap lands, both with the standard key."""
+    from meridian import hosted
+
+    pool = await _neon_pool(db, neon, "np-flipped", "standard")
+    calls.cu_hours = 260.0
+    pt = await _provisioned(db, "flipped-pt@example.com", "playtester", pool=pool)
+    await hosted.run_overage_check(db)
+
+    assert neon.fetches == [(pool, "key-standard")]
+    assert neon.cap_attempts == [(pool, "key-standard", 0.25)] and neon.refused_caps == []
+    assert calls.throttles == [(pool, 0.25)] and calls.meter == []
+    assert [s for _e, s, _h in calls.emails] == ["Meridian: compute limit reached — sessions throttled"]
+    assert (await db_module.get_tenant_by_id(db, pt["id"]))["compute_throttled_at"]
+
+
+async def test_throttle_is_lifted_with_the_key_of_the_pool_it_was_applied_to(db, calls, neon):
+    from meridian import hosted
+
+    pool = await _neon_pool(db, neon, "np-lift", "standard")
+    calls.cu_hours = 1.0
+    await _provisioned(
+        db, "lift-pt@example.com", "playtester", pool=pool,
+        compute_throttled_at="2026-01-01T00:00:00+00:00",
+        overage_reset_at="2000-01-15T00:00:00+00:00",
+    )
+    await hosted.run_overage_check(db)
+    # a refused lift leaves Neon throttled while the DB flag says otherwise
+    assert neon.cap_attempts == [(pool, "key-standard", 2.0)] and neon.refused_caps == []
+    assert calls.restores == [(pool, 2.0)]
+
+
+async def test_database_outside_the_pool_registry_falls_back_to_the_plans_key(db, calls, neon):
+    """A manually assigned database has no neon_pool_projects row: the plan's own
+    account is the best remaining guess, as before."""
+    from meridian import hosted
+
+    calls.cu_hours = 1.0
+    await _provisioned(db, "manual-pt@example.com", "playtester", pool="np-manual-pt")
+    await _provisioned(db, "manual-std@example.com", "standard", pool="np-manual-std")
+    await hosted.run_overage_check(db)
+    assert sorted(neon.fetches) == [("np-manual-pt", "key-pro"), ("np-manual-std", "key-standard")]
+
+
+async def test_storage_job_polls_the_account_that_owns_the_database(db, calls, neon, monkeypatch):
+    from meridian import hosted
+
+    reads: list[tuple[str, str]] = []
+
+    async def _gb(project, key):
+        reads.append((project, key))
+        return 0.0
+
+    monkeypatch.setattr(hosted, "get_neon_storage_gb", _gb)
+    for tier in ("standard", "pro"):
+        await _neon_pool(db, neon, f"np-store-{tier}", tier)
+        await _provisioned(db, f"store-{tier}-pt@example.com", "playtester", pool=f"np-store-{tier}")
+    await hosted.run_storage_overage_check(db)
+    assert sorted(reads) == [("np-store-pro", "key-pro"), ("np-store-standard", "key-standard")]
+
+
+async def test_storage_job_goes_on_when_one_pools_key_is_not_configured(
+    db, calls, neon, monkeypatch, caplog
+):
+    """A missing key for one account used to abort the whole hourly pass at the
+    first tenant of that pool, leaving everyone after it unmonitored."""
+    from meridian import hosted
+
+    reads: list[str] = []
+
+    async def _gb(project, _key):
+        reads.append(project)
+        return 0.0
+
+    monkeypatch.setattr(hosted, "get_neon_storage_gb", _gb)
+    monkeypatch.delenv("NEON_API_KEY_PRO")
+    await _neon_pool(db, neon, "np-nokey-pro", "pro")
+    await _neon_pool(db, neon, "np-nokey-std", "standard")
+    await _provisioned(db, "nokey-pt@example.com", "playtester", pool="np-nokey-pro")
+    await _provisioned(db, "nokey-std@example.com", "standard", pool="np-nokey-std")
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        await hosted.run_storage_overage_check(db)
+    assert reads == ["np-nokey-std"]
+    assert any("nokey-pt@example.com" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_refused_consumption_read_is_logged_not_silent(db, calls, neon, caplog):
+    """If Neon will not answer for a tenant's project, nothing can be enforced for
+    it: the job says so (tenant, project, plan; never the key) instead of moving
+    on, so a blind spot shows up in the logs."""
+    from meridian import hosted
+
+    pool = await _neon_pool(db, neon, "np-blind", "standard")
+    neon.owner_key[pool] = "some-other-account-key"  # whatever key the job picks is refused
+    calls.cu_hours = 900.0
+    await _provisioned(db, "blind-pt@example.com", "playtester", pool=pool)
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        await hosted.run_overage_check(db)
+
+    lines = [r.getMessage() for r in caplog.records if "blind-pt@example.com" in r.getMessage()]
+    assert len(lines) == 1, "a refused consumption read must leave exactly one warning"
+    line = lines[0]
+    assert pool in line and "playtester" in line
+    assert "key-standard" not in line and "key-pro" not in line
+    assert calls.cap_calls == [] and calls.emails == [] and calls.meter == []
+
+
+async def test_a_refused_compute_cap_is_logged_not_silent(monkeypatch, caplog):
+    """The real cap helper never raises; a 4xx used to vanish, leaving the tenant
+    row saying 'throttled' (or 'restored') while Neon kept the old ceiling."""
+    from meridian import hosted
+
+    class _Http:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def patch(self, *_a, **_k):
+            return types.SimpleNamespace(status_code=403)
+
+    monkeypatch.setattr("httpx.AsyncClient", _Http)
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        await hosted._set_neon_max_cu("np-refused", "secret-key", 0.25)
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "np-refused" in logged and "403" in logged and "secret-key" not in logged
+
+
+@pytest.mark.parametrize(
+    "plan, project, registered, expected",
+    [
+        ("playtester", "np-a", {"np-a": "standard"}, "key-standard"),  # the pool beats the plan
+        ("playtester", "np-a", {"np-a": "free"}, "key-standard"),
+        ("playtester", "np-a", {"np-a": "pro"}, "key-pro"),
+        ("pro", "np-a", {"np-a": "standard"}, "key-standard"),
+        ("standard", "np-a", {"np-a": "pro"}, "key-pro"),
+        ("playtester", "np-a", {}, "key-pro"),                          # not registered: the plan
+        ("standard", "np-a", {"np-other": "pro"}, "key-standard"),
+        (None, "np-a", {}, "key-standard"),                             # no plan: standard, as before
+    ],
+)
+def test_neon_key_follows_the_pool_and_only_then_the_plan(monkeypatch, plan, project, registered, expected):
+    from meridian import hosted
+
+    monkeypatch.setenv("NEON_API_KEY", "key-standard")
+    monkeypatch.setenv("NEON_API_KEY_PRO", "key-pro")
+    tenant = {"plan": plan, "neon_project_id": project}
+    assert hosted._neon_api_key_for_tenant(tenant, registered) == expected
+
+
+async def test_pool_registry_is_read_once_and_an_unreadable_one_degrades_to_the_plan(
+    db, neon, caplog
+):
+    from meridian import hosted
+
+    await _neon_pool(db, neon, "np-reg-pro", "pro")
+    await _neon_pool(db, neon, "np-reg-free", "free")
+    assert await hosted._pool_tiers_by_project(db) == {"np-reg-pro": "pro", "np-reg-free": "free"}
+
+    class _Broken:
+        def execute(self, *_a, **_k):
+            raise RuntimeError("no such table")
+
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        assert await hosted._pool_tiers_by_project(_Broken()) == {}
+    assert any("Pool registry unreadable" in r.getMessage() for r in caplog.records)
 
 
 async def test_owner_alerts_for_compute_and_storage_do_not_erase_each_other(db, calls):
