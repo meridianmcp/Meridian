@@ -6,7 +6,8 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db, _require_project_in_scope
+from .. import _deps
+from .._deps import _db, _deny_unless_in_scope, _require_project_in_scope, _session_project_id
 from .. import db as db_module
 from .. import handoff as handoff_module
 from ..models import Session, SessionRegister
@@ -14,14 +15,17 @@ from ..models import Session, SessionRegister
 router = APIRouter()
 
 
-async def _session_project_id(request: Request, session_id: str) -> "str | None":
-    """Project a session belongs to, or ``None`` for an unknown session id."""
-    _req_db = await _db(request)
-    async with _req_db.execute(
-        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
-    ) as cur:
-        row = await cur.fetchone()
-    return row["project_id"] if row is not None else None
+async def _require_session_in_scope(request: Request, session_id: str) -> None:
+    """Scope gate for the routes that only receive a session id.
+
+    H7 — the scope is resolved FIRST and the session's project is looked up only
+    when the caller turned out to be project-scoped, so owners, self-hosted and
+    demo callers (the overwhelming majority, and the hot heartbeat path) pay no
+    extra SELECT.
+    """
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None:
+        _deny_unless_in_scope(scoped, await _session_project_id(request, session_id))
 
 
 @router.post("/sessions/register", response_model=Session, status_code=201)
@@ -45,15 +49,17 @@ async def register_session(
 @router.post("/sessions/{session_id}/close")
 async def close_session(session_id: str, request: Request) -> dict[str, str]:
     """Mark a session closed."""
+    scoped = await _deps._scoped_project_ids_for_request(request)
     _req_db = await _db(request)
     async with _req_db.execute(
         "SELECT id, project_id FROM sessions WHERE id = ?", (session_id,)
     ) as cur:
         row = await cur.fetchone()
     if row is None:
+        _deny_unless_in_scope(scoped, None)  # scoped callers: same 403 as a foreign id
         raise HTTPException(status_code=404, detail="session not found")
     project_id = row["project_id"]
-    await _require_project_in_scope(request, project_id)  # RT-TI-005
+    _deny_unless_in_scope(scoped, project_id)  # RT-TI-005
     await db_module.close_session(_req_db, session_id)
     try:
         await db_module.delete_session_notes(await _db(request), session_id)
@@ -97,11 +103,9 @@ async def patch_session(
     if status not in {"active", "idle", "closed"}:
         raise HTTPException(status_code=422, detail="status must be active, idle, or closed")
     # RT-TI-005 — /sessions/{id} is outside the /projects/{uuid} middleware, so
-    # resolve the session's project and apply the scope rule here.
-    _pid = await _session_project_id(request, session_id)
-    if _pid is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    await _require_project_in_scope(request, _pid)
+    # resolve the session's project and apply the scope rule here (H7: only a
+    # project-scoped caller pays for the lookup; an unknown id stays a 404 below).
+    await _require_session_in_scope(request, session_id)
     db = await _db(request)
     cursor = await db.execute(
         "UPDATE sessions SET status = ? WHERE id = ?",
@@ -121,9 +125,7 @@ async def heartbeat_session(
 
     404 when the session id is unknown or already closed.
     """
-    _pid = await _session_project_id(request, session_id)
-    if _pid is not None:
-        await _require_project_in_scope(request, _pid)  # RT-TI-005
+    await _require_session_in_scope(request, session_id)  # RT-TI-005 / H7
     ok = await db_module.heartbeat_session(await _db(request), session_id)
     if not ok:
         raise HTTPException(status_code=404, detail="session not found")
@@ -135,7 +137,5 @@ async def get_session_notes(
     session_id: str, request: Request
 ) -> list[dict[str, Any]]:
     """Return sprint scratch-pad notes for a session (newest first)."""
-    _pid = await _session_project_id(request, session_id)
-    if _pid is not None:
-        await _require_project_in_scope(request, _pid)  # RT-TI-005
+    await _require_session_in_scope(request, session_id)  # RT-TI-005 / H7
     return await db_module.get_session_notes(await _db(request), session_id)

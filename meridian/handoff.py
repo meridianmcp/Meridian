@@ -940,6 +940,7 @@ async def invalidate_handoff(
     *,
     reason: str,
     correction_id: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a ``handoffs`` row invalidated/non-executable WITHOUT mutating its body.
 
@@ -951,15 +952,25 @@ async def invalidate_handoff(
     overwrites the reason/correction_id/timestamp with the latest call's
     values. Returns the updated row, or ``None`` if ``handoff_id`` doesn't
     exist.
+
+    ``project_id`` (RT-TI-005 pass 3, F-D5) binds the UPDATE and the returned row to one
+    project: a handoff of another project is left untouched and reads as not found
+    (``None``), exactly like an unknown id. :func:`regenerate_handoff_correction` always
+    passes the correction's own project, so a correction can never invalidate a handoff
+    of a different project. ``None`` keeps the unbound behaviour for internal callers.
     """
     now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
-    await db.execute(
+    sql = (
         f"UPDATE handoffs SET invalidated = 1, invalidated_reason = ?, "
-        f"invalidated_at = {now_expr}, superseded_by_correction_id = ? WHERE id = ?",
-        (reason, correction_id, handoff_id),
+        f"invalidated_at = {now_expr}, superseded_by_correction_id = ? WHERE id = ?"
     )
+    params: tuple[Any, ...] = (reason, correction_id, handoff_id)
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        params += (project_id,)
+    await db.execute(sql, params)
     await db.commit()
-    return await db_module.get_handoff(db, handoff_id)
+    return await db_module.get_handoff(db, handoff_id, project_id=project_id)
 
 
 async def record_handoff_correction(
@@ -1028,7 +1039,11 @@ async def record_handoff_correction(
         if existing is not None:
             return _deserialize_correction_row(db_module._row_to_dict(existing))
 
-    source = await db_module.get_handoff(db, source_handoff_id)
+    # RT-TI-005 (pass 3, F-D5) -- the source must be a handoff of THIS project. The lookup
+    # used to be unbound, so a caller scoped to project A could name a handoff of project B
+    # here, record a correction against it and (with regenerate) invalidate it; a handoff of
+    # another project is now indistinguishable from an unknown id (never legitimate).
+    source = await db_module.get_handoff(db, source_handoff_id, project_id=project_id)
     if source is None:
         raise HandoffCorrectionError(
             f"source handoff {source_handoff_id!r} not found — a correction "
@@ -1149,7 +1164,9 @@ async def regenerate_handoff_correction(
         )
 
     if correction.get("new_handoff_id"):
-        new_handoff = await db_module.get_handoff(db, correction["new_handoff_id"])
+        new_handoff = await db_module.get_handoff(
+            db, correction["new_handoff_id"], project_id=project_id
+        )
         return {
             "correction": correction,
             "regenerated": False,
@@ -1190,6 +1207,7 @@ async def regenerate_handoff_correction(
             f"(blocker: {correction['blocker_classification']})"
         ),
         correction_id=correction_id,
+        project_id=project_id,
     )
 
     # edd9c54b interaction (discovered while building this feature): generate_
@@ -1334,7 +1352,9 @@ async def load_handoff_correction(
         return None
     new_handoff_content = None
     if row.get("new_handoff_id"):
-        new_handoff = await db_module.get_handoff(db, row["new_handoff_id"])
+        new_handoff = await db_module.get_handoff(
+            db, row["new_handoff_id"], project_id=project_id
+        )
         if new_handoff is not None:
             new_handoff_content = new_handoff.get("body")
     return {**row, "new_handoff_content": new_handoff_content}
