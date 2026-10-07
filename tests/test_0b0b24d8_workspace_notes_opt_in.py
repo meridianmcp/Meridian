@@ -120,6 +120,7 @@ class _Spy:
         record = {
             "kwargs_mode": kwargs.get("mode"),
             "mode_passed": "mode" in kwargs,
+            "session_id": kwargs.get("session_id"),
             # Resolved BEFORE the call: the call itself marks the session as
             # having produced a handoff, which changes the answer.
             "effective_mode": handoff_module.resolve_handoff_mode(
@@ -483,8 +484,17 @@ def test_source_scan_detects_an_omitting_call(tmp_path):
 # dump, which is exactly what the REST correction endpoint once did. This scan
 # checks the VALUE: a function that forwards ``mode`` to the handoff family must
 # not default it to, or fall back to, the literal "full".
+#
+# ``resolve_handoff_mode`` is in the family because every transport (REST, HTTP
+# MCP, stdio MCP) feeds the caller's mode through it: ``resolve_handoff_mode(
+# arguments.get("mode") or "full", ...)`` makes an omitted mode an explicit
+# 'full' request, which the function then honours. That form has no ``mode=``
+# keyword and no ``mode = ...`` assignment, so it needs its own check below.
 _HANDOFF_FAMILY = frozenset(
-    {"generate_handoff", "regenerate_handoff_correction", "amend_handoff"}
+    {
+        "generate_handoff", "regenerate_handoff_correction", "amend_handoff",
+        "resolve_handoff_mode",
+    }
 )
 
 
@@ -539,6 +549,14 @@ def _full_by_default_sites(path: pathlib.Path) -> list[int]:
             for kw in call.keywords:
                 if kw.arg == "mode" and _falls_back_to_full(kw.value):
                     hits.add(kw.value.lineno)
+            # (4) ``resolve_handoff_mode(<x or "full">, ...)``: its first
+            # parameter is the requested mode, positional or by keyword
+            if _call_name(call) == "resolve_handoff_mode":
+                requested = [kw.value for kw in call.keywords if kw.arg == "requested_mode"]
+                requested += call.args[:1]
+                for expr in requested:
+                    if _falls_back_to_full(expr):
+                        hits.add(expr.lineno)
         # (3) ``mode = <x or "full">`` computed before the call
         for node in ast.walk(fn):
             if (
@@ -594,6 +612,34 @@ def test_no_handoff_caller_defaults_or_falls_back_to_full():
         "async def f(m, *, mode: str = 'full'):\n"
         "    await m.generate_handoff(db, 'p', 'd', mode=mode)\n",
         [1], id="kwonly-parameter-default-full",
+    ),
+    pytest.param(  # the stdio transport's form: no mode= keyword at all
+        "async def f(m, arguments):\n"
+        "    mode = m.resolve_handoff_mode(\n"
+        "        arguments.get('mode') or 'full',\n"
+        "        None,\n"
+        "    )\n",
+        [3], id="resolve-positional-or-full",
+    ),
+    pytest.param(
+        "async def f(m, arguments):\n"
+        "    mode = m.resolve_handoff_mode(requested_mode=arguments.get('mode') or 'full')\n",
+        [2], id="resolve-keyword-or-full",
+    ),
+    pytest.param(
+        "async def f(m, x):\n"
+        "    mode = m.resolve_handoff_mode(x if x else 'full', None)\n",
+        [2], id="resolve-ternary-full",
+    ),
+    pytest.param(
+        "async def f(m, arguments):\n"
+        "    mode = m.resolve_handoff_mode(arguments.get('mode'), None, session_role='executor')\n",
+        [], id="resolve-forwarding-the-raw-mode",
+    ),
+    pytest.param(
+        "async def f(m):\n"
+        "    mode = m.resolve_handoff_mode('full', None)\n",
+        [], id="resolve-explicit-full-constant",
     ),
     # allowed: forwarding None, an explicit constant request, or a "full"
     # label that never feeds a handoff call
@@ -929,3 +975,326 @@ async def test_workspace_context_helper_matches_each_renderer(db, monkeypatch):
     assert await _deps._build_workspace_context_block(db) == (
         _deps._render_workspace_block(decisions, notes)
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. The two background delta writers bound "Completed since last handoff"
+# ---------------------------------------------------------------------------
+#
+# Moving session-close auto-save and the idle-expire loop from the implicit
+# 'full' to an explicit 'delta' is only half a fix: delta takes the lower bound
+# of its "Completed since last handoff" list from the session. Called with no
+# session_id the list has no bound, so a project with a long history got its
+# OLDEST 20 completed items under that label (+N more), in the very file these
+# two paths exist to keep fresh.
+
+_ANCIENT_STAMP = "2020-01-01 00:00:00"
+_ANCIENT_COUNT = 25
+_RECENT_COUNT = 3
+
+
+async def _seed_completed_history(db, pid: str) -> list[str]:
+    """Completed items from years ago plus a few completed just now.
+
+    Returns the titles of the recent ones. ``force=True`` skips the duplicate
+    title guard, since these titles deliberately resemble each other."""
+    for i in range(_ANCIENT_COUNT):
+        item = await db_module.add_sprint_item(
+            db, pid, "v1", f"Ancient chore {i:03d}", force=True,
+        )
+        await db.execute(
+            "UPDATE sprint_items SET status = 'done', completed_at = ? WHERE id = ?",
+            (_ANCIENT_STAMP, item["id"]),
+        )
+    recent = []
+    for i in range(_RECENT_COUNT):
+        title = f"Fresh deliverable {i}"
+        item = await db_module.add_sprint_item(db, pid, "v1", title, force=True)
+        await db.execute(
+            "UPDATE sprint_items SET status = 'done', completed_at = datetime('now') "
+            "WHERE id = ?",
+            (item["id"],),
+        )
+        recent.append(title)
+    await db.commit()
+    return recent
+
+
+def _assert_completed_section_is_this_sessions_work(text: str, recent: list[str]) -> None:
+    assert "Completed since last handoff:" in text
+    for title in recent:
+        assert title in text, title
+    assert "Ancient chore" not in text
+    assert "more completed" not in text
+
+
+@pytest.mark.asyncio
+async def test_idle_expire_loop_scopes_delta_to_the_expired_session(
+    db, tmp_path, spy, _no_claude_md_write,
+):
+    pid = await _project(db, "0b0b24d8-idle-bounded")
+    sess = await db_module.register_session(db, pid, "stale")
+    recent = await _seed_completed_history(db, pid)
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (sess["id"],),
+    )
+    await db.commit()
+
+    result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
+
+    assert result["auto_handoff_generated"] is True
+    assert [(c["kwargs_mode"], c["session_id"]) for c in spy.calls] == [("delta", sess["id"])]
+    _assert_completed_section_is_this_sessions_work(spy.calls[0]["content"], recent)
+    written = (tmp_path / f"{handoff_module.handoff_file_stem(pid)}_handoff.md").read_text(
+        encoding="utf-8"
+    )
+    _assert_completed_section_is_this_sessions_work(written, recent)
+
+
+@pytest.mark.asyncio
+async def test_idle_expire_loop_writes_one_handoff_per_project_for_the_freshest_session(
+    db, tmp_path, spy, _no_claude_md_write,
+):
+    pid = await _project(db, "0b0b24d8-idle-two-sessions")
+    older = await db_module.register_session(db, pid, "older")
+    fresher = await db_module.register_session(db, pid, "fresher")
+    for sid, age in ((older["id"], 120), (fresher["id"], 45)):
+        await db.execute(
+            "UPDATE sessions SET last_seen = datetime('now', ? || ' minutes') WHERE id = ?",
+            (f"-{age}", sid),
+        )
+    await db.commit()
+
+    await srv._expire_and_generate_handoffs(db, str(tmp_path))
+
+    assert [c["session_id"] for c in spy.calls] == [fresher["id"]]
+
+
+@pytest.mark.asyncio
+async def test_expire_idle_sessions_reports_which_sessions_expired_per_project(db):
+    p1 = await db_module.create_project(db, "0b0b24d8-expire-a")
+    p2 = await db_module.create_project(db, "0b0b24d8-expire-b")
+    a_old = await db_module.register_session(db, p1["id"], "a-old")
+    a_new = await db_module.register_session(db, p1["id"], "a-new")
+    b_only = await db_module.register_session(db, p2["id"], "b-only")
+    fresh = await db_module.register_session(db, p2["id"], "still-alive")
+    for sid, age in ((a_old["id"], 200), (a_new["id"], 50), (b_only["id"], 90)):
+        await db.execute(
+            "UPDATE sessions SET last_seen = datetime('now', ? || ' minutes') WHERE id = ?",
+            (f"-{age}", sid),
+        )
+    await db.commit()
+
+    result = await db_module.expire_idle_sessions(db, max_age_minutes=30)
+
+    assert result["count"] == 3
+    assert sorted(result["project_ids"]) == sorted([p1["id"], p2["id"]])
+    assert result["session_ids_by_project"] == {
+        p1["id"]: [a_new["id"], a_old["id"]],   # most recently seen first
+        p2["id"]: [b_only["id"]],               # the live session is not listed
+    }
+    assert fresh["id"] not in {
+        s for ids in result["session_ids_by_project"].values() for s in ids
+    }
+
+
+def test_session_close_auto_save_scopes_delta_to_the_closed_session(
+    client, spy, _no_claude_md_write,
+):
+    project = client.post("/projects", json={"name": "0b0b24d8-close-bounded"}).json()
+    pid = project["id"]
+    sess = client.post(
+        "/sessions/register", json={"project_id": pid, "name": "s1"},
+    ).json()
+
+    async def _seed() -> list[str]:
+        return await _seed_completed_history(client.app.state.db, pid)
+
+    recent = asyncio.run(_seed())
+
+    assert client.post(f"/sessions/{sess['id']}/close").status_code == 200
+    deadline = time.monotonic() + 20
+    while not spy.finished.is_set() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert spy.finished.is_set(), "close_session never ran its auto-save handoff"
+
+    assert [(c["kwargs_mode"], c["session_id"]) for c in spy.calls] == [("delta", sess["id"])]
+    _assert_completed_section_is_this_sessions_work(spy.calls[0]["content"], recent)
+    written = (
+        pathlib.Path(client.app.state.data_dir)
+        / f"{handoff_module.handoff_file_stem(pid)}_handoff.md"
+    ).read_text(encoding="utf-8")
+    _assert_completed_section_is_this_sessions_work(written, recent)
+
+
+# ---------------------------------------------------------------------------
+# 8. Tenant scoping of the workspace index
+# ---------------------------------------------------------------------------
+#
+# The index names the number of notes and the titles of policy-tagged ones, so
+# an unscoped fetch would show tenant A a count and titles that belong to
+# tenant B. Single-tenant tests cannot see that: both tenants' rows have to
+# exist in the same database.
+
+_TENANT_A_NOTE = "TENANT-A-NOTE"
+_TENANT_B_POLICY_NOTE = "TENANT-B-SECRET-POLICY"
+_TENANT_B_DECISION = "TENANT-B-SECRET-DECISION"
+
+
+async def _seed_two_tenants(db) -> None:
+    await db_module.add_workspace_note(
+        db, _TENANT_A_NOTE, "a-body", "policy", tenant_id="tenant-a",
+    )
+    await db_module.add_workspace_note(
+        db, _TENANT_B_POLICY_NOTE, "b-body", "policy", tenant_id="tenant-b",
+    )
+    await db_module.add_workspace_note(
+        db, "TENANT-B-PLAIN-NOTE", "b-body-2", "research", tenant_id="tenant-b",
+    )
+    await db_module.pin_workspace_decision(
+        db, "TENANT-A-DECISION", "a-decision", "STRATEGIC", tenant_id="tenant-a",
+    )
+    await db_module.pin_workspace_decision(
+        db, _TENANT_B_DECISION, "b-decision", "STRATEGIC", tenant_id="tenant-b",
+    )
+
+
+def _assert_only_tenant_a(text: str) -> None:
+    assert _TENANT_A_NOTE in text and "TENANT-A-DECISION" in text
+    assert "TENANT-B" not in text
+    assert "b-body" not in text and "b-decision" not in text
+
+
+@pytest.mark.asyncio
+async def test_workspace_context_block_is_scoped_to_the_callers_tenant(db, monkeypatch):
+    await _seed_two_tenants(db)
+
+    index = await _deps._build_workspace_context_block(db, tenant_id="tenant-a")
+    _assert_only_tenant_a(index)
+    # B's two notes must not inflate the count either: A owns exactly one
+    assert "1 workspace note(s)" in index
+
+    monkeypatch.setenv(_FLAG_ENV, "1")
+    _assert_only_tenant_a(await _deps._build_workspace_context_block(db, tenant_id="tenant-a"))
+
+
+@pytest.mark.asyncio
+async def test_workspace_context_block_still_shows_pre_isolation_rows(db):
+    """A row with no tenant is only ever present on a dedicated per-tenant
+    database (see _ws_tenant_clause), so every tenant keeps seeing it."""
+    await db_module.add_workspace_note(db, "LEGACY-NOTE", "legacy", "policy")
+    await _seed_two_tenants(db)
+
+    index = await _deps._build_workspace_context_block(db, tenant_id="tenant-a")
+
+    assert "2 workspace note(s)" in index and "LEGACY-NOTE" in index
+    assert "TENANT-B" not in index
+
+
+@pytest.mark.asyncio
+async def test_get_context_block_is_scoped_to_the_callers_tenant(db, monkeypatch):
+    """handle_get_context_block gets the tenant from the transport and must hand
+    it to the workspace helper: dropping it there would leak B's index into A's
+    block even though the helper itself filters correctly."""
+    from meridian.mcp.handlers import session_tools
+
+    pid = await _project(db, "0b0b24d8-cb-tenants")
+    await _seed_two_tenants(db)
+
+    for flag in (None, "1"):
+        if flag:
+            monkeypatch.setenv(_FLAG_ENV, flag)
+        result = await session_tools.handle_get_context_block(
+            {"project_id": pid}, db, "/tmp", None, "tenant-a",
+        )
+        _assert_only_tenant_a(result["text"])
+
+
+# ---------------------------------------------------------------------------
+# 9. The stdio transport (python -m meridian --mcp, the documented self-host
+#    connection) resolves an omitted mode through the same intent logic
+# ---------------------------------------------------------------------------
+
+
+def _stdio_server(monkeypatch, db, tmp_path):
+    """The stdio MCP server with its lazy DB pinned to ``db`` and its handoff
+    files written under ``tmp_path`` (never the developer's own data dir)."""
+    async def _return_db(*_a, **_k):
+        return db
+
+    monkeypatch.setattr(db_module, "init_db", _return_db)
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.delenv("MERIDIAN_DB_URL", raising=False)
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    server, _run_stdio = srv.build_mcp_server()
+    return server
+
+
+async def _stdio_generate_handoff(server, arguments: dict) -> dict:
+    import json
+
+    import mcp.types as mcp_types
+
+    called = await server.request_handlers[mcp_types.CallToolRequest](
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="generate_handoff", arguments=arguments,
+            )
+        )
+    )
+    return json.loads(called.root.content[0].text)
+
+
+@pytest.mark.asyncio
+async def test_stdio_generate_handoff_omitted_mode_is_bounded_never_full(
+    db, monkeypatch, tmp_path,
+):
+    pid = await _project(db, "0b0b24d8-stdio-omitted")
+    await _seed_workspace(db)
+    server = _stdio_server(monkeypatch, db, tmp_path)
+
+    result = await _stdio_generate_handoff(server, {"project_id": pid})
+
+    assert _leaks(result["content"]) == []
+    assert result["mode"] == "goal"
+    assert (await db_module.get_handoffs(db, pid, limit=1))[0]["mode"] == "goal"
+    assert _leaks(_written_text(tmp_path)) == []
+    for row in await db_module.get_handoffs(db, pid, limit=20):
+        assert _leaks(row["body"]) == [], row["mode"]
+
+
+@pytest.mark.asyncio
+async def test_stdio_generate_handoff_omitted_mode_for_a_resumed_session_is_delta(
+    db, monkeypatch, tmp_path,
+):
+    pid = await _project(db, "0b0b24d8-stdio-resumed")
+    await _seed_workspace(db)
+    sess = await db_module.register_session(db, pid, "stdio-resumed")
+    server = _stdio_server(monkeypatch, db, tmp_path)
+
+    first = await _stdio_generate_handoff(
+        server, {"project_id": pid, "session_id": sess["id"]},
+    )
+    second = await _stdio_generate_handoff(
+        server, {"project_id": pid, "session_id": sess["id"]},
+    )
+
+    assert (first["mode"], second["mode"]) == ("goal", "delta")
+    assert _leaks(first["content"]) == [] and _leaks(second["content"]) == []
+    assert _leaks(_written_text(tmp_path)) == []
+
+
+@pytest.mark.asyncio
+async def test_stdio_generate_handoff_explicit_full_still_includes_everything(
+    db, monkeypatch, tmp_path,
+):
+    """Proves the absence assertions above are not vacuous over this transport."""
+    pid = await _project(db, "0b0b24d8-stdio-full")
+    await _seed_workspace(db)
+    server = _stdio_server(monkeypatch, db, tmp_path)
+
+    result = await _stdio_generate_handoff(server, {"project_id": pid, "mode": "full"})
+
+    assert result["mode"] == "full"
+    assert sorted(_leaks(result["content"])) == sorted(_SENTINELS)
