@@ -392,6 +392,9 @@ async function ensureWorkspaceSwitcher() {
 
     [...state.tabs].forEach(t => { try { closeTab(t.id); } catch (_) {} });
 
+    // The project-list socket follows the workspace whose projects are listed.
+    connectAccountWs();
+
     await loadProjects();
 
     // Show which workspace is active.
@@ -10685,6 +10688,16 @@ async function refreshTab(projectId: any) {
 
 async function refreshGoal(projectId: any) {
 
+  /** Pull the goal / north star / sprint back onto the Goal tab.
+   *
+   * A background refresh (a task or goal event, a WebSocket reconnect, a decision logged by
+   * an agent) must never throw away what the user is typing: a textarea that carries the
+   * 'dirty' class holds an edit the server has not seen yet, so its value, its dirty state
+   * and its saved-baseline are left alone while everything else on the tab (the read-only
+   * title / shipped / auto-block zones, version labels, the decisions) still refreshes. The
+   * save handlers clear 'dirty' once the server has the text, which is what lets the next
+   * refresh bring the saved version back. */
+
   const ta = document.getElementById(`goal-${projectId}`);
 
   const v = document.getElementById(`goal-version-${projectId}`);
@@ -10697,7 +10710,12 @@ async function refreshGoal(projectId: any) {
 
     const goal = await projectApi(projectId, goalPath);
 
+    // Judged now, after the await: the user may have started typing while it was in flight.
+    const keepGoalEdit = ta.classList.contains('dirty');
+
     state.panels[projectId].goalRaw = goal.content;
+
+    state.panels[projectId]._goalLoaded = true;
 
     let text;
 
@@ -10769,7 +10787,7 @@ async function refreshGoal(projectId: any) {
 
       }
 
-      ta.value = body.slice(editStart);
+      if (!keepGoalEdit) ta.value = body.slice(editStart);
 
     } else {
 
@@ -10777,7 +10795,7 @@ async function refreshGoal(projectId: any) {
 
       if (shippedEl) shippedEl.style.display = 'none';
 
-      ta.value = body;
+      if (!keepGoalEdit) ta.value = body;
 
     }
 
@@ -10833,7 +10851,12 @@ async function refreshGoal(projectId: any) {
 
     const spTA = document.getElementById(`goal-sprint-${projectId}`);
 
-    if (nsTA && 'north_star' in goal) {
+    // An edit in progress (dirty) is kept, with the baseline it is compared against.
+    const keepNsEdit = !!nsTA && nsTA.classList.contains('dirty');
+
+    const keepSpEdit = !!spTA && spTA.classList.contains('dirty');
+
+    if (nsTA && 'north_star' in goal && !keepNsEdit) {
 
       nsTA.value = goal.north_star || '';
 
@@ -10841,7 +10864,7 @@ async function refreshGoal(projectId: any) {
 
     }
 
-    if (spTA && 'sprint' in goal) {
+    if (spTA && 'sprint' in goal && !keepSpEdit) {
 
       spTA.value = goal.sprint || '';
 
@@ -10853,9 +10876,9 @@ async function refreshGoal(projectId: any) {
 
     const p = state.panels[projectId];
 
-    p._serverNorthStar = goal.north_star || '';
+    if (!keepNsEdit) p._serverNorthStar = goal.north_star || '';
 
-    p._serverSprint = goal.sprint || '';
+    if (!keepSpEdit) p._serverSprint = goal.sprint || '';
 
     const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
 
@@ -10883,13 +10906,17 @@ async function refreshGoal(projectId: any) {
       }
     }
 
-    p._lastSaved = text;
+    if (!keepGoalEdit) {
 
-    if (nsTA) { nsTA.classList.remove('dirty'); }
+      p._lastSaved = text;
 
-    if (spTA) { spTA.classList.remove('dirty'); }
+      ta.classList.remove('dirty');
 
-    ta.classList.remove('dirty');
+    }
+
+    if (nsTA && !keepNsEdit) { nsTA.classList.remove('dirty'); }
+
+    if (spTA && !keepSpEdit) { spTA.classList.remove('dirty'); }
 
     // v0.6.4 — last-modified timestamps
 
@@ -10919,6 +10946,14 @@ async function refreshGoal(projectId: any) {
 
   } catch (e: any) {
 
+    // A refresh that fails AFTER the goal has loaded once (the server is restarting, a
+    // blip during the post-reconnect resync) must not blank the tab: that wiped whatever
+    // the user had typed and replaced a good view with "unavailable". Only a goal that
+    // never loaded shows the failure.
+    const loadedBefore = !!(state.panels[projectId] && state.panels[projectId]._goalLoaded);
+
+    if (loadedBefore || ta.classList.contains('dirty')) return;
+
     ta.value = '';
 
     ta.placeholder = 'Goal state failed to load.';
@@ -10930,6 +10965,26 @@ async function refreshGoal(projectId: any) {
     if (titleEl) titleEl.textContent = 'Goal state unavailable';
 
   }
+
+}
+
+async function refreshDecisionsLog(projectId: any) {
+
+  /** Repaint only the Goal tab's Decisions table (the append-only set_decision log).
+   *
+   * An agent logging a decision announces goal_updated {field: 'decisions'}; the goal text,
+   * north star and sprint did not change, so re-running refreshGoal for it could only put
+   * the user's unsaved edits at risk for nothing. */
+
+  if (!document.getElementById(`decisions-table-${projectId}`)) return;
+
+  try {
+
+    const goal = await projectApi(projectId, `/projects/${projectId}/goal`);
+
+    renderDecisionsTable(projectId, goal.decisions || '');
+
+  } catch (_) { /* the next event or tab open repaints it */ }
 
 }
 
@@ -11531,6 +11586,12 @@ async function loadPinnedDecisions(projectId: any, { showArchived = false } = {}
 
     renderConstitutionWarning(projectId);
 
+    // An open inline editor holds a draft the user has not saved, and repainting the cards
+    // would close it and throw the draft away -- every goal / task / decision event and
+    // every WebSocket reconnect lands here. Skip the paint; Save and Cancel both reload
+    // the list, so nothing that arrived meanwhile is lost.
+    if (Array.from(host.querySelectorAll('.decision-edit-area')).some((el: any) => el.style.display === 'block')) return;
+
     if (!items || items.length === 0) {
 
       host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet — call <code>pin_decision</code> from MCP)</div>`;
@@ -11687,7 +11748,14 @@ async function loadPinnedDecisions(projectId: any, { showArchived = false } = {}
 
     host.querySelectorAll('.decision-edit-cancel').forEach(btn => {
 
-      btn.onclick = () => hideEdit(btn.dataset.id);
+      btn.onclick = () => {
+
+        hideEdit(btn.dataset.id);
+
+        // Catch up on whatever was held back while the editor was open (see above).
+        loadPinnedDecisions(projectId, { showArchived });
+
+      };
 
     });
 
@@ -12300,7 +12368,17 @@ async function saveGoal(projectId: any) {
 
   const raw = titleLine + shippedText + ta.value + autoBlocksText;
 
-  if (raw === state.panels[projectId]._lastSaved) return;
+  if (raw === state.panels[projectId]._lastSaved) {
+
+    // Nothing differs from what the server has (the user typed and reverted): not an
+    // unsaved edit any more, so a background refresh may update the field again.
+    ta.classList.remove('dirty');
+
+    return;
+
+  }
+
+  const sentGoalValue = ta.value;
 
   let content = raw;
 
@@ -12315,6 +12393,11 @@ async function saveGoal(projectId: any) {
     await api(`/projects/${projectId}/goal`, { method: 'POST', body: JSON.stringify({ content }) });
 
     state.panels[projectId]._lastSaved = raw;
+
+    // The server has this text now. Clearing 'dirty' is what lets refreshGoal (below and in
+    // every later background refresh) show the saved version instead of treating the field
+    // as an unsaved edit -- unless the user kept typing while the request was in flight.
+    if (ta.value === sentGoalValue) ta.classList.remove('dirty');
 
     toast('version goal saved');
 
@@ -12368,6 +12451,9 @@ async function saveNorthStar(projectId: any) {
 
     });
 
+    // Saved: no longer an unsaved edit (see saveGoal), unless more was typed meanwhile.
+    if (ta.value.trim() === val) ta.classList.remove('dirty');
+
     toast('north star saved');
 
     refreshGoal(projectId);
@@ -12396,6 +12482,8 @@ async function saveSprint(projectId: any) {
 
   if (!val) return;
 
+  const sentSprintValue = ta.value;
+
   try {
 
     await api(`/projects/${projectId}/goal/sprint`, {
@@ -12405,6 +12493,9 @@ async function saveSprint(projectId: any) {
       body: JSON.stringify({ sprint: val }),
 
     });
+
+    // Saved: no longer an unsaved edit (see saveGoal), unless more was typed meanwhile.
+    if (ta.value === sentSprintValue) ta.classList.remove('dirty');
 
     toast('sprint saved');
 
@@ -12982,6 +13073,124 @@ function connectWs(projectId: any) {
 
 
 
+function connectAccountWs() {
+
+  /** The page's own WebSocket, for events about the account rather than one project.
+   *
+   * connectWs opens one socket per project TAB, so a dashboard with no tab open (the last
+   * one closed, a brand-new account) held no socket at all and never heard that a project
+   * was created, renamed, merged or deleted from another tab, an agent or the API. This
+   * socket does not depend on the tabs. It carries only account-level events (see
+   * handleAccountEvent) and is keyed server-side by the database this page reads, so it
+   * follows the workspace switcher: calling this again replaces the socket. */
+
+  const previous = state.accountWs;
+
+  state.accountWs = null;
+
+  if (previous) { try { previous.close(); } catch (_) { /* already closed */ } }
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+  const workspace = state.activeWorkspaceTenantId
+    ? `?workspace=${encodeURIComponent(state.activeWorkspaceTenantId)}` : '';
+
+  let sock: any;
+
+  // A constructor that throws (a browser refusing the URL) must not take the dashboard's
+  // init down with it: the page works without live project-list updates, just as before.
+  try { sock = new WebSocket(`${proto}//${location.host}/ws-account${workspace}`); } catch (_) { return; }
+
+  state.accountWs = sock;
+
+  let opened = false;
+
+  sock.onopen = () => {
+
+    opened = true;
+
+    state.accountWsFailures = 0;
+
+    // Events published while no socket was open are never replayed, and the very first
+    // list fetch can race the connect, so every open refetches the project list once.
+    refreshProjectListFromAccount();
+
+  };
+
+  sock.onclose = (ev: any) => {
+
+    if (state.accountWs !== sock) return;   // replaced by a newer socket: nothing to restore
+
+    state.accountWs = null;
+
+    // 4401 = refused (not signed in, not a member of that workspace): retrying cannot help.
+    if (ev && ev.code === 4401) return;
+
+    // Back off while the server is unreachable instead of hammering it every 1.5 s.
+    const failures = opened ? 0 : (state.accountWsFailures || 0) + 1;
+
+    state.accountWsFailures = failures;
+
+    const delay = failures === 0 ? 1500 : Math.min(30000, 1500 * 2 ** (failures - 1));
+
+    setTimeout(() => { if (!state.accountWs) connectAccountWs(); }, delay);
+
+  };
+
+  sock.onerror = () => { /* onclose follows and reconnects */ };
+
+  sock.onmessage = (ev: any) => {
+
+    try { handleAccountEvent(JSON.parse(ev.data)); } catch (_) { /* malformed frame */ }
+
+  };
+
+}
+
+function refreshProjectListFromAccount() {
+
+  // Coalesced: a batch delete or a merge announces several times in a row.
+  _debounceRepaint('projects', async () => {
+
+    await loadProjects();
+
+    dismissEmptyAccountWizard();
+
+  });
+
+}
+
+function dismissEmptyAccountWizard() {
+
+  /** The first-run wizard is the empty state of an account with no project, and init stops
+   * there (it returns before restoring any tab). When the first project then appears from
+   * elsewhere -- an agent's create_project is the usual way -- the overlay would sit on top
+   * of a dashboard that has something to show: close it and open the project, as the
+   * wizard's own "advanced" link does. */
+
+  const wizard = document.getElementById('ez-wizard');
+
+  if (!wizard || wizard.style.display !== 'flex' || state.projects.length === 0) return;
+
+  wizard.style.display = 'none';
+
+  restoreTabs();
+
+}
+
+function handleAccountEvent(event: any) {
+
+  // The project LIST changed (a project was created, deleted, merged, renamed, reparented
+  // or re-prioritised, from another tab, an agent or the API). The event names no project:
+  // refetching GET /projects applies this caller's own workspace scoping.
+  if (event.type === 'projects_changed') {
+
+    refreshProjectListFromAccount();
+
+  }
+
+}
+
 function resyncProjectViews(projectId: any) {
 
   /** Bring every view of one project back in step with the server without an event to
@@ -13018,16 +13227,21 @@ function resyncProjectViews(projectId: any) {
 // THE LIVE-VIEW RULE (8a665a03): every mutation publishes exactly one event, and every
 // list view subscribes to it -- and a view that was disconnected resyncs when it
 // reconnects (ws.onopen -> resyncProjectViews), because a missed event is never replayed.
-// Server side the publish is a _publish_project_event / _publish_task / publish_global
-// call on the mutation's path (db layer or route); client side it is a branch below that
-// repaints the view(s) showing that data. Break either half and the view needs a reload
-// to catch up -- the permanently-deleted Backburner row that stayed on screen was a
-// mutation with no event and no branch. A repaint must also keep the view state the user
-// built up (Backburner filter text, scroll, focus): panel state, not the DOM, holds it.
+// Server side the publish is a _publish_project_event / _publish_task / publish_global /
+// _publish_account_event call on the mutation's path (db layer or route); client side it
+// is a branch below that repaints the view(s) showing that data. Break either half and the
+// view needs a reload to catch up -- the permanently-deleted Backburner row that stayed on
+// screen was a mutation with no event and no branch. A repaint must also keep what the user
+// built up on screen: the Backburner filter text, scroll and focus live in panel state, an
+// unsaved Goal / North Star / Sprint edit carries the 'dirty' class that refreshGoal
+// honours, and an open pinned-decision editor makes loadPinnedDecisions skip its paint.
+// Events about the account rather than one project (the project LIST) are not handled here:
+// they arrive on the page's own socket (connectAccountWs), which exists with or without a
+// project tab, and are handled in handleAccountEvent.
 // tests/test_ws_event_coverage.py fails when a server-published event type has no branch
-// here (or an allowlist entry with a reason), when a dashboard-driven mutating route
-// publishes nothing, and when a function that writes sprint_items or projects publishes
-// nothing (or has no allowlist entry with a reason).
+// here or in handleAccountEvent (or an allowlist entry with a reason), when a
+// dashboard-driven mutating route publishes nothing, and when a function that writes
+// sprint_items or projects publishes nothing (or has no allowlist entry with a reason).
 function handleWsEvent(projectId: any, event: any) {
   if (event.type === 'update_available') {
 
@@ -13089,14 +13303,9 @@ function handleWsEvent(projectId: any, event: any) {
     return;
   }
 
-  // The project LIST changed (a project was created, deleted, merged, renamed, reparented
-  // or re-prioritised, from another tab, an agent or the API). The event names no project:
-  // refetching GET /projects applies this caller's own workspace scoping. Coalesced -- a
-  // batch delete or a merge announces several times.
-  if (event.type === 'projects_changed') {
-    _debounceRepaint('projects', () => { loadProjects(); });
-    return;
-  }
+  // (projects_changed -- the project LIST -- is not a project event: it rides the page's
+  // own account socket, connectAccountWs / handleAccountEvent, so it also reaches a
+  // dashboard with no project tab open.)
 
   // THIS project no longer exists: close its tab instead of leaving a panel whose every
   // request now 404s, and refresh the sidebar.
@@ -13133,6 +13342,16 @@ function handleWsEvent(projectId: any, event: any) {
     return;
   }
   if (event.type === 'goal_updated') {
+
+    // set_decision announces {field: 'decisions'}: only the Decisions table changed, so
+    // only it is repainted (coalesced: an agent can log several in a row).
+    if (event.field === 'decisions') {
+
+      _debounceRepaint(`decisions-log:${projectId}`, () => { refreshDecisionsLog(projectId); });
+
+      return;
+
+    }
 
     refreshGoal(projectId);
 
@@ -13404,6 +13623,12 @@ async function restoreTabs() {
       }
     } catch (_) {}
   }
+
+  // 8a665a03 -- the page's own socket for project-list events. Opened before the empty-
+  // account wizard below on purpose: a dashboard with no project (and so no tab, and so no
+  // per-project socket) is exactly the one that must hear a project being created. The
+  // demo has no signed-in tenant, so the server would refuse it.
+  if (!isDemoMode()) connectAccountWs();
 
   if (isDemoMode()) hideDemoAdminControls();
 
@@ -13960,4 +14185,4 @@ function toggleExpand(id: any) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state }); } catch (e: any) {}
+try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, connectAccountWs, handleAccountEvent, dismissEmptyAccountWizard, refreshDecisionsLog, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state }); } catch (e: any) {}

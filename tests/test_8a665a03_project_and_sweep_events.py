@@ -12,8 +12,13 @@ button reaches and no route-level scan can see:
   sweeps, ``release_task``, a claim's resource amendment, the handoff's inferred resources).
 
 Each test fails on the code before this change (nothing is queued) and pins the event's type
-and payload, because the client routes on them (``handleWsEvent`` in
+and payload, because the client routes on them (``handleWsEvent`` / ``handleAccountEvent`` in
 ``meridian/static/dashboard.ts`` and ``meridian/static/live-refresh.test.ts``).
+
+The project LIST rides the ACCOUNT stream (``db.subscribe_account`` -> ``/ws-account``), not
+the per-project streams: a dashboard with no project tab open holds no per-project socket, so
+the first version of this announcement (fanned out to the projects' own streams) never reached
+exactly the dashboards that needed it -- the last tab closed, a brand-new account.
 """
 from __future__ import annotations
 
@@ -60,6 +65,23 @@ class _Subscription:
         return _drain(self.q)
 
 
+class _AccountSubscription:
+    """Subscribe to the account stream (project-list events) of a database for a block."""
+
+    def __init__(self, database: Any) -> None:
+        self.database = database
+        self.q = db_module.subscribe_account(database)
+
+    def __enter__(self) -> "_AccountSubscription":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        db_module.unsubscribe_account(self.database, self.q)
+
+    def events(self) -> list[dict[str, Any]]:
+        return _drain(self.q)
+
+
 def _prime_cache(project_id: str) -> None:
     db_module._SPRINT_ITEMS_CACHE[project_id] = (time.monotonic(), [])
 
@@ -76,70 +98,122 @@ def _cache_busted(project_id: str) -> bool:
 
 
 @pytest.mark.asyncio
-async def test_create_project_announces_projects_changed_to_the_other_projects_streams(db):
-    first = await db_module.create_project(db, "list-first")
-    with _Subscription(first["id"]) as sub:
-        second = await db_module.create_project(db, "list-second-secret-name")
-        events = sub.events()
-    assert _of_type(events, "projects_changed") == [
-        {"type": "projects_changed", "project_id": first["id"], "change": "created"}
-    ]
+async def test_create_project_announces_projects_changed_on_the_account_stream(db):
+    """Subscribed BEFORE any project exists: the empty account is the dashboard that has no
+    project tab and so no per-project socket, and it must still hear the first project."""
+    with _AccountSubscription(db) as acct:
+        created = await db_module.create_project(db, "list-first-secret-name")
+        events = acct.events()
+    assert events == [{"type": "projects_changed", "change": "created"}]
     # The event is a nudge to refetch GET /projects (which applies the caller's scoping):
     # it carries neither the new project's name nor its id.
-    assert "list-second-secret-name" not in json.dumps(events)
-    assert second["id"] not in json.dumps(events)
+    assert "list-first-secret-name" not in json.dumps(events)
+    assert created["id"] not in json.dumps(events)
 
 
 @pytest.mark.asyncio
-async def test_projects_changed_never_reaches_a_stream_outside_the_callers_own_database(db):
-    """Listener registry is process-wide; on hosted Meridian that spans tenants. The list
-    announcement is scoped by listing the CALLER's projects, so another tenant's stream (a
-    project id this database does not contain) must hear nothing -- unlike publish_global."""
-    first = await db_module.create_project(db, "scope-first")
-    foreign = db_module.subscribe_tasks("another-tenants-project")
+async def test_projects_changed_is_not_also_published_on_the_project_streams(db):
+    """One carrier per event: the page's account socket delivers the project list, so a page
+    with N project tabs does not hear every change N + 1 times."""
+    first = await db_module.create_project(db, "carrier-first")
+    with _Subscription(first["id"]) as sub, _AccountSubscription(db) as acct:
+        await db_module.create_project(db, "carrier-second")
+        await db_module.rename_project(db, first["id"], "carrier-first-renamed")
+        assert _of_type(sub.events(), "projects_changed") == []
+        assert [e["change"] for e in acct.events()] == ["created", "renamed"]
+
+
+@pytest.mark.asyncio
+async def test_projects_changed_never_reaches_a_socket_reading_another_database(db):
+    """On hosted Meridian every tenant's listeners share one process. The account stream is
+    keyed by the DATABASE the caller reads, so a socket on another tenant's database hears
+    nothing -- unlike publish_global -- and vice versa."""
+    other = await db_module.init_db(":memory:")
     try:
-        await db_module.create_project(db, "scope-second")
-        await db_module.rename_project(db, first["id"], "scope-first-renamed")
-        assert _drain(foreign) == []
+        with _AccountSubscription(db) as mine, _AccountSubscription(other) as theirs:
+            first = await db_module.create_project(db, "scope-first")
+            await db_module.rename_project(db, first["id"], "scope-first-renamed")
+            assert [e["change"] for e in mine.events()] == ["created", "renamed"]
+            assert theirs.events() == []
+            await db_module.create_project(other, "their-project")
+            assert [e["change"] for e in theirs.events()] == ["created"]
+            assert mine.events() == []
     finally:
-        db_module.unsubscribe_tasks("another-tenants-project", foreign)
+        await other.close()
+
+
+@pytest.mark.asyncio
+async def test_account_stream_registry_unsubscribes_and_is_safe_to_unsubscribe_twice(db):
+    """A closed socket must stop receiving (and stop keeping the database object alive)."""
+    q = db_module.subscribe_account(db)
+    db_module.unsubscribe_account(db, q)
+    db_module.unsubscribe_account(db, q)  # idempotent
+    await db_module.create_project(db, "after-unsubscribe")
+    assert _drain(q) == []
+    assert id(db) not in db_module._ACCOUNT_LISTENERS
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_account_socket_never_blocks_or_breaks_the_writer(db):
+    """A queue that refuses the event (a socket that stopped reading) drops it and warns;
+    the mutation itself still succeeds."""
+
+    class _Full(asyncio.Queue):
+        def put_nowait(self, item):  # noqa: D401 - test double
+            raise asyncio.QueueFull
+
+    wedged = _Full()
+    db_module._ACCOUNT_LISTENERS.setdefault(id(db), (db, set()))[1].add(wedged)
+    try:
+        created = await db_module.create_project(db, "wedged-socket")
+        assert created["name"] == "wedged-socket"
+    finally:
+        db_module.unsubscribe_account(db, wedged)
 
 
 def test_create_project_route_publishes_projects_changed(client):
-    existing = client.post("/projects", json={"name": f"list-{os.urandom(3).hex()}"}).json()
-    with _Subscription(existing["id"]) as sub:
+    with _AccountSubscription(client.app.state.db) as acct:
         r = client.post("/projects", json={"name": f"list-{os.urandom(3).hex()}"})
         assert r.status_code == 201
-        assert [e["change"] for e in _of_type(sub.events(), "projects_changed")] == ["created"]
+        assert [e["change"] for e in acct.events()] == ["created"]
 
 
 def test_delete_project_route_tells_the_deleted_stream_and_the_survivors(client):
     keep = client.post("/projects", json={"name": f"keep-{os.urandom(3).hex()}"}).json()
     gone = client.post("/projects", json={"name": f"gone-{os.urandom(3).hex()}"}).json()
-    with _Subscription(keep["id"]) as sub_keep, _Subscription(gone["id"]) as sub_gone:
+    with (
+        _Subscription(keep["id"]) as sub_keep,
+        _Subscription(gone["id"]) as sub_gone,
+        _AccountSubscription(client.app.state.db) as acct,
+    ):
         assert client.delete(f"/projects/{gone['id']}").status_code == 204
         keep_events = sub_keep.events()
         gone_events = sub_gone.events()
-    # Its own tab learns the project is gone (and nothing else could reach it: the row is
-    # no longer in the table the list announcement is built from).
+        account_events = acct.events()
+    # Its own tab learns the project is gone (the account stream cannot say WHICH project:
+    # the event names none, so the tab showing it closes on this one)...
     assert _of_type(gone_events, "project_deleted") == [{"type": "project_deleted", "project_id": gone["id"]}]
-    assert _of_type(gone_events, "projects_changed") == []
-    assert _of_type(keep_events, "projects_changed") == [
-        {"type": "projects_changed", "project_id": keep["id"], "change": "deleted"}
-    ]
+    # ...and every page, tab or no tab, refetches the list.
+    assert account_events == [{"type": "projects_changed", "change": "deleted"}]
     assert _of_type(keep_events, "project_deleted") == []
+    assert _of_type(keep_events, "projects_changed") == []
 
 
 def test_batch_delete_route_announces_every_deleted_project(client):
     keep = client.post("/projects", json={"name": f"bkeep-{os.urandom(3).hex()}"}).json()
     a = client.post("/projects", json={"name": f"ba-{os.urandom(3).hex()}"}).json()
     b = client.post("/projects", json={"name": f"bb-{os.urandom(3).hex()}"}).json()
-    with _Subscription(a["id"]) as sub_a, _Subscription(b["id"]) as sub_b, _Subscription(keep["id"]) as sub_keep:
+    assert keep["id"]
+    with (
+        _Subscription(a["id"]) as sub_a,
+        _Subscription(b["id"]) as sub_b,
+        _AccountSubscription(client.app.state.db) as acct,
+    ):
         r = client.delete(f"/projects?project_id={a['id']}&project_id={b['id']}")
         assert r.status_code == 200
         assert [e["project_id"] for e in _of_type(sub_a.events(), "project_deleted")] == [a["id"]]
         assert [e["project_id"] for e in _of_type(sub_b.events(), "project_deleted")] == [b["id"]]
-        assert len(_of_type(sub_keep.events(), "projects_changed")) == 1
+        assert len(_of_type(acct.events(), "projects_changed")) == 1
 
 
 @pytest.mark.asyncio
@@ -150,12 +224,13 @@ async def test_a_refused_delete_publishes_nothing(db):
     s = await db_module.register_session(db, p["id"], "busy-s")
     task = await db_module.log_task(db, s["id"], p["id"], "in flight", "pending")
     await db_module.claim_task(db, task["id"], s["id"])
-    with _Subscription(p["id"]) as sub, _Subscription(other["id"]) as sub_other:
+    with _Subscription(p["id"]) as sub, _Subscription(other["id"]) as sub_other, _AccountSubscription(db) as acct:
         _drain(sub.q)
         _drain(sub_other.q)
+        _drain(acct.q)
         with pytest.raises(ValueError):
             await db_module.delete_project(db, p["id"])
-        assert sub.events() == [] and sub_other.events() == []
+        assert sub.events() == [] and sub_other.events() == [] and acct.events() == []
     assert await db_module.get_project(db, p["id"]) is not None
 
 
@@ -166,12 +241,13 @@ async def test_mcp_path_create_rename_reparent_status_all_announce(db):
     anchor = await db_module.create_project(db, "mcp-anchor")
     other = await db_module.create_project(db, "mcp-other")
     child = await db_module.create_project(db, "mcp-child")
-    with _Subscription(anchor["id"]) as sub:
+    assert anchor["id"]
+    with _AccountSubscription(db) as acct:
         await db_module.rename_project(db, other["id"], "mcp-other-renamed")
         await db_module.set_parent_project(db, child["id"], other["id"])
         await db_module.set_project_status(db, other["id"], status="parked")
         await db_module.set_project_status(db, other["id"])  # nothing to change: silent
-        changes = [e["change"] for e in _of_type(sub.events(), "projects_changed")]
+        changes = [e["change"] for e in _of_type(acct.events(), "projects_changed")]
     assert changes == ["renamed", "reparented", "organization"]
 
 
@@ -182,11 +258,12 @@ async def test_merge_project_resyncs_both_streams_and_busts_both_caches(db):
     await db_module.add_sprint_item(db, src["id"], "v1", "moves with the merge")
     _prime_cache(src["id"])
     _prime_cache(tgt["id"])
-    with _Subscription(src["id"]) as sub_src, _Subscription(tgt["id"]) as sub_tgt:
+    with _Subscription(src["id"]) as sub_src, _Subscription(tgt["id"]) as sub_tgt, _AccountSubscription(db) as acct:
         result = await db_module.merge_project(db, src["id"], tgt["id"])
         assert "error" not in result
         src_events = sub_src.events()
         tgt_events = sub_tgt.events()
+        account_events = acct.events()
     for pid, events in ((src["id"], src_events), (tgt["id"], tgt_events)):
         assert _of_type(events, "project_merged") == [
             {
@@ -194,17 +271,17 @@ async def test_merge_project_resyncs_both_streams_and_busts_both_caches(db):
                 "source_project_id": src["id"], "target_project_id": tgt["id"],
             }
         ]
-        assert [e["change"] for e in _of_type(events, "projects_changed")] == ["merged"]
+    assert [e["change"] for e in _of_type(account_events, "projects_changed")] == ["merged"]
     assert _cache_busted(src["id"]) and _cache_busted(tgt["id"])
 
 
 @pytest.mark.asyncio
 async def test_a_refused_merge_publishes_nothing(db):
     p = await db_module.create_project(db, "merge-self")
-    with _Subscription(p["id"]) as sub:
+    with _Subscription(p["id"]) as sub, _AccountSubscription(db) as acct:
         assert "error" in await db_module.merge_project(db, p["id"], p["id"])
         assert "error" in await db_module.merge_project(db, p["id"], "no-such-project")
-        assert sub.events() == []
+        assert sub.events() == [] and acct.events() == []
 
 
 @pytest.mark.asyncio

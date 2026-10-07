@@ -9,10 +9,11 @@ turned up in the audit. These tests make the rule structural so the next one can
 in unnoticed:
 
 1. Every WebSocket event type the server publishes (``_publish_project_event``,
-   ``_publish_task``, ``publish_global`` anywhere under ``meridian/``) has a branch in
-   ``handleWsEvent`` in ``meridian/static/dashboard.ts`` -- or is on
-   ``UNSUBSCRIBED_EVENTS`` below with the reason nothing on screen shows it. And the
-   reverse: a branch for an event nothing publishes is a typo or dead code.
+   ``_publish_task``, ``publish_global``, ``_publish_account_event`` anywhere under
+   ``meridian/``) has a branch in ``handleWsEvent`` (per-project socket) or
+   ``handleAccountEvent`` (the page's own account socket) in ``meridian/static/dashboard.ts``
+   -- or is on ``UNSUBSCRIBED_EVENTS`` below with the reason nothing on screen shows it. And
+   the reverse: a branch for an event nothing publishes is a typo or dead code.
 2. Every mutating route under ``meridian/routes/`` that the dashboard calls, and that
    changes project-scoped data a WebSocket-fed view lists, publishes an event on its
    path -- or is on ``SILENT_ROUTES`` below with the reason that is acceptable. The
@@ -59,7 +60,7 @@ ROUTES = PKG / "routes"
 DB = PKG / "db"
 STATIC = PKG / "static"
 
-PUBLISH_CALLS = {"_publish_project_event", "_publish_task", "publish_global"}
+PUBLISH_CALLS = {"_publish_project_event", "_publish_task", "publish_global", "_publish_account_event"}
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ def _event_type_from_call(call: ast.Call) -> tuple[str | None, bool]:
     name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
     if name not in PUBLISH_CALLS:
         return None, False
-    if name == "_publish_project_event":
+    if name in ("_publish_project_event", "_publish_account_event"):
         arg = call.args[1] if len(call.args) > 1 else None
     elif name == "_publish_task":
         arg = call.args[0] if call.args else None
@@ -130,15 +131,22 @@ def _published_event_types() -> tuple[dict[str, list[str]], list[str]]:
     return found, dynamic
 
 
-def _handle_ws_event_source() -> str:
+def _client_function_source(name: str) -> str:
     src = (STATIC / "dashboard.ts").read_text(encoding="utf-8").replace("\r", "")
-    m = re.search(r"^function handleWsEvent\(.*?^\}", src, re.S | re.M)
-    assert m, "handleWsEvent not found in meridian/static/dashboard.ts"
+    m = re.search(rf"^function {name}\(.*?^\}}", src, re.S | re.M)
+    assert m, f"{name} not found in meridian/static/dashboard.ts"
     return m.group(0)
 
 
+def _handle_ws_event_source() -> str:
+    return _client_function_source("handleWsEvent")
+
+
 def _client_handled_types() -> set[str]:
-    return set(re.findall(r"event\.type === '([A-Za-z_]+)'", _handle_ws_event_source()))
+    """Event types with a branch in handleWsEvent (a project's socket) or handleAccountEvent
+    (the page's own account socket)."""
+    src = _handle_ws_event_source() + "\n" + _client_function_source("handleAccountEvent")
+    return set(re.findall(r"event\.type === '([A-Za-z_]+)'", src))
 
 
 def test_published_event_types_are_all_statically_known():
@@ -178,6 +186,52 @@ def test_every_client_event_branch_matches_a_published_type():
     orphans = sorted(_client_handled_types() - set(published))
     assert not orphans, (
         f"handleWsEvent has branches for event types no server code publishes: {orphans}"
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _account_event_types() -> set[str]:
+    """Types published through ``_publish_account_event`` (they travel on ``/ws-account``)."""
+    found: set[str] = set()
+    for path in sorted(PKG.rglob("*.py")):
+        if "static" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "_publish_account_event" not in text:
+            continue
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
+            if name == "_publish_account_event" and len(node.args) > 1:
+                arg = node.args[1]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    found.add(arg.value)
+    return found
+
+
+def test_account_events_are_handled_on_the_account_socket_not_the_project_one():
+    """The page has two kinds of socket: one per project tab (handleWsEvent) and its own
+    account socket (handleAccountEvent). An event travels on exactly one, so a branch in the
+    other function is a handler that can never fire -- which is how ``projects_changed`` sat
+    in handleWsEvent, invisible to a dashboard with no tab open."""
+    account = _account_event_types()
+    assert "projects_changed" in account, "the account stream publishes nothing -- scan broken?"
+    on_account_socket = set(
+        re.findall(r"event\.type === '([A-Za-z_]+)'", _client_function_source("handleAccountEvent"))
+    )
+    on_project_socket = set(re.findall(r"event\.type === '([A-Za-z_]+)'", _handle_ws_event_source()))
+    assert account <= on_account_socket, (
+        f"account-stream events with no handleAccountEvent branch: {sorted(account - on_account_socket)}"
+    )
+    assert not (account & on_project_socket), (
+        "handleWsEvent has a branch for an event that is published on the account stream, "
+        f"which never reaches it: {sorted(account & on_project_socket)}"
+    )
+    assert on_account_socket <= account, (
+        "handleAccountEvent has branches nothing publishes on the account stream: "
+        f"{sorted(on_account_socket - account)}"
     )
 
 

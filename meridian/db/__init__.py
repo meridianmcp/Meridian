@@ -170,34 +170,74 @@ def _publish_project_event(project_id: str, event_type: str, payload: dict[str, 
             _log.warning("WS broadcast queue full for project %s — event dropped", project_id[:8])
 
 
-async def _publish_projects_changed(db: aiosqlite.Connection, change: str) -> None:
+# 8a665a03 -- the ACCOUNT stream. ``_TASK_LISTENERS`` is keyed by project_id and a dashboard
+# opens one socket per open project TAB, so a dashboard with no project tab open (the last
+# one closed, a fresh account) held no socket at all and never heard that the project LIST
+# changed. This registry is keyed by the DATABASE the dashboard reads instead: self-hosted
+# has one database, hosted has one per tenant (and a workspace member reads the owner's).
+# An announcement published for a database therefore reaches exactly the sockets whose
+# caller can read that database's project list -- the boundary GET /projects applies --
+# and never another tenant's, which the process-wide per-project registry cannot promise.
+# The entry holds the database object itself so its ``id()`` cannot be recycled for another
+# connection while a socket is still registered under it.
+_ACCOUNT_LISTENERS: dict[int, tuple[Any, set[asyncio.Queue]]] = {}
+
+
+def subscribe_account(db: Any) -> asyncio.Queue:
+    """Register a listener queue for the account-level stream of ``db``'s project list."""
+    q: asyncio.Queue = asyncio.Queue()
+    _ACCOUNT_LISTENERS.setdefault(id(db), (db, set()))[1].add(q)
+    return q
+
+
+def unsubscribe_account(db: Any, queue: asyncio.Queue) -> None:
+    """Drop a listener registered by :func:`subscribe_account`. Safe to call twice."""
+    entry = _ACCOUNT_LISTENERS.get(id(db))
+    if entry and queue in entry[1]:
+        entry[1].discard(queue)
+        if not entry[1]:
+            _ACCOUNT_LISTENERS.pop(id(db), None)
+
+
+def _publish_account_event(db: Any, event_type: str, payload: dict[str, Any]) -> None:
+    """Fan an account-level event out to the sockets reading ``db``'s project list.
+
+    Synchronous and non-blocking like :func:`_publish_project_event`: a full queue means
+    the socket is wedged, so the event is dropped rather than back-pressuring the writer.
+    """
+    entry = _ACCOUNT_LISTENERS.get(id(db))
+    if not entry:
+        return
+    event = {"type": event_type, **payload}
+    for q in list(entry[1]):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            _log.warning("account WS broadcast queue full -- %s event dropped", event_type)
+
+
+def _publish_projects_changed(db: aiosqlite.Connection, change: str) -> None:
     """8a665a03 -- tell every open dashboard that the PROJECT LIST changed.
 
     The sidebar's project list is a view like any other, but a project is not owned by any
     one project's event stream: creating one has no listeners yet and deleting one removes
-    the very stream it would be announced on. So this fans a ``projects_changed`` event out
-    to the listeners of every project that is in ``db``'s own projects table -- the
-    dashboards that can show this list -- and the client refetches ``GET /projects`` (which
+    the very stream it would be announced on. So it rides the account stream of ``db``
+    (see ``_ACCOUNT_LISTENERS``), which the dashboard holds open for as long as the page
+    is, with or without a project tab. The client refetches ``GET /projects`` (which
     applies the caller's workspace scoping), so the event carries no project name or id.
 
     It deliberately does NOT use :func:`publish_global`: ``_TASK_LISTENERS`` is one
     process-wide registry, so on hosted Meridian a global event reaches every tenant's open
-    dashboards. ``db`` is the caller's own database (the tenant's own Neon DB on hosted), so
-    listing its projects is what keeps the announcement inside the tenant. Call it AFTER
-    the change commits: a deleted project is gone from the table and is told separately
-    (``project_deleted``, on its own stream). Best effort: an announcement failure must
-    never undo the change that already committed.
+    dashboards. ``db`` is the caller's own database (the tenant's own Neon DB on hosted),
+    which is what keeps the announcement inside the tenant. Call it AFTER the change
+    commits; a deleted project is told separately (``project_deleted``, on its own stream)
+    so the tab showing it can close. Never raises: an announcement failure must never undo
+    the change that already committed.
     """
     try:
-        async with db.execute("SELECT id FROM projects") as cur:
-            rows = await cur.fetchall()
-        targets = {(_row_to_dict(r) or {}).get("id") for r in rows}
+        _publish_account_event(db, "projects_changed", {"change": change})
     except Exception:  # noqa: BLE001 -- notification only
-        _log.debug("projects_changed: could not list projects", exc_info=True)
-        return
-    for pid in targets:
-        if pid:
-            _publish_project_event(pid, "projects_changed", {"change": change})
+        _log.debug("projects_changed: could not announce", exc_info=True)
 
 
 CREATE_TABLES = """
@@ -1283,7 +1323,7 @@ async def create_project(
     project = await get_project(db, pid)
     assert project is not None
     # 8a665a03 -- another open dashboard's sidebar never learned of the new project.
-    await _publish_projects_changed(db, "created")
+    _publish_projects_changed(db, "created")
     return project
 
 
@@ -1389,7 +1429,7 @@ async def set_project_status(
         )
         await db.commit()
         # 8a665a03 -- status / priority decide how the sidebar groups and badges a project.
-        await _publish_projects_changed(db, "organization")
+        _publish_projects_changed(db, "organization")
     return await get_project(db, project_id)
 
 
@@ -1490,7 +1530,7 @@ async def rename_project(
     await db.commit()
     # 8a665a03 -- the REST route also publishes project_renamed (it updates the open tab
     # label at once); this covers the MCP rename_project tool, which had no announcement.
-    await _publish_projects_changed(db, "renamed")
+    _publish_projects_changed(db, "renamed")
     return await get_project(db, project_id)
 
 
@@ -1546,7 +1586,7 @@ async def set_parent_project(
     await db.commit()
     # 8a665a03 -- see rename_project: the REST route publishes project_parent_changed,
     # the MCP set_parent_project tool published nothing.
-    await _publish_projects_changed(db, "reparented")
+    _publish_projects_changed(db, "reparented")
     return await get_project(db, project_id)
 
 
@@ -1669,7 +1709,7 @@ async def merge_project(
             _pid, "project_merged",
             {"source_project_id": source_project_id, "target_project_id": target_project_id},
         )
-    await _publish_projects_changed(conn, "merged")
+    _publish_projects_changed(conn, "merged")
 
     return {
         "source_project_id": source_project_id,
@@ -2441,7 +2481,7 @@ async def delete_project(
     for _pid in project_ids:
         _invalidate_sprint_items_cache(_pid)
         _publish_project_event(_pid, "project_deleted", {})
-    await _publish_projects_changed(db, "deleted")
+    _publish_projects_changed(db, "deleted")
 
 
 def _stale_collapse_map(

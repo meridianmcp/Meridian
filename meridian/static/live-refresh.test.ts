@@ -1047,19 +1047,10 @@ describe("handleWsEvent: project list events", () => {
     return { state, m };
   };
 
-  it("projects_changed refetches the project list (another tab created / deleted a project)", () => {
-    const { m } = run({ type: "projects_changed", change: "created" });
-    expect(m.loadProjects).toHaveBeenCalledTimes(1);
-  });
-
-  it("a burst of projects_changed (batch delete, merge) refetches once", () => {
-    const state = makeState("queue");
-    const m = makeMocks(state);
-    const { handleWsEvent } = load(["handleWsEvent", "_debounceRepaint"], m);
-    for (let i = 0; i < 10; i++) handleWsEvent(PID, { type: "projects_changed", change: "deleted" });
-    vi.advanceTimersByTime(300);
-    expect(m.loadProjects).toHaveBeenCalledTimes(1);
-  });
+  // projects_changed is the PROJECT LIST, not a project's data: it rides the page's own
+  // account socket (connectAccountWs -> handleAccountEvent), which exists with no project tab
+  // open. Its routing is pinned in live-refresh-account-socket.test.ts, and that a project's
+  // own stream no longer carries it in tests/test_8a665a03_project_and_sweep_events.py.
 
   it("project_deleted closes the open tab for that project, says so, and refreshes the list", () => {
     const { m } = run({ type: "project_deleted", project_id: PID });

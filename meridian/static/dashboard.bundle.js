@@ -10093,6 +10093,7 @@ ${n2.tags || ""}`.toLowerCase();
         } catch (_2) {
         }
       });
+      connectAccountWs();
       await loadProjects();
       const active = workspaces.find((w3) => w3.tenant_id === chosen);
       sel.title = active ? active.is_own ? "My workspace" : `${active.owner_email} (${active.role})` : "";
@@ -16658,7 +16659,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const goalPath = `/projects/${projectId}/goal`;
     try {
       const goal = await projectApi(projectId, goalPath);
+      const keepGoalEdit = ta.classList.contains("dirty");
       state.panels[projectId].goalRaw = goal.content;
+      state.panels[projectId]._goalLoaded = true;
       let text;
       if (typeof goal.content === "string") {
         state.panels[projectId].goalIsJson = false;
@@ -16690,11 +16693,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           shippedEl2.textContent = body.slice(0, editStart).trimEnd();
           shippedEl2.style.display = shippedEl2.textContent.trim() ? "block" : "none";
         }
-        ta.value = body.slice(editStart);
+        if (!keepGoalEdit) ta.value = body.slice(editStart);
       } else {
         const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
         if (shippedEl2) shippedEl2.style.display = "none";
-        ta.value = body;
+        if (!keepGoalEdit) ta.value = body;
       }
       const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
       if (shippedEl && !shippedEl.textContent.trim()) shippedEl.style.display = "none";
@@ -16717,17 +16720,19 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       if (vState) vState.textContent = `v${goal.version}`;
       const nsTA = document.getElementById(`goal-north-star-${projectId}`);
       const spTA = document.getElementById(`goal-sprint-${projectId}`);
-      if (nsTA && "north_star" in goal) {
+      const keepNsEdit = !!nsTA && nsTA.classList.contains("dirty");
+      const keepSpEdit = !!spTA && spTA.classList.contains("dirty");
+      if (nsTA && "north_star" in goal && !keepNsEdit) {
         nsTA.value = goal.north_star || "";
         autosizeGoalField(nsTA);
       }
-      if (spTA && "sprint" in goal) {
+      if (spTA && "sprint" in goal && !keepSpEdit) {
         spTA.value = goal.sprint || "";
         if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || "");
       }
       const p3 = state.panels[projectId];
-      p3._serverNorthStar = goal.north_star || "";
-      p3._serverSprint = goal.sprint || "";
+      if (!keepNsEdit) p3._serverNorthStar = goal.north_star || "";
+      if (!keepSpEdit) p3._serverSprint = goal.sprint || "";
       const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
       if (nsLock) nsLock.textContent = goal.north_star ? "locked" : "unlocked";
       const nsInherited = document.getElementById(`goal-ns-inherited-${projectId}`);
@@ -16745,14 +16750,16 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           nsInherited.style.display = "none";
         }
       }
-      p3._lastSaved = text;
-      if (nsTA) {
+      if (!keepGoalEdit) {
+        p3._lastSaved = text;
+        ta.classList.remove("dirty");
+      }
+      if (nsTA && !keepNsEdit) {
         nsTA.classList.remove("dirty");
       }
-      if (spTA) {
+      if (spTA && !keepSpEdit) {
         spTA.classList.remove("dirty");
       }
-      ta.classList.remove("dirty");
       const tsNs = document.getElementById(`goal-ns-ts-${projectId}`);
       const tsVg = document.getElementById(`goal-vg-ts-${projectId}`);
       const tsSp = document.getElementById(`goal-sp-ts-${projectId}`);
@@ -16763,11 +16770,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       renderDecisionsTable(projectId, goal.decisions || "");
       loadPinnedDecisions(projectId);
     } catch (e3) {
+      const loadedBefore = !!(state.panels[projectId] && state.panels[projectId]._goalLoaded);
+      if (loadedBefore || ta.classList.contains("dirty")) return;
       ta.value = "";
       ta.placeholder = "Goal state failed to load.";
       v3.textContent = "(load failed)";
       const titleEl = document.getElementById(`goal-title-${projectId}`);
       if (titleEl) titleEl.textContent = "Goal state unavailable";
+    }
+  }
+  async function refreshDecisionsLog(projectId) {
+    if (!document.getElementById(`decisions-table-${projectId}`)) return;
+    try {
+      const goal = await projectApi(projectId, `/projects/${projectId}/goal`);
+      renderDecisionsTable(projectId, goal.decisions || "");
+    } catch (_2) {
     }
   }
   function parseDecisionsBlob(blob) {
@@ -17054,6 +17071,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       getPanelState(projectId)._pinnedDecisions = items || [];
       setVtabCountBadge2(`.decisions-gtab-badge[data-pid="${projectId}"]`, (items || []).length);
       renderConstitutionWarning2(projectId);
+      if (Array.from(host.querySelectorAll(".decision-edit-area")).some((el2) => el2.style.display === "block")) return;
       if (!items || items.length === 0) {
         host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet \u2014 call <code>pin_decision</code> from MCP)</div>`;
         return;
@@ -17183,7 +17201,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         };
       });
       host.querySelectorAll(".decision-edit-cancel").forEach((btn) => {
-        btn.onclick = () => hideEdit(btn.dataset.id);
+        btn.onclick = () => {
+          hideEdit(btn.dataset.id);
+          loadPinnedDecisions(projectId, { showArchived });
+        };
       });
       host.querySelectorAll(".decision-edit-save").forEach((btn) => {
         btn.onclick = async () => {
@@ -17539,7 +17560,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
     const shippedText = shippedEl2 && shippedEl2.style.display !== "none" && shippedEl2.textContent ? "\n" + shippedEl2.textContent + "\n" : "";
     const raw = titleLine + shippedText + ta.value + autoBlocksText;
-    if (raw === state.panels[projectId]._lastSaved) return;
+    if (raw === state.panels[projectId]._lastSaved) {
+      ta.classList.remove("dirty");
+      return;
+    }
+    const sentGoalValue = ta.value;
     let content = raw;
     if (state.panels[projectId].goalIsJson) {
       try {
@@ -17550,6 +17575,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     try {
       await api(`/projects/${projectId}/goal`, { method: "POST", body: JSON.stringify({ content }) });
       state.panels[projectId]._lastSaved = raw;
+      if (ta.value === sentGoalValue) ta.classList.remove("dirty");
       toast("version goal saved");
       refreshGoal(projectId);
     } catch (e3) {
@@ -17575,6 +17601,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         method: "POST",
         body: JSON.stringify({ north_star: val, human_id: humanId || "owner" })
       });
+      if (ta.value.trim() === val) ta.classList.remove("dirty");
       toast("north star saved");
       refreshGoal(projectId);
     } catch (e3) {
@@ -17588,11 +17615,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const rawVal = ta.style.display === "none" && sel && sel.value && sel.value !== "__custom__" ? sel.value : ta.value;
     const val = rawVal.trim();
     if (!val) return;
+    const sentSprintValue = ta.value;
     try {
       await api(`/projects/${projectId}/goal/sprint`, {
         method: "POST",
         body: JSON.stringify({ sprint: val })
       });
+      if (ta.value === sentSprintValue) ta.classList.remove("dirty");
       toast("sprint saved");
       refreshGoal(projectId);
     } catch (e3) {
@@ -17893,6 +17922,67 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     };
     state.panels[projectId].ws = ws;
   }
+  function connectAccountWs() {
+    const previous = state.accountWs;
+    state.accountWs = null;
+    if (previous) {
+      try {
+        previous.close();
+      } catch (_2) {
+      }
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const workspace = state.activeWorkspaceTenantId ? `?workspace=${encodeURIComponent(state.activeWorkspaceTenantId)}` : "";
+    let sock;
+    try {
+      sock = new WebSocket(`${proto}//${location.host}/ws-account${workspace}`);
+    } catch (_2) {
+      return;
+    }
+    state.accountWs = sock;
+    let opened = false;
+    sock.onopen = () => {
+      opened = true;
+      state.accountWsFailures = 0;
+      refreshProjectListFromAccount();
+    };
+    sock.onclose = (ev) => {
+      if (state.accountWs !== sock) return;
+      state.accountWs = null;
+      if (ev && ev.code === 4401) return;
+      const failures = opened ? 0 : (state.accountWsFailures || 0) + 1;
+      state.accountWsFailures = failures;
+      const delay = failures === 0 ? 1500 : Math.min(3e4, 1500 * 2 ** (failures - 1));
+      setTimeout(() => {
+        if (!state.accountWs) connectAccountWs();
+      }, delay);
+    };
+    sock.onerror = () => {
+    };
+    sock.onmessage = (ev) => {
+      try {
+        handleAccountEvent(JSON.parse(ev.data));
+      } catch (_2) {
+      }
+    };
+  }
+  function refreshProjectListFromAccount() {
+    _debounceRepaint("projects", async () => {
+      await loadProjects();
+      dismissEmptyAccountWizard();
+    });
+  }
+  function dismissEmptyAccountWizard() {
+    const wizard = document.getElementById("ez-wizard");
+    if (!wizard || wizard.style.display !== "flex" || state.projects.length === 0) return;
+    wizard.style.display = "none";
+    restoreTabs();
+  }
+  function handleAccountEvent(event) {
+    if (event.type === "projects_changed") {
+      refreshProjectListFromAccount();
+    }
+  }
   function resyncProjectViews(projectId) {
     const panel = state.panels[projectId];
     if (!panel) return;
@@ -17951,12 +18041,6 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       loadProjects();
       return;
     }
-    if (event.type === "projects_changed") {
-      _debounceRepaint("projects", () => {
-        loadProjects();
-      });
-      return;
-    }
     if (event.type === "project_deleted") {
       if (state.tabs.some((t3) => t3.id === projectId)) {
         if (!(state.deletingProjects && state.deletingProjects[projectId])) toast("This project was deleted");
@@ -17983,6 +18067,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       return;
     }
     if (event.type === "goal_updated") {
+      if (event.field === "decisions") {
+        _debounceRepaint(`decisions-log:${projectId}`, () => {
+          refreshDecisionsLog(projectId);
+        });
+        return;
+      }
       refreshGoal(projectId);
       return;
     }
@@ -18132,6 +18222,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       } catch (_2) {
       }
     }
+    if (!isDemoMode()) connectAccountWs();
     if (isDemoMode()) hideDemoAdminControls();
     if (isHostedMode()) hideHostedAdminControls();
     if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher2();
@@ -18363,7 +18454,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state });
+    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, connectAccountWs, handleAccountEvent, dismissEmptyAccountWizard, refreshDecisionsLog, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state });
   } catch (e3) {
   }
 })();
