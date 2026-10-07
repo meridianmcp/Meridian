@@ -108,7 +108,8 @@
     standard: "Standard",
     pro: "Pro",
     trial: "Trial",
-    admin: "Admin"
+    admin: "Admin",
+    playtester: "Playtester"
   };
   var QUEUE_DONE_PAGE_SIZE2 = 10;
   var SESSION_LIVE_WINDOW_MS = 10 * 60 * 1e3;
@@ -1514,7 +1515,7 @@
   }
   if (typeof window !== "undefined") window._sprintHistoryBadges = _sprintHistoryBadges;
   function _renderPlanBadge2(me) {
-    const planColors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af" };
+    const planColors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", playtester: "#0891b2" };
     const planLabels = _PLAN_LABELS;
     const plan = me.is_internal || me.is_admin ? "admin" : me.plan || "free";
     const verEl = document.getElementById("server-version");
@@ -1522,13 +1523,13 @@
       const badge = document.createElement("span");
       badge.id = "plan-badge";
       const badgeColor = planColors[plan] || "#9ca3af";
-      const badgeLabel = plan === "free" && me.days_remaining != null ? `Free \xB7 ${me.days_remaining}d left` : planLabels[plan] || plan;
+      const badgeLabel = plan === "free" && me.days_remaining != null ? `Free \xB7 ${me.days_remaining}d left` : plan === "playtester" && me.days_remaining != null && !me.expired ? `Playtester \xB7 ${me.days_remaining}d left` : planLabels[plan] || plan;
       badge.title = `${planLabels[plan] || plan} plan`;
       badge.style = `margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${badgeColor}22;color:${badgeColor};border:1px solid ${badgeColor}44;vertical-align:middle`;
       badge.textContent = badgeLabel;
       verEl.parentNode.insertBefore(badge, verEl.nextSibling);
     }
-    const noUpgrade = plan === "admin" || !!me.is_internal;
+    const noUpgrade = plan === "admin" || plan === "playtester" || !!me.is_internal;
     const planBadge = document.getElementById("plan-badge");
     if (planBadge && !document.getElementById("billing-link")) {
       const hasStripe = !!me.has_stripe_customer;
@@ -2776,7 +2777,7 @@
     if (window.state.tenantEmail) {
       const plan = window.state.tenantPlan || "free";
       const hasStripe = !!window.state.tenantHasStripe;
-      const noUpgrade = plan === "admin" || !!window.state.tenantIsInternal;
+      const noUpgrade = plan === "admin" || plan === "playtester" || !!window.state.tenantIsInternal;
       let billingBtn = "";
       if (hasStripe) {
         billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing \u2192</button>`;
@@ -2799,6 +2800,10 @@
         }
         const payLink = window.state.serverConfig?.stripe_payment_link || "/pricing";
         resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
+      }
+      if (plan === "playtester" && !window.state.tenantIsInternal && (expiresAt || window.state.tenantExpired)) {
+        const ptDate = expiresAt ? String(expiresAt).slice(0, 10) : "";
+        expiryLine = window.state.tenantExpired ? `<div style="color:#f87171">Playtester access ended${ptDate ? ` on ${escapeHtml(ptDate)}` : ""}.</div>` : `<div>Playtester access ends${ptDate ? ` on <span style="color:var(--text)">${escapeHtml(ptDate)}</span>` : ""}${days != null ? ` <span style="color:var(--muted)">(${days} day${days === 1 ? "" : "s"} left)</span>` : ""}.</div>`;
       }
       out += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
@@ -5519,6 +5524,10 @@ project_id = "${displayPid}"`;
             <span id="caps-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;align-self:flex-end"></span>
 
           </div>`;
+            if (u4.overage_billing === false) {
+              const capsRow = document.getElementById(`save-caps-${projectId}`)?.parentElement;
+              if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; usage past the grace allowance is restricted.</span>';
+            }
             const saveBtn = document.getElementById(`save-caps-${projectId}`);
             const capsStatus = document.getElementById(`caps-status-${projectId}`);
             if (saveBtn) {
@@ -10716,7 +10725,7 @@ ${n2.tags || ""}`.toLowerCase();
       wrap.appendChild(badge);
     }
     const active = (workspaces || []).find((w3) => state.activeWorkspaceTenantId ? w3.tenant_id === state.activeWorkspaceTenantId : w3.is_own);
-    const colors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", invite: "#f59e0b" };
+    const colors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", playtester: "#0891b2", invite: "#f59e0b" };
     let label, color;
     if (active && !active.is_own) {
       label = `invite \xB7 ${active.role || "member"}`;
@@ -11484,7 +11493,8 @@ ${n2.tags || ""}`.toLowerCase();
   function updateTunnelConnectionIndicator(me) {
     const wrap = document.getElementById("connection-tunnel");
     if (!wrap || !me) return;
-    const isPro = me.plan === "pro" || me.plan === "admin" || me.is_internal;
+    const _ent = me.entitlement_plan || me.plan;
+    const isPro = _ent === "pro" || _ent === "admin" || me.is_internal;
     if (!isPro) {
       wrap.style.display = "none";
       return;

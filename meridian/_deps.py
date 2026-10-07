@@ -18,6 +18,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 from fastapi.templating import Jinja2Templates
 
+from .plans import tenant_entitlement_plan
 from .roles import has_perm, PERM_WRITE, PERM_INVITE, PERM_SETTINGS
 
 
@@ -726,6 +727,21 @@ _TENANT_RL_PER_MINUTE: dict[str, "int | None"] = {
     "pro": None,
     "admin": None,
 }
+
+
+def _tenant_rl_plan(tenant: "dict[str, Any]") -> str:
+    """The plan whose per-minute budget applies to ``tenant`` (lower-cased).
+
+    Goes through ``plans.tenant_entitlement_plan`` so a playtester gets Pro's
+    budget and a playtester past its end date drops to Free's. The result is
+    what ``_tenant_rl_plan_cache`` stores, so the 60 s plan cache already holds
+    the entitlement verdict; an unknown plan stays unknown and falls through to
+    the Free budget at the lookup.
+    """
+    plan = str(tenant.get("plan") or "free").lower()
+    return str(tenant_entitlement_plan({**tenant, "plan": plan}, default="free"))
+
+
 # tenant_id -> monotonic timestamps of requests within the current window
 _tenant_rl_hits: dict[str, list[float]] = {}
 # token_hash -> (cached_at_monotonic, (tenant_id, plan))

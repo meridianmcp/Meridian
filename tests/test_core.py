@@ -11471,7 +11471,7 @@ async def test_churn_cleanup_drops_only_the_tenants_own_database(monkeypatch):
 
         dropped = []
 
-        async def _fake_drop(tenant):
+        async def _fake_drop(tenant, db=None):
             dropped.append(tenant["id"])
 
         decremented = []

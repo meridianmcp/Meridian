@@ -81,7 +81,8 @@ async def delete_account(request: Request) -> Response:
         await cancel_stripe_subscription(stripe_id)
 
     if tenant.get("neon_project_id"):
-        asyncio.create_task(_drop_tenant_neon_database(tenant))
+        # db: the drop picks its Neon key from the pool registry, not the plan.
+        asyncio.create_task(_drop_tenant_neon_database(tenant, request.app.state.db))
 
     email = tenant.get("email", "")
     await db_module.delete_tenant_records(request.app.state.db, tenant["id"])

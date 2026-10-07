@@ -1956,11 +1956,15 @@ async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
         await conn.execute(
             "ALTER TABLE tenants ALTER COLUMN is_internal SET DEFAULT 0", ()
         )
-    # Backfill known internal emails.
+    from .plans import PLAYTESTER  # noqa: PLC0415
+
+    # Backfill known internal emails. A playtester is skipped: the plan is an
+    # operator's explicit decision and this runs on every boot, so it must not
+    # turn the account back into staff.
     for email in sorted(db_module._internal_emails()):
         await conn.execute(
-            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
-            (email,),
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ? AND plan != ?",
+            (email, PLAYTESTER),
         )
 
 
@@ -2011,11 +2015,15 @@ async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
     whitelist_raw = os.environ.get("MERIDIAN_ADMIN_EMAILS", os.environ.get("ADMIN_EMAIL", ""))
     if not whitelist_raw:
         return
+    from .plans import PLAYTESTER  # noqa: PLC0415
+
     admin_emails = {e.strip().lower() for e in whitelist_raw.split(",") if e.strip()}
     for email in sorted(admin_emails):
+        # A playtester is skipped for the same reason as in the is_internal backfill.
         await conn.execute(
-            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = ? AND plan != 'admin'",
-            (email,),
+            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = ? AND plan != 'admin' "
+            "AND plan != ?",
+            (email, PLAYTESTER),
         )
 
 

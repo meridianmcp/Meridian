@@ -573,7 +573,8 @@ export function _settingsAccountCardHtml(projectId: any): string {
     // Admin / internal accounts: no billing UI. Stripe customers: POST portal
     // button (avoids GET redirect leak). Free tier: prominent upgrade link.
 
-    const noUpgrade = plan === 'admin' || !!window.state.tenantIsInternal;
+    // A playtester has no Stripe relationship, so it never gets a billing button.
+    const noUpgrade = plan === 'admin' || plan === 'playtester' || !!window.state.tenantIsInternal;
 
     let billingBtn = '';
 
@@ -622,6 +623,18 @@ export function _settingsAccountCardHtml(projectId: any): string {
       const payLink = window.state.serverConfig?.stripe_payment_link || '/pricing';
 
       resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? 'Resubscribe' : 'Upgrade to Standard'}</a>`;
+
+    }
+
+    // A playtester's optional end date (the server's inactivity_expires_at): say
+    // when access ends, with no purchase button.
+    if (plan === 'playtester' && !window.state.tenantIsInternal && (expiresAt || window.state.tenantExpired)) {
+
+      const ptDate = expiresAt ? String(expiresAt).slice(0, 10) : '';
+
+      expiryLine = window.state.tenantExpired
+        ? `<div style="color:#f87171">Playtester access ended${ptDate ? ` on ${escapeHtml(ptDate)}` : ''}.</div>`
+        : `<div>Playtester access ends${ptDate ? ` on <span style="color:var(--text)">${escapeHtml(ptDate)}</span>` : ''}${days != null ? ` <span style="color:var(--muted)">(${days} day${days === 1 ? '' : 's'} left)</span>` : ''}.</div>`;
 
     }
 
@@ -4255,6 +4268,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
           </div>`;
 
 
+
+        // A playtester is never billed: there is no overage budget to set, so the
+        // budget row is replaced by a note (the Save wiring below then finds no button).
+        if (u.overage_billing === false) {
+          const capsRow = document.getElementById(`save-caps-${projectId}`)?.parentElement;
+          if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; you are emailed when usage passes them.</span>';
+        }
 
         const saveBtn = document.getElementById(`save-caps-${projectId}`);
 
