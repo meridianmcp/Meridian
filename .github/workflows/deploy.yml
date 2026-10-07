@@ -223,7 +223,12 @@ jobs:
   # ─── 3. Smoke tests against preview (skip for hotfix) ────────────────────
   smoke-preview:
     needs: deploy-preview
-    if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
+    # GitHub skips a job whose ANCESTOR was skipped unless its condition has a
+    # status function; the dev-push suite skip (see the header) is such an ancestor.
+    if: >
+      always() &&
+      github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes' &&
+      needs.deploy-preview.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Wait for preview to boot (retry /health up to 90s)
@@ -605,7 +610,12 @@ jobs:
   # ─── 6. CHANGELOG ─────────────────────────────────────────────────────────
   changelog:
     needs: deploy
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # always() + the explicit result: an attested tree skips `test`, and a skipped
+    # ancestor would otherwise skip this job too.
+    if: >
+      always() &&
+      github.ref == 'refs/heads/main' && github.event_name == 'push' &&
+      needs.deploy.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

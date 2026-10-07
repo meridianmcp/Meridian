@@ -144,6 +144,17 @@ def test_preview_and_operator_promote_survive_a_skipped_suite():
     assert "needs.test.result == 'skipped'" in preview
     assert "github.ref == 'refs/heads/dev'" in preview
 
+    # GitHub skips a job behind ANY skipped ancestor unless its condition has a status
+    # function: the preview smoke check must not silently vanish with the dev-push suite skip.
+    smoke = _norm(jobs["smoke-preview"]["if"])
+    assert smoke.startswith("always()")
+    assert "needs.deploy-preview.result == 'success'" in smoke
+    assert "github.ref == 'refs/heads/dev'" in smoke
+
+    changelog = _norm(jobs["changelog"]["if"])
+    assert changelog.startswith("always()")
+    assert "needs.deploy.result == 'success'" in changelog
+
     promote = jobs["merge-to-main"]
     assert "attest" in promote["needs"]
     cond = _norm(promote["if"])
