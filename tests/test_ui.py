@@ -1153,3 +1153,117 @@ def test_pwa_install_prompt_wired(js):
     # Never shown when already running as an installed app.
     assert "display-mode: standalone" in js, "standalone display-mode check missing"
     assert "navigator.standalone" in js, "legacy iOS standalone check missing"
+
+
+# ---------------------------------------------------------------------------
+# 0c30b989 -- the sprint arrow button: the wiring no unit test can import.
+#
+# dashboard-sprint-move.test.ts (vitest) drives the glue's behaviour through
+# injected dependencies and the real renderer markup. What it cannot see is
+# dashboard.ts itself -- a ~13,800-line script with side effects -- so these
+# source scans pin the three seams that file owns: the real loaders handed to
+# the glue, the global name the inline onclick resolves, and the served bundle.
+# ---------------------------------------------------------------------------
+
+
+def _static(name: str) -> str:
+    from pathlib import Path
+
+    return (Path(__file__).parent.parent / "meridian" / "static" / name).read_text(
+        encoding="utf-8"
+    )
+
+
+def _balanced_call(src: str, opener: str) -> str:
+    """The text of ``opener(...)`` up to its matching close paren."""
+    start = src.index(opener)
+    depth = 0
+    for i in range(start + len(opener) - 1, len(src)):
+        if src[i] == "(":
+            depth += 1
+        elif src[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    raise AssertionError(f"unbalanced call after {opener!r}")
+
+
+def test_sprint_arrow_glue_is_handed_the_real_loaders():
+    """dashboard.ts must give the glue the real api/toast and the three repaint
+    targets (Live tab, Queue tab, Goal tab's sprint board). A dropped or
+    swapped dependency would leave a view stale after a move while every
+    vitest case (which injects its own fakes) stayed green."""
+    import re
+
+    src = _static("dashboard.ts")
+    wiring = _balanced_call(src, "createSprintMoveActions(")
+    assert re.search(r"\bapi:\s*\(path, init\)\s*=>\s*api\(path, init\)", wiring), wiring
+    assert re.search(r"\btoast:\s*\(message, isError\)\s*=>\s*toast\(message, isError\)", wiring), wiring
+    assert re.search(r"\brefreshLiveTab:\s*\(projectId\)\s*=>\s*refreshLiveTab\(projectId\)", wiring), wiring
+    assert re.search(r"\bloadQueue:\s*\(projectId\)\s*=>\s*loadQueue\(projectId\)", wiring), wiring
+    # The Goal tab's board registers its reloader per project at build time.
+    assert re.search(
+        r"reloadSprintBoard:.*_sprintBoardReloaders\[projectId\].*reload\(\)", wiring, re.S
+    ), wiring
+    assert "from \"./dashboard-sprint-move\"" in src
+
+
+def test_sprint_arrow_inline_onclick_resolves_a_real_global():
+    """The arrow's inline onclick calls the bare name sprintPushPrompt; it must
+    exist as a function in dashboard.ts, delegate to the glue, and be on the
+    list re-exposed on window (the bundle is an IIFE, so a top-level function
+    is otherwise invisible to inline handlers)."""
+    import re
+
+    src = _static("dashboard.ts")
+    m = re.search(r"async function sprintPushPrompt\([^)]*\)\s*\{(.*?)\n\}", src, re.S)
+    assert m, "sprintPushPrompt is no longer a top-level function in dashboard.ts"
+    assert "_sprintMoveActions.sprintPushPrompt(projectId, itemId, anchor)" in m.group(1)
+    assert "prompt(" not in m.group(1), "the arrow must not fall back to window.prompt"
+    exports = [line for line in src.splitlines() if line.startswith("try { Object.assign(window, {")]
+    assert exports and re.search(r"[{ ,]sprintPushPrompt[ ,}]", exports[0]), (
+        "sprintPushPrompt must stay in the Object.assign(window, ...) export list"
+    )
+
+
+def test_sprint_arrow_markup_carries_what_the_glue_looks_up():
+    """Both boards render the arrow with data-act/data-item-id and the exact
+    onclick; the Queue card carries data-item-id and the Live row data-item,
+    because flashMovedItem and the popover's focus-return find rows by them."""
+    sprint = _static("dashboard-sprint.ts")
+    onclick = (
+        "onclick=\"sprintPushPrompt('${escapeHtml(projectId)}',"
+        "'${escapeHtml(it.id)}',this)\""
+    )
+    assert sprint.count('data-act="move-version" data-item-id="${escapeHtml(it.id)}"') == 2
+    assert sprint.count(onclick) == 2
+    assert 'class="queue-item" data-item-id="${escapeHtml(it.id || \'\')}"' in sprint
+    assert 'class="sprint-item-row" data-item="${escapeHtml(it.id)}"' in sprint
+    versions = _static("dashboard-versions.ts")
+    assert '.sprint-item-row[data-item="${esc}"], .queue-item[data-item-id="${esc}"]' in versions
+
+
+def test_sprint_arrow_glue_endpoints_and_bodies_in_source():
+    """Belt and braces for the vitest behaviour cases: the move goes to /move
+    (never /push), the legacy defer to /push with {to_version}, the move sends
+    the version the human saw, and nothing here reaches for window.prompt."""
+    glue = _static("dashboard-sprint-move.ts")
+    assert "/sprint-items/${itemId}/move`" in glue
+    assert "/sprint-items/${itemId}/push`" in glue
+    assert "JSON.stringify({ to_version: targetVersion })" in glue
+    assert "{ next: true, expected_version: currentVersion }" in glue
+    assert "{ to_version: version, expected_version: currentVersion }" in glue
+    assert "out.item.version !== out.to_version" in glue
+    assert "`Moved to ${out.to_version}`" in glue
+    assert "prompt(" not in glue
+
+
+def test_sprint_arrow_glue_is_in_the_served_bundle():
+    """The server ships the committed dashboard.bundle.js, not the .ts files: a
+    forgotten rebuild would keep the old window.prompt flow in front of users."""
+    bundle = _static("dashboard.bundle.js")
+    assert "createSprintMoveActions" in bundle
+    assert "/sprint-items/${itemId}/move`" in bundle
+    assert "expected_version: currentVersion" in bundle
+    assert "Moved to ${out.to_version}" in bundle
+    assert "Push to version (e.g. v2.0)" not in bundle

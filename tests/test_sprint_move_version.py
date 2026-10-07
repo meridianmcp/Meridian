@@ -589,10 +589,12 @@ def test_patch_version_still_works_and_move_agrees_with_it(client):
 # ---------------------------------------------------------------------------
 
 
-async def test_mcp_update_sprint_item_version_is_the_agent_side_move(db):
-    """An agent moves an item with update_sprint_item(version=...): same resulting
-    row as the dashboard's move (version changes; status, title and defer fields
-    do not)."""
+async def test_mcp_update_sprint_item_version_changes_the_items_own_row_like_a_move(db):
+    """An agent can re-version ONE item with update_sprint_item(version=...): the
+    item's own row ends up as the dashboard's move leaves it (version changes;
+    status, title and defer fields do not). That is ALL it has in common with the
+    move -- see test_update_sprint_item_version_is_not_the_full_move below for
+    what it does not do."""
     from meridian.mcp.handlers.sprint_tools import handle_update_sprint_item
 
     p = await _project(db)
@@ -605,6 +607,85 @@ async def test_mcp_update_sprint_item_version_is_the_agent_side_move(db):
     assert out["status"] == "pending"
     assert out["title"] == "agent-moved item"
     assert out["pushed_to"] is None and out["completed_at"] is None
+
+
+async def test_update_sprint_item_version_is_not_the_full_move(db, monkeypatch):
+    """The agent-facing wording must not promise more than update_sprint_item(
+    version=...) does. Compared with move_sprint_item_to_version (what the
+    dashboard's "Move to next version" calls), a bare version edit
+
+      * does NOT carry subtasks along, so a parent can end up ahead of its own
+        children (the state the move exists to prevent),
+      * writes NO sprint_item_version_moved history entry,
+      * publishes NO live event and does NOT bust the per-project sprint cache.
+
+    These are pinned so the description in stdio_handler.py and the note in
+    docs/api-reference.md cannot drift back into claiming the two are the same.
+    If patch_sprint_item is ever taught to do any of this, update that wording
+    in the same change and flip the matching assertion here."""
+    from meridian.mcp.handlers.sprint_tools import handle_update_sprint_item
+
+    events = []
+    monkeypatch.setattr(
+        si_mod, "_publish_project_event", lambda pid, kind, data: events.append(kind)
+    )
+
+    # Via the agent tool: parent moves, its subtask is left behind.
+    p1 = await _project(db, "agent-side")
+    parent = await _item(db, p1["id"], title="Parent epic", version="v7.0")
+    child = await db_module.add_subtask(db, p1["id"], parent["id"], "its subtask")
+    assert (await db_module.get_sprint_items_cached(db, p1["id"]))[0]["version"] == "v7.0"
+    events.clear()  # the adds above published their own events
+    out = await handle_update_sprint_item(
+        {"project_id": p1["id"], "item_id": parent["id"], "version": "v8.0"},
+        db, "", None, None,
+    )
+    assert out["version"] == "v8.0"
+    assert (await db_module.get_sprint_item(db, child["id"]))["version"] == "v7.0"
+    assert await _moves(db, p1["id"]) == []
+    assert events == []
+    stale = {i["id"]: i["version"] for i in await db_module.get_sprint_items_cached(db, p1["id"])}
+    assert stale[parent["id"]] == "v7.0"  # cached list still shows the old version
+
+    # Via the real move: the subtask goes with it, history and event are written,
+    # and the cache is fresh.
+    p2 = await _project(db, "dashboard-side")
+    parent2 = await _item(db, p2["id"], title="Parent epic", version="v7.0")
+    child2 = await db_module.add_subtask(db, p2["id"], parent2["id"], "its subtask")
+    assert (await db_module.get_sprint_items_cached(db, p2["id"]))[0]["version"] == "v7.0"
+    events.clear()
+    moved = await db_module.move_sprint_item_to_version(
+        db, p2["id"], parent2["id"], to_version="v8.0"
+    )
+    assert moved["moved_children"] == [child2["id"]]
+    assert (await db_module.get_sprint_item(db, child2["id"]))["version"] == "v8.0"
+    assert len(await _moves(db, p2["id"])) == 1
+    assert events == ["sprint_item_updated"]
+    fresh = {i["id"]: i["version"] for i in await db_module.get_sprint_items_cached(db, p2["id"])}
+    assert fresh[parent2["id"]] == "v8.0"
+
+
+async def test_agent_facing_wording_states_the_differences_not_equivalence():
+    """The push_sprint_item tool description and the API reference point agents at
+    update_sprint_item(version=...). They must say what it does NOT do, and must
+    not claim the dashboard's move "does exactly" that (it does not: it also
+    carries subtasks, records history and refreshes live views)."""
+    from pathlib import Path
+
+    from meridian import server as server_module
+
+    root = Path(__file__).parent.parent
+    src = (root / "meridian" / "mcp" / "stdio_handler.py").read_text(encoding="utf-8")
+    start = src.index('name="push_sprint_item"')
+    desc = " ".join(src[start : src.index("inputSchema", start)].split())
+    api_doc = await server_module.api_reference_doc()
+    on_disk = (root / "docs" / "api-reference.md").read_text(encoding="utf-8")
+
+    for text in (desc, " ".join(api_doc.split()), " ".join(on_disk.split())):
+        assert "does exactly that" not in text
+        assert "update_sprint_item(version=" in text
+        assert "subtasks" in text, "must warn that subtasks are not carried along"
+        assert "history" in text, "must warn that no version-move history is written"
 
 
 def test_stdio_push_tool_description_points_agents_at_the_move_path():

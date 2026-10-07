@@ -1958,9 +1958,13 @@ def build_mcp_server():
                     "The item status becomes 'pushed'; the next sprint can "
                     "add it fresh with add_sprint_item. This DEFERS the item to "
                     "the backburner and leaves its own version unchanged. To "
-                    "move an item to another version and keep it pending, use "
-                    "update_sprint_item(version=...) instead -- the dashboard's "
-                    "'Move to next version' does exactly that."
+                    "keep an item pending and only put it in another version, "
+                    "update_sprint_item(version=...) re-versions that one item "
+                    "and nothing else: unlike the dashboard's 'Move to next "
+                    "version' it does not work out the next number for you, does "
+                    "not carry the item's subtasks along (they stay in the old "
+                    "version unless you re-version them too), writes no "
+                    "version-move history entry and publishes no live event."
                 ),
                 inputSchema={
                     "type": "object",

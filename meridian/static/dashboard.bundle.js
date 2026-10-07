@@ -10164,6 +10164,81 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
+  // meridian/static/dashboard-sprint-move.ts
+  var queueBodyId = (projectId) => `queue-body-${projectId}`;
+  function createSprintMoveActions(deps) {
+    async function repaintSprintViews(projectId) {
+      const run = async (job) => {
+        await job();
+      };
+      const queueOpen = !!document.getElementById(queueBodyId(projectId));
+      await Promise.allSettled([
+        run(() => deps.refreshLiveTab(projectId)),
+        queueOpen ? run(() => deps.loadQueue(projectId)) : Promise.resolve(),
+        run(() => deps.reloadSprintBoard(projectId))
+      ]);
+    }
+    async function sprintMoveItem(projectId, itemId, body) {
+      const out = await deps.api(`/projects/${projectId}/sprint-items/${itemId}/move`, {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+      if (!out || !out.item || out.item.version !== out.to_version) {
+        throw new Error("The move could not be verified. Refresh and check the item.");
+      }
+      deps.toast(out.unchanged ? `Already in ${out.to_version}` : `Moved to ${out.to_version}`);
+      void repaintSprintViews(projectId).then(() => flashMovedItem(itemId));
+      return out;
+    }
+    async function sprintDeferItem(projectId, itemId, targetVersion) {
+      await deps.api(`/projects/${projectId}/sprint-items/${itemId}/push`, {
+        method: "POST",
+        body: JSON.stringify({ to_version: targetVersion })
+      });
+      deps.toast(`Deferred to backburner (${targetVersion})`);
+      void repaintSprintViews(projectId);
+    }
+    async function sprintPushPrompt2(projectId, itemId, anchor) {
+      if (openVersionMovePopoverItemId() === itemId) {
+        closeVersionMovePopover();
+        return;
+      }
+      closeVersionMovePopover();
+      let list = [];
+      try {
+        const payload = await deps.api(`/projects/${projectId}/sprint-items`);
+        list = Array.isArray(payload) ? payload : payload && payload.items || [];
+      } catch (e3) {
+        deps.toast(`Could not load the item: ${e3.message}`, true);
+        return;
+      }
+      const item = list.find((it) => it.id === itemId);
+      if (!item) {
+        deps.toast("That sprint item no longer exists.", true);
+        await repaintSprintViews(projectId);
+        return;
+      }
+      const esc = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(itemId) : itemId;
+      const clicked = anchor instanceof HTMLElement && anchor.isConnected ? anchor : null;
+      const live = clicked || document.querySelector(`[data-act="move-version"][data-item-id="${esc}"]`);
+      const currentVersion = item.version || "";
+      openVersionMovePopover({
+        itemId,
+        itemTitle: item.title || "",
+        currentVersion,
+        boardVersions: collectBoardVersions(list, currentVersion),
+        anchor: live instanceof HTMLElement ? live : null,
+        // expected_version makes a retried request safe: if the item moved in the
+        // meantime the server answers 409 instead of advancing it a second time.
+        onMoveNext: () => sprintMoveItem(projectId, itemId, { next: true, expected_version: currentVersion }),
+        onMoveSpecific: (version) => sprintMoveItem(projectId, itemId, { to_version: version, expected_version: currentVersion }),
+        onDefer: (target) => sprintDeferItem(projectId, itemId, target),
+        onError: (message) => deps.toast(`Move failed: ${message}`, true)
+      });
+    }
+    return { repaintSprintViews, sprintMoveItem, sprintDeferItem, sprintPushPrompt: sprintPushPrompt2 };
+  }
+
   // meridian/static/dashboard-folders.ts
   var FOLDER_ASSIGN_KEY = "meridian.projectFolders";
   var FOLDER_COLLAPSE_KEY = "meridian.projectFolderCollapsed";
@@ -13810,76 +13885,18 @@ Current: ${current || "(none)"}`,
       g2.style.display = anyVisible ? "" : "none";
     });
   }
-  async function repaintSprintViews(projectId) {
-    await Promise.allSettled([
-      refreshLiveTab(projectId),
-      document.getElementById(`queue-body-${projectId}`) ? loadQueue(projectId) : Promise.resolve(),
-      _sprintBoardReloaders[projectId] ? _sprintBoardReloaders[projectId]() : Promise.resolve()
-    ]);
-  }
-  async function sprintMoveItem(projectId, itemId, body) {
-    const out = await api(
-      `/projects/${projectId}/sprint-items/${itemId}/move`,
-      { method: "POST", body: JSON.stringify(body) }
-    );
-    if (!out || !out.item || out.item.version !== out.to_version) {
-      throw new Error("The move could not be verified. Refresh and check the item.");
+  var _sprintMoveActions = createSprintMoveActions({
+    api: (path, init2) => api(path, init2),
+    toast: (message, isError) => toast(message, isError),
+    refreshLiveTab: (projectId) => refreshLiveTab(projectId),
+    loadQueue: (projectId) => loadQueue(projectId),
+    reloadSprintBoard: (projectId) => {
+      const reload = _sprintBoardReloaders[projectId];
+      return reload ? reload() : void 0;
     }
-    toast(out.unchanged ? `Already in ${out.to_version}` : `Moved to ${out.to_version}`);
-    void repaintSprintViews(projectId).then(() => flashMovedItem(itemId));
-    return out;
-  }
-  async function sprintDeferItem(projectId, itemId, targetVersion) {
-    await api(
-      `/projects/${projectId}/sprint-items/${itemId}/push`,
-      { method: "POST", body: JSON.stringify({ to_version: targetVersion }) }
-    );
-    toast(`Deferred to backburner (${targetVersion})`);
-    void repaintSprintViews(projectId);
-  }
+  });
   async function sprintPushPrompt(projectId, itemId, anchor) {
-    if (openVersionMovePopoverItemId() === itemId) {
-      closeVersionMovePopover();
-      return;
-    }
-    closeVersionMovePopover();
-    let list = [];
-    try {
-      const payload = await api(`/projects/${projectId}/sprint-items`);
-      list = Array.isArray(payload) ? payload : payload && payload.items || [];
-    } catch (e3) {
-      toast(`Could not load the item: ${e3.message}`, true);
-      return;
-    }
-    const item = list.find((it) => it.id === itemId);
-    if (!item) {
-      toast("That sprint item no longer exists.", true);
-      await repaintSprintViews(projectId);
-      return;
-    }
-    const live = anchor && anchor.isConnected ? anchor : document.querySelector(`[data-act="move-version"][data-item-id="${CSS.escape(itemId)}"]`);
-    const currentVersion = item.version || "";
-    openVersionMovePopover({
-      itemId,
-      itemTitle: item.title || "",
-      currentVersion,
-      boardVersions: collectBoardVersions(list, currentVersion),
-      anchor: live instanceof HTMLElement ? live : null,
-      // expected_version makes a retried request safe: if the item moved in the
-      // meantime the server answers 409 instead of advancing it a second time.
-      onMoveNext: () => sprintMoveItem(
-        projectId,
-        itemId,
-        { next: true, expected_version: currentVersion }
-      ),
-      onMoveSpecific: (version) => sprintMoveItem(
-        projectId,
-        itemId,
-        { to_version: version, expected_version: currentVersion }
-      ),
-      onDefer: (target) => sprintDeferItem(projectId, itemId, target),
-      onError: (message) => toast(`Move failed: ${message}`, true)
-    });
+    return _sprintMoveActions.sprintPushPrompt(projectId, itemId, anchor);
   }
   async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
     event && event.stopPropagation();

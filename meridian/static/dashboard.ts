@@ -45,14 +45,10 @@ import { createStore } from "zustand/vanilla";
 // model + the collapse/reveal wiring.
 import { wireVtabGroups } from "./dashboard-tabgroups";
 // 0c30b989 — the sprint arrow button's "move to next / specific version / defer"
-// popover and the next-version rule it previews (mirrors meridian/versioning.py).
-import {
-  openVersionMovePopover,
-  closeVersionMovePopover,
-  openVersionMovePopoverItemId,
-  collectBoardVersions,
-  flashMovedItem,
-} from "./dashboard-versions";
+// glue (endpoints, request bodies, toast, repaint). The popover and the
+// next-version rule it previews (mirrors meridian/versioning.py) are in
+// dashboard-versions.ts.
+import { createSprintMoveActions } from "./dashboard-sprint-move";
 // d6b7da48 — client-side sidebar "folders/spheres" (localStorage-only grouping).
 import {
   loadFolderAssignments,
@@ -5738,138 +5734,23 @@ function filterBackburner(projectId: any, value: any) {
 
 
 
-async function repaintSprintViews(projectId: any) {
-
-  /** 0c30b989 — repaint every surface that lists sprint items after a move or
-   *  defer: the Live board (grouped by version), the Queue tab and the Goal
-   *  tab's sprint board. Previously only the Live tab refreshed, and the Queue
-   *  only if a websocket event happened to arrive while it was open. */
-
-  await Promise.allSettled([
-
-    refreshLiveTab(projectId),
-
-    document.getElementById(`queue-body-${projectId}`) ? loadQueue(projectId) : Promise.resolve(),
-
-    _sprintBoardReloaders[projectId] ? _sprintBoardReloaders[projectId]() : Promise.resolve(),
-
-  ]);
-
-}
-
-
-async function sprintMoveItem(projectId: any, itemId: any, body: any) {
-
-  /** 0c30b989 — POST .../move, check what the server says it did, repaint.
-   *  Throws on failure so the popover can show the reason inline. */
-
-  const out = await api(`/projects/${projectId}/sprint-items/${itemId}/move`,
-
-    { method: 'POST', body: JSON.stringify(body) });
-
-  // Trust the row the server re-read after writing, not our own request: the
-  // toast must state where the item really is.
-  if (!out || !out.item || out.item.version !== out.to_version) {
-
-    throw new Error('The move could not be verified. Refresh and check the item.');
-
-  }
-
-  toast(out.unchanged ? `Already in ${out.to_version}` : `Moved to ${out.to_version}`);
-
-  // Not awaited: the move is done and verified, so let the popover close now;
-  // the repaint refetches several lists and can take a second or two.
-  void repaintSprintViews(projectId).then(() => flashMovedItem(itemId));
-
-  return out;
-
-}
-
-
-async function sprintDeferItem(projectId: any, itemId: any, targetVersion: any) {
-
-  /** The legacy push: defer to the backburner, recording the target version
-   *  in pushed_to. Now an explicit third choice rather than the only one. */
-
-  await api(`/projects/${projectId}/sprint-items/${itemId}/push`,
-
-    { method: 'POST', body: JSON.stringify({ to_version: targetVersion }) });
-
-  toast(`Deferred to backburner (${targetVersion})`);
-
-  void repaintSprintViews(projectId);
-
-}
-
+// 0c30b989 -- the sprint arrow button's move/defer glue lives in
+// dashboard-sprint-move.ts (unit-tested: this file cannot be imported by a test);
+// only the real api/toast/loaders are wired here. The name sprintPushPrompt is
+// kept: renderSprintProgress / renderQueue emit it in inline onclick handlers.
+const _sprintMoveActions = createSprintMoveActions({
+  api: (path, init) => api(path, init),
+  toast: (message, isError) => toast(message, isError),
+  refreshLiveTab: (projectId) => refreshLiveTab(projectId),
+  loadQueue: (projectId) => loadQueue(projectId),
+  reloadSprintBoard: (projectId) => {
+    const reload = _sprintBoardReloaders[projectId];
+    return reload ? reload() : undefined;
+  },
+});
 
 async function sprintPushPrompt(projectId: any, itemId: any, anchor?: any) {
-
-  /** 0c30b989 — the arrow button on a pending item. Opens a popover offering
-   *  "Move to <next version>", a specific version (datalist of the versions
-   *  already on the board) and "Defer to backburner", instead of window.prompt
-   *  deferring the item to whatever was typed. Clicking the arrow again closes
-   *  it. The name is kept: inline onclick handlers and old bookmarks use it. */
-
-  if (openVersionMovePopoverItemId() === itemId) { closeVersionMovePopover(); return; }
-
-  closeVersionMovePopover();
-
-  let list: any[] = [];
-
-  try {
-
-    const payload = await api(`/projects/${projectId}/sprint-items`);
-
-    list = Array.isArray(payload) ? payload : ((payload && payload.items) || []);
-
-  } catch(e: any) { toast(`Could not load the item: ${e.message}`, true); return; }
-
-  const item = list.find((it: any) => it.id === itemId);
-
-  if (!item) {
-
-    toast('That sprint item no longer exists.', true);
-
-    await repaintSprintViews(projectId);
-
-    return;
-
-  }
-
-  // The board may have repainted while the list loaded, replacing the button
-  // that was clicked; anchor to whichever arrow button is on screen now.
-  const live = (anchor && anchor.isConnected)
-    ? anchor
-    : document.querySelector(`[data-act="move-version"][data-item-id="${CSS.escape(itemId)}"]`);
-
-  const currentVersion = item.version || '';
-
-  openVersionMovePopover({
-
-    itemId,
-
-    itemTitle: item.title || '',
-
-    currentVersion,
-
-    boardVersions: collectBoardVersions(list, currentVersion),
-
-    anchor: live instanceof HTMLElement ? live : null,
-
-    // expected_version makes a retried request safe: if the item moved in the
-    // meantime the server answers 409 instead of advancing it a second time.
-    onMoveNext: () => sprintMoveItem(projectId, itemId,
-      { next: true, expected_version: currentVersion }),
-
-    onMoveSpecific: (version: string) => sprintMoveItem(projectId, itemId,
-      { to_version: version, expected_version: currentVersion }),
-
-    onDefer: (target: string) => sprintDeferItem(projectId, itemId, target),
-
-    onError: (message: string) => toast(`Move failed: ${message}`, true),
-
-  });
-
+  return _sprintMoveActions.sprintPushPrompt(projectId, itemId, anchor);
 }
 
 
