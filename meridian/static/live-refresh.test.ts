@@ -1084,6 +1084,125 @@ describe("handleWsEvent: project list events", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The Goal-tab sprint board reloader is registered by the REAL buildTabBody.
+//
+// Every test above injects the registry itself ({ _sprintBoardReloaders: { [PID]: reload } }),
+// so deleting the one line that registers loadSprintBoard left them all green while every
+// Goal-board repaint (event, reconnect, local mutation) became a silent no-op. These tests
+// run the shipped buildTabBody to mount a project tab and use the registry IT filled.
+// ---------------------------------------------------------------------------
+describe("buildTabBody registers the Goal-tab sprint board reloader", () => {
+  const V1_ITEMS = [
+    { id: "i1", title: "first item", status: "pending", version: "v1" },
+    { id: "i2", title: "second item", status: "done", version: "v1" },
+  ];
+  let reloaders: Record<string, any>;
+  let serverItems: any[];
+  let projectApi: ReturnType<typeof vi.fn>;
+  let state: ReturnType<typeof makeState>;
+  const board = (pid = PID) => document.getElementById(`sprint-board-goal-${pid}`) as HTMLElement;
+
+  /** Scope for the real buildTabBody: every collaborator it calls while mounting. */
+  const mountScope = () =>
+    makeMocks(state, {
+      escapeHtml: (s: unknown) => String(s),
+      wireVtabGroups: vi.fn(() => ({ revealGroupForTab: vi.fn() })),
+      _initCodeIntelTabVisibility: vi.fn(),
+      _sprintBoardReloaders: reloaders,
+      projectApi,
+      wireClaudeLaunchPanel: vi.fn(),
+      autosizeGoalField: vi.fn(),
+      refreshTab: vi.fn(),
+      connectWs: vi.fn(),
+    });
+
+  /** Mount the project tab through the real buildTabBody; returns once its timers have run. */
+  async function mount(project = { id: PID, name: "Live project" }) {
+    if (!document.getElementById("tab-bodies")) document.body.innerHTML = `<div id="tab-bodies"></div>`;
+    // reloadGoalSprintBoard is the real one too: the Goal vtab's click handler calls it.
+    load(["buildTabBody", "reloadGoalSprintBoard"], mountScope()).buildTabBody(project);
+    await vi.advanceTimersByTimeAsync(300);
+  }
+  const openGoalTab = async () => {
+    (document.querySelector(`#vtab-strip-${PID} .vtab-btn[data-vtab="goal"]`) as HTMLElement).click();
+    await vi.advanceTimersByTimeAsync(0);
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    reloaders = {};
+    serverItems = V1_ITEMS.map((i) => ({ ...i }));
+    state = makeState("goal");
+    projectApi = vi.fn(async (_pid: string, path: string) => (path.endsWith("/sprint-items") ? serverItems.slice() : []));
+    document.body.innerHTML = `<div id="tab-bodies"></div>`;
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("registers a reloader for the mounted project (the line every other test pre-supplies)", async () => {
+    expect(reloaders[PID]).toBeUndefined();
+    await mount();
+    expect(typeof reloaders[PID]).toBe("function");
+    expect(Object.keys(reloaders)).toEqual([PID]);
+  });
+
+  it("the mount itself paints the compact board from /sprint-items", async () => {
+    await mount();
+    expect(projectApi).toHaveBeenCalledWith(PID, `/projects/${PID}/sprint-items`);
+    expect(board().textContent).toContain("1/2 done");
+  });
+
+  it("the registered reloader repaints #sprint-board-goal-<pid> from a fresh fetch", async () => {
+    await mount();
+    serverItems.push({ id: "i3", title: "third item", status: "done", version: "v1" });
+    await reloaders[PID]();
+    expect(board().textContent).toContain("2/3 done");
+  });
+
+  it("reloadGoalSprintBoard (the helper every repaint path calls) reaches the board through that registry", async () => {
+    await mount();
+    serverItems.push({ id: "i3", title: "third item", status: "pending", version: "v1" });
+    load(["reloadGoalSprintBoard"], makeMocks(state, { _sprintBoardReloaders: reloaders })).reloadGoalSprintBoard(PID);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(board().textContent).toContain("1/3 done");
+  });
+
+  it("opening the Goal tab (its real vtab click handler) repaints a board that went stale", async () => {
+    await mount();
+    serverItems.push({ id: "i3", title: "third item", status: "done", version: "v1" });
+    expect(board().textContent).toContain("1/2 done"); // nothing has told the board yet
+    await openGoalTab();
+    expect(state.panels[PID].activeVtab).toBe("goal");
+    expect(board().textContent).toContain("2/3 done");
+  });
+
+  it("a sprint_item_updated event with the Goal tab open repaints the board (event -> registry -> DOM)", async () => {
+    await mount();
+    await openGoalTab();
+    serverItems.push({ id: "i3", title: "third item", status: "done", version: "v1" });
+    expect(board().textContent).toContain("1/2 done"); // still the old counts
+    // The routing is the real handleWsEvent -> repaintVisibleSprintViews -> scheduleGoalBoardReload
+    // -> reloadGoalSprintBoard chain; only the loaders of the OTHER tabs are mocks.
+    const fns = load(
+      ["handleWsEvent", "repaintVisibleSprintViews", "scheduleGoalBoardReload", "reloadGoalSprintBoard", "_debounceRepaint"],
+      makeMocks(state, { _sprintBoardReloaders: reloaders }),
+    );
+    fns.handleWsEvent(PID, { type: "sprint_item_updated", project_id: PID });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(board().textContent).toContain("2/3 done");
+  });
+
+  it("a second project mounted in the same page gets its own reloader (the registry is keyed by project)", async () => {
+    await mount();
+    await mount({ id: OTHER, name: "Other" });
+    expect(Object.keys(reloaders).sort()).toEqual([PID, OTHER].sort());
+    expect(reloaders[PID]).not.toBe(reloaders[OTHER]);
+    expect(board(OTHER).textContent).toContain("1/2 done");
+  });
+});
+
 function readSource(rel: string): string {
   return readFileSync(resolve(process.cwd(), rel), "utf8");
 }

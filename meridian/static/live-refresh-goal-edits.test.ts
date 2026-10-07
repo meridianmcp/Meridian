@@ -202,6 +202,91 @@ describe("refreshGoal keeps an unsaved edit", () => {
   });
 });
 
+// A goal with NO version-label line (and no CURRENT FOCUS / KEY FILES heading) takes the
+// other branch of refreshGoal: the title bar is hidden and the whole content is the editable
+// text. That branch has its own `ta.value = ...` assignment, so it needs its own dirty guard --
+// dropping it left every test above green, because SERVER_GOAL always has a version label and
+// a CURRENT FOCUS heading.
+describe("refreshGoal keeps an unsaved edit in a free-text goal (no version-label line)", () => {
+  const FREE_TEXT = "Ship the importer first.\nThen the exporter.";
+  const freeGoal = (content: any, over: Record<string, any> = {}) => ({ ...SERVER_GOAL, content, version: 3, ...over });
+
+  it("control: a clean field takes the whole free text and no title bar is shown", async () => {
+    const { dom, fns } = setup({ projectApi: vi.fn(async () => freeGoal(FREE_TEXT)) });
+    await fns.refreshGoal(PID);
+    expect(dom.goal.value).toBe(FREE_TEXT);
+    expect(dom.title.textContent).toBe("");
+    expect(dom.title.style.display).toBe("none");
+    expect(dom.shipped.style.display).toBe("none");
+  });
+
+  it("a dirty textarea keeps its text, its dirty marker and its baseline (the user types, an agent POSTs /goal)", async () => {
+    const projectApi = vi.fn(async () => freeGoal(FREE_TEXT));
+    const { dom, state, fns } = setup({ projectApi });
+    await fns.refreshGoal(PID);
+    const baseline = state.panels[PID]._lastSaved;
+    expect(baseline).toBe(FREE_TEXT);
+
+    type(dom.goal, "MY HALF-WRITTEN GOAL");
+    projectApi.mockImplementation(async () => freeGoal("The agent rewrote the whole goal.", { version: 4 }));
+    await fns.refreshGoal(PID);
+
+    expect(dom.goal.value).toBe("MY HALF-WRITTEN GOAL");
+    expect(dom.goal.classList.contains("dirty")).toBe(true);
+    expect(state.panels[PID]._lastSaved).toBe(baseline);
+    // ...while the parts the user is not editing do move on to the agent's version.
+    expect(dom.version.textContent).toBe("v4");
+  });
+
+  it("arriving through the real goal_updated event handler (the agent's POST /goal), the edit survives", async () => {
+    const projectApi = vi.fn(async () => freeGoal(FREE_TEXT));
+    const { dom, fns } = setup({ projectApi }, ["handleWsEvent", "_debounceRepaint"]);
+    await fns.refreshGoal(PID);
+    type(dom.goal, "MY HALF-WRITTEN GOAL");
+    projectApi.mockImplementation(async () => freeGoal("The agent rewrote the whole goal.", { version: 4 }));
+
+    fns.handleWsEvent(PID, { type: "goal_updated", project_id: PID, version: 4 });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(projectApi).toHaveBeenCalledTimes(2);
+    expect(dom.version.textContent).toBe("v4"); // the refresh did run...
+    expect(dom.goal.value).toBe("MY HALF-WRITTEN GOAL"); // ...and left the edit alone
+    expect(dom.goal.classList.contains("dirty")).toBe(true);
+  });
+
+  it("a clean field still follows the agent's rewrite (nothing is frozen)", async () => {
+    const projectApi = vi.fn(async () => freeGoal(FREE_TEXT));
+    const { dom, fns } = setup({ projectApi });
+    await fns.refreshGoal(PID);
+    projectApi.mockImplementation(async () => freeGoal("The agent rewrote the whole goal.", { version: 4 }));
+    await fns.refreshGoal(PID);
+    expect(dom.goal.value).toBe("The agent rewrote the whole goal.");
+  });
+
+  it("a goal stored as JSON has no version-label line either, and keeps the edit too", async () => {
+    const projectApi = vi.fn(async () => freeGoal({ focus: "importer", next: ["exporter"] }));
+    const { dom, fns } = setup({ projectApi });
+    await fns.refreshGoal(PID);
+    expect(dom.goal.value).toContain('"focus": "importer"');
+    type(dom.goal, "MY HALF-WRITTEN GOAL");
+    projectApi.mockImplementation(async () => freeGoal({ focus: "rewritten by an agent" }));
+    await fns.refreshGoal(PID);
+    expect(dom.goal.value).toBe("MY HALF-WRITTEN GOAL");
+    expect(dom.goal.classList.contains("dirty")).toBe(true);
+  });
+
+  it("the text typed while the request was in flight survives too (judged after the fetch)", async () => {
+    let release: (g: any) => void = () => {};
+    const { dom, fns } = setup({ projectApi: vi.fn(() => new Promise((r) => { release = r; })) });
+    const pending = fns.refreshGoal(PID);
+    type(dom.goal, "TYPED DURING THE FETCH");
+    release(freeGoal(FREE_TEXT));
+    await pending;
+    expect(dom.goal.value).toBe("TYPED DURING THE FETCH");
+    expect(dom.goal.classList.contains("dirty")).toBe(true);
+  });
+});
+
 describe("saving clears the unsaved marker, so the refresh after it shows the saved text", () => {
   it("saveGoal: POSTs the edit, then the server's version replaces it and 'dirty' is gone", async () => {
     const { dom, m, fns } = setup();

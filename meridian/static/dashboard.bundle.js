@@ -192,6 +192,81 @@
     add(cfg.repo_path);
     return out;
   }
+  var _DRAFT_FIELDS = 'textarea, input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="tel"], input[type="number"], input[type="password"]';
+  function fieldHoldsDraft(el2) {
+    const fields = el2.matches(_DRAFT_FIELDS) ? [el2] : Array.from(el2.querySelectorAll(_DRAFT_FIELDS));
+    return fields.some((f4) => f4 === document.activeElement || f4.value !== f4.defaultValue);
+  }
+  function _collectDrafts(root, units) {
+    const kept = [];
+    for (const unit of units) {
+      const seen = /* @__PURE__ */ new Map();
+      root.querySelectorAll(unit.selector).forEach((el2) => {
+        const key = unit.key(el2);
+        if (!key) return;
+        const ordinal = seen.get(key) || 0;
+        seen.set(key, ordinal + 1);
+        if ((unit.keep || fieldHoldsDraft)(el2)) kept.push({ unit, key, ordinal, el: el2 });
+      });
+    }
+    return kept;
+  }
+  function _findTwin(root, k3) {
+    let n2 = 0;
+    for (const el2 of Array.from(root.querySelectorAll(k3.unit.selector))) {
+      if (k3.unit.key(el2) !== k3.key) continue;
+      if (n2++ === k3.ordinal) return el2;
+    }
+    return null;
+  }
+  function hasUnsentDrafts(root, units) {
+    return !!root && _collectDrafts(root, units).length > 0;
+  }
+  function paintKeepingDrafts(root, html, units) {
+    const kept = _collectDrafts(root, units);
+    if (!kept.length) {
+      root.innerHTML = html;
+      return 0;
+    }
+    const active = document.activeElement;
+    const focused = active && kept.some((k3) => k3.el === active || k3.el.contains(active)) ? active : null;
+    let caret = null;
+    if (focused) {
+      try {
+        caret = { start: focused.selectionStart, end: focused.selectionEnd, dir: focused.selectionDirection };
+      } catch (_2) {
+      }
+    }
+    const scrolls = /* @__PURE__ */ new Map();
+    for (const k3 of kept) {
+      const fields = k3.el.matches("textarea") ? [k3.el] : Array.from(k3.el.querySelectorAll("textarea"));
+      for (const f4 of fields) scrolls.set(f4, f4.scrollTop);
+    }
+    root.innerHTML = html;
+    let carried = 0;
+    for (const k3 of kept) {
+      const twin = _findTwin(root, k3);
+      if (!twin) continue;
+      twin.replaceWith(k3.el);
+      carried += 1;
+    }
+    scrolls.forEach((top, f4) => {
+      if (f4.isConnected) f4.scrollTop = top;
+    });
+    if (focused && focused.isConnected) {
+      try {
+        focused.focus({ preventScroll: true });
+      } catch (_2) {
+      }
+      if (caret && caret.start != null && caret.end != null) {
+        try {
+          focused.setSelectionRange(caret.start, caret.end, caret.dir || void 0);
+        } catch (_2) {
+        }
+      }
+    }
+    return carried;
+  }
   try {
     Object.assign(window, {
       getPanelState: getPanelState2,
@@ -210,7 +285,10 @@
       DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2,
       DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2,
       DEFAULT_MAX_TURNS: DEFAULT_MAX_TURNS2,
-      suggestedFsRoots: suggestedFsRoots2
+      suggestedFsRoots: suggestedFsRoots2,
+      fieldHoldsDraft,
+      hasUnsentDrafts,
+      paintKeepingDrafts
     });
   } catch (e3) {
   }
@@ -1590,6 +1668,19 @@
     ensureSignOutLink(me.email);
     ensureWorkspaceSwitcher();
   }
+  var _SPRINT_BOARD_DRAFTS = [
+    { selector: "input.live-add-input", key: (el2) => el2.id },
+    {
+      selector: ".sprint-item-row",
+      key: (el2) => el2.dataset.item,
+      keep: (row) => !!row.querySelector(
+        ".sprint-edit-input:not([data-saved]), .sprint-notes-textarea:not([data-saved]), .sprint-resources-textarea:not([data-saved])"
+      )
+    }
+  ];
+  function _paintSprintBoard(root, html) {
+    paintKeepingDrafts(root, html, _SPRINT_BOARD_DRAFTS);
+  }
   function renderSprintProgress2(projectId, items) {
     const root = document.getElementById(`live-sprint-progress-${projectId}`);
     if (!root) return;
@@ -1615,7 +1706,7 @@
     })[s3] || "var(--muted)";
     const activeSet = /* @__PURE__ */ new Set(["pending", "todo", "in_progress"]);
     if (items.length === 0) {
-      root.innerHTML = `
+      _paintSprintBoard(root, `
 
       <div class="live-empty">No sprint items. Add one below.</div>
 
@@ -1629,7 +1720,7 @@
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
       root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
       wireSprintAddEnter(projectId, root);
       return;
@@ -1641,7 +1732,7 @@
     );
     if (displayItems.length === 0) displayItems = items.filter((it) => activeStatuses.has(it.status));
     if (displayItems.length === 0) {
-      root.innerHTML = `
+      _paintSprintBoard(root, `
 
       <div class="live-empty" style="color:var(--accent-green)">\u{1F389} Sprint complete! All items done.</div>
 
@@ -1655,7 +1746,7 @@
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
       root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
       wireSprintAddEnter(projectId, root);
       return;
@@ -1907,7 +1998,7 @@
 
     </details>`;
     }
-    root.innerHTML = html;
+    _paintSprintBoard(root, html);
     root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
     wireSprintAddEnter(projectId, root);
     try {
@@ -13600,6 +13691,7 @@ Current: ${current || "(none)"}`,
           method: "PATCH",
           body: JSON.stringify({ title: newTitle, version: newVersion || void 0 })
         });
+        titleInput.dataset.saved = verInput.dataset.saved = "1";
         await refreshSprintSurfaces(projectId);
       } catch (e3) {
         toast(`Save failed: ${e3.message}`, true);
@@ -13609,6 +13701,7 @@ Current: ${current || "(none)"}`,
     const cancel = () => {
       titleInput.replaceWith(titleSpan);
       verInput.replaceWith(verSpan);
+      refreshSprintSurfaces(projectId);
     };
     titleInput.onkeydown = verInput.onkeydown = (e3) => {
       if (e3.key === "Enter") {
@@ -13650,6 +13743,7 @@ Current: ${current || "(none)"}`,
           body: JSON.stringify({ notes: newNotes })
         });
         row.dataset.notes = newNotes || "";
+        textarea.dataset.saved = "1";
         await refreshSprintSurfaces(projectId);
       } catch (e3) {
         toast(`Save failed: ${e3.message}`, true);
@@ -13659,6 +13753,7 @@ Current: ${current || "(none)"}`,
     const cancel = () => {
       if (existingNotesEl) textarea.replaceWith(existingNotesEl);
       else textarea.remove();
+      refreshSprintSurfaces(projectId);
     };
     textarea.onkeydown = (e3) => {
       if (e3.key === "Escape") {
@@ -13706,6 +13801,7 @@ Current: ${current || "(none)"}`,
           method: "PATCH",
           body: JSON.stringify({ touches_resources: lines.length ? lines : null })
         });
+        textarea.dataset.saved = "1";
         await refreshSprintSurfaces(projectId);
       } catch (e3) {
         toast(`Save failed: ${e3.message}`, true);
@@ -13715,6 +13811,7 @@ Current: ${current || "(none)"}`,
     const cancel = () => {
       if (existingEl) textarea.replaceWith(existingEl);
       else textarea.remove();
+      refreshSprintSurfaces(projectId);
     };
     textarea.onkeydown = (e3) => {
       if (e3.key === "Escape") {
@@ -15509,8 +15606,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!body) return;
     const urgencyColor = { blocking: "var(--red,#e05252)", high: "var(--yellow,#d4a017)", normal: "var(--muted)" };
     const statusBadge = { pending: "#f59e0b", answered: "#22c55e", dismissed: "var(--muted)" };
+    const draftUnits = [{ selector: 'input[id^="hitl-ans-"]', key: (el2) => el2.id }];
     const render = async () => {
-      body.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
+      if (!hasUnsentDrafts(body, draftUnits)) body.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
       const status = statusFilter && statusFilter.value || "pending";
       const qs = status === "all" ? "?status=all" : `?status=${status}`;
       try {
@@ -15640,7 +15738,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           html += `<div style="color:var(--muted);font-size:10px;margin:12px 0 6px;border-top:1px solid var(--border);padding-top:8px">RESOLVED (${resolved.length})</div>`;
           html += resolved.map(renderCard).join("");
         }
-        body.innerHTML = html;
+        paintKeepingDrafts(body, html, draftUnits);
         _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, ".hitl-row");
         body.querySelectorAll(".hitl-answer-btn").forEach((btn) => {
           btn.onclick = async () => {
@@ -15750,7 +15848,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           };
         });
       } catch (e3) {
-        body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e3))}</div>`;
+        if (hasUnsentDrafts(body, draftUnits)) console.warn("[meridian] HITL queue refresh failed:", e3);
+        else body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e3))}</div>`;
       }
     };
     if (statusFilter) statusFilter.onchange = render;
@@ -16963,7 +17062,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         return;
       }
       bar.style.display = "flex";
-      list.innerHTML = items.map((r3) => {
+      const draftUnits = [{ selector: "input.hitl-answer-input", key: (el2) => el2.dataset.hitlId }];
+      paintKeepingDrafts(list, items.map((r3) => {
         const color = _HITL_URGENCY_COLOR[r3.urgency] || _HITL_URGENCY_COLOR.normal;
         const ts = formatRelativeTime(r3.created_at);
         const ctx = r3.context ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--muted);font-size:10px">context</summary><pre style="margin:6px 0 0;padding:6px 8px;background:var(--surface-1);border-radius:3px;font-size:11px;white-space:pre-wrap;word-break:break-word">${escapeHtml(r3.context)}</pre></details>` : "";
@@ -17005,7 +17105,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         </div>
 
       </div>`;
-      }).join("");
+      }).join(""), draftUnits);
       list.querySelectorAll(".hitl-answer-btn").forEach((btn) => {
         btn.onclick = () => _hitlAnswer(btn.dataset.hitlId);
       });
@@ -17711,7 +17811,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!root || !hitlRoot) return;
     const hitl = tasks.filter((t3) => t3.status === "pending-hitl");
     banner.style.display = hitl.length ? "block" : "none";
-    hitlRoot.innerHTML = hitl.map((t3) => renderHitlRow(projectId, t3)).join("");
+    paintKeepingDrafts(
+      hitlRoot,
+      hitl.map((t3) => renderHitlRow(projectId, t3)).join(""),
+      [{ selector: "input[data-input]", key: (el2) => el2.dataset.input }]
+    );
     hitl.forEach((t3) => wireHitlRow(projectId, t3));
     root.innerHTML = tasks.map((t3) => renderTaskRow(t3)).join("");
     _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, ".task");

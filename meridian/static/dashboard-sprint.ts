@@ -3,6 +3,8 @@
 
 // 233bae67 — sprint dependency DAG (Cytoscape, guarded/CDN-global).
 import { buildSprintDagElements, mountSprintDag } from "./components/sprintGraph";
+// 8a665a03 -- a repaint of the Live sprint board keeps what the user is typing.
+import { paintKeepingDrafts, type DraftUnit } from "./dashboard-utils";
 
 // c2fe20c3 — history-signal badges for a sprint item so pending items aren't
 // indistinguishable: a stall counter (↻N), a "retried" tag (claimed before, now
@@ -223,6 +225,31 @@ export function _renderPlanBadge(me: any) {
 
 }
 
+// 8a665a03 -- the Live tab repaints this board ~10 s after any sprint_item_added/updated
+// event (and on every reconnect / mutation), and rebuilding it used to replace the add-item
+// box and any open inline editor: a half-typed item or title edit vanished mid-sentence. The
+// live nodes below are carried across the repaint instead (see paintKeepingDrafts):
+//   - the add-item box, while it has the focus or text in it;
+//   - an item row that has an inline editor open (title/version, notes, touches_resources),
+//     whether or not anything was typed yet -- the editor's own handlers keep working, and
+//     its Save / Cancel / blur paths repaint the row when the user is done. (Save marks its
+//     editor data-saved once the server has the edit, so the repaint it triggers replaces the
+//     row with the saved values instead of carrying the finished editor across.)
+const _SPRINT_BOARD_DRAFTS: DraftUnit[] = [
+  { selector: 'input.live-add-input', key: (el) => el.id },
+  {
+    selector: '.sprint-item-row',
+    key: (el) => el.dataset.item,
+    keep: (row) => !!row.querySelector(
+      '.sprint-edit-input:not([data-saved]), .sprint-notes-textarea:not([data-saved]), .sprint-resources-textarea:not([data-saved])',
+    ),
+  },
+];
+
+function _paintSprintBoard(root: HTMLElement, html: string) {
+  paintKeepingDrafts(root, html, _SPRINT_BOARD_DRAFTS);
+}
+
 export function renderSprintProgress(projectId: string, items: any) {
 
   /** Full grouped sprint board — replaces the old plain progress bar. */
@@ -265,7 +292,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
   if (items.length === 0) {
 
-    root.innerHTML = `
+    _paintSprintBoard(root, `
 
       <div class="live-empty">No sprint items. Add one below.</div>
 
@@ -279,7 +306,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
 
     root.querySelector('.sprint-add-btn')!.onclick =
 
@@ -317,7 +344,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
   if (displayItems.length === 0) {
 
-    root.innerHTML = `
+    _paintSprintBoard(root, `
 
       <div class="live-empty" style="color:var(--accent-green)">🎉 Sprint complete! All items done.</div>
 
@@ -331,7 +358,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
 
     root.querySelector('.sprint-add-btn')!.onclick = () => addSprintItemFromInput(projectId);
 
@@ -726,7 +753,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
 
 
-  root.innerHTML = html;
+  _paintSprintBoard(root, html);
 
   root.querySelector('.sprint-add-btn')!.onclick =
 

@@ -44,6 +44,9 @@ import { createStore } from "zustand/vanilla";
 // the source-scanning UI tests keep matching); this module owns the grouping
 // model + the collapse/reveal wiring.
 import { wireVtabGroups } from "./dashboard-tabgroups";
+// 8a665a03 -- a repaint must never throw away what the user typed: list views that are
+// rebuilt from a fetch carry their half-written inputs across (see paintKeepingDrafts).
+import { paintKeepingDrafts, hasUnsentDrafts } from "./dashboard-utils";
 // d6b7da48 — client-side sidebar "folders/spheres" (localStorage-only grouping).
 import {
   loadFolderAssignments,
@@ -5955,6 +5958,10 @@ async function sprintItemEdit(projectId: any, itemId: any) {
 
         body: JSON.stringify({ title: newTitle, version: newVersion || undefined }),
       });
+      // The edit is on the server, so this editor is finished: marked so the repaint below
+      // replaces the row instead of carrying the closed editor across (renderSprintProgress
+      // keeps every row with an open editor, see _SPRINT_BOARD_DRAFTS).
+      titleInput.dataset.saved = verInput.dataset.saved = '1';
       await refreshSprintSurfaces(projectId);
 
     } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
@@ -5966,6 +5973,9 @@ async function sprintItemEdit(projectId: any, itemId: any) {
     titleInput.replaceWith(titleSpan);
 
     verInput.replaceWith(verSpan);
+
+    // The row was kept as-is while the editor was open: catch it up with whatever changed.
+    refreshSprintSurfaces(projectId);
 
   };
 
@@ -6050,6 +6060,7 @@ async function sprintItemNotesEdit(projectId: any, itemId: any) {
       });
 
       row.dataset.notes = newNotes || '';
+      textarea.dataset.saved = '1'; // finished: the repaint below replaces the row (see sprintItemEdit)
       await refreshSprintSurfaces(projectId);
 
     } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
@@ -6061,6 +6072,8 @@ async function sprintItemNotesEdit(projectId: any, itemId: any) {
     if (existingNotesEl) textarea.replaceWith(existingNotesEl);
 
     else textarea.remove();
+
+    refreshSprintSurfaces(projectId); // catch the kept row up (see sprintItemEdit)
 
   };
 
@@ -6137,6 +6150,7 @@ async function sprintItemResourcesEdit(projectId: any, itemId: any, rawJson: any
 
         body: JSON.stringify({ touches_resources: lines.length ? lines : null }),
       });
+      textarea.dataset.saved = '1'; // finished: the repaint below replaces the row (see sprintItemEdit)
       await refreshSprintSurfaces(projectId);
 
     } catch(e: any) { toast(`Save failed: ${e.message}`, true); cancel(); }
@@ -6148,6 +6162,8 @@ async function sprintItemResourcesEdit(projectId: any, itemId: any, rawJson: any
     if (existingEl) textarea.replaceWith(existingEl);
 
     else textarea.remove();
+
+    refreshSprintSurfaces(projectId); // catch the kept row up (see sprintItemEdit)
 
   };
 
@@ -8747,11 +8763,14 @@ async function loadHitlTab(projectId: any) {
 
   const statusBadge: Record<string, string> = { pending: '#f59e0b', answered: '#22c55e', dismissed: 'var(--muted)' };
 
-
+  // 8a665a03 -- an answer typed into a pending card is a draft the repaint must keep. Every
+  // hitl_filed event, reconnect and Refresh click rebuilds this list; the typed text (and the
+  // caret) is carried across, and the "loading…" placeholder is not painted over it first.
+  const draftUnits = [{ selector: 'input[id^="hitl-ans-"]', key: (el: any) => el.id }];
 
   const render = async () => {
 
-    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading…</div>`;
+    if (!hasUnsentDrafts(body, draftUnits)) body.innerHTML = `<div class="empty" style="color:var(--muted)">loading…</div>`;
 
     const status = (statusFilter && statusFilter.value) || 'pending';
 
@@ -8932,7 +8951,9 @@ async function loadHitlTab(projectId: any) {
 
       }
 
-      body.innerHTML = html;
+      // Judged here, after the fetch returned: an answer typed while the request was in
+      // flight is kept too.
+      paintKeepingDrafts(body, html, draftUnits);
 
       _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, '.hitl-row');
 
@@ -9117,7 +9138,11 @@ async function loadHitlTab(projectId: any) {
 
     } catch (e: any) {
 
-      body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
+      // A transient failure (server restarting) must not wipe an answer being typed: the
+      // cards stay as they are and the next refresh repaints them.
+      if (hasUnsentDrafts(body, draftUnits)) console.warn('[meridian] HITL queue refresh failed:', e);
+
+      else body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
 
     }
 
@@ -11388,7 +11413,11 @@ async function refreshHitl(_pid?: any) {
 
     bar.style.display = 'flex';
 
-    list.innerHTML = items.map((r: any) => {
+    // 8a665a03 -- an answer typed into a card's input is a draft: every hitl_filed event and
+    // reconnect repaints this panel, and the typed text (and the caret) must survive that.
+    const draftUnits = [{ selector: 'input.hitl-answer-input', key: (el: any) => el.dataset.hitlId }];
+
+    paintKeepingDrafts(list, items.map((r: any) => {
 
       const color = _HITL_URGENCY_COLOR[r.urgency] || _HITL_URGENCY_COLOR.normal;
 
@@ -11444,7 +11473,7 @@ async function refreshHitl(_pid?: any) {
 
       </div>`;
 
-    }).join('');
+    }).join(''), draftUnits);
 
     list.querySelectorAll('.hitl-answer-btn').forEach(btn => {
 
@@ -12695,7 +12724,13 @@ function renderTasks(projectId: any) {
 
   banner!.style.display = hitl.length ? 'block' : 'none';
 
-  hitlRoot.innerHTML = hitl.map((t: any) => renderHitlRow(projectId, t)).join('');
+  // 8a665a03 -- every task event repaints this list; a reply typed into a pending-HITL row
+  // (and its caret) is carried across instead of being replaced by an empty twin.
+  paintKeepingDrafts(
+    hitlRoot,
+    hitl.map((t: any) => renderHitlRow(projectId, t)).join(''),
+    [{ selector: 'input[data-input]', key: (el: any) => el.dataset.input }],
+  );
 
   hitl.forEach((t: any) => wireHitlRow(projectId, t));
 
