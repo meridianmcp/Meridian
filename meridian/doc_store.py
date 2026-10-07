@@ -4593,6 +4593,8 @@ class DocStructureStore:
         self,
         figure_id: str,
         caption_element_id: str,
+        *,
+        document_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Durably set the ``caption_element_id`` on an existing doc_figures row.
 
@@ -4606,22 +4608,32 @@ class DocStructureStore:
 
         Returns the updated figure row as a dict, or ``None`` when ``figure_id``
         does not resolve to any stored figure.
+
+        ``document_id`` (6fe5210c, wave 2 third pass) binds the row to ONE
+        document: when given, a figure of any other document is treated exactly
+        like an id that does not exist (``None``) and is never written. The
+        ``link_figure_caption`` handler passes the document it resolved under the
+        caller's own project, so the tool cannot rewrite a figure of another
+        document (or project). Without it the primitive keeps its bare-id
+        behaviour for direct callers.
         """
         if not isinstance(figure_id, str) or not figure_id.strip():
             return None
+        _bind = "" if document_id is None else " AND document_id = ?"
+        _key = (figure_id.strip(),) if document_id is None else (figure_id.strip(), document_id)
         async with self._db.execute(
-            "SELECT * FROM doc_figures WHERE id = ?", (figure_id.strip(),)
+            f"SELECT * FROM doc_figures WHERE id = ?{_bind}", _key
         ) as cur:
             row = await cur.fetchone()
         if row is None:
             return None
         await self._db.execute(
-            "UPDATE doc_figures SET caption_element_id = ? WHERE id = ?",
-            (caption_element_id, figure_id.strip()),
+            f"UPDATE doc_figures SET caption_element_id = ? WHERE id = ?{_bind}",
+            (caption_element_id, *_key),
         )
         await self._db.commit()
         async with self._db.execute(
-            "SELECT * FROM doc_figures WHERE id = ?", (figure_id.strip(),)
+            f"SELECT * FROM doc_figures WHERE id = ?{_bind}", _key
         ) as cur:
             updated_row = await cur.fetchone()
         return _row_to_dict(updated_row, _FIGURE_COLUMNS)
@@ -4960,6 +4972,8 @@ class DocStructureStore:
         self,
         table_id: str,
         caption_element_id: str,
+        *,
+        document_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Durably set the ``caption_element_id`` on an existing doc_tables row.
 
@@ -4974,22 +4988,28 @@ class DocStructureStore:
 
         Returns the updated table row as a dict, or ``None`` when ``table_id``
         does not resolve to any stored table.
+
+        ``document_id`` (6fe5210c, wave 2 third pass) binds the row to ONE
+        document, exactly as in :meth:`set_figure_caption_link`: a table of any
+        other document answers ``None`` and is never written.
         """
         if not isinstance(table_id, str) or not table_id.strip():
             return None
+        _bind = "" if document_id is None else " AND document_id = ?"
+        _key = (table_id.strip(),) if document_id is None else (table_id.strip(), document_id)
         async with self._db.execute(
-            "SELECT * FROM doc_tables WHERE id = ?", (table_id.strip(),)
+            f"SELECT * FROM doc_tables WHERE id = ?{_bind}", _key
         ) as cur:
             row = await cur.fetchone()
         if row is None:
             return None
         await self._db.execute(
-            "UPDATE doc_tables SET caption_element_id = ? WHERE id = ?",
-            (caption_element_id, table_id.strip()),
+            f"UPDATE doc_tables SET caption_element_id = ? WHERE id = ?{_bind}",
+            (caption_element_id, *_key),
         )
         await self._db.commit()
         async with self._db.execute(
-            "SELECT * FROM doc_tables WHERE id = ?", (table_id.strip(),)
+            f"SELECT * FROM doc_tables WHERE id = ?{_bind}", _key
         ) as cur:
             updated_row = await cur.fetchone()
         return _row_to_dict(updated_row, _TABLE_COLUMNS)

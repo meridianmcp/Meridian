@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from .. import _deps
 from .._deps import _db, _get_tenant_from_request, validate_input_size
 from .. import db as db_module
 
@@ -315,6 +316,29 @@ async def execute_batch_endpoint(
     tenant = await _get_tenant_from_request(request)
     tenant_id = tenant.get("id") if tenant else None
     session_id = body.get("session_id")
+    # RT-TI-005 (pass 3, F-D4) -- every session id this batch names (the batch-level default
+    # and, for notes, each entry's own) is bound to the project in the path. Notes are
+    # written INTO that session and re-injected into its agent's next context, so a session
+    # of another project must never be reachable from here. The engine refuses a foreign
+    # session per entry (for every caller); a PROJECT-SCOPED caller additionally gets the
+    # same 403 as everywhere else for a session outside their scope, an unknown id included
+    # (existence is not leaked), before anything runs.
+    session_refs: list[str] = []
+    if isinstance(session_id, str) and session_id:
+        session_refs.append(session_id)
+    if body.get("operation") == "notes":
+        for entry in entries:
+            entry_sid = entry.get("session_id") if isinstance(entry, dict) else None
+            if isinstance(entry_sid, str) and entry_sid:
+                session_refs.append(entry_sid)
+    if session_refs:
+        scoped = await _deps._scoped_project_ids_for_request(request)
+        if scoped is not None:
+            owners = await _deps._session_projects(request, session_refs)
+            for ref in dict.fromkeys(session_refs):
+                _deps._deny_unless_in_scope(scoped, owners.get(ref))
+                if owners[ref] != project_id:
+                    raise HTTPException(status_code=404, detail="session not found")
     try:
         return await batch_ops.execute_batch_operation(
             db,

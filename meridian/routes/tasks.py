@@ -7,7 +7,8 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db, _require_project_in_scope
+from .. import _deps
+from .._deps import _db, _deny_unless_in_scope, _require_project_in_scope
 from .. import db as db_module
 from ..models import ClaimTaskRequest, ClaimTaskResponse, Task, TaskCreate, TaskUpdate
 
@@ -17,6 +18,21 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Helper (previously in server.py)
 # ---------------------------------------------------------------------------
+
+async def _session_of_another_project(
+    db: aiosqlite.Connection, session_id: str, project_id: str
+) -> bool:
+    """True when ``session_id`` is a REAL session whose project is not ``project_id``.
+
+    An unknown session id is ``False`` (not foreign), so callers that claim with an
+    id that was never registered keep working exactly as before.
+    """
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row is not None and row["project_id"] != project_id
+
 
 async def _claim_task_result(
     db: aiosqlite.Connection,
@@ -119,10 +135,16 @@ async def get_session_tasks_live(
     running Claude Code session is doing in real-time (polling every 5s).
     """
     db = await _db(request)
+    # RT-TI-005 (wave 2, pass 2) — the session joined in for its name / human_id
+    # must belong to the SAME project as the task row (``s.project_id = t.project_id``).
+    # {session_id} comes from the URL and the middleware only vets {project_id}, so
+    # naming a foreign session id next to an in-scope project must never surface
+    # that session's name or human_id (a legacy row whose session_id points at
+    # another project's session would otherwise be an enumeration oracle).
     async with db.execute(
         "SELECT t.*, s.name AS session_name, s.human_id AS human_id "
         "FROM task_log t "
-        "LEFT JOIN sessions s ON s.id = t.session_id "
+        "LEFT JOIN sessions s ON s.id = t.session_id AND s.project_id = t.project_id "
         "WHERE t.project_id = ? AND t.session_id = ? "
         "ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?",
         (project_id, session_id, limit),
@@ -158,11 +180,21 @@ async def claim_task_endpoint(
 ) -> dict[str, Any]:
     """Atomically claim a pending task. Returns ``claimed=False`` when
     another worker holds the lock."""
-    project = await db_module.get_project(await _db(request), project_id)
+    _req_db = await _db(request)
+    project = await db_module.get_project(_req_db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    # RT-TI-005 (wave 2, pass 2) — the claiming session must not belong to ANOTHER
+    # project. The task and sprint item are already bound to the path project by
+    # _claim_task_result, but body.session_id is stored as claimed_by (get_tasks
+    # joins that id back to the session's name and human_id), and log_task touches
+    # the session (last_seen, run transcript). A session of a different project is
+    # answered like a missing one, for every caller; an UNKNOWN session id keeps
+    # its historical behaviour.
+    if await _session_of_another_project(_req_db, body.session_id, project_id):
+        raise HTTPException(status_code=404, detail="session not found")
     return await _claim_task_result(
-        await _db(request), project_id, body.task_id, body.session_id
+        _req_db, project_id, body.task_id, body.session_id
     )
 
 
@@ -174,8 +206,14 @@ async def release_task_endpoint(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    # RT-TI-005 (wave 2, pass 2) — the task must belong to the project in the PATH
+    # (the only project the scope middleware vets). Without the binding a scoped
+    # caller could pair its own project with a foreign task id plus the claimant's
+    # session id and reset that task and its linked sprint item. A task of another
+    # project is answered exactly like a task this session does not hold (404), for
+    # every caller, and is left untouched.
     released = await db_module.release_task(
-        await _db(request), body.task_id, body.session_id
+        await _db(request), body.task_id, body.session_id, project_id=project_id
     )
     if not released:
         raise HTTPException(status_code=404, detail="task not claimed by this session")
@@ -192,10 +230,15 @@ async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     async with _req_db.execute(
-        "SELECT id FROM sessions WHERE id = ?", (body.session_id,)
+        "SELECT id, project_id FROM sessions WHERE id = ?", (body.session_id,)
     ) as cur:
         row = await cur.fetchone()
-    if row is None:
+    # RT-TI-005 (wave 2) — the session must belong to the project the task is
+    # logged against. db.log_task touches that session (last_seen, run
+    # transcript) and publishes task_created, so a caller who passed its own
+    # in-scope project_id with a foreign session_id would otherwise write into
+    # another project's session. A mismatch is answered like a missing session.
+    if row is None or row["project_id"] != body.project_id:
         raise HTTPException(status_code=404, detail="session not found")
     return await db_module.log_task(
         _req_db, body.session_id, body.project_id,
@@ -207,10 +250,12 @@ async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
 @router.patch("/tasks/{task_id}", response_model=Task)
 async def patch_task(task_id: str, body: TaskUpdate, request: Request) -> dict[str, Any]:
     """Update a task's status and/or description in place."""
+    scoped = await _deps._scoped_project_ids_for_request(request)  # H7: scope first
     existing = await db_module.get_task(await _db(request), task_id)
     if existing is None:
+        _deny_unless_in_scope(scoped, None)  # scoped callers: same 403 as a foreign id
         raise HTTPException(status_code=404, detail="task not found")
-    await _require_project_in_scope(request, existing["project_id"])  # RT-TI-005
+    _deny_unless_in_scope(scoped, existing["project_id"])  # RT-TI-005
     try:
         updated = await db_module.update_task(
             await _db(request), task_id,
@@ -228,11 +273,14 @@ async def delete_task_endpoint(task_id: str, request: Request) -> Response:
     """Hard-delete a task-log entry."""
     db = await _db(request)
     # RT-TI-005 — /tasks/{id} is outside the /projects/{uuid} middleware: resolve
-    # the task's project and apply the scope rule. An unknown id stays a 204
-    # no-op, as before.
-    existing = await db_module.get_task(db, task_id)
-    if existing is not None:
-        await _require_project_in_scope(request, existing["project_id"])
+    # the task's project and apply the scope rule. H7 — the scope is resolved
+    # FIRST and the task is only loaded for a project-scoped caller (the delete
+    # needs no row otherwise). For an unscoped caller an unknown id stays a 204
+    # no-op, as before; a scoped caller gets the same 403 for unknown and foreign.
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None:
+        existing = await db_module.get_task(db, task_id)
+        _deny_unless_in_scope(scoped, existing["project_id"] if existing is not None else None)
     await db.execute("DELETE FROM task_log WHERE id = ?", (task_id,))
     await db.commit()
     return Response(status_code=204)

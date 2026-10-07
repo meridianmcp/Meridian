@@ -1351,6 +1351,21 @@ async def get_sprint_item(
     return _row_to_dict(row)
 
 
+async def _get_sprint_item_in_project(
+    db: aiosqlite.Connection, project_id: str, item_id: str
+) -> dict[str, Any] | None:
+    """:func:`get_sprint_item`, bound to ``project_id``.
+
+    A row that belongs to another project answers ``None`` -- the same as an id
+    that does not exist -- so a read-only code path of a project-scoped function
+    can never hand back another project's row (6fe5210c, wave 2).
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    return item
+
+
 # c0ddd5b3 — sentinel for _transition_status(lock_session_id=...): "leave the
 # column as it is", distinct from an explicit None ("write NULL"). Also used
 # for coarse_lock_files.
@@ -6097,7 +6112,14 @@ async def patch_sprint_item(
         ns_values.append(_gc)
 
     if not ns_fields and status_value is None:
-        return await get_sprint_item(db, item_id)
+        # 6fe5210c (wave 2, third pass) -- a patch with nothing editable in it is
+        # still a READ of the row, so it must be bound to the caller's project
+        # exactly like the UPDATEs below. The unbound lookup returned another
+        # project's full row to a caller that named its OWN project_id with a
+        # foreign item_id (MCP update_sprint_item and HTTP PATCH
+        # /projects/{pid}/sprint-items/{iid} with an empty body). A mismatched
+        # item now answers None, i.e. exactly like "not found".
+        return await _get_sprint_item_in_project(db, project_id, item_id)
 
     result = None
     if ns_fields:
@@ -6168,7 +6190,9 @@ async def patch_sprint_item(
                 result = await get_sprint_item(db, item_id)
 
     if result is None:
-        result = await get_sprint_item(db, item_id)
+        # Same binding as the no-op branch above (6fe5210c): never read the row
+        # without the project.
+        result = await _get_sprint_item_in_project(db, project_id, item_id)
     return result
 
 

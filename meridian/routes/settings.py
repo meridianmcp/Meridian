@@ -19,6 +19,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from .. import _deps
 from .._deps import _db
 from .. import db as db_module
 from .. import profile_contract as profile_contract_module
@@ -26,17 +27,132 @@ from .. import profile_contract as profile_contract_module
 router = APIRouter()
 
 
+def _scope_type_is(scope_type: Any, name: str) -> bool:
+    """True when ``scope_type`` names the ``name`` layer.
+
+    Normalised exactly like ``profile_contract.normalize_scope_type`` (strip +
+    lowercase) so ``"PROJECT"`` or ``" session "`` cannot slip past the scope
+    check and still be stored as the project / session layer.
+    """
+    return isinstance(scope_type, str) and scope_type.strip().lower() == name
+
+
+def _is_project_layer(scope_type: Any) -> bool:
+    """True when ``scope_type`` names the ``project`` layer (keyed by a project id)."""
+    return _scope_type_is(scope_type, "project")
+
+
+def _is_session_layer(scope_type: Any) -> bool:
+    """True when ``scope_type`` names the ``session`` layer (keyed by a session id)."""
+    return _scope_type_is(scope_type, "session")
+
+
+async def _require_layer_scopes_in_scope(
+    request: Request, *layers: "tuple[Any, Any]"
+) -> None:
+    """RT-TI-005 (wave 2) — ``project`` and ``session`` profile layers are keyed by an id
+    that belongs to exactly one project.
+
+    ``/profile-layers/...`` is top-level (outside the /projects/{uuid}
+    middleware), so a project-scoped workspace member could otherwise read,
+    overwrite, reset or clone another project's executor/capability profile by
+    naming its id (pinned decision 6fe5210c). Every ``(scope_type, scope_id)``
+    pair that is a project layer must name a project inside the caller's scope;
+    every session layer must name a session whose project (``sessions.project_id``)
+    is inside it (403, same message as the middleware; an unknown session id gets
+    the same 403 as a foreign one, so existence is not leaked). The other scope
+    types (hosted_default, workspace, user) are not project-keyed and are left
+    unchanged -- whether a project-scoped member may touch them is an open
+    product question.
+
+    The scope is only resolved when a project or session layer is involved, and
+    the session lookup only for a project-scoped caller, so the other layer types
+    and every unscoped caller pay nothing extra.
+    """
+    project_ids = [
+        str(sid).strip() for stype, sid in layers if _is_project_layer(stype) and str(sid).strip()
+    ]
+    session_ids = [
+        str(sid).strip() for stype, sid in layers if _is_session_layer(stype) and str(sid).strip()
+    ]
+    if not project_ids and not session_ids:
+        return
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is None:
+        return
+    for pid in project_ids:
+        _deps._deny_unless_in_scope(scoped, pid)
+    for sid in session_ids:
+        _deps._deny_unless_in_scope(scoped, await _deps._session_project_id(request, sid))
+
+
+async def _in_scope_session_ids(
+    request: Request, scoped: "list[str]", session_ids: "list[str]"
+) -> "set[str]":
+    """The subset of ``session_ids`` whose session belongs to a project in ``scoped``.
+
+    One ``IN (...)`` lookup per chunk instead of a query per layer row; an id that
+    names no session is simply absent from the result (so it is not in scope).
+    """
+    allowed = set(scoped)
+    found: set[str] = set()
+    ids = list(dict.fromkeys(session_ids))
+    db = await _db(request)
+    for start in range(0, len(ids), 400):
+        chunk = ids[start:start + 400]
+        placeholders = ", ".join("?" for _ in chunk)
+        async with db.execute(
+            f"SELECT id, project_id FROM sessions WHERE id IN ({placeholders})",
+            tuple(chunk),
+        ) as cur:
+            for row in await cur.fetchall():
+                if row["project_id"] in allowed:
+                    found.add(row["id"])
+    return found
+
+
 @router.get("/profile-layers")
 async def list_profile_layers_route(
     request: Request, scope_type: str | None = None
 ) -> list[dict[str, Any]]:
     """List every persisted profile_layers row, optionally filtered by
-    ``scope_type``. Mirrors the ``list_profile_layers`` MCP tool."""
+    ``scope_type``. Mirrors the ``list_profile_layers`` MCP tool.
+
+    RT-TI-005 (wave 2) — for a project-scoped caller the ``project`` layers of
+    projects outside their scope and the ``session`` layers of sessions of other
+    projects are dropped (the other layer types are not project-keyed and are
+    returned as before). The scope is resolved only when the listing can contain
+    a project or session layer, i.e. never for ``?scope_type=workspace`` /
+    ``user`` / ``hosted_default``.
+    """
     db = await _db(request)
     try:
-        return await db_module.list_profile_layers(db, scope_type)
+        rows = await db_module.list_profile_layers(db, scope_type)
     except (profile_contract_module.ProfileContractError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if scope_type is not None and not (
+        _is_project_layer(scope_type) or _is_session_layer(scope_type)
+    ):
+        return rows
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None:
+        allowed = set(scoped)
+        session_ids = [
+            str(r.get("scope_id")) for r in rows if _is_session_layer(r.get("scope_type"))
+        ]
+        in_scope_sessions = (
+            await _in_scope_session_ids(request, scoped, session_ids) if session_ids else set()
+        )
+
+        def _visible(row: dict[str, Any]) -> bool:
+            if _is_project_layer(row.get("scope_type")):
+                return row.get("scope_id") in allowed
+            if _is_session_layer(row.get("scope_type")):
+                return row.get("scope_id") in in_scope_sessions
+            return True  # hosted_default / workspace / user: not project-keyed
+
+        rows = [r for r in rows if _visible(r)]
+    return rows
 
 
 @router.get("/profile-layers/{scope_id}/revisions")
@@ -75,6 +191,7 @@ async def get_profile_layer_route(
         raise HTTPException(status_code=400, detail="scope_type is required")
     if not scope_id.strip():
         raise HTTPException(status_code=400, detail="scope_id is required")
+    await _require_layer_scopes_in_scope(request, (scope_type, scope_id))  # RT-TI-005
     db = await _db(request)
     try:
         return await db_module.get_profile_layer(db, scope_type, scope_id)
@@ -96,6 +213,7 @@ async def save_profile_layer_route(
         raise HTTPException(status_code=400, detail="scope_type is required")
     if not scope_id.strip():
         raise HTTPException(status_code=400, detail="scope_id is required")
+    await _require_layer_scopes_in_scope(request, (scope_type, scope_id))  # RT-TI-005
     db = await _db(request)
     try:
         return await db_module.set_profile_layer(
@@ -128,6 +246,7 @@ async def reset_profile_layer_route(
         raise HTTPException(status_code=400, detail="scope_type is required")
     if not scope_id.strip():
         raise HTTPException(status_code=400, detail="scope_id is required")
+    await _require_layer_scopes_in_scope(request, (scope_type, scope_id))  # RT-TI-005
     db = await _db(request)
     try:
         return await db_module.reset_profile_layer(db, scope_type, scope_id)
@@ -154,6 +273,11 @@ async def clone_profile_layer_route(
         raise HTTPException(status_code=400, detail="target_scope_type is required")
     if not target_scope_id:
         raise HTTPException(status_code=400, detail="target_scope_id is required")
+    # RT-TI-005 — both ends of a clone: reading another project's layer (source)
+    # and overwriting another project's layer (target) are each refused.
+    await _require_layer_scopes_in_scope(
+        request, (scope_type, scope_id), (target_scope_type, target_scope_id)
+    )
     db = await _db(request)
     try:
         return await db_module.clone_profile_layer(
@@ -197,11 +321,23 @@ async def get_effective_profile_route(
     applicable layer — hosted_default -> workspace -> user -> project ->
     session. Mirrors the ``get_effective_profile`` MCP tool. This is the
     one project-anchored route in this module — see the module docstring.
+
+    RT-TI-005 (wave 2) — ``project_id`` is vetted by the middleware, but
+    ``session_id`` merges that session's layer into the result and
+    ``db.get_effective_profile`` never checks the session belongs to the project.
+    A project-scoped caller therefore gets a 403 for a session of any other
+    project (or an unknown one); unscoped callers are unchanged.
     """
     db = await _db(request)
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    if session_id and session_id.strip():
+        scoped = await _deps._scoped_project_ids_for_request(request)
+        if scoped is not None and await _deps._session_project_id(
+            request, session_id.strip()
+        ) != project_id:
+            raise HTTPException(status_code=403, detail="Project is outside your access scope.")
     try:
         return await db_module.get_effective_profile(
             db, project_id,

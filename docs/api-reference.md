@@ -28,6 +28,39 @@ Check server health.
 
 ---
 
+## Access Scope (hosted workspaces)
+
+A hosted workspace member is invited either to the whole workspace or to a single project. A **project-scoped** member (a caller whose `X-Workspace-Tenant-Id` header names a workspace they were invited to, with one project granted) may only reach the project(s) in their scope. The workspace owner, workspace-wide members, self-hosted servers and demo sessions are never scoped and see no change.
+
+For a scoped caller:
+
+- Every `/projects/{project_id}/...` route, and every route that reaches a project through another id (a session, task, HITL request or profile-layer id), a request body field or a name, answers `403 {"detail": "Project is outside your access scope."}` when the project is outside the scope. An id that does not exist gets the same `403` as a foreign one, so existence is not revealed. The exception is `GET /projects/by-name/{name}`: an out-of-scope project is a `404`, exactly like a name that does not exist.
+- `GET /projects` and `GET /hitl` list only in-scope projects and requests. `GET /profile-layers` drops the `project` and `session` layers that belong to other projects.
+- `GET /team/summary` requires a `project_id` inside the scope. Omitting it is a `403` (it would otherwise roll up every project).
+- `DELETE /projects` (batch) checks every id first: if any id is outside the scope the whole call is a `403` and nothing is deleted.
+- `GET /projects/{project_id}/effective-profile?session_id=` is a `403` unless the session belongs to `{project_id}`.
+- `GET /settings/mcp-config` lists only in-scope projects, and the tunnel routes (`GET /tunnel/launch-matrix/{tenant_id}`, `GET`/`POST`/`DELETE /tunnel/filesystem-roots`) read and write the executor config of in-scope projects only.
+- `GET /export/my-data` exports only the in-scope projects, and no workspace-level notes or decisions (they belong to no project).
+- `POST /hooks/session-start` and `POST /hooks/stop`, when called with a browser session plus `X-Workspace-Tenant-Id` (a call with a Bearer token goes to the token's own workspace and is not scoped): a body `project_id` outside the scope is a `403`, project auto-routing by `cwd` / `hostname` only considers in-scope projects, and the stop hook's `session_id` must belong to the project it acts on.
+- `POST /projects/{project_id}/sprint-batch`: a `session_id` (the batch default or a `notes` entry's own) that is outside the scope, or unknown, is a `403` before anything runs.
+- If the scope cannot be resolved (for example the auth database is briefly unavailable) the request fails closed with `503 {"detail": "scope check unavailable"}` (a JSON-RPC error with code `-32603` on `POST /mcp`) instead of being treated as unscoped. Requests without an `X-Workspace-Tenant-Id` header are unaffected.
+
+Project bindings that apply to **every** caller (an id of another project is never legitimate, so it is answered like a missing one with `404`, and the object is left untouched):
+
+- `POST /tasks` -- the `session_id` must belong to `project_id` (`404`).
+- `POST /projects/{project_id}/tasks/claim` -- a `session_id` that belongs to another project is a `404`.
+- `POST /projects/{project_id}/tasks/release` -- a task of another project is a `404`, the same answer as a task the session does not hold.
+- `GET /projects/{project_id}/sessions/{session_id}/tasks/live` -- a task whose recorded session belongs to another project is listed without a `session_name` or `human_id` (the session is joined only within the task's own project).
+- `DELETE /projects/{project_id}/worktrees/{worktree_id}` -- a worktree of another project is a `404`.
+- `POST /projects/{project_id}/worktrees` -- a `session_id` or `item_id` that belongs to another project is a `404`.
+- `POST /projects/{project_id}/hitl` -- a `session_id` that belongs to another project is a `404`.
+- `POST /projects/{project_id}/sprint-batch` (`notes`) -- an entry whose `session_id` belongs to another project fails with a `NOT_FOUND` entry result and writes nothing.
+- `POST /projects/{project_id}/handoff/corrections` -- a `source_handoff_id` of another project is answered exactly like an unknown handoff id (`422`), and no handoff of another project is ever invalidated or regenerated.
+
+Not restricted by project scope (open product questions, not project-keyed): the workspace-level objects (`/workspace/notes`, `/workspace/decisions`, `/workspace/sprint-items`, workspace settings), the `workspace`, `user` and `hosted_default` profile layers, whether a scoped member may create projects, and the OAuth `/mcp` endpoint (it opens the tenant's own database, so it cannot be project-scoped). A subproject inherits context from its parent project, and a parent's search reaches its subprojects, so grant a member a parent or a subproject only when that sharing is intended.
+
+---
+
 ## Projects
 
 ### `GET /projects`
@@ -230,6 +263,8 @@ Log a task.
 }
 ```
 
+The `session_id` must belong to `project_id`; otherwise the call is a `404` (see Access Scope).
+
 ---
 
 ### `PATCH /tasks/{task_id}`
@@ -251,6 +286,8 @@ List unclaimed pending tasks.
 Release a claimed task.
 
 **Body:** `{"task_id": "uuid", "session_id": "uuid"}`
+
+The task must belong to `{project_id}`. A task of another project is a `404`, the same answer as a task the session does not hold, and is left untouched (see Access Scope).
 
 ---
 
