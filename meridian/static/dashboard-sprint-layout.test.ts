@@ -13,7 +13,7 @@
 // parsed CSSOM) the properties that GUARANTEE no overlap: pixel overlap itself is
 // measured in a real browser (see the commit message). Every test below includes
 // at least one assertion that the pre-fix code violates.
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 // renderSprintProgress calls the ambient global escapeHtml (bundled app-wide by
@@ -304,5 +304,51 @@ describe("sprint row layout contract: media queries and the parsed stylesheet", 
     expect(title, ".sprint-item-title base rule").toBeDefined();
     expect(title!.style!.getPropertyValue("white-space")).toBe("normal");
     expect(title!.style!.getPropertyValue("overflow-wrap")).toBe("anywhere");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Needs-attention row's "Pending" button used to render the tail of its own
+// handler as its label: `${JSON.stringify(projectId)}` put raw double quotes inside the
+// double-quoted onclick attribute, so the attribute ended early and the rest of the
+// handler (`x.id===it.id?{...x,status:'pending'}:x)))">`) became a 255px-wide unbreakable
+// "label" that pushed the row's buttons out past the board at narrow widths. (The
+// handler also referenced `items` / `it`, which do not exist where an inline handler runs.)
+// ---------------------------------------------------------------------------
+describe("sprint board buttons: labels and the Needs-attention 'Pending' handler", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("no board button label leaks markup or handler code from a mis-quoted attribute", () => {
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>(`#live-sprint-progress-${PID} button.sprint-btn`));
+    expect(buttons.length).toBeGreaterThan(20);
+    for (const b of buttons) {
+      const text = (b.textContent || "").trim();
+      expect(text, `button ${b.title}`).toMatch(/^[^"'<>=(){}\\]{1,24}$/u);
+    }
+  });
+
+  it("the Needs-attention 'Pending' button reads '↩ Pending' and carries only its own attributes", () => {
+    const row = allRows().find((r) => r.dataset.item === "ind" && kindOf(r) === "attention")!;
+    const btn = row.querySelector<HTMLButtonElement>('button[title="Back to pending"]')!;
+    expect((btn.textContent || "").trim()).toBe("↩ Pending");
+    expect(Array.from(btn.attributes).map((a) => a.name).sort()).toEqual(["class", "onclick", "title"]);
+  });
+
+  it("clicking it PATCHes the item back to pending, then refreshes the Live tab", async () => {
+    const row = allRows().find((r) => r.dataset.item === "ind" && kindOf(r) === "attention")!;
+    const code = row.querySelector<HTMLButtonElement>('button[title="Back to pending"]')!.getAttribute("onclick")!;
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true });
+    const refreshSpy = vi.fn();
+    // an inline handler runs in global scope: give it only the two globals it may use
+    const handler = new Function("fetch", "refreshLiveTab", code);
+    handler(fetchSpy, refreshSpy);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe(`/projects/${PID}/sprint-items/ind`);
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body)).toEqual({ status: "pending" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(refreshSpy).toHaveBeenCalledWith(PID);
   });
 });
