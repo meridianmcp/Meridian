@@ -64,6 +64,18 @@ import {
   eligibleParents,
   type HierProject,
 } from "./dashboard-subprojects";
+// fc779141 — goal fields that never lose an in-progress edit to a live update or a stale save
+// (Changed elsewhere bar, Esc-to-discard, 409-aware saves, leave guards).
+import {
+  GoalField,
+  registerGoalFields,
+  getGoalField,
+  noteGoalEvent,
+  installGoalUnloadGuard,
+  guardGoalLeave,
+  splitGoalText,
+  type GoalParts,
+} from "./dashboard-goal-conflict";
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
@@ -3180,7 +3192,12 @@ function _makeTabEl(t: any) {
 
   close.textContent = '×';
 
-  close.onclick = (e) => { e.stopPropagation(); closeTab(t.id); };
+  close.onclick = (e) => {
+    e.stopPropagation();
+    // fc779141 — unsaved goal edits would vanish with the tab: ask first.
+    if (guardGoalLeave(t.id, () => closeTab(t.id))) return;
+    closeTab(t.id);
+  };
 
   div.appendChild(close);
 
@@ -4636,6 +4653,11 @@ function buildTabBody(project: any) {
         const vtab = btn.dataset.vtab;
 
         const p = state.panels[project.id];
+        // fc779141 — leaving the Goal tab with unsaved goal edits (a failed save, or a "Changed
+        // elsewhere" nobody resolved) asks Save / Discard / Stay instead of dropping them.
+        if (btn._goalLeaveOk) btn._goalLeaveOk = false;
+        else if (p.activeVtab === 'goal' && vtab !== 'goal'
+          && guardGoalLeave(project.id, () => { btn._goalLeaveOk = true; btn.click(); })) return;
 
         // Keep the clicked tab's group expanded so it stays visible/measurable.
         revealGroupForTab(vtab);
@@ -4990,7 +5012,10 @@ function buildTabBody(project: any) {
       if (sel.value === '__custom__') { inp.style.display = 'block'; inp.focus(); }
 
       else { inp.style.display = 'none'; inp.value = sel.value; }
-
+      // fc779141 — the field hears about the pick only now that the input holds it: a listener
+      // on the select itself runs first and would still read the old text, so the pick would
+      // neither look dirty nor count as an edit (and would let a waiting remote change replace it).
+      getGoalField(project.id, 'sprint')?.onUserInput();
     };
 
   }, 200);
@@ -5068,39 +5093,9 @@ function buildTabBody(project: any) {
 
   wireClaudeLaunchPanel(project.id);
 
-  document.getElementById(`goal-${project.id}`)!.addEventListener('blur', () => saveGoal(project.id));
-
-  document.getElementById(`goal-north-star-${project.id}`)!.addEventListener('blur', () => saveNorthStar(project.id));
-
-  document.getElementById(`goal-sprint-${project.id}`)!.addEventListener('blur', () => saveSprint(project.id));
-
-  // v0.6.4 — dirty state: highlight textarea border when unsaved changes exist
-
-  document.getElementById(`goal-${project.id}`)!.addEventListener('input', function() {
-
-    const p = state.panels[project.id];
-
-    this.classList.toggle('dirty', this.value !== (p._lastSaved || ''));
-
-  });
-
-  document.getElementById(`goal-north-star-${project.id}`)!.addEventListener('input', function() {
-
-    const p = state.panels[project.id];
-
-    this.classList.toggle('dirty', this.value !== (p._serverNorthStar || ''));
-
-    autosizeGoalField(this);
-
-  });
-
-  document.getElementById(`goal-sprint-${project.id}`)!.addEventListener('input', function() {
-
-    const p = state.panels[project.id];
-
-    this.classList.toggle('dirty', this.value !== (p._serverSprint || ''));
-
-  });
+  // fc779141 — blur-save, dirty tracking, Esc-to-discard and the "Changed elsewhere" bar for the
+  // three goal fields live in dashboard-goal-conflict.ts (GoalField); see initGoalFields.
+  initGoalFields(project.id);
 
   autosizeGoalField(document.getElementById(`goal-north-star-${project.id}`));
 
@@ -10581,183 +10576,70 @@ async function refreshTab(projectId: any) {
 
 
 async function refreshGoal(projectId: any) {
-
   const ta = document.getElementById(`goal-${projectId}`);
-
   const v = document.getElementById(`goal-version-${projectId}`);
-
   if (!ta) return;
-
   const goalPath = `/projects/${projectId}/goal`;
-
   try {
-
     const goal = await projectApi(projectId, goalPath);
-
     state.panels[projectId].goalRaw = goal.content;
-
     let text;
-
     if (typeof goal.content === 'string') {
-
       state.panels[projectId].goalIsJson = false;
-
       text = goal.content;
-
     } else {
-
       state.panels[projectId].goalIsJson = true;
-
       text = JSON.stringify(goal.content, null, 2);
-
     }
 
-    // Split out title line + AUTO BLOCKS zone
-
-    const AUTO_SPLIT = '--- AUTO BLOCKS BELOW ---';
-
-    const splitIdx = text.indexOf(AUTO_SPLIT);
-
-    const mainText = splitIdx !== -1 ? text.slice(0, splitIdx).trimEnd() : text;
-
-
-
+    // Split out title line + SHIPPED block + AUTO BLOCKS zone (splitGoalText):
     // Zone 1: title (line 0) — read-only
-
     // Zone 2: SHIPPED block — read-only
-
     // Zone 3: CURRENT FOCUS onwards — editable
+    const parts = splitGoalText(text);
+    applyGoalZones(projectId, parts);
 
-    const allLines = mainText.split('\n');
-
-    // Only use goal-title as blue header if the first line looks like a version label
-    // (e.g. "v1.0.0", "v2.3 — auth sprint"). Otherwise everything goes in the textarea.
-    const _firstLine = allLines[0] || '';
-    const _isVersionLabel = /^v\d+\.\d+/.test(_firstLine.trim()) || _firstLine.trim().length === 0;
-    const titleLine = _isVersionLabel ? _firstLine : '';
-    const titleEl = document.getElementById(`goal-title-${projectId}`);
-    if (titleEl) {
-      titleEl.textContent = titleLine;
-      // 06d57fef — when there's no version label, hide the title bar entirely.
-      // Otherwise the empty div renders as a stray gray bar above the textarea
-      // (its background/border/padding show even with no text). Round the
-      // textarea's top corners when the bar is gone so it doesn't look clipped.
-      const hasTitle = !!titleLine.trim();
-      titleEl.style.display = hasTitle ? 'block' : 'none';
-      const taEl = document.getElementById(`goal-${projectId}`);
-      if (taEl) taEl.style.borderRadius = hasTitle ? '0 0 4px 4px' : '4px';
-    }
-
-    const body = (_isVersionLabel ? allLines.slice(1) : allLines).join('\n').replace(/^\n/, '');
-
-    // Find CURRENT FOCUS as the start of editable zone
-
-    const editStart = body.search(/^(CURRENT FOCUS|KEY FILES)/m);
-
-    if (editStart > 0) {
-
-      const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
-
-      if (shippedEl) {
-
-        shippedEl.textContent = body.slice(0, editStart).trimEnd();
-
-        shippedEl.style.display = shippedEl.textContent.trim() ? 'block' : 'none';
-
-      }
-
-      ta.value = body.slice(editStart);
-
-    } else {
-
-      const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
-
-      if (shippedEl) shippedEl.style.display = 'none';
-
-      ta.value = body;
-
-    }
-
-    const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
-
-    if (shippedEl && !shippedEl.textContent.trim()) shippedEl.style.display = 'none';
-
+    // fc779141 — server data reaches the editors only through GoalField.applyServer: a field
+    // the person is editing keeps their text (and shows "Changed elsewhere"), an untouched one
+    // updates live as before. field_updated_at is the per-field stamp the next save is based on.
+    const stamps = goal.field_updated_at || {};
+    const vgField = getGoalField(projectId, 'version_goal');
+    if (vgField) vgField.applyServer(parts.editable, stamps.version_goal ?? null);
+    else ta.value = parts.editable;
     autosizeGoalField(ta);
 
-
-
-    const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
-
-    if (autoBlocksEl) {
-
-      if (splitIdx !== -1) {
-
-        const abWrapper = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
-
-        if (abWrapper) abWrapper.style.display = 'block';
-
-        autoBlocksEl.style.display = 'block';
-
-        autoBlocksEl.textContent = text.slice(splitIdx + '--- AUTO BLOCKS BELOW ---'.length).trimStart();
-
-      } else {
-
-        const abWrapper2 = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
-
-        if (abWrapper2) abWrapper2.style.display = 'none';
-
-        autoBlocksEl.style.display = 'none';
-
-      }
-
-    }
-
     v!.textContent = `v${goal.version}`;
-
     const vState = document.getElementById(`goal-state-${projectId}`);
-
     if (vState) vState.textContent = `v${goal.version}`;
 
     // v0.5.2 — north star and sprint textareas
-
     // v0.9 — guard against partial responses: only overwrite when the
-
     // server returned an explicit value (string or null). undefined
-
     // means "field absent from this response" — keep what the user has.
-
     const nsTA = document.getElementById(`goal-north-star-${projectId}`);
-
     const spTA = document.getElementById(`goal-sprint-${projectId}`);
-
     if (nsTA && 'north_star' in goal) {
-
-      nsTA.value = goal.north_star || '';
-
+      const nsField = getGoalField(projectId, 'north_star');
+      if (nsField) nsField.applyServer(goal.north_star || '', stamps.north_star ?? null);
+      else nsTA.value = goal.north_star || '';
       autosizeGoalField(nsTA);
-
     }
-
     if (spTA && 'sprint' in goal) {
-
-      spTA.value = goal.sprint || '';
-
-      if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || '');
-
+      const spField = getGoalField(projectId, 'sprint');
+      if (spField) spField.applyServer(goal.sprint || '', stamps.sprint ?? null);
+      else {
+        spTA.value = goal.sprint || '';
+        if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || '');
+      }
     }
 
-    // v0.6.4 — store server values for dirty tracking; clear dirty state
-
+    // v0.6.4 — store the latest server values (other panels read them); the
+    // dirty state itself now lives in each GoalField.
     const p = state.panels[projectId];
-
     p._serverNorthStar = goal.north_star || '';
-
     p._serverSprint = goal.sprint || '';
-
     const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
-
     if (nsLock) nsLock.textContent = goal.north_star ? 'locked' : 'unlocked';
-
     // P0 VERIFY (106519eb) — the north star shown for a subproject with none of
     // its own is borrowed from goal.north_star_source_project_id (0fed6a42 /
     // 3b6ff466 inheritance). Without this badge the textarea looks identical to
@@ -10780,54 +10662,30 @@ async function refreshGoal(projectId: any) {
       }
     }
 
-    p._lastSaved = text;
-
-    if (nsTA) { nsTA.classList.remove('dirty'); }
-
-    if (spTA) { spTA.classList.remove('dirty'); }
-
-    ta.classList.remove('dirty');
-
     // v0.6.4 — last-modified timestamps
-
     const tsNs = document.getElementById(`goal-ns-ts-${projectId}`);
-
     const tsVg = document.getElementById(`goal-vg-ts-${projectId}`);
-
     const tsSp = document.getElementById(`goal-sp-ts-${projectId}`);
-
     const updAt = goal.updated_at ? formatRelativeTime(goal.updated_at) : '';
-
     if (tsNs) tsNs.textContent = updAt ? `· ${updAt}` : '';
-
     if (tsVg) tsVg.textContent = updAt ? `· ${updAt}` : '';
-
     if (tsSp) tsSp.textContent = updAt ? `· ${updAt}` : '';
 
     // v2.3 — decisions table subtab. goal.decisions is the append-only
-
     // blob: "[YYYY-MM-DD] text\n\n[YYYY-MM-DD] text\n\n..." (newest first).
-
     renderDecisionsTable(projectId, goal.decisions || '');
 
     // v2.4 — pinned decisions (editable constitution) above the log.
-
     loadPinnedDecisions(projectId);
-
   } catch (e: any) {
-
-    ta.value = '';
-
+    // A failed load must not blank a field the person is typing in.
+    const vgField = getGoalField(projectId, 'version_goal');
+    if (!vgField || !vgField.isEditing()) ta.value = '';
     ta.placeholder = 'Goal state failed to load.';
-
     v!.textContent = '(load failed)';
-
     const titleEl = document.getElementById(`goal-title-${projectId}`);
-
     if (titleEl) titleEl.textContent = 'Goal state unavailable';
-
   }
-
 }
 
 
@@ -12171,148 +12029,164 @@ function wireGoalPreviewToggle(taEl: any, previewEl: any) {
 
 
 
+// fc779141 — the three goal fields are GoalField controllers (dashboard-goal-conflict.ts):
+// blur-save, dirty tracking, Esc-to-discard and the "Changed elsewhere" bar live there, and a
+// save sends the stamp it is based on so the server can refuse a stale one (409) instead of
+// overwriting somebody else's change. These wrappers are the save buttons' entry points.
 async function saveGoal(projectId: any) {
-
-  const ta = document.getElementById(`goal-${projectId}`);
-
-  if (!ta) return;
-
-  // Reattach auto blocks before saving so they aren't lost
-
-  const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
-
-  const autoBlocksText = (autoBlocksEl && autoBlocksEl.style.display !== 'none')
-
-    ? '\n--- AUTO BLOCKS BELOW ---\n' + autoBlocksEl.textContent : '';
-
-  const titleEl = document.getElementById(`goal-title-${projectId}`);
-
-  const titleLine = (titleEl && titleEl.textContent) ? titleEl.textContent + '\n' : '';
-
-  const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
-
-  const shippedText = (shippedEl2 && shippedEl2.style.display !== 'none' && shippedEl2.textContent)
-
-    ? '\n' + shippedEl2.textContent + '\n' : '';
-
-  const raw = titleLine + shippedText + ta.value + autoBlocksText;
-
-  if (raw === state.panels[projectId]._lastSaved) return;
-
-  let content = raw;
-
-  if (state.panels[projectId].goalIsJson) {
-
-    try { content = JSON.parse(raw); } catch(e: any) { /* fall back to string */ }
-
-  }
-
-  try {
-
-    await api(`/projects/${projectId}/goal`, { method: 'POST', body: JSON.stringify({ content }) });
-
-    state.panels[projectId]._lastSaved = raw;
-
-    toast('version goal saved');
-
-    refreshGoal(projectId);
-
-  } catch (e: any) {
-
-    toast('save failed: ' + e.message, true);
-
-  }
-
+  await getGoalField(projectId, 'version_goal')?.saveNow({ explicit: true });
 }
-
-
 
 async function saveNorthStar(projectId: any) {
-
-  const ta = document.getElementById(`goal-north-star-${projectId}`);
-
-  if (!ta) return;
-
-  const val = ta.value.trim();
-
-  if (!val) return;
-
-  const saved = state.panels[projectId]?._serverNorthStar || '';
-
-  if (saved && val !== saved && !confirm('North star is intended to be stable. Save changes?')) {
-
-    ta.value = saved;
-
-    autosizeGoalField(ta);
-
-    ta.classList.remove('dirty');
-
-    return;
-
-  }
-
-  try {
-
-    const humanInput = document.getElementById('new-project-human');
-
-    const humanId = humanInput ? humanInput.value.trim() : '';
-
-    await api(`/projects/${projectId}/goal/north-star`, {
-
-      method: 'POST',
-
-      body: JSON.stringify({ north_star: val, human_id: humanId || 'owner' }),
-
-    });
-
-    toast('north star saved');
-
-    refreshGoal(projectId);
-
-  } catch (e: any) {
-
-    toast('save failed: ' + e.message, true);
-
-  }
-
+  await getGoalField(projectId, 'north_star')?.saveNow({ explicit: true });
 }
 
-
-
 async function saveSprint(projectId: any) {
+  await getGoalField(projectId, 'sprint')?.saveNow({ explicit: true });
+}
 
-  const ta = document.getElementById(`goal-sprint-${projectId}`);
-  const sel = document.getElementById(`goal-sprint-select-${projectId}`);
+// Reattach the read-only zones (title, SHIPPED block, AUTO BLOCKS) around the edited text so a
+// version-goal save doesn't drop them.
+function composeGoalRaw(projectId: any, editable: string) {
+  const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
+  const autoBlocksText = (autoBlocksEl && autoBlocksEl.style.display !== 'none')
+    ? '\n--- AUTO BLOCKS BELOW ---\n' + autoBlocksEl.textContent : '';
+  const titleEl = document.getElementById(`goal-title-${projectId}`);
+  const titleLine = (titleEl && titleEl.textContent) ? titleEl.textContent + '\n' : '';
+  const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+  const shippedText = (shippedEl && shippedEl.style.display !== 'none' && shippedEl.textContent)
+    ? '\n' + shippedEl.textContent + '\n' : '';
+  return titleLine + shippedText + editable + autoBlocksText;
+}
 
-  if (!ta) return;
-
-  const rawVal = (ta.style.display === 'none' && sel && sel.value && sel.value !== '__custom__')
-    ? sel.value
-    : ta.value;
-  const val = rawVal.trim();
-
-  if (!val) return;
-
-  try {
-
-    await api(`/projects/${projectId}/goal/sprint`, {
-
-      method: 'POST',
-
-      body: JSON.stringify({ sprint: val }),
-
-    });
-
-    toast('sprint saved');
-
-    refreshGoal(projectId);
-
-  } catch (e: any) {
-
-    toast('save failed: ' + e.message, true);
-
+// The version goal's read-only zones always follow the server, even while the editable zone is
+// protected from a live update.
+function applyGoalZones(projectId: any, parts: GoalParts) {
+  const titleEl = document.getElementById(`goal-title-${projectId}`);
+  if (titleEl) {
+    titleEl.textContent = parts.titleLine;
+    // 06d57fef — when there's no version label, hide the title bar entirely.
+    // Otherwise the empty div renders as a stray gray bar above the textarea
+    // (its background/border/padding show even with no text). Round the
+    // textarea's top corners when the bar is gone so it doesn't look clipped.
+    const hasTitle = !!parts.titleLine.trim();
+    titleEl.style.display = hasTitle ? 'block' : 'none';
+    const taEl = document.getElementById(`goal-${projectId}`);
+    if (taEl) taEl.style.borderRadius = hasTitle ? '0 0 4px 4px' : '4px';
   }
+  const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+  if (shippedEl) {
+    shippedEl.textContent = parts.shipped;
+    shippedEl.style.display = shippedEl.textContent.trim() ? 'block' : 'none';
+  }
+  const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
+  if (autoBlocksEl) {
+    const abWrapper = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
+    if (parts.autoBlocks !== null) {
+      if (abWrapper) abWrapper.style.display = 'block';
+      autoBlocksEl.style.display = 'block';
+      autoBlocksEl.textContent = parts.autoBlocks;
+    } else {
+      if (abWrapper) abWrapper.style.display = 'none';
+      autoBlocksEl.style.display = 'none';
+    }
+  }
+}
 
+function initGoalFields(projectId: any) {
+  const ta = document.getElementById(`goal-${projectId}`);
+  const nsTA = document.getElementById(`goal-north-star-${projectId}`);
+  const spTA = document.getElementById(`goal-sprint-${projectId}`);
+  const spSel = document.getElementById(`goal-sprint-select-${projectId}`);
+  if (!ta || !nsTA || !spTA) return;
+  // A stamp the server did not send stays undefined, which JSON.stringify drops: the save is then
+  // last-write-wins, exactly as it was before stamps existed.
+  const stampOf = (res: any, key: string) => (res && res.field_updated_at && res.field_updated_at[key]) || undefined;
+  const send = (path: string, body: any) => api(`/projects/${projectId}${path}`, {
+    method: 'POST',
+    body: JSON.stringify({ ...body, source: 'dashboard' }),
+  });
+  const notify = (msg: string, isError?: boolean) => toast(msg, isError);
+  const fields = {
+    version_goal: new GoalField({
+      key: 'version_goal',
+      label: 'version goal',
+      el: ta,
+      anchor: () => document.getElementById(`goal-title-${projectId}`),
+      getValue: () => ta.value,
+      setValue: (t: string) => { ta.value = t; autosizeGoalField(ta); },
+      // A 409 carries the whole stored content; resolve it to the editable zone the same way
+      // refreshGoal does, and let the read-only zones follow it.
+      fromServer: (v: any) => {
+        const parts = splitGoalText(typeof v === 'string' ? v : JSON.stringify(v, null, 2));
+        applyGoalZones(projectId, parts);
+        return parts.editable;
+      },
+      allowEmpty: true,
+      persist: async (_text: string, stamp: string | null) => {
+        const raw = composeGoalRaw(projectId, ta.value);
+        let content: any = raw;
+        if (state.panels[projectId].goalIsJson) {
+          try { content = JSON.parse(raw); } catch (e: any) { /* fall back to string */ }
+        }
+        const res = await send('/goal', { content, expected_updated_at: stamp ?? undefined });
+        return { stamp: stampOf(res, 'version_goal') };
+      },
+      notify,
+      onSaved: () => { toast('version goal saved'); refreshGoal(projectId); },
+    }),
+    north_star: new GoalField({
+      key: 'north_star',
+      label: 'north star',
+      el: nsTA,
+      anchor: () => nsTA,
+      getValue: () => nsTA.value,
+      setValue: (t: string) => { nsTA.value = t; autosizeGoalField(nsTA); },
+      // Changing an existing north star asks first; declining reverts to the saved text.
+      confirmSave: (text: string, base: string) =>
+        !base || text === base || confirm('North star is intended to be stable. Save changes?'),
+      persist: async (text: string, stamp: string | null) => {
+        const humanInput = document.getElementById('new-project-human');
+        const humanId = humanInput ? humanInput.value.trim() : '';
+        const res = await send('/goal/north-star', {
+          north_star: text,
+          human_id: humanId || 'owner',
+          expected_updated_at: stamp ?? undefined,
+        });
+        return { stamp: stampOf(res, 'north_star') };
+      },
+      notify,
+      onSaved: () => { toast('north star saved'); refreshGoal(projectId); },
+    }),
+    sprint: new GoalField({
+      key: 'sprint',
+      label: 'current focus',
+      el: spTA,
+      anchor: () => (spTA.parentElement as HTMLElement | null),
+      // The session select owns the value while the free-text input is hidden.
+      getValue: () => (spTA.style.display === 'none' && spSel && spSel.value && spSel.value !== '__custom__')
+        ? spSel.value
+        : spTA.value,
+      setValue: (t: string) => {
+        spTA.value = t;
+        if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](t);
+      },
+      persist: async (text: string, stamp: string | null) => {
+        const res = await send('/goal/sprint', { sprint: text, expected_updated_at: stamp ?? undefined });
+        return { stamp: stampOf(res, 'sprint') };
+      },
+      notify,
+      onSaved: () => { toast('sprint saved'); refreshGoal(projectId); },
+    }),
+  };
+  fields.version_goal.wire({ blur: [ta], input: [ta], keys: [ta] });
+  fields.north_star.wire({ blur: [nsTA], input: [nsTA], keys: [nsTA] });
+  nsTA.addEventListener('input', () => autosizeGoalField(nsTA));
+  const sprintEls = spSel ? [spTA, spSel] : [spTA];
+  // The session select reports its pick itself (its onchange handler in buildTabBody, after it has synced the input).
+  fields.sprint.wire({ blur: [spTA], input: [spTA], keys: sprintEls });
+  registerGoalFields(projectId, fields);
+  installGoalUnloadGuard();
 }
 
 
@@ -12900,11 +12774,11 @@ function handleWsEvent(projectId: any, event: any) {
   }
 
   if (event.type === 'goal_updated') {
-
+    // fc779141 — the event names the changed fields and who made the change, so a
+    // "Changed elsewhere" bar can say "by an agent, 2m ago" for the refresh below.
+    noteGoalEvent(projectId, event);
     refreshGoal(projectId);
-
     return;
-
   }
 
   if (event.type === 'session_started') {

@@ -2263,6 +2263,7 @@ def build_mcp_server():
                     )
                     coherence = db_module.compute_coherence_warning(field_ages)
                     goal["field_ages"] = field_ages
+                    goal["field_updated_at"] = db_module.goal_field_stamps(goal)
                     goal["coherence_warning"] = coherence
                     decisions_raw = await db_module.get_decisions(
                         db, arguments["project_id"]
@@ -2287,14 +2288,23 @@ def build_mcp_server():
                         goal["meridian_instructions"] = meridian_md
                     result = goal
             elif name == "set_goal":
-                result = await db_module.set_goal(
-                    db,
-                    arguments["project_id"],
-                    arguments["content"],
-                    north_star=arguments.get("north_star"),
-                    sprint=arguments.get("sprint"),
-                    minor=bool(arguments.get("minor", False)),
-                )
+                _expected = arguments.get("expected_updated_at")
+                try:
+                    result = await db_module.set_goal(
+                        db,
+                        arguments["project_id"],
+                        arguments["content"],
+                        north_star=arguments.get("north_star"),
+                        sprint=arguments.get("sprint"),
+                        minor=bool(arguments.get("minor", False)),
+                        expected_updated_at=(
+                            {"version_goal": _expected}
+                            if _expected is not None else None
+                        ),
+                        actor=db_module.goal_actor("mcp"),
+                    )
+                except db_module.GoalConflict as exc:
+                    result = db_module.goal_conflict_detail(exc)
             elif name == "set_north_star":
                 owner = await db_module.get_project_owner(
                     db, arguments["project_id"]
@@ -2307,21 +2317,29 @@ def build_mcp_server():
                 else:
                     try:
                         result = await db_module.set_north_star(
-                            db, arguments["project_id"], arguments["north_star"]
+                            db, arguments["project_id"], arguments["north_star"],
+                            expected_updated_at=arguments.get("expected_updated_at"),
+                            actor=db_module.goal_actor("mcp", arguments.get("human_id")),
                         )
                         await goal_md_module.sync_db_to_goal_md(
                             db, arguments["project_id"]
                         )
+                    except db_module.GoalConflict as exc:
+                        result = db_module.goal_conflict_detail(exc)
                     except ValueError as exc:
                         result = {"error": str(exc)}
             elif name == "set_sprint":
                 try:
                     result = await db_module.set_sprint(
-                        db, arguments["project_id"], arguments["sprint"]
+                        db, arguments["project_id"], arguments["sprint"],
+                        expected_updated_at=arguments.get("expected_updated_at"),
+                        actor=db_module.goal_actor("mcp"),
                     )
                     await goal_md_module.sync_db_to_goal_md(
                         db, arguments["project_id"]
                     )
+                except db_module.GoalConflict as exc:
+                    result = db_module.goal_conflict_detail(exc)
                 except ValueError as exc:
                     result = {"error": str(exc)}
             elif name == "set_executor_config":

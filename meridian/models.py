@@ -46,6 +46,22 @@ class GoalSet(BaseModel):
     north_star: str | None = None
     sprint: str | None = None
     minor: bool = False  # if True, update in-place without version bump (for AUTO BLOCKS)
+    # fc779141 — optimistic concurrency. The per-field ``field_updated_at`` stamp
+    # (from GET /goal) the caller based its edit on; when the stored stamp has
+    # moved the write is refused with 409 and nothing changes.  Omit to keep the
+    # historical last-write-wins behaviour.  ``expected_updated_at`` guards the
+    # version goal (``content``); ``expected_north_star_updated_at`` /
+    # ``expected_sprint_updated_at`` guard north_star / sprint (send them
+    # alongside the field they protect).
+    expected_updated_at: str | None = None
+    expected_north_star_updated_at: str | None = None
+    expected_sprint_updated_at: str | None = None
+    # Origin label for the goal_updated event ("dashboard" = a person in the UI).
+    # Display only — never an authorization input.  Typed Any on purpose: before this
+    # field existed an unknown ``source`` key was ignored, so a caller that already
+    # sends one (any length, any JSON type) must not start getting 422; goal_actor()
+    # coerces it to a short string.
+    source: Any = None
 
 
 class SetNorthStarRequest(BaseModel):
@@ -56,6 +72,16 @@ class SetNorthStarRequest(BaseModel):
 
     north_star: str = Field(..., min_length=1)
     human_id: str = Field(..., min_length=1, description="Must match project owner.")
+    expected_updated_at: str | None = Field(
+        default=None,
+        description=(
+            "fc779141 — the north star's field_updated_at stamp the edit was based "
+            "on. A stale stamp returns 409 with the current value and writes nothing; "
+            "omit for last-write-wins."
+        ),
+    )
+    # Typed Any on purpose (see GoalSet.source): never a reason to refuse a write.
+    source: Any = Field(default=None, description="Origin label (display only); any value is accepted.")
 
 
 class SetSprintRequest(BaseModel):
@@ -69,6 +95,16 @@ class SetSprintRequest(BaseModel):
         default=None,
         description="Optional session identifier for logging.",
     )
+    expected_updated_at: str | None = Field(
+        default=None,
+        description=(
+            "fc779141 — the current focus's field_updated_at stamp the edit was based "
+            "on. A stale stamp returns 409 with the current value and writes nothing; "
+            "omit for last-write-wins."
+        ),
+    )
+    # Typed Any on purpose (see GoalSet.source): never a reason to refuse a write.
+    source: Any = Field(default=None, description="Origin label (display only); any value is accepted.")
 
 
 class SessionRegister(BaseModel):
@@ -260,6 +296,10 @@ class GoalState(BaseModel):
     # v1.1.3 — per-field freshness so the dashboard can render the
     # green / amber / red dot next to each field.
     field_ages: dict[str, dict[str, Any]] | None = None
+    # fc779141 — per-field stamps in the exact form the 409 check compares
+    # (version_goal / north_star / sprint; "" when never set). Send the one for
+    # the field being saved back as ``expected_updated_at``.
+    field_updated_at: dict[str, str] | None = None
     # v1.1.4 — append-only decisions log, newest first.
     decisions: str | None = None
 

@@ -2820,6 +2820,141 @@ async def _inherited_north_star(
     return parent_ns, parent_id
 
 
+# ---------------------------------------------------------------------------
+# fc779141 — optimistic concurrency for the three goal fields.
+#
+# The dashboard used to save the version goal / north star / current focus
+# last-write-wins, so a person editing in the browser could silently overwrite
+# (or be overwritten by) an agent's set_goal / set_north_star / set_sprint.
+# Callers may now pass the per-field ``updated_at`` stamp their edit was based
+# on; when the stored stamp has moved the write is refused with GoalConflict
+# (HTTP 409) and nothing changes.  Omitting the stamp keeps the historical
+# last-write-wins behaviour exactly, so MCP tools, agents and every pre-existing
+# caller are unaffected.
+# ---------------------------------------------------------------------------
+
+GOAL_FIELDS = ("version_goal", "north_star", "sprint")
+
+_GOAL_FIELD_LABELS = {
+    "version_goal": "version goal",
+    "north_star": "north star",
+    "sprint": "current focus",
+}
+
+
+class GoalConflict(Exception):
+    """A stale ``expected_updated_at`` was supplied for a goal field.
+
+    Deliberately NOT a ValueError: the HTTP routes and MCP handlers catch
+    ValueError for "no goal set yet" (422 / error dict) and a conflict must
+    never be mistaken for that.  ``current`` is the goal as it is stored now.
+    """
+
+    def __init__(self, field: str, expected: str, current: dict[str, Any] | None):
+        super().__init__(f"goal field {field!r} changed since {expected!r}")
+        self.field = field
+        self.expected = expected
+        self.current = current
+
+
+def goal_field_stamps(goal: dict[str, Any] | None) -> dict[str, str]:
+    """Per-field ``updated_at`` stamps, exactly as the 409 check compares them.
+
+    Rows written before the per-field columns existed carry NULLs; those fall
+    back to the row's ``updated_at`` (the same fallback set_goal uses when it
+    carries a stamp forward), so a stamp read here is always one set_goal will
+    accept.  A project with no goal row of its own yields empty strings.
+    """
+    if not goal or "id" not in goal:
+        return {f: "" for f in GOAL_FIELDS}
+    base = goal.get("updated_at") or ""
+    return {
+        "version_goal": goal.get("content_updated_at") or base,
+        "north_star": goal.get("ns_updated_at") or base,
+        "sprint": goal.get("sprint_updated_at") or base,
+    }
+
+
+def goal_conflict_detail(exc: GoalConflict) -> dict[str, Any]:
+    """The 409 body: the CURRENT value of the contested field plus metadata."""
+    goal = exc.current or {}
+    values = {
+        "version_goal": goal.get("content"),
+        "north_star": goal.get("north_star"),
+        "sprint": goal.get("sprint"),
+    }
+    stamps = goal_field_stamps(exc.current)
+    label = _GOAL_FIELD_LABELS.get(exc.field, exc.field)
+    return {
+        "error": "goal_conflict",
+        "message": (
+            f"The {label} was changed by someone else after you loaded it. "
+            "Nothing was saved."
+        ),
+        "field": exc.field,
+        "expected_updated_at": exc.expected,
+        "current": {
+            "value": values.get(exc.field),
+            "updated_at": stamps.get(exc.field, ""),
+            "version": goal.get("version", 0),
+        },
+        "field_updated_at": stamps,
+    }
+
+
+_GOAL_SOURCE_KINDS = {"dashboard": "human", "goal_md": "human", "mcp": "agent"}
+
+
+def goal_actor(source: str | None, actor_id: str | None = None) -> dict[str, Any] | None:
+    """Who made a goal write, for the ``goal_updated`` event (display only).
+
+    ``source`` is a label the caller's entry point supplies ("dashboard" for a
+    person using the UI, "mcp" for an agent tool call, "goal_md" for a GOAL.md
+    file edit, "api" for any other REST client).  It is a hint for the
+    "changed by an agent 2m ago" banner, never an authorization input, and it
+    is not persisted — goal_states has no per-field author column.
+    """
+    src = str(source or "").strip().lower()[:32] or None
+    ident = str(actor_id or "").strip()[:128] or None
+    if src is None and ident is None:
+        return None
+    return {"kind": _GOAL_SOURCE_KINDS.get(src or "", "unknown"), "source": src, "id": ident}
+
+
+def _changed_goal_fields(before: dict[str, Any] | None, after: dict[str, Any]) -> list[str]:
+    """Which of the three goal fields differ between two get_goal() results."""
+
+    def _own_ns(g: dict[str, Any] | None) -> Any:
+        # An inherited (parent's) north star is not this project's own value.
+        if not g or g.get("north_star_inherited"):
+            return None
+        return g.get("north_star") or None
+
+    pairs = {
+        "version_goal": ((before or {}).get("content") or None, after.get("content") or None),
+        "north_star": (_own_ns(before), _own_ns(after)),
+        "sprint": ((before or {}).get("sprint") or None, after.get("sprint") or None),
+    }
+    return [f for f, (old, new) in pairs.items() if old != new]
+
+
+# One write lock per project, process-wide.  set_north_star / set_sprint read the
+# stored goal and write it back with one field changed, so two interleaved saves
+# of DIFFERENT fields could otherwise resurrect a stale copy of the field the
+# other one just wrote, and a stamp check made before a concurrent write lands
+# would not protect anything.  This serialises writers inside one server process
+# (the hosted deployment and the self-hosted server); separate processes sharing
+# one database still rely on the stamp check alone.
+_GOAL_WRITE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _goal_write_lock(project_id: str) -> asyncio.Lock:
+    lock = _GOAL_WRITE_LOCKS.get(project_id)
+    if lock is None:
+        lock = _GOAL_WRITE_LOCKS[project_id] = asyncio.Lock()
+    return lock
+
+
 async def set_goal(
     db: aiosqlite.Connection,
     project_id: str,
@@ -2827,6 +2962,8 @@ async def set_goal(
     north_star: str | None = None,
     sprint: str | None = None,
     minor: bool = False,
+    expected_updated_at: dict[str, str | None] | None = None,
+    actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Upsert the goal state for a project.
 
@@ -2837,8 +2974,34 @@ async def set_goal(
     When ``minor=True``, the latest row is updated in-place without
     incrementing the version counter. Use this for AUTO BLOCKS appends
     that should not pollute the goal history.
+
+    ``expected_updated_at`` (fc779141) maps a field name (``version_goal`` /
+    ``north_star`` / ``sprint``) to the per-field stamp the caller based its
+    edit on.  A stamp that no longer matches raises :class:`GoalConflict` and
+    writes nothing; fields absent from the map (and a ``None`` map) are not
+    checked.  ``actor`` (see :func:`goal_actor`) only labels the broadcast
+    ``goal_updated`` event.
     """
+    async with _goal_write_lock(project_id):
+        return await _set_goal_locked(
+            db, project_id, content, north_star=north_star, sprint=sprint,
+            minor=minor, expected_updated_at=expected_updated_at, actor=actor,
+        )
+
+
+async def _set_goal_locked(
+    db: aiosqlite.Connection,
+    project_id: str,
+    content: Any,
+    north_star: str | None = None,
+    sprint: str | None = None,
+    minor: bool = False,
+    expected_updated_at: dict[str, str | None] | None = None,
+    actor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """set_goal's body; the caller holds this project's goal write lock."""
     existing = await get_goal(db, project_id)
+    _current_goal = existing  # fc779141 — pre-normalisation view, returned on a 409
     # 3b6ff466 — a subproject with no goal row of its own gets a *synthesised*
     # goal dict back from get_goal (parent's inherited north_star, no real
     # goal_states row → no "id"). That is NOT a row to update or version off
@@ -2847,6 +3010,13 @@ async def set_goal(
     # inherited north_star would be materialised into the child's first row.
     if existing is not None and "id" not in existing:
         existing = None
+    if expected_updated_at:
+        _stamps = goal_field_stamps(existing)
+        for _field, _expected in expected_updated_at.items():
+            if _field not in GOAL_FIELDS:
+                raise ValueError(f"unknown goal field {_field!r}")
+            if _expected is not None and _stamps[_field] != str(_expected):
+                raise GoalConflict(_field, str(_expected), _current_goal)
     encoded = _encode_content(content)
     # Never carry forward an INHERITED north_star as if it were the child's own.
     # get_goal flags a borrowed parent north_star with north_star_inherited;
@@ -2984,43 +3154,78 @@ async def set_goal(
         await db.commit()
     goal = await get_goal(db, project_id)
     assert goal is not None
+    goal["field_updated_at"] = goal_field_stamps(goal)
     # Broadcast to dashboard WebSocket subscribers so the goal panel refreshes live.
-    _publish_project_event(project_id, "goal_updated", {"version": goal.get("version")})
+    # fc779141 — additive fields only: which goal fields this write touched, who
+    # made it (None when the caller did not say) and the new per-field stamps, so
+    # a panel can say "changed by an agent 2m ago" next to a conflicting edit.
+    _publish_project_event(project_id, "goal_updated", {
+        "version": goal.get("version"),
+        "changed_fields": _changed_goal_fields(_current_goal, goal),
+        "changed_by": actor,
+        "updated_at": goal.get("updated_at"),
+        "field_updated_at": goal["field_updated_at"],
+    })
     return goal
 
 
 async def set_north_star(
-    db: aiosqlite.Connection, project_id: str, north_star: str
+    db: aiosqlite.Connection,
+    project_id: str,
+    north_star: str,
+    expected_updated_at: str | None = None,
+    actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Update only the north_star field, preserving current content and sprint.
 
     Creates a new goal row (increments version). 404-equivalent: raises
     ValueError if no goal exists yet — set the version goal first.
+    ``expected_updated_at`` is the north star's stamp the caller based its edit
+    on (see :func:`set_goal`); a stale one raises :class:`GoalConflict`.
     """
-    existing = await get_goal(db, project_id)
-    if existing is None:
-        raise ValueError("no goal set — call set_goal before set_north_star")
-    return await set_goal(
-        db, project_id, existing["content"],
-        north_star=north_star, sprint=existing.get("sprint")
-    )
+    # The lock spans the read of the stored goal AND the write-back, so a
+    # concurrent version-goal save cannot be reverted by this stale copy of it.
+    async with _goal_write_lock(project_id):
+        existing = await get_goal(db, project_id)
+        if existing is None:
+            raise ValueError("no goal set — call set_goal before set_north_star")
+        return await _set_goal_locked(
+            db, project_id, existing["content"],
+            north_star=north_star, sprint=existing.get("sprint"),
+            expected_updated_at=(
+                {"north_star": expected_updated_at}
+                if expected_updated_at is not None else None
+            ),
+            actor=actor,
+        )
 
 
 async def set_sprint(
-    db: aiosqlite.Connection, project_id: str, sprint: str
+    db: aiosqlite.Connection,
+    project_id: str,
+    sprint: str,
+    expected_updated_at: str | None = None,
+    actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Update only the sprint field, preserving current content and north_star.
 
     Any team member can call this (no ownership check at the db layer).
-    Creates a new goal row (increments version).
+    Creates a new goal row (increments version).  ``expected_updated_at`` is the
+    current focus's stamp the caller based its edit on (see :func:`set_goal`).
     """
-    existing = await get_goal(db, project_id)
-    if existing is None:
-        raise ValueError("no goal set — call set_goal before set_sprint")
-    return await set_goal(
-        db, project_id, existing["content"],
-        north_star=existing.get("north_star"), sprint=sprint
-    )
+    async with _goal_write_lock(project_id):
+        existing = await get_goal(db, project_id)
+        if existing is None:
+            raise ValueError("no goal set — call set_goal before set_sprint")
+        return await _set_goal_locked(
+            db, project_id, existing["content"],
+            north_star=existing.get("north_star"), sprint=sprint,
+            expected_updated_at=(
+                {"sprint": expected_updated_at}
+                if expected_updated_at is not None else None
+            ),
+            actor=actor,
+        )
 
 
 async def register_session(

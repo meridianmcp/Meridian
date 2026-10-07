@@ -331,6 +331,51 @@ body.meridian-guest .guest-hidden { display: none !important; }
 .goal-area.readonly { background: var(--surface-1); color: var(--muted); cursor: default; }
 .goal-area.sprint { min-height: 100px; }
 .goal-area.dirty { border-color: var(--accent) !important; }
+.goal-area.save-failed { border-color: var(--status-failed) !important; }
+
+/* fc779141 — "Changed elsewhere" bar above a goal field whose server value moved while the
+   person had unsaved text in it (Keep mine / Take theirs / See both), and the same bar in its
+   error form when a save failed. Wraps on a narrow screen; the diff scrolls instead of growing. */
+.goal-conflict-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+  margin: 0 0 6px; padding: 6px 8px; min-width: 0;
+  background: rgba(240,198,116,0.10); border: 1px solid rgba(240,198,116,0.45);
+  border-radius: 4px; color: var(--text);
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; line-height: 1.4;
+}
+.goal-conflict-bar[hidden] { display: none; }
+.goal-conflict-bar.is-error { background: rgba(255,107,107,0.10); border-color: rgba(255,107,107,0.45); }
+.goal-conflict-msg { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+.goal-conflict-lead { color: var(--status-pending); }
+.goal-conflict-bar.is-error .goal-conflict-lead { color: var(--status-failed); }
+.goal-conflict-detail { color: var(--muted); }
+.goal-conflict-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.goal-conflict-actions button { padding: 3px 8px; font-size: 11px; }
+.goal-conflict-actions button[hidden] { display: none; }
+.goal-conflict-diff {
+  flex: 1 1 100%; max-height: 220px; overflow: auto; padding: 6px 0;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 4px;
+}
+.gcd-legend { padding: 0 8px 4px; color: var(--muted); font-size: 10px; white-space: pre-wrap; }
+.gcd-line { display: flex; gap: 6px; padding: 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.gcd-mark { flex: 0 0 1ch; user-select: none; color: var(--muted); }
+.gcd-mine { background: rgba(255,107,107,0.14); }
+.gcd-theirs { background: rgba(0,212,170,0.14); }
+
+/* fc779141 — Save / Discard / Stay prompt when leaving the Goal tab with unsaved goal edits. */
+.goal-leave-overlay {
+  position: fixed; inset: 0; z-index: 10001; padding: 16px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.55);
+}
+.goal-leave-dialog {
+  width: 100%; max-width: 380px; padding: 14px 16px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.goal-leave-title { font-weight: 600; margin-bottom: 6px; }
+.goal-leave-body { color: var(--muted); margin-bottom: 12px; overflow-wrap: anywhere; }
+.goal-leave-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .goal-label { font-size: 10px; font-family: 'IBM Plex Mono', monospace; font-weight: 600;
   letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
 .goal-label .goal-ts { font-weight: 400; opacity: 0.6; margin-left: 6px; text-transform: none; letter-spacing: 0; }
