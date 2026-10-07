@@ -126,6 +126,31 @@ describe("error helpers", () => {
     expect(describeMoveError(null)).toBe("The request failed.");
   });
 
+  // The server's global 404 handler answers EVERY 404 (even the move route's own
+  // "sprint item not found") with an HTML error page, and api() builds its message
+  // as "<status>: <body>". Without this the popover would print the page's CSS.
+  const htmlErrorPage = (status: number) => {
+    const body =
+      `<!doctype html><html lang='en'><head><meta charset='utf-8'><title>${status}</title>` +
+      "<style>body{background:#0b0c0e;color:#fff}</style></head><body><div class='card'>" +
+      `<h1>${status}</h1><p>not found</p></div></body></html>`;
+    const err: any = new Error(`${status}: ${body}`);
+    err.status = status;
+    err.responseText = body;
+    return err;
+  };
+
+  it("says the item is gone for a 404 instead of printing the server's HTML page", () => {
+    const text = describeMoveError(htmlErrorPage(404));
+    expect(text).toBe("That sprint item no longer exists. Refresh the board.");
+    expect(text).not.toMatch(/<|doctype|style/i);
+  });
+
+  it("never lets an HTML error page reach the popover for other statuses either", () => {
+    expect(describeMoveError(htmlErrorPage(502))).toBe("The request failed (502).");
+    expect(describeMoveError(htmlErrorPage(500))).toBe("The request failed (500).");
+  });
+
   it("recognises the server's next-version-unavailable answer", () => {
     expect(
       isNextUnavailableError(

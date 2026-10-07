@@ -131,7 +131,16 @@ export function describeMoveError(err: any): string {
       /* not JSON: fall through to the Error's own message */
     }
   }
-  return err && err.message ? String(err.message) : "The request failed.";
+  const status = err && typeof err.status === "number" ? err.status : 0;
+  // The server's global 404 handler answers every 404, even the move route's own
+  // "sprint item not found", with an HTML page rather than JSON. The usual way to
+  // get here is the item being deleted while its popover was open.
+  if (status === 404) return "That sprint item no longer exists. Refresh the board.";
+  const message = err && err.message ? String(err.message) : "";
+  // api() words its Error as "<status>: <raw body>", so an HTML error page (a
+  // proxy's 502, say) would otherwise be printed into the popover verbatim.
+  if (/<[a-z!]/i.test(message)) return status ? `The request failed (${status}).` : "The request failed.";
+  return message || "The request failed.";
 }
 
 /** True for the server's "this label has no next version" answer, so the UI

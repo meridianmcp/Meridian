@@ -9868,7 +9868,11 @@ ${n2.tags || ""}`.toLowerCase();
       } catch {
       }
     }
-    return err && err.message ? String(err.message) : "The request failed.";
+    const status = err && typeof err.status === "number" ? err.status : 0;
+    if (status === 404) return "That sprint item no longer exists. Refresh the board.";
+    const message = err && err.message ? String(err.message) : "";
+    if (/<[a-z!]/i.test(message)) return status ? `The request failed (${status}).` : "The request failed.";
+    return message || "The request failed.";
   }
   function isNextUnavailableError(err) {
     if (!err || err.status !== 422 || typeof err.responseText !== "string") return false;
