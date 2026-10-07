@@ -239,8 +239,9 @@ that apply to every project (e.g. "always use Neon for Postgres", "company style
 **What a session sees by default.** A cold `start_session` (its `workspace_context`
 field) and `get_context_block` lead with a bounded *index*, not the full text:
 
-- up to 5 workspace **decisions**, newest first, as one-line summaries (title plus the
-  start of the body), with a "+N more" line when there are more;
+- up to 5 workspace **decisions**, newest first, as one-line summaries (title, category
+  and the start of the body, each clipped to a fixed length so one oversized record cannot
+  inflate the block), with a "+N more" line when there are more;
 - the **note** count only, plus the titles of up to 5 notes tagged `policy` (or
   `workspace-policy`). Note bodies are never inlined;
 - the exact calls that fetch the rest: `get_workspace_notes()`,

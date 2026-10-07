@@ -867,6 +867,11 @@ def _render_workspace_block(
 # visible but capped, and reduces notes to a count plus policy-tagged titles.
 _WORKSPACE_INDEX_MAX_DECISIONS = 5
 _WORKSPACE_INDEX_DECISION_CHARS = 160
+# Decision title and category are free text too (REST caps neither, MCP caps
+# only the title), so they are clipped like the body: an unclipped one let five
+# decisions with 90k-char titles turn a cold session start into 455k chars.
+_WORKSPACE_INDEX_DECISION_TITLE_CHARS = 120
+_WORKSPACE_INDEX_CATEGORY_CHARS = 40
 _WORKSPACE_INDEX_MAX_POLICY_TITLES = 5
 _WORKSPACE_INDEX_TITLE_CHARS = 80
 # A note is "policy" when any comma-separated tag equals one of these.
@@ -884,13 +889,14 @@ def _render_workspace_index_block(
     """0b0b24d8 — bounded stand-in for :func:`_render_workspace_block`.
 
     Decisions are the owner's standing policy, so they stay, but capped at
-    ``_WORKSPACE_INDEX_MAX_DECISIONS`` one-line summaries (title plus the body
-    clipped to ``_WORKSPACE_INDEX_DECISION_CHARS``). Notes are NOT inlined at
-    all: a count, the titles of up to ``_WORKSPACE_INDEX_MAX_POLICY_TITLES``
-    policy-tagged ones, and the exact tool calls that fetch the rest. Empty
-    string when there is nothing to show, same as the full renderer. Output
-    size is bounded by the constants above regardless of how many records
-    exist, which is the point.
+    ``_WORKSPACE_INDEX_MAX_DECISIONS`` one-line summaries (title, category and
+    body each clipped to their ``_WORKSPACE_INDEX_*_CHARS`` limit). Notes are
+    NOT inlined at all: a count, the titles of up to
+    ``_WORKSPACE_INDEX_MAX_POLICY_TITLES`` policy-tagged ones, and the exact
+    tool calls that fetch the rest. Empty string when there is nothing to
+    show, same as the full renderer. Every variable-length field is clipped,
+    so output size is bounded by the constants above regardless of how many
+    records exist or how long any one of them is, which is the point.
     """
     if not decisions and not notes:
         return ""
@@ -902,12 +908,21 @@ def _render_workspace_index_block(
         shown = decisions[:_WORKSPACE_INDEX_MAX_DECISIONS]
         clipped = False
         for d in shown:
-            cat = (d.get("category") or "").strip()
+            # Flatten first and compare lengths, so a clipped field also
+            # triggers the "fetch the rest" hint below.
+            cat = " ".join(str(d.get("category") or "").split())
+            title = " ".join(str(d.get("title") or "").split())
+            body = " ".join(str(d.get("body") or "").split())
+            clipped = clipped or (
+                len(cat) > _WORKSPACE_INDEX_CATEGORY_CHARS
+                or len(title) > _WORKSPACE_INDEX_DECISION_TITLE_CHARS
+                or len(body) > _WORKSPACE_INDEX_DECISION_CHARS
+            )
+            cat = _md_one_line(cat, _WORKSPACE_INDEX_CATEGORY_CHARS)
             prefix = f"[{cat}] " if cat else ""
-            body = " ".join((d.get("body") or "").split())
-            clipped = clipped or len(body) > _WORKSPACE_INDEX_DECISION_CHARS
             lines.append(
-                f"  - DECISION {prefix}{d.get('title', '')}: "
+                f"  - DECISION {prefix}"
+                f"{_md_one_line(title, _WORKSPACE_INDEX_DECISION_TITLE_CHARS)}: "
                 f"{_md_one_line(body, _WORKSPACE_INDEX_DECISION_CHARS)}"
             )
         hidden = len(decisions) - len(shown)
