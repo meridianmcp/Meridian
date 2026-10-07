@@ -228,6 +228,8 @@ export class GoalField {
   private touched = false;
   private lastSavedAt = 0;
   private inflight: Promise<SaveOutcome> | null = null;
+  /** A blur / Save arrived while a save was on its way: save again once it lands if text is left over. */
+  private resaveWanted = false;
   private recent: RemoteMeta | null = null;
   private bar: HTMLElement | null = null;
   private diffOpen = false;
@@ -268,9 +270,9 @@ export class GoalField {
     return this.cfg.el.ownerDocument.activeElement === this.cfg.el;
   }
 
-  /** Resolves once an in-flight save (if any) has finished, whatever its outcome. */
+  /** Resolves once an in-flight save (if any, and the follow-up save it may chain) has finished, whatever its outcome. */
   async settle(): Promise<void> {
-    if (this.inflight) {
+    while (this.inflight) {
       try { await this.inflight; } catch (_) { /* the outcome is already reflected in state */ }
     }
   }
@@ -378,7 +380,14 @@ export class GoalField {
 
   /** Blur / explicit save.  Never writes over an unresolved "Changed elsewhere" prompt. */
   async saveNow(opts: { explicit?: boolean; skipConfirm?: boolean } = {}): Promise<SaveOutcome> {
-    if (this.inflight) return this.inflight;
+    if (this.inflight) {
+      // The person kept typing while the first save was on its way and has now left the
+      // field (or pressed Save): remember it, so what they typed since is saved right after
+      // instead of being left behind a field that looks clean.
+      this.resaveWanted = true;
+      return this.inflight;
+    }
+    this.resaveWanted = false;
     const explicit = !!opts.explicit;
     if (this.pending) {
       if (explicit) this.cfg.notify?.('Resolve the change from elsewhere first: Keep mine or Take theirs.', true);
@@ -400,13 +409,17 @@ export class GoalField {
     }
     const run = this.runSave(text, false);
     this.inflight = run;
+    let outcome: SaveOutcome;
     try {
-      return await run;
+      outcome = await run;
     } finally {
       this.inflight = null;
       this.renderBar();
       this.paintDirty();
     }
+    // Chained here (not left to the next blur) so settle() and the leave guard see one save.
+    if (outcome === 'saved' && this.resaveWanted && !this.pending && this.isDirty()) return this.saveNow();
+    return outcome;
   }
 
   private async runSave(text: string, retried: boolean): Promise<SaveOutcome> {
@@ -415,7 +428,10 @@ export class GoalField {
     try {
       const res = await this.cfg.persist(text, this.stamp);
       this.base = text;
-      this.touched = false;
+      // Text typed while the save was on its way is not saved yet: the field stays
+      // dirty, so a blur saves it, the leave guard sees it and a live update cannot
+      // replace it.
+      this.touched = this.current() !== text;
       this.error = null;
       if (res && res.stamp) this.stamp = res.stamp;
       this.lastSavedAt = Date.now();

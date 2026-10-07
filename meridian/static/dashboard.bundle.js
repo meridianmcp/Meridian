@@ -10014,6 +10014,8 @@ ${n2.tags || ""}`.toLowerCase();
       this.touched = false;
       this.lastSavedAt = 0;
       this.inflight = null;
+      /** A blur / Save arrived while a save was on its way: save again once it lands if text is left over. */
+      this.resaveWanted = false;
       this.recent = null;
       this.bar = null;
       this.diffOpen = false;
@@ -10043,9 +10045,9 @@ ${n2.tags || ""}`.toLowerCase();
     isFocused() {
       return this.cfg.el.ownerDocument.activeElement === this.cfg.el;
     }
-    /** Resolves once an in-flight save (if any) has finished, whatever its outcome. */
+    /** Resolves once an in-flight save (if any, and the follow-up save it may chain) has finished, whatever its outcome. */
     async settle() {
-      if (this.inflight) {
+      while (this.inflight) {
         try {
           await this.inflight;
         } catch (_2) {
@@ -10146,7 +10148,11 @@ ${n2.tags || ""}`.toLowerCase();
     }
     /** Blur / explicit save.  Never writes over an unresolved "Changed elsewhere" prompt. */
     async saveNow(opts = {}) {
-      if (this.inflight) return this.inflight;
+      if (this.inflight) {
+        this.resaveWanted = true;
+        return this.inflight;
+      }
+      this.resaveWanted = false;
       const explicit = !!opts.explicit;
       if (this.pending) {
         if (explicit) this.cfg.notify?.("Resolve the change from elsewhere first: Keep mine or Take theirs.", true);
@@ -10166,13 +10172,16 @@ ${n2.tags || ""}`.toLowerCase();
       }
       const run = this.runSave(text, false);
       this.inflight = run;
+      let outcome;
       try {
-        return await run;
+        outcome = await run;
       } finally {
         this.inflight = null;
         this.renderBar();
         this.paintDirty();
       }
+      if (outcome === "saved" && this.resaveWanted && !this.pending && this.isDirty()) return this.saveNow();
+      return outcome;
     }
     async runSave(text, retried) {
       this.error = null;
@@ -10180,7 +10189,7 @@ ${n2.tags || ""}`.toLowerCase();
       try {
         const res = await this.cfg.persist(text, this.stamp);
         this.base = text;
-        this.touched = false;
+        this.touched = this.current() !== text;
         this.error = null;
         if (res && res.stamp) this.stamp = res.stamp;
         this.lastSavedAt = Date.now();
@@ -13634,6 +13643,7 @@ Current: ${current || "(none)"}`,
           inp.style.display = "none";
           inp.value = sel.value;
         }
+        getGoalField(project.id, "sprint")?.onUserInput();
       };
     }, 200);
     const sprintAddBtn = document.getElementById(`sprint-add-btn-${project.id}`);
@@ -17969,7 +17979,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     fields.north_star.wire({ blur: [nsTA], input: [nsTA], keys: [nsTA] });
     nsTA.addEventListener("input", () => autosizeGoalField(nsTA));
     const sprintEls = spSel ? [spTA, spSel] : [spTA];
-    fields.sprint.wire({ blur: [spTA], input: sprintEls, keys: sprintEls });
+    fields.sprint.wire({ blur: [spTA], input: [spTA], keys: sprintEls });
     registerGoalFields(projectId, fields);
     installGoalUnloadGuard();
   }

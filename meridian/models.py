@@ -57,8 +57,11 @@ class GoalSet(BaseModel):
     expected_north_star_updated_at: str | None = None
     expected_sprint_updated_at: str | None = None
     # Origin label for the goal_updated event ("dashboard" = a person in the UI).
-    # Display only — never an authorization input.
-    source: str | None = Field(default=None, max_length=32)
+    # Display only — never an authorization input.  Typed Any on purpose: before this
+    # field existed an unknown ``source`` key was ignored, so a caller that already
+    # sends one (any length, any JSON type) must not start getting 422; goal_actor()
+    # coerces it to a short string.
+    source: Any = None
 
 
 class SetNorthStarRequest(BaseModel):
@@ -77,7 +80,8 @@ class SetNorthStarRequest(BaseModel):
             "omit for last-write-wins."
         ),
     )
-    source: str | None = Field(default=None, max_length=32, description="Origin label (display only).")
+    # Typed Any on purpose (see GoalSet.source): never a reason to refuse a write.
+    source: Any = Field(default=None, description="Origin label (display only); any value is accepted.")
 
 
 class SetSprintRequest(BaseModel):
@@ -99,7 +103,8 @@ class SetSprintRequest(BaseModel):
             "omit for last-write-wins."
         ),
     )
-    source: str | None = Field(default=None, max_length=32, description="Origin label (display only).")
+    # Typed Any on purpose (see GoalSet.source): never a reason to refuse a write.
+    source: Any = Field(default=None, description="Origin label (display only); any value is accepted.")
 
 
 class SessionRegister(BaseModel):

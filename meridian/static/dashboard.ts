@@ -5012,7 +5012,10 @@ function buildTabBody(project: any) {
       if (sel.value === '__custom__') { inp.style.display = 'block'; inp.focus(); }
 
       else { inp.style.display = 'none'; inp.value = sel.value; }
-
+      // fc779141 — the field hears about the pick only now that the input holds it: a listener
+      // on the select itself runs first and would still read the old text, so the pick would
+      // neither look dirty nor count as an edit (and would let a waiting remote change replace it).
+      getGoalField(project.id, 'sprint')?.onUserInput();
     };
 
   }, 200);
@@ -12180,7 +12183,8 @@ function initGoalFields(projectId: any) {
   fields.north_star.wire({ blur: [nsTA], input: [nsTA], keys: [nsTA] });
   nsTA.addEventListener('input', () => autosizeGoalField(nsTA));
   const sprintEls = spSel ? [spTA, spSel] : [spTA];
-  fields.sprint.wire({ blur: [spTA], input: sprintEls, keys: sprintEls });
+  // The session select reports its pick itself (its onchange handler in buildTabBody, after it has synced the input).
+  fields.sprint.wire({ blur: [spTA], input: [spTA], keys: sprintEls });
   registerGoalFields(projectId, fields);
   installGoalUnloadGuard();
 }

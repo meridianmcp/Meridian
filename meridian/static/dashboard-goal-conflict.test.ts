@@ -240,6 +240,170 @@ describe("editing and a remote change arrives", () => {
   });
 });
 
+describe("typing while a save is in flight", () => {
+  /** A rig whose first save is held open; `finish` lets it land. */
+  function held(base = "base text") {
+    const r = loaded(base);
+    let finish!: (v: { stamp: string }) => void;
+    r.persist.mockImplementationOnce(() => new Promise((res) => { finish = res; }));
+    return { r, finish: (stamp = "S1") => finish({ stamp }) };
+  }
+
+  it("keeps the field dirty when more was typed than was saved", async () => {
+    const { r, finish } = held();
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "ONE TWO-DURING-FLIGHT");
+    finish();
+    expect(await saving).toBe("saved");
+    // The server has "ONE"; what the person added since is still only in the editor.
+    expect(r.persist).toHaveBeenCalledWith("ONE", "T0");
+    expect(r.field.isDirty()).toBe(true);
+    expect(r.ta.classList.contains("dirty")).toBe(true);
+    expect(r.ta.value).toBe("ONE TWO-DURING-FLIGHT");
+  });
+
+  it("protects that text from the next live update (bar, not overwrite)", async () => {
+    const { r, finish } = held();
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "ONE TWO-DURING-FLIGHT");
+    finish();
+    await saving;
+    expect(r.field.applyServer("an agent rewrote this", "T9")).toBe("conflict");
+    expect(r.ta.value).toBe("ONE TWO-DURING-FLIGHT");
+    expect(visibleBar(r)).not.toBeNull();
+  });
+
+  it("is seen by the leave guard even though the first save succeeded", async () => {
+    const { r, finish } = held();
+    registerGoalFields("p1", { north_star: r.field });
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "ONE TWO-DURING-FLIGHT");
+    finish();
+    await saving;
+    expect(hasUnsavedGoalEdits("p1")).toBe(true);
+    const proceed = vi.fn();
+    expect(guardGoalLeave("p1", proceed)).toBe(true);
+    await flush();
+    const stay = document.querySelector('.goal-leave-dialog button[data-choice="stay"]') as HTMLButtonElement | null;
+    expect(stay).not.toBeNull(); // the prompt opened: there is something unsaved to ask about
+    stay!.click();
+    await flush();
+    expect(proceed).not.toHaveBeenCalled();
+  });
+
+  it("saves the extra text right after, on the stamp the first save returned, when the person left the field meanwhile", async () => {
+    const { r, finish } = held();
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "ONE TWO-DURING-FLIGHT");
+    void r.field.saveNow(); // the blur that arrives while the first save is still on its way
+    finish("S1");
+    expect(await saving).toBe("saved");
+    expect(r.persist).toHaveBeenCalledTimes(2);
+    expect(r.persist).toHaveBeenNthCalledWith(2, "ONE TWO-DURING-FLIGHT", "S1");
+    expect(r.field.isDirty()).toBe(false);
+    expect(r.ta.classList.contains("dirty")).toBe(false);
+  });
+
+  it("settle() waits for that follow-up save too", async () => {
+    const { r, finish } = held();
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "ONE TWO-DURING-FLIGHT");
+    void r.field.saveNow();
+    let second!: (v: { stamp: string }) => void;
+    r.persist.mockImplementationOnce(() => new Promise((res) => { second = res; }));
+    const settled = vi.fn();
+    void r.field.settle().then(settled);
+    finish("S1");
+    await flush();
+    expect(r.persist).toHaveBeenCalledTimes(2);
+    expect(settled).not.toHaveBeenCalled(); // the chained save is still running
+    second({ stamp: "S2" });
+    expect(await saving).toBe("saved");
+    await flush();
+    expect(settled).toHaveBeenCalledTimes(1);
+  });
+
+  it("typing back to the saved text does not open the door to a live update while the save is on its way", async () => {
+    const { r, finish } = held();
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "base text"); // back to what the server had before this save
+    expect(r.field.isDirty()).toBe(false);
+    expect(r.field.isEditing()).toBe(true); // ...but the save is still going to change the server
+    expect(r.field.applyServer("an agent's text", "T9")).toBe("conflict");
+    expect(r.ta.value).toBe("base text");
+    finish();
+    await saving;
+    // The save landed as "ONE" while the editor says something else: a difference to resolve, not to hide.
+    expect(r.field.isDirty()).toBe(true);
+    expect(visibleBar(r)).not.toBeNull();
+  });
+
+  it("the push of the save itself, arriving before its response, leaves no bar behind", async () => {
+    const { r, finish } = held();
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "ONE TWO");
+    expect(r.field.applyServer("ONE", "S1")).toBe("conflict"); // the echo of the text being saved
+    expect(visibleBar(r)).not.toBeNull();
+    finish("S1");
+    await saving;
+    expect(visibleBar(r)).toBeNull();
+    expect(r.field.isDirty()).toBe(true); // "TWO" is still only in the editor
+    expect(r.ta.value).toBe("ONE TWO");
+  });
+
+  it("a save in flight counts as unsaved for the page and the leave guard, even if the text was typed back", async () => {
+    const { r, finish } = held();
+    registerGoalFields("p1", { north_star: r.field });
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "base text");
+    expect(r.field.isDirty()).toBe(false);
+    expect(hasUnsavedGoalEdits("p1")).toBe(true);
+    const proceed = vi.fn();
+    expect(guardGoalLeave("p1", proceed)).toBe(true); // waits for the save, then asks about what differs
+    finish();
+    await saving;
+    await flush();
+    const stay = document.querySelector('.goal-leave-dialog button[data-choice="stay"]') as HTMLButtonElement | null;
+    expect(stay).not.toBeNull();
+    stay!.click();
+    await flush();
+    expect(proceed).not.toHaveBeenCalled();
+  });
+
+  it("does not save again when nothing was typed after the first save started", async () => {
+    const { r, finish } = held();
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    void r.field.saveNow();
+    finish();
+    await saving;
+    expect(r.persist).toHaveBeenCalledTimes(1);
+    expect(r.field.isDirty()).toBe(false);
+  });
+
+  it("does not chain a second save after a failed first one", async () => {
+    const r = loaded();
+    let fail!: (e: Error) => void;
+    r.persist.mockImplementationOnce(() => new Promise((_, rej) => { fail = rej; }));
+    type(r, "ONE");
+    const saving = r.field.saveNow();
+    type(r, "ONE TWO");
+    void r.field.saveNow();
+    fail(new Error("offline"));
+    expect(await saving).toBe("error");
+    expect(r.persist).toHaveBeenCalledTimes(1);
+    expect(r.ta.value).toBe("ONE TWO");
+  });
+});
+
 describe("Keep mine", () => {
   it("saves the draft over the remote change, based on the remote stamp", async () => {
     const r = loaded();
@@ -307,10 +471,38 @@ describe("See both", () => {
     expect(diff.querySelector(".gcd-mine .gcd-text")!.textContent).toBe("my line");
     expect(diff.querySelector(".gcd-theirs .gcd-text")!.textContent).toBe("their line");
     expect((barOf(r)!.querySelector('button[data-act="both"]') as HTMLElement).getAttribute("aria-expanded")).toBe("true");
+    // A reader who cannot see the colours still gets the marks and the legend.
+    expect(diff.querySelector(".gcd-legend")!.textContent).toContain("only in your text");
+    expect(diff.querySelector(".gcd-legend")!.textContent).toContain("only in the current version");
+    expect(diff.querySelector(".gcd-mine .gcd-mark")!.textContent).toBe("-");
+    expect(diff.querySelector(".gcd-theirs .gcd-mark")!.textContent).toBe("+");
+    expect((barOf(r)!.querySelector('button[data-act="both"]') as HTMLElement).textContent).toBe("Hide diff");
     click(r, "both");
     expect(diff.hidden).toBe(true);
+    expect((barOf(r)!.querySelector('button[data-act="both"]') as HTMLElement).textContent).toBe("See both");
     // Looking at the diff changes nothing about the draft.
     expect(r.ta.value).toBe("line one\nmy line");
+  });
+
+  it("starts closed again for the next conflict", () => {
+    const r = loaded("line one");
+    type(r, "mine");
+    r.field.applyServer("theirs", "T1");
+    click(r, "both");
+    click(r, "take");
+    type(r, "mine again");
+    r.field.applyServer("theirs again", "T2");
+    expect((barOf(r)!.querySelector(".goal-conflict-diff") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("the bar is an alert placed right above the field it is about", () => {
+    const r = loaded();
+    type(r, "mine");
+    r.field.applyServer("theirs", "T1");
+    const b = visibleBar(r)!;
+    expect(b.getAttribute("role")).toBe("alert");
+    expect(b.dataset.goalField).toBe("north_star");
+    expect(b.nextElementSibling).toBe(r.ta);
   });
 
   it("renders text as text, never as markup", () => {
@@ -700,6 +892,55 @@ describe("unsaved edits when leaving", () => {
     expect(proceed).toHaveBeenCalledTimes(1);
   });
 
+  it("the prompt is a modal dialog that names what is unsaved and starts on Save", async () => {
+    const r = loaded();
+    const v = loaded("v base", { key: "version_goal", label: "version goal" });
+    registered(["north_star", r], ["version_goal", v]);
+    type(r, "my draft");
+    type(v, "my plan");
+    guardGoalLeave("p1", vi.fn());
+    await flush();
+    const dlg = dialog()!;
+    expect(dlg.getAttribute("role")).toBe("dialog");
+    expect(dlg.getAttribute("aria-modal")).toBe("true");
+    expect(dlg.getAttribute("aria-label")).toBe("Unsaved goal changes");
+    expect(dlg.textContent).toContain("north star and the version goal");
+    expect(document.activeElement).toBe(dlg.querySelector('button[data-choice="save"]'));
+    choose("stay");
+  });
+
+  it("a click outside the dialog means stay", async () => {
+    const r = loaded();
+    registered(["north_star", r]);
+    type(r, "my draft");
+    const proceed = vi.fn();
+    guardGoalLeave("p1", proceed);
+    await flush();
+    (document.querySelector(".goal-leave-overlay") as HTMLElement).click();
+    await flush();
+    expect(dialog()).toBeNull();
+    expect(proceed).not.toHaveBeenCalled();
+    expect(r.ta.value).toBe("my draft");
+  });
+
+  it("Save with two fields proceeds only when both were saved", async () => {
+    const a = loaded();
+    const b = loaded("v base", { key: "version_goal", label: "version goal" });
+    registered(["north_star", a], ["version_goal", b]);
+    type(a, "my draft");
+    type(b, "my plan");
+    b.persist.mockRejectedValueOnce(new Error("offline"));
+    const proceed = vi.fn();
+    guardGoalLeave("p1", proceed);
+    await flush();
+    choose("save");
+    await flush();
+    expect(a.persist).toHaveBeenCalled();
+    expect(b.persist).toHaveBeenCalled();
+    expect(proceed).not.toHaveBeenCalled(); // the version goal did not save: do not drop it
+    expect(b.ta.value).toBe("my plan");
+  });
+
   it("Save that fails does not proceed, and the error stays on the field", async () => {
     const r = loaded();
     registered(["north_star", r]);
@@ -808,6 +1049,20 @@ describe("splitGoalText", () => {
     expect(parts.autoBlocks).toBeNull();
   });
 
+  it("drops the blank line between the title and the SHIPPED block", () => {
+    const parts = splitGoalText("v2.3 — auth sprint\n\nSHIPPED\n- login\n\nCURRENT FOCUS\nship it");
+    expect(parts.titleLine).toBe("v2.3 — auth sprint");
+    expect(parts.shipped).toBe("SHIPPED\n- login");
+    expect(parts.editable).toBe("CURRENT FOCUS\nship it");
+  });
+
+  it("only a version label (vN.N) is a title: a first line that merely starts with v is text", () => {
+    const parts = splitGoalText("vNext plan\nCURRENT FOCUS\nship it");
+    expect(parts.titleLine).toBe("");
+    expect(parts.shipped).toBe("vNext plan");
+    expect(parts.editable).toBe("CURRENT FOCUS\nship it");
+  });
+
   it("an empty goal is an editable empty string", () => {
     expect(splitGoalText("")).toEqual({ titleLine: "", shipped: "", editable: "", autoBlocks: null });
   });
@@ -862,6 +1117,10 @@ describe("parseGoalConflict", () => {
   it("returns null for anything else", () => {
     expect(parseGoalConflict(new Error("x"))).toBeNull();
     expect(parseGoalConflict({ status: 500, responseText: "{}" })).toBeNull();
+    // Only a 409 is a conflict, whatever else the body says.
+    const body = JSON.stringify({ detail: { error: "goal_conflict", current: { value: "v", updated_at: "T9" } } });
+    expect(parseGoalConflict({ status: 500, responseText: body })).toBeNull();
+    expect(parseGoalConflict({ status: 409, responseText: body })).toEqual({ value: "v", stamp: "T9" });
     expect(parseGoalConflict({ status: 409, responseText: "not json" })).toBeNull();
     expect(parseGoalConflict({ status: 409, responseText: JSON.stringify({ detail: "other conflict" }) })).toBeNull();
     expect(parseGoalConflict(null)).toBeNull();

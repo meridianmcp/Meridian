@@ -163,6 +163,39 @@ async def test_without_a_stamp_the_last_write_still_wins(db):
     assert set(last["field_updated_at"]) == {"version_goal", "north_star", "sprint"}
 
 
+async def test_a_none_stamp_entry_means_no_stamp_for_that_field(db):
+    # The map type is dict[str, str | None]: a None value says "no stamp for this field",
+    # exactly like leaving the field out, and must not be compared against the stored stamp.
+    p = await db_module.create_project(db, "none-entry")
+    await db_module.set_goal(db, p["id"], "g", north_star="n", sprint="s")
+    await _backdate(db, p["id"])
+    out = await db_module.set_goal(
+        db, p["id"], "g2",
+        expected_updated_at={"version_goal": None, "north_star": None, "sprint": None},
+    )
+    assert out["content"] == "g2"
+
+
+async def test_rows_without_per_field_stamps_fall_back_to_the_row_stamp(db):
+    # Rows written before the per-field columns existed carry NULLs; the stamp a client reads
+    # for them is the row's updated_at, and a save carrying it must be accepted.
+    p = await db_module.create_project(db, "legacy-stamps")
+    pid = p["id"]
+    await db_module.set_goal(db, pid, "g", north_star="n", sprint="s")
+    await db.execute(
+        "UPDATE goal_states SET content_updated_at = NULL, ns_updated_at = NULL, "
+        "sprint_updated_at = NULL, updated_at = ? WHERE project_id = ?",
+        (OLD, pid),
+    )
+    await db.commit()
+    stamps = db_module.goal_field_stamps(await db_module.get_goal(db, pid))
+    assert stamps == {"version_goal": OLD, "north_star": OLD, "sprint": OLD}
+    out = await db_module.set_north_star(db, pid, "n2", expected_updated_at=OLD)
+    assert out["north_star"] == "n2"
+    out = await db_module.set_goal(db, pid, "g2", expected_updated_at={"version_goal": OLD})
+    assert out["content"] == "g2"
+
+
 async def test_unknown_field_name_is_rejected(db):
     p = await db_module.create_project(db, "bad-field")
     with pytest.raises(ValueError):
@@ -318,6 +351,45 @@ def test_http_version_goal_409_returns_the_current_value(client):
     assert client.get(f"/projects/{pid}/goal").json()["content"] == "theirs"
 
 
+def test_http_version_goal_route_checks_each_field_against_its_own_stamp(client):
+    # POST /goal can carry a north star and a current focus too; each is guarded by its own
+    # expected_*_updated_at, and a conflict names the field that moved.
+    pid = _project(client, "http-vg-fields")
+    client.post(f"/projects/{pid}/goal", json={"content": "go", "north_star": "ns0", "sprint": "s0"})
+    stamps = client.get(f"/projects/{pid}/goal").json()["field_updated_at"]
+
+    r = client.post(
+        f"/projects/{pid}/goal",
+        json={"content": "go", "north_star": "ns1", "expected_north_star_updated_at": STALE},
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["field"] == "north_star"
+    assert r.json()["detail"]["current"]["value"] == "ns0"
+
+    r = client.post(
+        f"/projects/{pid}/goal",
+        json={"content": "go", "sprint": "s1", "expected_sprint_updated_at": STALE},
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["field"] == "sprint"
+    assert r.json()["detail"]["current"]["value"] == "s0"
+
+    # Nothing was written by either refusal; fresh stamps for all three fields are accepted.
+    goal = client.get(f"/projects/{pid}/goal").json()
+    assert (goal["north_star"], goal["sprint"]) == ("ns0", "s0")
+    r = client.post(
+        f"/projects/{pid}/goal",
+        json={
+            "content": "go 2", "north_star": "ns1", "sprint": "s1",
+            "expected_updated_at": stamps["version_goal"],
+            "expected_north_star_updated_at": stamps["north_star"],
+            "expected_sprint_updated_at": stamps["sprint"],
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert (r.json()["north_star"], r.json()["sprint"]) == ("ns1", "s1")
+
+
 def test_http_fresh_stamp_saves_and_returns_new_stamps(client):
     pid = _project(client, "http-fresh")
     client.post(f"/projects/{pid}/goal", json={"content": "go", "north_star": "ns0", "sprint": "s0"})
@@ -375,6 +447,48 @@ def test_http_without_a_stamp_the_last_write_wins_and_nothing_is_409(client):
     assert "field_updated_at" in r3.json()  # the additive field is present
     goal = client.get(f"/projects/{pid}/goal").json()
     assert (goal["content"], goal["north_star"], goal["sprint"]) == ("b", "n2", "s2")
+
+
+# Before fc779141 an unknown ``source`` key in the body was ignored, so a REST
+# caller that already sends one (of any length or JSON type) must keep getting 200:
+# the label is display-only and is coerced server-side, never validated.
+ODD_SOURCES = [
+    pytest.param("x" * 40, id="longer-than-32"),
+    pytest.param("x" * 5000, id="huge"),
+    pytest.param(5, id="int"),
+    pytest.param(True, id="bool"),
+    pytest.param({"a": 1}, id="object"),
+    pytest.param(["dashboard"], id="list"),
+    pytest.param("", id="empty"),
+    pytest.param(None, id="null"),
+]
+
+
+@pytest.mark.parametrize("source", ODD_SOURCES)
+def test_http_any_source_value_is_accepted_on_all_three_write_paths(client, source):
+    pid = _project(client, "http-odd-source")
+    r = client.post(f"/projects/{pid}/goal", json={"content": "go", "north_star": "ns", "sprint": "s", "source": source})
+    assert r.status_code == 200, r.text
+    r = client.post(
+        f"/projects/{pid}/goal/north-star",
+        json={"north_star": "ns2", "human_id": "adam", "source": source},
+    )
+    assert r.status_code == 200, r.text
+    r = client.post(f"/projects/{pid}/goal/sprint", json={"sprint": "s2", "source": source})
+    assert r.status_code == 200, r.text
+    goal = client.get(f"/projects/{pid}/goal").json()
+    assert (goal["north_star"], goal["sprint"]) == ("ns2", "s2")
+
+
+def test_goal_actor_coerces_any_source_to_a_short_label():
+    for odd in (5, True, {"a": 1}, ["x"] * 50, "x" * 5000):
+        actor = db_module.goal_actor(odd, "adam")
+        assert actor is not None
+        assert isinstance(actor["source"], str) and len(actor["source"]) <= 32
+        assert actor["kind"] == "unknown"
+    # Falsy values mean "no label", the same as omitting it.
+    for none_like in (None, "", 0, False, {}, []):
+        assert db_module.goal_actor(none_like) is None
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +580,17 @@ def test_mcp_tool_schemas_advertise_the_optional_stamp():
 # ---------------------------------------------------------------------------
 
 
+def _entry_source() -> str:
+    """dashboard.ts alone.
+
+    ``dashboard_src.dashboard_source()`` concatenates every ``dashboard-*.ts`` file, the
+    ``*.test.ts`` ones included, so a name that only appears in a test would satisfy these
+    scans.  They are a cheap structural net; the behaviour itself is exercised against the real
+    page by meridian/static/dashboard-goal-wiring.test.ts.
+    """
+    return (Path(__file__).parent.parent / "meridian" / "static" / "dashboard.ts").read_text(encoding="utf-8")
+
+
 def _func_body(src: str, signature: str) -> str:
     """Text of the function whose declaration starts with ``signature`` (up to the next top-level function)."""
     start = src.index(signature)
@@ -476,9 +601,7 @@ def _func_body(src: str, signature: str) -> str:
 
 
 def test_refresh_goal_no_longer_overwrites_the_editors_directly():
-    from dashboard_src import dashboard_source
-
-    js = dashboard_source()
+    js = _entry_source()
     body = _func_body(js, "async function refreshGoal(")
     # Server data reaches all three fields only through GoalField.applyServer...
     assert body.count(".applyServer(") == 3
@@ -491,9 +614,7 @@ def test_refresh_goal_no_longer_overwrites_the_editors_directly():
 
 
 def test_goal_saves_send_the_stamp_and_label_themselves_as_the_dashboard():
-    from dashboard_src import dashboard_source
-
-    js = dashboard_source()
+    js = _entry_source()
     init = _func_body(js, "function initGoalFields(")
     assert init.count("expected_updated_at") >= 3  # version goal, north star, current focus
     assert "source: 'dashboard'" in init
@@ -503,9 +624,7 @@ def test_goal_saves_send_the_stamp_and_label_themselves_as_the_dashboard():
 
 
 def test_goal_events_leave_guards_and_bar_styles_are_wired():
-    from dashboard_src import dashboard_source
-
-    js = dashboard_source()
+    js = _entry_source()
     assert "noteGoalEvent(projectId, event);" in js
     assert "guardGoalLeave(project.id" in js          # leaving the Goal vtab
     assert "guardGoalLeave(t.id" in js                # closing the project tab
