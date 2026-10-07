@@ -107,9 +107,15 @@ jobs:
     # therefore block auto-promote, not just report a warning. See
     # tests/test_f4ab2787_ci_workflow_contract.py for the regression test.
     runs-on: ubuntu-latest
-    # Same hard ceiling as test-core: a hung test/loop can never keep the job
+    # Same hard ceiling idea as test-core: a hung test/loop can never keep the job
     # "in progress" forever. --timeout=60 kills the individual test first.
-    timeout-minutes: 20
+    # 2026-10-07 -- raised 20 -> 30. The Postgres run grew past the old ceiling on a normal
+    # runner (run 37701466301: 19.8 min inside the test step, then 'cancelled' by the job
+    # timeout, which GitHub reports as cancelled and which therefore silently blocks the
+    # dev -> main auto-promote exactly like the test-core ceiling did before it was raised).
+    # This is the longest job in the workflow, i.e. the promote critical path: sharding it
+    # across two jobs is the proper fix and is tracked on the board.
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
