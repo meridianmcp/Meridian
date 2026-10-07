@@ -52,7 +52,13 @@ if ('serviceWorker' in navigator) {
 </script>
 </head>
 <body>
-{% if demo_mode %}<div id="demo-banner" style="position:fixed;top:0;left:0;right:0;z-index:10000;background:#7c3aed;color:#fff;padding:8px 16px;font-size:12px;font-family:'IBM Plex Mono',monospace;display:flex;align-items:center;gap:12px">&#x1f9ed; <strong>Demo mode</strong> — read-only. Data resets periodically. &nbsp;<a href="https://usemeridian.us" style="color:#ddd6fe;text-decoration:underline">Get your own instance →</a><span style="margin-left:auto;color:rgba(255,255,255,.6)">usemeridian.us</span></div>{% endif %}
+{% if demo_mode %}<div id="demo-banner" style="position:fixed;top:0;left:0;right:0;z-index:10000;background:#7c3aed;color:#fff;padding:8px 16px;font-size:12px;font-family:'IBM Plex Mono',monospace;display:flex;align-items:center;gap:12px">&#x1f9ed; <strong>Demo mode</strong> — read-only. Data resets periodically. &nbsp;<a href="https://usemeridian.us" style="color:#ddd6fe;text-decoration:underline">Get your own instance →</a><span style="margin-left:auto;color:rgba(255,255,255,.6)">usemeridian.us</span></div>
+<!-- 90952bad - the banner is position:fixed, so on a phone (where it wraps to several lines) it
+     painted over the hamburger and the waffle launcher and made both unclickable. Publish its
+     real height as --demo-banner-h so dashboard.css can reserve exactly that much room above
+     the app. It re-measures on resize, load and web-font arrival (the font swap changes the
+     wrapped height, and a background tab throttles ResizeObserver) as well as on observe. -->
+<script>(function(){var b=document.getElementById('demo-banner'),d=document.documentElement;if(!b)return;function s(){d.style.setProperty('--demo-banner-h',Math.ceil(b.getBoundingClientRect().height)+'px')}s();window.addEventListener('resize',s);window.addEventListener('load',s);if(document.fonts&&document.fonts.addEventListener)document.fonts.addEventListener('loadingdone',s);if(window.ResizeObserver)new ResizeObserver(s).observe(b)})();</script>{% endif %}
 <script>window.MERIDIAN_DEMO_MODE = {{ demo_mode | tojson }}; window.MERIDIAN_HOSTED = {{ hosted_mode | tojson }}; window.MERIDIAN_IS_ADMIN = {{ is_admin | default(false) | tojson }};</script>
 <div id="update-banner" style="display:none">
   &#9888;&#65039; Server updated — restart to apply
@@ -122,7 +128,11 @@ if ('serviceWorker' in navigator) {
     <div id="hitl-panel" style="display:none;background:var(--surface-2);border-bottom:1px solid var(--border);padding:12px 14px;max-height:40vh;overflow-y:auto;flex-shrink:0">
       <div id="hitl-list"></div>
     </div>
-    <div class="tabs" id="tabs"></div>
+    <!-- 90952bad — top bar: dashboard-waffle.ts inserts the waffle launcher button
+         as this container's first child, left of the project tabs. -->
+    <div class="topbar" id="topbar">
+      <div class="tabs" id="tabs"></div>
+    </div>
     <div class="tab-bodies" id="tab-bodies">
       <div class="empty">no project open — pick one on the left</div>
     </div>

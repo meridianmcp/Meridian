@@ -1969,3 +1969,305 @@ def test_sprint_arrow_glue_is_in_the_served_bundle():
     assert "expected_version: currentVersion" in bundle
     assert "Moved to ${out.to_version}" in bundle
     assert "Push to version (e.g. v2.0)" not in bundle
+
+
+# ---------------------------------------------------------------------------
+# 90952bad - waffle launcher + collapsed-by-default vtab rail
+# ---------------------------------------------------------------------------
+
+
+def _static_text(name: str) -> str:
+    from pathlib import Path
+
+    return (Path(__file__).parent.parent / "meridian" / "static" / name).read_text(encoding="utf-8")
+
+
+def test_waffle_launcher_has_popup_semantics_and_keyboard_support():
+    """90952bad - the launcher is a real button with aria-haspopup/aria-expanded
+    opening a labelled dialog that holds a filter box and a menu of menuitems; it
+    closes on Escape (returning focus), on an outside click and when focus leaves,
+    and it traps Tab. The behaviour itself is covered by vitest
+    (dashboard-waffle.test.ts); this guards the source contract."""
+    waffle = _static_text("dashboard-waffle.ts")
+    for needle in (
+        'button.setAttribute("aria-haspopup", "dialog")',
+        'button.setAttribute("aria-expanded", "false")',
+        'button.setAttribute("aria-controls", "waffle-popover")',
+        'popover.setAttribute("role", "dialog")',
+        'popover.setAttribute("aria-modal", "true")',
+        'role="menu"',
+        'role="menuitem"',
+        'aria-keyshortcuts="P"',
+        'type="search"',
+        'aria-label="Filter tabs"',
+        'aria-live="polite"',
+        'ev.key !== "Escape"',
+        'document.addEventListener("keydown", onDocKey, true)',
+        'ev.key === "Tab"',
+        '"mousedown"',
+        '"focusin"',
+        'ArrowDown',
+    ):
+        assert needle in waffle, f"waffle launcher source contract missing: {needle}"
+    # Every localStorage access is guarded: the page must work without storage.
+    assert "safeLocalStorage" in waffle
+    # The only code that touches window.localStorage is the guarded accessor.
+    guard = waffle[waffle.index("export function safeLocalStorage") :]
+    guard = guard[: guard.index("\n}\n")]
+    assert "try {" in guard and "catch" in guard
+    assert waffle.count("window.localStorage ?") == 1 and waffle.count("localStorage.getItem") == 0
+
+
+def test_waffle_activation_reuses_the_rail_button_path():
+    """90952bad - choosing a tile is ADDITIVE: it reveals the tab's group and then
+    clicks the matching .vtab-btn (whose own onclick owns the drawer switch, the
+    persisted last tab and the loaders), instead of re-implementing navigation."""
+    waffle = _static_text("dashboard-waffle.ts")
+    start = waffle.index("export function activateWaffleTab")
+    body = waffle[start : start + 1400]
+    reveal = body.index("revealGroupInStrip(strip, tab)")
+    click = body.index("btn.click()")
+    assert reveal < click, "the waffle must reveal the tab's group BEFORE clicking its button"
+    assert ".goal-subtab-btn" in body, "Goal sub-entries must click the Goal sub-tab button"
+    # It never touches panel state or loaders directly.
+    for forbidden in ("activeVtab", "loadNotesTab", "loadQueue", "drawer-panel"):
+        assert forbidden not in body
+
+
+def test_waffle_wired_into_dashboard_and_template():
+    """90952bad - dashboard.ts mounts the launcher first thing in init(), feeds the
+    Queue badge from the sprint loaders, and the template wraps the project tabs in
+    the #topbar the launcher is inserted into."""
+    dash = _static_text("dashboard.ts")
+    assert 'from "./dashboard-waffle"' in dash
+    init = dash.index("(async function init() {")
+    assert "_mountDashboardWaffle();" in dash[init : init + 400]
+    assert dash.count("_setWaffleQueueCount(") >= 4  # definition + goal/live/queue loaders
+    assert "host: document.getElementById('topbar')" in dash
+    assert "storageKey: STORAGE_KEY('waffle.v1')" in dash
+
+    html_path = __import__("pathlib").Path(__file__).parent.parent / "meridian" / "templates" / "dashboard.html"
+    html = html_path.read_text(encoding="utf-8")
+    top = html.index('id="topbar"')
+    assert html.index('id="tabs"') > top, "#tabs must live inside #topbar"
+    assert html.index('id="tab-bodies"') > html.index('id="tabs"')
+
+
+def test_waffle_refresh_keeps_focus_and_skips_identical_swaps():
+    """90952bad - the HITL fallback poll (every 10 s) and the sprint loaders call
+    refreshWaffle() while the popover may be open. render() must read focus before
+    it replaces the grid and put it back afterwards, and must not rebuild the grid
+    at all when the generated HTML is unchanged; otherwise a keyboard user is
+    dropped onto <body> and arrows/Enter/P/Esc go dead. Behaviour is covered by
+    vitest (\"refreshing while open keeps keyboard control\"); this guards the
+    source contract."""
+    waffle = _static_text("dashboard-waffle.ts")
+    start = waffle.index("const render = () => {")
+    body = waffle[start : waffle.index("const place = () => {", start)]
+    focus_read = body.index("document.activeElement")
+    swap = body.index("body.innerHTML = html")
+    assert focus_read < swap, "focus must be read BEFORE the grid is replaced"
+    assert "if (html !== lastHtml)" in body, "an identical refresh must not swap the grid"
+    assert "focusEntry(target)" in body, "focus must be restored onto the same entry after a swap"
+    # Esc is heard at the document so it still works when focus has fallen to <body>.
+    assert 'document.addEventListener("keydown", onDocKey, true)' in waffle
+    assert 'document.removeEventListener("keydown", onDocKey, true)' in waffle
+
+
+def test_waffle_state_writes_are_read_modify_write_and_follow_other_tabs():
+    """90952bad - pins, usage and recents are ONE localStorage value shared by every
+    open dashboard tab. A launcher that loaded it at mount and wrote its whole
+    in-memory copy back lost whatever another tab had pinned or counted since. Every
+    write must re-read the latest stored value and apply only its own change, and a
+    window 'storage' listener (plus a re-read on open) must keep an open popover
+    current. Behaviour is covered by vitest ("two tabs share one stored state");
+    this guards the source contract."""
+    waffle = _static_text("dashboard-waffle.ts")
+    start = waffle.index("const mutate = (")
+    mutate = waffle[start : waffle.index("};", start)]
+    assert mutate.index("syncFromStorage()") < mutate.index("state = change(state)"), (
+        "the latest stored value must be read BEFORE the one change is applied"
+    )
+    assert mutate.index("state = change(state)") < mutate.index("saveState(storage, storageKey, state)")
+    # The only save in the launcher is that read-modify-write: no path persists a stale copy.
+    assert waffle.count("saveState(storage, storageKey") == 1
+    assert "persist()" not in waffle
+    start = waffle.index("const noteUse = (tab: string) => {")
+    assert "mutate((latest) => recordUse(latest, tab))" in waffle[start : start + 300]
+    start = waffle.index("const togglePinFor = (")
+    assert "mutate((latest) => setPinned(latest, tab, wantPinned))" in waffle[start : start + 900]
+    # Other tabs' writes arrive through the storage event, and opening re-reads too.
+    on_storage = waffle[waffle.index("const onStorage = (") : waffle.index("const onDocKey")]
+    assert "ev.key !== storageKey" in on_storage and "render()" in on_storage
+    assert 'window.addEventListener("storage", onStorage)' in waffle
+    assert 'window.removeEventListener("storage", onStorage)' in waffle
+    opened = waffle[waffle.index("function open(): void {") :]
+    assert opened.index("syncFromStorage()") < opened.index("render()")
+    # Reading storage stays guarded: unreadable storage is "no answer", never a throw.
+    raw = waffle[waffle.index("export function readRawState") : waffle.index("export function parseRawState")]
+    assert "try {" in raw and "catch" in raw
+
+
+def test_waffle_usage_is_recorded_from_the_shared_rail_onclick():
+    """90952bad - usage adaptation must learn from every way of opening a tab, not
+    only waffle activations: the rail's shared .vtab-btn onclick calls
+    recordWaffleUse before any loader, while the scripted clicks (restoring the last
+    tab on load, the demo tour) run inside withoutWaffleUse so they do not count."""
+    dash = _static_text("dashboard.ts").replace(chr(13) + chr(10), chr(10))
+    waffle = _static_text("dashboard-waffle.ts")
+    assert "export function recordWaffleUse" in waffle
+    assert "export function withoutWaffleUse" in waffle
+    onclick = dash.index("btn.onclick = () => {", dash.index("wireVtabGroups(vtabStrip)"))
+    record = dash.index("recordWaffleUse(vtab);", onclick)
+    first_loader = dash.index("if (vtab === 'files') loadFilesTab", onclick)
+    assert onclick < record < first_loader, "recordWaffleUse must run before any loader"
+    assert "withoutWaffleUse(() => savedBtn.click())" in dash
+    tour = dash[dash.index("function _tourActivateVtab") : dash.index("function startDemoTour")]
+    assert "withoutWaffleUse(() => btn.click())" in tour
+    # The waffle's own activation is counted once: it guards the rail onclick's call.
+    start = waffle.index("const activateKey = (key: string | null) => {")
+    activate = waffle[start : start + 900]
+    assert "withoutWaffleUse(() => activateWaffleTab(" in activate
+    assert "noteUse(entry.tab)" in activate
+
+
+def test_waffle_css_is_theme_driven_and_responsive(css):
+    """90952bad - the launcher styles use the theme variables only (no hard-coded
+    palette, so a light theme restyles it), keep the popover above the sidebar,
+    honour [hidden], and clear the fixed hamburger on phones."""
+    import re
+
+    start = css.index("90952bad - waffle launcher")
+    block = css[start:]
+    for selector in (
+        ".waffle-btn",
+        ".waffle-popover",
+        ".waffle-tile",
+        ".waffle-sub",
+        ".waffle-badge",
+        ".waffle-filter",
+        ".waffle-popover[hidden]",
+    ):
+        assert selector in block, f"missing CSS rule {selector}"
+    # No hex colours inside the block (rgba shadow aside): theme variables only.
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b", block), "waffle CSS hard-codes a colour"
+    z = int(re.search(r"\.waffle-popover\s*\{[^}]*z-index:\s*(\d+)", block).group(1))
+    assert z > 300, "popover must sit above the mobile sidebar (200) and hamburger (300)"
+    assert re.search(r"@media \(max-width: 768px\)\s*\{[^}]*\.waffle-slot\s*\{[^}]*padding-left", block), (
+        "phone layout must clear the fixed hamburger"
+    )
+    assert "grid-template-columns: repeat(3" in block, "tiles are a 3-column grid at every width"
+    assert ":focus-visible" in block, "keyboard focus needs a visible ring"
+
+
+def test_vtab_groups_start_collapsed_except_the_active_one():
+    """90952bad - the rail groups are collapsed by default except the active tab's
+    group, and every in-repo consumer that navigates by clicking a rail button
+    reveals the group first: the rail's own onclick, the restored last tab, and the
+    demo tour (which measures the button right after)."""
+    groups = _static_text("dashboard-tabgroups.ts")
+    assert "export const VTAB_GROUPS_COLLAPSED_BY_DEFAULT = true;" in groups
+    assert '"experiments"' in groups, "Experiments must belong to a group so its group can be revealed"
+    dash = _static_text("dashboard.ts")
+
+    onclick = dash.index("btn.onclick = () => {", dash.index("wireVtabGroups(vtabStrip)"))
+    assert dash.index("revealGroupForTab(vtab);", onclick) < dash.index("if (vtab === 'files') loadFilesTab", onclick)
+
+    restore = dash.index("// Restore last active vtab from localStorage")
+    assert dash.index("revealGroupForTab(saved);", restore) < dash.index("savedBtn.click()", restore)
+
+    tour = dash.index("function _tourActivateVtab")
+    tour_body = dash[tour : tour + 900]
+    assert tour_body.index("revealGroupInStrip(") < tour_body.index("btn.click()"), (
+        "the demo tour must reveal the step's rail group before clicking/measuring its button"
+    )
+
+
+def test_playwright_ux_tests_open_a_collapsed_group_before_waiting_for_its_button():
+    """90952bad - Playwright click/wait_for_selector wait for VISIBILITY, and a tab
+    outside the active group is hidden on load. Every UX test that clicks a rail
+    button must go through the _open_vtab helper (which opens the group first)."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).parent / "test_demo_ux.py").read_text(encoding="utf-8")
+    assert "def _open_vtab(page, tab" in src
+    raw_clicks = re.findall(r"page\.click\(['\"]\.vtab-btn", src)
+    assert not raw_clicks, "a UX test clicks a .vtab-btn directly; use _open_vtab(page, tab).click()"
+    for tab in ("sessions", "rewind", "documents", "live"):
+        assert f'_open_vtab(page, "{tab}")' in src, f"UX test for the {tab} vtab no longer opens its group first"
+
+
+# ---------------------------------------------------------------------------
+# 90952bad - the fixed /demo banner must not cover the launcher or the hamburger
+# ---------------------------------------------------------------------------
+
+
+def test_demo_page_publishes_the_banner_height_and_other_pages_do_not(client):
+    """/demo's banner is position:fixed and wraps to ~76px on a phone, where it used
+    to sit on top of the hamburger and the waffle button (a tap landed on the
+    banner). The page now publishes the banner's measured height as --demo-banner-h,
+    re-measuring on resize, load, web-font arrival and ResizeObserver; non-demo
+    pages must not carry the banner, its script or the variable."""
+    demo = client.get("/demo")
+    assert demo.status_code == 200
+    text = demo.text
+    banner = text.index('id="demo-banner"')
+    script_start = text.index("<script>(function(){var b=document.getElementById('demo-banner')", banner)
+    script = text[script_start : text.index("</script>", script_start)]
+    assert script_start < text.index("window.MERIDIAN_DEMO_MODE"), "the height must be set before the app is laid out"
+    assert "--demo-banner-h" in script
+    assert "Math.ceil(b.getBoundingClientRect().height)" in script, "round UP: a floor would leave a sub-pixel strip covered"
+    for trigger in ("'resize'", "'load'", "'loadingdone'", "new ResizeObserver"):
+        assert trigger in script, f"the banner height is not re-measured on {trigger}"
+
+    plain = client.get("/dashboard")
+    assert plain.status_code == 200
+    assert "--demo-banner-h" not in plain.text and "demo-banner" not in plain.text
+
+
+def test_app_reserves_the_demo_banner_height_with_a_zero_fallback(css):
+    """The reservation is padding on .app (so it stays 100vh and nothing scrolls),
+    plus moving the fixed phone drawer and its hamburger down by the same amount.
+    Every rule falls back to 0px, so a page without the variable is unchanged."""
+    import re
+
+    start = css.index("room for the fixed demo banner")
+    block = css[start:]
+    assert re.search(r"\.app\s*\{\s*padding-top:\s*var\(--demo-banner-h,\s*0px\);\s*\}", block)
+    mobile = block[block.index("@media (max-width: 768px)") :]
+    assert re.search(r"\.sidebar\s*\{\s*top:\s*var\(--demo-banner-h,\s*0px\);\s*\}", mobile)
+    assert re.search(r"#sidebar-toggle\s*\{\s*top:\s*calc\(var\(--demo-banner-h,\s*0px\)\s*\+\s*10px\);\s*\}", mobile)
+    # The original declarations are untouched: the override rules only add the offset.
+    assert re.search(r"\.app\s*\{\s*display:\s*grid;[^}]*height:\s*100vh;", css)
+    assert re.search(r"#sidebar-toggle\s*\{[^}]*top:\s*10px;", css)
+
+
+def test_js_demo_banner_does_not_pad_when_the_page_banner_reserves_room():
+    """dashboard.ts's own 22px 'Preview mode' bar sits UNDER the server-rendered
+    banner on /demo. Its inline body padding would stack 22px of dead space on top of
+    the room .app already reserves for that banner, so it pads only when
+    #demo-banner is absent (the /dashboard page running with MERIDIAN_DEMO set)."""
+    dash = _static_text("dashboard.ts").replace(chr(13) + chr(10), chr(10))
+    start = dash.index("b.id = 'demo-mode-banner';")
+    block = dash[start : dash.index("resumeDemoTour();", start)]
+    guard = block.index("if (!document.getElementById('demo-banner')) {")
+    pad = block.index("document.body.style.paddingTop")
+    assert guard < pad, "the 22px padding must sit inside the no-page-banner guard"
+    # The tour still resumes from the same place regardless of the guard.
+    assert "resumeDemoTour();" in dash[start : start + 3000]
+
+
+def test_waffle_playwright_test_keeps_the_demo_banner_and_hit_tests_the_controls():
+    """The first version of the launcher's Playwright test deleted #demo-banner before
+    measuring, which hid the covered-button bug. It must keep the real banner and
+    hit-test the button and hamburger at phone widths."""
+    from pathlib import Path
+
+    src = (Path(__file__).parent / "test_demo_ux.py").read_text(encoding="utf-8")
+    start = src.index("def test_waffle_launcher_stays_in_viewport_and_navigates")
+    body = src[start : src.index("def test_subproject_hierarchy_ui", start)]
+    assert "'demo-banner'" not in body.split("page.evaluate(")[1], "the demo banner must not be removed"
+    assert "elementFromPoint" in body and "--demo-banner-h" in body
+    for width in ("(375, 812)", "(320, 640)", "(768, 900)", "(1280, 800)"):
+        assert width in body, f"the banner hit-test no longer runs at {width}"

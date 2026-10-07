@@ -1056,6 +1056,29 @@ def test_free_tier_signout_visible_on_hosted_dashboard(client, monkeypatch):
             server.should_exit = True
 
 
+def _open_vtab(page, tab: str, timeout: int = 8000):
+    """Reveal the rail group that holds ``tab`` and return its laid-out button.
+
+    90952bad: the vtab rail starts with every group collapsed except the one
+    holding the active tab (Status -> Overview). Playwright's click/wait_for_selector
+    wait for VISIBILITY, so a tab in another group would time out. This does what a
+    user does: open the group by its header, then wait for the button to be visible.
+    (Programmatic navigation, e.g. the tour or deep links, needs none of this: a
+    button's own click reveals its group first.)
+    """
+    sel = f'.vtab-btn[data-vtab="{tab}"]'
+    page.wait_for_selector(sel, state="attached", timeout=timeout)
+    page.evaluate(
+        "(tab) => { const b = document.querySelector('.vtab-btn[data-vtab=\"' + tab + '\"]');"
+        " const g = b && b.closest('.vtab-group');"
+        " if (g && g.classList.contains('collapsed')) {"
+        " const h = g.querySelector('.vtab-group-header'); if (h) h.click(); } }",
+        tab,
+    )
+    page.wait_for_selector(sel, state="visible", timeout=timeout)
+    return page.locator(sel).first
+
+
 @pytestmark_playwright
 def test_demo_tour_persists_and_finishes(client):
     """Phase 4: the rebuilt demo tour persists progress across reloads and,
@@ -1135,13 +1158,13 @@ def test_session_timeline_tab_renders(demo_client):
             except Exception:
                 pass
 
-            page.wait_for_selector(".vtab-btn", timeout=8000)  # project panel is open
+            page.wait_for_selector(".vtab-btn", state="attached", timeout=8000)  # project panel is open
             btn = page.locator('.vtab-btn[data-vtab="sessions"]').first
             _vtabs = page.evaluate(
                 "() => Array.from(document.querySelectorAll('.vtab-btn')).map(b=>b.getAttribute('data-vtab'))"
             )
             assert btn.count() >= 1, f"Sessions vtab not found; vtabs present = {_vtabs}"
-            btn.click()
+            _open_vtab(page, "sessions").click()  # Sessions is in the (collapsed) Work group
 
             # The loader paints its explanatory header — wait for it to appear.
             page.wait_for_selector("text=Per session", timeout=8000)
@@ -1175,8 +1198,7 @@ def test_activity_by_domain_chart_renders(demo_client):
             except Exception:
                 pass
 
-            page.wait_for_selector('.vtab-btn[data-vtab="rewind"]', timeout=8000)
-            page.click('.vtab-btn[data-vtab="rewind"]')
+            _open_vtab(page, "rewind").click()  # Rewind is in the (collapsed) History group
             page.wait_for_timeout(1200)
             page.wait_for_selector('.rewind-subtab-btn[data-tab="charts"]', timeout=8000)
             page.click('.rewind-subtab-btn[data-tab="charts"]')
@@ -1214,8 +1236,7 @@ def test_documents_tab_shows_peeks_and_ingest_copy(demo_client):
             except Exception:
                 pass
 
-            page.wait_for_selector('.vtab-btn[data-vtab="documents"]', timeout=8000)
-            page.click('.vtab-btn[data-vtab="documents"]')
+            _open_vtab(page, "documents").click()  # Documents is in the (collapsed) Content group
             page.wait_for_selector("text=Recently viewed (not saved)", timeout=8000)
             content = page.content()
             assert "Recently viewed (not saved)" in content
@@ -1264,13 +1285,13 @@ def test_live_parallelization_tab_renders(demo_client):
             except Exception:
                 pass
 
-            page.wait_for_selector(".vtab-btn", timeout=8000)
+            page.wait_for_selector(".vtab-btn", state="attached", timeout=8000)
             btn = page.locator('.vtab-btn[data-vtab="live"]').first
             _vtabs = page.evaluate(
                 "() => Array.from(document.querySelectorAll('.vtab-btn')).map(b=>b.getAttribute('data-vtab'))"
             )
             assert btn.count() >= 1, f"Live vtab not found; vtabs present = {_vtabs}"
-            btn.click()
+            _open_vtab(page, "live").click()
 
             # The new e19c3ca2 section container is wired into the live drawer and
             # becomes visible when the Live tab is active.
@@ -1279,6 +1300,104 @@ def test_live_parallelization_tab_renders(demo_client):
             assert "by session" in content, "in-progress-by-session section label missing"
             assert page.locator('[id^="live-inprogress-by-session-"]').count() >= 1, \
                 "in-progress-by-session container not rendered"
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_waffle_launcher_stays_in_viewport_and_navigates(demo_client):
+    """90952bad — the waffle launcher (9-dot button at the left of the top bar) opens
+    a popover grid that stays inside the viewport at desktop AND phone width, lists
+    the owner's pinned tabs first (Goal, Notes, Insights), and choosing a tile
+    navigates exactly like clicking the rail button: it reveals the tile's collapsed
+    rail group and makes that tab active. Notes lives in the Content group, which
+    starts collapsed, so this also proves the collapsed default does not strand a
+    programmatic/launcher navigation.
+
+    The demo banner is deliberately LEFT IN PLACE: it is position:fixed and wraps to
+    ~76px on a phone, and before the --demo-banner-h reservation it painted over the
+    hamburger and the launcher so a tap landed on the banner. The hit-test below
+    (elementFromPoint at the button's centre and two inner corners) fails if any
+    part of the control is covered again; only the onboarding tour, which is
+    modal by design, is dismissed."""
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        server, _thread, port = _start_live_server(server_module.app)
+        try:
+            browser = p.chromium.launch()
+            for width, height in ((1280, 800), (768, 900), (375, 812), (320, 640)):
+                page = browser.new_page(viewport={"width": width, "height": height})
+                page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                page.evaluate(
+                    "() => { for (const id of ['demo-onboarding-overlay','demo-tour-tooltip','demo-tour-backdrop']) { const el = document.getElementById(id); if (el) el.remove(); } }"
+                )
+
+                page.wait_for_selector("#waffle-btn", timeout=8000)
+                assert page.query_selector("#demo-banner") is not None, "this test must run with the real demo banner"
+                reserved = page.evaluate(
+                    """() => {
+                        const banner = document.getElementById('demo-banner').getBoundingClientRect();
+                        const hit = (sel) => {
+                            const el = document.querySelector(sel);
+                            const r = el.getBoundingClientRect();
+                            if (!r.width) return { rendered: false };
+                            // centre, two inner corners and the top/bottom edges: a banner that
+                            // only overlaps the top few pixels (desktop, before the fix) still counts
+                            const points = [[0.5, 0.5], [0.25, 0.25], [0.75, 0.75], [0.5, 0.1], [0.5, 0.9]];
+                            const covered = points.filter(([fx, fy]) => {
+                                const top = document.elementFromPoint(r.left + r.width * fx, r.top + r.height * fy);
+                                return !(top === el || el.contains(top));
+                            }).length;
+                            return { rendered: true, covered, top: r.top };
+                        };
+                        return {
+                            bannerBottom: banner.bottom,
+                            varPx: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--demo-banner-h')),
+                            topbarTop: document.getElementById('topbar').getBoundingClientRect().top,
+                            appBottom: document.querySelector('.app').getBoundingClientRect().bottom,
+                            scrollH: document.documentElement.scrollHeight,
+                            waffle: hit('#waffle-btn'),
+                            hamburger: hit('#sidebar-toggle'),
+                        };
+                    }"""
+                )
+                # What a user feels first: every probed point of the controls is theirs to click.
+                assert reserved["waffle"]["covered"] == 0, f"{width}px: the banner covers the waffle button: {reserved}"
+                if width <= 768:  # the hamburger exists only on phones/tablets
+                    assert reserved["hamburger"]["rendered"], f"{width}px: hamburger missing: {reserved}"
+                    assert reserved["hamburger"]["covered"] == 0, f"{width}px: the banner covers the hamburger: {reserved}"
+                # Why: the app starts below the banner, ends inside the viewport, and the
+                # published height is current (never smaller than the banner it measures).
+                assert reserved["topbarTop"] >= reserved["bannerBottom"] - 0.5, f"{width}px: top bar is under the banner: {reserved}"
+                assert reserved["appBottom"] <= height + 0.5 and reserved["scrollH"] <= height, f"{width}px: app overflows the viewport: {reserved}"
+                assert reserved["varPx"] >= reserved["bannerBottom"] - 0.5, f"{width}px: --demo-banner-h is stale: {reserved}"
+                assert page.get_attribute("#waffle-btn", "aria-expanded") == "false"
+                page.click("#waffle-btn")
+                page.wait_for_selector("#waffle-popover:not([hidden])", timeout=3000)
+                assert page.get_attribute("#waffle-btn", "aria-expanded") == "true"
+
+                box = page.locator("#waffle-popover").bounding_box()
+                assert box is not None
+                assert box["x"] >= 0 and box["y"] >= 0, f"{width}px: popover off the top/left: {box}"
+                assert box["x"] + box["width"] <= width + 0.5, f"{width}px: popover overflows right: {box}"
+                assert box["y"] + box["height"] <= height + 0.5, f"{width}px: popover overflows bottom: {box}"
+
+                tabs = page.evaluate(
+                    "() => Array.from(document.querySelectorAll('.waffle-tile')).map(t => t.dataset.waffleTab)"
+                )
+                assert tabs[:3] == ["goal", "notes", "insights"], tabs
+
+                # Notes starts in a collapsed rail group: the launcher must reveal it.
+                assert page.evaluate(
+                    "() => document.querySelector('.vtab-btn[data-vtab=\"notes\"]').closest('.vtab-group').classList.contains('collapsed')"
+                ), "Content group should start collapsed (Status is the active tab)"
+                page.click('.waffle-tile[data-waffle-tab="notes"]')
+                page.wait_for_selector('.vtab-btn[data-vtab="notes"].active', state="visible", timeout=5000)
+                assert page.evaluate("() => document.getElementById('waffle-popover').hidden") is True
+                page.close()
             browser.close()
         finally:
             server.should_exit = True

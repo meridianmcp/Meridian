@@ -43,7 +43,7 @@ import { createStore } from "zustand/vanilla";
 // The grouped button markup lives inline in buildTabBody (literal buttons, so
 // the source-scanning UI tests keep matching); this module owns the grouping
 // model + the collapse/reveal wiring.
-import { wireVtabGroups } from "./dashboard-tabgroups";
+import { wireVtabGroups, revealGroupInStrip } from "./dashboard-tabgroups";
 // 8a665a03 -- a repaint must never throw away what the user typed: list views that are
 // rebuilt from a fetch carry their half-written inputs across (see paintKeepingDrafts).
 import { paintKeepingDrafts, hasUnsentDrafts } from "./dashboard-utils";
@@ -52,6 +52,10 @@ import { paintKeepingDrafts, hasUnsentDrafts } from "./dashboard-utils";
 // next-version rule it previews (mirrors meridian/versioning.py) are in
 // dashboard-versions.ts.
 import { createSprintMoveActions } from "./dashboard-sprint-move";
+// 90952bad — Outlook-style "waffle" launcher: a 9-dot button in the top bar that
+// pops a grid of tab tiles (pinned / recent / all, ordered by usefulness). It
+// activates a tile through the SAME path as clicking the rail's .vtab-btn.
+import { mountWaffle, refreshWaffle, countActiveSprintItems, readWaffleBadges, recordWaffleUse, withoutWaffleUse } from "./dashboard-waffle";
 // d6b7da48 — client-side sidebar "folders/spheres" (localStorage-only grouping).
 import {
   loadFolderAssignments,
@@ -1508,7 +1512,12 @@ function _tourActivateVtab(vtab: any, gtab: any) {
 
   const btn = document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${vtab}"]`);
 
-  if (btn) btn.click();
+  // 90952bad — rail groups start collapsed: expand the step's group first so the
+  // button is laid out before the click (and before startDemoTour measures it).
+  revealGroupInStrip(document.getElementById(`vtab-strip-${pid}`) || document, vtab);
+
+  // 90952bad — the tour's scripted clicks are not the user choosing a tab.
+  if (btn) withoutWaffleUse(() => btn.click());
 
   if (gtab) {
 
@@ -1743,7 +1752,15 @@ async function loadServerConfig() {
 
       document.body.prepend(b);
 
-      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 22) + 'px';
+      // 90952bad — /demo already carries the server-rendered #demo-banner, which sits on
+      // top of this one and reserves its own measured room through --demo-banner-h
+      // (dashboard.css). Padding here too would leave a 22px dead strip under it, so
+      // only a page without that banner pads for this one.
+      if (!document.getElementById('demo-banner')) {
+
+        document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 22) + 'px';
+
+      }
 
       // Demo onboarding overlay — self-guards once the tour is finished
 
@@ -3496,6 +3513,9 @@ function activateTab(id: any) {
 
   if (switcher) switcher.value = id;
 
+  // 90952bad — the waffle's badge dot reads the ACTIVE project's HITL chip.
+  refreshWaffle();
+
   // 73907f9e — re-init the Settings panel on project-tab switch. Its renderer has
   // a 30s TTL cache + a MutationObserver lifecycle, so switching to an already-built
   // project tab whose active vtab is Settings can show a blank panel (the observer
@@ -4676,6 +4696,11 @@ function buildTabBody(project: any) {
         else if (p.activeVtab === 'goal' && vtab !== 'goal'
           && guardGoalLeave(project.id, () => { btn._goalLeaveOk = true; btn.click(); })) return;
 
+        // 90952bad — every way of opening a tab (the rail, the waffle, HITL/timeline
+        // jumps, deep links) lands here, so this is where usage is counted. Before
+        // the loaders, so one that throws cannot skip it.
+        recordWaffleUse(vtab);
+
         // Keep the clicked tab's group expanded so it stays visible/measurable.
         revealGroupForTab(vtab);
 
@@ -4767,7 +4792,8 @@ function buildTabBody(project: any) {
       if (saved) {
         revealGroupForTab(saved);
         const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
-        if (savedBtn) savedBtn.click();
+        // 90952bad — a page load restoring the last tab is not a use of it.
+        if (savedBtn) withoutWaffleUse(() => savedBtn.click());
       }
     } catch(_) {}
 
@@ -4899,6 +4925,8 @@ function buildTabBody(project: any) {
     try {
 
       const items = await projectApi(project.id, sprintItemsPath);
+
+      _setWaffleQueueCount(project.id, items);
 
       const board = document.getElementById(`sprint-board-goal-${project.id}`);
 
@@ -5553,6 +5581,8 @@ async function refreshLiveTab(projectId: any) {
     if (sprintItemsResult.status === 'fulfilled') {
 
       renderSprintProgress(projectId, sprintItemsResult.value || []);
+
+      _setWaffleQueueCount(projectId, sprintItemsResult.value);
 
       // e3355ccb — live parallel-execution waves. Recomputes the server's
       // conflict-free batches from the same sprint-items payload (no extra fetch)
@@ -10233,6 +10263,7 @@ async function loadQueue(projectId: any, opts: any = {}) {
 
     const sprintPayload = sprintItems || [];
     panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : (sprintPayload.items || []);
+    _setWaffleQueueCount(projectId, panel.queueSprintItems);
     panel.queueTotalDoneCount = Array.isArray(sprintPayload)
       ? panel.queueSprintItems.filter((it: any) => it.status === 'done').length
       : (sprintPayload.total_done_count || 0);
@@ -11119,6 +11150,37 @@ function setVtabCountBadge(selector: any, count: any) {
 
   });
 
+  // 90952bad — the waffle launcher reads these chips (HITL pending count).
+  refreshWaffle();
+
+}
+
+// 90952bad — remember how many sprint items are still open for the project, from
+// a sprint-items payload the Goal/Live/Queue loaders already fetched, so the
+// waffle's Queue tile can show a pending-work badge without another request.
+function _setWaffleQueueCount(projectId: any, items: any) {
+  try {
+    getPanelState(projectId).sprintActiveCount = countActiveSprintItems(items);
+    refreshWaffle();
+  } catch (_) {}
+}
+
+// 90952bad — mount the waffle launcher in the top bar. It reads the ACTIVE
+// project's rail (state.activeTab is the project id) at open time.
+function _mountDashboardWaffle() {
+  try {
+    mountWaffle({
+      host: document.getElementById('topbar'),
+      getStrip: () => (state.activeTab ? document.getElementById(`vtab-strip-${state.activeTab}`) : null),
+      getBadges: () => {
+        const pid = state.activeTab;
+        return pid ? readWaffleBadges(document.getElementById(`vtab-strip-${pid}`), state.panels[pid]) : {};
+      },
+      storageKey: STORAGE_KEY('waffle.v1'),
+    });
+  } catch (e: any) {
+    console.warn('waffle launcher unavailable', e);
+  }
 }
 
 
@@ -13448,6 +13510,10 @@ async function restoreTabs() {
 
 
 (async function init() {
+
+  // 90952bad — synchronous and first: the launcher must exist even when the
+  // first-run wizard below returns early.
+  _mountDashboardWaffle();
 
   // 90de5ac9 — invited users land with ?ws=<owner_tenant_id> after OAuth login.
   // Set activeWorkspaceTenantId before any API calls so loadProjects() sends
