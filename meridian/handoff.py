@@ -5656,6 +5656,7 @@ async def _annotate_touches_files(
     if not changed_files:
         return pending_items
 
+    annotated_ids: list[str] = []
     for item in pending_items:
         if item.get("touches_resources"):
             continue
@@ -5689,8 +5690,17 @@ async def _annotate_touches_files(
                 ) as _:
                     pass
                 await db.commit()
+                annotated_ids.append(item["id"])
             except Exception:  # noqa: BLE001
                 pass
+    if annotated_ids:
+        # 8a665a03 -- the inferred resources are written straight to the rows the Queue /
+        # Live tab draws, so bust the list cache and announce once for the whole pass.
+        db_module._invalidate_sprint_items_cache(project_id)
+        db_module._publish_project_event(
+            project_id, "sprint_item_updated",
+            {"item_ids": annotated_ids, "fields": ["touches_resources"]},
+        )
     return pending_items
 
 

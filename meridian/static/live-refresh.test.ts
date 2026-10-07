@@ -16,6 +16,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { loadDashboardFunctions, topLevelFunctionSource } from "./source-harness";
+// The REAL Queue renderer: the filter / repaint tests below must see the markup that ships
+// (the filter input, data-bb-title rows, bb-group wrappers), not a stand-in. The sprint
+// module reads escapeHtml / getPanelState / formatRelativeTime / QUEUE_DONE_PAGE_SIZE as
+// window globals, which dashboard-utils installs on import (as the shipped bundle does).
+import "./dashboard-utils";
+import { renderQueue as realRenderQueue } from "./dashboard-sprint";
 
 const DASH = "meridian/static/dashboard.ts";
 const PID = "proj-live-1";
@@ -65,6 +71,9 @@ function makeMocks(state: any, over: Mocks = {}): Mocks {
     renderQueue: vi.fn(),
     renderQueueBody: vi.fn(),
     wireQueueSectionToggles: vi.fn(),
+    closeTab: vi.fn(),
+    refreshTab: vi.fn(async () => {}),
+    resyncProjectViews: vi.fn(),
     QUEUE_DONE_PAGE_SIZE: 25,
     _sprintBoardReloaders: {} as Record<string, any>,
     _repaintTimers: {} as Record<string, any>,
@@ -392,6 +401,7 @@ describe("permanent delete in the Backburner (Queue tab)", () => {
   const names = [
     "sprintArchive", "refreshSprintSurfaces", "repaintVisibleSprintViews", "reloadGoalSprintBoard",
     "scheduleGoalBoardReload", "_debounceRepaint", "applySprintItemDeleted", "renderQueueBody",
+    "applyBackburnerFilter", "queueSearchActive",
   ];
   const items = () => [
     { id: "bb-1", title: "backburner one", status: "skipped" },
@@ -602,6 +612,484 @@ describe("inline sprint handlers are reachable from markup", () => {
     const sprint = readSource("meridian/static/dashboard-sprint.ts");
     expect(sprint).toContain("sprintResetPending(");
     expect(sprint).not.toContain("items.map(x=>x.id===it.id");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A repaint must not reset the view state the user built up (Backburner filter)
+// ---------------------------------------------------------------------------
+describe("Backburner filter survives every Queue repaint", () => {
+  const names = [
+    "filterBackburner", "applyBackburnerFilter", "renderQueueBody", "applySprintItemDeleted",
+    "queueSearchActive", "loadQueue", "handleWsEvent", "_debounceRepaint",
+  ];
+  const TITLES = ["filterme one", "filterme two", "other three", "bb alpha"];
+  const rowItems = () => [
+    ...TITLES.map((title, i) => ({
+      id: `bb-${i}`, title, status: "skipped", item_group: i < 2 ? "grp-a" : "grp-b",
+    })),
+    { id: "p-1", title: "pending one", status: "pending" },
+  ];
+  const sectionState = () => ({ backburner: false, pending: false, in_progress: false, done: true, failed: true });
+
+  function setup(extra: Record<string, any> = {}) {
+    document.body.innerHTML = `<div id="queue-body-${PID}"></div><input id="task-search-${PID}">`;
+    const state = makeState("queue", {
+      queueSprintItems: rowItems(), queueTotalDoneCount: 0, queueSectionState: sectionState(), ...extra,
+    });
+    (window as any).state = state; // renderQueue reads panel state through window.state
+    const m = makeMocks(state, {
+      renderQueue: realRenderQueue,
+      projectApi: vi.fn(async (_pid: string, path: string) =>
+        path.includes("sprint-items") ? { items: state.panels[PID].queueSprintItems, total_done_count: 0 } : []),
+      isLiveSession: vi.fn(() => false),
+      loadRecentSessions: vi.fn(),
+      renderSearchResults: vi.fn(() => '<div class="search-hit">hit</div>'),
+      renderProjectLoadError: vi.fn(() => "err"),
+      wireProjectLoadRetry: vi.fn(),
+      runReconcile: vi.fn(),
+      getPanelState: (pid: string) => state.panels[pid],
+    });
+    const fns = load(names, m);
+    fns.renderQueueBody(PID);
+    return { state, m, fns };
+  }
+
+  const bbRows = (pid = PID) =>
+    Array.from(document.querySelectorAll(`#queue-body-${pid} .queue-section[data-section="backburner"] .queue-item`)) as HTMLElement[];
+  const shown = (pid = PID) => bbRows(pid).filter((e) => e.style.display !== "none").map((e) => e.dataset.bbTitle);
+  const filterInput = (pid = PID) => document.getElementById(`backburner-search-${pid}`) as HTMLInputElement;
+
+  /** What the oninput attribute does when the user types. */
+  const type = (fns: any, text: string, pid = PID) => {
+    filterInput(pid).value = text;
+    fns.filterBackburner(pid, text);
+  };
+
+  it("hides the rows that do not match while typing", () => {
+    const { fns } = setup();
+    type(fns, "filterme");
+    expect(shown()).toEqual(["filterme one", "filterme two"]);
+  });
+
+  it("deleting a visible row keeps the filter text AND keeps the other rows hidden", () => {
+    // The verifier's repro: type a filter, trash a visible row -> the whole body was
+    // rebuilt, the new input was empty and every hidden row came back.
+    const { fns, state } = setup();
+    type(fns, "filterme");
+    fns.applySprintItemDeleted(PID, "bb-0");
+    expect(filterInput().value).toBe("filterme");
+    expect(shown()).toEqual(["filterme two"]);
+    expect(bbRows().map((e) => e.dataset.bbTitle)).toContain("other three"); // present, just hidden
+    expect(state.panels[PID].backburnerFilter).toBe("filterme");
+  });
+
+  it("an empty group header disappears with its last visible row, and the filter outlives that too", () => {
+    const { fns } = setup();
+    type(fns, "filterme");
+    const groups = () => Array.from(document.querySelectorAll(`#queue-body-${PID} .bb-group`)) as HTMLElement[];
+    expect(groups().filter((g) => g.style.display !== "none")).toHaveLength(1); // only grp-a
+    fns.applySprintItemDeleted(PID, "bb-0");
+    fns.applySprintItemDeleted(PID, "bb-1");
+    expect(shown()).toEqual([]);
+    expect(groups().every((g) => g.style.display === "none")).toBe(true);
+    expect(filterInput().value).toBe("filterme");
+  });
+
+  it("deleting every visible row one after another never resurrects a hidden one", () => {
+    const { fns } = setup();
+    type(fns, "filterme");
+    for (const id of ["bb-0", "bb-1"]) {
+      fns.applySprintItemDeleted(PID, id);
+      expect(shown().every((t) => (t as string).startsWith("filterme"))).toBe(true);
+    }
+    expect(shown()).toEqual([]);
+  });
+
+  it("a sprint_item_deleted event from another tab / session keeps the filter", () => {
+    const { fns, state } = setup();
+    type(fns, "alpha");
+    expect(shown()).toEqual(["bb alpha"]);
+    fns.handleWsEvent(PID, { type: "sprint_item_deleted", item_id: "bb-1" });
+    expect(shown()).toEqual(["bb alpha"]);
+    expect(filterInput().value).toBe("alpha");
+    expect(state.panels[PID].queueSprintItems.map((i: any) => i.id)).not.toContain("bb-1");
+  });
+
+  it("a quiet loadQueue repaint (any WebSocket event) keeps the filter", async () => {
+    const { fns } = setup();
+    type(fns, "filterme");
+    await fns.loadQueue(PID, { quiet: true });
+    expect(filterInput().value).toBe("filterme");
+    expect(shown()).toEqual(["filterme one", "filterme two"]);
+  });
+
+  it("matches the group name as well as the title", () => {
+    const { fns } = setup();
+    type(fns, "grp-b");
+    expect(shown()).toEqual(["other three", "bb alpha"]);
+  });
+
+  it("clearing the filter shows every row again, and the cleared state persists across a repaint", () => {
+    const { fns, state } = setup();
+    type(fns, "filterme");
+    type(fns, "");
+    expect(shown()).toHaveLength(4);
+    fns.renderQueueBody(PID);
+    expect(shown()).toHaveLength(4);
+    expect(state.panels[PID].backburnerFilter).toBe("");
+  });
+
+  it("keeps the filter box focused, with its caret, across a repaint that rebuilds it", () => {
+    const { fns } = setup();
+    const before = filterInput();
+    before.focus();
+    type(fns, "filterme");
+    before.setSelectionRange(3, 6);
+    fns.renderQueueBody(PID);
+    const after = filterInput();
+    expect(after).not.toBe(before); // a NEW node: this is what used to lose everything
+    expect(document.activeElement).toBe(after);
+    expect([after.selectionStart, after.selectionEnd]).toEqual([3, 6]);
+  });
+
+  it("does not steal focus when the filter box was not focused", () => {
+    const { fns } = setup();
+    const other = document.getElementById(`task-search-${PID}`) as HTMLInputElement;
+    other.focus();
+    type(fns, "filterme");
+    fns.renderQueueBody(PID);
+    expect(document.activeElement).toBe(other);
+  });
+
+  it("renders a filter containing quotes and markup back into the input without breaking the page", () => {
+    const { fns } = setup();
+    type(fns, `"><img src=x onerror=alert(1)>`);
+    fns.renderQueueBody(PID);
+    expect(filterInput().value).toBe(`"><img src=x onerror=alert(1)>`);
+    expect(document.querySelector(`#queue-body-${PID} img`)).toBeNull();
+  });
+
+  it("the filter is per project: typing in one Queue never hides rows in another open project", () => {
+    document.body.innerHTML = `<div id="queue-body-${PID}"></div><div id="queue-body-${OTHER}"></div>`;
+    const state = makeState("queue", { queueSprintItems: rowItems(), queueSectionState: sectionState() });
+    state.panels[OTHER] = {
+      activeVtab: "queue", taskCache: [], queueSprintItems: rowItems(), queueSectionState: sectionState(),
+    };
+    (window as any).state = state;
+    const m = makeMocks(state, { renderQueue: realRenderQueue, getPanelState: (pid: string) => state.panels[pid] });
+    const fns = load(names, m);
+    fns.renderQueueBody(PID);
+    fns.renderQueueBody(OTHER);
+    type(fns, "filterme", OTHER);
+    expect(shown(OTHER)).toEqual(["filterme one", "filterme two"]);
+    expect(shown(PID)).toHaveLength(4);
+    expect(state.panels[PID].backburnerFilter).toBeUndefined();
+  });
+
+  it("keeps the Queue body's scroll offset across a repaint", () => {
+    const { fns } = setup();
+    const body = document.getElementById(`queue-body-${PID}`) as HTMLElement;
+    body.scrollTop = 120;
+    fns.renderQueueBody(PID);
+    expect(body.scrollTop).toBe(120);
+  });
+
+  describe("universal search results on screen", () => {
+    it("a delete event does not wipe the search results the user is reading", () => {
+      const { fns, state } = setup();
+      const body = document.getElementById(`queue-body-${PID}`) as HTMLElement;
+      (document.getElementById(`task-search-${PID}`) as HTMLInputElement).value = "needle";
+      body.innerHTML = '<div class="search-hit">hit</div>';
+      fns.applySprintItemDeleted(PID, "bb-0");
+      expect(body.querySelector(".search-hit")).not.toBeNull();
+      // ...but the cache is already current, so clearing the search shows the right queue.
+      expect(state.panels[PID].queueSprintItems.map((i: any) => i.id)).not.toContain("bb-0");
+      (document.getElementById(`task-search-${PID}`) as HTMLInputElement).value = "";
+      fns.renderQueueBody(PID);
+      expect(bbRows().map((e) => e.dataset.bbTitle)).not.toContain("filterme one");
+    });
+
+    it("a quiet loadQueue refreshes the cache but leaves the results (and does not flash 'loading')", async () => {
+      const { fns, state } = setup();
+      const body = document.getElementById(`queue-body-${PID}`) as HTMLElement;
+      (document.getElementById(`task-search-${PID}`) as HTMLInputElement).value = "needle";
+      body.innerHTML = '<div class="search-hit">hit</div>';
+      state.panels[PID].queueSprintItems = state.panels[PID].queueSprintItems.slice(1);
+      await fns.loadQueue(PID, { quiet: true });
+      expect(body.querySelector(".search-hit")).not.toBeNull();
+      expect(body.textContent).not.toContain("loading");
+    });
+
+    it("an explicit (non-quiet) reload still repaints over the search results", async () => {
+      const { fns } = setup();
+      const body = document.getElementById(`queue-body-${PID}`) as HTMLElement;
+      (document.getElementById(`task-search-${PID}`) as HTMLInputElement).value = "needle";
+      body.innerHTML = '<div class="search-hit">hit</div>';
+      await fns.loadQueue(PID);
+      expect(body.querySelector(".queue-section")).not.toBeNull();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket reconnect: events missed while the socket was down are never replayed
+// ---------------------------------------------------------------------------
+describe("WebSocket reconnect resyncs every view", () => {
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+    onopen: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    onmessage: ((ev: { data: string }) => void) | null = null;
+    closed = false;
+    constructor(public url: string) {
+      FakeWebSocket.instances.push(this);
+    }
+    close() {
+      this.closed = true;
+    }
+  }
+
+  beforeEach(() => {
+    FakeWebSocket.instances = [];
+    vi.useFakeTimers();
+    document.body.innerHTML = `<span id="ws-${PID}"></span>`;
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const wsNames = ["connectWs", "resyncProjectViews", "_debounceRepaint"];
+  function setup(vtab = "status", over: Mocks = {}) {
+    const state = makeState(vtab);
+    const m = makeMocks(state, { WebSocket: FakeWebSocket, ...over });
+    // resyncProjectViews is the real one; mocks for the loaders it fans out to.
+    delete (m as any).resyncProjectViews;
+    const fns = load([...wsNames, "repaintVisibleSprintViews", "scheduleGoalBoardReload", "reloadGoalSprintBoard"], m);
+    return { state, m, fns };
+  }
+
+  it("the first open does not resync (the tab just loaded fresh data) but marks the panel connected", () => {
+    const { state, m, fns } = setup("queue");
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    expect(m.refreshTab).not.toHaveBeenCalled();
+    expect(m.loadQueue).not.toHaveBeenCalled();
+    expect(state.panels[PID].wsOpenedBefore).toBe(true);
+    expect(document.getElementById(`ws-${PID}`)!.classList.contains("connected")).toBe(true);
+  });
+
+  it("a socket that opens AGAIN resyncs: the 1.5 s reconnect timer path", () => {
+    const { m, fns } = setup("queue");
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    FakeWebSocket.instances[0].onclose!();
+    expect(document.getElementById(`ws-${PID}`)!.classList.contains("connected")).toBe(false);
+    vi.advanceTimersByTime(1500);
+    expect(FakeWebSocket.instances).toHaveLength(2); // the reconnect
+    FakeWebSocket.instances[1].onopen!();
+    vi.advanceTimersByTime(300); // past the coalescing window of the debounced repaints
+    expect(m.refreshTab).toHaveBeenCalledWith(PID);
+    expect(m.loadQueue).toHaveBeenCalledWith(PID, { quiet: true });
+    expect(m.loadPinnedDecisions).toHaveBeenCalledWith(PID);
+    expect(m.refreshProjectCountBadges).toHaveBeenCalledWith(PID);
+    expect(m.refreshHitl).toHaveBeenCalled();
+    expect(m.loadProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("also resyncs when connectWs is called directly a second time (no timer involved)", () => {
+    const { m, fns } = setup("queue");
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    fns.connectWs(PID);
+    FakeWebSocket.instances[1].onopen!();
+    vi.advanceTimersByTime(300);
+    expect(m.refreshTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("resyncs only the views that are on screen", () => {
+    for (const [vtab, loader] of [["live", "refreshLiveTab"], ["notes", "loadNotesTab"], ["insights", "loadInsightsTab"]] as const) {
+      const { m, fns } = setup(vtab);
+      fns.connectWs(PID);
+      FakeWebSocket.instances[FakeWebSocket.instances.length - 1].onopen!();
+      fns.connectWs(PID);
+      FakeWebSocket.instances[FakeWebSocket.instances.length - 1].onopen!();
+      vi.advanceTimersByTime(300);
+      expect(m[loader]).toHaveBeenCalledWith(PID);
+      for (const other of ["refreshLiveTab", "loadNotesTab", "loadInsightsTab"].filter((n) => n !== loader)) {
+        expect(m[other]).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("reloads the Goal-tab sprint board on reconnect when that tab is visible", () => {
+    const reload = vi.fn(async () => {});
+    const { fns } = setup("goal", { _sprintBoardReloaders: { [PID]: reload } });
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    fns.connectWs(PID);
+    FakeWebSocket.instances[1].onopen!();
+    vi.advanceTimersByTime(300);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failing refresh neither stops the others nor throws out of onopen", async () => {
+    const { m, fns } = setup("live", { refreshTab: vi.fn(async () => { throw new Error("warming up"); }) });
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    fns.connectWs(PID);
+    expect(() => FakeWebSocket.instances[1].onopen!()).not.toThrow();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(m.loadPinnedDecisions).toHaveBeenCalledWith(PID);
+    expect(m.refreshLiveTab).toHaveBeenCalledWith(PID);
+  });
+
+  it("a resync that throws synchronously still leaves the socket usable (panel stays marked)", () => {
+    const { state, fns } = setup("status", { refreshHitl: vi.fn(() => { throw new Error("sync boom"); }) });
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    fns.connectWs(PID);
+    expect(() => FakeWebSocket.instances[1].onopen!()).not.toThrow();
+    expect(state.panels[PID].wsOpenedBefore).toBe(true);
+  });
+
+  it("does not reconnect (or resync) for a tab that was closed", () => {
+    const { state, fns } = setup();
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    delete state.panels[PID];
+    FakeWebSocket.instances[0].onclose!();
+    vi.advanceTimersByTime(5000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("a reopen that races a closed tab neither throws nor resyncs", () => {
+    const { state, m, fns } = setup();
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    fns.connectWs(PID);
+    delete state.panels[PID];
+    expect(() => FakeWebSocket.instances[1].onopen!()).not.toThrow();
+    expect(m.refreshTab).not.toHaveBeenCalled();
+  });
+
+  it("routes incoming frames to handleWsEvent and ignores malformed ones", () => {
+    const handleWsEvent = vi.fn();
+    const { fns } = setup("status", { handleWsEvent });
+    fns.connectWs(PID);
+    const sock = FakeWebSocket.instances[0];
+    sock.onmessage!({ data: JSON.stringify({ type: "x" }) });
+    sock.onmessage!({ data: "not json" });
+    expect(handleWsEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("the verifier's repro: a Queue that missed a delete while disconnected is repainted on reconnect", async () => {
+    // Tab B shows 3 backburner rows; the socket is down while one is deleted through
+    // REST; after the reconnect the server has 2 and the DOM must say 2 without a reload.
+    document.body.innerHTML = `<span id="ws-${PID}"></span><div id="queue-body-${PID}"></div>`;
+    const server = [
+      { id: "bb-1", title: "one", status: "skipped" },
+      { id: "bb-2", title: "two", status: "skipped" },
+      { id: "bb-3", title: "three", status: "skipped" },
+    ];
+    const state = makeState("queue", { queueSprintItems: server.slice(), queueSectionState: { backburner: false } });
+    (window as any).state = state;
+    const m = makeMocks(state, {
+      WebSocket: FakeWebSocket,
+      renderQueue: realRenderQueue,
+      getPanelState: (pid: string) => state.panels[pid],
+      projectApi: vi.fn(async (_pid: string, path: string) =>
+        path.includes("sprint-items") ? { items: server.slice(), total_done_count: 0 } : []),
+      isLiveSession: vi.fn(() => false),
+      loadRecentSessions: vi.fn(),
+    });
+    delete (m as any).loadQueue;
+    delete (m as any).renderQueueBody;
+    delete (m as any).resyncProjectViews;
+    const fns = load([
+      ...wsNames, "repaintVisibleSprintViews", "scheduleGoalBoardReload", "reloadGoalSprintBoard",
+      "loadQueue", "renderQueueBody", "applyBackburnerFilter", "queueSearchActive",
+    ], m);
+    const rows = () => document.querySelectorAll(`#queue-body-${PID} .queue-item`).length;
+    fns.renderQueueBody(PID);
+    expect(rows()).toBe(3);
+    fns.connectWs(PID);
+    FakeWebSocket.instances[0].onopen!();
+    FakeWebSocket.instances[0].onclose!();
+    server.splice(0, 1); // deleted through REST while the socket was down
+    vi.advanceTimersByTime(1500);
+    FakeWebSocket.instances[1].onopen!();
+    await vi.advanceTimersByTimeAsync(400);
+    expect(rows()).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Project-level events: the sidebar list, a deleted project's own tab, a merge
+// ---------------------------------------------------------------------------
+describe("handleWsEvent: project list events", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const run = (event: any, over: Mocks = {}, stateOver: (s: any) => void = () => {}) => {
+    const state = makeState("queue");
+    state.tabs = [{ id: PID, project: { id: PID, name: "P" } }];
+    stateOver(state);
+    const m = makeMocks(state, over);
+    const { handleWsEvent } = load(["handleWsEvent", "_debounceRepaint"], m);
+    handleWsEvent(PID, event);
+    vi.advanceTimersByTime(300);
+    return { state, m };
+  };
+
+  it("projects_changed refetches the project list (another tab created / deleted a project)", () => {
+    const { m } = run({ type: "projects_changed", change: "created" });
+    expect(m.loadProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("a burst of projects_changed (batch delete, merge) refetches once", () => {
+    const state = makeState("queue");
+    const m = makeMocks(state);
+    const { handleWsEvent } = load(["handleWsEvent", "_debounceRepaint"], m);
+    for (let i = 0; i < 10; i++) handleWsEvent(PID, { type: "projects_changed", change: "deleted" });
+    vi.advanceTimersByTime(300);
+    expect(m.loadProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("project_deleted closes the open tab for that project, says so, and refreshes the list", () => {
+    const { m } = run({ type: "project_deleted", project_id: PID });
+    expect(m.closeTab).toHaveBeenCalledWith(PID);
+    expect(m.toast).toHaveBeenCalledWith("This project was deleted");
+    expect(m.loadProjects).toHaveBeenCalled();
+  });
+
+  it("project_deleted in the tab that issued the delete closes silently (it reports the delete itself)", () => {
+    const { m } = run({ type: "project_deleted", project_id: PID }, {}, (s) => {
+      s.deletingProjects = { [PID]: true };
+    });
+    expect(m.closeTab).toHaveBeenCalledWith(PID);
+    expect(m.toast).not.toHaveBeenCalled();
+  });
+
+  it("project_deleted for a project with no open tab only refreshes the list", () => {
+    const state = makeState("queue");
+    state.tabs = [];
+    const m = makeMocks(state);
+    const { handleWsEvent } = load(["handleWsEvent", "_debounceRepaint"], m);
+    handleWsEvent(PID, { type: "project_deleted", project_id: PID });
+    vi.advanceTimersByTime(300);
+    expect(m.closeTab).not.toHaveBeenCalled();
+    expect(m.loadProjects).toHaveBeenCalled();
+  });
+
+  it("project_merged resyncs every view of the project", () => {
+    const { m } = run({ type: "project_merged", source_project_id: OTHER, target_project_id: PID });
+    expect(m.resyncProjectViews).toHaveBeenCalledWith(PID);
   });
 });
 

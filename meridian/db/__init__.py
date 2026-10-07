@@ -169,6 +169,37 @@ def _publish_project_event(project_id: str, event_type: str, payload: dict[str, 
         except asyncio.QueueFull:
             _log.warning("WS broadcast queue full for project %s — event dropped", project_id[:8])
 
+
+async def _publish_projects_changed(db: aiosqlite.Connection, change: str) -> None:
+    """8a665a03 -- tell every open dashboard that the PROJECT LIST changed.
+
+    The sidebar's project list is a view like any other, but a project is not owned by any
+    one project's event stream: creating one has no listeners yet and deleting one removes
+    the very stream it would be announced on. So this fans a ``projects_changed`` event out
+    to the listeners of every project that is in ``db``'s own projects table -- the
+    dashboards that can show this list -- and the client refetches ``GET /projects`` (which
+    applies the caller's workspace scoping), so the event carries no project name or id.
+
+    It deliberately does NOT use :func:`publish_global`: ``_TASK_LISTENERS`` is one
+    process-wide registry, so on hosted Meridian a global event reaches every tenant's open
+    dashboards. ``db`` is the caller's own database (the tenant's own Neon DB on hosted), so
+    listing its projects is what keeps the announcement inside the tenant. Call it AFTER
+    the change commits: a deleted project is gone from the table and is told separately
+    (``project_deleted``, on its own stream). Best effort: an announcement failure must
+    never undo the change that already committed.
+    """
+    try:
+        async with db.execute("SELECT id FROM projects") as cur:
+            rows = await cur.fetchall()
+        targets = {(_row_to_dict(r) or {}).get("id") for r in rows}
+    except Exception:  # noqa: BLE001 -- notification only
+        _log.debug("projects_changed: could not list projects", exc_info=True)
+        return
+    for pid in targets:
+        if pid:
+            _publish_project_event(pid, "projects_changed", {"change": change})
+
+
 CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -1251,6 +1282,8 @@ async def create_project(
         await update_project_settings(db, pid, hitl_auto_answer=1)
     project = await get_project(db, pid)
     assert project is not None
+    # 8a665a03 -- another open dashboard's sidebar never learned of the new project.
+    await _publish_projects_changed(db, "created")
     return project
 
 
@@ -1355,6 +1388,8 @@ async def set_project_status(
             f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
         )
         await db.commit()
+        # 8a665a03 -- status / priority decide how the sidebar groups and badges a project.
+        await _publish_projects_changed(db, "organization")
     return await get_project(db, project_id)
 
 
@@ -1453,6 +1488,9 @@ async def rename_project(
         (new_name, project_id),
     )
     await db.commit()
+    # 8a665a03 -- the REST route also publishes project_renamed (it updates the open tab
+    # label at once); this covers the MCP rename_project tool, which had no announcement.
+    await _publish_projects_changed(db, "renamed")
     return await get_project(db, project_id)
 
 
@@ -1506,6 +1544,9 @@ async def set_parent_project(
         (parent_project_id, project_id),
     )
     await db.commit()
+    # 8a665a03 -- see rename_project: the REST route publishes project_parent_changed,
+    # the MCP set_parent_project tool published nothing.
+    await _publish_projects_changed(db, "reparented")
     return await get_project(db, project_id)
 
 
@@ -1617,6 +1658,18 @@ async def merge_project(
         source_archived = True
 
     await conn.commit()
+
+    # 8a665a03 -- a merge re-parents every child row at once (items, notes, decisions,
+    # sessions, HITL, insights ...), so each of those views in the target (now fuller) and
+    # the source (now empty) is stale. One event per stream makes the client resync them
+    # all; the cache bust keeps the next list read from serving the pre-merge board.
+    for _pid in (source_project_id, target_project_id):
+        _invalidate_sprint_items_cache(_pid)
+        _publish_project_event(
+            _pid, "project_merged",
+            {"source_project_id": source_project_id, "target_project_id": target_project_id},
+        )
+    await _publish_projects_changed(conn, "merged")
 
     return {
         "source_project_id": source_project_id,
@@ -2381,6 +2434,14 @@ async def delete_project(
                 # Real error (FK violation, connection failure, …) — propagate.
                 raise
     await db.commit()
+    # 8a665a03 -- the sidebar of every other open dashboard still listed the deleted
+    # project(s), and a tab open on one kept polling a project that no longer exists.
+    # The deleted project's own stream gets project_deleted (it is no longer in the
+    # table, so the list announcement cannot reach it); everyone else refetches the list.
+    for _pid in project_ids:
+        _invalidate_sprint_items_cache(_pid)
+        _publish_project_event(_pid, "project_deleted", {})
+    await _publish_projects_changed(db, "deleted")
 
 
 def _stale_collapse_map(
@@ -3632,6 +3693,10 @@ async def set_decision(
         (updated, project_id),
     )
     await db.commit()
+    # 8a665a03 -- this log is what the Goal tab's Decisions table renders (refreshGoal ->
+    # renderDecisionsTable), and nothing announced an entry added by an MCP session, so
+    # the table stayed one decision behind until a reload. goal_updated re-runs refreshGoal.
+    _publish_project_event(project_id, "goal_updated", {"field": "decisions"})
     return updated
 
 
@@ -3936,7 +4001,44 @@ async def archive_stale_sessions(
         (project_id, cutoff),
     )
     await db.commit()
+    # 8a665a03 -- this runs inside start_session and silently dropped sessions from the
+    # Active Sessions / Live lists and put their claimed tasks and items back to pending,
+    # without telling any open dashboard.
+    await _announce_released_claims(db, project_id, stale_task_ids, linked_item_ids)
+    if cursor.rowcount:
+        _publish_project_event(
+            project_id, "session_updated", {"status": "archived", "count": cursor.rowcount},
+        )
     return cursor.rowcount
+
+
+async def _announce_released_claims(
+    db: aiosqlite.Connection,
+    project_id: str | None,
+    task_ids: list[str],
+    item_ids: list[str],
+) -> None:
+    """8a665a03 -- announce tasks / sprint items a stale-session sweep put back to pending.
+
+    The sweeps (archive_stale_sessions, release_stale_task_claims) reset rows with plain
+    UPDATEs, so neither the Devlog (task_updated) nor the Queue / Goal board / Live tab
+    (sprint_item_updated) heard about it and every open dashboard kept showing the dead
+    session's claims until a reload. Best effort: an announcement failure must never
+    undo or mask the sweep that already committed.
+    """
+    try:
+        if item_ids and project_id:
+            _invalidate_sprint_items_cache(project_id)
+            _publish_project_event(
+                project_id, "sprint_item_updated",
+                {"item_ids": list(item_ids), "status": "pending", "reason": "stale_claim_released"},
+            )
+        for task_id in task_ids:
+            task = await get_task(db, task_id)
+            if task is not None:
+                _publish_task("task_updated", task)
+    except Exception:  # noqa: BLE001 -- notification only
+        _log.debug("announce released claims failed", exc_info=True)
 
 
 async def archive_empty_sessions(
@@ -6252,6 +6354,7 @@ async def release_stale_task_claims(
             tuple(linked_item_ids),
         )
     await db.commit()
+    await _announce_released_claims(db, project_id, task_ids, linked_item_ids)
     return len(task_ids)
 
 
@@ -6280,6 +6383,14 @@ async def release_task(
         )
         await db.commit()
         updated = await get_task(db, task_id)
+        # 8a665a03 -- only the task was announced; the linked sprint item went back to
+        # pending silently, so the Queue / Goal board kept it in progress.
+        if updated is not None and updated.get("project_id"):
+            _invalidate_sprint_items_cache(updated["project_id"])
+            _publish_project_event(
+                updated["project_id"], "sprint_item_updated",
+                {"item_id": updated["sprint_item_id"], "status": "pending"},
+            )
     if updated is not None:
         _publish_task("task_updated", updated)
     return True
@@ -6331,6 +6442,11 @@ async def expire_idle_sessions(
         (f"-{max_age_minutes}",),
     )
     await db.commit()
+    # 8a665a03 -- sessions going idle were never announced, so every open dashboard kept
+    # showing them as active until a reload.
+    for _pid in affected_project_ids:
+        if _pid:
+            _publish_project_event(_pid, "session_updated", {"status": "idle"})
     return {"count": cursor.rowcount, "project_ids": affected_project_ids}
 
 
@@ -6396,6 +6512,14 @@ async def expire_inactive_sessions(
         (cutoff,),
     )
     await db.commit()
+    # 8a665a03 -- the sweep reset the dead sessions' tasks and archived the sessions with
+    # no announcement (the sprint items already went through requeue_or_fail_stalled_item,
+    # which publishes). Without these the Active Sessions list and the Devlog kept the
+    # dead workers' rows until a reload.
+    await _announce_released_claims(db, None, stale_task_ids, [])
+    for _pid in affected_project_ids:
+        if _pid:
+            _publish_project_event(_pid, "session_updated", {"status": "archived"})
     return {"count": cursor.rowcount, "project_ids": affected_project_ids}
 
 

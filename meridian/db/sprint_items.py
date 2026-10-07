@@ -2490,6 +2490,13 @@ async def link_sprint_item_github_issue(
     if cursor.rowcount == 0:
         return None
     _invalidate_sprint_items_cache(project_id)
+    # 8a665a03 -- the linked issue is part of the item payload every sprint list refetches
+    # (no dashboard row draws a badge for it yet, but API / MCP clients and the next row
+    # that does must not need a reload to see a link made by the auto-issue path).
+    _publish_project_event(
+        project_id, "sprint_item_updated",
+        {"item_id": item_id, "fields": ["github_issue_number", "github_issue_url", "github_issue_source"]},
+    )
     return await get_sprint_item(db, item_id)
 
 
@@ -5122,6 +5129,13 @@ async def clear_stale_claim_metadata(
     )
     await db.commit()
     _invalidate_sprint_items_cache(project_id)
+    # 8a665a03 -- the repair clears claimed_at / actor, columns the Live tab's
+    # in-progress-by-session panel and every item payload carry, so announce it like
+    # every other item write instead of leaving other dashboards on the stale claim.
+    _publish_project_event(
+        project_id, "sprint_item_updated",
+        {"item_id": item_id, "fields": ["claimed_at", "actor"]},
+    )
     return await get_sprint_item(db, item_id)
 
 
@@ -6284,6 +6298,11 @@ async def add_subtask(
     item = await get_sprint_item(db, iid)
     assert item is not None
     _invalidate_sprint_items_cache(project_id)
+    # 8a665a03 -- the cache bust alone told nobody: add_subtask is an MCP tool, so a
+    # subtask an agent adds never reached an open Queue / Goal board / Live tab.
+    _publish_project_event(
+        project_id, "sprint_item_added", {"item_id": iid, "parent_id": parent_id},
+    )
     return item
 
 
@@ -10968,6 +10987,19 @@ async def move_sprint_item_to_project(
     )
     await db.commit()
     moved_item = await get_sprint_item(db, item_id)
+    # 8a665a03 -- a move is a delete from one board and an add to another; neither
+    # board's 2 s list cache was busted and neither dashboard was told, so the row sat in
+    # the source project's Queue (and was missing from the destination's) until a reload.
+    _invalidate_sprint_items_cache(source_project_id)
+    _invalidate_sprint_items_cache(destination_project_id)
+    _publish_project_event(
+        source_project_id, "sprint_item_deleted",
+        {"item_id": item_id, "moved_to": destination_project_id},
+    )
+    _publish_project_event(
+        destination_project_id, "sprint_item_added",
+        {"item_id": item_id, "moved_from": source_project_id},
+    )
 
     try:
         # Lazy import: same circularity reason as set_project_blocker_policy's

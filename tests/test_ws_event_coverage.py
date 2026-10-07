@@ -15,12 +15,25 @@ in unnoticed:
    reverse: a branch for an event nothing publishes is a typo or dead code.
 2. Every mutating route under ``meridian/routes/`` that the dashboard calls, and that
    changes project-scoped data a WebSocket-fed view lists, publishes an event on its
-   path -- or is on ``SILENT_ROUTES`` below with the reason that is acceptable.
+   path -- or is on ``SILENT_ROUTES`` below with the reason that is acceptable. The
+   project-level routes (``POST /projects``, ``DELETE /projects/{id}``) are in scope too:
+   the sidebar's project list is a view like any other.
+3. Every FUNCTION anywhere under ``meridian/`` that writes the ``sprint_items`` or
+   ``projects`` table publishes an event (directly or through what it calls) -- or is on
+   ``SILENT_WRITERS`` below with the reason. Scan 2 only sees routes a dashboard button
+   calls, so a write reachable only from an MCP tool, a background sweep, a batch rollback
+   or a cross-project move (the verifier found seven of them) was invisible to it.
 
-Both are static scans (AST for the server, regex for the TypeScript), deliberately cheap
+All are static scans (AST for the server, regex for the TypeScript), deliberately cheap
 and deliberately conservative: a scan can miss a case, but adding a publish call, a
 client branch or an allowlist entry is always enough to satisfy it. Allowlist entries are
 checked for staleness in both directions so the lists cannot rot into noise.
+
+Limits of scan 3: it asks whether ANY path through the function publishes, so a write in
+one branch with a publish in another passes -- the per-path behaviour is pinned by
+tests/test_8a665a03_project_and_sweep_events.py (e.g. a batch rollback's compensating
+delete). It also stops at the table boundary: ``task_log``, ``sessions``, notes and the
+rest are covered by their own event tests, not scanned here.
 
 Limits of scan 2 -- it is a guard, not a proof:
 
@@ -176,7 +189,7 @@ def test_client_handles_every_event_the_delete_and_edit_paths_publish():
         "sprint_item_deleted", "sprint_item_updated", "sprint_item_added", "sprint_items_fanned_out",
         "note_updated", "note_deleted", "decision_updated", "decision_deleted", "insight_added",
         "task_deleted", "session_updated", "session_started", "project_icon_changed",
-        "project_parent_changed",
+        "project_parent_changed", "projects_changed", "project_deleted", "project_merged",
     ):
         assert etype in published, f"{etype} is no longer published"
         assert etype in handled, f"{etype} has no handleWsEvent branch"
@@ -194,6 +207,10 @@ def test_client_handles_every_event_the_delete_and_edit_paths_publish():
 def _in_scope(path: str) -> bool:
     return (
         path.startswith("/projects/{project_id}/")
+        # The project LIST (create / delete): every other open dashboard's sidebar shows it.
+        # These two used to be excluded by construction, which is how a create or delete
+        # that told nobody got past this scan.
+        or path in ("/projects", "/projects/{project_id}")
         or path == "/tasks"
         or path.startswith("/tasks/")
         or path.startswith("/sessions")
@@ -400,8 +417,13 @@ def test_the_scan_sees_the_routes_this_change_fixed():
         ("DELETE", "/projects/{project_id}/notes/{note_id}"),
         ("PATCH", "/projects/{project_id}/decisions-pinned/{decision_id}"),
         ("PATCH", "/sessions/{session_id}"),
+        # the project list: out of scope of this scan until the verifier found a create /
+        # delete that told no other dashboard
+        ("POST", "/projects"),
+        ("DELETE", "/projects/{project_id}"),
     ):
         assert key in routes, f"route {key} not found"
+        assert _in_scope(key[1]), f"{key} is not scanned"
         assert _dashboard_calls(key[0], key[1], ts), f"dashboard caller for {key} not detected"
         assert _publishes(routes[key], index), f"{key} should publish an event"
 
@@ -420,3 +442,175 @@ def test_the_publish_scan_is_not_vacuous():
         "    _publish_project_event(project_id, 'x_changed', {})\n"
     )
     assert _publishes(tree2.body[0], _function_index())
+
+
+# ---------------------------------------------------------------------------
+# 3. every function that writes sprint_items / projects publishes
+# ---------------------------------------------------------------------------
+
+WRITER_TABLES = ("sprint_items", "projects")
+
+# (table, file, function) of writers that publish nothing, with why that is acceptable.
+# sprint_items is the table behind the Queue, Live and Goal boards, so only a column no
+# view renders belongs here. projects holds both the sidebar list (create / rename /
+# parent / status / merge / delete -- all announced) and a lot of single-form settings.
+_SETTINGS_FORM = (
+    "Settings-tab form; that tab loads the value when it is opened and no WebSocket-fed list "
+    "shows it, so there is nothing to repaint in another dashboard"
+)
+_STARTUP_MIGRATION = "schema migration / backfill that runs once at startup, before any dashboard is connected"
+_NTFY_TARGET = (
+    "notification target on the Account card; only that form shows it and the acting tab "
+    "keeps its own cache in step"
+)
+SILENT_WRITERS: dict[tuple[str, str, str], str] = {
+    ("sprint_items", "meridian/db/sprint_items.py", "_add_coarse_lock_path"): (
+        "records which files a claim's whole-file lock covers (coarse_lock_files): lock-ownership "
+        "bookkeeping no dashboard view renders (it still busts the list cache)"
+    ),
+    ("projects", "meridian/db/__init__.py", "set_project_execution_mode"): _SETTINGS_FORM,
+    ("projects", "meridian/db/__init__.py", "update_project_settings"): _SETTINGS_FORM,
+    ("projects", "meridian/db/__init__.py", "set_agent_instructions"): _SETTINGS_FORM,
+    ("projects", "meridian/db/__init__.py", "set_project_repo_identity"): (
+        "stores a one-way repo fingerprint used for MCP scope checks; never rendered"
+    ),
+    ("projects", "meridian/db/__init__.py", "set_project_ntfy_url"): _NTFY_TARGET,
+    ("projects", "meridian/db/__init__.py", "set_project_notify_email"): _NTFY_TARGET,
+    ("projects", "meridian/pg_adapter.py", "set_project_ntfy_url"): "Postgres twin of db.set_project_ntfy_url (same reason)",
+    ("projects", "meridian/pg_adapter.py", "set_project_notify_email"): "Postgres twin of db.set_project_notify_email (same reason)",
+    ("projects", "meridian/db/__init__.py", "set_goal_mode"): (
+        "auto/manual goal-mode switch; the dashboard toggle was removed (see buildTabBody), so it "
+        "is reachable only from the API / MCP and nothing on screen renders it"
+    ),
+    ("projects", "meridian/db/__init__.py", "get_or_create_rewind_token"): (
+        "mints the share token on first read; shown only in the response to the Rewind tab's own request"
+    ),
+    ("projects", "meridian/db/__init__.py", "ensure_project_token"): (
+        "mints the project API token on first use; shown on demand, never in a list"
+    ),
+    ("projects", "meridian/db/__init__.py", "set_queued_session"): (
+        "queued next-/goal slot read back once by the handoff; executor plumbing no dashboard list renders"
+    ),
+    ("projects", "meridian/db/__init__.py", "pop_queued_session"): "read-once clear of the queued /goal slot (see set_queued_session)",
+    ("projects", "meridian/db/__init__.py", "set_pending_goal"): (
+        "read-once pending /goal handoff slot delivered through start_session / load_handoff; "
+        "executor plumbing no dashboard list renders"
+    ),
+    ("projects", "meridian/db/__init__.py", "_clear_pending_goal_if_unchanged"): "read-once clear of the pending /goal slot (see set_pending_goal)",
+    ("projects", "meridian/db/__init__.py", "pop_pending_goal"): "read-once clear of the pending /goal slot (see set_pending_goal)",
+    ("projects", "meridian/db/migrations.py", "_migrate_github_to_projects"): _STARTUP_MIGRATION,
+    ("projects", "meridian/db/migrations.py", "_backfill_agent_instructions"): _STARTUP_MIGRATION,
+    ("projects", "meridian/pg_adapter.py", "_migrate_pg_backfill_agent_instructions"): _STARTUP_MIGRATION,
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _table_writers(table: str) -> dict[tuple[str, str], ast.AST]:
+    """{(file, function name): node} for every function with an INSERT / UPDATE / DELETE on ``table``."""
+    pat = re.compile(rf"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+{table}\b", re.I)
+    out: dict[tuple[str, str], ast.AST] = {}
+    for path in sorted(PKG.rglob("*.py")):
+        if "static" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if not pat.search(text):  # cheap pre-filter: most modules never touch the table
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:  # pragma: no cover - a broken file fails its own tests
+            continue
+        rel = path.relative_to(REPO).as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if any(
+                isinstance(c, ast.Constant) and isinstance(c.value, str) and pat.search(c.value)
+                for c in ast.walk(node)
+            ):
+                out[(rel, node.name)] = node
+    return out
+
+
+def test_every_function_that_writes_a_listed_table_publishes_an_event():
+    index = _function_index()
+    offenders = []
+    for table in WRITER_TABLES:
+        for (rel, name), node in sorted(_table_writers(table).items()):
+            if _publishes(node, index) or (table, rel, name) in SILENT_WRITERS:
+                continue
+            offenders.append(f"{table}: {rel}::{name} (line {node.lineno})")
+    assert not offenders, (
+        "These functions write a table whose rows a WebSocket-fed dashboard view lists, but "
+        "neither they nor anything they call publishes an event, so every other open dashboard "
+        "keeps the stale row until a reload (the permanently-deleted Backburner row was exactly "
+        "this):\n  " + "\n  ".join(offenders)
+        + "\nCall _publish_project_event(project_id, '<type>', {...}) after the commit (and bust "
+        "the sprint-items cache for sprint_items) and make sure handleWsEvent has a branch -- or, "
+        "if no view shows the column, add (table, file, function) to SILENT_WRITERS in "
+        "tests/test_ws_event_coverage.py with the reason."
+    )
+
+
+def test_silent_writers_allowlist_has_no_stale_entries():
+    index = _function_index()
+    for (table, rel, name), reason in SILENT_WRITERS.items():
+        assert reason.strip(), f"{(table, rel, name)} has no reason"
+        assert table in WRITER_TABLES, f"{table} is not a scanned table -- remove {(table, rel, name)}"
+        writers = _table_writers(table)
+        assert (rel, name) in writers, (
+            f"SILENT_WRITERS lists {rel}::{name} but it no longer writes {table} -- remove it"
+        )
+        assert not _publishes(writers[(rel, name)], index), (
+            f"{rel}::{name} publishes an event now -- remove it from SILENT_WRITERS"
+        )
+
+
+def test_the_writer_scan_sees_the_functions_the_verifier_found_silent():
+    """Guard the scan itself: these were the silent writers, so they must be detected as
+    writers AND now count as publishing -- if detection regresses the scan proves nothing."""
+    index = _function_index()
+    expected = {
+        "sprint_items": [
+            ("meridian/db/sprint_items.py", "add_subtask"),
+            ("meridian/db/sprint_items.py", "move_sprint_item_to_project"),
+            ("meridian/db/sprint_items.py", "clear_stale_claim_metadata"),
+            ("meridian/db/sprint_items.py", "link_sprint_item_github_issue"),
+            ("meridian/db/sprint_items.py", "delete_sprint_item"),
+            ("meridian/db/__init__.py", "archive_stale_sessions"),
+            ("meridian/db/__init__.py", "release_stale_task_claims"),
+            ("meridian/db/__init__.py", "release_task"),
+            ("meridian/db/locks.py", "_amend_sprint_item_resources_for_session"),
+            ("meridian/handoff.py", "_annotate_touches_files"),
+        ],
+        "projects": [
+            ("meridian/db/__init__.py", "create_project"),
+            ("meridian/db/__init__.py", "delete_project"),
+            ("meridian/db/__init__.py", "merge_project"),
+            ("meridian/db/__init__.py", "rename_project"),
+            ("meridian/db/__init__.py", "set_parent_project"),
+            ("meridian/db/__init__.py", "set_project_status"),
+            ("meridian/db/__init__.py", "set_decision"),
+        ],
+    }
+    for table, keys in expected.items():
+        writers = _table_writers(table)
+        for key in keys:
+            assert key in writers, f"{key} no longer detected as a {table} writer"
+            assert _publishes(writers[key], index), f"{key} writes {table} but publishes nothing"
+
+
+def test_the_writer_scan_is_not_vacuous():
+    """A synthetic writer with no publish must be flagged; one that publishes must not."""
+    silent = ast.parse(
+        "async def silent(db, project_id):\n"
+        "    await db.execute('UPDATE sprint_items SET title = ? WHERE id = ?', ('x', project_id))\n"
+    ).body[0]
+    loud = ast.parse(
+        "async def loud(db, project_id):\n"
+        "    await db.execute('UPDATE sprint_items SET title = ? WHERE id = ?', ('x', project_id))\n"
+        "    _publish_project_event(project_id, 'sprint_item_updated', {})\n"
+    ).body[0]
+    assert not _publishes(silent, _function_index())
+    assert _publishes(loud, _function_index())
+    pat = re.compile(r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+sprint_items\b", re.I)
+    assert pat.search("DELETE FROM sprint_items WHERE id = ?") and not pat.search("SELECT * FROM sprint_items")

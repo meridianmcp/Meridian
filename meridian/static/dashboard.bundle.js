@@ -2061,6 +2061,8 @@
       const groupNames = Object.keys(groups).sort((a3, b2) => a3.localeCompare(b2));
       const search = `<input type="text" id="backburner-search-${escapeHtml(projectId)}" placeholder="filter backburner\u2026"
 
+      value="${escapeHtml(panel.backburnerFilter || "")}"
+
       oninput="filterBackburner('${escapeHtml(projectId)}', this.value)"
 
       style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 8px;margin-bottom:8px;outline:none">`;
@@ -11656,6 +11658,7 @@ Current: ${current || "(none)"}`,
       };
       box.querySelector("#del-proj-confirm").onclick = async () => {
         overlay.remove();
+        (state.deletingProjects = state.deletingProjects || {})[t3.id] = true;
         try {
           await api(`/projects/${t3.id}`, { method: "DELETE" });
           closeTab2(t3.id);
@@ -11671,6 +11674,8 @@ Current: ${current || "(none)"}`,
           } else {
             toast(e3.message.includes("409") ? "Cannot delete \u2014 active tasks in progress." : "Delete failed: " + e3.message, true);
           }
+        } finally {
+          delete state.deletingProjects[t3.id];
         }
         resolve();
       };
@@ -13455,7 +13460,11 @@ Current: ${current || "(none)"}`,
       panel.queueSprintItems = panel.queueSprintItems.filter((it) => it.id !== itemId);
       if (gone && gone.status === "done" && panel.queueTotalDoneCount > 0) panel.queueTotalDoneCount -= 1;
     }
-    if (panel.activeVtab === "queue") renderQueueBody(projectId);
+    if (panel.activeVtab === "queue" && !queueSearchActive(projectId)) renderQueueBody(projectId);
+  }
+  function queueSearchActive(projectId) {
+    const box = document.getElementById(`task-search-${projectId}`);
+    return !!(box && box.value && box.value.trim());
   }
   function wireSprintAddEnter2(projectId, root) {
     const inp = root.querySelector(`#sprint-add-input-${projectId}`);
@@ -13487,8 +13496,15 @@ Current: ${current || "(none)"}`,
     }
   }
   function filterBackburner(projectId, value) {
-    const q2 = (value || "").trim().toLowerCase();
-    const sec = document.querySelector('.queue-section[data-section="backburner"]');
+    const panel = state.panels[projectId];
+    if (panel) panel.backburnerFilter = value || "";
+    applyBackburnerFilter(projectId);
+  }
+  function applyBackburnerFilter(projectId) {
+    const panel = state.panels[projectId];
+    const q2 = (panel && panel.backburnerFilter || "").trim().toLowerCase();
+    const scope = document.getElementById(`queue-body-${projectId}`) || document;
+    const sec = scope.querySelector('.queue-section[data-section="backburner"]');
     if (!sec) return;
     sec.querySelectorAll(".queue-item").forEach((el2) => {
       const hit = !q2 || (el2.dataset.bbTitle || "").includes(q2) || (el2.dataset.bbGroup || "").includes(q2);
@@ -16351,7 +16367,24 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const body = document.getElementById(`queue-body-${projectId}`);
     const panel = state.panels[projectId];
     if (!body || !panel) return;
+    const filterId = `backburner-search-${projectId}`;
+    const active = document.activeElement;
+    const hadFilterFocus = !!(active && active.id === filterId);
+    const caret = hadFilterFocus ? { start: active.selectionStart, end: active.selectionEnd } : null;
+    const scrollTop = body.scrollTop;
     body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
+    applyBackburnerFilter(projectId);
+    if (scrollTop) body.scrollTop = scrollTop;
+    if (hadFilterFocus) {
+      const next = document.getElementById(filterId);
+      if (next) {
+        next.focus();
+        try {
+          if (caret && caret.start != null) next.setSelectionRange(caret.start, caret.end ?? caret.start);
+        } catch (_2) {
+        }
+      }
+    }
     wireQueueSectionToggles(projectId);
     const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
     if (moreBtn) {
@@ -16366,7 +16399,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!body) return;
     const panel = getPanelState(projectId);
     if (!panel.queueDoneLimit) panel.queueDoneLimit = QUEUE_DONE_PAGE_SIZE;
-    if (!(opts && opts.quiet && body.querySelector(".queue-section"))) {
+    const quietKeep = !!(opts && opts.quiet && (body.querySelector(".queue-section") || queueSearchActive(projectId)));
+    if (!quietKeep) {
       body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
     }
     try {
@@ -16380,7 +16414,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : sprintPayload.items || [];
       panel.queueTotalDoneCount = Array.isArray(sprintPayload) ? panel.queueSprintItems.filter((it) => it.status === "done").length : sprintPayload.total_done_count || 0;
       const renderCurrentQueue = () => renderQueueBody(projectId);
-      renderCurrentQueue();
+      if (!(opts && opts.quiet && queueSearchActive(projectId))) renderCurrentQueue();
       loadRecentSessions(projectId, sessions || []);
       const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
       if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
@@ -17829,6 +17863,17 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const dot = document.getElementById(`ws-${projectId}`);
     ws.onopen = () => {
       dot && dot.classList.add("connected");
+      const panel = state.panels[projectId];
+      if (panel) {
+        const reopened = !!panel.wsOpenedBefore;
+        panel.wsOpenedBefore = true;
+        if (reopened) {
+          try {
+            resyncProjectViews(projectId);
+          } catch (_2) {
+          }
+        }
+      }
     };
     ws.onclose = () => {
       dot && dot.classList.remove("connected");
@@ -17847,6 +17892,25 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
     };
     state.panels[projectId].ws = ws;
+  }
+  function resyncProjectViews(projectId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    _debounceRepaint("projects", () => {
+      loadProjects();
+    });
+    repaintVisibleSprintViews(projectId);
+    const jobs = [
+      refreshTab(projectId),
+      // goal + Active Sessions + the Devlog task list
+      loadPinnedDecisions(projectId),
+      refreshProjectCountBadges(projectId),
+      refreshHitl()
+    ];
+    if (panel.activeVtab === "live") jobs.push(refreshLiveTab(projectId));
+    if (panel.activeVtab === "notes") jobs.push(loadNotesTab(projectId));
+    if (panel.activeVtab === "insights") jobs.push(loadInsightsTab(projectId));
+    Promise.allSettled(jobs);
   }
   function handleWsEvent(projectId, event) {
     if (event.type === "update_available") {
@@ -17885,6 +17949,26 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const tab = state.tabs.find((t3) => t3.id === event.project_id);
       if (tab) tab.project = { ...tab.project, parent_project_id: event.parent_project_id || null };
       loadProjects();
+      return;
+    }
+    if (event.type === "projects_changed") {
+      _debounceRepaint("projects", () => {
+        loadProjects();
+      });
+      return;
+    }
+    if (event.type === "project_deleted") {
+      if (state.tabs.some((t3) => t3.id === projectId)) {
+        if (!(state.deletingProjects && state.deletingProjects[projectId])) toast("This project was deleted");
+        closeTab2(projectId);
+      }
+      _debounceRepaint("projects", () => {
+        loadProjects();
+      });
+      return;
+    }
+    if (event.type === "project_merged") {
+      resyncProjectViews(projectId);
       return;
     }
     if (event.type === "sprint_item_updated") {

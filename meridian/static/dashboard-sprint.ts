@@ -981,7 +981,12 @@ export function renderQueue(projectId: string, sprintItems: any = []) {
 
     const groupNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));
 
+    // The filter text lives in panel state (filterBackburner) and is rendered back into
+    // the input: this section is rebuilt on every repaint (delete, WebSocket event), and
+    // an empty fresh input used to drop the user's filter after each single delete.
     const search = `<input type="text" id="backburner-search-${escapeHtml(projectId)}" placeholder="filter backburner…"
+
+      value="${escapeHtml(panel.backburnerFilter || '')}"
 
       oninput="filterBackburner('${escapeHtml(projectId)}', this.value)"
 

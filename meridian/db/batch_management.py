@@ -550,12 +550,11 @@ async def _compensate_sprint_item_entry(
         kind = comp_state[0]
         if kind == "create":
             item_id = comp_state[1]
-            await db.execute(
-                "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
-                (item_id, project_id),
-            )
-            await db.commit()
-            db_module._invalidate_sprint_items_cache(project_id)
+            # 8a665a03 -- delete_sprint_item busts the cache AND announces the removal.
+            # The raw DELETE this replaced only busted the cache, so a dashboard that
+            # refetched between the create's sprint_item_added event and the rollback kept
+            # the phantom row of a batch that never happened.
+            await db_module.delete_sprint_item(db, project_id, item_id)
         elif kind == "update":
             _, item_id, changed_fields, snapshot = comp_state
             revert_kwargs: dict[str, Any] = {}

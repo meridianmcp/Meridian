@@ -3407,6 +3407,10 @@ async function _deleteProject(t: any) {
     overlay.onclick = e => { if (e.target === overlay) { overlay.remove(); resolve(); } };
     box.querySelector('#del-proj-confirm')!.onclick = async () => {
       overlay.remove();
+      // The server's project_deleted event can reach this tab before the DELETE response
+      // does; this flag keeps that handler from also announcing a delete THIS tab is
+      // already reporting itself.
+      (state.deletingProjects = state.deletingProjects || {})[t.id] = true;
       try {
         await api(`/projects/${t.id}`, { method: 'DELETE' });
         closeTab(t.id);
@@ -3420,6 +3424,8 @@ async function _deleteProject(t: any) {
         } else {
           toast(e.message.includes('409') ? 'Cannot delete — active tasks in progress.' : 'Delete failed: ' + e.message, true);
         }
+      } finally {
+        delete state.deletingProjects[t.id];
       }
       resolve();
     };
@@ -5694,7 +5700,17 @@ function applySprintItemDeleted(projectId: any, itemId: any) {
     panel.queueSprintItems = panel.queueSprintItems.filter((it: any) => it.id !== itemId);
     if (gone && gone.status === 'done' && panel.queueTotalDoneCount > 0) panel.queueTotalDoneCount -= 1;
   }
-  if (panel.activeVtab === 'queue') renderQueueBody(projectId);
+  // The cache is already updated, so a search that is on screen repaints from it when
+  // the search is cleared; repainting now would wipe the results the user is reading.
+  if (panel.activeVtab === 'queue' && !queueSearchActive(projectId)) renderQueueBody(projectId);
+}
+
+function queueSearchActive(projectId: any) {
+  /** True while the Queue tab's universal-search box has text: the body then shows search
+   * results (renderSearchResults), not the queue, and a background repaint must not
+   * replace them. */
+  const box = document.getElementById(`task-search-${projectId}`) as HTMLInputElement | null;
+  return !!(box && box.value && box.value.trim());
 }
 
 // function renderSprintProgress -- moved to dashboard-sprint.js
@@ -5752,15 +5768,35 @@ async function sprintArchive(projectId: any, itemId: any) {
 
 function filterBackburner(projectId: any, value: any) {
 
-  /** e62ce019 — client-side filter of the backburner section by title/group. */
+  /** e62ce019 — client-side filter of the backburner section by title/group.
+   * The text is kept in panel state (not just in the input) so every repaint of the
+   * Queue body can put it back: a delete / WebSocket repaint rebuilds the input node and
+   * used to reset the filter after every single delete. */
 
-  const q = (value || '').trim().toLowerCase();
+  const panel = state.panels[projectId];
 
-  const sec = document.querySelector('.queue-section[data-section="backburner"]');
+  if (panel) panel.backburnerFilter = value || '';
+
+  applyBackburnerFilter(projectId);
+
+}
+
+function applyBackburnerFilter(projectId: any) {
+
+  /** Hide the backburner rows that do not match the filter text held in panel state.
+   * Scoped to this project's Queue body (a second open project has its own section). */
+
+  const panel = state.panels[projectId];
+
+  const q = ((panel && panel.backburnerFilter) || '').trim().toLowerCase();
+
+  const scope = document.getElementById(`queue-body-${projectId}`) || document;
+
+  const sec = scope.querySelector('.queue-section[data-section="backburner"]');
 
   if (!sec) return;
 
-  sec.querySelectorAll('.queue-item').forEach(el => {
+  sec.querySelectorAll('.queue-item').forEach((el: any) => {
 
     const hit = !q || (el.dataset.bbTitle || '').includes(q) || (el.dataset.bbGroup || '').includes(q);
 
@@ -5768,9 +5804,9 @@ function filterBackburner(projectId: any, value: any) {
 
   });
 
-  sec.querySelectorAll('.bb-group').forEach(g => {
+  sec.querySelectorAll('.bb-group').forEach((g: any) => {
 
-    const anyVisible = Array.from(g.querySelectorAll('.queue-item')).some(el => el.style.display !== 'none');
+    const anyVisible = Array.from(g.querySelectorAll('.queue-item')).some((el: any) => el.style.display !== 'none');
 
     g.style.display = anyVisible ? '' : 'none';
 
@@ -10103,7 +10139,26 @@ function renderQueueBody(projectId: any) {
   const body = document.getElementById(`queue-body-${projectId}`);
   const panel = state.panels[projectId];
   if (!body || !panel) return;
+  // A repaint rebuilds every node, so the view state that lives only in the DOM has to be
+  // carried across it by hand: the focused filter box (and its caret) and the scroll
+  // offset. The filter TEXT lives in panel.backburnerFilter and is re-applied below.
+  const filterId = `backburner-search-${projectId}`;
+  const active = document.activeElement as HTMLInputElement | null;
+  const hadFilterFocus = !!(active && active.id === filterId);
+  const caret = hadFilterFocus
+    ? { start: active!.selectionStart, end: active!.selectionEnd }
+    : null;
+  const scrollTop = body.scrollTop;
   body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
+  applyBackburnerFilter(projectId);
+  if (scrollTop) body.scrollTop = scrollTop;
+  if (hadFilterFocus) {
+    const next = document.getElementById(filterId) as HTMLInputElement | null;
+    if (next) {
+      next.focus();
+      try { if (caret && caret.start != null) next.setSelectionRange(caret.start, caret.end ?? caret.start); } catch (_) { /* not a text input */ }
+    }
+  }
   wireQueueSectionToggles(projectId);
   const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
   if (moreBtn) {
@@ -10122,7 +10177,11 @@ async function loadQueue(projectId: any, opts: any = {}) {
   if (!body) return;
   const panel = getPanelState(projectId);
   if (!panel.queueDoneLimit) panel.queueDoneLimit = QUEUE_DONE_PAGE_SIZE;
-  if (!(opts && opts.quiet && body.querySelector('.queue-section'))) {
+  // A quiet repaint never blanks what is on screen: the queue rows, or the search results
+  // the user is reading (queueSearchActive) -- those are replaced only when the search is
+  // cleared, from the cache this call refreshes.
+  const quietKeep = !!(opts && opts.quiet && (body.querySelector('.queue-section') || queueSearchActive(projectId)));
+  if (!quietKeep) {
     body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
   }
 
@@ -10152,7 +10211,7 @@ async function loadQueue(projectId: any, opts: any = {}) {
 
 
 
-    renderCurrentQueue();
+    if (!(opts && opts.quiet && queueSearchActive(projectId))) renderCurrentQueue();
 
     loadRecentSessions(projectId, sessions || []);
 
@@ -12862,7 +12921,32 @@ function connectWs(projectId: any) {
 
   const dot = document.getElementById(`ws-${projectId}`);
 
-  ws.onopen = () => { dot && dot.classList.add('connected'); };
+  ws.onopen = () => {
+
+    dot && dot.classList.add('connected');
+
+    // A socket that OPENS AGAIN has missed every event published while it was down
+    // (server restart, laptop sleep, network blip), and nothing replays them -- so every
+    // list view stays stale until the next event happens to touch it, or a reload. The
+    // live-view rule has two halves for that reason: events while connected, and a full
+    // resync on reconnect. The first open needs none: the tab loads fresh data itself.
+    const panel = state.panels[projectId];
+
+    if (panel) {
+
+      const reopened = !!panel.wsOpenedBefore;
+
+      panel.wsOpenedBefore = true;
+
+      if (reopened) {
+
+        try { resyncProjectViews(projectId); } catch (_) { /* a failed resync must not break the socket */ }
+
+      }
+
+    }
+
+  };
 
   ws.onclose = () => {
 
@@ -12898,15 +12982,52 @@ function connectWs(projectId: any) {
 
 
 
+function resyncProjectViews(projectId: any) {
+
+  /** Bring every view of one project back in step with the server without an event to
+   * say what changed: after a WebSocket reconnect (events published while the socket was
+   * down are gone for good) and after a merge (rows moved between projects wholesale).
+   * Visible views fetch now; hidden ones reload when they are opened, as they always do.
+   * Everything here is the same refresh the matching event handler would have run. */
+
+  const panel = state.panels[projectId];
+
+  if (!panel) return;
+
+  _debounceRepaint('projects', () => { loadProjects(); });
+
+  repaintVisibleSprintViews(projectId);   // Queue and the Goal tab's sprint board, when visible
+
+  // Independent refreshes: one failing (the server may still be warming up after a
+  // restart) must not stop the others, and none may surface as an unhandled rejection.
+  const jobs: any[] = [
+    refreshTab(projectId),                // goal + Active Sessions + the Devlog task list
+    loadPinnedDecisions(projectId),
+    refreshProjectCountBadges(projectId),
+    refreshHitl(),
+  ];
+
+  if (panel.activeVtab === 'live') jobs.push(refreshLiveTab(projectId));
+  if (panel.activeVtab === 'notes') jobs.push(loadNotesTab(projectId));
+  if (panel.activeVtab === 'insights') jobs.push(loadInsightsTab(projectId));
+
+  Promise.allSettled(jobs);
+
+}
+
 // THE LIVE-VIEW RULE (8a665a03): every mutation publishes exactly one event, and every
-// list view subscribes to it. Server side that is a _publish_project_event /
-// _publish_task / publish_global call on the mutation's path (db layer or route);
-// client side it is a branch below that repaints the view(s) showing that data.
-// Break either half and the view needs a reload to catch up -- the permanently-deleted
-// Backburner row that stayed on screen was a mutation with no event and no branch.
+// list view subscribes to it -- and a view that was disconnected resyncs when it
+// reconnects (ws.onopen -> resyncProjectViews), because a missed event is never replayed.
+// Server side the publish is a _publish_project_event / _publish_task / publish_global
+// call on the mutation's path (db layer or route); client side it is a branch below that
+// repaints the view(s) showing that data. Break either half and the view needs a reload
+// to catch up -- the permanently-deleted Backburner row that stayed on screen was a
+// mutation with no event and no branch. A repaint must also keep the view state the user
+// built up (Backburner filter text, scroll, focus): panel state, not the DOM, holds it.
 // tests/test_ws_event_coverage.py fails when a server-published event type has no branch
-// here (or an allowlist entry with a reason) and when a dashboard-driven mutating route
-// publishes nothing (or has no allowlist entry with a reason).
+// here (or an allowlist entry with a reason), when a dashboard-driven mutating route
+// publishes nothing, and when a function that writes sprint_items or projects publishes
+// nothing (or has no allowlist entry with a reason).
 function handleWsEvent(projectId: any, event: any) {
   if (event.type === 'update_available') {
 
@@ -12965,6 +13086,32 @@ function handleWsEvent(projectId: any, event: any) {
     const tab = state.tabs.find(t => t.id === event.project_id);
     if (tab) tab.project = { ...tab.project, parent_project_id: event.parent_project_id || null };
     loadProjects();
+    return;
+  }
+
+  // The project LIST changed (a project was created, deleted, merged, renamed, reparented
+  // or re-prioritised, from another tab, an agent or the API). The event names no project:
+  // refetching GET /projects applies this caller's own workspace scoping. Coalesced -- a
+  // batch delete or a merge announces several times.
+  if (event.type === 'projects_changed') {
+    _debounceRepaint('projects', () => { loadProjects(); });
+    return;
+  }
+
+  // THIS project no longer exists: close its tab instead of leaving a panel whose every
+  // request now 404s, and refresh the sidebar.
+  if (event.type === 'project_deleted') {
+    if (state.tabs.some((t: any) => t.id === projectId)) {
+      if (!(state.deletingProjects && state.deletingProjects[projectId])) toast('This project was deleted');
+      closeTab(projectId);
+    }
+    _debounceRepaint('projects', () => { loadProjects(); });
+    return;
+  }
+
+  // Rows were re-parented between projects wholesale: resync every view of this one.
+  if (event.type === 'project_merged') {
+    resyncProjectViews(projectId);
     return;
   }
   // v2.6 — sprint item / goal / session events broadcast live from server
