@@ -30,10 +30,49 @@ This module closes that class with ONE entry point,
   argument must be in scope, every ``*_project_name`` argument must resolve to
   an in-scope project, and every session-pointer argument (``session_id``,
   ``to_session_id`` ...) must name a session of an in-scope project.
+* :data:`DOC_OBJECT_ARGS` -- document-store objects (a figure or table id) that
+  the handler looks up WITHOUT binding to the document; checked against the
+  caller's own stored document (pass 2, F-M3).
+* :data:`REDACT_HOLDER_TOOLS` -- results that name the holder of a file lock,
+  symbol / docx-region claim or resource lease. ``file_locks`` and friends are
+  keyed by file path only, so a foreign project's session can be the holder;
+  :func:`filter_scoped_result` blanks every holder identity that belongs to an
+  out-of-scope session while still reporting the conflict (pass 2, F-M2).
 
 Every refusal raises ``ValueError("project is outside your access scope")``,
 the same opaque message the pre-dispatch gate uses, so a caller cannot tell
-which layer (or which argument) refused it.
+which layer (or which argument) refused it. ``prompts/get`` is a project-reading
+method too (the ``executor-goal`` prompt renders a project's pending sprint
+items), so :func:`enforce_scoped_prompt` applies the generic project rules to its
+arguments (pass 2, F-M1).
+
+Open product questions (recorded, deliberately NOT changed here)
+----------------------------------------------------------------
+The rule of decision 6fe5210c is "a project-scoped member is refused on any
+PROJECT outside their scope". The tools below act on TENANT-level state, which
+belongs to no project, so this module leaves them alone. Whether a project-scoped
+member should reach them at all is a product decision for the owner:
+
+* tenant-level profile scopes: ``workspace`` / ``user`` / ``hosted_default``
+  profile layers and capability profiles (``save_profile_layer``,
+  ``reset_profile_layer``, ``clone_profile_layer``, ``set_capability_profile``,
+  ``clear_capability_profile``, ``activate_profile_layer``) and the read-only
+  ``get_effective_profile`` / ``get_effective_capability_profile`` scope ids;
+* ``update_workspace_settings`` and ``get_workspace_settings``;
+* ``pin_workspace_decision`` / ``get_workspace_decisions``, workspace notes
+  (``add_workspace_note``, ``get_workspace_notes``, ``move_workspace_note_to_project``
+  for a workspace note) and workspace sprint items (``add_workspace_sprint_item``
+  and friends);
+* ``create_project`` without a parent still creates a project that is not on the
+  caller's scope list;
+* ``get_server_logs`` / ``search_server_logs`` / ``get_connection_log`` /
+  ``get_server_log_checkpoint`` read server-wide logs;
+* the tunnel-forward branch of ``_handle_mcp_request`` (it runs before this
+  guard and hands the call to a tunnel plugin tool) and the ``batch_read``
+  ``tunnel_research`` adapter, which reads from the tenant's own workstation;
+* ``find_orphaned_docx_staged_files``, ``check_embedded_staleness`` and
+  ``audit_figure_table_provenance`` read server-side file paths named by the
+  caller (host level, not project data).
 
 Invariants worth keeping when you edit this file:
 
@@ -48,13 +87,23 @@ Invariants worth keeping when you edit this file:
 * A proposal with no project (workspace-global) belongs to no project, so it
   is out of scope for a scoped caller.
 
+* A result is only ever NARROWED (a holder blanked, a row dropped), never rewritten
+  into something else, and the conflict a caller is entitled to learn about
+  ("this path is locked, until T") survives the redaction.
+
 ``tests/test_scope_guard_mcp.py`` enumerates these tables: every tool and
-argument named here must exist in the real tool schemas, and every tool with an
-unbound id argument must be listed here or explicitly exempted with a reason,
-so the tables cannot silently rot.
+argument named here must exist in the real tool schemas, and every listed tool is
+refused out of scope and still works in scope.
+``tests/test_scope_guard_mcp_pass2.py`` proves the other direction: EVERY
+id-bearing argument of EVERY tool (with or without a project_id of its own) is
+guarded here, covered by a generic rule, or exempted with a reason and, for the
+ones a handler already binds to the project, a proof; and every tool the
+dispatcher routes but tools/list does not advertise has been reviewed. So the
+tables cannot silently rot.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, NoReturn
 
@@ -125,6 +174,22 @@ async def _proposal_project(db: Any, object_id: str) -> Any:
     return _owner(db_module._row_to_dict(row) if row is not None else None)
 
 
+async def _task_project(db: Any, object_id: str) -> Any:
+    # task_log rows carry their project; a linked task is read back as completion
+    # evidence and joined into session summaries, so a foreign one is refused.
+    return _owner(await db_module.get_task(db, object_id))
+
+
+async def _handoff_project(db: Any, object_id: str) -> Any:
+    # record_handoff_correction(regenerate=true) INVALIDATES the source handoff,
+    # so the handoff must belong to an in-scope project.
+    async with db.execute(
+        "SELECT project_id FROM handoffs WHERE id = ?", (object_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _owner(db_module._row_to_dict(row) if row is not None else None)
+
+
 _RESOLVERS: "dict[str, Callable[[Any, str], Awaitable[Any]]]" = {
     "note": _note_project,
     "decision": _decision_project,
@@ -134,6 +199,8 @@ _RESOLVERS: "dict[str, Callable[[Any, str], Awaitable[Any]]]" = {
     "sprint_item": _sprint_item_project,
     "session": _session_project,
     "proposal": _proposal_project,
+    "task": _task_project,
+    "handoff": _handoff_project,
 }
 
 
@@ -218,6 +285,31 @@ OBJECT_ARGS: "dict[str, tuple[ObjectArg, ...]]" = {
     "commit_proposal_promotion": (ObjectArg("proposal_id", "proposal"),),
     # --- worktrees by id -----------------------------------------------------
     "set_active_repo": (ObjectArg("worktree_id", "worktree"),),
+    # --- second object id next to the tool's OWN project_id (pass 2, F-M3) ---
+    # Each tool in this block was probed with a foreign id under an in-scope
+    # project_id. The ones the handler already binds to the project are NOT here:
+    # they are exempted, with a proof, in tests/test_scope_guard_mcp_pass2.py.
+    #
+    # start_wave_run wrote a wave-run child row pointing at a foreign item.
+    "start_wave_run": (ObjectArg("item_ids", "sprint_item", many=True),),
+    # Stored on the caller's own row and never dereferenced today; refused so it
+    # cannot become a cross-project link (an own item is the only valid value).
+    "start_remote_task": (ObjectArg("sprint_item_id", "sprint_item"),),
+    # regenerate=true INVALIDATES the SOURCE handoff and rewrote a foreign one.
+    "record_handoff_correction": (ObjectArg("source_handoff_id", "handoff"),),
+    # get_task() is not project-bound: a foreign task id counted as completion
+    # evidence and linked an own item into the foreign session's summary.
+    "complete_sprint_item": (ObjectArg("task_id", "task"),),
+    # Stored only (get_findings never joins it); same rule as above.
+    "store_finding": (ObjectArg("task_id", "task"),),
+    # Stored, never validated: refuse a foreign worktree, leave an unknown id to
+    # the handler (it accepts any label).
+    "start_experiment_run": (ObjectArg("worktree_id", "worktree", missing_ok=True),),
+    # --- dispatchable but NOT in tools/list (so the schema scan cannot see them)
+    # proposal_to_handoff loaded the proposal by tenant only and wrote update
+    # rows and pointers against it; claim_parallel_batch's item_sessions values
+    # are handled in _Checker.check_special.
+    "proposal_to_handoff": (ObjectArg("proposal_id", "proposal"),),
 }
 
 #: Tools that list across EVERY project when ``project_id`` is omitted. A
@@ -257,6 +349,51 @@ PROFILE_SCOPE_ARGS: "dict[str, tuple[tuple[str, str], ...]]" = {
 #: argument; :func:`filter_scoped_result` drops the rows outside the scope.
 FILTER_RESULT_TOOLS: "frozenset[str]" = frozenset({"list_profile_layers"})
 
+#: Tools the dispatcher routes by name that are NOT advertised in tools/list.
+#: ``tools/call`` does not check the advertised list, so they are reachable, but
+#: the schema scan in the tests cannot see their arguments; they are named here
+#: so a table entry for one is not mistaken for a stale name.
+UNLISTED_TOOLS: "frozenset[str]" = frozenset({
+    "proposal_to_handoff",
+    "claim_parallel_batch",
+})
+
+#: tool -> ``(document argument, object-id argument, DocStructureStore method that
+#: lists the document's objects)``. The handler resolves ``doc`` against the
+#: caller's own ``project_id`` and then calls a store primitive keyed by the bare
+#: figure/table id (``set_figure_caption_link`` / ``set_table_caption_link``),
+#: which is bound to neither the document nor the project -- so an own document
+#: plus a foreign figure id rewrote and returned the foreign row. The object must
+#: be one of the named document's own.
+DOC_OBJECT_ARGS: "dict[str, tuple[str, str, str]]" = {
+    "link_figure_caption": ("doc", "figure_id", "get_figures"),
+    "link_table_caption": ("doc", "table_id", "get_tables"),
+}
+
+#: Tools whose RESULT can name the holder of a file lock, a symbol / docx-region
+#: claim or a resource lease. Those tables are keyed by path (not project), so
+#: the holder may be a session of a project outside the caller's scope;
+#: :func:`filter_scoped_result` blanks that identity and keeps the conflict.
+REDACT_HOLDER_TOOLS: "frozenset[str]" = frozenset({
+    "claim_file",
+    "get_file_claims",
+    "claim_docx_region",
+    "get_docx_region_claims",
+    "acquire_docx_document_lease",
+    "get_docx_document_lease",
+    # They run the same claim primitives (or read the same lock tables) and
+    # returned the holder in a resource-conflict row / message (probed).
+    # transfer_sprint_item_claim is deliberately NOT here: it re-locks the item's
+    # resources that the caller's own session already holds, and a path-keyed lock
+    # cannot have a second (foreign) holder at the same time.
+    "claim_sprint_item",
+    "claim_parallel_batch",
+    "get_parallelizable_groups",
+    # The docx write gate (check_docx_region_write_conflict) answers with the
+    # blocking session as ``holder`` (an id) and spells it out in ``message``.
+    "update_paragraph",
+})
+
 #: Batch tools -> the argument holding their per-entry list. The engines honour
 #: an entry's own ``session_id`` / ``scope_type`` + ``scope_id`` (``batch_read``
 #: requests nest them under ``args``) without re-checking scope.
@@ -283,11 +420,16 @@ def guarded_tool_names() -> "frozenset[str]":
     return frozenset(
         set(OBJECT_ARGS) | set(REQUIRE_PROJECT) | set(DENY)
         | set(PROFILE_SCOPE_ARGS) | set(FILTER_RESULT_TOOLS) | set(BATCH_ENVELOPES)
+        | set(DOC_OBJECT_ARGS) | set(REDACT_HOLDER_TOOLS) | set(UNLISTED_TOOLS)
     )
 
 
 def schema_argument_refs() -> "list[tuple[str, str]]":
-    """``(tool, argument)`` pairs the tables expect to exist in the tool schemas."""
+    """``(tool, argument)`` pairs the tables expect to exist in the tool schemas.
+
+    Tools in :data:`UNLISTED_TOOLS` have no advertised schema, so their pairs are
+    left out (the tests pin that they really are unlisted instead).
+    """
     refs: "list[tuple[str, str]]" = []
     for tool, args in OBJECT_ARGS.items():
         refs.extend((tool, a.arg) for a in args)
@@ -296,10 +438,39 @@ def schema_argument_refs() -> "list[tuple[str, str]]":
             refs.extend(((tool, type_arg), (tool, id_arg)))
     for tool, arg in BATCH_ENVELOPES.items():
         refs.append((tool, arg))
+    for tool, (doc_arg, id_arg, _method) in DOC_OBJECT_ARGS.items():
+        refs.extend(((tool, doc_arg), (tool, id_arg), (tool, "project_id")))
     refs.extend((tool, "project_id") for tool in REQUIRE_PROJECT)
     refs.append(("promote_proposal", "allow_project_transfer"))
     refs.append(("send_message", "project_id"))
-    return refs
+    return [(t, a) for t, a in refs if t not in UNLISTED_TOOLS]
+
+
+def covered_argument_pairs() -> "frozenset[tuple[str, str]]":
+    """``(tool, argument)`` pairs the guard actually checks beyond the generic
+    project / session rules: every object-table argument, profile scope pair,
+    batch envelope and document-object argument. The tests compare this against
+    the id-bearing arguments in the real schemas."""
+    pairs: "set[tuple[str, str]]" = set()
+    for tool, args in OBJECT_ARGS.items():
+        pairs.update((tool, a.arg) for a in args)
+    for tool, scope_pairs in PROFILE_SCOPE_ARGS.items():
+        for type_arg, id_arg in scope_pairs:
+            pairs.update(((tool, type_arg), (tool, id_arg)))
+    for tool, arg in BATCH_ENVELOPES.items():
+        pairs.add((tool, arg))
+    for tool, (_doc_arg, id_arg, _method) in DOC_OBJECT_ARGS.items():
+        pairs.add((tool, id_arg))
+    pairs.add(("claim_parallel_batch", "item_sessions"))
+    pairs.add(("promote_proposal", "allow_project_transfer"))
+    return frozenset(pairs)
+
+
+def generic_rule_keys() -> "frozenset[str]":
+    """Argument names covered on EVERY tool by the generic rules (the project
+    rule is ``project_id`` / ``*_project_id`` / ``*_project_name``, not listed
+    here because it is a pattern)."""
+    return frozenset(_SESSION_ARG_KEYS) | frozenset(_SESSION_LIST_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +638,198 @@ class _Checker:
             # under; a scoped caller never gets to do that.
             if args.get("allow_project_transfer"):
                 self.deny()
+        elif name == "claim_parallel_batch":
+            # item_sessions maps {item_id: worker session}: the VALUES are
+            # session pointers. A foreign worker session would end up holding
+            # the claim (and the file locks) of an item of the caller's project.
+            mapping = args.get("item_sessions")
+            if isinstance(mapping, dict):
+                await self.check_object(
+                    _sess("item_sessions", many=True, missing_ok=True),
+                    list(mapping.values()),
+                )
+            elif mapping:
+                self.deny()
+
+    # -- document-store objects -------------------------------------------------
+
+    async def check_doc_object(
+        self,
+        name: str,
+        args: "dict[str, Any]",
+        doc_store_factory: "Callable[[], Awaitable[Any]] | None",
+    ) -> None:
+        """The figure / table id must be one of the named document's own.
+
+        ``doc`` is resolved against ``project_id`` (already in scope by the
+        generic rule) exactly as the handler does; an unknown document or a blank
+        id is left to the handler (it stops there without touching an object).
+        Fails closed when the document store cannot be opened.
+        """
+        spec = DOC_OBJECT_ARGS.get(name)
+        if spec is None:
+            return
+        doc_arg, id_arg, lister = spec
+        object_id = self._text(args.get(id_arg))
+        project_id = self._text(args.get("project_id"))
+        doc_source = args.get(doc_arg)
+        if not object_id or not project_id or not isinstance(doc_source, str) or not doc_source.strip():
+            return
+        store = await doc_store_factory() if doc_store_factory is not None else None
+        if store is None:
+            self.deny()
+        doc_row = await store.get_document(project_id, doc_source)
+        if doc_row is None:
+            return
+        owned = await getattr(store, lister)(doc_row["id"])
+        if object_id not in {str(o.get("id")) for o in owned or [] if isinstance(o, dict)}:
+            self.deny()
+
+    # -- holder redaction (F-M2) ----------------------------------------------
+
+    async def session_visible(self, session_id: str, own: "frozenset[str]") -> bool:
+        """True when a session named in a RESULT may be shown to this caller: it
+        is one the caller itself named (and passed the scope check), or it belongs
+        to an in-scope project. An unknown session is not visible (fail closed)."""
+        if session_id in own:
+            return True
+        owner = await self.owner_of("session", session_id)
+        return owner is not _MISSING and owner in self.scope
+
+    async def _note_foreign_session(self, session_id: str, state: "_Redaction") -> None:
+        """Remember a foreign session's id, short id and NAME so free text that
+        spells them out ("claimed by session <name>", or the first 8 characters of
+        the id when the session has no name) can be scrubbed too."""
+        state.ids.add(session_id)
+        state.names.add(session_id[:8])
+        key = ("session_name", session_id)
+        if key not in self._memo:
+            async with self.db.execute(
+                "SELECT name FROM sessions WHERE id = ?", (session_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            self._memo[key] = (db_module._row_to_dict(row) or {}).get("name") if row is not None else None
+        if self._memo[key]:
+            state.names.add(str(self._memo[key]))
+
+    async def redact_foreign_holders(self, result: Any, own: "frozenset[str]") -> Any:
+        """Blank every lock / claim holder that belongs to an out-of-scope session.
+
+        The conflict itself is kept (``claimed: false``, the reason, the file, the
+        timestamps) so the caller still learns the path is held; only WHO holds it
+        and WHAT they are editing is removed. See :data:`REDACT_HOLDER_TOOLS`.
+        """
+        if not isinstance(result, (dict, list)):
+            return result
+        state = _Redaction()
+        redacted = await self._redact_node(result, own, state)
+        if not state.hit:
+            return result
+        if isinstance(redacted, dict):
+            redacted["holder_redacted"] = True
+        return _scrub_text(redacted, state)
+
+    async def _redact_node(self, node: Any, own: "frozenset[str]", state: "_Redaction") -> Any:
+        if isinstance(node, list):
+            return [await self._redact_node(item, own, state) for item in node]
+        if not isinstance(node, dict):
+            return node
+        out = dict(node)
+        foreign = [
+            out[key].strip()
+            for key in _HOLDER_ID_KEYS
+            if isinstance(out.get(key), str) and out[key].strip()
+            and not await self.session_visible(out[key].strip(), own)
+        ]
+        if foreign:
+            state.hit = True
+            for foreign_id in foreign:
+                await self._note_foreign_session(foreign_id, state)
+            for key in _HOLDER_ID_KEYS:
+                if isinstance(out.get(key), str) and out[key].strip() in foreign:
+                    out[key] = None
+            for key in _HOLDER_NAME_KEYS:
+                if key in out:
+                    if isinstance(out[key], str) and out[key]:
+                        state.names.add(out[key])
+                    out[key] = None
+            if any(key in out for key in _CLAIM_DETAIL_MARKERS):
+                # A symbol / docx-element claim row: what the foreign session is
+                # editing is as private as who it is.
+                for key in _CLAIM_DETAIL_KEYS:
+                    if key in out:
+                        out[key] = None
+            out["holder_redacted"] = True
+        for key in list(out):
+            value = out[key]
+            if key in _UNATTRIBUTABLE_KEYS:
+                # Element ids merged across EVERY other live claimant; there is no
+                # way to tell which belong to an in-scope session.
+                del out[key]
+                state.hit = True
+            elif key in _SESSION_ID_LIST_KEYS and isinstance(value, list) and all(
+                isinstance(v, str) for v in value
+            ):
+                kept = [v for v in value if await self.session_visible(v.strip(), own)]
+                if len(kept) != len(value):
+                    state.hit = True
+                    for removed in (v.strip() for v in value if v not in kept):
+                        await self._note_foreign_session(removed, state)
+                out[key] = kept
+            elif isinstance(value, (dict, list)):
+                out[key] = await self._redact_node(value, own, state)
+        return out
+
+
+#: Result keys that carry the session that holds a lock / claim / lease.
+_HOLDER_ID_KEYS: "tuple[str, ...]" = ("session_id", "holder_session_id", "holder")
+_HOLDER_NAME_KEYS: "tuple[str, ...]" = ("session_name", "holder_session_name")
+#: A row that has one of these is a symbol / docx-element claim; its detail keys
+#: are blanked next to the holder's identity.
+_CLAIM_DETAIL_MARKERS: "tuple[str, ...]" = ("symbol_name", "element_id")
+_CLAIM_DETAIL_KEYS: "tuple[str, ...]" = (
+    "id", "symbol_name", "symbol_type", "symbol", "line_start", "line_end",
+    "element_id", "item_id",
+)
+#: Lists of BARE session ids (claim_file's read_claims / readers).
+_SESSION_ID_LIST_KEYS: "tuple[str, ...]" = ("read_claims", "readers")
+#: Lists of element ids merged across every other holder of a document.
+_UNATTRIBUTABLE_KEYS: "tuple[str, ...]" = ("other_claimed_elements", "conflicting_elements")
+#: Free-text keys whose strings may embed a holder's session NAME ("claimed by
+#: session X"). Names are arbitrary words, so they are only scrubbed from these.
+_TEXT_KEYS: "tuple[str, ...]" = ("message", "error", "reason", "hint", "detail", "warning")
+
+
+class _Redaction:
+    """What one result redaction saw: whether anything was blanked and which
+    foreign session ids / names to scrub out of free text."""
+
+    def __init__(self) -> None:
+        self.hit = False
+        self.ids: "set[str]" = set()
+        self.names: "set[str]" = set()
+
+
+def _scrub_text(node: Any, state: "_Redaction", key: "str | None" = None) -> Any:
+    """Replace foreign session ids (anywhere) and names (in free-text keys) inside
+    the strings of an already structurally redacted result."""
+    if isinstance(node, dict):
+        return {k: _scrub_text(v, state, k) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_scrub_text(v, state, key) for v in node]
+    if not isinstance(node, str):
+        return node
+    text = node
+    for foreign_id in state.ids:
+        if foreign_id:
+            text = text.replace(foreign_id, "<redacted>")
+    if key in _TEXT_KEYS:
+        for foreign_name in state.names:
+            if foreign_name:
+                text = re.sub(
+                    r"(?<![\w-])" + re.escape(foreign_name) + r"(?![\w-])", "<redacted>", text,
+                )
+    return text
 
 
 async def enforce_scoped_call(
@@ -474,6 +837,8 @@ async def enforce_scoped_call(
     args: "dict[str, Any]",
     db: Any,
     scoped_project_ids: "list[str] | None",
+    *,
+    doc_store_factory: "Callable[[], Awaitable[Any]] | None" = None,
 ) -> None:
     """Refuse a tool call that reaches outside a project-scoped caller's scope.
 
@@ -483,6 +848,8 @@ async def enforce_scoped_call(
 
     Runs AFTER ``_resolve_project_reference`` has folded ``project_name`` into
     ``project_id``, so ``args["project_id"]`` is the final target project.
+    ``doc_store_factory`` opens the document-structure store for the tools in
+    :data:`DOC_OBJECT_ARGS`; without one those tools fail closed.
     """
     if scoped_project_ids is None:
         return
@@ -496,6 +863,7 @@ async def enforce_scoped_call(
     for ref in OBJECT_ARGS.get(name, ()):
         await chk.check_object(ref, args.get(ref.arg))
     await chk.check_special(name, args)
+    await chk.check_doc_object(name, args, doc_store_factory)
     for type_arg, id_arg in PROFILE_SCOPE_ARGS.get(name, ()):
         await chk.check_profile_scope(args.get(type_arg), args.get(id_arg))
     envelope = BATCH_ENVELOPES.get(name)
@@ -503,25 +871,69 @@ async def enforce_scoped_call(
         await chk.check_batch(args.get(envelope))
 
 
+async def enforce_scoped_prompt(
+    name: str,
+    args: Any,
+    db: Any,
+    scoped_project_ids: "list[str] | None",
+) -> None:
+    """Refuse a ``prompts/get`` whose arguments name a project outside the scope.
+
+    The ``executor-goal`` prompt renders the named project's live pending sprint
+    items (and the other prompts echo the project they are given), so the same
+    generic rules as a tool call apply: every ``project_id`` / ``*_project_id``
+    argument must be in scope and every ``project_name`` /
+    ``*_project_name`` must resolve to an in-scope project (an unresolvable name
+    is left to the prompt builder, which degrades to its fill-in template, exactly
+    as ``tools/call`` leaves it to the handler). Malformed ``arguments`` (not an
+    object) are refused for a scoped caller. ``None`` (owner, self-hosted, demo,
+    stdio) returns immediately with no DB access.
+    """
+    if scoped_project_ids is None:
+        return
+    chk = _Checker(db, scoped_project_ids)
+    if not isinstance(args, dict):
+        chk.deny()
+    await chk.check_project_args(args)
+    pname = chk._text(args.get("project_name"))
+    if pname:
+        project = await db_module.get_project_by_name(db, pname)
+        if project and str(project["id"]) not in chk.scope:
+            chk.deny()
+
+
 async def filter_scoped_result(
     name: str,
     result: Any,
     db: Any,
     scoped_project_ids: "list[str] | None",
+    args: "dict[str, Any] | None" = None,
 ) -> Any:
-    """Drop the rows of a cross-project listing that lie outside the scope.
+    """Narrow a result for a scoped caller; a no-op (and no DB access) otherwise.
 
-    Only :data:`FILTER_RESULT_TOOLS` are touched, and only for a scoped caller;
-    anything else is returned unchanged with no DB access.
+    * :data:`FILTER_RESULT_TOOLS` -- cross-project listings lose the rows outside
+      the scope (``list_profile_layers``).
+    * :data:`REDACT_HOLDER_TOOLS` -- lock / claim / lease holders that belong to an
+      out-of-scope session are blanked, the conflict itself kept (F-M2).
+      ``args`` supplies the session ids the caller named (already scope-checked),
+      which stay visible so a caller never loses its own identity from a result.
     """
-    if (
-        scoped_project_ids is None
-        or name not in FILTER_RESULT_TOOLS
-        or not isinstance(result, list)
-    ):
+    if scoped_project_ids is None:
         return result
-    chk = _Checker(db, scoped_project_ids)
-    return [row for row in result if await chk.profile_row_visible(row)]
+    if name in FILTER_RESULT_TOOLS:
+        if not isinstance(result, list):
+            return result
+        chk = _Checker(db, scoped_project_ids)
+        return [row for row in result if await chk.profile_row_visible(row)]
+    if name in REDACT_HOLDER_TOOLS:
+        chk = _Checker(db, scoped_project_ids)
+        own: "set[str]" = set()
+        for key in _SESSION_ARG_KEYS:
+            value = (args or {}).get(key)
+            if isinstance(value, str) and value.strip():
+                own.add(value.strip())
+        return await chk.redact_foreign_holders(result, frozenset(own))
+    return result
 
 
 async def session_in_scope(

@@ -1344,6 +1344,17 @@ async def _handle_mcp_request(
     if method == "prompts/get":
         prompt_name = params.get("name", "")
         prompt_args = params.get("arguments") or {}
+        # Decision 6fe5210c (wave 2, F-M1) -- the executor-goal prompt renders a
+        # project's live pending sprint items, so prompts/get is a project-reading
+        # method exactly like tools/call and needs the same scope gate. Same
+        # opaque error as the tools/call pre-gate (-32603, no distinguishing
+        # data). A no-op, with no DB access, for an unscoped caller.
+        try:
+            await scope_guard.enforce_scoped_prompt(
+                prompt_name, prompt_args, db, scoped_project_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 -- fail closed: never render the prompt
+            return _server._jsonrpc_err(req_id, -32603, str(exc))
         try:
             messages = await _build_prompt_messages_async(prompt_name, prompt_args, db)
         except ValueError as exc:
@@ -7395,7 +7406,13 @@ async def _dispatch_mcp_tool(
     # argument (notes, decisions, HITL requests, sessions, wave runs,
     # proposals ...), listings that span every project when project_id is
     # omitted, and profile-layer scope ids.
-    await scope_guard.enforce_scoped_call(name, args, db, scoped_project_ids)
+    await scope_guard.enforce_scoped_call(
+        name, args, db, scoped_project_ids,
+        # link_figure_caption / link_table_caption bind a figure or table id to
+        # the caller's own stored document (the doc store is a separate backend,
+        # opened lazily and only for those two tools).
+        doc_store_factory=lambda: _resolve_ingest_doc_store(db, data_dir, tenant),
+    )
     _groups = (
         _handle_project_tools,
         _handle_task_tools,
@@ -7487,7 +7504,7 @@ async def _dispatch_mcp_tool(
             # caller's scope. No-op (and no DB access) for every other tool and
             # for an unscoped caller.
             _result = await scope_guard.filter_scoped_result(
-                name, _result, db, scoped_project_ids,
+                name, _result, db, scoped_project_ids, args=args,
             )
             # 8c147109 — activity heartbeat: record a compact one-liner into the
             # session_activity ring-buffer so a remote planner session can observe

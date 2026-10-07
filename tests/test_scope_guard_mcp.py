@@ -22,7 +22,6 @@ Owners, workspace-wide members and self-hosted callers pass
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -55,17 +54,35 @@ class _World:
 async def _objects(db: Any, pid: str, label: str) -> "dict[str, str]":
     session = await db_module.register_session(db, pid, f"sess-{label}")
     session_b = await db_module.register_session(db, pid, f"sess-b-{label}")
+    # The board is complete BEFORE the wave run pins its snapshot, so resume_wave
+    # finds the live board unchanged (its real success path, F-M4).
+    sprint_item = (await db_module.add_sprint_item(db, pid, "v1", f"build {label} parser"))["id"]
+    # (a near-duplicate title would be deduplicated into the first item)
+    sprint_item_b = (await db_module.add_sprint_item(db, pid, "v1", f"deploy {label} gateway"))["id"]
+    wave = await db_module.create_wave_run(
+        db, pid, snapshot=await db_module.build_board_snapshot(db, pid),
+    )
+    await db_module.advance_wave_run_status(db, wave["id"], "running")
+    # get_session_log reads an executor run; get_graph_diff compares two snapshots.
+    for sess in (session, session_b):
+        await db_module.create_executor_run(db, sess["id"], pid)
+        await db_module.snapshot_graph_metrics(db, sess["id"], pid)
+    from meridian.db import experiments as experiments_db  # noqa: PLC0415
     return {
         "note": (await db_module.add_project_note(db, pid, f"note-{label}", "body"))["id"],
         "decision": (await db_module.pin_decision(db, pid, f"dec-{label}", "body"))["id"],
         "hitl": (await db_module.request_hitl(db, pid, f"question {label}?"))["id"],
         "session": session["id"],
         "session_b": session_b["id"],
-        "wave_run": (await db_module.create_wave_run(db, pid))["id"],
+        "wave_run": wave["id"],
         "proposal": (await db_module.add_workspace_proposal(db, f"prop-{label}", "body", project_id=pid))["id"],
         "proposal_b": (await db_module.add_workspace_proposal(db, f"prop-b-{label}", "body", project_id=pid))["id"],
         "worktree": (await db_module.register_worktree(db, session["id"], pid, f"branch-{label}", f"wt-{label}"))["id"],
-        "sprint_item": (await db_module.add_sprint_item(db, pid, "v1", f"item-{label}"))["id"],
+        "sprint_item": sprint_item,
+        "sprint_item_b": sprint_item_b,
+        "task": (await db_module.log_task(db, session["id"], pid, f"task-{label}"))["id"],
+        "handoff": (await db_module.record_handoff(db, pid, "full", f"body-{label}", session["id"]))["id"],
+        "experiment": (await experiments_db.create_experiment(db, pid, session["id"], name=f"exp-{label}"))["id"],
     }
 
 
@@ -126,7 +143,7 @@ _EXTRA: "dict[str, Callable[[_World], dict[str, Any]]]" = {
     "send_message": lambda w: {"project_id": w.mine, "payload": "hello"},
     "idle_until_session_done": lambda w: {"timeout_seconds": 0},
     "idle_until_all_done": lambda w: {},
-    "finalize_wave_run": lambda w: {},
+    "finalize_wave_run": lambda w: {"evidence": {"status": "ok", "exit_code": 0, "failed": 0}},
     "resume_wave": lambda w: {},
     "advance_proposal_status": lambda w: {"status": "investigating"},
     "create_proposal_successor": lambda w: {"title": "next", "body": "b", "relation_type": "refines"},
@@ -139,13 +156,68 @@ _EXTRA: "dict[str, Callable[[_World], dict[str, Any]]]" = {
         "project_id": w.mine, "depth": "proposal", "preview_hash": "stale",
     },
     "set_active_repo": lambda w: {},
+    # pass 2 (F-M3): a second object id next to the tool's own project_id
+    "start_wave_run": lambda w: {"project_id": w.mine},
+    "start_remote_task": lambda w: {
+        "project_id": w.mine, "session_id": w.own["session"], "host": "h", "command": "echo hi",
+    },
+    "record_handoff_correction": lambda w: {
+        "project_id": w.mine, "blocker_classification": "other",
+    },
+    "complete_sprint_item": lambda w: {
+        "project_id": w.mine, "session_id": w.own["session"], "item_id": w.own["sprint_item"],
+        "notes": "done",
+    },
+    "store_finding": lambda w: {"project_id": w.mine, "content": "finding"},
+    "start_experiment_run": lambda w: {
+        "project_id": w.mine, "session_id": w.own["session"], "experiment_id": w.own["experiment"],
+    },
+    "proposal_to_handoff": lambda w: {
+        "project_id": w.mine, "session_id": w.own["session"], "skip_handoff": True,
+        "items": [{"title": "decomposed item"}],
+    },
 }
 
 #: Tools whose handler legitimately raises for an in-scope object in this test
-#: setup (no tunnel tenant). The message proves the call got PAST the guard.
+#: setup (no tunnel tenant). The message proves the call got PAST the guard;
+#: the success path of set_active_repo is proven in test_scope_guard_mcp_pass2.py
+#: (it needs a tenant and a stubbed tunnel push).
 _IN_SCOPE_RAISES = {
     "set_active_repo": "requires an authenticated tenant",
 }
+
+#: F-M4 -- the in-scope control must prove the REAL success path, not merely
+#: that the guard let the call through (a handler error dict is "let through"
+#: too). tool -> assertion on the result for an in-scope object.
+_SUCCESS_CHECKS: "dict[str, Callable[[Any, _World], None]]" = {
+    "finalize_wave_run": lambda r, w: _assert(r.get("finalized") is True and r["status"] == "merged", r),
+    "resume_wave": lambda r, w: _assert(r.get("resumable") is True, r),
+    "get_graph_diff": lambda r, w: _assert(
+        "error" not in r and r["session_a"] == w.own["session"] and r["session_b"] == w.own["session_b"], r,
+    ),
+    "get_session_log": lambda r, w: _assert(
+        r.get("session_id") == w.own["session"] and "recent_activity" in r, r,
+    ),
+    "get_session_activity": lambda r, w: _assert(isinstance(r, (list, dict)) and "error" not in r, r),
+    "start_wave_run": lambda r, w: _assert(bool(r.get("wave_run_id")), r),
+    "complete_sprint_item": lambda r, w: _assert(r.get("status") == "done", r),
+    "start_experiment_run": lambda r, w: _assert(bool((r.get("run") or {}).get("id")), r),
+    "record_handoff_correction": lambda r, w: _assert(
+        r.get("correction", {}).get("source_handoff_id") == w.own["handoff"], r,
+    ),
+    "store_finding": lambda r, w: _assert(r.get("task_id") == w.own["task"], r),
+    "start_remote_task": lambda r, w: _assert(r["job"]["sprint_item_id"] == w.own["sprint_item"], r),
+    "proposal_to_handoff": lambda r, w: _assert(bool(r.get("created_item_ids")), r),
+}
+
+
+def _assert(condition: Any, result: Any) -> None:
+    assert condition, f"in-scope call did not succeed: {str(result)[:300]}"
+
+
+#: Tools whose in-scope control legitimately answers with an {"error": ...} dict
+#: in this world, and why (kept explicit so a regression cannot hide in it).
+_IN_SCOPE_ERROR_DICT_OK: "dict[str, str]" = {}
 
 
 def _args_for(tool: str, world: _World, foreign_index: "int | None" = None) -> "dict[str, Any]":
@@ -187,7 +259,15 @@ async def test_listed_tool_still_works_for_an_in_scope_object(db, tmp_path, tool
         with pytest.raises(ValueError, match=expected_error):
             await _call(db, tmp_path, tool, args, [w.mine])
     else:
-        await _call(db, tmp_path, tool, args, [w.mine])  # must not raise at all
+        result = await _call(db, tmp_path, tool, args, [w.mine])  # must not raise at all
+        # F-M4: "the guard let it through" is not "it works" -- a handler that
+        # answers with an error dict was let through too. Every control must
+        # either assert its real success shape or at least not be an error.
+        check = _SUCCESS_CHECKS.get(tool)
+        if check is not None:
+            check(result, w)
+        elif tool not in _IN_SCOPE_ERROR_DICT_OK:
+            _assert(not (isinstance(result, dict) and result.get("error")), result)
 
 
 @pytest.mark.parametrize("tool", sorted(scope_guard.OBJECT_ARGS))
@@ -688,14 +768,19 @@ async def test_batch_read_refuses_a_profile_request_for_another_project(db, tmp_
 async def test_a_foreign_session_pointer_is_refused_on_tools_outside_the_table(db, tmp_path):
     w = await _world(db)
     sid = w.foreign["session"]
+
+    async def _snapshots() -> int:
+        async with db.execute(
+            "SELECT COUNT(*) AS n FROM session_graph_snapshots WHERE session_id = ?", (sid,)
+        ) as cur:
+            return (await cur.fetchone())["n"]
+
+    before = await _snapshots()  # the world gives every session one (get_graph_diff needs two)
     # snapshot_graph_metrics falls back to the SESSION's project when project_id is omitted.
     await _refused(db, tmp_path, "snapshot_graph_metrics", {"session_id": sid}, [w.mine])
     await _refused(db, tmp_path, "get_findings", {"project_id": w.mine, "session_id": sid}, [w.mine])
     await _refused(db, tmp_path, "request_hitl", {"project_id": w.mine, "session_id": sid, "question": "q"}, [w.mine])
-    async with db.execute(
-        "SELECT COUNT(*) AS n FROM session_graph_snapshots WHERE session_id = ?", (sid,)
-    ) as cur:
-        assert (await cur.fetchone())["n"] == 0
+    assert await _snapshots() == before
 
 
 async def test_an_unknown_session_pointer_is_left_to_the_handler(db, tmp_path):
@@ -802,7 +887,9 @@ def _schema_args(tool: str) -> "set[str]":
 
 
 def _names_missing_from_the_tool_list(names: "set[str] | frozenset[str]") -> "list[str]":
-    return sorted(n for n in names if n not in _TOOLS)
+    # UNLISTED_TOOLS are dispatchable but intentionally not advertised; the pass-2
+    # test pins that they really are absent from tools/list.
+    return sorted(n for n in names if n not in _TOOLS and n not in scope_guard.UNLISTED_TOOLS)
 
 
 def test_every_tool_named_in_the_tables_exists():
@@ -826,44 +913,7 @@ def test_every_object_kind_has_a_resolver():
     assert kinds <= set(scope_guard._RESOLVERS)
 
 
-#: Tools with an id-bearing argument and no project_id/project_name in their
-#: schema that are deliberately NOT object-checked, and why. Anything else with
-#: such an argument must be listed in scope_guard or added here after review.
-_EXEMPT_UNBOUND_ID_TOOLS = {
-    "create_project": "parent_project_id is covered by the generic *_project_id rule (tested above)",
-    "merge_project": "source/target_project_id are covered by the generic *_project_id rule (tested above)",
-    "activate_profile_layer": "acts on the tenant-wide hosted_default layer only; no project-typed scope_id exists",
-    "get_profile_layer_revisions": "reads hosted_default history only; any other scope_id returns []",
-    "add_workspace_sprint_item": "workspace-level item; human_id is an identity label, not a project object",
-    "update_workspace_sprint_item": "workspace-level sprint item, not a project object",
-    "complete_workspace_sprint_item": "workspace-level sprint item, not a project object",
-    "save_blog_post": "workspace blog post id, not project data",
-    "zotero_search": "external Zotero library id, not a project object",
-}
-
-_ID_ARG = re.compile(r"(_id$|_ids$|^id$|^scope_|^session_[ab]$|worktree)")
-
-
-def _unbound_id_tools() -> "set[str]":
-    found = set()
-    for name, tool in _TOOLS.items():
-        props = _schema_args(name)
-        if props & {"project_id", "project_name"}:
-            continue
-        if any(_ID_ARG.search(p) for p in props):
-            found.add(name)
-    return found
-
-
-def test_every_tool_with_an_unbound_id_argument_is_guarded_or_exempted():
-    unhandled = _unbound_id_tools() - scope_guard.guarded_tool_names() - set(_EXEMPT_UNBOUND_ID_TOOLS)
-    assert not unhandled, (
-        f"{sorted(unhandled)} take an id argument but no project_id/project_name; list them in "
-        "meridian/mcp/scope_guard.py (so a scoped caller is checked) or exempt them here with a reason"
-    )
-
-
-def test_no_exemption_has_gone_stale():
-    assert set(_EXEMPT_UNBOUND_ID_TOOLS) <= set(_TOOLS)
-    assert not (set(_EXEMPT_UNBOUND_ID_TOOLS) & scope_guard.guarded_tool_names())
-    assert set(_EXEMPT_UNBOUND_ID_TOOLS) <= _unbound_id_tools()
+# The completeness check ("every id-bearing argument of every tool is guarded or
+# exempted with a reason") lives in test_scope_guard_mcp_pass2.py. It used to look
+# only at tools WITHOUT a project_id; it now covers every (tool, argument) pair,
+# including a second object id next to a tool's own project_id.
