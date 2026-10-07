@@ -1102,7 +1102,10 @@ async def regenerate_handoff_correction(
     output_dir: str,
     *,
     session_id: str | None = None,
-    mode: str = "full",
+    # 0b0b24d8 — None, not "full": a regenerated revision replaces an
+    # executor-facing handoff, so omission must resolve by intent (see
+    # generate_handoff's ``mode``), not pull in every workspace note.
+    mode: str | None = None,
     **generate_handoff_kwargs: Any,
 ) -> dict[str, Any]:
     """Repair pointers, invalidate the source, and produce a new deterministic revision.
@@ -1450,7 +1453,7 @@ async def amend_handoff(
     correction_rationale: "str | None" = None,
     status: str = "draft",
     force_regenerate: bool = False,
-    mode: str = "full",
+    mode: "str | None" = None,  # 0b0b24d8 — see regenerate_handoff_correction
     idempotency_key: "str | None" = None,
     **generate_handoff_kwargs: Any,
 ) -> dict[str, Any]:
@@ -12089,7 +12092,7 @@ async def generate_handoff(
     *,
     summarizer: object | None = None,
     skip_ai_summary: bool = False,
-    mode: str = "full",
+    mode: str | None = None,
     session_id: str | None = None,
     commit_messages: list[str] | None = None,
     graph_searcher: Callable[[str], Any] | None = None,
@@ -12122,6 +12125,19 @@ async def generate_handoff(
     pending_goal_receiver: "dict[str, Any] | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
+
+    ``mode`` (0b0b24d8, extends aec043cb) — ``None`` (the default) means "the
+    caller did not say", and is resolved through the SAME intent logic the
+    MCP/HTTP transports use (:func:`resolve_handoff_mode`: a session that
+    already produced a handoff -> ``delta``; anything else -> the bounded
+    ``goal``), so omitting it can never mean ``full``. aec043cb made that true
+    for the transports, but this Python default was still ``"full"`` — and
+    ``full`` is the only mode that prepends every cross-project workspace
+    decision AND note, so every internal caller that simply left ``mode`` off
+    (session-close auto-save, the idle-expire loop, proposal promotion)
+    silently inherited the archival dump. ``mode="full"`` stays fully
+    available, but only as an explicit request. An unrecognized string still
+    raises ``ValueError`` below rather than degrading quietly.
 
     ``pending_goal_receiver`` (0527f636) — optional, ``None`` by default (every
     pre-existing call site: zero behaviour change). An object with any subset
@@ -12551,6 +12567,9 @@ async def generate_handoff(
     ``evidence_status``'s own documented mode gap above. A caller that never
     passes ``proposal_scope`` sees zero functional change.
     """
+    if mode is None:
+        # 0b0b24d8 — omission is intent-resolved, never a silent 'full'.
+        mode = resolve_handoff_mode(None, session_id)
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise ValueError(f"project not found: {project_id}")

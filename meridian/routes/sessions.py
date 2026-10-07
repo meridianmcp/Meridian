@@ -74,11 +74,18 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     except Exception:
         pass
     # v2.5 — auto-save handoff on session close so the file is always fresh.
+    # 0b0b24d8 — mode="delta" is explicit on purpose: this call used to omit it
+    # and inherit the 'full' default, i.e. an unattended background write of
+    # every cross-project workspace decision AND note on EVERY session close.
+    # delta (not goal) because it still writes the <stem>_handoff.md file this
+    # auto-save exists to keep fresh (goal writes a different file), it is
+    # bounded, and it skips the Haiku summary calls this 30s budget raced.
     async def _auto_save_handoff() -> None:
         try:
             await asyncio.wait_for(
                 handoff_module.generate_handoff(
-                    await _db(request), project_id, request.app.state.data_dir
+                    await _db(request), project_id, request.app.state.data_dir,
+                    mode="delta",
                 ),
                 timeout=30.0,
             )

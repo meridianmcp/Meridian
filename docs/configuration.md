@@ -230,12 +230,41 @@ sees the latest goal and sprint queue without any manual copy-paste.
 
 ### WORKSPACE — workspace notes and decisions
 
-Tenant-global context injected at the **top** of every project's context block.
-Created via `add_workspace_note` / `set_workspace_decision` and visible across all
-projects owned by your account.
+Tenant-global context created via `add_workspace_note` / `set_workspace_decision` and
+visible across all projects owned by your account.
 
 **Use for:** team-wide conventions, shared infrastructure notes, org-level decisions
 that apply to every project (e.g. "always use Neon for Postgres", "company style guide").
+
+**What a session sees by default.** A cold `start_session` (its `workspace_context`
+field) and `get_context_block` lead with a bounded *index*, not the full text:
+
+- up to 5 workspace **decisions**, newest first, as one-line summaries (title plus the
+  start of the body), with a "+N more" line when there are more;
+- the **note** count only, plus the titles of up to 5 notes tagged `policy` (or
+  `workspace-policy`). Note bodies are never inlined;
+- the exact calls that fetch the rest: `get_workspace_notes()`,
+  `get_workspace_notes(tag="policy")` and `get_workspace_decisions()`.
+
+Tag a note `policy` when every session should at least see that it exists.
+
+**Restoring the old behaviour.** Set `include_workspace_context` to put the full text of
+every decision and note back at the top of both. It is read by the Meridian server
+process, so it is a self-host switch:
+
+```
+MERIDIAN_INCLUDE_WORKSPACE_CONTEXT=1          # env wins over the toml
+```
+
+```toml
+[meridian]
+include_workspace_context = true              # meridian.toml
+```
+
+On the hosted tier the env var would apply to every tenant and `meridian.toml` is not
+shipped, so there it is an operator-level switch only; callers fetch what they need
+with the tools above. A `generate_handoff` call includes workspace decisions and notes
+only when `mode='full'` is requested explicitly; an omitted `mode` never does.
 
 ```
 ┌─────────────────────────────────────┐

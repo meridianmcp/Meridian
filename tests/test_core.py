@@ -348,7 +348,7 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     await db_module.log_task(db, s1["id"], p["id"], "did A", "done")
     await db_module.log_task(db, s2["id"], p["id"], "did B", "done")
     path, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in content
     # v2.4 — tier markers replace the old single "Goal State" header.
@@ -384,7 +384,7 @@ async def test_handoff_custom_template(db, tmp_path):
 
     # Default behavior first: no template set → standard L0/L1 handoff.
     _, default_content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in default_content
 
@@ -400,7 +400,7 @@ async def test_handoff_custom_template(db, tmp_path):
     )
     assert (await db_module.get_workspace_settings(db))["handoff_template"]
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "# Custom Handoff" in content
     assert "Goal: ship v1.1 features" in content
@@ -414,7 +414,7 @@ async def test_handoff_custom_template(db, tmp_path):
     await db_module.update_workspace_settings(db, handoff_template="")
     assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
     _, reverted, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in reverted
 
@@ -456,7 +456,7 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
         db, p["id"], "v1", "Second fix", depends_on=first["id"]
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "1. [pending] First fix" in content
     assert "2. [pending] Second fix" in content
@@ -493,7 +493,7 @@ async def test_handoff_includes_strategic_notes(db, tmp_path):
         "technical",
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Strategic Notes (1)" in content
     assert "Competitive Landscape" in content
@@ -6181,14 +6181,14 @@ async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
     p = await db_module.create_project(db, "queue-proj2")
     await db_module.set_queued_session(db, p["id"], "/goal next sprint")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "=== QUEUED NEXT SESSION ===" in content
     assert "/goal next sprint" in content
     # Cleared after exactly one handoff.
     assert await db_module.get_queued_session(db, p["id"]) is None
     _, content2, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "=== QUEUED NEXT SESSION ===" not in content2
 
@@ -6223,7 +6223,7 @@ async def test_generate_handoff_persists_pending_goal(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v1", "Do a thing")
     assert await db_module.get_pending_goal(db, p["id"]) is None
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     stored = await db_module.get_pending_goal(db, p["id"])
     assert stored is not None
@@ -6641,12 +6641,12 @@ async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_
     p = await db_module.create_project(db, "loop-proj")
     await db_module.add_sprint_item(db, p["id"], "v1", "an item")
     await db_module.update_workspace_settings(db, loop_enabled_default=True)
-    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full")
     # 5abf3e12 — XML-structured /goal starts with "/loop /goal\n" / "/goal\n".
     assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal\n")
     # Workspace default OFF (and no project override) → no /loop.
     await db_module.update_workspace_settings(db, loop_enabled_default=False)
-    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full")
     stored2 = await db_module.get_pending_goal(db, p["id"])
     assert stored2.startswith("/goal\n") and not stored2.startswith("/loop")
 
@@ -16627,7 +16627,7 @@ def test_generate_handoff_accepts_commit_messages(db, tmp_path):
         _, content, _ = await hm.generate_handoff(
             db, p["id"], str(tmp_path),
             skip_ai_summary=True,
-            commit_messages=commits,
+            commit_messages=commits, mode="full",
         )
         return content
 
@@ -21010,7 +21010,7 @@ async def test_handoff_excludes_deferred_from_pending_list(db, tmp_path):
         db, p["id"], "v1", "Backburner task", deferred_until=future
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Visible task" in content
     assert "Backburner task" not in content
@@ -21029,7 +21029,7 @@ async def test_handoff_force_include_ids_re_adds_deferred(db, tmp_path):
     )
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=[deferred["id"]],
+        force_include_ids=[deferred["id"]], mode="full",
     )
     assert "Backburner task" in content
     # deferred_until is NOT cleared — the item is still deferred in the DB
@@ -21050,7 +21050,7 @@ async def test_handoff_force_include_ids_does_not_affect_claim_gate(db, tmp_path
     # Generate handoff with force_include_ids — item appears in handoff
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=[deferred["id"]],
+        force_include_ids=[deferred["id"]], mode="full",
     )
     assert "Deferred task" in content
     # But claiming the item is still blocked
@@ -21081,7 +21081,7 @@ async def test_handoff_force_include_ids_unknown_item_is_ignored(db, tmp_path):
     # Include a made-up id — should not raise, just ignore
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=["nonexistent-id-00000000"],
+        force_include_ids=["nonexistent-id-00000000"], mode="full",
     )
     assert "Real task" in content
 

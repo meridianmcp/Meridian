@@ -567,14 +567,14 @@ async def test_generate_handoff_warns_on_stale_executor_rules(db, tmp_path):
         "# Meridian — executor rules\nCall start_session(project_id=...) first.",
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, stale["id"], str(tmp_path), skip_ai_summary=True
+        db, stale["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Executor rules are behind the current standard" in content
 
     fresh = await db_module.create_project(db, "fresh-proj")
     await db_module.set_agent_instructions(db, fresh["id"], ad.DEFAULT_AGENT_INSTRUCTIONS)
     _, content2, _ = await handoff_module.generate_handoff(
-        db, fresh["id"], str(tmp_path), skip_ai_summary=True
+        db, fresh["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Executor rules are behind the current standard" not in content2
 
@@ -1268,7 +1268,7 @@ async def test_migrate_handoffs_table_idempotent(db):
 @pytest.mark.asyncio
 async def test_generate_handoff_project_not_found(db, tmp_path):
     with pytest.raises(ValueError):
-        await handoff_module.generate_handoff(db, "nope", str(tmp_path))
+        await handoff_module.generate_handoff(db, "nope", str(tmp_path), mode="full")
 
 
 @pytest.mark.asyncio
@@ -1288,7 +1288,7 @@ async def test_generate_handoff_no_goal_uses_placeholder(db, tmp_path):
         db, p["id"], "", "Project done when A < B & C > D."
     )
     path, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "HANDOFF READINESS" in content
     assert "No sprint name set" in content
@@ -1332,10 +1332,10 @@ async def test_generate_handoff_same_name_projects_no_path_collision(db, tmp_pat
         await db_module.set_goal(db2, p2["id"], "project two goal")
 
         path1, content1, _ = await handoff_module.generate_handoff(
-            db, p1["id"], str(tmp_path), skip_ai_summary=True
+            db, p1["id"], str(tmp_path), skip_ai_summary=True, mode="full"
         )
         path2, content2, _ = await handoff_module.generate_handoff(
-            db2, p2["id"], str(tmp_path), skip_ai_summary=True
+            db2, p2["id"], str(tmp_path), skip_ai_summary=True, mode="full"
         )
 
         assert path1 != path2
@@ -1373,7 +1373,7 @@ async def test_generate_handoff_full_with_decisions_and_workspace(db, tmp_path):
     s = await db_module.register_session(db, p["id"], "sess-rich")
     await db_module.log_task(db, s["id"], p["id"], "did the rich thing", "done")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Use psycopg3" in content
     assert "Workspace (applies to all projects)" in content
@@ -1398,7 +1398,7 @@ async def test_generate_handoff_clips_long_bodies(db, tmp_path):
     s = await db_module.register_session(db, p["id"], "sess-clip")
     await db_module.log_task(db, s["id"], p["id"], long_task, "done")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     # None of the full 5000-char bodies survive verbatim.
     assert long_dec not in content
@@ -1431,7 +1431,7 @@ async def test_generate_handoff_total_size_bounded_with_many_long_items(db, tmp_
         )
         await db_module.log_task(db, s["id"], p["id"], huge, "done")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     # 30 decisions + 30 insight notes + 30 tasks × 8000 chars would be >700K raw;
     # clipped, the whole handoff stays well under a conservative bound.
@@ -1451,7 +1451,7 @@ async def test_generate_handoff_with_ai_summary_stub(db, tmp_path):
         return "STUB SUMMARY: did work, do more."
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), summarizer=_summarizer, skip_ai_summary=False
+        db, p["id"], str(tmp_path), summarizer=_summarizer, skip_ai_summary=False, mode="full"
     )
     assert "STUB SUMMARY" in content
 
@@ -1591,7 +1591,7 @@ async def test_generate_handoff_writes_retrospective_note(db, tmp_path):
 
     await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
-        skip_ai_summary=False,
+        skip_ai_summary=False, mode="full",
     )
     notes = await db_module.get_project_notes(
         db, p["id"], tag="retrospective", bodies=True
@@ -1623,7 +1623,7 @@ async def test_generate_handoff_retrospective_is_idempotent(db, tmp_path):
     for _ in range(2):
         await handoff_module.generate_handoff(
             db, p["id"], str(tmp_path), summarizer=_seq_summarizer,
-            skip_ai_summary=False,
+            skip_ai_summary=False, mode="full",
         )
     notes = await db_module.get_project_notes(
         db, p["id"], tag="retrospective", bodies=True
@@ -1639,7 +1639,7 @@ async def test_generate_handoff_skip_ai_summary_no_retrospective(db, tmp_path):
     it = await db_module.add_sprint_item(db, p["id"], "v1", "Item")
     await db_module.complete_sprint_item(db, p["id"], it["id"])
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     notes = await db_module.get_project_notes(db, p["id"], tag="retrospective")
     assert notes == []
@@ -1652,7 +1652,7 @@ async def test_generate_handoff_no_completed_items_no_retrospective(db, tmp_path
     await db_module.add_sprint_item(db, p["id"], "v1", "Still pending")
     await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), summarizer=_retro_summarizer,
-        skip_ai_summary=False,
+        skip_ai_summary=False, mode="full",
     )
     notes = await db_module.get_project_notes(db, p["id"], tag="retrospective")
     assert notes == []
@@ -1859,13 +1859,13 @@ async def test_generate_handoff_appends_queued_session(db, tmp_path):
     await db_module.set_goal(db, p["id"], "queued goal")
     await db_module.set_queued_session(db, p["id"], "/goal do the queued thing")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "QUEUED NEXT SESSION" in content
     assert "do the queued thing" in content
     # Second call — queue cleared, no longer present.
     _, content2, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "QUEUED NEXT SESSION" not in content2
 
@@ -2418,7 +2418,7 @@ async def test_generate_handoff_stores_goal_compliance(db, tmp_path):
     # No metric until the session ends.
     assert await db_module.get_session_goal_compliance(db, sid) is None
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=sid
+        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=sid, mode="full"
     )
     stored = await db_module.get_session_goal_compliance(db, sid)
     assert stored is not None
@@ -2434,7 +2434,7 @@ async def test_generate_handoff_no_session_id_skips_compliance(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v1", "an item")
     # No session_id → no compliance write, no error.
     path, _, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert path
 
@@ -2635,7 +2635,7 @@ async def test_generate_handoff_full_renders_session_span(db, tmp_path):
     sid = s["id"] if isinstance(s, dict) else s
     await db_module.log_task(db, sid, p["id"], "did some work")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=sid
+        db, p["id"], str(tmp_path), skip_ai_summary=True, session_id=sid, mode="full"
     )
     assert "## Session span" in content
     assert "calendar day" in content
@@ -3484,7 +3484,7 @@ async def test_generate_handoff_default_budget_noop_for_typical_content(db, tmp_
     p = await db_module.create_project(db, "budget-genhandoff-default")
     await db_module.set_goal(db, p["id"], "ship", sprint="s1")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     assert "TRUNCATED" not in content
 
@@ -3501,7 +3501,7 @@ async def test_generate_handoff_default_budget_truncates_pathologically_large_co
     huge_narrative = "N" * 400_000
     path, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        extra_narrative=huge_narrative,
+        extra_narrative=huge_narrative, mode="full",
     )
     assert len(content.encode("utf-8")) < 400_000
     assert "TRUNCATED" in content
@@ -3515,7 +3515,7 @@ async def test_generate_handoff_max_content_bytes_none_disables_budget(db, tmp_p
     huge_narrative = "M" * 400_000
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        extra_narrative=huge_narrative, max_content_bytes=None,
+        extra_narrative=huge_narrative, max_content_bytes=None, mode="full",
     )
     assert huge_narrative in content
     assert "TRUNCATED" not in content
@@ -3528,7 +3528,7 @@ async def test_generate_handoff_max_content_bytes_explicit_override(db, tmp_path
     p = await db_module.create_project(db, "budget-genhandoff-explicit")
     await db_module.set_goal(db, p["id"], "ship", sprint="s1")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True, max_content_bytes=50,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, max_content_bytes=50, mode="full",
     )
     assert "TRUNCATED" in content
     assert len(content.encode("utf-8")) < 5000
@@ -3876,7 +3876,7 @@ async def _seed_handoff(db, name: str, tmp_path):
     p = await db_module.create_project(db, name)
     await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     rows = await db_module.get_handoffs(db, p["id"], limit=1)
     return p, rows[0]
@@ -3971,7 +3971,7 @@ async def test_record_handoff_correction_auto_supersedes_prior_open_correction(d
 async def test_list_handoff_corrections_filters_by_source_and_status(db, tmp_path):
     p = await db_module.create_project(db, "corr-list-filters")
     await db_module.set_goal(db, p["id"], "goal", sprint="s")
-    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full")
     h1 = (await db_module.get_handoffs(db, p["id"], limit=1))[0]
     await db_module.pop_pending_goal(db, p["id"])  # simulate a start_session consuming it
     # get_handoffs orders by created_at DESC, id DESC — SQLite's created_at is
@@ -3979,7 +3979,7 @@ async def test_list_handoff_corrections_filters_by_source_and_status(db, tmp_pat
     # tie and the id (a random UUID) is not a chronological tiebreaker. Diff
     # the id sets before/after instead of trusting "limit=1 is the new one".
     _before_ids = {r["id"] for r in await db_module.get_handoffs(db, p["id"], limit=10)}
-    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full")
     _after_rows = await db_module.get_handoffs(db, p["id"], limit=10)
     h2 = next(r for r in _after_rows if r["id"] not in _before_ids)
     assert h2["id"] != h1["id"]
@@ -4323,7 +4323,7 @@ async def test_load_handoff_content_routed_through_format_handoff_mcp_content(
     await db_module.add_sprint_item(db, p["id"], "v1", "do the thing")
 
     _path, generated_content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     result = await mcp_handler._handle_task_tools(
