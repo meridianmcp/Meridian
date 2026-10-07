@@ -13,6 +13,8 @@ that hit the FastAPI TestClient.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from bs4 import BeautifulSoup
 
@@ -146,6 +148,33 @@ def test_backburner_section_has_grouping_search_and_archive(js):
     # Per-item archive/delete button (write control → must be demo-hidden).
     assert "sprintArchive(" in js, "backburner archive button missing"
     assert "async function sprintArchive" in js, "sprintArchive impl missing"
+
+
+def test_backburner_delete_repaints_the_queue_tab(js):
+    """8a665a03 -- the trash button lives in the Queue tab, so the delete must repaint
+    the Queue tab (and not only the Live tab, which is all it used to refresh)."""
+    m = re.search(r"async function sprintArchive\(.*?\n\}", js, re.S)
+    assert m, "sprintArchive impl missing"
+    body = m.group(0)
+    assert "applySprintItemDeleted(" in body, "the deleted row must be dropped from the Queue cache"
+    assert "refreshSprintSurfaces(" in body, "the delete must repaint Queue + Live + Goal board"
+    assert "refreshLiveTab(" not in body, "a Live-only refresh is exactly the bug"
+    # The server half: the DELETE route announces the delete, and the client subscribes.
+    assert "sprint_item_deleted" in js, "handleWsEvent must handle sprint_item_deleted"
+
+
+def test_every_sprint_mutation_handler_repaints_all_sprint_views(js):
+    """8a665a03 -- complete/skip/fail/push/edit/notes/resources/feedback/add all end in the
+    shared repaint, never a Live-only refresh."""
+    for name in (
+        "sprintAction", "sprintPushPrompt", "sprintResetPending", "sprintFeedback",
+        "sprintFeedbackNote", "sprintItemEdit", "sprintItemNotesEdit",
+        "sprintItemResourcesEdit", "addSprintItemFromInput",
+    ):
+        m = re.search(r"async function " + name + r"\(.*?\n\}", js, re.S)
+        assert m, f"{name} impl missing"
+        assert "refreshSprintSurfaces(" in m.group(0), f"{name} must repaint through refreshSprintSurfaces"
+        assert "refreshLiveTab(" not in m.group(0), f"{name} refreshes only the Live tab"
 
 
 def test_notes_tab_has_cursor_load_more(js):
@@ -475,8 +504,10 @@ def test_dashboard_live_tab_exists(client):
 
     Section A: active sessions (filtered to last 24h) with claimed task
     shown indented per session.  Section B: queue (pending + in_progress
-    tasks) with an add-task input and per-row cancel.  Header buttons:
-    [Pause] / [Run All] (stubs).  WebSocket-driven — no setInterval.
+    tasks) with an add-task input and per-row cancel.  Header: the
+    auto-refresh toggle only -- the [Pause] / [Run All] placeholders were
+    removed (3bcb4013) because they did nothing.  WebSocket-driven — no
+    setInterval.
     """
     js = client.get("/static/dashboard.ts").text
     css = client.get("/static/dashboard.css").text
@@ -488,8 +519,13 @@ def test_dashboard_live_tab_exists(client):
     assert "live-sessions-" in js, "live sessions container ID missing"
     assert "live-queue-" in js, "live queue container ID missing"
     assert "live-add-input-" in js, "add task input ID missing"
-    assert "live-pause-" in js, "Pause stub button missing"
-    assert "live-run-" in js, "Run All stub button missing"
+    # 3bcb4013 -- the Pause / Run All header buttons were UI stubs (their own tooltips
+    # said so, and the only handler toasted "coming soon"). They are gone, and nothing
+    # may wire a stub toast in their place.
+    assert "live-pause-" not in js, "Pause stub button is back"
+    assert "live-run-" not in js, "Run All stub button is back"
+    assert "is a stub" not in js and "UI stub" not in js, "a stub placeholder is back in the Live tab"
+    assert "live-auto-btn-" in js, "the real auto-refresh toggle must stay"
     # Add task posts to /tasks with status pending
     assert "addLiveTask" in js, "addLiveTask helper missing"
     assert "'/tasks'" in js or '"/tasks"' in js, "POST /tasks not referenced"

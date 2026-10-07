@@ -581,9 +581,23 @@ async function loadTunnelPluginsSection(projectId: string, hostname: any) {
 
     document.getElementById(`tp-save-${projectId}`)!.onclick = async () => {
       try {
-        await api('/tunnel/plugins' + _hq, { method: 'PUT', body: JSON.stringify({ config: collectConfig() }) });
+        const saved = await api('/tunnel/plugins' + _hq, { method: 'PUT', body: JSON.stringify({ config: collectConfig() }) });
         toast(_selHost ? `Saved for ${_selHost}` : 'Tunnel plugins saved');
-        setStatus('Saved — restart the tunnel to apply.');
+        // 8a665a03 -- re-render from the server after a save, like Reset below does. The
+        // PUT normalises the config and decides restart_required, but this handler used
+        // to only toast, so the lifecycle badges (derived from `enabled`), the per-host
+        // override marker and the restart banner kept their pre-save values until the
+        // Settings tab was rebuilt.
+        const restartNotNeeded = !!(saved && saved.config_generation && saved.config_generation.restart_required === false);
+        await loadTunnelPluginsSection(projectId, _selHost);
+        try { await (window as any)._renderTunnelConfigGenerationBanner?.(projectId); } catch (_) { /* banner is best-effort */ }
+        // The section (and its #tp-status line) was rebuilt, so look the line up again.
+        const msg = restartNotNeeded ? 'Saved.' : 'Saved — restart the tunnel to apply.';
+        const fresh = document.getElementById(`tp-status-${projectId}`);
+        if (fresh) {
+          fresh.textContent = msg;
+          setTimeout(() => { if (fresh.textContent === msg) fresh.textContent = ''; }, 2500);
+        }
       } catch (e: any) { toast('Save failed: ' + e.message, true); }
     };
 

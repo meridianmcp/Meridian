@@ -3864,6 +3864,20 @@ async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
     await release_resource_locks_for_session(db, session_id)
     await release_symbol_claims_for_session(db, session_id)
     await db.commit()
+    # 8a665a03 -- only a session STARTING was announced, so a closed session stayed in
+    # every other dashboard's "Active Sessions" / Live lists until a reload.
+    try:
+        async with db.execute(
+            "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row is not None and _row["project_id"]:
+            _publish_project_event(
+                _row["project_id"], "session_updated",
+                {"session_id": session_id, "status": "closed"},
+            )
+    except Exception:  # noqa: BLE001 -- best-effort notification, never blocks the close
+        pass
     try:
         await handle_session_stall(db, session_id)
     except Exception:  # noqa: BLE001 — stall recovery must never block session close
@@ -9237,6 +9251,13 @@ async def update_pinned_decision(
         f"UPDATE decisions_pinned SET {set_clause} WHERE id = ?", args
     )
     await db.commit()
+    # 8a665a03 -- edit / archive (supersede) / priority / category changes used to
+    # be silent, so an open Decisions view only learned about a NEW pin
+    # (decision_pinned) and stayed stale after any other change made from another
+    # tab, session or MCP client.
+    _publish_project_event(
+        existing["project_id"], "decision_updated", {"decision_id": decision_id}
+    )
     return await get_pinned_decision(db, decision_id)
 
 
@@ -9295,6 +9316,12 @@ async def delete_pinned_decision(
     RT-TI-004 — with ``project_id`` the delete only matches a decision that
     belongs to that project (a mismatch is answered like a missing decision).
     """
+    # 8a665a03 -- the event is routed by project, and the MCP path passes no
+    # project_id, so resolve the owner before the row disappears.
+    owner_project_id = project_id
+    if owner_project_id is None:
+        existing = await get_pinned_decision(db, decision_id)
+        owner_project_id = existing.get("project_id") if existing else None
     if project_id is None:
         cur = await db.execute(
             "DELETE FROM decisions_pinned WHERE id = ?", (decision_id,)
@@ -9305,7 +9332,12 @@ async def delete_pinned_decision(
             (decision_id, project_id),
         )
     await db.commit()
-    return cur.rowcount > 0
+    deleted = cur.rowcount > 0
+    if deleted and owner_project_id:
+        _publish_project_event(
+            owner_project_id, "decision_deleted", {"decision_id": decision_id}
+        )
+    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -11031,6 +11063,10 @@ async def update_project_note(
         f"UPDATE project_notes SET {set_clause} WHERE id = ?", args
     )
     await db.commit()
+    # 8a665a03 -- only note_added used to be announced, so an edit made through the
+    # API, MCP, a handoff retrospective rewrite or a document re-ingest left an open
+    # Notes tab showing the old text.
+    _publish_project_event(existing["project_id"], "note_updated", {"note_id": note_id})
     return await get_project_note(db, note_id)
 
 
@@ -11043,6 +11079,12 @@ async def delete_project_note(
     to that project, so naming one project while passing another project's note
     id removes nothing (same answer as a missing note).
     """
+    # 8a665a03 -- the event is routed by project, and the MCP path passes no
+    # project_id, so resolve the owner before the row disappears.
+    owner_project_id = project_id
+    if owner_project_id is None:
+        existing = await get_project_note(db, note_id)
+        owner_project_id = existing.get("project_id") if existing else None
     if project_id is None:
         sql, params = "DELETE FROM project_notes WHERE id = ?", (note_id,)
     else:
@@ -11053,6 +11095,8 @@ async def delete_project_note(
     async with db.execute(sql, params) as cur:
         rc = cur.rowcount or 0
     await db.commit()
+    if rc > 0 and owner_project_id:
+        _publish_project_event(owner_project_id, "note_deleted", {"note_id": note_id})
     return rc > 0
 
 
@@ -13200,6 +13244,7 @@ from .sprint_items import (  # noqa: F401
     count_new_sprint_items_since,
     count_pending_sprint_items,
     count_sprint_items_awaiting_verification,
+    delete_sprint_item,
     delete_sprint_item_pointer,
     relocate_sprint_item_pointer,
     evaluate_board_blockers,

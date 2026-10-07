@@ -6112,6 +6112,17 @@ async def patch_sprint_item(
         if cursor.rowcount == 0:
             return None
         result = await get_sprint_item(db, item_id)
+        # 8a665a03 -- every mutation publishes one event: a title/version/notes/
+        # resources/feedback edit used to change the row silently, so a second
+        # dashboard tab (or an MCP-side edit) never repainted the Queue/Live/Goal
+        # views until a reload. A status change in the same call publishes its own
+        # event from _transition_status below, so only announce when none follows.
+        _invalidate_sprint_items_cache(project_id)
+        if status_value is None:
+            _publish_project_event(project_id, "sprint_item_updated", {
+                "item_id": item_id,
+                "fields": [f.split(" = ")[0] for f in ns_fields],
+            })
 
     if status_value is not None:
         # Phase 2: route the status write through _transition_status so cache
@@ -6170,6 +6181,33 @@ async def patch_sprint_item(
     if result is None:
         result = await get_sprint_item(db, item_id)
     return result
+
+
+async def delete_sprint_item(
+    db: aiosqlite.Connection, project_id: str, item_id: str
+) -> bool:
+    """Permanently delete one sprint item. Returns True when a row was removed.
+
+    8a665a03 -- this used to be a raw ``DELETE`` inside the HTTP route, which meant
+    nothing busted the sprint-items cache and nothing told the dashboard: the
+    Backburner trash button removed the row in the database but the Queue tab kept
+    showing it until a reload. Keeping the delete, the cache bust and the
+    ``sprint_item_deleted`` event in one function means no caller (route, MCP tool,
+    future bulk path) can forget one of them -- the same consolidation
+    ``_transition_status`` does for status changes. The delete is scoped to
+    ``project_id``; an id that belongs to another project (or is already gone)
+    removes nothing and publishes nothing.
+    """
+    cursor = await db.execute(
+        "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
+        (item_id, project_id),
+    )
+    await db.commit()
+    deleted = (cursor.rowcount or 0) > 0
+    if deleted:
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_item_deleted", {"item_id": item_id})
+    return deleted
 
 
 async def add_subtask(
@@ -6381,6 +6419,15 @@ async def split_sprint_item(
         new_item = await get_sprint_item(db, nid)
         if new_item:
             new_items.append(new_item)
+    if new_items:
+        # 8a665a03 -- the original's skip event fires BEFORE these inserts, so a
+        # dashboard that refetched on it could miss the children; announce them once
+        # they all exist.
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_item_added", {
+            "item_ids": [n["id"] for n in new_items],
+            "split_from": item_id,
+        })
     return new_items
 
 

@@ -1684,7 +1684,7 @@
 
           <button class="sprint-btn" title="Back to pending"
 
-            onclick="fetch('/projects/${escapeHtml(projectId)}/sprint-items/${escapeHtml(it.id)}',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'pending'})}).then(()=>renderSprintProgress(${JSON.stringify(projectId)},items.map(x=>x.id===it.id?{...x,status:'pending'}:x)))">\u21A9 Pending</button>
+            onclick="sprintResetPending('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u21A9 Pending</button>
 
           <button class="sprint-btn sprint-btn-fail" title="Mark failed"
 
@@ -2700,6 +2700,133 @@
     }
   }
   window._loadSettingsAccountPane = _loadSettingsAccountPane;
+  function _syncAccountCacheAfterSave(projectId, saved) {
+    const data = _settingsTabDataCache.get(`${projectId}:account`);
+    if (!data || !saved || typeof saved !== "object") return;
+    data.ntfyResult = { status: "fulfilled", value: saved };
+  }
+  function _wireAccountPaneHandlers(projectId) {
+    const body = document.getElementById(`settings-body-${projectId}`);
+    const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
+    if (ntfySaveBtn) {
+      ntfySaveBtn.onclick = async () => {
+        const inp = document.getElementById(`ntfy-url-${projectId}`);
+        const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+        const raw = (inp ? inp.value : "").trim() || null;
+        try {
+          const saved = await api(`/projects/${projectId}/ntfy`, {
+            method: "PATCH",
+            body: JSON.stringify({ notify_url: raw, ntfy_url: raw })
+          });
+          _syncAccountCacheAfterSave(projectId, saved);
+          const savedVal = saved && (saved.notify_url || saved.ntfy_url || "");
+          const shownVal = displayNotifyTarget(savedVal || "");
+          if (inp) inp.value = shownVal || "";
+          if (statusEl) {
+            statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase() ? `saved as ${shownVal}` : "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 2400);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = "error";
+        }
+      };
+    }
+    const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
+    if (notifyEmailSaveBtn) {
+      notifyEmailSaveBtn.onclick = async () => {
+        const inp = document.getElementById(`notify-email-${projectId}`);
+        const statusEl = document.getElementById(`notify-email-status-${projectId}`);
+        const raw = (inp ? inp.value : "").trim() || null;
+        try {
+          const savedEmail = await api(`/projects/${projectId}/ntfy`, {
+            method: "PATCH",
+            body: JSON.stringify({ notify_email: raw })
+          });
+          _syncAccountCacheAfterSave(projectId, savedEmail);
+          if (statusEl) {
+            statusEl.textContent = "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 2400);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = "error";
+        }
+      };
+    }
+    const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
+    if (ntfyTestBtn) {
+      ntfyTestBtn.onclick = async () => {
+        const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+        ntfyTestBtn.disabled = true;
+        try {
+          await api(`/projects/${projectId}/notify/test`, { method: "POST", body: "{}" });
+          if (statusEl) {
+            statusEl.textContent = "sent!";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 3e3);
+          }
+        } catch (e3) {
+          if (statusEl) {
+            const raw = String(e3?.message || e3 || "");
+            let msg = raw.replace(/^\d+:\s*/, "");
+            try {
+              const parsed = JSON.parse(msg);
+              msg = parsed.detail || parsed.message || parsed.error || msg;
+            } catch (_err) {
+            }
+            statusEl.textContent = msg.includes("No notify URL configured") ? "save a URL first" : msg;
+          }
+        } finally {
+          ntfyTestBtn.disabled = false;
+        }
+      };
+    }
+    const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
+    if (ntfyWarnAckCb) {
+      ntfyWarnAckCb.onchange = () => {
+        if (!ntfyWarnAckCb.checked) return;
+        try {
+          localStorage.setItem(STORAGE_KEY("ntfy.warn.dismissed"), "1");
+        } catch (e3) {
+        }
+        const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
+        if (warnEl) warnEl.style.display = "none";
+        const inp = document.getElementById(`ntfy-url-${projectId}`);
+        const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
+        const testBtn = document.getElementById(`ntfy-test-${projectId}`);
+        [inp, saveBtn, testBtn].forEach((el2) => {
+          if (el2) {
+            el2.disabled = false;
+            el2.style.opacity = "1";
+          }
+        });
+      };
+    }
+    if (body) body.querySelectorAll("input[data-pref]").forEach((cb) => {
+      cb.onchange = async () => {
+        const statusEl = document.getElementById(`settings-save-status-${projectId}`);
+        const payload = {};
+        body.querySelectorAll("input[data-pref]").forEach((c3) => {
+          payload[c3.dataset.pref] = c3.checked;
+        });
+        try {
+          await api("/settings/notifications", { method: "PATCH", body: JSON.stringify(payload) });
+          if (statusEl) {
+            statusEl.textContent = "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 1800);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
+        }
+      };
+    });
+  }
   function _applySettingsAccountPaneData(projectId, data) {
     const { notifResult, ntfyResult, mcpResult, PREFS } = data;
     const prefs = notifResult.status === "fulfilled" ? notifResult.value.prefs || {} : null;
@@ -2708,6 +2835,7 @@
     if (ntfyPlaceholder) ntfyPlaceholder.outerHTML = _settingsNotificationsCardHtml(projectId, ntfyResult);
     const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
     if (prefsPlaceholder) prefsPlaceholder.outerHTML = _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+    _wireAccountPaneHandlers(projectId);
   }
   window._applySettingsAccountPaneData = _applySettingsAccountPaneData;
   function _activateSettingsTab(projectId, key) {
@@ -2716,11 +2844,8 @@
     body.dataset.activeStab = key;
     _applyActiveTabVisibility(projectId);
     if (key === "account") {
-      const cacheKey = `${projectId}:account`;
-      if (!_settingsTabDataCache.has(cacheKey)) {
-        _loadSettingsAccountPane(projectId).catch(() => {
-        });
-      }
+      _loadSettingsAccountPane(projectId).catch(() => {
+      });
     }
   }
   window._activateSettingsTab = _activateSettingsTab;
@@ -6126,123 +6251,6 @@ project_id = "${displayPid}"`;
         renderHooks();
         if (tokenListEl) loadHooksTokens();
       }, 0);
-      const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
-      if (ntfySaveBtn) {
-        ntfySaveBtn.onclick = async () => {
-          const inp = document.getElementById(`ntfy-url-${projectId}`);
-          const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-          const raw = (inp ? inp.value : "").trim() || null;
-          try {
-            const saved = await api(`/projects/${projectId}/ntfy`, {
-              method: "PATCH",
-              body: JSON.stringify({ notify_url: raw, ntfy_url: raw })
-            });
-            const savedVal = saved && (saved.notify_url || saved.ntfy_url || "");
-            const shownVal = displayNotifyTarget(savedVal || "");
-            if (inp) inp.value = shownVal || "";
-            if (statusEl) {
-              statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase() ? `saved as ${shownVal}` : "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 2400);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = "error";
-          }
-        };
-      }
-      const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
-      if (notifyEmailSaveBtn) {
-        notifyEmailSaveBtn.onclick = async () => {
-          const inp = document.getElementById(`notify-email-${projectId}`);
-          const statusEl = document.getElementById(`notify-email-status-${projectId}`);
-          const raw = (inp ? inp.value : "").trim() || null;
-          try {
-            await api(`/projects/${projectId}/ntfy`, {
-              method: "PATCH",
-              body: JSON.stringify({ notify_email: raw })
-            });
-            if (statusEl) {
-              statusEl.textContent = "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 2400);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = "error";
-          }
-        };
-      }
-      const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
-      if (ntfyTestBtn) {
-        ntfyTestBtn.onclick = async () => {
-          const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-          ntfyTestBtn.disabled = true;
-          try {
-            await api(`/projects/${projectId}/notify/test`, { method: "POST", body: "{}" });
-            if (statusEl) {
-              statusEl.textContent = "sent!";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 3e3);
-            }
-          } catch (e3) {
-            if (statusEl) {
-              const raw = String(e3?.message || e3 || "");
-              let msg = raw.replace(/^\d+:\s*/, "");
-              try {
-                const parsed = JSON.parse(msg);
-                msg = parsed.detail || parsed.message || parsed.error || msg;
-              } catch (_err) {
-              }
-              statusEl.textContent = msg.includes("No notify URL configured") ? "save a URL first" : msg;
-            }
-          } finally {
-            ntfyTestBtn.disabled = false;
-          }
-        };
-      }
-      const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
-      if (ntfyWarnAckCb) {
-        ntfyWarnAckCb.onchange = () => {
-          if (!ntfyWarnAckCb.checked) return;
-          try {
-            localStorage.setItem(STORAGE_KEY("ntfy.warn.dismissed"), "1");
-          } catch (e3) {
-          }
-          const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
-          if (warnEl) warnEl.style.display = "none";
-          const inp = document.getElementById(`ntfy-url-${projectId}`);
-          const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
-          const testBtn = document.getElementById(`ntfy-test-${projectId}`);
-          [inp, saveBtn, testBtn].forEach((el2) => {
-            if (el2) {
-              el2.disabled = false;
-              el2.style.opacity = "1";
-            }
-          });
-        };
-      }
-      body.querySelectorAll("input[data-pref]").forEach((cb) => {
-        cb.onchange = async () => {
-          const statusEl = document.getElementById(`settings-save-status-${projectId}`);
-          const payload = {};
-          body.querySelectorAll("input[data-pref]").forEach((c3) => {
-            payload[c3.dataset.pref] = c3.checked;
-          });
-          try {
-            await api("/settings/notifications", { method: "PATCH", body: JSON.stringify(payload) });
-            if (statusEl) {
-              statusEl.textContent = "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 1800);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
-          }
-        };
-      });
       const ghConnectBtn = document.getElementById(`github-connect-btn-${projectId}`);
       if (ghConnectBtn) {
         ghConnectBtn.onclick = () => {
@@ -6828,9 +6836,22 @@ project_id = "${displayPid}"`;
       };
       document.getElementById(`tp-save-${projectId}`).onclick = async () => {
         try {
-          await api("/tunnel/plugins" + _hq, { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
+          const saved = await api("/tunnel/plugins" + _hq, { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
           toast(_selHost ? `Saved for ${_selHost}` : "Tunnel plugins saved");
-          setStatus("Saved \u2014 restart the tunnel to apply.");
+          const restartNotNeeded = !!(saved && saved.config_generation && saved.config_generation.restart_required === false);
+          await loadTunnelPluginsSection2(projectId, _selHost);
+          try {
+            await window._renderTunnelConfigGenerationBanner?.(projectId);
+          } catch (_2) {
+          }
+          const msg = restartNotNeeded ? "Saved." : "Saved \u2014 restart the tunnel to apply.";
+          const fresh = document.getElementById(`tp-status-${projectId}`);
+          if (fresh) {
+            fresh.textContent = msg;
+            setTimeout(() => {
+              if (fresh.textContent === msg) fresh.textContent = "";
+            }, 2500);
+          }
         } catch (e3) {
           toast("Save failed: " + e3.message, true);
         }
@@ -10849,7 +10870,9 @@ ${n2.tags || ""}`.toLowerCase();
         loadNotesTab(pid),
         refreshProjectCountBadges(pid),
         refreshHitl(pid),
-        loadSprintBoard(pid)
+        // 8a665a03 -- loadSprintBoard is a closure inside buildTabBody, so the bare
+        // call that used to be here threw a ReferenceError (swallowed by the catch).
+        reloadGoalSprintBoard(pid)
       ]);
     } catch (_2) {
     }
@@ -11825,10 +11848,6 @@ Current: ${current || "(none)"}`,
           <span style="display:flex;gap:6px;align-items:center">
 
             <button class="secondary" id="live-auto-btn-${project.id}" title="Toggle auto-refresh" style="padding:2px 8px;font-size:10px">\u21BB Auto</button>
-
-            <button class="secondary" id="live-pause-${project.id}" title="Pause queue (UI stub)" style="padding:2px 8px;font-size:10px">Pause</button>
-
-            <button class="secondary" id="live-run-${project.id}" title="Run all pending (UI stub)" style="padding:2px 8px;font-size:10px">Run All</button>
 
           </span>
 
@@ -12825,6 +12844,7 @@ Current: ${current || "(none)"}`,
           } catch (_2) {
           }
           if (vtab === "files") loadFilesTab(project.id);
+          if (vtab === "goal") reloadGoalSprintBoard(project.id);
           if (vtab === "devlog") refreshTasks(project.id);
           if (vtab === "timeline") loadTimeline2(project.id);
           if (vtab === "rewind") initRewindTab(project.id);
@@ -12956,7 +12976,7 @@ Current: ${current || "(none)"}`,
     if (saveNorthStarBtn) saveNorthStarBtn.onclick = () => saveNorthStar(project.id);
     const saveSprintBtn = document.getElementById(`save-sprint-${project.id}`);
     if (saveSprintBtn) saveSprintBtn.onclick = () => saveSprint(project.id);
-    async function loadSprintBoard2() {
+    async function loadSprintBoard() {
       const sprintItemsPath = `/projects/${project.id}/sprint-items`;
       try {
         const items = await projectApi(project.id, sprintItemsPath);
@@ -13001,8 +13021,8 @@ Current: ${current || "(none)"}`,
         wireProjectLoadRetry2(board, project.id);
       }
     }
-    _sprintBoardReloaders[project.id] = loadSprintBoard2;
-    loadSprintBoard2();
+    _sprintBoardReloaders[project.id] = loadSprintBoard;
+    loadSprintBoard();
     setTimeout(async () => {
       const sel = document.getElementById(`goal-sprint-select-${project.id}`);
       const inp = document.getElementById(`goal-sprint-${project.id}`);
@@ -13053,7 +13073,7 @@ Current: ${current || "(none)"}`,
         try {
           await api(`/projects/${project.id}/sprint-items`, { method: "POST", body: JSON.stringify({ title, version: state.panels[project.id]?.sprint || "current" }) });
           sprintAddInput.value = "";
-          loadSprintBoard2();
+          loadSprintBoard();
         } catch (e3) {
           console.error("Add sprint item failed:", e3);
         }
@@ -13217,10 +13237,6 @@ Current: ${current || "(none)"}`,
     if (!panel) return;
     panel.liveWired = panel.liveWired || false;
     if (!panel.liveWired) {
-      const pause = document.getElementById(`live-pause-${projectId}`);
-      const runAll = document.getElementById(`live-run-${projectId}`);
-      if (pause) pause.onclick = () => toast("Pause is a stub \u2014 coming soon");
-      if (runAll) runAll.onclick = () => toast("Run All is a stub \u2014 coming soon");
       const input = document.getElementById(`live-add-input-${projectId}`);
       if (input) input.addEventListener("keydown", (ev) => {
         if (ev.key !== "Enter") return;
@@ -13400,6 +13416,47 @@ Current: ${current || "(none)"}`,
     } catch (e3) {
     }
   }
+  function reloadGoalSprintBoard(projectId) {
+    try {
+      const reload = _sprintBoardReloaders[projectId];
+      if (reload) Promise.resolve(reload()).catch(() => {
+      });
+    } catch (_2) {
+    }
+  }
+  var _repaintTimers = {};
+  function _debounceRepaint(key, fn, ms = 150) {
+    clearTimeout(_repaintTimers[key]);
+    _repaintTimers[key] = setTimeout(fn, ms);
+  }
+  function scheduleGoalBoardReload(projectId) {
+    const panel = state.panels[projectId];
+    if (panel && panel.activeVtab === "goal") {
+      _debounceRepaint(`goal:${projectId}`, () => reloadGoalSprintBoard(projectId));
+    }
+  }
+  function repaintVisibleSprintViews(projectId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    if (panel.activeVtab === "queue") {
+      _debounceRepaint(`queue:${projectId}`, () => loadQueue(projectId, { quiet: true }));
+    }
+    scheduleGoalBoardReload(projectId);
+  }
+  async function refreshSprintSurfaces(projectId) {
+    repaintVisibleSprintViews(projectId);
+    await refreshLiveTab(projectId);
+  }
+  function applySprintItemDeleted(projectId, itemId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    if (Array.isArray(panel.queueSprintItems)) {
+      const gone = panel.queueSprintItems.find((it) => it.id === itemId);
+      panel.queueSprintItems = panel.queueSprintItems.filter((it) => it.id !== itemId);
+      if (gone && gone.status === "done" && panel.queueTotalDoneCount > 0) panel.queueTotalDoneCount -= 1;
+    }
+    if (panel.activeVtab === "queue") renderQueueBody(projectId);
+  }
   function wireSprintAddEnter2(projectId, root) {
     const inp = root.querySelector(`#sprint-add-input-${projectId}`);
     if (inp) inp.onkeydown = (e3) => {
@@ -13413,7 +13470,7 @@ Current: ${current || "(none)"}`,
         { method: "POST", body: JSON.stringify({}) }
       );
       toast(`Sprint item ${action}d`);
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast(`Failed: ${e3.message}`, true);
     }
@@ -13421,10 +13478,10 @@ Current: ${current || "(none)"}`,
   async function sprintArchive(projectId, itemId) {
     if (!confirm("Permanently delete this backburner item? This cannot be undone.")) return;
     try {
-      const r3 = await fetch(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
-      if (!r3.ok && r3.status !== 204) throw new Error(`${r3.status}`);
+      await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
       toast("Backburner item deleted");
-      await refreshLiveTab(projectId);
+      applySprintItemDeleted(projectId, itemId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast(`Delete failed: ${e3.message}`, true);
     }
@@ -13451,9 +13508,21 @@ Current: ${current || "(none)"}`,
         { method: "POST", body: JSON.stringify({ to_version: toVersion }) }
       );
       toast("Sprint item pushed to " + toVersion);
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast(`Push failed: ${e3.message}`, true);
+    }
+  }
+  async function sprintResetPending(projectId, itemId) {
+    try {
+      await api(
+        `/projects/${projectId}/sprint-items/${itemId}`,
+        { method: "PATCH", body: JSON.stringify({ status: "pending" }) }
+      );
+      toast("Sprint item back to pending");
+      await refreshSprintSurfaces(projectId);
+    } catch (e3) {
+      toast(`Failed: ${e3.message}`, true);
     }
   }
   async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
@@ -13464,7 +13533,7 @@ Current: ${current || "(none)"}`,
         `/projects/${projectId}/sprint-items/${itemId}`,
         { method: "PATCH", body: JSON.stringify({ feedback_thumb: newThumb }) }
       );
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Feedback failed: " + e3.message, true);
     }
@@ -13476,7 +13545,7 @@ Current: ${current || "(none)"}`,
         `/projects/${projectId}/sprint-items/${itemId}`,
         { method: "PATCH", body: JSON.stringify({ feedback_note: note.trim() }) }
       );
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Note save failed: " + e3.message, true);
     }
@@ -13514,7 +13583,7 @@ Current: ${current || "(none)"}`,
           method: "PATCH",
           body: JSON.stringify({ title: newTitle, version: newVersion || void 0 })
         });
-        await refreshLiveTab(projectId);
+        await refreshSprintSurfaces(projectId);
       } catch (e3) {
         toast(`Save failed: ${e3.message}`, true);
         cancel();
@@ -13536,6 +13605,143 @@ Current: ${current || "(none)"}`,
         if (!row.contains(document.activeElement)) save();
       }, 150);
     };
+  }
+  async function sprintItemNotesEdit(projectId, itemId) {
+    const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+    if (!row) return;
+    const curNotes = row.dataset.notes || "";
+    if (row.querySelector(".sprint-notes-textarea")) return;
+    const existingNotesEl = row.querySelector(".sprint-item-notes");
+    const textarea = document.createElement("textarea");
+    textarea.className = "sprint-notes-textarea";
+    textarea.value = curNotes;
+    textarea.placeholder = "Add context, links, or notes\u2026";
+    textarea.style.cssText = "width:100%;min-height:56px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:3px 5px;color:var(--text);font-size:10px;font-family:var(--font-mono);line-height:1.4;resize:vertical;box-sizing:border-box;margin-top:3px";
+    if (existingNotesEl) {
+      existingNotesEl.replaceWith(textarea);
+    } else {
+      const titleSpan = row.querySelector(".sprint-item-title");
+      if (titleSpan) titleSpan.parentNode.insertBefore(textarea, titleSpan.nextSibling);
+      else row.appendChild(textarea);
+    }
+    textarea.focus();
+    const save = async () => {
+      const newNotes = textarea.value.trim() || null;
+      try {
+        await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ notes: newNotes })
+        });
+        row.dataset.notes = newNotes || "";
+        await refreshSprintSurfaces(projectId);
+      } catch (e3) {
+        toast(`Save failed: ${e3.message}`, true);
+        cancel();
+      }
+    };
+    const cancel = () => {
+      if (existingNotesEl) textarea.replaceWith(existingNotesEl);
+      else textarea.remove();
+    };
+    textarea.onkeydown = (e3) => {
+      if (e3.key === "Escape") {
+        e3.preventDefault();
+        cancel();
+      }
+      if (e3.key === "Enter" && (e3.ctrlKey || e3.metaKey)) {
+        e3.preventDefault();
+        save();
+      }
+    };
+    textarea.onblur = () => setTimeout(() => {
+      if (!row.contains(document.activeElement)) save();
+    }, 150);
+  }
+  async function sprintItemResourcesEdit(projectId, itemId, rawJson) {
+    const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+    if (!row) return;
+    if (row.querySelector(".sprint-resources-textarea")) return;
+    let current = [];
+    try {
+      current = JSON.parse(rawJson || "[]");
+    } catch {
+      current = [];
+    }
+    const existingEl = row.querySelector(".sprint-item-resources");
+    const textarea = document.createElement("textarea");
+    textarea.className = "sprint-resources-textarea";
+    textarea.value = current.join("\n");
+    textarea.placeholder = "One resource per line, e.g.\nfile:meridian/db/__init__.py\nnote:my-note\ndecision:abc123";
+    textarea.style.cssText = "width:100%;min-height:56px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:3px 5px;color:var(--text);font-size:10px;font-family:var(--font-mono);line-height:1.4;resize:vertical;box-sizing:border-box;margin-top:3px";
+    if (existingEl) {
+      existingEl.replaceWith(textarea);
+    } else {
+      const notesEl = row.querySelector(".sprint-item-notes");
+      const anchor = notesEl || row.querySelector(".sprint-item-title");
+      if (anchor) anchor.parentNode.insertBefore(textarea, anchor.nextSibling);
+      else row.appendChild(textarea);
+    }
+    textarea.focus();
+    const save = async () => {
+      const lines = textarea.value.split("\n").map((s3) => s3.trim()).filter(Boolean);
+      try {
+        await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ touches_resources: lines.length ? lines : null })
+        });
+        await refreshSprintSurfaces(projectId);
+      } catch (e3) {
+        toast(`Save failed: ${e3.message}`, true);
+        cancel();
+      }
+    };
+    const cancel = () => {
+      if (existingEl) textarea.replaceWith(existingEl);
+      else textarea.remove();
+    };
+    textarea.onkeydown = (e3) => {
+      if (e3.key === "Escape") {
+        e3.preventDefault();
+        cancel();
+      }
+      if (e3.key === "Enter" && (e3.ctrlKey || e3.metaKey)) {
+        e3.preventDefault();
+        save();
+      }
+    };
+    textarea.onblur = () => setTimeout(() => {
+      if (!row.contains(document.activeElement)) save();
+    }, 150);
+  }
+  async function resourceChipClick(projectId, resourceId) {
+    const existing = document.getElementById("resource-chip-popover");
+    if (existing) existing.remove();
+    let items = [];
+    try {
+      items = await api(`/projects/${projectId}/resources/sprint-items?resource=${encodeURIComponent(resourceId)}`);
+    } catch (e3) {
+      toast(`Lookup failed: ${e3.message}`, true);
+      return;
+    }
+    const pop = document.createElement("div");
+    pop.id = "resource-chip-popover";
+    pop.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--surface-0,#1a1a1a);border:1px solid var(--border);border-radius:6px;padding:12px 14px;z-index:9999;min-width:280px;max-width:480px;max-height:320px;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.6)";
+    const esc = (s3) => (s3 || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    pop.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-size:11px;font-weight:600;color:var(--text)">Sprint items touching <code style="font-size:10px">${esc(resourceId)}</code></span>
+      <button onclick="document.getElementById('resource-chip-popover')!.remove()" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px;line-height:1;padding:0 2px">\u2715</button>
+    </div>
+    ${items.length === 0 ? `<div style="font-size:10px;color:var(--muted)">No sprint items reference this resource.</div>` : items.map((it) => `<div style="font-size:10px;padding:4px 0;border-top:1px solid var(--border);color:var(--text)"><span style="color:var(--muted);margin-right:4px">${esc(it.status)}</span>${esc(it.title)}</div>`).join("")}
+  `;
+    document.body.appendChild(pop);
+    const close = (e3) => {
+      if (!pop.contains(e3.target)) {
+        pop.remove();
+        document.removeEventListener("click", close);
+      }
+    };
+    setTimeout(() => document.addEventListener("click", close), 50);
   }
   async function loadSprintNotesPanel(projectId, sessionId) {
     const section = document.getElementById(`sprint-notes-section-${projectId}`);
@@ -13607,7 +13813,7 @@ Current: ${current || "(none)"}`,
       inp.value = "";
       inp.style.borderColor = "";
       toast("Sprint item added");
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Add failed: " + e3.message, true);
     }
@@ -16141,12 +16347,28 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = '<div style="color:var(--muted);font-size:10px">Could not load runs.</div>';
     }
   }
-  async function loadQueue(projectId) {
+  function renderQueueBody(projectId) {
+    const body = document.getElementById(`queue-body-${projectId}`);
+    const panel = state.panels[projectId];
+    if (!body || !panel) return;
+    body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
+    wireQueueSectionToggles(projectId);
+    const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
+    if (moreBtn) {
+      moreBtn.onclick = () => {
+        panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
+        renderQueueBody(projectId);
+      };
+    }
+  }
+  async function loadQueue(projectId, opts = {}) {
     const body = document.getElementById(`queue-body-${projectId}`);
     if (!body) return;
     const panel = getPanelState(projectId);
     if (!panel.queueDoneLimit) panel.queueDoneLimit = QUEUE_DONE_PAGE_SIZE;
-    body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    if (!(opts && opts.quiet && body.querySelector(".queue-section"))) {
+      body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    }
     try {
       const [sessions, sprintItems] = await Promise.all([
         projectApi(projectId, `/projects/${projectId}/sessions?active_only=false`).catch(() => []),
@@ -16157,17 +16379,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const sprintPayload = sprintItems || [];
       panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : sprintPayload.items || [];
       panel.queueTotalDoneCount = Array.isArray(sprintPayload) ? panel.queueSprintItems.filter((it) => it.status === "done").length : sprintPayload.total_done_count || 0;
-      const renderCurrentQueue = () => {
-        body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
-        wireQueueSectionToggles(projectId);
-        const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
-        if (moreBtn) {
-          moreBtn.onclick = () => {
-            panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
-            renderCurrentQueue();
-          };
-        }
-      };
+      const renderCurrentQueue = () => renderQueueBody(projectId);
       renderCurrentQueue();
       loadRecentSessions(projectId, sessions || []);
       const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
@@ -17501,10 +17713,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!confirm(warn)) return;
     try {
       await api("/tasks/" + taskId, { method: "DELETE" });
+      dropTaskFromCaches(taskId);
       const row = document.getElementById("task-row-" + taskId);
       if (row) row.remove();
     } catch (e22) {
       console.error("Delete failed:", e22);
+    }
+  }
+  function dropTaskFromCaches(taskId, onlyProjectId) {
+    const ids = onlyProjectId ? [onlyProjectId] : Object.keys(state.panels);
+    for (const pid of ids) {
+      const p3 = state.panels[pid];
+      if (!p3 || !Array.isArray(p3.taskCache)) continue;
+      const before = p3.taskCache.length;
+      p3.taskCache = p3.taskCache.filter((t3) => t3.id !== taskId);
+      if (p3.taskCache.length < before) p3.taskOffset = Math.max(0, (p3.taskOffset || 0) - 1);
     }
   }
   function renderHitlRow(projectId, t3) {
@@ -17650,9 +17873,28 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
       return;
     }
+    if (event.type === "project_icon_changed") {
+      const tab = state.tabs.find((t3) => t3.id === event.project_id);
+      if (tab) tab.project = { ...tab.project, icon: event.icon || null };
+      const proj = state.projects.find((p3) => p3.id === event.project_id);
+      if (proj) proj.icon = event.icon || null;
+      renderTabs();
+      return;
+    }
+    if (event.type === "project_parent_changed") {
+      const tab = state.tabs.find((t3) => t3.id === event.project_id);
+      if (tab) tab.project = { ...tab.project, parent_project_id: event.parent_project_id || null };
+      loadProjects();
+      return;
+    }
     if (event.type === "sprint_item_updated") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+      repaintVisibleSprintViews(projectId);
+      scheduleLiveRefresh(projectId);
+      return;
+    }
+    if (event.type === "sprint_item_deleted") {
+      applySprintItemDeleted(projectId, event.item_id);
+      scheduleGoalBoardReload(projectId);
       scheduleLiveRefresh(projectId);
       return;
     }
@@ -17660,28 +17902,47 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       refreshGoal(projectId);
       return;
     }
-    if (event.type === "session_started") {
+    if (event.type === "session_started" || event.type === "session_updated") {
       const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId, { quiet: true });
       scheduleLiveRefresh(projectId);
+      refreshSessions(projectId);
       return;
     }
-    if (event.type === "sprint_item_added") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+    if (event.type === "sprint_item_added" || event.type === "sprint_items_fanned_out") {
+      repaintVisibleSprintViews(projectId);
       scheduleLiveRefresh(projectId);
       refreshProjectCountBadges(projectId);
       return;
     }
-    if (event.type === "note_added") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "notes") loadNotesTab(projectId);
-      refreshProjectCountBadges(projectId);
+    if (event.type === "note_added" || event.type === "note_updated" || event.type === "note_deleted") {
+      _debounceRepaint(`notes:${projectId}`, () => {
+        const panel2 = state.panels[projectId];
+        if (panel2 && panel2.activeVtab === "notes") loadNotesTab(projectId);
+        refreshProjectCountBadges(projectId);
+      });
       return;
     }
-    if (event.type === "decision_pinned") {
-      if (state.panels[projectId]) loadPinnedDecisions(projectId);
-      refreshProjectCountBadges(projectId);
+    if (event.type === "decision_pinned" || event.type === "decision_updated" || event.type === "decision_deleted") {
+      _debounceRepaint(`decisions:${projectId}`, () => {
+        if (state.panels[projectId]) loadPinnedDecisions(projectId);
+        refreshProjectCountBadges(projectId);
+      });
+      return;
+    }
+    if (event.type === "insight_added") {
+      const panel2 = state.panels[projectId];
+      if (panel2 && panel2.activeVtab === "insights") loadInsightsTab(projectId);
+      return;
+    }
+    if (event.type === "task_deleted") {
+      dropTaskFromCaches(event.task_id, projectId);
+      const panel2 = state.panels[projectId];
+      if (panel2) {
+        renderTasks(projectId);
+        if (panel2.activeVtab === "queue") updateLiveFeed(projectId);
+      }
+      scheduleLiveRefresh(projectId);
       return;
     }
     if (event.type === "hitl_filed") {
@@ -17872,39 +18133,6 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   })();
   var _sprintBoardReloaders = {};
   var _sprintSelectSyncers = {};
-  async function _deleteSprintItem(projectId, itemId) {
-    if (!confirm("Remove this sprint item?")) return;
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Delete sprint item failed:", e3);
-    }
-  }
-  async function _sprintAction(projectId, itemId, action) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/${action}`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Sprint action failed:", action, e3);
-    }
-  }
-  async function completeSprintItem(projectId, itemId) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/complete`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Complete sprint item failed:", e3);
-    }
-  }
-  async function failSprintItem(projectId, itemId) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/fail`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Fail sprint item failed:", e3);
-    }
-  }
   document.getElementById("ez-create-btn").onclick = async () => {
     const nameEl = document.getElementById("ez-project-name");
     const humanEl = document.getElementById("ez-human-name");
@@ -18051,7 +18279,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, flattenHierarchy, eligibleParents, state });
+    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state });
   } catch (e3) {
   }
 })();

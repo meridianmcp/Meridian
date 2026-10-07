@@ -235,4 +235,10 @@ async def delete_task_endpoint(task_id: str, request: Request) -> Response:
         await _require_project_in_scope(request, existing["project_id"])
     await db.execute("DELETE FROM task_log WHERE id = ?", (task_id,))
     await db.commit()
+    if existing is not None:
+        # 8a665a03 -- a hard delete used to leave every other open dashboard (and the
+        # deleting tab's own task cache) showing the row until a reload.
+        db_module._publish_project_event(
+            existing["project_id"], "task_deleted", {"task_id": task_id}
+        )
     return Response(status_code=204)
