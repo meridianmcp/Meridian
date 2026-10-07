@@ -1053,3 +1053,16 @@ select option {
   .waffle-slot { padding-left: 52px; }
   .topbar > .tabs { padding-left: 0; }
 }
+
+/* 90952bad - room for the fixed demo banner. /demo's banner is position:fixed, so it
+   used to paint over the top of the app: on a phone it wraps to ~76px and covered the
+   hamburger and the waffle button completely (a click landed on the banner). The
+   template publishes the banner's measured height as --demo-banner-h; reserve exactly
+   that much above the app (padding keeps .app at 100vh, so nothing scrolls) and move the
+   fixed phone drawer and its hamburger down with it. The variable exists only on /demo,
+   so on every other page each rule below resolves to the old value (0px). */
+.app { padding-top: var(--demo-banner-h, 0px); }
+@media (max-width: 768px) {
+  .sidebar { top: var(--demo-banner-h, 0px); }
+  #sidebar-toggle { top: calc(var(--demo-banner-h, 0px) + 10px); }
+}

@@ -1346,3 +1346,78 @@ def test_playwright_ux_tests_open_a_collapsed_group_before_waiting_for_its_butto
     assert not raw_clicks, "a UX test clicks a .vtab-btn directly; use _open_vtab(page, tab).click()"
     for tab in ("sessions", "rewind", "documents", "live"):
         assert f'_open_vtab(page, "{tab}")' in src, f"UX test for the {tab} vtab no longer opens its group first"
+
+
+# ---------------------------------------------------------------------------
+# 90952bad - the fixed /demo banner must not cover the launcher or the hamburger
+# ---------------------------------------------------------------------------
+
+
+def test_demo_page_publishes_the_banner_height_and_other_pages_do_not(client):
+    """/demo's banner is position:fixed and wraps to ~76px on a phone, where it used
+    to sit on top of the hamburger and the waffle button (a tap landed on the
+    banner). The page now publishes the banner's measured height as --demo-banner-h,
+    re-measuring on resize, load, web-font arrival and ResizeObserver; non-demo
+    pages must not carry the banner, its script or the variable."""
+    demo = client.get("/demo")
+    assert demo.status_code == 200
+    text = demo.text
+    banner = text.index('id="demo-banner"')
+    script_start = text.index("<script>(function(){var b=document.getElementById('demo-banner')", banner)
+    script = text[script_start : text.index("</script>", script_start)]
+    assert script_start < text.index("window.MERIDIAN_DEMO_MODE"), "the height must be set before the app is laid out"
+    assert "--demo-banner-h" in script
+    assert "Math.ceil(b.getBoundingClientRect().height)" in script, "round UP: a floor would leave a sub-pixel strip covered"
+    for trigger in ("'resize'", "'load'", "'loadingdone'", "new ResizeObserver"):
+        assert trigger in script, f"the banner height is not re-measured on {trigger}"
+
+    plain = client.get("/dashboard")
+    assert plain.status_code == 200
+    assert "--demo-banner-h" not in plain.text and "demo-banner" not in plain.text
+
+
+def test_app_reserves_the_demo_banner_height_with_a_zero_fallback(css):
+    """The reservation is padding on .app (so it stays 100vh and nothing scrolls),
+    plus moving the fixed phone drawer and its hamburger down by the same amount.
+    Every rule falls back to 0px, so a page without the variable is unchanged."""
+    import re
+
+    start = css.index("room for the fixed demo banner")
+    block = css[start:]
+    assert re.search(r"\.app\s*\{\s*padding-top:\s*var\(--demo-banner-h,\s*0px\);\s*\}", block)
+    mobile = block[block.index("@media (max-width: 768px)") :]
+    assert re.search(r"\.sidebar\s*\{\s*top:\s*var\(--demo-banner-h,\s*0px\);\s*\}", mobile)
+    assert re.search(r"#sidebar-toggle\s*\{\s*top:\s*calc\(var\(--demo-banner-h,\s*0px\)\s*\+\s*10px\);\s*\}", mobile)
+    # The original declarations are untouched: the override rules only add the offset.
+    assert re.search(r"\.app\s*\{\s*display:\s*grid;[^}]*height:\s*100vh;", css)
+    assert re.search(r"#sidebar-toggle\s*\{[^}]*top:\s*10px;", css)
+
+
+def test_js_demo_banner_does_not_pad_when_the_page_banner_reserves_room():
+    """dashboard.ts's own 22px 'Preview mode' bar sits UNDER the server-rendered
+    banner on /demo. Its inline body padding would stack 22px of dead space on top of
+    the room .app already reserves for that banner, so it pads only when
+    #demo-banner is absent (the /dashboard page running with MERIDIAN_DEMO set)."""
+    dash = _static_text("dashboard.ts").replace(chr(13) + chr(10), chr(10))
+    start = dash.index("b.id = 'demo-mode-banner';")
+    block = dash[start : dash.index("resumeDemoTour();", start)]
+    guard = block.index("if (!document.getElementById('demo-banner')) {")
+    pad = block.index("document.body.style.paddingTop")
+    assert guard < pad, "the 22px padding must sit inside the no-page-banner guard"
+    # The tour still resumes from the same place regardless of the guard.
+    assert "resumeDemoTour();" in dash[start : start + 3000]
+
+
+def test_waffle_playwright_test_keeps_the_demo_banner_and_hit_tests_the_controls():
+    """The first version of the launcher's Playwright test deleted #demo-banner before
+    measuring, which hid the covered-button bug. It must keep the real banner and
+    hit-test the button and hamburger at phone widths."""
+    from pathlib import Path
+
+    src = (Path(__file__).parent / "test_demo_ux.py").read_text(encoding="utf-8")
+    start = src.index("def test_waffle_launcher_stays_in_viewport_and_navigates")
+    body = src[start : src.index("def test_subproject_hierarchy_ui", start)]
+    assert "'demo-banner'" not in body.split("page.evaluate(")[1], "the demo banner must not be removed"
+    assert "elementFromPoint" in body and "--demo-banner-h" in body
+    for width in ("(375, 812)", "(320, 640)", "(768, 900)", "(1280, 800)"):
+        assert width in body, f"the banner hit-test no longer runs at {width}"

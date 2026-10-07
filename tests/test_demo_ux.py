@@ -1308,24 +1308,67 @@ def test_waffle_launcher_stays_in_viewport_and_navigates(demo_client):
     navigates exactly like clicking the rail button: it reveals the tile's collapsed
     rail group and makes that tab active. Notes lives in the Content group, which
     starts collapsed, so this also proves the collapsed default does not strand a
-    programmatic/launcher navigation."""
+    programmatic/launcher navigation.
+
+    The demo banner is deliberately LEFT IN PLACE: it is position:fixed and wraps to
+    ~76px on a phone, and before the --demo-banner-h reservation it painted over the
+    hamburger and the launcher so a tap landed on the banner. The hit-test below
+    (elementFromPoint at the button's centre and two inner corners) fails if any
+    part of the control is covered again; only the onboarding tour, which is
+    modal by design, is dismissed."""
     from meridian import server as server_module
 
     with sync_playwright() as p:
         server, _thread, port = _start_live_server(server_module.app)
         try:
             browser = p.chromium.launch()
-            for width, height in ((1280, 800), (320, 640)):
+            for width, height in ((1280, 800), (768, 900), (375, 812), (320, 640)):
                 page = browser.new_page(viewport={"width": width, "height": height})
                 page.goto(f"http://127.0.0.1:{port}/demo", wait_until="domcontentloaded")
                 page.wait_for_timeout(2500)
-                # The fixed demo banner wraps to several lines on a 320px phone and then
-                # covers the top bar (and the hamburger): unrelated to the launcher.
                 page.evaluate(
-                    "() => { for (const id of ['demo-onboarding-overlay','demo-tour-tooltip','demo-tour-backdrop','demo-banner']) { const el = document.getElementById(id); if (el) el.remove(); } }"
+                    "() => { for (const id of ['demo-onboarding-overlay','demo-tour-tooltip','demo-tour-backdrop']) { const el = document.getElementById(id); if (el) el.remove(); } }"
                 )
 
                 page.wait_for_selector("#waffle-btn", timeout=8000)
+                assert page.query_selector("#demo-banner") is not None, "this test must run with the real demo banner"
+                reserved = page.evaluate(
+                    """() => {
+                        const banner = document.getElementById('demo-banner').getBoundingClientRect();
+                        const hit = (sel) => {
+                            const el = document.querySelector(sel);
+                            const r = el.getBoundingClientRect();
+                            if (!r.width) return { rendered: false };
+                            // centre, two inner corners and the top/bottom edges: a banner that
+                            // only overlaps the top few pixels (desktop, before the fix) still counts
+                            const points = [[0.5, 0.5], [0.25, 0.25], [0.75, 0.75], [0.5, 0.1], [0.5, 0.9]];
+                            const covered = points.filter(([fx, fy]) => {
+                                const top = document.elementFromPoint(r.left + r.width * fx, r.top + r.height * fy);
+                                return !(top === el || el.contains(top));
+                            }).length;
+                            return { rendered: true, covered, top: r.top };
+                        };
+                        return {
+                            bannerBottom: banner.bottom,
+                            varPx: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--demo-banner-h')),
+                            topbarTop: document.getElementById('topbar').getBoundingClientRect().top,
+                            appBottom: document.querySelector('.app').getBoundingClientRect().bottom,
+                            scrollH: document.documentElement.scrollHeight,
+                            waffle: hit('#waffle-btn'),
+                            hamburger: hit('#sidebar-toggle'),
+                        };
+                    }"""
+                )
+                # What a user feels first: every probed point of the controls is theirs to click.
+                assert reserved["waffle"]["covered"] == 0, f"{width}px: the banner covers the waffle button: {reserved}"
+                if width <= 768:  # the hamburger exists only on phones/tablets
+                    assert reserved["hamburger"]["rendered"], f"{width}px: hamburger missing: {reserved}"
+                    assert reserved["hamburger"]["covered"] == 0, f"{width}px: the banner covers the hamburger: {reserved}"
+                # Why: the app starts below the banner, ends inside the viewport, and the
+                # published height is current (never smaller than the banner it measures).
+                assert reserved["topbarTop"] >= reserved["bannerBottom"] - 0.5, f"{width}px: top bar is under the banner: {reserved}"
+                assert reserved["appBottom"] <= height + 0.5 and reserved["scrollH"] <= height, f"{width}px: app overflows the viewport: {reserved}"
+                assert reserved["varPx"] >= reserved["bannerBottom"] - 0.5, f"{width}px: --demo-banner-h is stale: {reserved}"
                 assert page.get_attribute("#waffle-btn", "aria-expanded") == "false"
                 page.click("#waffle-btn")
                 page.wait_for_selector("#waffle-popover:not([hidden])", timeout=3000)

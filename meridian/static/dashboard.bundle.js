@@ -11578,7 +11578,9 @@ ${n2.tags || ""}`.toLowerCase();
         b2.style = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:4px 12px;font-size:11px;font-family:inherit;letter-spacing:0.02em";
         b2.innerHTML = 'Preview mode \u2014 read only \xB7 <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in \u2192</a>';
         document.body.prepend(b2);
-        document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 22 + "px";
+        if (!document.getElementById("demo-banner")) {
+          document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 22 + "px";
+        }
         if (!_demoTourDone2()) {
           resumeDemoTour();
         }

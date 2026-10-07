@@ -1729,7 +1729,15 @@ async function loadServerConfig() {
 
       document.body.prepend(b);
 
-      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 22) + 'px';
+      // 90952bad — /demo already carries the server-rendered #demo-banner, which sits on
+      // top of this one and reserves its own measured room through --demo-banner-h
+      // (dashboard.css). Padding here too would leave a 22px dead strip under it, so
+      // only a page without that banner pads for this one.
+      if (!document.getElementById('demo-banner')) {
+
+        document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 22) + 'px';
+
+      }
 
       // Demo onboarding overlay — self-guards once the tour is finished
 
