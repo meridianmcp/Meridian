@@ -130,13 +130,13 @@
   }
   var _toastTimer;
   function toast2(msg, isError = false) {
-    const el2 = document.getElementById("toast");
-    if (!el2) return;
-    el2.textContent = msg;
-    el2.classList.toggle("error", isError);
-    el2.classList.add("show");
+    const el3 = document.getElementById("toast");
+    if (!el3) return;
+    el3.textContent = msg;
+    el3.classList.toggle("error", isError);
+    el3.classList.add("show");
     clearTimeout(_toastTimer);
-    _toastTimer = setTimeout(() => el2.classList.remove("show"), 2600);
+    _toastTimer = setTimeout(() => el3.classList.remove("show"), 2600);
   }
   function escapeHtml2(s3) {
     const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -401,8 +401,8 @@
       '[id^="codex-regen-goal-"]'
     ];
     selectors.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((el2) => {
-        el2.style.display = "none";
+      document.querySelectorAll(sel).forEach((el3) => {
+        el3.style.display = "none";
       });
     });
     const writeBtnSelectors = [
@@ -437,12 +437,12 @@
     });
   }
   function showDemoReadonlyToast2() {
-    const el2 = document.getElementById("toast");
-    if (!el2) return;
-    el2.innerHTML = 'Read-only demo \u2014 <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access \u2192</a>';
-    el2.classList.add("error", "show");
+    const el3 = document.getElementById("toast");
+    if (!el3) return;
+    el3.innerHTML = 'Read-only demo \u2014 <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access \u2192</a>';
+    el3.classList.add("error", "show");
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => el2.classList.remove("show"), 3200);
+    toast._t = setTimeout(() => el3.classList.remove("show"), 3200);
   }
   function showDemoOnboardingOverlay2() {
     if (document.getElementById("demo-onboarding-overlay")) return;
@@ -1783,9 +1783,9 @@
 
              onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">\u2715</button>
 
-           <button class="sprint-btn sprint-btn-push" title="Push to next version"
-
-             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u2192</button>
+           <button class="sprint-btn sprint-btn-push" title="Move to the next version, pick one, or defer" aria-label="Move to another version" aria-haspopup="dialog"
+             data-act="move-version" data-item-id="${escapeHtml(it.id)}"
+             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this)">\u2192</button>
 
            ${canEdit ? editBtn : ""}
 
@@ -1975,9 +1975,9 @@
 
           onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">\u2715</button>
 
-        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Push to next version"
-
-          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u2192</button>
+        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Move to the next version, pick one, or defer" aria-label="Move to another version" aria-haspopup="dialog"
+          data-act="move-version" data-item-id="${escapeHtml(it.id)}"
+          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this)">\u2192</button>
 
       </div>` : "";
       const isBackburner = ["pushed", "skipped"].includes(it.status);
@@ -1990,7 +1990,7 @@
           onclick="sprintArchive('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u{1F5D1}</button>
 
       </div>` : "";
-      return `<div class="queue-item" data-bb-title="${escapeHtml((it.title || "").toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || "").toLowerCase())}">
+      return `<div class="queue-item" data-item-id="${escapeHtml(it.id || "")}" data-bb-title="${escapeHtml((it.title || "").toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || "").toLowerCase())}">
 
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
 
@@ -2584,8 +2584,8 @@
       `tunnel-plugins-section-${projectId}`
       // tunnel plugin config
     ].forEach((id) => {
-      const el2 = document.getElementById(id);
-      if (el2) el2.style.display = "none";
+      const el3 = document.getElementById(id);
+      if (el3) el3.style.display = "none";
     });
     const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
     if (inviteForm) inviteForm.style.display = "none";
@@ -2638,8 +2638,8 @@
       link.onclick = (e3) => {
         e3.preventDefault();
         const expanded = link.dataset.expanded === "1";
-        grid.querySelectorAll("[data-connect-platform]").forEach((el2) => {
-          el2.style.display = expanded ? el2.dataset.connectPlatform === os ? "" : "none" : "";
+        grid.querySelectorAll("[data-connect-platform]").forEach((el3) => {
+          el3.style.display = expanded ? el3.dataset.connectPlatform === os ? "" : "none" : "";
         });
         link.dataset.expanded = expanded ? "" : "1";
         link.textContent = expanded ? "Show other platforms" : "Show detected platform only";
@@ -2647,8 +2647,8 @@
       grid.insertAdjacentElement("afterend", link);
     });
   }
-  function _classifySettingsSection(el2, projectId) {
-    const id = el2 && el2.id || "";
+  function _classifySettingsSection(el3, projectId) {
+    const id = el3 && el3.id || "";
     const has = (frag) => id.indexOf(frag) !== -1;
     if (has("workspace-section")) return "workspace";
     if (has("settings-account-card") || has("settings-account-danger") || has("settings-grp-aw") || has("settings-grp-blog") || has("members-section") || has("fs-mcp-section") || has("tunnel-plugins") || has("github-card")) return "account";
@@ -2747,8 +2747,8 @@
       btn.onclick = () => _activateSettingsTab(projectId, key);
       bar.appendChild(btn);
     });
-    Array.from(body.children).forEach((el2) => {
-      panes[_classifySettingsSection(el2, projectId)].appendChild(el2);
+    Array.from(body.children).forEach((el3) => {
+      panes[_classifySettingsSection(el3, projectId)].appendChild(el3);
     });
     body.appendChild(bar);
     TABS.forEach(([key]) => body.appendChild(panes[key]));
@@ -4956,44 +4956,44 @@ project_id = "${displayPid}"`;
           };
           const loaded = { relationships: false, proposals: false, artifacts: false };
           async function loadRelationships() {
-            const el2 = panels.relationships;
-            if (!el2) return;
+            const el3 = panels.relationships;
+            if (!el3) return;
             try {
               const data = await api("/control-plane/relationships");
               const rows = buildRelationshipRows(data.scope, data.projects || []);
-              el2.innerHTML = rows.length ? rows.map((r3) => `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);padding-left:${r3.depth * 14}px"><span>${r3.depth ? "\u21B3 " : ""}${escapeHtml(displaySafe(r3.project.name || r3.project.id))}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(r3.scopeLabel)}</span></div>`).join("") : '<div style="color:var(--muted)">No projects visible in this scope.</div>';
+              el3.innerHTML = rows.length ? rows.map((r3) => `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);padding-left:${r3.depth * 14}px"><span>${r3.depth ? "\u21B3 " : ""}${escapeHtml(displaySafe(r3.project.name || r3.project.id))}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(r3.scopeLabel)}</span></div>`).join("") : '<div style="color:var(--muted)">No projects visible in this scope.</div>';
             } catch (e3) {
-              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+              el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
           }
           async function loadProposals() {
-            const el2 = panels.proposals;
-            if (!el2) return;
+            const el3 = panels.proposals;
+            if (!el3) return;
             try {
               const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=20`);
               const items = data.items || [];
-              el2.innerHTML = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
+              el3.innerHTML = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
             } catch (e3) {
-              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+              el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
           }
           async function loadArtifacts() {
-            const el2 = panels.artifacts;
-            if (!el2) return;
+            const el3 = panels.artifacts;
+            if (!el3) return;
             try {
               const data = await api("/control-plane/artifacts?limit=50");
               if (isArtifactsUnavailable(data)) {
-                el2.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : "Not available.")}</div>`;
+                el3.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : "Not available.")}</div>`;
                 return;
               }
               const items = data.items || [];
-              el2.innerHTML = items.length ? items.map((rec) => {
+              el3.innerHTML = items.length ? items.map((rec) => {
                 const health = classifyArtifactHealth(rec);
                 const ident = displaySafe(rec.path || rec.run_id || rec.artifact_id || "(unknown)");
                 return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)"><span>[${escapeHtml(rec.record_kind)}] ${escapeHtml(ident)}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(health)}</span></div>`;
               }).join("") : '<div style="color:var(--muted)">No run manifests, provenance records, or registered artifacts found.</div>';
             } catch (e3) {
-              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+              el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
           }
           const loaders = {
@@ -5265,7 +5265,7 @@ project_id = "${displayPid}"`;
             </div>`;
               }).join("");
               if (_guest) {
-                listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach((el2) => el2.remove());
+                listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach((el3) => el3.remove());
               }
               listEl.querySelectorAll("select.member-role-select").forEach((sel) => {
                 sel.dataset.prev = sel.value;
@@ -5949,8 +5949,8 @@ project_id = "${displayPid}"`;
             [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet2("unix", needsAuth)
           };
           Object.entries(snippets).forEach(([id, text]) => {
-            const el2 = document.getElementById(id);
-            if (el2) el2.textContent = text;
+            const el3 = document.getElementById(id);
+            if (el3) el3.textContent = text;
           });
           const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
           if (statusEl) {
@@ -6215,10 +6215,10 @@ project_id = "${displayPid}"`;
           const inp = document.getElementById(`ntfy-url-${projectId}`);
           const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
           const testBtn = document.getElementById(`ntfy-test-${projectId}`);
-          [inp, saveBtn, testBtn].forEach((el2) => {
-            if (el2) {
-              el2.disabled = false;
-              el2.style.opacity = "1";
+          [inp, saveBtn, testBtn].forEach((el3) => {
+            if (el3) {
+              el3.disabled = false;
+              el3.style.opacity = "1";
             }
           });
         };
@@ -7699,17 +7699,17 @@ ${n2.tags || ""}`.toLowerCase();
       for (const f4 of g2.findings) html += _findingRow(f4);
     }
     target.innerHTML = html;
-    target.querySelectorAll(".review-copy-locator-btn").forEach((el2) => {
-      el2.addEventListener("click", () => {
-        const txt = el2.getAttribute("data-locator") || "";
+    target.querySelectorAll(".review-copy-locator-btn").forEach((el3) => {
+      el3.addEventListener("click", () => {
+        const txt = el3.getAttribute("data-locator") || "";
         try {
           navigator.clipboard.writeText(txt);
         } catch (_2) {
         }
-        const prev = el2.textContent;
-        el2.textContent = "Copied \u2713";
+        const prev = el3.textContent;
+        el3.textContent = "Copied \u2713";
         setTimeout(() => {
-          el2.textContent = prev || "Copy Word Ctrl+F text";
+          el3.textContent = prev || "Copy Word Ctrl+F text";
         }, 1500);
       });
     });
@@ -7730,8 +7730,8 @@ ${n2.tags || ""}`.toLowerCase();
   }
   function _selectedJournalFor(root, did) {
     let value = "";
-    root.querySelectorAll(".doc-review-journal-select").forEach((el2) => {
-      if (el2.getAttribute("data-did") === did) value = el2.value || "";
+    root.querySelectorAll(".doc-review-journal-select").forEach((el3) => {
+      if (el3.getAttribute("data-did") === did) value = el3.value || "";
     });
     return value;
   }
@@ -8987,7 +8987,7 @@ ${n2.tags || ""}`.toLowerCase();
   }
   function filterCyElements(elements, enabled) {
     return elements.filter(
-      (el2) => el2.group === "nodes" || enabled.has(el2.data.etype)
+      (el3) => el3.group === "nodes" || enabled.has(el3.data.etype)
     );
   }
   function mountCytoscapeGraph(container, elements, opts = {}) {
@@ -9796,6 +9796,374 @@ ${n2.tags || ""}`.toLowerCase();
     return { revealGroupForTab };
   }
 
+  // meridian/static/dashboard-versions.ts
+  var MAX_VERSION_LENGTH = 64;
+  var MAX_COMPONENT_DIGITS = 9;
+  var VERSION_RE = /^([vV]?)([0-9]+(?:\.[0-9]+)*)(\.[xX])?$/;
+  var ASCII_WS_ENDS = /^[ \t\r\n]+|[ \t\r\n]+$/g;
+  function nextVersion(version) {
+    if (typeof version !== "string") return null;
+    const text = version.replace(ASCII_WS_ENDS, "");
+    if (!text || text.length > MAX_VERSION_LENGTH) return null;
+    const m3 = VERSION_RE.exec(text);
+    if (!m3) return null;
+    const parts = m3[2].split(".");
+    if (parts.some((p3) => p3.length > MAX_COMPONENT_DIGITS)) return null;
+    const last = parts[parts.length - 1];
+    let bumped = String(parseInt(last, 10) + 1);
+    if (last.length > 1 && last[0] === "0") bumped = bumped.padStart(last.length, "0");
+    parts[parts.length - 1] = bumped;
+    const result = m3[1] + parts.join(".") + (m3[3] || "");
+    return result.length <= MAX_VERSION_LENGTH ? result : null;
+  }
+  var FORBIDDEN_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}]/u;
+  function validateVersionLabel(value) {
+    if (typeof value !== "string") return { ok: false, error: "Enter a version." };
+    const label = value.replace(ASCII_WS_ENDS, "");
+    if (!label) return { ok: false, error: "Enter a version." };
+    if (Array.from(label).length > MAX_VERSION_LENGTH) {
+      return { ok: false, error: `A version can be at most ${MAX_VERSION_LENGTH} characters.` };
+    }
+    if (FORBIDDEN_CHARS.test(label.replace(/ /g, ""))) {
+      return { ok: false, error: "A version cannot contain control or invisible characters." };
+    }
+    return { ok: true, label };
+  }
+  function versionKey(label) {
+    const m3 = VERSION_RE.exec(label.replace(ASCII_WS_ENDS, ""));
+    return m3 ? m3[2].split(".").map((p3) => parseInt(p3, 10)) : null;
+  }
+  function compareVersionLabels(a3, b2) {
+    const ka = versionKey(a3);
+    const kb = versionKey(b2);
+    if (ka && kb) {
+      const n2 = Math.max(ka.length, kb.length);
+      for (let i3 = 0; i3 < n2; i3++) {
+        const d3 = (ka[i3] ?? 0) - (kb[i3] ?? 0);
+        if (d3 !== 0) return d3;
+      }
+      return a3.localeCompare(b2);
+    }
+    if (ka) return -1;
+    if (kb) return 1;
+    return a3.localeCompare(b2);
+  }
+  function collectBoardVersions(items, excludeVersion) {
+    const seen = /* @__PURE__ */ new Set();
+    for (const it of items || []) {
+      const v3 = typeof it?.version === "string" ? it.version.trim() : "";
+      if (v3 && v3 !== (excludeVersion || "").trim()) seen.add(v3);
+    }
+    return Array.from(seen).sort(compareVersionLabels);
+  }
+  function describeMoveError(err) {
+    if (err && err.message === "demo_readonly") return "The demo is read-only.";
+    const raw = err && typeof err.responseText === "string" ? err.responseText : "";
+    if (raw) {
+      try {
+        const detail = JSON.parse(raw)?.detail;
+        if (typeof detail === "string" && detail) return detail;
+        if (detail && typeof detail.message === "string") return detail.message;
+        if (Array.isArray(detail) && typeof detail[0]?.msg === "string") return detail[0].msg;
+      } catch {
+      }
+    }
+    return err && err.message ? String(err.message) : "The request failed.";
+  }
+  function isNextUnavailableError(err) {
+    if (!err || err.status !== 422 || typeof err.responseText !== "string") return false;
+    try {
+      return JSON.parse(err.responseText)?.detail?.code === "next_version_unavailable";
+    } catch {
+      return false;
+    }
+  }
+  function computePopoverPosition(anchor, size, viewport, gap = 6, margin = 8) {
+    const clamp = (v3, lo, hi) => Math.max(lo, Math.min(v3, Math.max(lo, hi)));
+    if (!anchor) {
+      return {
+        left: clamp((viewport.width - size.width) / 2, margin, viewport.width - size.width - margin),
+        top: clamp((viewport.height - size.height) / 2, margin, viewport.height - size.height - margin)
+      };
+    }
+    const left = clamp(anchor.right - size.width, margin, viewport.width - size.width - margin);
+    let top = anchor.bottom + gap;
+    if (top + size.height > viewport.height - margin) {
+      const above = anchor.top - gap - size.height;
+      if (above >= margin) top = above;
+    }
+    return { left, top: clamp(top, margin, viewport.height - size.height - margin) };
+  }
+  var VERSION_POPOVER_CLASS = "version-move-popover";
+  var openPopover = null;
+  function closeVersionMovePopover() {
+    if (!openPopover) return false;
+    openPopover.close();
+    return true;
+  }
+  function openVersionMovePopoverItemId() {
+    return openPopover ? openPopover.itemId : null;
+  }
+  function el2(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== void 0) node.textContent = text;
+    return node;
+  }
+  function openVersionMovePopover(opts) {
+    closeVersionMovePopover();
+    const { itemId, itemTitle, currentVersion, boardVersions, anchor } = opts;
+    const next = nextVersion(currentVersion);
+    const uid = `vmp-${Math.random().toString(36).slice(2, 8)}`;
+    const pop = el2("div", VERSION_POPOVER_CLASS);
+    pop.setAttribute("role", "dialog");
+    pop.setAttribute("aria-modal", "false");
+    pop.setAttribute("aria-label", "Move sprint item to a version");
+    pop.dataset.itemId = itemId;
+    const head = el2("div", "vmp-head");
+    const title = el2("span", "vmp-title", itemTitle || "Sprint item");
+    title.title = itemTitle || "";
+    const closeBtn = el2("button", "vmp-close", "\u2715");
+    closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "Close");
+    head.append(title, closeBtn);
+    const cur = el2("div", "vmp-current");
+    cur.append("Now in ");
+    cur.append(el2("code", "", currentVersion || "(no version)"));
+    const nextBtn = el2("button", "vmp-next");
+    nextBtn.type = "button";
+    nextBtn.dataset.action = "next";
+    const nextHint = el2("div", "vmp-hint");
+    nextHint.id = `${uid}-next-hint`;
+    if (next) {
+      nextBtn.textContent = `Move to ${next} (next)`;
+      nextHint.textContent = "Stays pending; only its version changes.";
+    } else {
+      nextBtn.textContent = "Move to next version";
+      nextBtn.disabled = true;
+      nextHint.textContent = currentVersion ? `No next version can be worked out from "${currentVersion}". Type one below.` : "This item has no version. Type one below.";
+    }
+    nextBtn.setAttribute("aria-describedby", nextHint.id);
+    const or = el2("div", "vmp-or", "or a specific version");
+    const row = el2("div", "vmp-row");
+    const input = el2("input", "vmp-input");
+    input.type = "text";
+    input.placeholder = "e.g. v2.5";
+    input.maxLength = MAX_VERSION_LENGTH;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.setAttribute("aria-label", "Specific version");
+    const listId = `${uid}-versions`;
+    input.setAttribute("list", listId);
+    const datalist = el2("datalist");
+    datalist.id = listId;
+    for (const v3 of boardVersions) {
+      const opt = el2("option");
+      opt.value = v3;
+      datalist.append(opt);
+    }
+    const goBtn = el2("button", "vmp-go", "Move");
+    goBtn.type = "button";
+    goBtn.dataset.action = "specific";
+    row.append(input, goBtn, datalist);
+    const sep = el2("div", "vmp-sep");
+    const deferBtn = el2("button", "vmp-defer", "Defer to backburner");
+    deferBtn.type = "button";
+    deferBtn.dataset.action = "defer";
+    const deferHint = el2("div", "vmp-hint");
+    deferHint.id = `${uid}-defer-hint`;
+    deferBtn.setAttribute("aria-describedby", deferHint.id);
+    const error = el2("div", "vmp-error");
+    error.setAttribute("role", "alert");
+    error.hidden = true;
+    pop.append(head, cur, nextBtn, nextHint, or, row, sep, deferBtn, deferHint, error);
+    const deferTarget = () => {
+      const typed = input.value.replace(ASCII_WS_ENDS, "");
+      if (typed) {
+        const c3 = validateVersionLabel(typed);
+        return c3.ok ? c3.label : null;
+      }
+      return next;
+    };
+    const refreshDeferHint = () => {
+      const t3 = deferTarget();
+      deferHint.textContent = t3 ? `Hides it in the Backburner, marked as pushed to ${t3}.` : "Type the version it is deferred to, above.";
+    };
+    refreshDeferHint();
+    const controls = [closeBtn, nextBtn, input, goBtn, deferBtn];
+    const frozenWhileBusy = [nextBtn, input, goBtn, deferBtn];
+    const showError = (msg, invalidInput = false) => {
+      error.textContent = msg;
+      error.hidden = false;
+      input.setAttribute("aria-invalid", invalidInput ? "true" : "false");
+    };
+    const clearError = () => {
+      error.textContent = "";
+      error.hidden = true;
+      input.setAttribute("aria-invalid", "false");
+    };
+    let closed = false;
+    let busy = false;
+    const onDocMouseDown = (ev) => {
+      const t3 = ev.target;
+      if (!t3 || pop.contains(t3)) return;
+      if (anchor && anchor.contains(t3)) return;
+      close();
+    };
+    const onResize = () => close();
+    const onKeyDown = (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        close();
+      } else if (ev.key === "Tab") {
+        const live = controls.filter((c3) => !c3.disabled);
+        if (!live.length) return;
+        const first = live[0];
+        const last = live[live.length - 1];
+        const active = document.activeElement;
+        if (ev.shiftKey && (active === first || !pop.contains(active))) {
+          ev.preventDefault();
+          last.focus();
+        } else if (!ev.shiftKey && (active === last || !pop.contains(active))) {
+          ev.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    function close() {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener("mousedown", onDocMouseDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("resize", onResize);
+      const hadFocus = pop.contains(document.activeElement);
+      pop.remove();
+      if (openPopover && openPopover.close === close) openPopover = null;
+      if (hadFocus) {
+        const esc = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(itemId) : itemId;
+        const target = anchor && anchor.isConnected ? anchor : document.querySelector(
+          `[data-act="move-version"][data-item-id="${esc}"]`
+        );
+        if (target) target.focus();
+      }
+    }
+    const setBusy = (on, working) => {
+      busy = on;
+      pop.setAttribute("aria-busy", on ? "true" : "false");
+      for (const c3 of frozenWhileBusy) c3.disabled = on || c3 === nextBtn && !next;
+      if (on && working) {
+        working.dataset.label = working.textContent || "";
+        working.textContent = "Working\u2026";
+      }
+      if (!on) {
+        for (const c3 of [nextBtn, goBtn, deferBtn]) {
+          if (c3.dataset.label) {
+            c3.textContent = c3.dataset.label;
+            delete c3.dataset.label;
+          }
+        }
+      }
+    };
+    const run = async (working, job) => {
+      if (busy) return;
+      clearError();
+      setBusy(true, working);
+      try {
+        await job();
+        close();
+      } catch (err) {
+        if (closed) {
+          if (opts.onError) opts.onError(describeMoveError(err));
+          return;
+        }
+        setBusy(false);
+        showError(describeMoveError(err));
+        (isNextUnavailableError(err) ? input : working).focus();
+      }
+    };
+    nextBtn.addEventListener("click", () => {
+      if (!next) return;
+      void run(nextBtn, () => opts.onMoveNext());
+    });
+    const submitSpecific = () => {
+      if (busy) return;
+      const check = validateVersionLabel(input.value);
+      if (!check.ok) {
+        showError(check.error, true);
+        input.focus();
+        return;
+      }
+      if (check.label === currentVersion) {
+        showError(`It is already in ${check.label}.`, true);
+        input.focus();
+        return;
+      }
+      void run(goBtn, () => opts.onMoveSpecific(check.label));
+    };
+    goBtn.addEventListener("click", submitSpecific);
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        submitSpecific();
+      }
+    });
+    input.addEventListener("input", () => {
+      if (!error.hidden) clearError();
+      refreshDeferHint();
+    });
+    deferBtn.addEventListener("click", () => {
+      if (busy) return;
+      const target = deferTarget();
+      if (!target) {
+        const typed = input.value.replace(ASCII_WS_ENDS, "");
+        const check = typed ? validateVersionLabel(typed) : null;
+        showError(check && !check.ok ? check.error : "Type the version it is deferred to, above.", true);
+        input.focus();
+        return;
+      }
+      void run(deferBtn, () => opts.onDefer(target));
+    });
+    closeBtn.addEventListener("click", () => close());
+    pop.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+    });
+    document.body.appendChild(pop);
+    document.addEventListener("mousedown", onDocMouseDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("resize", onResize);
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    pop.style.position = "fixed";
+    pop.style.visibility = "hidden";
+    const rect = pop.getBoundingClientRect();
+    const size = { width: rect.width || 300, height: rect.height || 220 };
+    const anchorRect = anchor ? anchor.getBoundingClientRect() : null;
+    const pos = computePopoverPosition(anchorRect, size, { width: vw, height: vh });
+    pop.style.left = `${Math.round(pos.left)}px`;
+    pop.style.top = `${Math.round(pos.top)}px`;
+    pop.style.visibility = "";
+    (next ? nextBtn : input).focus();
+    openPopover = { itemId, close };
+    return { el: pop, close };
+  }
+  function flashMovedItem(itemId, root = document) {
+    try {
+      const esc = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(itemId) : itemId;
+      const rows = root.querySelectorAll(
+        `.sprint-item-row[data-item="${esc}"], .queue-item[data-item-id="${esc}"]`
+      );
+      rows.forEach((row, i3) => {
+        row.classList.add("sprint-row-moved");
+        if (i3 === 0 && typeof row.scrollIntoView === "function") {
+          row.scrollIntoView({ block: "nearest" });
+        }
+        setTimeout(() => row.classList.remove("sprint-row-moved"), 2400);
+      });
+    } catch {
+    }
+  }
+
   // meridian/static/dashboard-folders.ts
   var FOLDER_ASSIGN_KEY = "meridian.projectFolders";
   var FOLDER_COLLAPSE_KEY = "meridian.projectFolderCollapsed";
@@ -9965,8 +10333,8 @@ ${n2.tags || ""}`.toLowerCase();
       // check-updates and update banner
     ];
     toHide.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((el2) => {
-        el2.style.display = "none";
+      document.querySelectorAll(sel).forEach((el3) => {
+        el3.style.display = "none";
       });
     });
     const ctrlRow = document.getElementById("server-controls-row");
@@ -9976,7 +10344,7 @@ ${n2.tags || ""}`.toLowerCase();
       if (connInd) connInd.style.display = "none";
       document.querySelectorAll(".conn-popup").forEach((p3) => p3.remove());
     } else {
-      document.querySelectorAll(".hosted-label").forEach((el2) => el2.remove());
+      document.querySelectorAll(".hosted-label").forEach((el3) => el3.remove());
     }
     const footer = document.querySelector(".sidebar-footer");
     if (!isHostedAdmin() && footer && !footer.querySelector(".hosted-label")) {
@@ -10224,8 +10592,8 @@ ${n2.tags || ""}`.toLowerCase();
   function showLocalServerControls() {
     if (isHostedMode() || isDemoMode()) return;
     ["#git-check-btn", "#restart-server-btn", "#stop-server-btn"].forEach((sel) => {
-      const el2 = document.querySelector(sel);
-      if (el2) el2.style.display = "";
+      const el3 = document.querySelector(sel);
+      if (el3) el3.style.display = "";
     });
   }
   var STORAGE_KEY2 = (k3) => (isDemoMode() ? "meridian_demo_" : "meridian_") + k3.replace(/^meridian[._]/, "");
@@ -10379,10 +10747,10 @@ ${n2.tags || ""}`.toLowerCase();
       item.classList.toggle("active", item.dataset.projectId === state.activeTab);
     });
   }
-  function autosizeGoalField(el2, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
-    if (!el2) return;
-    el2.style.height = "auto";
-    el2.style.height = `${Math.max(el2.scrollHeight, minPx)}px`;
+  function autosizeGoalField(el3, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
+    if (!el3) return;
+    el3.style.height = "auto";
+    el3.style.height = `${Math.max(el3.scrollHeight, minPx)}px`;
   }
   function githubIconSvg2(size = 12, color = "currentColor") {
     return `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false" style="color:${color};flex-shrink:0"><path d="${GITHUB_OCTICON_PATH}"></path></svg>`;
@@ -11657,7 +12025,7 @@ Current: ${current || "(none)"}`,
     state.activeTab = id;
     renderTabs();
     syncSidebarActiveProject();
-    document.querySelectorAll(".tab-body").forEach((el2) => el2.classList.remove("active"));
+    document.querySelectorAll(".tab-body").forEach((el3) => el3.classList.remove("active"));
     const body = document.getElementById(`tab-body-${id}`);
     if (body) body.classList.add("active");
     const empty = document.querySelector(".tab-bodies > .empty");
@@ -12942,8 +13310,8 @@ Current: ${current || "(none)"}`,
         decFormBody.style.borderColor = over ? "var(--red, #f87171)" : near ? "var(--warning, #fb923c)" : "";
         if (decFormStatus) decFormStatus.textContent = over || near ? `Body: ${len.toLocaleString()}/${limit.toLocaleString()}` : "";
       };
-      [decFormTitle, decFormBody].forEach((el2) => {
-        if (el2) el2.addEventListener("keydown", (e3) => {
+      [decFormTitle, decFormBody].forEach((el3) => {
+        if (el3) el3.addEventListener("keydown", (e3) => {
           if ((e3.ctrlKey || e3.metaKey) && e3.key === "Enter") doAddDecision();
         });
       });
@@ -13433,28 +13801,85 @@ Current: ${current || "(none)"}`,
     const q2 = (value || "").trim().toLowerCase();
     const sec = document.querySelector('.queue-section[data-section="backburner"]');
     if (!sec) return;
-    sec.querySelectorAll(".queue-item").forEach((el2) => {
-      const hit = !q2 || (el2.dataset.bbTitle || "").includes(q2) || (el2.dataset.bbGroup || "").includes(q2);
-      el2.style.display = hit ? "" : "none";
+    sec.querySelectorAll(".queue-item").forEach((el3) => {
+      const hit = !q2 || (el3.dataset.bbTitle || "").includes(q2) || (el3.dataset.bbGroup || "").includes(q2);
+      el3.style.display = hit ? "" : "none";
     });
     sec.querySelectorAll(".bb-group").forEach((g2) => {
-      const anyVisible = Array.from(g2.querySelectorAll(".queue-item")).some((el2) => el2.style.display !== "none");
+      const anyVisible = Array.from(g2.querySelectorAll(".queue-item")).some((el3) => el3.style.display !== "none");
       g2.style.display = anyVisible ? "" : "none";
     });
   }
-  async function sprintPushPrompt(projectId, itemId) {
-    const toVersion = window.prompt("Push to version (e.g. v2.0):");
-    if (!toVersion) return;
-    try {
-      await api(
-        `/projects/${projectId}/sprint-items/${itemId}/push`,
-        { method: "POST", body: JSON.stringify({ to_version: toVersion }) }
-      );
-      toast("Sprint item pushed to " + toVersion);
-      await refreshLiveTab(projectId);
-    } catch (e3) {
-      toast(`Push failed: ${e3.message}`, true);
+  async function repaintSprintViews(projectId) {
+    await Promise.allSettled([
+      refreshLiveTab(projectId),
+      document.getElementById(`queue-body-${projectId}`) ? loadQueue(projectId) : Promise.resolve(),
+      _sprintBoardReloaders[projectId] ? _sprintBoardReloaders[projectId]() : Promise.resolve()
+    ]);
+  }
+  async function sprintMoveItem(projectId, itemId, body) {
+    const out = await api(
+      `/projects/${projectId}/sprint-items/${itemId}/move`,
+      { method: "POST", body: JSON.stringify(body) }
+    );
+    if (!out || !out.item || out.item.version !== out.to_version) {
+      throw new Error("The move could not be verified. Refresh and check the item.");
     }
+    toast(out.unchanged ? `Already in ${out.to_version}` : `Moved to ${out.to_version}`);
+    void repaintSprintViews(projectId).then(() => flashMovedItem(itemId));
+    return out;
+  }
+  async function sprintDeferItem(projectId, itemId, targetVersion) {
+    await api(
+      `/projects/${projectId}/sprint-items/${itemId}/push`,
+      { method: "POST", body: JSON.stringify({ to_version: targetVersion }) }
+    );
+    toast(`Deferred to backburner (${targetVersion})`);
+    void repaintSprintViews(projectId);
+  }
+  async function sprintPushPrompt(projectId, itemId, anchor) {
+    if (openVersionMovePopoverItemId() === itemId) {
+      closeVersionMovePopover();
+      return;
+    }
+    closeVersionMovePopover();
+    let list = [];
+    try {
+      const payload = await api(`/projects/${projectId}/sprint-items`);
+      list = Array.isArray(payload) ? payload : payload && payload.items || [];
+    } catch (e3) {
+      toast(`Could not load the item: ${e3.message}`, true);
+      return;
+    }
+    const item = list.find((it) => it.id === itemId);
+    if (!item) {
+      toast("That sprint item no longer exists.", true);
+      await repaintSprintViews(projectId);
+      return;
+    }
+    const live = anchor && anchor.isConnected ? anchor : document.querySelector(`[data-act="move-version"][data-item-id="${CSS.escape(itemId)}"]`);
+    const currentVersion = item.version || "";
+    openVersionMovePopover({
+      itemId,
+      itemTitle: item.title || "",
+      currentVersion,
+      boardVersions: collectBoardVersions(list, currentVersion),
+      anchor: live instanceof HTMLElement ? live : null,
+      // expected_version makes a retried request safe: if the item moved in the
+      // meantime the server answers 409 instead of advancing it a second time.
+      onMoveNext: () => sprintMoveItem(
+        projectId,
+        itemId,
+        { next: true, expected_version: currentVersion }
+      ),
+      onMoveSpecific: (version) => sprintMoveItem(
+        projectId,
+        itemId,
+        { to_version: version, expected_version: currentVersion }
+      ),
+      onDefer: (target) => sprintDeferItem(projectId, itemId, target),
+      onError: (message) => toast(`Move failed: ${message}`, true)
+    });
   }
   async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
     event && event.stopPropagation();
@@ -14477,13 +14902,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   if (typeof window !== "undefined") window._buildCodebaseForceGraph = _buildCodebaseForceGraph;
   function _renderCodebaseGraph(containerId, packages, edges) {
     if (typeof window === "undefined" || !window.echarts) return;
-    const el2 = document.getElementById(containerId);
-    if (!el2) return;
+    const el3 = document.getElementById(containerId);
+    if (!el3) return;
     const opt = _buildCodebaseForceGraph(packages, edges, "packages");
     if (!opt) return;
     let chart;
     try {
-      chart = window.echarts.init(el2);
+      chart = window.echarts.init(el3);
     } catch (_2) {
       return;
     }
@@ -14797,18 +15222,18 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       html += `</div>`;
     }
     body.innerHTML = html;
-    body.querySelectorAll(".doc-peek-ingest-btn").forEach((el2) => {
-      el2.addEventListener("click", () => {
-        const fp = el2.getAttribute("data-fp") || "";
+    body.querySelectorAll(".doc-peek-ingest-btn").forEach((el3) => {
+      el3.addEventListener("click", () => {
+        const fp = el3.getAttribute("data-fp") || "";
         const cmd = `ingest_document(file_path="${fp}")`;
         try {
           navigator.clipboard.writeText(cmd);
         } catch (_2) {
         }
-        const prev = el2.textContent;
-        el2.textContent = "Copied \u2713";
+        const prev = el3.textContent;
+        el3.textContent = "Copied \u2713";
         setTimeout(() => {
-          el2.textContent = prev || "Ingest this";
+          el3.textContent = prev || "Ingest this";
         }, 1500);
       });
     });
@@ -15120,10 +15545,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = html;
       if (window.Chart && archCharts.length) {
         for (const c3 of archCharts) {
-          const el2 = document.getElementById(c3.id);
-          if (el2) {
+          const el3 = document.getElementById(c3.id);
+          if (el3) {
             try {
-              new Chart(el2, c3.config);
+              new Chart(el3, c3.config);
             } catch (_2) {
             }
           }
@@ -15274,8 +15699,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     });
   }
   function _removeHitlCard(id) {
-    document.querySelectorAll(`[data-hitl-id="${id}"]`).forEach((el2) => {
-      (el2.closest(".hitl-row") || el2).remove();
+    document.querySelectorAll(`[data-hitl-id="${id}"]`).forEach((el3) => {
+      (el3.closest(".hitl-row") || el3).remove();
     });
   }
   window._removeHitlCard = _removeHitlCard;
@@ -15841,15 +16266,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     render();
   }
   async function updateLiveFeed(projectId) {
-    const el2 = document.getElementById(`live-session-${projectId}`);
-    if (!el2) return;
+    const el3 = document.getElementById(`live-session-${projectId}`);
+    if (!el3) return;
     const panel = getPanelState(projectId);
     try {
       const sessions = await api(`/projects/${projectId}/sessions?active_only=true`);
       const active = sessions && sessions.filter((s3) => s3.status === "active");
       if (!active || active.length === 0) {
         panel.liveSessionId = null;
-        el2.style.display = "none";
+        el3.style.display = "none";
         return;
       }
       const sess = active[0];
@@ -15880,7 +16305,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${ageStr ? `<span style="font-size:9px;color:var(--muted);margin-left:auto">${ageStr}</span>` : ""}
       </div>`;
       }).join("");
-      el2.innerHTML = `
+      el3.innerHTML = `
 
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
 
@@ -15904,8 +16329,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
       </div>`;
       if (extraCount > 0) {
-        const toggleBtn = el2.querySelector(`#live-feed-extra-toggle-${projectId}`);
-        const extraEl = el2.querySelector(`#live-feed-extra-${projectId}`);
+        const toggleBtn = el3.querySelector(`#live-feed-extra-toggle-${projectId}`);
+        const extraEl = el3.querySelector(`#live-feed-extra-${projectId}`);
         if (toggleBtn && extraEl) {
           toggleBtn.onclick = () => {
             const open = extraEl.style.display !== "none";
@@ -15914,15 +16339,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           };
         }
       }
-      el2.style.display = "block";
+      el3.style.display = "block";
     } catch (e3) {
       panel.liveSessionId = null;
-      el2.style.display = "none";
+      el3.style.display = "none";
     }
   }
   async function loadRecentSessions(projectId, sessions = null) {
-    const el2 = document.getElementById(`recent-sessions-${projectId}`);
-    if (!el2) return;
+    const el3 = document.getElementById(`recent-sessions-${projectId}`);
+    if (!el3) return;
     try {
       const panel = getPanelState(projectId);
       const allSessions = Array.isArray(sessions) ? sessions : await api(`/projects/${projectId}/sessions?active_only=false`);
@@ -15930,10 +16355,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         (allSessions || []).filter((s3) => s3.id !== panel.liveSessionId && !isLiveSession(s3))
       ).slice(0, 5);
       if (!recent.length) {
-        el2.style.display = "none";
+        el3.style.display = "none";
         return;
       }
-      el2.innerHTML = `
+      el3.innerHTML = `
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Recent Sessions</div>
 
@@ -15975,20 +16400,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
         </div>`;
       }).join("")}`;
-      el2.querySelectorAll(".resume-session-btn").forEach((btn) => {
+      el3.querySelectorAll(".resume-session-btn").forEach((btn) => {
         btn.onclick = (event) => {
           event.stopPropagation();
           const cmd = btn.dataset.cmd || "";
           navigator.clipboard.writeText(cmd).then(() => toast("Copied start_session() to clipboard")).catch(() => toast("copy failed", true));
         };
       });
-      el2.querySelectorAll(".recent-session-timeline-btn").forEach((btn) => {
+      el3.querySelectorAll(".recent-session-timeline-btn").forEach((btn) => {
         btn.onclick = (event) => {
           event.stopPropagation();
           openTimelineForSession(projectId, btn.dataset.sessionId);
         };
       });
-      el2.querySelectorAll(".recent-session-row").forEach((row) => {
+      el3.querySelectorAll(".recent-session-row").forEach((row) => {
         row.onclick = async (evt) => {
           if (evt.target.closest(".resume-session-btn, .recent-session-timeline-btn")) return;
           const target = row.querySelector(".recent-session-tasks");
@@ -16017,14 +16442,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           if (chevron) chevron.textContent = "\u25B2";
         };
       });
-      el2.style.display = "block";
+      el3.style.display = "block";
     } catch (_2) {
-      el2.style.display = "none";
+      el3.style.display = "none";
     }
   }
   async function loadMilestones(projectId) {
-    const el2 = document.getElementById(`milestones-strip-${projectId}`);
-    if (!el2) return;
+    const el3 = document.getElementById(`milestones-strip-${projectId}`);
+    if (!el3) return;
     try {
       const all = await api(`/projects/${projectId}/sprint-items`);
       const doneStatuses = /* @__PURE__ */ new Set(["done", "skipped", "failed", "pushed"]);
@@ -16036,12 +16461,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         return bTs.localeCompare(aTs);
       });
       if (!milestones.length) {
-        el2.style.display = "none";
+        el3.style.display = "none";
         return;
       }
       const statusIcon = (s3) => s3 === "done" ? "\u2713" : s3 === "failed" ? "\u2717" : s3 === "pushed" ? "\u2192" : s3 === "skipped" ? "\u2014" : s3 === "in_progress" ? "\u25B6" : "\u25E6";
       const statusColor = (s3) => s3 === "done" ? "var(--accent-green,#34d399)" : s3 === "failed" ? "#e05" : s3 === "pushed" ? "var(--accent)" : s3 === "in_progress" ? "var(--accent)" : "var(--muted)";
-      el2.innerHTML = `
+      el3.innerHTML = `
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Completed (${milestones.length})</div>
 
@@ -16065,9 +16490,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${milestones.length > 20 ? `<span style="font-size:10px;color:var(--muted);padding:3px 4px">+${milestones.length - 20} more</span>` : ""}
 
       </div>`;
-      el2.style.display = "block";
+      el3.style.display = "block";
     } catch (_2) {
-      el2.style.display = "none";
+      el3.style.display = "none";
     }
   }
   async function loadRecentRuns(projectId) {
@@ -16390,8 +16815,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       } else if (action === "backlog") {
         await api(`/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ status: "backlog" }) });
       }
-      document.querySelectorAll('[id^="queue-body-"]').forEach((el2) => {
-        const pid = el2.id.replace("queue-body-", "");
+      document.querySelectorAll('[id^="queue-body-"]').forEach((el3) => {
+        const pid = el3.id.replace("queue-body-", "");
         loadQueue(pid);
       });
     } catch (e3) {
@@ -16887,8 +17312,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         card.querySelector(".decision-title-view").style.display = "";
         card.querySelector(".decision-edit-area").style.display = "none";
       };
-      host.querySelectorAll(".decision-body-view, .decision-title-view").forEach((el2) => {
-        el2.onclick = () => showEdit(el2.dataset.id);
+      host.querySelectorAll(".decision-body-view, .decision-title-view").forEach((el3) => {
+        el3.onclick = () => showEdit(el3.dataset.id);
       });
       const _CATS = ["TECHNICAL", "STRATEGIC", "ARCHITECTURAL", "PRODUCT", "TACTICAL", "BUSINESS", "COMPETITIVE"];
       host.querySelectorAll(".decision-cat-tag").forEach((tag) => {
@@ -17003,8 +17428,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         } else {
           api(`/projects/${projectId}/decisions-pinned?include_superseded=true`).then((all) => {
             const n2 = (all || []).filter((d3) => d3.status === "superseded").length;
-            const el2 = document.getElementById(`decisions-view-archived-${projectId}`);
-            if (el2) el2.innerHTML = n2 > 0 ? `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:true})">View archived (${n2}) \u25B8</button>` : "";
+            const el22 = document.getElementById(`decisions-view-archived-${projectId}`);
+            if (el22) el22.innerHTML = n2 > 0 ? `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:true})">View archived (${n2}) \u25B8</button>` : "";
           }).catch(() => {
           });
         }
@@ -18040,11 +18465,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     };
   })();
   function toggleExpand(id) {
-    const el2 = document.getElementById(id);
-    if (!el2) return;
-    const open = el2.style.display !== "none";
-    el2.style.display = open ? "none" : "";
-    const trigger = el2.previousElementSibling;
+    const el3 = document.getElementById(id);
+    if (!el3) return;
+    const open = el3.style.display !== "none";
+    el3.style.display = open ? "none" : "";
+    const trigger = el3.previousElementSibling;
     if (trigger) {
       const arrow = trigger.querySelector(".expand-arrow");
       if (arrow) arrow.textContent = open ? "\u25B6" : "\u25BC";

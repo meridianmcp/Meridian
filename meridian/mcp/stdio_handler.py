@@ -1956,7 +1956,11 @@ def build_mcp_server():
                     "scope creep means the item won't fit this sprint. "
                     "``to_version`` records where it was moved (e.g. 'v2.0'). "
                     "The item status becomes 'pushed'; the next sprint can "
-                    "add it fresh with add_sprint_item."
+                    "add it fresh with add_sprint_item. This DEFERS the item to "
+                    "the backburner and leaves its own version unchanged. To "
+                    "move an item to another version and keep it pending, use "
+                    "update_sprint_item(version=...) instead -- the dashboard's "
+                    "'Move to next version' does exactly that."
                 ),
                 inputSchema={
                     "type": "object",

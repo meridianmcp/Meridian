@@ -13233,6 +13233,13 @@ from .sprint_items import (  # noqa: F401
     link_sprint_item_github_issue,
     merge_sprint_items,
     move_sprint_item_to_project,
+    # 0c30b989 — move an item to another version (vs push_sprint_item = defer)
+    move_sprint_item_to_version,
+    move_sprint_items_to_version,
+    MAX_BULK_MOVE_ITEMS,
+    SPRINT_ITEM_VERSION_MOVED_AUDIT_EVENT,
+    NextVersionUnavailable,
+    SprintItemVersionConflict,
     patch_sprint_item,
     provisional_complete_sprint_item,
     push_sprint_item,
