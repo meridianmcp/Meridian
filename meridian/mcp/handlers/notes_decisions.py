@@ -1353,7 +1353,12 @@ async def handle_link_figure_caption(
             ),
         }
     try:
-        updated = await store.set_figure_caption_link(figure_id, caption_element_id)
+        # 6fe5210c (wave 2, third pass) -- bind the figure to the document resolved
+        # above (under the caller's project): the primitive used to update any
+        # figure row of the store by its bare id.
+        updated = await store.set_figure_caption_link(
+            figure_id, caption_element_id, document_id=doc_row["id"],
+        )
     except Exception as exc:  # noqa: BLE001
         return {"error": f"could not set caption link: {exc}"}
     if updated is None:
@@ -1534,7 +1539,10 @@ async def handle_link_table_caption(
             ),
         }
     try:
-        updated = await store.set_table_caption_link(table_id, caption_element_id)
+        # 6fe5210c (wave 2, third pass) -- bound to the resolved document, as above.
+        updated = await store.set_table_caption_link(
+            table_id, caption_element_id, document_id=doc_row["id"],
+        )
     except Exception as exc:  # noqa: BLE001
         return {"error": f"could not set caption link: {exc}"}
     if updated is None:

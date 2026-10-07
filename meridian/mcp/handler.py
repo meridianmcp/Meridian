@@ -25,6 +25,7 @@ from .. import db as db_module
 from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
 from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
+from . import scope_guard
 
 # CI-PERF-3B — named, overridable timeout constants (extracted from inline
 # literals scattered across the dispatch functions below) so tests can
@@ -1076,6 +1077,13 @@ async def discover_and_link_manual_issue(
     # 4. Wave-relative velocity/anomaly check — non-blocking escalation only.
     try:
         item = await db_module.get_sprint_item(db, item_id)
+        if item is not None and item.get("project_id") != project_id:
+            # 6fe5210c (wave 2, third pass) -- the row only supplies a wave label to
+            # the velocity signal, but that signal (wave label included) is written
+            # into this project's HITL context and audit row, so another project's
+            # item must never feed it. link_sprint_item_github_issue below is
+            # already bound to project_id; this read is now too.
+            item = None
         anomaly = await db_module.check_manual_issue_action_velocity(
             db, project_id, triggering_item=item,
         )
@@ -1343,6 +1351,17 @@ async def _handle_mcp_request(
     if method == "prompts/get":
         prompt_name = params.get("name", "")
         prompt_args = params.get("arguments") or {}
+        # Decision 6fe5210c (wave 2, F-M1) -- the executor-goal prompt renders a
+        # project's live pending sprint items, so prompts/get is a project-reading
+        # method exactly like tools/call and needs the same scope gate. Same
+        # opaque error as the tools/call pre-gate (-32603, no distinguishing
+        # data). A no-op, with no DB access, for an unscoped caller.
+        try:
+            await scope_guard.enforce_scoped_prompt(
+                prompt_name, prompt_args, db, scoped_project_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 -- fail closed: never render the prompt
+            return _server._jsonrpc_err(req_id, -32603, str(exc))
         try:
             messages = await _build_prompt_messages_async(prompt_name, prompt_args, db)
         except ValueError as exc:
@@ -1572,6 +1591,13 @@ async def _handle_mcp_request(
                     _exc_sid
                     and _exc_sid in _EXECUTOR_SESSIONS
                     and name not in _ACTIVITY_SKIP_TOOLS
+                    # Decision 6fe5210c — a scoped caller's refused/failed call
+                    # that merely NAMES another project's executor session must
+                    # not land a row in that session's feed (a planner reads the
+                    # feed as proof of life). Unscoped callers skip this lookup.
+                    and await scope_guard.session_in_scope(
+                        db, _exc_sid, scoped_project_ids,
+                    )
                 ):
                     await db_module.record_session_activity(
                         db, _exc_sid, name,
@@ -7219,17 +7245,6 @@ _PROJECT_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
 )
 
-#: RT-TI-003/004 — tools that mutate a note or decision by its own id and whose
-#: schema carries no project_id. tool name -> (argument holding the object id,
-#: name of the db function that loads the object with its project_id). Used by
-#: _dispatch_mcp_tool to scope-check a project-scoped caller against the
-#: OBJECT's project instead of an argument the tool does not have.
-_SCOPED_OBJECT_ID_TOOLS: "dict[str, tuple[str, str]]" = {
-    "delete_note": ("note_id", "get_project_note"),
-    "update_decision": ("decision_id", "get_pinned_decision"),
-    "archive_decision": ("decision_id", "get_pinned_decision"),
-}
-
 
 async def _resolve_project_reference(
     db: Any,
@@ -7375,6 +7390,12 @@ async def _dispatch_mcp_tool(
     # 3f47cc6e — an explicit project_id is never silently overridden by a
     # project_name that resolves elsewhere: that conflict is rejected.
     args = await _resolve_project_reference(db, args, scoped_project_ids)
+    # RT-TI-006 — never trust a caller-supplied scope list: drop it, then (for a
+    # scoped caller only) inject the real one for the discovery tools to filter on.
+    if name in ("list_projects", "get_project_by_name"):
+        args = {k: v for k, v in args.items() if k != "_scoped_project_ids"}
+        if scoped_project_ids is not None:
+            args = {**args, "_scoped_project_ids": list(scoped_project_ids)}
     # a9c041d7 — re-check tenant scope against the FINAL resolved project_id,
     # after the resolver above may have set it via project_name (or a
     # non-UUID project_id-as-name lookup). The pre-dispatch gate in
@@ -7383,28 +7404,22 @@ async def _dispatch_mcp_tool(
     # that gate and then have this resolver silently swap in the out-of-scope
     # project. Same error shape/message as the pre-check gate so callers can't
     # distinguish which layer caught it.
-    # RT-TI-006 — never trust a caller-supplied scope list: drop it, then (for a
-    # scoped caller only) inject the real one for the discovery tools to filter on.
-    if name in ("list_projects", "get_project_by_name"):
-        args = {k: v for k, v in args.items() if k != "_scoped_project_ids"}
-        if scoped_project_ids is not None:
-            args = {**args, "_scoped_project_ids": list(scoped_project_ids)}
-    if scoped_project_ids is not None:
-        _final_pid = (args.get("project_id") or "").strip()
-        if _final_pid and _final_pid not in scoped_project_ids:
-            raise ValueError("project is outside your access scope")
-        # RT-TI-003/004 — tools that act on a note or decision BY ID alone carry
-        # no project_id in their schema, so the check above sees nothing to
-        # compare. For a project-scoped caller, look the object up and require
-        # its project to be in scope (same opaque error as the gate above).
-        _by_id = _SCOPED_OBJECT_ID_TOOLS.get(name)
-        if _by_id is not None:
-            _id_key, _lookup = _by_id
-            _obj_id = str(args.get(_id_key) or "").strip()
-            if _obj_id:
-                _obj = await getattr(db_module, _lookup)(db, _obj_id)
-                if _obj is not None and _obj.get("project_id") not in scoped_project_ids:
-                    raise ValueError("project is outside your access scope")
+    #
+    # Decision 6fe5210c (wave 2) — that re-check is now one case of a single
+    # table-driven guard (meridian/mcp/scope_guard.py), a no-op with no DB
+    # access when scoped_project_ids is None. It also covers every OTHER way a
+    # call reaches a project: other *_project_id / *_project_name arguments
+    # (merge_project, set_parent_project ...), object ids with no project
+    # argument (notes, decisions, HITL requests, sessions, wave runs,
+    # proposals ...), listings that span every project when project_id is
+    # omitted, and profile-layer scope ids.
+    await scope_guard.enforce_scoped_call(
+        name, args, db, scoped_project_ids,
+        # link_figure_caption / link_table_caption bind a figure or table id to
+        # the caller's own stored document (the doc store is a separate backend,
+        # opened lazily and only for those two tools).
+        doc_store_factory=lambda: _resolve_ingest_doc_store(db, data_dir, tenant),
+    )
     _groups = (
         _handle_project_tools,
         _handle_task_tools,
@@ -7491,6 +7506,13 @@ async def _dispatch_mcp_tool(
         else:
             _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
         if _result is not _MISS:
+            # Decision 6fe5210c — a cross-project listing (list_profile_layers)
+            # cannot be narrowed by an argument: drop the rows outside a scoped
+            # caller's scope. No-op (and no DB access) for every other tool and
+            # for an unscoped caller.
+            _result = await scope_guard.filter_scoped_result(
+                name, _result, db, scoped_project_ids, args=args,
+            )
             # 8c147109 — activity heartbeat: record a compact one-liner into the
             # session_activity ring-buffer so a remote planner session can observe
             # signs of life via get_session_log even before the executor calls
