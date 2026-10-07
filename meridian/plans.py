@@ -30,6 +30,11 @@ plan                  entitlements
 ``playtester``        Pro entitlements, no Stripe relationship. See below.
 ====================  =====================================================
 
+Operators set a plan with ``tenant_plan_admin.set_tenant_plan_by_email`` (the
+``POST /admin/tenants/plan`` admin route and ``scripts/set_tenant_plan.py`` are
+thin wrappers over it); it accepts ``OPERATOR_SETTABLE_PLANS`` only. ``admin``
+is never set that way: it comes from the MERIDIAN_ADMIN_EMAILS allowlist.
+
 The limit tables themselves stay next to the code that enforces them:
 ``hosted.PLAN_LIMITS`` (compute/storage), ``_deps._TENANT_RL_PER_MINUTE``
 (Bearer-token requests per minute), ``server._WORKSPACE_MEMBER_LIMITS``
@@ -42,28 +47,39 @@ its canonical plan before any lookup.
 A person invited to exercise the hosted product. Entitlements are exactly
 those of ``pro`` (one alias, ``ENTITLEMENT_ALIASES``), but the account is never
 charged, never dunned, never churned, never trial-expired and never receives
-an overage invoice: there is no Stripe customer behind it. Usage is still
-bounded by the Pro ceilings in ``hosted.PLAN_LIMITS``. Past the compute grace
-allowance the daily overage job throttles Neon compute (the same path an
-unbilled tenant already takes) instead of metering a charge, and the owner is
-alerted by email; the throttle is lifted at the monthly reset. Consumption and
-the compute cap belong to a Neon *pool project* shared by several tenants, so
-while a paying customer lives in the same pool the job does not throttle (it
-would land on them) and only alerts the owner, at most once a month. Because
-Neon reports usage per pool project and not per tenant, such an alert can name a
-playtester whose own usage is small. Storage past the ceiling is logged and
-emailed (the existing storage path has no write-refusal step).
+an overage invoice: there is no Stripe customer behind it. Its monthly cost is
+bounded by the Pro ceilings in ``hosted.PLAN_LIMITS``: the tenant gets the
+warning at the Pro threshold and, past the compute grace allowance or the
+storage ceiling, the tenant and the owner are emailed (once a month per
+notice). Nothing is ever throttled, metered or refused for a playtester: Neon
+accounts consumption per *pool project* shared by several tenants, and the
+pool's own Neon quota is the hard stop behind the warnings.
 
-Granting it: change the plan of a tenant that has signed in at least once. A
-tenant row created with this plan before the person's first sign-in has no
-database, because sign-in only provisions one for a free-tier tenant (a plan
-that maps to Pro is assumed to be provisioned at checkout, which a playtester
-never goes through); ``POST /projects`` creates it on first use. The database
+Because that consumption is per pool, a playtester's usage cannot be told from
+its pool mates'. The usage jobs therefore never judge a billed tenant on the
+total of a pool that also holds a playtester (such a tenant is skipped and the
+skip is logged), so a playtester can never raise what a paying customer is
+billed, warned or throttled for. The cost is that a paying tenant sharing a
+pool with a playtester is not metered for overage while it does; the owner is
+emailed once a month for each tenant skipped this way, and the admin action
+reports how many billed tenants share the pool, so granting the plan to a
+tenant in an unshared pool avoids it. Pool placement does not keep the two
+apart: a playtester provisioned from scratch is placed like a Pro tenant, in the
+fullest Pro pool with room.
+
+Granting it: ``set_tenant_plan_by_email`` on a tenant that has signed in at
+least once. A tenant row created with this plan before the person's first
+sign-in has no database, because sign-in only provisions one for a free-tier
+tenant (a plan that maps to Pro is assumed to be provisioned at checkout, which
+a playtester never goes through); ``POST /projects`` creates it on first use. The database
 of a tenant that already has one stays in the pool it was provisioned into
-(free, standard or pro) whatever the plan becomes. The usage jobs poll it with
-the key of the Neon account that pool belongs to, not the plan's, so the Pro
-ceilings are still enforced there; the pool's autoscaling ceiling and
-retention are those of the pool it lives in.
+(free, standard or pro) whatever the plan becomes. The usage jobs poll a
+playtester's pool with the key of the Neon account that pool belongs to, not
+the plan's, so the Pro ceilings are still measured there; every other plan is
+polled with its own plan's key, as before. A database drop (account deletion,
+reset-provisioning, churn, dunning) always uses the pool's key, so a playtester's
+data is really removed. The pool's autoscaling ceiling and retention are those
+of the pool it lives in.
 
 An optional end date can be kept in ``tenants.inactivity_expires_at`` (NULL =
 no end date). Once it passes, ``tenant_entitlement_plan`` reports ``free`` for
@@ -74,7 +90,11 @@ expire: a playtester who goes on to pay keeps the stale date in the column, and
 it is ignored.
 
 ``is_internal`` is a separate flag (staff) and is not a plan: it keeps its own
-meaning wherever it is checked.
+meaning wherever it is checked. The boot-time backfills that set ``is_internal``
+from MERIDIAN_INTERNAL_EMAILS and ``plan='admin'`` from MERIDIAN_ADMIN_EMAILS
+skip a playtester, so an operator's grant is not undone at the next restart. The
+admin action can clear ``is_internal`` when it grants the plan (the move from
+the staff stopgap) but never sets it.
 
 Unknown plan values are never aliased and never accepted on write: every
 lookup falls through to the lowest tier and ``validate_plan`` rejects them.
@@ -116,6 +136,23 @@ UNBILLED_PLANS: frozenset[str] = frozenset({PLAYTESTER})
 # alias -> the canonical plan whose entitlements it shares.
 ENTITLEMENT_ALIASES: dict[str, str] = {PLAYTESTER: PRO}
 
+# Plans an operator may assign with tenant_plan_admin.set_tenant_plan_by_email.
+# Not 'admin' (operator accounts come from the MERIDIAN_ADMIN_EMAILS allowlist)
+# and not 'trial' (a legacy label nothing assigns any more).
+OPERATOR_SETTABLE_PLANS: frozenset[str] = frozenset({FREE, STANDARD, PRO, PLAYTESTER})
+
+# The label a person sees for each plan. Mirrors _PLAN_LABELS in
+# static/dashboard-utils.ts (a test compares the two), so the badge in the
+# dashboard and an operator's confirmation read the same.
+PLAN_LABELS: dict[str, str] = {
+    FREE: "Free Trial",
+    TRIAL: "Trial",
+    STANDARD: "Standard",
+    PRO: "Pro",
+    ADMIN: "Admin",
+    PLAYTESTER: "Playtester",
+}
+
 # Plans whose tenants.inactivity_expires_at is an end date the product acts on:
 # the free-tier trial window and a playtester's optional end date. Every other
 # plan never expires, so a date left behind by a trial or a playtester period
@@ -151,6 +188,13 @@ def validate_plan(plan: Any) -> str:
             f"unknown plan {plan!r}; expected one of {sorted(KNOWN_PLANS)}"
         )
     return plan
+
+
+def plan_label(plan: Any) -> str:
+    """Display label of ``plan``; an unknown value is shown as stored."""
+    if isinstance(plan, str):
+        return PLAN_LABELS.get(plan, plan)
+    return ""
 
 
 def is_playtester(plan: Any) -> bool:

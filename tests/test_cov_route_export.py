@@ -291,7 +291,7 @@ def test_delete_account_happy_path_with_stripe_and_neon(monkeypatch, tmp_path):
         async def _fake_cancel(stripe_id):
             cancelled.append(stripe_id)
 
-        async def _fake_drop(tenant):
+        async def _fake_drop(tenant, db=None):
             dropped.append(tenant)
 
         async def _fake_email(email):

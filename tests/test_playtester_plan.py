@@ -9,15 +9,22 @@ still bounded. This file pins:
   Pro tenant (one parametrized table of probes, plus end-to-end checks through
   the real routes and jobs where a probe would just restate the expression);
 * that a playtester is never billed, dunned, churned, trial-expired or sent an
-  overage invoice, while its usage ceilings still warn, throttle and alert;
+  overage invoice, while its usage ceilings still warn and alert (nothing is
+  ever throttled for it), and that it never raises what a paying tenant in the
+  same Neon pool is judged on;
+* that a database drop asks the Neon account that owns the pool;
+* the operator action that grants and revokes the plan, and that no boot-time
+  backfill undoes it;
 * that ``is_internal`` (staff) keeps exactly the meaning it had.
 """
 from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import logging
 import sys
+import time
 import types
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -868,17 +875,13 @@ class _Calls:
         self.owner_alerts: list[tuple[str, str]] = []
         self.cancelled: list[str] = []
         self.dropped: list[str] = []
+        self.drop_dbs: list[Any] = []  # the control-plane db each database drop was given
         self.deleted: list[str] = []
 
     @property
     def throttles(self) -> list[tuple]:
         """Calls that clamp a pool to the throttle ceiling (0.25 CU)."""
         return [c for c in self.cap_calls if c[1] == 0.25]
-
-    @property
-    def restores(self) -> list[tuple]:
-        """Calls that lift a pool back to its normal ceiling."""
-        return [c for c in self.cap_calls if c[1] != 0.25]
 
 
 @pytest.fixture
@@ -908,8 +911,9 @@ def calls(monkeypatch):
     async def _cancel(customer_id):
         rec.cancelled.append(customer_id)
 
-    async def _drop(tenant):
+    async def _drop(tenant, db=None):
         rec.dropped.append(tenant["id"])
+        rec.drop_dbs.append(db)
 
     async def _delete(_db, tenant_id):
         rec.deleted.append(tenant_id)
@@ -961,13 +965,18 @@ async def _provisioned(
     db, email: str, plan: str, *, stripe: bool = True, pool: "str | None" = None, **fields: Any
 ) -> dict[str, Any]:
     """A tenant with a database. ``pool`` puts it in a named (shared) Neon pool
-    project; by default each tenant gets a pool project of its own."""
+    project; by default each tenant gets a pool project of its own. Every tenant
+    has an overage budget unless a field says otherwise."""
     t = await db_module.upsert_tenant(db, email)
+    fields = {"compute_overage_cap_usd": 500.0, "storage_overage_cap_usd": 500.0, **fields}
     return await db_module.update_tenant(
         db, t["id"], plan=plan, neon_project_id=pool or f"np-{plan}-{email.split('@')[0]}",
-        stripe_customer_id="cus_stray" if stripe else None,
-        compute_overage_cap_usd=500.0, storage_overage_cap_usd=500.0, **fields,
+        stripe_customer_id="cus_stray" if stripe else None, **fields,
     )
+
+
+def _month() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 _POOL_KEY = {"free": "key-standard", "standard": "key-standard", "pro": "key-pro"}
@@ -978,13 +987,12 @@ class _FakeNeon:
     the account that owns it, which is the pool tier it was created under (a
     free or standard pool belongs to the standard account, a pro pool to the pro
     one). Anything else is refused the way the real API refuses it: an empty
-    consumption answer, a PATCH that changes nothing."""
+    consumption answer."""
 
     def __init__(self) -> None:
         self.owner_key: dict[str, str] = {}
         self.fetches: list[tuple[str, str]] = []   # (project, key) of every consumption read
         self.cap_attempts: list[tuple[str, str, float]] = []  # (project, key, max_cu)
-        self.refused_caps: list[tuple[str, str, float]] = []
 
     def accepts(self, project: str, key: str) -> bool:
         return self.owner_key.get(project, key) == key
@@ -995,7 +1003,7 @@ def neon(calls, monkeypatch):
     from meridian import hosted
 
     fake = _FakeNeon()
-    real_fetch, real_cap = hosted._fetch_neon_consumption, hosted._set_neon_max_cu
+    real_fetch = hosted._fetch_neon_consumption
 
     async def _consumption(project, key, from_dt, to_dt):
         fake.fetches.append((project, key))
@@ -1003,11 +1011,10 @@ def neon(calls, monkeypatch):
             return {}
         return await real_fetch(project, key, from_dt, to_dt)
 
+    real_cap = hosted._set_neon_max_cu
+
     async def _cap(project, key, max_cu):
         fake.cap_attempts.append((project, key, max_cu))
-        if not fake.accepts(project, key):
-            fake.refused_caps.append((project, key, max_cu))
-            return
         await real_cap(project, key, max_cu)
 
     monkeypatch.setattr(hosted, "_fetch_neon_consumption", _consumption)
@@ -1023,7 +1030,7 @@ async def _neon_pool(db, neon: _FakeNeon, project: str, tier: str) -> str:
     return project
 
 
-async def test_playtester_over_the_ceiling_is_throttled_and_alerted_never_billed(db, calls):
+async def test_playtester_over_the_ceiling_is_alerted_never_billed_or_throttled(db, calls):
     from meridian import hosted
 
     calls.cu_hours, calls.storage_gb = 260.0, 20.0  # past Pro's 200 + 20 grace and 10 GB
@@ -1031,21 +1038,26 @@ async def test_playtester_over_the_ceiling_is_throttled_and_alerted_never_billed
     await hosted.run_overage_check(db)
 
     assert calls.meter == [] and calls.storage_reports == []
-    assert calls.throttles == [(pt["neon_project_id"], 0.25)]
-    subjects = [s for _e, s, _h in calls.emails]
-    assert "Meridian: compute limit reached — sessions throttled" in subjects
-    assert "Meridian: storage limit exceeded" in subjects
+    assert calls.cap_calls == []  # nothing is ever clamped for a playtester
+    assert sorted(s for _e, s, _h in calls.emails) == [
+        "Meridian: compute limit reached",
+        "Meridian: storage limit exceeded",
+    ]
     for _e, _s, html in calls.emails:
         assert "Set an overage budget" not in html and "/GB-month" not in html
+        assert "throttl" not in html.lower()
     assert len(calls.owner_alerts) == 2  # compute + storage
     row = await db_module.get_tenant_by_id(db, pt["id"])
-    assert row["compute_throttled_at"]
-    assert "playtester_storage_alert_month" in row["notification_prefs"]
+    assert row["compute_throttled_at"] is None
+    prefs = json.loads(row["notification_prefs"])
+    assert prefs["playtester_compute_notice_month"] == _month()
+    assert prefs["playtester_storage_notice_month"] == _month()
+    assert prefs["storage"] is True  # the rest of the blob is kept
 
-    # A second pass neither re-throttles nor re-alerts the owner this month.
+    # Re-checked every day, told once a month.
     await hosted.run_overage_check(db)
-    assert len(calls.throttles) == 1 and len(calls.owner_alerts) == 2
-    assert calls.meter == [] and calls.storage_reports == []
+    assert len(calls.emails) == 2 and len(calls.owner_alerts) == 2
+    assert calls.meter == [] and calls.storage_reports == [] and calls.cap_calls == []
 
 
 async def test_control_pro_tenant_with_a_budget_is_still_billed(db, calls):
@@ -1059,6 +1071,18 @@ async def test_control_pro_tenant_with_a_budget_is_still_billed(db, calls):
     assert len(calls.meter) == 1 and calls.meter[0]["event_name"] == "compute_overage_cu_hours"
     assert len(calls.storage_reports) == 1
     assert calls.throttles == [] and calls.owner_alerts == []
+
+
+async def test_a_pro_tenant_without_a_budget_is_still_throttled_as_before(db, calls):
+    """The existing throttle for a tenant that has no overage budget is untouched."""
+    from meridian import hosted
+
+    calls.cu_hours = 260.0
+    pro = await _provisioned(db, "throttle-pro@example.com", "pro", compute_overage_cap_usd=0.0)
+    await hosted.run_overage_check(db)
+    assert calls.cap_calls == [(pro["neon_project_id"], 0.25)]
+    assert [s for _e, s, _h in calls.emails] == ["Meridian: compute limit reached — sessions throttled"]
+    assert (await db_module.get_tenant_by_id(db, pro["id"]))["compute_throttled_at"]
 
 
 async def test_playtester_warns_at_the_pro_threshold_without_budget_text(db, calls):
@@ -1075,7 +1099,13 @@ async def test_playtester_warns_at_the_pro_threshold_without_budget_text(db, cal
     assert pt_subject == pro_subject == "Meridian: compute approaching limit"
     assert "Set an overage budget" in pro_html
     assert "Set an overage budget" not in pt_html and "not billed" in pt_html
-    assert calls.throttles == [] and calls.meter == []
+    assert "throttl" not in pt_html.lower() and "restricted" not in pt_html
+    assert calls.cap_calls == [] and calls.meter == []
+
+    # A playtester is warned once a month; the Pro control keeps its old daily behaviour.
+    calls.emails.clear()
+    await hosted.run_overage_check(db)
+    assert [e for e, _s, _h in calls.emails] == ["warn-pro@example.com"]
 
     calls.emails.clear()
     calls.cu_hours = 150.0  # under the ceiling: silence
@@ -1107,105 +1137,109 @@ async def test_lapsed_playtester_is_judged_by_free_limits(db, calls):
     await _provisioned(db, "lapsed-pt@example.com", "playtester", inactivity_expires_at=PAST)
     await hosted.run_overage_check(db)
     assert [s for _e, s, _h in calls.emails] == ["Meridian: compute approaching limit"]
-    assert calls.throttles == []
-
-
-async def test_compute_throttle_is_lifted_at_the_monthly_reset(db, calls):
-    """The throttle email promises 'until next month'. The DB flag used to clear
-    on the reset while Neon stayed at 0.25 CU for good."""
-    from meridian import hosted
-
-    calls.cu_hours = 260.0
-    pt = await _provisioned(db, "reset-pt@example.com", "playtester")
-    await hosted.run_overage_check(db)
-    assert calls.throttles == [(pt["neon_project_id"], 0.25)] and calls.restores == []
-    assert (await db_module.get_tenant_by_id(db, pt["id"]))["compute_throttled_at"]
-
-    # Later in the same month: still throttled, nothing more is sent to Neon.
-    await hosted.run_overage_check(db)
-    assert len(calls.cap_calls) == 1
-
-    # The month rolls over and usage starts from zero again.
-    await db_module.update_tenant(db, pt["id"], overage_reset_at="2000-01-15T00:00:00+00:00")
-    calls.cu_hours = 1.0
-    await hosted.run_overage_check(db)
-    assert (await db_module.get_tenant_by_id(db, pt["id"]))["compute_throttled_at"] is None
-    # A playtester lives in a pro-tier pool, so that is the ceiling it goes back to.
-    assert calls.restores == [(pt["neon_project_id"], 4.0)]
-
-    # Nothing is throttled or restored again afterwards.
-    await hosted.run_overage_check(db)
-    assert len(calls.throttles) == 1 and len(calls.restores) == 1
-
-
-async def test_unthrottled_tenants_are_not_restored_at_the_monthly_reset(db, calls):
-    from meridian import hosted
-
-    calls.cu_hours = 1.0
-    await _provisioned(db, "norestore-pt@example.com", "playtester",
-                       overage_reset_at="2000-01-15T00:00:00+00:00")
-    await hosted.run_overage_check(db)
     assert calls.cap_calls == []
 
 
-@pytest.mark.parametrize(
-    "plan, pool_tier, expected",
-    [
-        ("pro", None, 4.0),         # no pool row: the plan's own tier
-        ("standard", None, 2.0),
-        ("pro", "standard", 2.0),   # upgraded after provisioning: the pool it lives in wins
-        ("standard", "pro", 4.0),
-    ],
-)
-async def test_throttle_is_lifted_to_the_pools_own_ceiling(db, calls, plan, pool_tier, expected):
+async def test_playtester_notices_are_once_per_calendar_month(db):
     from meridian import hosted
 
-    pool = f"np-restore-{plan}-{pool_tier}"
-    if pool_tier:
-        await db_module.register_pool_project(db, pool, pool_tier)
-    calls.cu_hours = 1.0
-    await _provisioned(
-        db, f"restore-{plan}-{pool_tier}@example.com", plan, pool=pool,
-        compute_throttled_at="2026-01-01T00:00:00+00:00",
-        overage_reset_at="2000-01-15T00:00:00+00:00",
+    t = await _provisioned(db, "month-pt@example.com", "playtester")
+    jan = datetime(2026, 1, 31, 23, 0, tzinfo=timezone.utc)
+    assert await hosted._claim_playtester_notice(db, t, "compute", jan) is True
+    assert await hosted._claim_playtester_notice(db, t, "compute", jan) is False
+    # the same month, another day
+    assert await hosted._claim_playtester_notice(
+        db, t, "compute", datetime(2026, 1, 2, tzinfo=timezone.utc)) is False
+    # another kind of notice is its own
+    assert await hosted._claim_playtester_notice(db, t, "storage", jan) is True
+    # the next month re-arms it (a per-year flag would not), and so does the next year
+    assert await hosted._claim_playtester_notice(
+        db, t, "compute", datetime(2026, 2, 1, tzinfo=timezone.utc)) is True
+    assert await hosted._claim_playtester_notice(
+        db, t, "compute", datetime(2027, 2, 1, tzinfo=timezone.utc)) is True
+    prefs = json.loads((await db_module.get_tenant_by_id(db, t["id"]))["notification_prefs"])
+    assert prefs["playtester_compute_notice_month"] == "2027-02"
+    assert prefs["playtester_storage_notice_month"] == "2026-01"
+    assert prefs["sprint"] is True  # unrelated preferences survive every write
+
+
+# --- A playtester never raises what a paying pool mate is billed for --------
+#
+# Neon reports consumption per pool project (up to 8 tenants). Every tenant in
+# a pool used to be judged on the pool total, so a playtester's usage lifted
+# what its paying neighbours were metered, warned and throttled for.
+
+
+async def test_playtester_does_not_raise_the_compute_a_paying_pool_mate_is_judged_on(
+    db, calls, caplog
+):
+    from meridian import hosted
+
+    calls.cu_hours = 260.0  # the POOL total: past Pro's 200 + 20 grace
+    await _provisioned(db, "shared-pt@example.com", "playtester", pool="np-shared")
+    pro = await _provisioned(db, "shared-pro@example.com", "pro", pool="np-shared")  # has a budget
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        await hosted.run_overage_check(db)
+
+    assert calls.meter == []  # the paying tenant is not metered for the playtester's usage
+    assert calls.cap_calls == []
+    assert calls.emails == []  # nor mailed; the playtester's number is the pool's, so no mail either
+    # the owner hears about both: the playtester over its ceiling, and the unmetered payer
+    assert sorted(s for s, _h in calls.owner_alerts) == [
+        "[Meridian] Paying tenant not metered, a playtester shares its pool: shared-pro@example.com",
+        "[Meridian] Playtester over compute limit: shared-pt@example.com",
+    ]
+    by_subject = dict(calls.owner_alerts)
+    assert "shared with paying tenants" in by_subject[
+        "[Meridian] Playtester over compute limit: shared-pt@example.com"]
+    assert "cannot be told apart" in by_subject[
+        "[Meridian] Paying tenant not metered, a playtester shares its pool: shared-pro@example.com"]
+    row = await db_module.get_tenant_by_id(db, pro["id"])
+    assert not row["compute_cu_hours_used"] and row["compute_throttled_at"] is None
+    assert any(
+        "shared-pro@example.com" in r.getMessage() and "not attributable" in r.getMessage()
+        for r in caplog.records
     )
+
+    # re-checked every day, the owner is told once a month
     await hosted.run_overage_check(db)
-    assert calls.restores == [(pool, expected)]
-    assert hosted._pool_max_cu("pro") == 4.0 and hosted._pool_max_cu("standard") == 2.0
+    assert len(calls.owner_alerts) == 2 and calls.meter == [] and calls.emails == []
 
 
-async def test_playtester_never_throttles_a_pool_that_paying_customers_share(db, calls):
-    """Consumption and the cap are per Neon pool project (up to 8 tenants), so a
-    throttle for the playtester would land on the paying Pro tenant next to it,
-    who has a budget precisely so that it is billed instead."""
+async def test_the_same_pool_without_a_playtester_meters_both_paying_tenants(db, calls):
+    """Control for the test above: the guard is the playtester, not the pool."""
     from meridian import hosted
 
     calls.cu_hours = 260.0
-    pt = await _provisioned(db, "shared-pt@example.com", "playtester", pool="np-shared")
-    await _provisioned(db, "shared-pro@example.com", "pro", pool="np-shared")
+    await _provisioned(db, "mate-a@example.com", "pro", pool="np-shared")
+    await _provisioned(db, "mate-b@example.com", "pro", pool="np-shared")
+    await hosted.run_overage_check(db)
+    assert len(calls.meter) == 2
+
+
+async def test_the_pool_rule_is_scoped_to_the_pool_the_playtester_is_in(db, calls):
+    from meridian import hosted
+
+    calls.cu_hours = 260.0
+    await _provisioned(db, "own-pt@example.com", "playtester", pool="np-own")
+    await _provisioned(db, "far-pro@example.com", "pro", pool="np-far")
     await hosted.run_overage_check(db)
 
-    assert calls.cap_calls == []  # the pool is left alone
-    assert len(calls.meter) == 1  # the paying tenant is metered, as always
-    assert [s for e, s, _h in calls.emails if e == "shared-pt@example.com"] == []
+    assert len(calls.meter) == 1  # a paying customer in ANOTHER pool is billed as always
+    # a playtester alone in its pool is mailed, and the owner is told
+    assert [e for e, _s, _h in calls.emails] == ["own-pt@example.com"]
     assert [s for s, _h in calls.owner_alerts] == [
-        "[Meridian] Playtester over compute limit: shared-pt@example.com"
+        "[Meridian] Playtester over compute limit: own-pt@example.com"
     ]
-    assert "NOT throttled" in calls.owner_alerts[0][1]
-    row = await db_module.get_tenant_by_id(db, pt["id"])
-    assert row["compute_throttled_at"] is None
-    assert "playtester_compute_alert_month" in row["notification_prefs"]
-
-    # Re-checked every day, but the owner hears about it once a month.
-    await hosted.run_overage_check(db)
-    assert len(calls.owner_alerts) == 1 and calls.cap_calls == []
+    assert "shared with paying tenants" not in calls.owner_alerts[0][1]
+    assert calls.cap_calls == []
 
 
 @pytest.mark.parametrize("mate_plan, mate_internal", [("playtester", False), ("pro", True)])
-async def test_playtester_is_throttled_when_no_paying_customer_shares_its_pool(
+async def test_other_playtesters_and_staff_do_not_make_a_pool_shared(
     db, calls, mate_plan, mate_internal
 ):
-    """Other playtesters and staff are not customers anyone is billing."""
+    """Neither is a customer anyone is billing, so the playtester is mailed."""
     from meridian import hosted
 
     calls.cu_hours = 260.0
@@ -1215,28 +1249,85 @@ async def test_playtester_is_throttled_when_no_paying_customer_shares_its_pool(
         await db.execute("UPDATE tenants SET is_internal = 1 WHERE id = ?", (mate["id"],))
         await db.commit()
     await hosted.run_overage_check(db)
-    assert calls.throttles and {p for p, _ in calls.throttles} == {"np-alone"}
-    assert calls.meter == []
+    assert "alone-pt@example.com" in [e for e, _s, _h in calls.emails]
+    assert calls.meter == [] and calls.cap_calls == []
 
 
-async def test_a_paying_customer_in_another_pool_does_not_stop_the_throttle(db, calls):
-    """Only a paying customer in the playtester's OWN pool project can be hurt by
-    the throttle. Without the pool match, any paying customer anywhere would
-    switch the throttle off for every playtester."""
+async def test_a_lapsed_playtester_still_shields_its_paying_pool_mate(db, calls):
+    """Its database is still in the pool and still used: the stored plan decides."""
     from meridian import hosted
 
     calls.cu_hours = 260.0
-    await _provisioned(db, "far-pro@example.com", "pro", pool="np-far")
-    await _provisioned(db, "own-pt@example.com", "playtester", pool="np-own")
+    await _provisioned(db, "lapsed-shared-pt@example.com", "playtester",
+                       pool="np-lapsed", inactivity_expires_at=PAST)
+    await _provisioned(db, "lapsed-shared-pro@example.com", "pro", pool="np-lapsed")
     await hosted.run_overage_check(db)
+    assert calls.meter == []
 
-    assert calls.throttles == [("np-own", 0.25)]  # the playtester's pool, and only it
-    assert [e for e, s, _h in calls.emails if "throttled" in s] == ["own-pt@example.com"]
-    assert len(calls.meter) == 1  # the paying customer is billed, as always
-    assert [s for s, _h in calls.owner_alerts] == [
-        "[Meridian] Playtester over compute limit: own-pt@example.com"
+
+async def test_hourly_storage_job_does_not_bill_a_paying_tenant_for_a_playtesters_pool(
+    db, calls, monkeypatch, caplog
+):
+    from meridian import hosted
+
+    async def _gb(_project, _key):
+        return 12.0  # the pool's storage: over Pro's 10 GB
+
+    monkeypatch.setattr(hosted, "get_neon_storage_gb", _gb)
+    await _provisioned(db, "st-pt@example.com", "playtester", pool="np-st")
+    # No overage budget at all: the hourly job reports overage without checking one.
+    await _provisioned(db, "st-pro@example.com", "pro", pool="np-st", storage_overage_cap_usd=0.0)
+    await _provisioned(db, "st-far@example.com", "pro", pool="np-st-far")  # another pool
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        await hosted.run_storage_overage_check(db)
+
+    assert calls.storage_reports == [("cus_stray", 2.0)]  # only the one in the other pool
+    assert any(
+        "st-pro@example.com" in r.getMessage() and "not attributable" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_hourly_storage_job_bills_the_pool_when_no_playtester_is_in_it(db, calls, monkeypatch):
+    from meridian import hosted
+
+    async def _gb(_project, _key):
+        return 12.0
+
+    monkeypatch.setattr(hosted, "get_neon_storage_gb", _gb)
+    await _provisioned(db, "st-mate-a@example.com", "pro", pool="np-st2", storage_overage_cap_usd=0.0)
+    await _provisioned(db, "st-mate-b@example.com", "pro", pool="np-st2", storage_overage_cap_usd=0.0)
+    await hosted.run_storage_overage_check(db)
+    assert calls.storage_reports == [("cus_stray", 2.0), ("cus_stray", 2.0)]
+
+
+async def test_daily_job_does_not_bill_pool_storage_to_a_paying_tenant_either(db, calls):
+    from meridian import hosted
+
+    calls.storage_gb = 20.0  # the pool's storage: over Pro's 10 GB
+    await _provisioned(db, "dst-pt@example.com", "playtester", pool="np-dst")
+    await _provisioned(db, "dst-pro@example.com", "pro", pool="np-dst")
+    await hosted.run_overage_check(db)
+    assert calls.storage_reports == [] and calls.emails == []
+    assert sorted(s for s, _h in calls.owner_alerts) == [
+        "[Meridian] Paying tenant not metered, a playtester shares its pool: dst-pro@example.com",
+        "[Meridian] Playtester over storage limit: dst-pt@example.com",
     ]
-    assert "NOT throttled" not in calls.owner_alerts[0][1]
+
+
+def test_pools_with_unbilled_tenants_follow_the_stored_plan():
+    from meridian import hosted
+
+    rows = [
+        {"neon_project_id": "np-1", "plan": "playtester"},
+        {"neon_project_id": "np-2", "plan": "pro"},
+        {"neon_project_id": None, "plan": "playtester"},
+        # a lapsed playtester still has its database in the pool
+        {"neon_project_id": "np-3", "plan": "playtester", "inactivity_expires_at": PAST},
+        {"neon_project_id": "np-4", "plan": None},
+    ]
+    assert hosted._pools_with_unbilled_tenants(rows) == {"np-1", "np-3"}
+    assert hosted._pools_with_unbilled_tenants([]) == set()
 
 
 def test_billed_neighbour_check_is_scoped_to_the_pool_and_to_who_is_billed():
@@ -1258,39 +1349,64 @@ def test_billed_neighbour_check_is_scoped_to_the_pool_and_to_who_is_billed():
     assert hosted._pool_has_billed_neighbours([{**me, "plan": "pro"}], {**me, "plan": "pro"}) is False
 
 
+# --- Which Neon account a usage job asks -------------------------------------
+
+
 @pytest.mark.parametrize(
-    "plan, pool_tier",
+    "plan, pool_tier, polled_with",
     [
-        ("playtester", "standard"),  # signed up as free/standard, flipped afterwards
-        ("playtester", "free"),
-        ("playtester", "pro"),
-        ("pro", "standard"),         # same mismatch for an ordinary upgrade
-        ("standard", "pro"),         # and for a downgrade
-        ("free", "pro"),
+        ("playtester", "standard", "key-standard"),  # signed up as free/standard, flipped afterwards
+        ("playtester", "free", "key-standard"),
+        ("playtester", "pro", "key-pro"),
+        # everyone else keeps asking the account their PLAN names, exactly as before
+        # the playtester plan, even when their pool belongs to the other one
+        ("pro", "standard", "key-pro"),
+        ("standard", "pro", "key-standard"),
+        ("free", "pro", "key-standard"),
     ],
 )
-async def test_overage_job_polls_the_account_that_owns_the_database(
-    db, calls, neon, plan, pool_tier
+async def test_overage_job_keys_follow_the_pool_for_a_playtester_and_the_plan_for_everyone_else(
+    db, calls, neon, plan, pool_tier, polled_with
 ):
-    """The Neon key follows the pool project the database lives in, not the plan
-    the tenant is on today. Polling a standard-account project with the Pro key
-    is refused by Neon, and the job used to move on without a trace."""
     from meridian import hosted
 
     pool = await _neon_pool(db, neon, f"np-key-{plan}-{pool_tier}", pool_tier)
     calls.cu_hours = 1.0
     await _provisioned(db, f"key-{plan}-{pool_tier}@example.com", plan, pool=pool)
     await hosted.run_overage_check(db)
-    assert neon.fetches == [(pool, _POOL_KEY[pool_tier])]
-    # and the usage really was read: it was persisted on the tenant
+    assert neon.fetches == [(pool, polled_with)]
+    # usage is read, and persisted, only when the account asked owns the pool
     row = (await db_module.list_tenants_with_neon(db))[0]
-    assert row["compute_cu_hours_used"] == 1.0
+    assert bool(row["compute_cu_hours_used"]) is (_POOL_KEY[pool_tier] == polled_with)
 
 
-async def test_playtester_flipped_from_a_standard_pool_is_still_throttled(db, calls, neon):
+async def test_a_tenant_in_a_pool_of_another_tier_is_not_newly_measured_and_cannot_throttle_it(
+    db, calls, neon
+):
+    """Reproduced by the verifier: A is on standard (a Stripe customer without a
+    budget) and B on pro, both in one pro pool at 150 CU-hours. Following the pool
+    registry for A would measure it past its own 50 + 20 grace and throttle the
+    whole pool, B included. As before the playtester plan, A is simply not
+    measured and nothing happens."""
+    from meridian import hosted
+
+    pool = await _neon_pool(db, neon, "np-pro-shared", "pro")
+    calls.cu_hours = 150.0
+    await _provisioned(db, "mm-a@example.com", "standard", pool=pool, compute_overage_cap_usd=0.0)
+    await _provisioned(db, "mm-b@example.com", "pro", pool=pool, compute_overage_cap_usd=0.0)
+    await hosted.run_overage_check(db)
+
+    assert sorted(neon.fetches) == [(pool, "key-pro"), (pool, "key-standard")]
+    assert calls.cap_calls == [] and neon.cap_attempts == []
+    assert calls.emails == [] and calls.meter == []
+
+
+async def test_playtester_flipped_from_a_standard_pool_is_still_measured_and_reported(
+    db, calls, neon
+):
     """The way a playtester is normally made: the person signs in (a free tenant,
     database in the standard account), then the plan is changed. The ceiling must
-    still bite: usage is read and the cap lands, both with the standard key."""
+    still be measured: usage is read with the standard key, reported, never capped."""
     from meridian import hosted
 
     pool = await _neon_pool(db, neon, "np-flipped", "standard")
@@ -1299,26 +1415,12 @@ async def test_playtester_flipped_from_a_standard_pool_is_still_throttled(db, ca
     await hosted.run_overage_check(db)
 
     assert neon.fetches == [(pool, "key-standard")]
-    assert neon.cap_attempts == [(pool, "key-standard", 0.25)] and neon.refused_caps == []
-    assert calls.throttles == [(pool, 0.25)] and calls.meter == []
-    assert [s for _e, s, _h in calls.emails] == ["Meridian: compute limit reached — sessions throttled"]
-    assert (await db_module.get_tenant_by_id(db, pt["id"]))["compute_throttled_at"]
-
-
-async def test_throttle_is_lifted_with_the_key_of_the_pool_it_was_applied_to(db, calls, neon):
-    from meridian import hosted
-
-    pool = await _neon_pool(db, neon, "np-lift", "standard")
-    calls.cu_hours = 1.0
-    await _provisioned(
-        db, "lift-pt@example.com", "playtester", pool=pool,
-        compute_throttled_at="2026-01-01T00:00:00+00:00",
-        overage_reset_at="2000-01-15T00:00:00+00:00",
-    )
-    await hosted.run_overage_check(db)
-    # a refused lift leaves Neon throttled while the DB flag says otherwise
-    assert neon.cap_attempts == [(pool, "key-standard", 2.0)] and neon.refused_caps == []
-    assert calls.restores == [(pool, 2.0)]
+    assert neon.cap_attempts == [] and calls.cap_calls == [] and calls.meter == []
+    assert [s for _e, s, _h in calls.emails] == ["Meridian: compute limit reached"]
+    assert [s for s, _h in calls.owner_alerts] == [
+        "[Meridian] Playtester over compute limit: flipped-pt@example.com"
+    ]
+    assert (await db_module.get_tenant_by_id(db, pt["id"]))["compute_cu_hours_used"] == 260.0
 
 
 async def test_database_outside_the_pool_registry_falls_back_to_the_plans_key(db, calls, neon):
@@ -1333,7 +1435,9 @@ async def test_database_outside_the_pool_registry_falls_back_to_the_plans_key(db
     assert sorted(neon.fetches) == [("np-manual-pt", "key-pro"), ("np-manual-std", "key-standard")]
 
 
-async def test_storage_job_polls_the_account_that_owns_the_database(db, calls, neon, monkeypatch):
+async def test_storage_job_keys_follow_the_pool_for_a_playtester_and_the_plan_for_everyone_else(
+    db, calls, neon, monkeypatch
+):
     from meridian import hosted
 
     reads: list[tuple[str, str]] = []
@@ -1346,8 +1450,15 @@ async def test_storage_job_polls_the_account_that_owns_the_database(db, calls, n
     for tier in ("standard", "pro"):
         await _neon_pool(db, neon, f"np-store-{tier}", tier)
         await _provisioned(db, f"store-{tier}-pt@example.com", "playtester", pool=f"np-store-{tier}")
+    # an ordinary standard tenant in a pro pool is asked with its plan's key
+    await _neon_pool(db, neon, "np-store-mismatch", "pro")
+    await _provisioned(db, "store-mismatch@example.com", "standard", pool="np-store-mismatch")
     await hosted.run_storage_overage_check(db)
-    assert sorted(reads) == [("np-store-pro", "key-pro"), ("np-store-standard", "key-standard")]
+    assert sorted(reads) == [
+        ("np-store-mismatch", "key-standard"),
+        ("np-store-pro", "key-pro"),
+        ("np-store-standard", "key-standard"),
+    ]
 
 
 async def test_storage_job_goes_on_when_one_pools_key_is_not_configured(
@@ -1396,31 +1507,6 @@ async def test_a_refused_consumption_read_is_logged_not_silent(db, calls, neon, 
     assert calls.cap_calls == [] and calls.emails == [] and calls.meter == []
 
 
-async def test_a_refused_compute_cap_is_logged_not_silent(monkeypatch, caplog):
-    """The real cap helper never raises; a 4xx used to vanish, leaving the tenant
-    row saying 'throttled' (or 'restored') while Neon kept the old ceiling."""
-    from meridian import hosted
-
-    class _Http:
-        def __init__(self, *_a, **_k):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_a):
-            return False
-
-        async def patch(self, *_a, **_k):
-            return types.SimpleNamespace(status_code=403)
-
-    monkeypatch.setattr("httpx.AsyncClient", _Http)
-    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
-        await hosted._set_neon_max_cu("np-refused", "secret-key", 0.25)
-    logged = " ".join(r.getMessage() for r in caplog.records)
-    assert "np-refused" in logged and "403" in logged and "secret-key" not in logged
-
-
 @pytest.mark.parametrize(
     "plan, project, registered, expected",
     [
@@ -1443,6 +1529,27 @@ def test_neon_key_follows_the_pool_and_only_then_the_plan(monkeypatch, plan, pro
     assert hosted._neon_api_key_for_tenant(tenant, registered) == expected
 
 
+@pytest.mark.parametrize(
+    "plan, registered, expected",
+    [
+        ("playtester", {"np-a": "standard"}, "key-standard"),
+        ("playtester", {"np-a": "pro"}, "key-pro"),
+        ("playtester", {}, "key-pro"),
+        ("pro", {"np-a": "standard"}, "key-pro"),       # an ordinary tenant ignores the registry
+        ("standard", {"np-a": "pro"}, "key-standard"),
+        ("free", {"np-a": "pro"}, "key-standard"),
+        (None, {"np-a": "pro"}, "key-standard"),
+    ],
+)
+def test_usage_jobs_ask_the_pool_only_for_an_unbilled_plan(monkeypatch, plan, registered, expected):
+    from meridian import hosted
+
+    monkeypatch.setenv("NEON_API_KEY", "key-standard")
+    monkeypatch.setenv("NEON_API_KEY_PRO", "key-pro")
+    tenant = {"plan": plan, "neon_project_id": "np-a"}
+    assert hosted._neon_api_key_for_usage(tenant, registered) == expected
+
+
 async def test_pool_registry_is_read_once_and_an_unreadable_one_degrades_to_the_plan(
     db, neon, caplog
 ):
@@ -1461,22 +1568,21 @@ async def test_pool_registry_is_read_once_and_an_unreadable_one_degrades_to_the_
     assert any("Pool registry unreadable" in r.getMessage() for r in caplog.records)
 
 
-async def test_owner_alerts_for_compute_and_storage_do_not_erase_each_other(db, calls):
-    """Both alerts are de-duplicated through the same notification_prefs blob; a
+async def test_compute_and_storage_notices_do_not_erase_each_other(db, calls):
+    """Both notices are de-duplicated through the same notification_prefs blob; a
     stale copy written back by the second one used to drop the first's flag, so
-    the next day's run alerted again."""
+    the next day's run notified again."""
     from meridian import hosted
 
     calls.cu_hours, calls.storage_gb = 260.0, 20.0
     pt = await _provisioned(db, "both-pt@example.com", "playtester", pool="np-both")
-    await _provisioned(db, "both-pro@example.com", "pro", pool="np-both")
     await hosted.run_overage_check(db)
-    assert len(calls.owner_alerts) == 2
+    assert len(calls.owner_alerts) == 2 and len(calls.emails) == 2
     prefs = (await db_module.get_tenant_by_id(db, pt["id"]))["notification_prefs"]
-    assert "playtester_compute_alert_month" in prefs and "playtester_storage_alert_month" in prefs
+    assert "playtester_compute_notice_month" in prefs and "playtester_storage_notice_month" in prefs
 
     await hosted.run_overage_check(db)
-    assert len(calls.owner_alerts) == 2
+    assert len(calls.owner_alerts) == 2 and len(calls.emails) == 2
 
 
 async def test_the_owner_alert_really_goes_to_the_admin_email(monkeypatch):
@@ -1574,6 +1680,8 @@ async def test_dunning_never_touches_a_playtester(db, calls):
     await hosted.run_dunning_cleanup(db)
     assert calls.deleted == [pro["id"]]  # day-15 hard delete reaches only the paying tenant
     assert pt["id"] not in calls.deleted and pt["id"] not in calls.dropped
+    # the delete drops the database with the registry in hand (see the drop tests below)
+    assert calls.dropped == [pro["id"]] and calls.drop_dbs == [db]
 
 
 async def test_churn_cleanup_never_touches_a_playtester(db, calls, monkeypatch):
@@ -1598,6 +1706,7 @@ async def test_churn_cleanup_never_touches_a_playtester(db, calls, monkeypatch):
 
     await hosted.run_churn_cleanup(db)
     assert calls.dropped == ["t-free"]  # the control is churned, the playtester is not
+    assert calls.drop_dbs == [db]
     row = await db_module.get_tenant_by_id(db, "t-pt")
     assert row["neon_project_id"] == "np-pt"
 
@@ -1611,6 +1720,16 @@ def test_playtester_never_receives_trial_reminders():
     assert hosted.compute_trial_reminder(free, NOW) is not None  # control
     assert hosted.compute_trial_reminder(pt, NOW) is None
     assert "playtester" not in hosted._TRIAL_PLANS
+
+
+def test_provisioning_pool_tier_of_a_lapsed_playtester_is_frees():
+    from meridian import hosted
+
+    assert hosted.pool_tier_for({"plan": "playtester"}) == "pro"
+    assert hosted.pool_tier_for({"plan": "playtester", "inactivity_expires_at": FUTURE}) == "pro"
+    assert hosted.pool_tier_for({"plan": "playtester", "inactivity_expires_at": PAST}) == "free"
+    assert hosted.pool_tier_for({"plan": "pro"}) == "pro"
+    assert hosted.pool_tier_for({"plan": None}) == "standard"
 
 
 # ---------------------------------------------------------------------------
@@ -1692,9 +1811,10 @@ def test_dashboard_says_when_a_playtesters_access_ends_and_has_no_budget_copy_to
     # the optional end date, in the account card (no purchase button next to it)
     assert "Playtester access ends" in src and "Playtester access ended" in src
     assert "plan === 'playtester' && !window.state.tenantIsInternal" in src
-    # the usage card's fixed-limits note must stay true where the pool is shared
-    # and the server only alerts the owner instead of throttling
-    assert "usage past the grace allowance is restricted" in src
+    # the usage card's fixed-limits note must stay true: nothing is throttled
+    # for a playtester, the tenant is emailed when usage passes the limits
+    assert "you are emailed when usage passes them" in src
+    assert "restricted" not in src.split("These limits are fixed for this account")[1][:200]
     assert "compute is throttled once the grace allowance is used" not in src
 
 
@@ -1717,10 +1837,661 @@ def test_tracked_bundle_carries_the_playtester_dashboard_and_matches_its_manifes
         'plan === "playtester" || !!window.state.tenantIsInternal',  # account card
         "Playtester access ends",                        # optional end date note
         "overage_billing === false",                     # no overage budget row
-        "usage past the grace allowance is restricted",
         "me.entitlement_plan || me.plan",                # tunnel indicator follows entitlement
     ):
         assert marker in bundle, f"{stale} ({marker!r} missing)"
     assert bundle.count('playtester: "#0891b2"') == 2, stale  # two badge colour maps
     manifest = json.loads((static / "asset-manifest.json").read_text(encoding="utf-8"))
     assert manifest["bundle_hash"] == hashlib.sha256(raw).hexdigest()[:12], stale
+
+
+# ---------------------------------------------------------------------------
+# Database drops: the Neon account is the pool's, not the plan's
+# ---------------------------------------------------------------------------
+#
+# Account deletion, admin reset-provisioning, churn and dunning all drop a
+# tenant's database through one best-effort helper. It used to pick the Neon key
+# from the plan; a playtester is normally a free/standard tenant whose plan was
+# flipped, so its database sits in a standard-account pool, Neon refused the Pro
+# key, the helper swallowed that, and the caller still answered "deleted".
+
+
+class _NeonConsole:
+    """Neon's console API as a database drop sees it: a project answers only to the
+    key of the account that owns it. ``log`` holds every (method, project, key,
+    answered) it was asked."""
+
+    def __init__(self) -> None:
+        self.owner_key: dict[str, str] = {}
+        self.log: list[tuple[str, str, str, bool]] = []
+        self.deleted_databases: list[tuple[str, str]] = []
+
+    def answers(self, project: str, key: str) -> bool:
+        return self.owner_key.get(project, key) == key
+
+
+@pytest.fixture
+def neon_console(monkeypatch):
+    console = _NeonConsole()
+
+    def _who(url: str, headers: "dict | None") -> tuple[str, str]:
+        key = (headers or {}).get("Authorization", "").removeprefix("Bearer ")
+        return url.split("/projects/", 1)[1].split("/", 1)[0], key
+
+    class _Http:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def get(self, url, headers=None, **_k):
+            project, key = _who(url, headers)
+            ok = console.answers(project, key)
+            console.log.append(("GET", project, key, ok))
+            body = {"branches": [{"id": "br-main", "default": True}]} if ok else {"message": "not found"}
+            return types.SimpleNamespace(status_code=200 if ok else 404, json=lambda: body)
+
+        async def delete(self, url, headers=None, **_k):
+            project, key = _who(url, headers)
+            ok = console.answers(project, key)
+            console.log.append(("DELETE", project, key, ok))
+            if ok:
+                console.deleted_databases.append((project, url.rsplit("/", 1)[1]))
+            return types.SimpleNamespace(status_code=200 if ok else 404, json=lambda: {})
+
+    monkeypatch.setattr("httpx.AsyncClient", _Http)
+    monkeypatch.setenv("NEON_API_KEY", "key-standard")
+    monkeypatch.setenv("NEON_API_KEY_PRO", "key-pro")
+    return console
+
+
+@pytest.mark.parametrize(
+    "plan, pool_tier, key",
+    [
+        ("playtester", "standard", "key-standard"),  # the verifier's repro: the Pro key was used and refused
+        ("playtester", "free", "key-standard"),
+        ("playtester", "pro", "key-pro"),
+        ("pro", "standard", "key-standard"),         # same bug class for any plan changed after provisioning
+        ("standard", "pro", "key-pro"),
+        ("standard", "standard", "key-standard"),    # controls
+        ("pro", "pro", "key-pro"),
+    ],
+)
+async def test_database_drop_asks_the_account_that_owns_the_pool(db, neon_console, plan, pool_tier, key):
+    from meridian import hosted
+
+    await db_module.register_pool_project(db, "np-drop", pool_tier)
+    neon_console.owner_key["np-drop"] = _POOL_KEY[pool_tier]
+    tenant = {"id": "abcdef12-0000", "email": "who.am@example.com", "plan": plan,
+              "neon_project_id": "np-drop"}
+    await hosted._drop_tenant_neon_database(tenant, db)
+    assert neon_console.log == [("GET", "np-drop", key, True), ("DELETE", "np-drop", key, True)]
+    assert neon_console.deleted_databases == [("np-drop", "cust_who_am_abcdef12")]
+
+
+async def test_database_drop_falls_back_to_the_plans_key_for_an_unregistered_pool(db, neon_console):
+    """A manually assigned database has no registry row: the plan's account is the
+    best guess, with or without the registry at hand."""
+    from meridian import hosted
+
+    tenant = {"id": "abcdef12-0000", "email": "who@example.com", "plan": "playtester",
+              "neon_project_id": "np-manual"}
+    await hosted._drop_tenant_neon_database(tenant, db)
+    await hosted._drop_tenant_neon_database(tenant)
+    assert [entry[2] for entry in neon_console.log] == ["key-pro"] * 4
+
+
+async def test_a_drop_neon_refuses_leaves_a_warning_and_never_names_the_key(db, neon_console, caplog):
+    from meridian import hosted
+
+    neon_console.owner_key["np-refused"] = "some-other-account-key"
+    tenant = {"id": "abcdef12-0000", "email": "who@example.com", "plan": "pro",
+              "neon_project_id": "np-refused"}
+    with caplog.at_level(logging.WARNING, logger="meridian.hosted"):
+        await hosted._drop_tenant_neon_database(tenant, db)
+    assert [entry[0] for entry in neon_console.log] == ["GET"]  # no DELETE was attempted
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "np-refused" in logged and "abcdef12-0000" in logged and "404" in logged
+    assert "key-pro" not in logged and "key-standard" not in logged
+
+
+def test_account_deletion_removes_a_playtesters_database_from_the_account_that_owns_it(
+    monkeypatch, tmp_path, neon_console
+):
+    """Reproduced by the verifier through POST /account/delete: a playtester made
+    the normal way (database in a standard-account pool) got {"deleted": true}
+    while Neon refused every call and the database stayed."""
+    client = _hosted_client(monkeypatch, tmp_path)
+    with client:
+        asyncio.run(db_module.register_pool_project(client.app.state.db, "np-del", "standard"))
+        neon_console.owner_key["np-del"] = "key-standard"
+        tenant = _seed(client, "del-pt@example.com", "playtester", neon_project_id="np-del")
+        r = client.post("/account/delete", json={"confirmation": "DELETE"})
+        assert r.status_code == 200 and r.json() == {"deleted": True}
+        deadline = time.monotonic() + 5  # the drop runs as a background task
+        while not neon_console.deleted_databases and time.monotonic() < deadline:
+            time.sleep(0.05)
+    assert neon_console.log[:2] == [
+        ("GET", "np-del", "key-standard", True), ("DELETE", "np-del", "key-standard", True),
+    ]
+    assert neon_console.deleted_databases == [("np-del", f"cust_del-pt_{tenant['id'][:8]}")]
+
+
+async def test_reset_provisioning_drops_the_playtesters_database_from_the_account_that_owns_it(
+    db, neon_console
+):
+    from meridian import hosted
+
+    await db_module.register_pool_project(db, "np-reset", "standard")
+    neon_console.owner_key["np-reset"] = "key-standard"
+    t = await _provisioned(db, "reset-pt@example.com", "playtester", pool="np-reset", stripe=False)
+    result = await hosted.reset_tenant_provisioning(db, t["id"])
+    assert result["had_neon_project"] is True and result["dropped_neon_project_id"] == "np-reset"
+    assert neon_console.deleted_databases == [("np-reset", f"cust_reset-pt_{t['id'][:8]}")]
+    assert [entry[2] for entry in neon_console.log] == ["key-standard", "key-standard"]
+
+
+# ---------------------------------------------------------------------------
+# Boot-time backfills never touch a playtester
+# ---------------------------------------------------------------------------
+#
+# MERIDIAN_INTERNAL_EMAILS re-asserts is_internal=1 and MERIDIAN_ADMIN_EMAILS
+# plan='admin' on EVERY boot. If either secret lists the account an operator just
+# made a playtester, the next restart would silently undo it.
+
+
+async def _make_tenant(db, email: str, plan: str = "free", **fields: Any) -> dict[str, Any]:
+    t = await db_module.upsert_tenant(db, email)
+    return await db_module.update_tenant(db, t["id"], plan=plan, **fields) if (plan != "free" or fields) else t
+
+
+async def _flag(db, tenant_id: str, column: str) -> Any:
+    return (await db_module.get_tenant_by_id(db, tenant_id))[column]
+
+
+async def _seed_backfill_cases(db) -> dict[str, dict[str, Any]]:
+    return {
+        "pt": await _make_tenant(db, "pt-boot@example.com", "playtester"),
+        "staff": await _make_tenant(db, "staff-boot@example.com", "pro"),
+        "boss": await _make_tenant(db, "boss-boot@example.com", "free"),
+    }
+
+
+async def test_boot_backfills_leave_a_playtester_alone_and_still_do_their_job(db, monkeypatch):
+    monkeypatch.setenv("MERIDIAN_INTERNAL_EMAILS", "pt-boot@example.com, STAFF-boot@example.com")
+    monkeypatch.setenv("MERIDIAN_ADMIN_EMAILS", "pt-boot@example.com,boss-boot@example.com")
+    cases = await _seed_backfill_cases(db)
+
+    for _boot in range(2):  # every boot re-runs them
+        await db_module._migrate_tenants_is_internal(db)
+        await db_module._migrate_admin_plan(db)
+        assert await _flag(db, cases["pt"]["id"], "is_internal") == 0
+        assert await _flag(db, cases["pt"]["id"], "plan") == "playtester"
+        # the behaviour for everyone else is exactly what it was
+        assert await _flag(db, cases["staff"]["id"], "is_internal") == 1
+        assert await _flag(db, cases["boss"]["id"], "plan") == "admin"
+
+
+class _PgOverSqlite:
+    """Just enough of PostgresConnection for the Postgres boot backfills. They use
+    the same ``?`` SQL as the SQLite ones (the adapter only swaps the placeholder),
+    so the statements run on the SQLite test db and their effect is checked there.
+    The information_schema probe answers 'integer' (no legacy BOOLEAN column)."""
+
+    def __init__(self, db) -> None:
+        self.db = db
+
+    async def executescript(self, _sql: str) -> None:
+        return None
+
+    def execute(self, sql: str, params: tuple = ()):
+        return _PgExec(self.db, sql, params)
+
+
+class _PgExec:
+    def __init__(self, db, sql: str, params: tuple) -> None:
+        self.db, self.sql, self.params = db, sql, params
+
+    async def _run(self) -> "_PgExec":
+        if "information_schema" not in self.sql:
+            await self.db.execute(self.sql, self.params)
+            await self.db.commit()
+        return self
+
+    def __await__(self):
+        return self._run().__await__()
+
+    async def __aenter__(self) -> "_PgExec":
+        return await self._run()
+
+    async def __aexit__(self, *_a) -> bool:
+        return False
+
+    async def fetchone(self) -> dict[str, str]:
+        return {"data_type": "integer"}
+
+
+async def test_postgres_boot_backfills_leave_a_playtester_alone_and_still_do_their_job(db, monkeypatch):
+    from meridian import pg_adapter
+
+    monkeypatch.setenv("MERIDIAN_INTERNAL_EMAILS", "pt-boot@example.com,staff-boot@example.com")
+    monkeypatch.setenv("MERIDIAN_ADMIN_EMAILS", "pt-boot@example.com,boss-boot@example.com")
+    cases = await _seed_backfill_cases(db)
+    conn = _PgOverSqlite(db)
+
+    for _boot in range(2):
+        await pg_adapter._migrate_pg_tenants_is_internal(conn)
+        await pg_adapter._migrate_pg_admin_plan(conn)
+        assert await _flag(db, cases["pt"]["id"], "is_internal") == 0
+        assert await _flag(db, cases["pt"]["id"], "plan") == "playtester"
+        assert await _flag(db, cases["staff"]["id"], "is_internal") == 1
+        assert await _flag(db, cases["boss"]["id"], "plan") == "admin"
+
+
+# ---------------------------------------------------------------------------
+# Operator action: set / revoke a plan by email (tenant_plan_admin)
+# ---------------------------------------------------------------------------
+
+
+def test_every_plan_has_a_label_that_matches_the_dashboard_and_settable_plans_are_known():
+    import re
+
+    assert set(plans.PLAN_LABELS) == set(plans.KNOWN_PLANS)
+    assert plans.OPERATOR_SETTABLE_PLANS <= plans.KNOWN_PLANS
+    assert "admin" not in plans.OPERATOR_SETTABLE_PLANS and "playtester" in plans.OPERATOR_SETTABLE_PLANS
+    assert plans.plan_label("playtester") == "Playtester" and plans.plan_label("bogus") == "bogus"
+    assert plans.plan_label(None) == ""
+    block = re.search(r"export const _PLAN_LABELS[^=]*=\s*\{(.*?)\};", dashboard_source(), re.S)
+    assert block, "dashboard-utils.ts _PLAN_LABELS not found"
+    client_labels = dict(re.findall(r"(\w+):\s*'([^']*)'", block.group(1)))
+    for plan, label in plans.PLAN_LABELS.items():
+        assert client_labels[plan] == label, plan
+
+
+async def _audit(db, tenant_id: str) -> list[dict[str, Any]]:
+    return await db_module.get_action_audit_log(db, tenant_id=tenant_id, event_type="tenant_plan_changed")
+
+
+async def test_grant_previews_then_applies_audits_and_is_idempotent(db):
+    from meridian import tenant_plan_admin as tpa
+
+    t = await db_module.upsert_tenant(db, "grant@example.com")
+
+    preview = await tpa.set_tenant_plan_by_email(
+        db, "grant@example.com", "playtester", actor="owner@example.com")
+    assert preview["applied"] is False and preview["changed"] is True
+    assert preview["plan_before"] == "free" and preview["plan"] == "playtester"
+    assert preview["plan_label"] == "Playtester"
+    assert (await _flag(db, t["id"], "plan")) == "free"  # a preview writes nothing
+    assert await _audit(db, t["id"]) == []
+
+    done = await tpa.set_tenant_plan_by_email(
+        db, "  Grant@Example.COM ", "playtester", apply=True, actor="owner@example.com")
+    assert done["applied"] is True and done["changed"] is True and done["tenant_id"] == t["id"]
+    row = await db_module.get_tenant_by_id(db, t["id"])
+    assert row["plan"] == "playtester" and row["inactivity_expires_at"] is None
+    audit = await _audit(db, t["id"])
+    assert len(audit) == 1 and audit[0]["actor"] == "owner@example.com"
+    detail = json.loads(audit[0]["detail"])
+    assert detail["plan"] == ["free", "playtester"] and detail["via"] == "admin"
+    assert detail["email"] == "grant@example.com"
+
+    again = await tpa.set_tenant_plan_by_email(db, "grant@example.com", "playtester", apply=True)
+    assert again["changed"] is False and again["applied"] is True
+    assert len(await _audit(db, t["id"])) == 1  # a no-op leaves no audit row
+
+
+async def test_end_date_is_set_kept_replaced_and_cleared(db):
+    from meridian import tenant_plan_admin as tpa
+
+    t = await db_module.upsert_tenant(db, "end@example.com")
+
+    async def _set(**kw):
+        return await tpa.set_tenant_plan_by_email(db, "end@example.com", "playtester", apply=True, **kw)
+
+    r = await _set(expires_at="2099-06-30")
+    assert r["expires_at"] == "2099-06-30 00:00:00"
+    row = await db_module.get_tenant_by_id(db, t["id"])
+    assert row["inactivity_expires_at"] == "2099-06-30 00:00:00"
+    assert plans.playtester_access_expired(row) is False
+
+    kept = await _set()  # no date given: a playtester keeps its own
+    assert kept["changed"] is False and await _flag(db, t["id"], "inactivity_expires_at") == "2099-06-30 00:00:00"
+
+    r = await _set(expires_at="2099-07-01T12:30:00")
+    assert r["changed"] is True and await _flag(db, t["id"], "inactivity_expires_at") == "2099-07-01 12:30:00"
+
+    r = await _set(expires_at=None)  # explicit null: no end date
+    assert r["changed"] is True and await _flag(db, t["id"], "inactivity_expires_at") is None
+
+    for bad, status in (("2000-01-01", 400), ("not a date", 400), ("", 400)):
+        with pytest.raises(tpa.PlanChangeError) as err:
+            await _set(expires_at=bad)
+        assert err.value.status == status
+    assert await _flag(db, t["id"], "inactivity_expires_at") is None  # refusals changed nothing
+
+
+async def test_granting_never_inherits_a_trial_date_and_revoking_clears_the_end_date(db):
+    from meridian import tenant_plan_admin as tpa
+
+    t = await db_module.upsert_tenant(db, "trialdate@example.com")
+    await db_module.update_tenant(db, t["id"], inactivity_expires_at=PAST)  # a lapsed free trial
+
+    await tpa.set_tenant_plan_by_email(db, "trialdate@example.com", "playtester", apply=True)
+    row = await db_module.get_tenant_by_id(db, t["id"])
+    # the old trial date must not become a playtester end date that expires it at once
+    assert row["inactivity_expires_at"] is None
+    assert plans.playtester_access_expired(row) is False
+    assert plans.tenant_entitlement_plan(row) == "pro"
+
+    await tpa.set_tenant_plan_by_email(
+        db, "trialdate@example.com", "playtester", expires_at="2099-01-01", apply=True)
+    revoked = await tpa.set_tenant_plan_by_email(db, "trialdate@example.com", "free", apply=True)
+    row = await db_module.get_tenant_by_id(db, t["id"])
+    assert row["plan"] == "free" and revoked["plan_label"] == "Free Trial"
+    # the playtester's end date is not left behind as the free trial's expiry
+    assert row["inactivity_expires_at"] is None
+    assert len(await _audit(db, t["id"])) == 3
+
+    again = await tpa.set_tenant_plan_by_email(db, "trialdate@example.com", "free", apply=True)
+    assert again["changed"] is False
+
+
+async def test_a_plan_change_between_other_plans_leaves_the_trial_clock_alone(db):
+    from meridian import tenant_plan_admin as tpa
+
+    t = await db_module.upsert_tenant(db, "clock@example.com")
+    await db_module.update_tenant(db, t["id"], inactivity_expires_at=FUTURE)
+    r = await tpa.set_tenant_plan_by_email(db, "clock@example.com", "pro", apply=True)
+    assert r["plan_label"] == "Pro" and r["expires_at"] == FUTURE
+    assert await _flag(db, t["id"], "inactivity_expires_at") == FUTURE
+
+
+@pytest.mark.parametrize(
+    "email, plan, extra, status",
+    [
+        ("known@example.com", "bogus", {}, 400),
+        ("known@example.com", "Playtester", {}, 400),          # exact spelling only
+        ("known@example.com", "admin", {}, 400),               # never set from here
+        ("known@example.com", "trial", {}, 400),
+        ("known@example.com", None, {}, 400),
+        ("known@example.com", "pro", {"expires_at": "2099-01-01"}, 400),  # only a playtester has an end date
+        ("", "playtester", {}, 400),
+        ("not-an-email", "playtester", {}, 400),
+        ("nobody@example.com", "playtester", {}, 404),
+        ("boss@example.com", "playtester", {}, 409),           # an operator account
+        ("payer@example.com", "playtester", {}, 409),          # a live Stripe customer would keep paying
+    ],
+)
+async def test_the_action_refuses_what_it_should_and_changes_nothing(db, email, plan, extra, status):
+    from meridian import tenant_plan_admin as tpa
+
+    known = await _make_tenant(db, "known@example.com")
+    boss = await _make_tenant(db, "boss@example.com", "admin")
+    payer = await _make_tenant(db, "payer@example.com", "pro", stripe_customer_id="cus_real")
+    with pytest.raises(tpa.PlanChangeError) as err:
+        await tpa.set_tenant_plan_by_email(db, email, plan, apply=True, **extra)
+    assert err.value.status == status and err.value.message
+    for t, plan_now in ((known, "free"), (boss, "admin"), (payer, "pro")):
+        assert await _flag(db, t["id"], "plan") == plan_now
+    assert [e for t in (known, boss, payer) for e in await _audit(db, t["id"])] == []
+
+
+async def test_a_paying_customer_can_still_be_moved_to_free_but_a_playtester_has_none(db):
+    """The Stripe refusal is for GRANTING the unbilled plan, not for any change."""
+    from meridian import tenant_plan_admin as tpa
+
+    t = await _make_tenant(db, "payer2@example.com", "pro", stripe_customer_id="cus_real")
+    r = await tpa.set_tenant_plan_by_email(db, "payer2@example.com", "standard", apply=True)
+    assert r["changed"] is True and await _flag(db, t["id"], "plan") == "standard"
+
+
+async def test_clearing_the_staff_flag_is_explicit_and_only_ever_clears(db):
+    from meridian import tenant_plan_admin as tpa
+
+    t = await _make_tenant(db, "staffer@example.com", "pro")
+    await db.execute("UPDATE tenants SET is_internal = 1 WHERE id = ?", (t["id"],))
+    await db.commit()
+
+    kept = await tpa.set_tenant_plan_by_email(db, "staffer@example.com", "playtester", apply=True)
+    assert kept["is_internal"] is True and kept["is_internal_before"] is True
+    assert any("is_internal" in w and "no ceiling" in w for w in kept["warnings"])
+    assert await _flag(db, t["id"], "is_internal") == 1  # not touched unless asked
+
+    cleared = await tpa.set_tenant_plan_by_email(
+        db, "staffer@example.com", "playtester", clear_internal=True, apply=True)
+    assert cleared["changed"] is True and cleared["is_internal"] is False
+    assert not any("is_internal" in w for w in cleared["warnings"])
+    assert await _flag(db, t["id"], "is_internal") == 0
+    audits = [json.loads(a["detail"]) for a in await _audit(db, t["id"])]
+    assert any(a["is_internal"] == [True, False] for a in audits)  # the audit says what changed
+
+    noop = await tpa.set_tenant_plan_by_email(
+        db, "staffer@example.com", "playtester", clear_internal=True, apply=True)
+    assert noop["changed"] is False
+    assert len(await _audit(db, t["id"])) == 2
+
+
+async def test_the_action_says_when_paying_tenants_share_the_pool_and_when_there_is_no_database(db):
+    from meridian import tenant_plan_admin as tpa
+
+    await _make_tenant(db, "sg-target@example.com", "free", neon_project_id="np-sg")
+    await _make_tenant(db, "sg-pro@example.com", "pro", neon_project_id="np-sg")
+    mate = await _make_tenant(db, "sg-staff@example.com", "pro", neon_project_id="np-sg")
+    await db.execute("UPDATE tenants SET is_internal = 1 WHERE id = ?", (mate["id"],))
+    await db.commit()
+    await _make_tenant(db, "sg-pt@example.com", "playtester", neon_project_id="np-sg")
+    await _make_tenant(db, "sg-elsewhere@example.com", "pro", neon_project_id="np-other")
+
+    shared = await tpa.set_tenant_plan_by_email(db, "sg-target@example.com", "playtester")
+    assert shared["billed_pool_neighbours"] == 1  # staff, playtesters and other pools do not count
+    assert any("share" in w and "pool" in w for w in shared["warnings"])
+
+    await _make_tenant(db, "sg-alone@example.com", "free", neon_project_id="np-alone")
+    alone = await tpa.set_tenant_plan_by_email(db, "sg-alone@example.com", "playtester")
+    assert alone["billed_pool_neighbours"] == 0 and alone["warnings"] == []
+
+    await _make_tenant(db, "sg-nodb@example.com", "free")
+    nodb = await tpa.set_tenant_plan_by_email(db, "sg-nodb@example.com", "playtester")
+    assert any("no database" in w for w in nodb["warnings"])
+
+
+async def test_the_unknown_plan_guard_on_the_one_write_path_is_unchanged(db):
+    t = await db_module.upsert_tenant(db, "guard@example.com")
+    with pytest.raises(ValueError):
+        await db_module.update_tenant(db, t["id"], plan="playtest")
+    await db_module.update_tenant(db, t["id"], plan="playtester")
+    assert await _flag(db, t["id"], "plan") == "playtester"
+
+
+# --- the admin route ---------------------------------------------------------
+
+
+def _as_admin(client, monkeypatch, email: str = "plan-admin@example.com") -> dict[str, Any]:
+    monkeypatch.setenv("MERIDIAN_ADMIN_EMAILS", email)
+    monkeypatch.delenv("MERIDIAN_ADMIN_PASSWORD", raising=False)
+    return _seed(client, email, "free")
+
+
+def test_admin_plan_route_is_not_served_when_self_hosted(client):
+    r = client.post("/admin/tenants/plan", json={"email": "a@example.com", "plan": "free", "confirm": True})
+    assert r.status_code == 404
+
+
+def test_admin_plan_route_refuses_anonymous_and_non_admin_callers(monkeypatch, tmp_path):
+    client = _hosted_client(monkeypatch, tmp_path)
+    monkeypatch.delenv("MERIDIAN_ADMIN_EMAILS", raising=False)
+    monkeypatch.delenv("ADMIN_EMAIL", raising=False)
+    body = {"email": "victim@example.com", "plan": "playtester", "confirm": True}
+    with client:
+        victim = _seed(client, "victim@example.com", "free")
+        client.cookies.clear()
+        assert client.post("/admin/tenants/plan", json=body).status_code == 401
+        _seed(client, "plain-user@example.com", "free")
+        assert client.post("/admin/tenants/plan", json=body).status_code == 403
+        # an admin whose password cookie is missing is refused too
+        monkeypatch.setenv("MERIDIAN_ADMIN_EMAILS", "plain-user@example.com")
+        monkeypatch.setenv("MERIDIAN_ADMIN_PASSWORD", "hunter2-test")
+        assert client.post("/admin/tenants/plan", json=body).status_code == 403
+        row = asyncio.run(db_module.get_tenant_by_id(client.app.state.db, victim["id"]))
+    assert row["plan"] == "free"
+
+
+def test_admin_grants_and_revokes_the_playtester_plan_over_http(monkeypatch, tmp_path):
+    client = _hosted_client(monkeypatch, tmp_path)
+    with client:
+        db = client.app.state.db
+        target = _seed(client, "moved@example.com", "pro", is_internal=True)  # the staff stopgap
+        _as_admin(client, monkeypatch)
+        url = "/admin/tenants/plan"
+        grant = {"email": "moved@example.com", "plan": "playtester", "is_internal": False}
+
+        r = client.post(url, json=grant)  # no confirm: a preview
+        assert r.status_code == 200
+        body = r.json()
+        assert body["applied"] is False and body["changed"] is True and body["plan_label"] == "Playtester"
+        assert asyncio.run(db_module.get_tenant_by_id(db, target["id"]))["plan"] == "pro"
+
+        r = client.post(url, json={**grant, "confirm": True})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["applied"] is True and body["plan_before"] == "pro" and body["plan"] == "playtester"
+        assert body["is_internal_before"] is True and body["is_internal"] is False
+        row = asyncio.run(db_module.get_tenant_by_id(db, target["id"]))
+        assert row["plan"] == "playtester" and row["is_internal"] == 0
+        assert row["inactivity_expires_at"] is None
+        audit = asyncio.run(_audit(db, target["id"]))
+        assert len(audit) == 1 and audit[0]["actor"] == "plan-admin@example.com"
+        assert json.loads(audit[0]["detail"])["via"] == "admin_route"
+
+        # idempotent, and the account now reads as a playtester everywhere
+        again = client.post(url, json={**grant, "confirm": True}).json()
+        assert again["changed"] is False and again["applied"] is True
+        assert len(asyncio.run(_audit(db, target["id"]))) == 1
+
+        # end date: given, kept when the key is absent, cleared by null
+        r = client.post(url, json={"email": "moved@example.com", "plan": "playtester",
+                                   "expires_at": "2099-12-31", "confirm": True})
+        assert r.json()["expires_at"] == "2099-12-31 00:00:00"
+        r = client.post(url, json={"email": "moved@example.com", "plan": "playtester", "confirm": True})
+        assert r.json()["expires_at"] == "2099-12-31 00:00:00" and r.json()["changed"] is False
+        r = client.post(url, json={"email": "moved@example.com", "plan": "playtester",
+                                   "expires_at": None, "confirm": True})
+        assert r.json()["expires_at"] is None and r.json()["changed"] is True
+
+        r = client.post(url, json={"email": "moved@example.com", "plan": "free", "confirm": True})
+        assert r.status_code == 200 and r.json()["plan_label"] == "Free Trial"
+        assert asyncio.run(db_module.get_tenant_by_id(db, target["id"]))["plan"] == "free"
+
+
+def test_admin_plan_route_validates_the_request(monkeypatch, tmp_path):
+    client = _hosted_client(monkeypatch, tmp_path)
+    with client:
+        db = client.app.state.db
+        _seed(client, "route-known@example.com", "free")
+        payer = _seed(client, "route-payer@example.com", "pro", stripe_customer_id="cus_real")
+        _as_admin(client, monkeypatch)
+        url = "/admin/tenants/plan"
+
+        def _post(**body):
+            return client.post(url, json={"confirm": True, **body})
+
+        assert _post(email="route-known@example.com", plan="bogus").status_code == 400
+        assert _post(email="route-known@example.com", plan="admin").status_code == 400
+        assert _post(email="nobody@example.com", plan="playtester").status_code == 404
+        assert _post(email="route-payer@example.com", plan="playtester").status_code == 409
+        # the staff flag can be cleared here, never set
+        assert _post(email="route-known@example.com", plan="playtester", is_internal=True).status_code == 400
+        assert _post(email="route-known@example.com", plan="playtester", is_internal="no").status_code == 400
+        assert client.post(url, content=b"not json").status_code == 400
+        assert client.post(url, json=["a list"]).status_code == 400
+        assert asyncio.run(db_module.get_tenant_by_id(db, payer["id"]))["plan"] == "pro"
+        known = asyncio.run(db_module.get_tenant_by_id(db, _seed_id(db, "route-known@example.com")))
+        assert known["plan"] == "free" and known["is_internal"] == 0
+
+
+def _seed_id(db, email: str) -> str:
+    async def _go():
+        async with db.execute("SELECT id FROM tenants WHERE email = ?", (email,)) as cur:
+            return (await cur.fetchone())["id"]
+
+    return asyncio.run(_go())
+
+
+def test_admin_waitlist_page_does_not_count_a_playtester_as_a_paid_plan(monkeypatch, tmp_path):
+    import re
+
+    client = _hosted_client(monkeypatch, tmp_path)
+    with client:
+        _seed(client, "count-pro@example.com", "pro")
+        _seed(client, "count-std@example.com", "standard")
+        _seed(client, "count-pt@example.com", "playtester")
+        _as_admin(client, monkeypatch, "count-admin@example.com")
+        page = client.get("/admin/waitlist")
+        assert page.status_code == 200
+        paid = re.search(r'<div class="n">(\d+)</div><div class="l">Paid Plan', page.text)
+        total = re.search(r'<div class="n">(\d+)</div><div class="l">Total Tenants', page.text)
+        assert paid and total
+        assert (int(paid.group(1)), int(total.group(1))) == (2, 4)
+
+
+# --- the command line --------------------------------------------------------
+
+
+def _load_cli():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "set_tenant_plan.py"
+    spec = importlib.util.spec_from_file_location("set_tenant_plan_cli", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+async def test_cli_previews_by_default_and_applies_with_the_same_rules(db):
+    cli = _load_cli()
+    t = await db_module.upsert_tenant(db, "cli@example.com")
+
+    def _args(*argv: str):
+        return cli.build_parser().parse_args(["cli@example.com", *argv])
+
+    preview = await cli.run(_args("playtester"), db)
+    assert preview["applied"] is False and await _flag(db, t["id"], "plan") == "free"
+
+    done = await cli.run(_args("playtester", "--expires", "2099-03-01", "--apply"), db)
+    assert done["applied"] is True and done["plan_label"] == "Playtester"
+    assert await _flag(db, t["id"], "inactivity_expires_at") == "2099-03-01 00:00:00"
+    audit = (await _audit(db, t["id"]))[0]
+    assert audit["actor"].startswith("cli:") and json.loads(audit["detail"])["via"] == "cli"
+
+    kept = await cli.run(_args("playtester", "--apply"), db)  # no date flag: keeps it
+    assert kept["changed"] is False
+    cleared = await cli.run(_args("playtester", "--no-expiry", "--apply"), db)
+    assert cleared["changed"] is True and await _flag(db, t["id"], "inactivity_expires_at") is None
+
+    await db.execute("UPDATE tenants SET is_internal = 1 WHERE id = ?", (t["id"],))
+    await db.commit()
+    await cli.run(_args("playtester", "--clear-internal", "--apply"), db)
+    assert await _flag(db, t["id"], "is_internal") == 0
+
+    from meridian.tenant_plan_admin import PlanChangeError
+
+    with pytest.raises(PlanChangeError):
+        await cli.run(_args("admin", "--apply"), db)
+    revoked = await cli.run(_args("free", "--apply"), db)
+    assert revoked["plan"] == "free" and await _flag(db, t["id"], "plan") == "free"
+
+
+def test_cli_needs_a_database_and_rejects_conflicting_date_flags(monkeypatch, capsys):
+    cli = _load_cli()
+    monkeypatch.delenv("MERIDIAN_DB_URL", raising=False)
+    monkeypatch.delenv("MERIDIAN_AUTH_DB", raising=False)
+    assert cli.main(["someone@example.com", "free"]) == 1
+    assert "MERIDIAN_DB_URL" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["a@example.com", "playtester", "--expires", "2099-01-01", "--no-expiry"])

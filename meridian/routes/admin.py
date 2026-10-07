@@ -324,6 +324,60 @@ async def admin_reset_tenant_provisioning(tenant_id: str, request: Request) -> R
     return JSONResponse({"reset": True, **result})
 
 
+@router.post("/admin/tenants/plan")
+async def admin_set_tenant_plan(request: Request) -> Response:
+    """Set or revoke a tenant's plan by account email (grant the playtester plan).
+
+    The ``playtester`` plan is unpaid Pro entitlements with usage still bounded.
+
+    Body: ``{"email": ..., "plan": "playtester"|"free"|"standard"|"pro",
+    "expires_at": "YYYY-MM-DD" | null, "is_internal": false, "confirm": true}``.
+    ``expires_at`` is only for a playtester (omitted keeps its current end date;
+    null clears it). ``is_internal`` may only be ``false``: it clears the staff
+    flag when moving a staff account to playtester and is never set here.
+    Without ``confirm`` nothing is written and the response says what would
+    change (``applied`` is false); with it the change is applied, idempotent and
+    audited. The response carries the plan label and any warning (a pool shared
+    with paying tenants, a staff flag that still exempts the tenant).
+
+    Hosted operator only (admin session + admin password), like
+    reset-provisioning. See ``meridian/tenant_plan_admin.py``.
+    """
+    from ..tenant_plan_admin import UNSET, PlanChangeError, set_tenant_plan_by_email  # noqa: PLC0415
+
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    await _require_hosted_operator(request)
+    from ..hosted import get_current_tenant  # noqa: PLC0415
+
+    caller = await get_current_tenant(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON object body required")
+    if "is_internal" in body and body["is_internal"] is not False:
+        raise HTTPException(
+            status_code=400,
+            detail="is_internal can only be false here: the staff flag is never set by this action",
+        )
+    try:
+        result = await set_tenant_plan_by_email(
+            request.app.state.db,
+            body.get("email", ""),
+            body.get("plan", ""),
+            expires_at=body["expires_at"] if "expires_at" in body else UNSET,
+            clear_internal=body.get("is_internal") is False,
+            apply=body.get("confirm") is True,
+            actor=caller.get("email", ""),
+            via="admin_route",
+        )
+    except PlanChangeError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+    return JSONResponse(result)
+
+
 @router.get("/admin/snapshot")
 async def download_snapshot(request: Request) -> Response:
     """Download the current DB as a SQLite snapshot file."""

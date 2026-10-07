@@ -1218,15 +1218,6 @@ _ALERT_THRESHOLD_STANDARD = int(os.environ.get("ALERT_THRESHOLD_STANDARD", "85")
 _ALERT_THRESHOLD_PRO = int(os.environ.get("ALERT_THRESHOLD_PRO", "90"))
 
 
-def _pool_max_cu(tier: str) -> float:
-    """Autoscaling ceiling (CU) a pool project of ``tier`` is created with.
-
-    Also the value a compute throttle is lifted back to at the monthly reset,
-    so the two cannot drift apart.
-    """
-    return 4.0 if tier == "pro" else 2.0
-
-
 def _neon_api_key_for_tier(tier: str) -> str:
     """Return the Neon API key for the given tier.  Raises if not configured.
 
@@ -1274,11 +1265,27 @@ def _neon_api_key_for_tenant(tenant: dict[str, Any], pool_tiers: dict[str, str])
     The database stays in the pool it was provisioned into when the plan
     changes later (free -> playtester or pro, pro -> standard), so the plan is
     only the fallback for a database that is not a registered pool project.
-    Asking the wrong account is refused by Neon and the usage jobs then skip the
-    tenant: nothing is measured, throttled or lifted for it.
+    Asking the wrong account is refused by Neon: a usage job then cannot measure
+    the tenant and a database drop silently does nothing.
     """
     tier = pool_tiers.get(tenant.get("neon_project_id") or "") or tenant.get("plan") or "standard"
     return _neon_api_key_for_tier(tier)
+
+
+def _neon_api_key_for_usage(tenant: dict[str, Any], pool_tiers: dict[str, str]) -> str:
+    """Neon API key the usage jobs (daily overage, hourly storage) poll a tenant with.
+
+    Every ordinary tenant is polled with its plan's key, exactly as before the
+    playtester plan: following the pool registry for them too would start
+    measuring (and, through the existing no-budget throttle, clamping) pools that
+    are today skipped because plan and pool disagree. Only an unbilled plan
+    follows the registry, because it is normally made by flipping the plan of a
+    tenant that already has a database in a free/standard pool, and polling that
+    pool with the Pro key would leave the playtester unmeasured.
+    """
+    if is_unbilled_plan(tenant.get("plan")):
+        return _neon_api_key_for_tenant(tenant, pool_tiers)
+    return _neon_api_key_for_tier(tenant.get("plan") or "standard")
 
 
 def _neon_org_id_for_tier(tier: str) -> str | None:
@@ -1327,12 +1334,13 @@ async def _create_neon_pool_project(
             "active_time_seconds": 300 * 3600,  # 300 CU-hrs
             "compute_time_seconds": 300 * 3600,
         }
+        autoscaling_limit_max_cu = 4.0
     else:
         quota = {
             "active_time_seconds": 100 * 3600,   # 100 CU-hrs
             "compute_time_seconds": 100 * 3600,
         }
-    autoscaling_limit_max_cu = _pool_max_cu(tier)
+        autoscaling_limit_max_cu = 2.0
 
     payload: dict[str, Any] = {
         "project": {
@@ -1845,15 +1853,24 @@ async def cancel_stripe_subscription(stripe_customer_id: str) -> None:
         pass
 
 
-async def _drop_tenant_neon_database(tenant: dict[str, Any]) -> None:
-    """Drop the customer's database within their pool Neon project. Best-effort."""
+async def _drop_tenant_neon_database(tenant: dict[str, Any], db: Any = None) -> None:
+    """Drop the customer's database within their pool Neon project. Best-effort.
+
+    The Neon API key is that of the account owning the pool project the database
+    lives in (``neon_pool_projects.tier``), not the one the plan names today: a
+    plan can change after provisioning (a playtester is usually a free or
+    standard tenant whose plan was flipped), and Neon refuses a project to any
+    other account's key, which this best-effort call would swallow, leaving the
+    customer's data behind a "deleted" answer. Pass ``db`` (the control-plane
+    DB) so the registry can be read; without it the plan is the only hint.
+    """
     import httpx
     neon_project_id = tenant.get("neon_project_id")
     if not neon_project_id:
         return
-    plan = tenant.get("plan", "standard")
+    pool_tiers = await _pool_tiers_by_project(db) if db is not None else {}
     try:
-        api_key = _neon_api_key_for_tier(plan)
+        api_key = _neon_api_key_for_tenant(tenant, pool_tiers)
     except RuntimeError:
         api_key = _cfg("NEON_API_KEY") or ""
     if not api_key:
@@ -1872,6 +1889,12 @@ async def _drop_tenant_neon_database(tenant: dict[str, Any]) -> None:
             if not branch_id and branches:
                 branch_id = branches[0]["id"]
             if not branch_id:
+                # A refused or empty answer used to end here without a trace.
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "Neon database not dropped, no branch listed: pool=%s tenant=%s status=%s",
+                    neon_project_id, tenant_id, getattr(br, "status_code", "?"),
+                )
                 return
             await http.delete(
                 f"https://console.neon.tech/api/v2/projects/{neon_project_id}/branches/{branch_id}/databases/{db_name}",
@@ -1913,7 +1936,7 @@ async def reset_tenant_provisioning(db: Any, tenant_id: str) -> dict[str, Any]:
     neon_project_id = tenant.get("neon_project_id")
 
     if had_neon_project:
-        await _drop_tenant_neon_database(tenant)
+        await _drop_tenant_neon_database(tenant, db)
         try:
             await db_module.decrement_pool_project_count(db, neon_project_id)
         except Exception:  # noqa: BLE001
@@ -2056,52 +2079,102 @@ async def _send_owner_alert(subject: str, html: str) -> None:
         pass
 
 
-async def _alert_owner_playtester_limit(
-    playtester_email: str,
-    kind: str,
-    detail: str,
-    *,
-    db: Any = None,
-    tenant: "dict[str, Any] | None" = None,
-    now: "datetime | None" = None,
-) -> None:
+async def _alert_owner_playtester_limit(playtester_email: str, kind: str, detail: str) -> None:
     """Tell the owner a playtester crossed a usage ceiling.
 
     Playtester usage is bounded but never billed, so nothing else surfaces an
-    over-limit account to the person who granted it. When ``db`` and ``tenant``
-    are given the alert is sent at most once per calendar month per ``kind``,
-    tracked in the tenant's ``notification_prefs`` blob (like the Redis flags);
-    callers that are already one-shot (a compute throttle that stamps
-    ``compute_throttled_at``) omit them.
+    over-limit account to the person who granted it.
     """
     import html as _html
-    import json as _json
-    from . import db as db_module  # noqa: PLC0415
 
-    month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
-    flag = f"playtester_{kind}_alert_month"
-    prefs: "dict[str, Any] | None" = None
-    if db is not None and tenant is not None:
-        # Read the blob fresh: an earlier alert for this tenant in the same job
-        # run (compute, then storage) has already written its own month flag,
-        # and writing back the caller's stale copy would erase it.
-        fresh = await db_module.get_tenant_by_id(db, tenant["id"]) or tenant
-        prefs = _parse_notification_prefs(fresh)
-        if prefs.get(flag) == month:
-            return
     await _send_owner_alert(
         f"[Meridian] Playtester over {kind} limit: {playtester_email}",
         f"<p>Playtester <strong>{_html.escape(playtester_email)}</strong> is over the "
         f"{kind} ceiling: {_html.escape(detail)}</p>",
     )
-    if prefs is not None:
-        prefs[flag] = month
-        try:
-            await db_module.update_tenant(
-                db, tenant["id"], notification_prefs=_json.dumps(prefs)  # type: ignore[index]
-            )
-        except Exception:  # noqa: BLE001
-            pass
+
+
+async def _claim_playtester_notice(
+    db: Any, tenant: dict[str, Any], kind: str, now: "datetime"
+) -> bool:
+    """True the first time a notice of ``kind`` is due for ``tenant`` this calendar month.
+
+    The daily job re-checks every tenant every day and an unbilled plan has no
+    throttle flag to stop the repeats, so the month is recorded in the tenant's
+    ``notification_prefs`` blob. The blob is read fresh: an earlier notice for
+    this tenant in the same run has already written its own flag, and writing
+    back the caller's stale copy would erase it. If the flag cannot be written the
+    notice is still sent (a repeat is better than a ceiling nobody hears about).
+    """
+    import json as _json
+    from . import db as db_module  # noqa: PLC0415
+
+    flag = f"playtester_{kind}_notice_month"
+    month = now.strftime("%Y-%m")
+    fresh = await db_module.get_tenant_by_id(db, tenant["id"]) or tenant
+    prefs = _parse_notification_prefs(fresh)
+    if prefs.get(flag) == month:
+        return False
+    prefs[flag] = month
+    try:
+        await db_module.update_tenant(db, tenant["id"], notification_prefs=_json.dumps(prefs))
+    except Exception:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Playtester notice month not recorded, it may repeat: tenant=%s kind=%s",
+            tenant.get("email", ""), kind,
+        )
+    return True
+
+
+async def _notify_playtester_over_ceiling(
+    db: Any,
+    tenant: dict[str, Any],
+    kind: str,
+    now: "datetime",
+    *,
+    shared_pool: bool,
+    detail: str,
+    subject: str,
+    html: str,
+) -> None:
+    """A playtester is past a hard ceiling (past grace, for compute).
+
+    The owner is always told; the tenant is too unless the pool is shared with
+    paying tenants, where the measured usage may not be the playtester's. Once a
+    month per ``kind``.
+    """
+    import logging as _logging
+
+    email = tenant.get("email", "")
+    if not await _claim_playtester_notice(db, tenant, kind, now):
+        return
+    _logging.getLogger(__name__).warning(
+        "Playtester %s ceiling exceeded: tenant=%s shared_pool=%s: %s",
+        kind, email, shared_pool, detail,
+    )
+    if not shared_pool:
+        await _send_overage_email(email, subject, html)
+    await _alert_owner_playtester_limit(email, kind, detail)
+
+
+async def _notify_playtester_warning(
+    db: Any,
+    tenant: dict[str, Any],
+    now: "datetime",
+    *,
+    shared_pool: bool,
+    subject: str,
+    html: str,
+) -> None:
+    """Compute warning at the Pro threshold, once a month, to the tenant only.
+
+    Silent in a pool shared with paying tenants: the number is the pool's.
+    """
+    if shared_pool:
+        return
+    if await _claim_playtester_notice(db, tenant, "compute_warning", now):
+        await _send_overage_email(tenant.get("email", ""), subject, html)
 
 
 async def check_capacity(db: Any) -> dict[str, Any]:
@@ -2246,6 +2319,7 @@ async def run_storage_overage_check(db: Any) -> None:
 
     tenants = [_to_d(r) for r in rows] if rows else []
     pool_tiers = await _pool_tiers_by_project(db)
+    playtester_pools = _pools_with_unbilled_tenants(tenants)
 
     for tenant in tenants:
         # G2.10 — internal tenants are never charged for storage overage.
@@ -2255,10 +2329,16 @@ async def run_storage_overage_check(db: Any) -> None:
         if not neon_project_id:
             continue
         plan = tenant.get("plan") or "standard"
-        # The API key follows the pool the database lives in; the ceiling
-        # follows the entitlement currently in force.
+        if not is_unbilled_plan(plan) and neon_project_id in playtester_pools:
+            # Storage is read per pool project, so with a playtester in it this
+            # tenant's share cannot be told from the playtester's: a charge
+            # would bill it for someone else's data.
+            _log_pool_not_attributable(tenant, neon_project_id)
+            continue
+        # An unbilled plan's API key follows the pool the database lives in;
+        # the ceiling follows the entitlement currently in force.
         try:
-            api_key = _neon_api_key_for_tenant(tenant, pool_tiers)
+            api_key = _neon_api_key_for_usage(tenant, pool_tiers)
         except RuntimeError as exc:
             # One account's key missing must not end the pass for every tenant after it.
             import logging as _logging
@@ -2391,45 +2471,13 @@ async def _set_neon_max_cu(project_id: str, api_key: str, max_cu: float) -> None
     import httpx
     try:
         async with httpx.AsyncClient(timeout=15) as http:
-            resp = await http.patch(
+            await http.patch(
                 f"https://console.neon.tech/api/v2/projects/{project_id}",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={"project": {"autoscaling_limit_max_cu": max_cu}},
             )
-        if resp.status_code >= 400:
-            # A refused cap is otherwise invisible: the tenant row says throttled
-            # (or restored) while Neon kept the old ceiling.
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "Neon refused the compute cap: pool=%s max_cu=%s status=%s",
-                project_id, max_cu, resp.status_code,
-            )
     except Exception:  # noqa: BLE001
         pass
-
-
-async def _restore_neon_max_cu(
-    db: Any, neon_project_id: str, api_key: str, plan: Any
-) -> None:
-    """Lift a compute throttle: put the pool's autoscaling ceiling back.
-
-    The value is what the pool project was created with, by its registered tier
-    (the tenant's own plan tier when the pool row cannot be found). Best-effort,
-    like the throttle it undoes.
-    """
-    tier: Any = effective_entitlement_plan(plan)
-    try:
-        async with db.execute(
-            "SELECT tier FROM neon_pool_projects WHERE neon_project_id = ?",
-            (neon_project_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        if row is not None:
-            found = row if isinstance(row, dict) else {k: row[k] for k in row.keys()}
-            tier = found.get("tier") or tier
-    except Exception:  # noqa: BLE001
-        pass
-    await _set_neon_max_cu(neon_project_id, api_key, _pool_max_cu(str(tier)))
 
 
 def _pool_has_billed_neighbours(
@@ -2437,9 +2485,9 @@ def _pool_has_billed_neighbours(
 ) -> bool:
     """True when a paying customer's database lives in this tenant's pool project.
 
-    Neon consumption and the compute cap are per pool project, so a throttle
-    aimed at one tenant lands on everyone in it. Staff (``is_internal``) and
-    unbilled plans do not count: nothing is charged for them.
+    Neon consumption is per pool project, so the figure measured for a playtester
+    in such a pool is mostly its paying neighbours' usage. Staff (``is_internal``)
+    and unbilled plans do not count: nothing is charged for them.
     """
     pool = tenant.get("neon_project_id")
     return any(
@@ -2448,6 +2496,28 @@ def _pool_has_billed_neighbours(
         and not other.get("is_internal")
         and not is_unbilled_plan(other.get("plan"))
         for other in tenants
+    )
+
+
+def _pools_with_unbilled_tenants(tenants: "list[dict[str, Any]]") -> "set[str]":
+    """Pool projects that hold at least one unbilled-plan (playtester) database.
+
+    Decided on the stored plan, not the entitlement: a playtester past its end
+    date still has a database in the pool and still uses it.
+    """
+    return {
+        t["neon_project_id"]
+        for t in tenants
+        if t.get("neon_project_id") and is_unbilled_plan(t.get("plan"))
+    }
+
+
+def _log_pool_not_attributable(tenant: dict[str, Any], neon_project_id: str) -> None:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "Pool usage not attributable, tenant skipped: a playtester shares the pool "
+        "project (tenant=%s plan=%s pool=%s)",
+        tenant.get("email", ""), tenant.get("plan"), neon_project_id,
     )
 
 
@@ -2486,20 +2556,19 @@ async def run_overage_check(db: Any) -> None:
     Excluded: EXCLUDED_NEON_PROJECTS, admin emails, tenants with no stripe_customer_id.
     Reset: columns are reset to 0 each month via overage_reset_at.
 
-    An unbilled plan (playtester, see plans.py) is bounded by the same Pro
-    ceilings but is never metered: warnings and compute throttling fire as for
-    any unbilled tenant, wording carries no budget/price text, and the owner
-    is alerted when the ceiling is crossed. Compute is not throttled while
-    paying customers share the tenant's pool project (the cap is per pool, so
-    it would land on them); the owner is alerted instead.
+    An unbilled plan (playtester, see plans.py) is judged by the same Pro
+    ceilings but is never metered and never throttled (the throttle is a
+    per-pool Neon setting and would land on its pool mates): it gets the
+    warning at the Pro threshold, and past the grace allowance the tenant and
+    the owner are told, once a month. Its Neon API key follows the pool
+    registry; every other tenant is polled with its plan's key, as before.
 
-    A compute throttle is lifted at the monthly reset (the pool's autoscaling
-    ceiling goes back to what it was created with).
+    Neon reports usage per pool project, so a billed tenant whose pool also
+    holds a playtester is skipped (logged): its share of the pool total cannot
+    be told from the playtester's, and judging it on the total would bill or
+    throttle it for the playtester's usage.
 
-    The Neon API key is that of the account owning the tenant's pool project
-    (neon_pool_projects.tier), not of the tenant's plan: a plan can change after
-    the database was provisioned. A tenant whose consumption Neon will not
-    return is logged and skipped.
+    A tenant whose consumption Neon will not return is logged and skipped.
     """
     from datetime import datetime, timezone as _tz, timedelta as _td
     from . import db as db_module
@@ -2513,6 +2582,7 @@ async def run_overage_check(db: Any) -> None:
 
     tenants = await db_module.list_tenants_with_neon(db)
     pool_tiers = await _pool_tiers_by_project(db)
+    playtester_pools = _pools_with_unbilled_tenants(tenants)
 
     for tenant in tenants:
         email = tenant.get("email", "")
@@ -2530,12 +2600,11 @@ async def run_overage_check(db: Any) -> None:
         plan = tenant.get("plan") or "standard"
         unbilled = is_unbilled_plan(plan)
         # Ceilings follow the entitlement in force (a lapsed playtester drops to
-        # free); the API key follows the pool the database actually lives in
-        # (a playtester made from a free or standard tenant is still in that pool).
+        # free).
         limits = plan_limits_for(tenant)
 
         try:
-            api_key = _neon_api_key_for_tenant(tenant, pool_tiers)
+            api_key = _neon_api_key_for_usage(tenant, pool_tiers)
         except RuntimeError:
             api_key = _cfg("NEON_API_KEY") or ""
         if not api_key:
@@ -2547,7 +2616,6 @@ async def run_overage_check(db: Any) -> None:
             try:
                 last_reset = datetime.fromisoformat(reset_at_raw.replace("Z", "+00:00"))
                 if last_reset.year < now.year or last_reset.month < now.month:
-                    was_throttled = bool(tenant.get("compute_throttled_at"))
                     await db_module.update_tenant(
                         db, tenant["id"],
                         compute_cu_hours_used=0.0,
@@ -2555,14 +2623,28 @@ async def run_overage_check(db: Any) -> None:
                         overage_reset_at=now_iso,
                         compute_throttled_at=None,
                     )
-                    tenant["compute_throttled_at"] = None
-                    if was_throttled:
-                        # The throttle email promises "until next month": lift
-                        # the cap, otherwise the DB flag clears but Neon stays
-                        # at 0.25 CU for good.
-                        await _restore_neon_max_cu(db, neon_project_id, api_key, plan)
             except (ValueError, AttributeError):
                 pass
+
+        if not unbilled and neon_project_id in playtester_pools:
+            # Consumption is per pool project: with a playtester in it this
+            # tenant's share cannot be told from the playtester's, and judging
+            # it on the total would bill or throttle it for someone else's usage.
+            _log_pool_not_attributable(tenant, neon_project_id)
+            # A paying tenant going unmetered must not be silent: tell the owner,
+            # once a month.
+            if await _claim_playtester_notice(db, tenant, "pool_skip", now):
+                import html as _html
+                await _send_owner_alert(
+                    f"[Meridian] Paying tenant not metered, a playtester shares its pool: {email}",
+                    f"<p>Overage for <strong>{_html.escape(email)}</strong> ({_html.escape(str(plan))}) "
+                    "is not being metered, warned or throttled while a playtester's database is in "
+                    "the same Neon pool project: usage is reported per pool, so the two cannot be "
+                    "told apart. It resumes when the playtester plan is revoked or one of the two "
+                    "is in another pool.</p>",
+                )
+            continue
+        shared_pool = unbilled and _pool_has_billed_neighbours(tenants, tenant)
 
         # Fetch Neon consumption for current billing month
         raw = await _fetch_neon_consumption(neon_project_id, api_key, month_start, now_iso)
@@ -2599,10 +2681,32 @@ async def run_overage_check(db: Any) -> None:
             overage_hours = cu_used - cu_limit
             charge = overage_hours * COMPUTE_OVERAGE_RATE
 
-            if (
-                compute_cap > 0 and charge <= compute_cap and stripe_id and stripe_api_key
-                and not unbilled
-            ):
+            if unbilled:
+                # Never metered and never throttled: the throttle is a per-pool
+                # Neon setting that would land on every tenant sharing the pool,
+                # and this plan has no budget to bill instead. The bound is the
+                # Pro table: the tenant and the owner are told, and Neon's own
+                # pool quota is the hard stop behind that.
+                await _notify_playtester_over_ceiling(
+                    db, tenant, "compute", now, shared_pool=shared_pool,
+                    detail=(
+                        f"{cu_used:.1f} CU-hours this month (ceiling {cu_limit:.0f} + "
+                        f"{limits['grace_cu_hours']:.0f} grace). Nothing was billed or throttled."
+                        + (
+                            " The pool is shared with paying tenants, so this is the pool's "
+                            "usage, not necessarily the playtester's."
+                            if shared_pool else ""
+                        )
+                    ),
+                    subject="Meridian: compute limit reached",
+                    html=(
+                        f"<p>Your Meridian playtester account has used <strong>{cu_used:.1f} CU-hours</strong> "
+                        f"this month (limit: {cu_limit:.0f} + {limits['grace_cu_hours']:.0f} grace).</p>"
+                        "<p>Playtester accounts are not billed and have no overage budget; "
+                        "please bring usage back under the limit.</p>"
+                    ),
+                )
+            elif compute_cap > 0 and charge <= compute_cap and stripe_id and stripe_api_key:
                 # Bill via Stripe meter event
                 try:
                     import stripe as _stripe
@@ -2614,54 +2718,34 @@ async def run_overage_check(db: Any) -> None:
                     )
                 except Exception:  # noqa: BLE001
                     pass
-            elif unbilled and _pool_has_billed_neighbours(tenants, tenant):
-                # Consumption and the cap are per pool project: throttling here
-                # would also throttle the paying customers sharing it (some of
-                # whom have a budget so that they are billed instead), so the
-                # owner decides what to do about the playtester.
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "Playtester compute ceiling exceeded in a shared pool, not throttled: "
-                    "tenant=%s pool_usage=%.1f CU-hours limit=%.0f",
-                    email, cu_used, cu_limit,
-                )
-                await _alert_owner_playtester_limit(
-                    email, "compute",
-                    f"pool compute is at {cu_used:.1f} CU-hours (ceiling {cu_limit:.0f} + "
-                    f"{limits['grace_cu_hours']:.0f} grace) and the pool is shared with paying "
-                    "tenants, so it was NOT throttled; usage is metered per pool, not per tenant.",
-                    db=db, tenant=tenant, now=now,
-                )
             elif not tenant.get("compute_throttled_at"):
                 # Throttle compute to 0.25 CU and email
                 await _set_neon_max_cu(neon_project_id, api_key, 0.25)
                 await db_module.update_tenant(db, tenant["id"], compute_throttled_at=now_iso)
-                if unbilled:
-                    # No budget to set and nothing to bill: the ceiling is hard.
-                    await _send_overage_email(
-                        email,
-                        subject="Meridian: compute limit reached — sessions throttled",
-                        html=(
-                            f"<p>Your Meridian playtester account has used <strong>{cu_used:.1f} CU-hours</strong> "
-                            f"this month (limit: {cu_limit:.0f} + {limits['grace_cu_hours']:.0f} grace).</p>"
-                            "<p>Compute has been throttled to 0.25 CU until next month.</p>"
-                        ),
-                    )
-                    await _alert_owner_playtester_limit(
-                        email, "compute", f"{cu_used:.1f} CU-hours used (limit {cu_limit:.0f} + "
-                        f"{limits['grace_cu_hours']:.0f} grace); compute throttled to 0.25 CU.",
-                    )
-                else:
-                    await _send_overage_email(
-                        email,
-                        subject="Meridian: compute limit reached — sessions throttled",
-                        html=(
-                            f"<p>Your Meridian project has used <strong>{cu_used:.1f} CU-hours</strong> "
-                            f"this month (limit: {cu_limit:.0f} + {limits['grace_cu_hours']:.0f} grace).</p>"
-                            "<p>Compute has been throttled to 0.25 CU until next month or you set an overage budget.</p>"
-                            f"<p><a href='{base}/dashboard'>Set an overage budget →</a></p>"
-                        ),
-                    )
+                await _send_overage_email(
+                    email,
+                    subject="Meridian: compute limit reached — sessions throttled",
+                    html=(
+                        f"<p>Your Meridian project has used <strong>{cu_used:.1f} CU-hours</strong> "
+                        f"this month (limit: {cu_limit:.0f} + {limits['grace_cu_hours']:.0f} grace).</p>"
+                        "<p>Compute has been throttled to 0.25 CU until next month or you set an overage budget.</p>"
+                        f"<p><a href='{base}/dashboard'>Set an overage budget →</a></p>"
+                    ),
+                )
+
+        elif unbilled and cu_used >= cu_limit:
+            # Grace period for a playtester: one warning a month, no budget to set.
+            await _notify_playtester_warning(
+                db, tenant, now, shared_pool=shared_pool,
+                subject="Meridian: compute approaching limit",
+                html=(
+                    f"<p>You've used <strong>{cu_used:.1f} of {cu_limit:.0f} CU-hours</strong> "
+                    f"this month. You have {cu_grace - cu_used:.1f} grace hours remaining before "
+                    "the limit is exceeded.</p>"
+                    "<p>Playtester accounts are not billed, so there is no overage budget; "
+                    "please keep usage within the limit.</p>"
+                ),
+            )
 
         elif cu_used >= cu_limit and not tenant.get("compute_throttled_at"):
             # Grace period — send one warning
@@ -2672,12 +2756,7 @@ async def run_overage_check(db: Any) -> None:
                 html=(
                     f"<p>You've used <strong>{cu_used:.1f} of {cu_limit:.0f} CU-hours</strong> "
                     f"this month. You have {remaining:.1f} grace hours remaining before throttling.</p>"
-                    + (
-                        "<p>Playtester accounts are not billed, so there is no overage budget; "
-                        "usage past the grace hours is restricted.</p>"
-                        if unbilled
-                        else f"<p><a href='{base}/dashboard'>Set an overage budget to avoid throttling →</a></p>"
-                    )
+                    f"<p><a href='{base}/dashboard'>Set an overage budget to avoid throttling →</a></p>"
                 ),
             )
 
@@ -2687,21 +2766,20 @@ async def run_overage_check(db: Any) -> None:
             overage_gb = gb_used - gb_limit
             charge = overage_gb * STORAGE_OVERAGE_RATE
 
-            if (
-                storage_cap > 0 and charge <= storage_cap and stripe_id and stripe_api_key
-                and not unbilled
-            ):
-                await report_stripe_overage(stripe_id, overage_gb, stripe_api_key)
-            elif unbilled:
+            if unbilled:
                 # The storage path has no write-refusal step for any tenant, so
-                # for a playtester the bound is: log, tell them, tell the owner.
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "Playtester storage ceiling exceeded: tenant=%s usage=%.2f GB limit=%.1f GB",
-                    email, gb_used, gb_limit,
-                )
-                await _send_overage_email(
-                    email,
+                # for a playtester the bound is: tell them, tell the owner.
+                await _notify_playtester_over_ceiling(
+                    db, tenant, "storage", now, shared_pool=shared_pool,
+                    detail=(
+                        f"{gb_used:.2f} GB stored (limit {gb_limit:.1f} GB); nothing is billed "
+                        "and no write refusal exists on this path."
+                        + (
+                            " The pool is shared with paying tenants, so this is the pool's "
+                            "storage, not necessarily the playtester's."
+                            if shared_pool else ""
+                        )
+                    ),
                     subject="Meridian: storage limit exceeded",
                     html=(
                         f"<p>Your Meridian playtester storage is at <strong>{gb_used:.2f} GB</strong> "
@@ -2709,11 +2787,8 @@ async def run_overage_check(db: Any) -> None:
                         "<p>Playtester accounts are not billed; please delete data you no longer need.</p>"
                     ),
                 )
-                await _alert_owner_playtester_limit(
-                    email, "storage",
-                    f"{gb_used:.2f} GB stored (limit {gb_limit:.1f} GB); no write refusal exists on this path.",
-                    db=db, tenant=tenant, now=now,
-                )
+            elif storage_cap > 0 and charge <= storage_cap and stripe_id and stripe_api_key:
+                await report_stripe_overage(stripe_id, overage_gb, stripe_api_key)
             else:
                 await _send_overage_email(
                     email,
@@ -2792,7 +2867,7 @@ async def run_churn_cleanup(db: Any) -> None:
             # the matching pool-slot decrement that was also missing here.
             neon_id = tenant.get("neon_project_id")
             if neon_id:
-                await _drop_tenant_neon_database(tenant)
+                await _drop_tenant_neon_database(tenant, db)
                 try:
                     await db_module.decrement_pool_project_count(db, neon_id)
                 except Exception:  # noqa: BLE001
@@ -3370,7 +3445,7 @@ async def run_dunning_cleanup(db: Any) -> None:
             if stripe_id:
                 await cancel_stripe_subscription(stripe_id)
             if tenant.get("neon_project_id"):
-                await _drop_tenant_neon_database(tenant)
+                await _drop_tenant_neon_database(tenant, db)
             await db_module.delete_tenant_records(db, tenant_id)
             if email:
                 try:

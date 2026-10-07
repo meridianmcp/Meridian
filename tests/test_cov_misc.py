@@ -873,7 +873,7 @@ def test_admin_reset_provisioning_clears_state_keeps_tenant(monkeypatch, tmp_pat
 
         target = _run(_setup_target())
 
-        async def _noop_drop(_tenant):
+        async def _noop_drop(_tenant, _db=None):
             return None
 
         monkeypatch.setattr(hosted_module, "_drop_tenant_neon_database", _noop_drop)
