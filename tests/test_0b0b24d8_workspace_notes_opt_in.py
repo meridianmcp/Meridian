@@ -48,8 +48,31 @@ _SENTINELS = (NOTE_TITLE, NOTE_BODY, DECISION_TITLE, DECISION_BODY)
 
 @pytest.fixture(autouse=True)
 def _flag_off(monkeypatch):
-    """A developer's real env must not flip these tests."""
+    """A developer's real env AND meridian.toml must not flip these tests.
+
+    The toml is the documented self-host way to turn the flag on, so an owner
+    who does exactly that in the repo-root meridian.toml (which load_toml finds
+    through the cwd) would otherwise see every default-is-off test here fail.
+    Only the one key is stripped: every other table the app reads at startup
+    passes through untouched, and a test that wants a toml value patches
+    load_toml itself, which wins over this wrapper.
+    """
     monkeypatch.delenv(_FLAG_ENV, raising=False)
+    real_load_toml = toml_config.load_toml
+
+    def _load_toml_without_the_flag():
+        data = real_load_toml()
+        table = data.get("meridian") if isinstance(data, dict) else None
+        if isinstance(table, dict) and "include_workspace_context" in table:
+            data = {
+                **data,
+                "meridian": {
+                    k: v for k, v in table.items() if k != "include_workspace_context"
+                },
+            }
+        return data
+
+    monkeypatch.setattr(toml_config, "load_toml", _load_toml_without_the_flag)
 
 
 @pytest.fixture
@@ -633,6 +656,21 @@ def test_include_workspace_context_toml_and_env_precedence(monkeypatch):
     # a blank env value is "not set", so toml applies
     monkeypatch.setenv(_FLAG_ENV, "  ")
     assert toml_config.get_include_workspace_context() is True
+
+
+def test_a_real_toml_file_with_the_flag_on_cannot_flip_these_tests(tmp_path, monkeypatch):
+    """Pins the _flag_off fixture: load_toml finds meridian.toml through the cwd,
+    so an owner who turns the flag on there must still see this file's
+    default-is-off tests pass."""
+    import tomllib
+
+    toml_file = tmp_path / "meridian.toml"
+    toml_file.write_text("[meridian]\ninclude_workspace_context = true\n", encoding="utf-8")
+    assert tomllib.loads(toml_file.read_text(encoding="utf-8"))["meridian"][
+        "include_workspace_context"
+    ] is True
+    monkeypatch.chdir(tmp_path)
+    assert toml_config.get_include_workspace_context() is False
 
 
 # ---------------------------------------------------------------------------
