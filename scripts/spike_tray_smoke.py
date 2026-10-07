@@ -181,6 +181,88 @@ def enumerate_tray() -> None:
     t["found_via_uia"] = bool(uia)
 
 
+def registry_notify_icons() -> None:
+    """Windows 11 / Server 2025 records every tray icon the shell has seen under
+    HKCU\\Control Panel\\NotifyIconSettings. This proves the shell received the icon
+    even when the UI cannot show where it landed."""
+    t = report["tray"]
+
+    @probe("registry_notify_icon_settings")
+    def _reg():
+        import winreg  # noqa: PLC0415
+
+        rows = []
+        base = r"Control Panel\NotifyIconSettings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base) as k:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(k, i)
+                except OSError:
+                    break
+                i += 1
+                row = {"key": sub}
+                try:
+                    with winreg.OpenKey(k, sub) as sk:
+                        for name in ("ExecutablePath", "InitialTooltip", "IsPromoted", "UID"):
+                            try:
+                                row[name] = winreg.QueryValueEx(sk, name)[0]
+                            except OSError:
+                                pass
+                except OSError as exc:
+                    row["error"] = str(exc)
+                rows.append(row)
+        t["registry_notify_icon_rows"] = rows
+        needle = TRAY_TOOLTIP.lower()
+        t["registry_has_spike_icon"] = any(
+            needle in str(r.get("InitialTooltip", "")).lower()
+            or "python" in str(r.get("ExecutablePath", "")).lower()
+            for r in rows
+        )
+        t["registry_spike_rows"] = [
+            r for r in rows
+            if needle in str(r.get("InitialTooltip", "")).lower()
+            or "python" in str(r.get("ExecutablePath", "")).lower()
+        ]
+
+
+def open_overflow_and_list(out: Path) -> None:
+    """Click 'Show Hidden Icons' through UIA, screenshot the flyout and list it."""
+    t = report["tray"]
+
+    @probe("open_hidden_icons_flyout")
+    def _open():
+        from pywinauto import Desktop  # noqa: PLC0415
+
+        taskbar = Desktop(backend="uia").window(class_name="Shell_TrayWnd")
+        btn = taskbar.child_window(title="Show Hidden Icons", control_type="Button")
+        btn.click_input()
+        time.sleep(2)
+        screenshot("3_hidden_icons_flyout_open", out)
+        names: list[str] = []
+        for cls in ("TopLevelWindowForOverflowXamlIsland", "NotifyIconOverflowWindow"):
+            try:
+                fly = Desktop(backend="uia").window(class_name=cls)
+                for d in fly.descendants():
+                    try:
+                        n = d.window_text()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if n:
+                        names.append(f"{cls}: {n}")
+            except Exception as exc:  # noqa: BLE001
+                names.append(f"<{cls}: {type(exc).__name__}>")
+        t["flyout_descendant_names"] = names[:120]
+        needle = TRAY_TOOLTIP.lower()
+        t["found_in_hidden_icons_flyout"] = any(needle in n.lower() for n in names)
+        try:
+            from pywinauto.keyboard import send_keys  # noqa: PLC0415
+
+            send_keys("{ESC}")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def window_titles() -> list[str]:
     titles: list[str] = []
 
@@ -230,6 +312,8 @@ def main() -> int:
     time.sleep(5)
     screenshot("1_after_tray_icon", out)
     enumerate_tray()
+    registry_notify_icons()
+    open_overflow_and_list(out)
 
     @probe("tk_start")
     def _tk():
@@ -266,6 +350,8 @@ def main() -> int:
         "tray_visible_area": report["tray"].get("found_in_visible_notification_area"),
         "tray_overflow_only": report["tray"].get("found_in_overflow_only"),
         "tray_via_uia": report["tray"].get("found_via_uia"),
+        "tray_registered_in_shell_registry": report["tray"].get("registry_has_spike_icon"),
+        "tray_in_hidden_icons_flyout": report["tray"].get("found_in_hidden_icons_flyout"),
         "tk_enumerated": report["tk"].get("enum_windows_contains_title"),
     }
     (out / "spike_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
