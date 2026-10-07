@@ -149,6 +149,7 @@ get_goal(project_id="abc-123")
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `content` | string | required |  |
+| `expected_updated_at` | string | optional | Optional optimistic-concurrency stamp: field_updated_at.version_goal from get_goal. If the version goal changed since, returns a goal_conflict error with the current value and writes nothing. Omit for last-write-wins. |
 
 **Example:**
 ```

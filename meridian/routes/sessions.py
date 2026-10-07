@@ -134,10 +134,14 @@ async def patch_session(
     await db.commit()
     if cursor.rowcount == 0:
         raise HTTPException(status_code=404, detail="session not found")
-    # 8a665a03 -- "Mark idle" / reopen used to repaint only the acting tab.
-    db_module._publish_project_event(
-        _pid, "session_updated", {"session_id": session_id, "status": status}
-    )
+    # 8a665a03 -- "Mark idle" / reopen used to repaint only the acting tab. The event needs the
+    # project id, which is a read of its own (NOT the scope lookup H7 keeps off the unscoped path).
+    async with db.execute("SELECT project_id FROM sessions WHERE id = ?", (session_id,)) as _cur:
+        _row = await _cur.fetchone()
+    if _row is not None and _row["project_id"]:
+        db_module._publish_project_event(
+            _row["project_id"], "session_updated", {"session_id": session_id, "status": status}
+        )
     return {"status": status, "session_id": session_id}
 
 
