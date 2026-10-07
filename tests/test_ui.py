@@ -1106,6 +1106,7 @@ def _css_items(text):
     """The top-level items of a CSS block body: ("stmt", "prop: value" | "@import ...") for each
     ``;``-terminated statement and ("block", prelude, body) for each ``prelude { body }``."""
     items, depth, quote, start, brace, i = [], 0, None, 0, None, 0
+    body_start = 0  # set when a block opens; initialised so the loop-carried read below is a defined name (ruff F821)
     while i < len(text):
         c = text[i]
         if quote:
