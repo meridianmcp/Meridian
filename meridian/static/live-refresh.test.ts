@@ -74,6 +74,13 @@ function makeMocks(state: any, over: Mocks = {}): Mocks {
     closeTab: vi.fn(),
     refreshTab: vi.fn(async () => {}),
     resyncProjectViews: vi.fn(),
+    // 90952bad -- the waffle launcher hooks dashboard.ts calls from loadQueue/buildTabBody; they are
+    // collaborators here (covered by dashboard-waffle.test.ts), so default them to inert stubs.
+    recordWaffleUse: vi.fn(),
+    refreshWaffle: vi.fn(),
+    withoutWaffleUse: (fn: () => unknown) => fn(),
+    _setWaffleQueueCount: vi.fn(),
+    renderProjectLoadError: vi.fn(() => "err"),
     QUEUE_DONE_PAGE_SIZE: 25,
     _sprintBoardReloaders: {} as Record<string, any>,
     _repaintTimers: {} as Record<string, any>,
@@ -342,14 +349,29 @@ describe("sprint mutation handlers repaint every view", () => {
     expect(m.refreshLiveTab).not.toHaveBeenCalled();
   });
 
-  it("sprintPushPrompt refreshes through refreshSprintSurfaces", async () => {
+  // 0c30b989 -- the arrow button's move/defer flow moved into dashboard-sprint-move.ts, which
+  // repaints the Live board, the Queue (when opened) and the Goal sprint board itself
+  // (dashboard-sprint-move.test.ts pins that, including one failing repaint not stopping the
+  // others). What stays pinned HERE is the glue in dashboard.ts: the inline onclick's
+  // sprintPushPrompt hands straight to the move actions, and those actions are wired to all
+  // three real loaders -- so a Backburner/Live/Goal view can never be left stale by a move.
+  it("sprintPushPrompt hands the click (project, item, button) to the move actions", async () => {
     const state = makeState("queue");
-    const m = makeMocks(state);
-    const prompt = vi.spyOn(window, "prompt").mockReturnValue("v9.0");
-    await load(["sprintPushPrompt"], m).sprintPushPrompt(PID, "it-1");
-    expect(m.api).toHaveBeenCalledWith(`/projects/${PID}/sprint-items/it-1/push`, expect.objectContaining({ method: "POST" }));
-    expect(m.refreshSprintSurfaces).toHaveBeenCalledWith(PID);
-    prompt.mockRestore();
+    const sprintPushPrompt = vi.fn(async () => {});
+    const m = makeMocks(state, { _sprintMoveActions: { sprintPushPrompt } });
+    const anchor = document.createElement("button");
+    await load(["sprintPushPrompt"], m).sprintPushPrompt(PID, "it-1", anchor);
+    expect(sprintPushPrompt).toHaveBeenCalledWith(PID, "it-1", anchor);
+  });
+
+  it("the move actions are wired to the Live loader, the Queue loader and the Goal board registry", () => {
+    const src = readFileSync(resolve(DASH), "utf8");
+    const start = src.indexOf("const _sprintMoveActions = createSprintMoveActions({");
+    expect(start).toBeGreaterThan(-1);
+    const wiring = src.slice(start, src.indexOf("});", start));
+    expect(wiring).toContain("refreshLiveTab(projectId)");
+    expect(wiring).toContain("loadQueue(projectId)");
+    expect(wiring).toContain("_sprintBoardReloaders[projectId]");
   });
 
   it("sprintResetPending (the 'Back to pending' button) PATCHes and repaints", async () => {
@@ -384,7 +406,7 @@ describe("sprint mutation handlers repaint every view", () => {
   // The DOM-heavy inline editors cannot be driven through the harness; pin the
   // property that matters instead: none of them ends in a Live-only repaint.
   it.each([
-    "sprintAction", "sprintArchive", "sprintPushPrompt", "sprintResetPending", "sprintFeedback",
+    "sprintAction", "sprintArchive", "sprintResetPending", "sprintFeedback",
     "sprintFeedbackNote", "sprintItemEdit", "sprintItemNotesEdit", "sprintItemResourcesEdit",
     "addSprintItemFromInput",
   ])("%s repaints through refreshSprintSurfaces, never refreshLiveTab alone", (name) => {
