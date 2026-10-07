@@ -32,10 +32,12 @@ import {
   readWaffleBadges,
   recentTabs,
   recordUse,
+  recordWaffleUse,
   refreshWaffle,
   saveState,
   togglePin,
   waffleIconSvg,
+  withoutWaffleUse,
   type WaffleController,
   type WaffleModel,
   type WaffleState,
@@ -515,9 +517,11 @@ function buildPage(): Page {
   const expandedAtClick: Record<string, boolean> = {};
   const { revealGroupForTab } = wireVtabGroups(strip);
   strip.querySelectorAll<HTMLElement>(".vtab-btn").forEach((btn) => {
-    // Mirrors the production onclick in buildTabBody: reveal the group, mark active.
+    // Mirrors the production onclick in buildTabBody: record the use, reveal the
+    // group, mark active.
     btn.onclick = () => {
       const tab = btn.dataset.vtab as string;
+      recordWaffleUse(tab);
       const group = btn.closest(".vtab-group") as HTMLElement;
       expandedAtClick[tab] = !group.classList.contains("collapsed");
       revealGroupForTab(tab);
@@ -1036,6 +1040,197 @@ describe("launcher: pins and adaptive order", () => {
   });
 });
 
+// The HITL fallback poll (every 10 s) and every sprint loader call refreshWaffle()
+// while the popover may be open. A refresh that swaps the grid's DOM must not
+// strand a keyboard user on <body> (arrows, Enter, P and Esc all went dead).
+describe("launcher: refreshing while open keeps keyboard control", () => {
+  let page: Page;
+  let waffle: WaffleController;
+
+  beforeEach(() => {
+    page = buildPage();
+    waffle = page.mount();
+    waffle.open();
+  });
+
+  afterEach(() => {
+    waffle.destroy();
+    document.body.innerHTML = "";
+  });
+
+  it("a refresh that changes the grid keeps focus on the tile that had it (focused with a plain .focus())", () => {
+    const q = tile("queue")!;
+    q.focus();
+    page.badges = { hitl: 2 };
+    waffle.refresh();
+    expect(tile("hitl")!.querySelector(".waffle-badge")).not.toBeNull(); // the DOM really was swapped
+    expect(q.isConnected).toBe(false);
+    expect(document.activeElement).toBe(tile("queue"));
+    expect(waffle.popover.contains(document.activeElement)).toBe(true);
+  });
+
+  it("arrows, P and Escape still work after refreshes (the 10 s HITL poll through the module-level hook)", () => {
+    tile("queue")!.focus();
+    for (const hitl of [1, 2, 3]) {
+      page.badges = { hitl };
+      refreshWaffle();
+    }
+    key(document.activeElement as Element, "ArrowRight");
+    expect(document.activeElement).toBe(tile("live"));
+    key(document.activeElement as Element, "p");
+    expect(waffle.getState().pins).toEqual(["goal", "notes", "insights", "live"]);
+    key(document.activeElement as Element, "Escape");
+    expect(waffle.isOpen()).toBe(false);
+    expect(document.activeElement).toBe(waffle.button);
+  });
+
+  it("a refresh with nothing new leaves the grid DOM alone (same nodes, still focused)", () => {
+    page.badges = { hitl: 2 };
+    waffle.refresh();
+    const q = tile("queue")!;
+    q.focus();
+    const nodes = Array.from(document.querySelectorAll(".waffle-tile"));
+    waffle.refresh();
+    refreshWaffle();
+    expect(Array.from(document.querySelectorAll(".waffle-tile"))).toEqual(nodes);
+    expect(tile("queue")).toBe(q);
+    expect(document.activeElement).toBe(q);
+  });
+
+  it("keeps a focused Goal sub-entry focused across a refresh", () => {
+    sub("sprint")!.focus();
+    page.badges = { queue: 4 };
+    waffle.refresh();
+    expect(document.activeElement).toBe(sub("sprint"));
+  });
+
+  it("does not pull focus out of the filter box into the grid", () => {
+    filterInput().focus();
+    page.badges = { hitl: 4 };
+    waffle.refresh();
+    expect(document.activeElement).toBe(filterInput());
+    type("ti");
+    page.badges = { hitl: 5 };
+    waffle.refresh();
+    expect(document.activeElement).toBe(filterInput());
+  });
+
+  it("falls back to the first tile (never to <body>) when the focused tab leaves the rail", () => {
+    tile("queue")!.focus();
+    (page.strip.querySelector('[data-vtab="queue"]') as HTMLElement).style.display = "none";
+    waffle.refresh();
+    expect(tile("queue")).toBeNull();
+    expect(document.activeElement).toBe(tile("goal"));
+  });
+
+  it("the roving tab stop follows a tile that was focused without the keyboard handler", () => {
+    tile("timeline")!.focus();
+    page.badges = { hitl: 1 };
+    waffle.refresh();
+    const tabbable = Array.from(document.querySelectorAll<HTMLElement>("[data-waffle-key]")).filter((e) => e.tabIndex >= 0);
+    expect(tabbable).toEqual([tile("timeline")]);
+  });
+
+  it("Escape closes (and returns focus to the button) even when focus has fallen to <body>", () => {
+    (document.activeElement as HTMLElement).blur();
+    expect(document.activeElement).toBe(document.body);
+    const ev = key(document.body, "Escape");
+    expect(ev.defaultPrevented).toBe(true);
+    expect(waffle.isOpen()).toBe(false);
+    expect(document.activeElement).toBe(waffle.button);
+  });
+
+  it("Escape is only intercepted while the popover is open", () => {
+    waffle.close(false);
+    const ev = key(document.body, "Escape");
+    expect(ev.defaultPrevented).toBe(false);
+  });
+});
+
+// Usage adaptation has to learn from how people really navigate: the rail's own
+// buttons (and the jumps/deep links that click them), not only the waffle.
+describe("launcher: usage is learned from the rail as well as the waffle", () => {
+  let page: Page;
+  let waffle: WaffleController;
+  const railBtn = (tab: string) => page.strip.querySelector<HTMLElement>(`.vtab-btn[data-vtab="${tab}"]`)!;
+
+  beforeEach(() => {
+    page = buildPage();
+    waffle = page.mount();
+  });
+
+  afterEach(() => {
+    waffle.destroy();
+    document.body.innerHTML = "";
+  });
+
+  it("a click on a rail button counts as a use, becomes Recent and is persisted", () => {
+    railBtn("sessions").click();
+    expect(waffle.getState().usage).toEqual({ sessions: 1 });
+    expect(waffle.getState().recent).toEqual(["sessions"]);
+    expect(JSON.parse(page.store.get("k")!)).toMatchObject({ usage: { sessions: 1 }, recent: ["sessions"] });
+    waffle.open();
+    expect(tileOrder().slice(0, 4)).toEqual(["goal", "notes", "insights", "sessions"]);
+    expect(Array.from(document.querySelectorAll(".waffle-heading")).map((h) => h.textContent)).toContain("Recent");
+  });
+
+  it("navigating by the rail alone re-sorts the middle of the grid once the threshold is passed", () => {
+    const clicks: [string, number][] = [["sessions", 12], ["settings", 8], ["timeline", 6], ["team", 5], ["devlog", 4]];
+    for (const [tab, n] of clicks) for (let i = 0; i < n; i++) railBtn(tab).click();
+    expect(waffle.getState().usage).toEqual({ sessions: 12, settings: 8, timeline: 6, team: 5, devlog: 4 });
+    waffle.open();
+    // Pinned, then Recent (newest first), then All tabs most used first, never-used in default order.
+    expect(tileOrder().slice(0, 9)).toEqual([
+      "goal", "notes", "insights", "devlog", "team", "timeline", "sessions", "settings", "queue",
+    ]);
+    expect(tileOrder()[tileOrder().length - 1]).not.toBe("sessions");
+  });
+
+  it("a waffle activation is counted exactly once (it runs through the rail's own onclick)", () => {
+    waffle.open();
+    tile("queue")!.click();
+    expect(waffle.getState().usage).toEqual({ queue: 1 });
+    waffle.open();
+    sub("sprint")!.click();
+    expect(waffle.getState().usage).toEqual({ queue: 1, goal: 1 });
+    expect(page.clicks).toEqual(["queue", "goal"]);
+  });
+
+  it("withoutWaffleUse keeps scripted navigation (restore on load, the tour) out of the counts", () => {
+    withoutWaffleUse(() => railBtn("timeline").click());
+    withoutWaffleUse(() => withoutWaffleUse(() => railBtn("rewind").click()));
+    expect(page.clicks).toEqual(["timeline", "rewind"]); // the navigation itself still happened
+    expect(waffle.getState().usage).toEqual({});
+    expect(waffle.getState().recent).toEqual([]);
+    // Exception-safe and not sticky: the next real click counts again.
+    expect(() =>
+      withoutWaffleUse(() => {
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+    railBtn("team").click();
+    expect(waffle.getState().usage).toEqual({ team: 1 });
+  });
+
+  it("recordWaffleUse updates an open popover's Recent section and ignores junk ids", () => {
+    waffle.open();
+    recordWaffleUse("devlog");
+    recordWaffleUse("not a valid id!");
+    recordWaffleUse("");
+    expect(waffle.getState().usage).toEqual({ devlog: 1 });
+    expect(tileOrder().slice(0, 4)).toEqual(["goal", "notes", "insights", "devlog"]);
+  });
+
+  it("is a no-op with no launcher mounted, and with storage blocked it still counts for this page load", () => {
+    waffle.destroy();
+    expect(() => recordWaffleUse("goal")).not.toThrow();
+    const w = page.mount({ storage: null });
+    recordWaffleUse("live");
+    expect(w.getState().usage).toEqual({ live: 1 });
+    w.destroy();
+  });
+});
+
 describe("rail helpers", () => {
   it("readRailTabs skips display:none buttons, reads the active tab and uses titles as fallback labels", () => {
     const page = buildPage();
@@ -1170,5 +1365,22 @@ describe("dashboard.ts wiring", () => {
     const firstLoader = dashboardSrc.indexOf("if (vtab === 'files') loadFilesTab", at);
     expect(reveal).toBeGreaterThan(at);
     expect(reveal).toBeLessThan(firstLoader);
+  });
+
+  it("the rail's own onclick records the use before any loader (so a loader that throws cannot skip it)", () => {
+    const at = dashboardSrc.indexOf("btn.onclick = () => {", dashboardSrc.indexOf("wireVtabGroups(vtabStrip)"));
+    const record = dashboardSrc.indexOf("recordWaffleUse(vtab);", at);
+    const firstLoader = dashboardSrc.indexOf("if (vtab === 'files') loadFilesTab", at);
+    expect(record).toBeGreaterThan(at);
+    expect(record).toBeLessThan(firstLoader);
+    expect(dashboardSrc).toMatch(/import \{[^}]*\brecordWaffleUse\b[^}]*\bwithoutWaffleUse\b[^}]*\} from "\.\/dashboard-waffle"/);
+  });
+
+  it("restoring the last tab on load and the demo tour's clicks are scripted: neither is counted as a use", () => {
+    expect(dashboardSrc).toMatch(/withoutWaffleUse\(\(\) => savedBtn\.click\(\)\)/);
+    const from = dashboardSrc.indexOf("function _tourActivateVtab");
+    const to = dashboardSrc.indexOf("function startDemoTour", from);
+    expect(from).toBeGreaterThan(0);
+    expect(dashboardSrc.slice(from, to)).toMatch(/withoutWaffleUse\(\(\) => btn\.click\(\)\)/);
   });
 });

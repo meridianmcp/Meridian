@@ -1185,7 +1185,8 @@ def test_waffle_launcher_has_popup_semantics_and_keyboard_support():
         'type="search"',
         'aria-label="Filter tabs"',
         'aria-live="polite"',
-        'ev.key === "Escape"',
+        'ev.key !== "Escape"',
+        'document.addEventListener("keydown", onDocKey, true)',
         'ev.key === "Tab"',
         '"mousedown"',
         '"focusin"',
@@ -1234,6 +1235,50 @@ def test_waffle_wired_into_dashboard_and_template():
     top = html.index('id="topbar"')
     assert html.index('id="tabs"') > top, "#tabs must live inside #topbar"
     assert html.index('id="tab-bodies"') > html.index('id="tabs"')
+
+
+def test_waffle_refresh_keeps_focus_and_skips_identical_swaps():
+    """90952bad - the HITL fallback poll (every 10 s) and the sprint loaders call
+    refreshWaffle() while the popover may be open. render() must read focus before
+    it replaces the grid and put it back afterwards, and must not rebuild the grid
+    at all when the generated HTML is unchanged; otherwise a keyboard user is
+    dropped onto <body> and arrows/Enter/P/Esc go dead. Behaviour is covered by
+    vitest (\"refreshing while open keeps keyboard control\"); this guards the
+    source contract."""
+    waffle = _static_text("dashboard-waffle.ts")
+    start = waffle.index("const render = () => {")
+    body = waffle[start : waffle.index("const place = () => {", start)]
+    focus_read = body.index("document.activeElement")
+    swap = body.index("body.innerHTML = html")
+    assert focus_read < swap, "focus must be read BEFORE the grid is replaced"
+    assert "if (html !== lastHtml)" in body, "an identical refresh must not swap the grid"
+    assert "focusEntry(target)" in body, "focus must be restored onto the same entry after a swap"
+    # Esc is heard at the document so it still works when focus has fallen to <body>.
+    assert 'document.addEventListener("keydown", onDocKey, true)' in waffle
+    assert 'document.removeEventListener("keydown", onDocKey, true)' in waffle
+
+
+def test_waffle_usage_is_recorded_from_the_shared_rail_onclick():
+    """90952bad - usage adaptation must learn from every way of opening a tab, not
+    only waffle activations: the rail's shared .vtab-btn onclick calls
+    recordWaffleUse before any loader, while the scripted clicks (restoring the last
+    tab on load, the demo tour) run inside withoutWaffleUse so they do not count."""
+    dash = _static_text("dashboard.ts").replace(chr(13) + chr(10), chr(10))
+    waffle = _static_text("dashboard-waffle.ts")
+    assert "export function recordWaffleUse" in waffle
+    assert "export function withoutWaffleUse" in waffle
+    onclick = dash.index("btn.onclick = () => {", dash.index("wireVtabGroups(vtabStrip)"))
+    record = dash.index("recordWaffleUse(vtab);", onclick)
+    first_loader = dash.index("if (vtab === 'files') loadFilesTab", onclick)
+    assert onclick < record < first_loader, "recordWaffleUse must run before any loader"
+    assert "withoutWaffleUse(() => savedBtn.click())" in dash
+    tour = dash[dash.index("function _tourActivateVtab") : dash.index("function startDemoTour")]
+    assert "withoutWaffleUse(() => btn.click())" in tour
+    # The waffle's own activation is counted once: it guards the rail onclick's call.
+    start = waffle.index("const activateKey = (key: string | null) => {")
+    activate = waffle[start : start + 900]
+    assert "withoutWaffleUse(() => activateWaffleTab(" in activate
+    assert "noteUse(entry.tab)" in activate
 
 
 def test_waffle_css_is_theme_driven_and_responsive(css):

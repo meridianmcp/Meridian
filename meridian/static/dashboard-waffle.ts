@@ -23,7 +23,10 @@
 //   * Usage adapts the order, but only the middle of it: the owner's top picks
 //     (WAFFLE_DEFAULT_PINS) stay pinned until the user unpins them, and the
 //     re-sort does not start until WAFFLE_USAGE_THRESHOLD activations, so a new
-//     user sees the owner's order, not the noise of their first clicks.
+//     user sees the owner's order, not the noise of their first clicks. Every
+//     way of opening a tab counts (the rail's shared onclick calls
+//     recordWaffleUse), not only waffle activations; scripted navigation (restore
+//     on load, the tour) runs inside withoutWaffleUse and does not.
 //   * Per-user state (pins, click counts, recents) lives in localStorage ONLY,
 //     every access wrapped in try/catch; the launcher works with storage blocked.
 //
@@ -768,6 +771,8 @@ export interface WaffleController {
   isOpen(): boolean;
   /** Re-read badges/availability: refreshes the dot and, when open, the grid. */
   refresh(): void;
+  /** Count one use of `tab` (see recordWaffleUse, the module-level entry point). */
+  recordUse(tab: string): void;
   getModel(): WaffleModel;
   getState(): WaffleState;
   destroy(): void;
@@ -839,6 +844,35 @@ let current: WaffleController | null = null;
 /** Refresh the mounted launcher (badge dot, open grid). No-op when none is mounted. */
 export function refreshWaffle(): void {
   current?.refresh();
+}
+
+// Depth counter, not a boolean: scripted navigation can nest (a tour step that
+// calls a helper that also wraps its own click).
+let scriptedDepth = 0;
+
+/**
+ * Run `fn` (a scripted navigation: restoring the last tab on page load, the demo
+ * tour) without counting the `.vtab-btn` clicks it makes as uses. The launcher's
+ * own activation uses it too, because it already counted the use itself.
+ */
+export function withoutWaffleUse<T>(fn: () => T): T {
+  scriptedDepth += 1;
+  try {
+    return fn();
+  } finally {
+    scriptedDepth -= 1;
+  }
+}
+
+/**
+ * Count one use of the tab `tab`. dashboard.ts calls this from the rail's shared
+ * `.vtab-btn` onclick, so every way of opening a tab trains the order (the rail,
+ * HITL/timeline jumps, deep links, and the waffle itself), not only the waffle.
+ * No-op while a scripted navigation runs or when no launcher is mounted.
+ */
+export function recordWaffleUse(tab: string): void {
+  if (scriptedDepth > 0) return;
+  current?.recordUse(tab);
 }
 
 /**
@@ -944,20 +978,55 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
     });
   };
 
+  // The HTML last written into the grid. Refreshes arrive constantly (the HITL
+  // fallback poll fires every 10 s, every sprint loader calls refreshWaffle) and
+  // most change nothing visible: skipping an identical swap keeps the tile nodes,
+  // hover, focus and a half-finished click alive instead of rebuilding them.
+  let lastHtml = "";
+
+  /** Key of the grid entry that holds DOM focus right now (however it got it), else null. */
+  const heldFocusKey = (): string | null => {
+    const a = document.activeElement as HTMLElement | null;
+    if (!a || !body.contains(a)) return null;
+    return a.closest<HTMLElement>("[data-waffle-key]")?.dataset.waffleKey ?? null;
+  };
+
   const render = () => {
+    // Read focus BEFORE touching the DOM: replacing the grid removes the focused
+    // tile, and focus then falls to <body>, where arrows, Enter, P and Esc go
+    // dead while the popover is still open.
+    const hadGridFocus = !!document.activeElement && body.contains(document.activeElement);
+    const heldKey = heldFocusKey();
+    if (heldKey) focusKey = heldKey; // keep the roving tab stop on what really has focus
+
     model = compute();
     updateDot();
+    let html: string;
     if (!model.sections.length) {
       const strip = deps.getStrip();
-      body.innerHTML = query
+      html = query
         ? `<div class="waffle-empty" role="none">No tabs match &quot;${esc(query)}&quot;</div>`
         : `<div class="waffle-empty" role="none">${strip ? "No tabs available" : "Open a project to jump between its tabs"}</div>`;
     } else {
-      body.innerHTML = model.sections.map(sectionHtml).join("");
+      html = model.sections.map(sectionHtml).join("");
+    }
+    if (html !== lastHtml) {
+      const scroll = body.scrollTop;
+      body.innerHTML = html;
+      body.scrollTop = scroll;
+      lastHtml = html;
     }
     const flat = model.keys.flat();
     setRoving(focusKey && flat.includes(focusKey) ? focusKey : flat[0] ?? null);
     live.textContent = query ? (model.count === 1 ? "1 match" : `${model.count} matches`) : "";
+
+    if (hadGridFocus && !body.contains(document.activeElement)) {
+      // The swap dropped focus. Put it back on the same entry, or on the first one
+      // when that tab has left the rail, or on the filter when nothing is left.
+      const target = heldKey && flat.includes(heldKey) ? heldKey : flat[0] ?? null;
+      if (target) focusEntry(target);
+      else input.focus();
+    }
   };
 
   const place = () => {
@@ -993,12 +1062,23 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
   const onResize = () => {
     if (isOpen) place();
   };
+  // Escape is handled at the document, not on the popover: if focus ever ends up
+  // on <body> while the dialog is open (an element removed under it, a click on a
+  // gap) a popover-level listener would never hear it and Esc would be dead.
+  const onDocKey = (ev: KeyboardEvent) => {
+    // isComposing: Esc cancels an IME composition in the filter box, not the dialog.
+    if (ev.key !== "Escape" || ev.isComposing) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    close(true);
+  };
 
   function close(returnFocus = true): void {
     if (!isOpen) return;
     isOpen = false;
     popover.hidden = true;
     button.setAttribute("aria-expanded", "false");
+    document.removeEventListener("keydown", onDocKey, true);
     document.removeEventListener("mousedown", onDocPointer, true);
     document.removeEventListener("touchstart", onDocPointer, true);
     document.removeEventListener("focusin", onFocusIn, true);
@@ -1018,6 +1098,7 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
     button.setAttribute("aria-expanded", "true");
     render();
     place();
+    document.addEventListener("keydown", onDocKey, true);
     document.addEventListener("mousedown", onDocPointer, true);
     document.addEventListener("touchstart", onDocPointer, true);
     document.addEventListener("focusin", onFocusIn, true);
@@ -1029,16 +1110,25 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
     else focusEntry(focusKey);
   }
 
+  // One use of a tab, from any path (see recordWaffleUse). A scripted use can land
+  // while the grid is open, so keep an open grid's Recent section current.
+  const noteUse = (tab: string) => {
+    state = recordUse(state, tab);
+    persist();
+    if (isOpen) render();
+  };
+
   const activateKey = (key: string | null) => {
     if (!key) return;
     const entry = model.sections.flatMap((s) => s.rows.flatMap((r) => r.entries)).find((e) => e.key === key);
     if (!entry) return;
     const strip = deps.getStrip();
     if (!strip) return;
-    state = recordUse(state, entry.tab);
-    persist();
     close(true);
-    activateWaffleTab(strip, entry.tab, entry.sub);
+    // The rail button's onclick also calls recordWaffleUse; the scripted guard makes
+    // it skip, so this activation counts exactly once, and only if a button was there.
+    const activated = withoutWaffleUse(() => activateWaffleTab(strip, entry.tab, entry.sub));
+    if (activated) noteUse(entry.tab);
     updateDot();
   };
 
@@ -1083,12 +1173,6 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
 
   popover.addEventListener("keydown", (ev) => {
     const target = ev.target as HTMLElement;
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      ev.stopPropagation();
-      close(true);
-      return;
-    }
     if (ev.key === "Tab") {
       // Tab trap: the popover has two tab stops (filter, roving tile). Wrap at both ends.
       const stops = [input, body.querySelector<HTMLElement>('[data-waffle-key][tabindex="0"]')].filter(
@@ -1151,6 +1235,7 @@ export function mountWaffle(deps: WaffleDeps): WaffleController | null {
       if (isOpen) render();
       else updateDot();
     },
+    recordUse: noteUse,
     getModel: () => model,
     getState: () => state,
     destroy: () => {

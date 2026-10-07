@@ -47,7 +47,7 @@ import { wireVtabGroups, revealGroupInStrip } from "./dashboard-tabgroups";
 // 90952bad — Outlook-style "waffle" launcher: a 9-dot button in the top bar that
 // pops a grid of tab tiles (pinned / recent / all, ordered by usefulness). It
 // activates a tile through the SAME path as clicking the rail's .vtab-btn.
-import { mountWaffle, refreshWaffle, countActiveSprintItems, readWaffleBadges } from "./dashboard-waffle";
+import { mountWaffle, refreshWaffle, countActiveSprintItems, readWaffleBadges, recordWaffleUse, withoutWaffleUse } from "./dashboard-waffle";
 // d6b7da48 — client-side sidebar "folders/spheres" (localStorage-only grouping).
 import {
   loadFolderAssignments,
@@ -1493,7 +1493,8 @@ function _tourActivateVtab(vtab: any, gtab: any) {
   // button is laid out before the click (and before startDemoTour measures it).
   revealGroupInStrip(document.getElementById(`vtab-strip-${pid}`) || document, vtab);
 
-  if (btn) btn.click();
+  // 90952bad — the tour's scripted clicks are not the user choosing a tab.
+  if (btn) withoutWaffleUse(() => btn.click());
 
   if (gtab) {
 
@@ -4648,6 +4649,11 @@ function buildTabBody(project: any) {
 
         const p = state.panels[project.id];
 
+        // 90952bad — every way of opening a tab (the rail, the waffle, HITL/timeline
+        // jumps, deep links) lands here, so this is where usage is counted. Before
+        // the loaders, so one that throws cannot skip it.
+        recordWaffleUse(vtab);
+
         // Keep the clicked tab's group expanded so it stays visible/measurable.
         revealGroupForTab(vtab);
 
@@ -4737,7 +4743,8 @@ function buildTabBody(project: any) {
       if (saved) {
         revealGroupForTab(saved);
         const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
-        if (savedBtn) savedBtn.click();
+        // 90952bad — a page load restoring the last tab is not a use of it.
+        if (savedBtn) withoutWaffleUse(() => savedBtn.click());
       }
     } catch(_) {}
 

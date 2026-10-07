@@ -10270,6 +10270,19 @@ ${n2.tags || ""}`.toLowerCase();
   function refreshWaffle() {
     current?.refresh();
   }
+  var scriptedDepth = 0;
+  function withoutWaffleUse(fn) {
+    scriptedDepth += 1;
+    try {
+      return fn();
+    } finally {
+      scriptedDepth -= 1;
+    }
+  }
+  function recordWaffleUse(tab) {
+    if (scriptedDepth > 0) return;
+    current?.recordUse(tab);
+  }
   function mountWaffle(deps) {
     const host = deps.host;
     if (!host) return null;
@@ -10351,18 +10364,39 @@ ${n2.tags || ""}`.toLowerCase();
         el2.tabIndex = el2.dataset.waffleKey === key ? 0 : -1;
       });
     };
+    let lastHtml = "";
+    const heldFocusKey = () => {
+      const a3 = document.activeElement;
+      if (!a3 || !body.contains(a3)) return null;
+      return a3.closest("[data-waffle-key]")?.dataset.waffleKey ?? null;
+    };
     const render = () => {
+      const hadGridFocus = !!document.activeElement && body.contains(document.activeElement);
+      const heldKey = heldFocusKey();
+      if (heldKey) focusKey = heldKey;
       model = compute();
       updateDot();
+      let html;
       if (!model.sections.length) {
         const strip = deps.getStrip();
-        body.innerHTML = query ? `<div class="waffle-empty" role="none">No tabs match &quot;${esc(query)}&quot;</div>` : `<div class="waffle-empty" role="none">${strip ? "No tabs available" : "Open a project to jump between its tabs"}</div>`;
+        html = query ? `<div class="waffle-empty" role="none">No tabs match &quot;${esc(query)}&quot;</div>` : `<div class="waffle-empty" role="none">${strip ? "No tabs available" : "Open a project to jump between its tabs"}</div>`;
       } else {
-        body.innerHTML = model.sections.map(sectionHtml).join("");
+        html = model.sections.map(sectionHtml).join("");
+      }
+      if (html !== lastHtml) {
+        const scroll = body.scrollTop;
+        body.innerHTML = html;
+        body.scrollTop = scroll;
+        lastHtml = html;
       }
       const flat = model.keys.flat();
       setRoving(focusKey && flat.includes(focusKey) ? focusKey : flat[0] ?? null);
       live.textContent = query ? model.count === 1 ? "1 match" : `${model.count} matches` : "";
+      if (hadGridFocus && !body.contains(document.activeElement)) {
+        const target = heldKey && flat.includes(heldKey) ? heldKey : flat[0] ?? null;
+        if (target) focusEntry(target);
+        else input.focus();
+      }
     };
     const place = () => {
       const r3 = button.getBoundingClientRect();
@@ -10395,11 +10429,18 @@ ${n2.tags || ""}`.toLowerCase();
     const onResize = () => {
       if (isOpen) place();
     };
+    const onDocKey = (ev) => {
+      if (ev.key !== "Escape" || ev.isComposing) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      close(true);
+    };
     function close(returnFocus = true) {
       if (!isOpen) return;
       isOpen = false;
       popover.hidden = true;
       button.setAttribute("aria-expanded", "false");
+      document.removeEventListener("keydown", onDocKey, true);
       document.removeEventListener("mousedown", onDocPointer, true);
       document.removeEventListener("touchstart", onDocPointer, true);
       document.removeEventListener("focusin", onFocusIn, true);
@@ -10418,6 +10459,7 @@ ${n2.tags || ""}`.toLowerCase();
       button.setAttribute("aria-expanded", "true");
       render();
       place();
+      document.addEventListener("keydown", onDocKey, true);
       document.addEventListener("mousedown", onDocPointer, true);
       document.addEventListener("touchstart", onDocPointer, true);
       document.addEventListener("focusin", onFocusIn, true);
@@ -10426,16 +10468,20 @@ ${n2.tags || ""}`.toLowerCase();
       if (fine) input.focus();
       else focusEntry(focusKey);
     }
+    const noteUse = (tab) => {
+      state2 = recordUse(state2, tab);
+      persist();
+      if (isOpen) render();
+    };
     const activateKey = (key) => {
       if (!key) return;
       const entry = model.sections.flatMap((s3) => s3.rows.flatMap((r3) => r3.entries)).find((e3) => e3.key === key);
       if (!entry) return;
       const strip = deps.getStrip();
       if (!strip) return;
-      state2 = recordUse(state2, entry.tab);
-      persist();
       close(true);
-      activateWaffleTab(strip, entry.tab, entry.sub);
+      const activated = withoutWaffleUse(() => activateWaffleTab(strip, entry.tab, entry.sub));
+      if (activated) noteUse(entry.tab);
       updateDot();
     };
     const togglePinFor = (tab, keyToFocus) => {
@@ -10472,12 +10518,6 @@ ${n2.tags || ""}`.toLowerCase();
     });
     popover.addEventListener("keydown", (ev) => {
       const target = ev.target;
-      if (ev.key === "Escape") {
-        ev.preventDefault();
-        ev.stopPropagation();
-        close(true);
-        return;
-      }
       if (ev.key === "Tab") {
         const stops = [input, body.querySelector('[data-waffle-key][tabindex="0"]')].filter(
           (el3) => !!el3
@@ -10536,6 +10576,7 @@ ${n2.tags || ""}`.toLowerCase();
         if (isOpen) render();
         else updateDot();
       },
+      recordUse: noteUse,
       getModel: () => model,
       getState: () => state2,
       destroy: () => {
@@ -11419,7 +11460,7 @@ ${n2.tags || ""}`.toLowerCase();
     if (!pid || !vtab) return;
     const btn = document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${vtab}"]`);
     revealGroupInStrip(document.getElementById(`vtab-strip-${pid}`) || document, vtab);
-    if (btn) btn.click();
+    if (btn) withoutWaffleUse(() => btn.click());
     if (gtab) {
       const gbtn = document.querySelector(`#drawer-goal-${pid} .goal-subtab-btn[data-gtab="${gtab}"]`);
       if (gbtn) gbtn.click();
@@ -13567,6 +13608,7 @@ Current: ${current2 || "(none)"}`,
         btn.onclick = () => {
           const vtab = btn.dataset.vtab;
           const p3 = state.panels[project.id];
+          recordWaffleUse(vtab);
           revealGroupForTab(vtab);
           vtabStrip.querySelectorAll(".vtab-btn").forEach((b2) => {
             b2.classList.toggle("active", b2.dataset.vtab === vtab);
@@ -13614,7 +13656,7 @@ Current: ${current2 || "(none)"}`,
         if (saved) {
           revealGroupForTab(saved);
           const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
-          if (savedBtn) savedBtn.click();
+          if (savedBtn) withoutWaffleUse(() => savedBtn.click());
         }
       } catch (_2) {
       }
