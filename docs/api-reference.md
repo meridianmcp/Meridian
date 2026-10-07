@@ -691,6 +691,7 @@ No auth required.
 | `GET` | `/admin/health` | JSON health check for ops/curl — restricted to admin users |
 | `GET` | `/admin/login` | Admin password gate for the /admin panel |
 | `POST` | `/admin/login` | Validate admin password and set signed cookie |
+| `GET` | `/admin/pool-load` | 1b2fbebe -- redacted per-tenant / per-Neon-pool load telemetry (admin only) |
 | `POST` | `/admin/restart` | Restart the server by spawning a new process then shutting down |
 | `POST` | `/admin/shutdown` | Gracefully stop the server process |
 | `GET` | `/admin/snapshot` | Download the current DB as a SQLite snapshot file |
