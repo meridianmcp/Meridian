@@ -709,6 +709,31 @@ class TestRestartPersistence:
         assert after["provenance_type"] == PS.UNREGISTERED
 
 
+def test_cited_zotero_keys_are_persisted_as_opaque_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        AN.outputs_local, "register_priority_path", lambda *_a, **_k: None,
+    )
+    output = tmp_path / "cited.csv"
+    output.write_text("id,value\n1,2\n", encoding="utf-8")
+    keys = ["ABCD1234", "EFGH5678"]
+
+    recorded = AN.record_provenance(
+        str(tmp_path), str(output), cited_zotero_keys=keys,
+    )
+    assert recorded["cited_zotero_keys"] == keys
+    assert AN.get_provenance(str(tmp_path), str(output))["cited_zotero_keys"] == keys
+    listed = AN.list_provenance(str(tmp_path))
+    assert len(listed) == 1
+    assert listed[0]["cited_zotero_keys"] == keys
+
+    legacy_shape = AN.record_provenance(
+        str(tmp_path), str(tmp_path / "no-citations.csv"),
+    )
+    assert legacy_shape["cited_zotero_keys"] is None
+
+
 # ---------------------------------------------------------------------------
 # stale_by_script (item d3374b0e)
 # ---------------------------------------------------------------------------

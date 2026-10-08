@@ -223,6 +223,9 @@ class ProvenanceRecord:
     # returns the raw dict as-is rather than reconstructing this dataclass,
     # so there is no forward-compat parsing step that could choke on it.
     experiment_run_id: str | None = None
+    # 93a8b26b -- optional opaque Zotero item keys cited by this output.
+    # Resolution stays with consumers that already have Zotero access.
+    cited_zotero_keys: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -238,6 +241,7 @@ def record_provenance(
     decision_id: str | None = None,
     note: str | None = None,
     experiment_run_id: str | None = None,
+    cited_zotero_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """Attach lightweight reproducibility metadata to one output file.
 
@@ -284,11 +288,15 @@ def record_provenance(
                            no DB engine access at all), it is stored as an
                            opaque string exactly like sprint_item_id/
                            decision_id already are.
+      cited_zotero_keys:   Optional (93a8b26b) Zotero item keys cited by this
+                           output. Stored as an opaque list; this standalone
+                           package does not resolve keys or make hosted calls.
 
     Returns:
       The stored record as a dict (path, generating_script, params,
       sprint_item_id, decision_id, note, recorded_at, recorded_at_iso,
-      content_hash, experiment_run_id), or ``{"error": ...}`` on failure.
+      content_hash, experiment_run_id, cited_zotero_keys), or
+      ``{"error": ...}`` on failure.
 
     bd5b8d79 -- ``content_hash`` is a best-effort SHA-256 of ``path``'s
     on-disk bytes AT THE MOMENT this record is written, via
@@ -356,6 +364,7 @@ def record_provenance(
         recorded_at_iso=datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
         content_hash=content_hash,
         experiment_run_id=experiment_run_id,
+        cited_zotero_keys=cited_zotero_keys,
     )
 
     key = os.path.normcase(os.path.normpath(stored_path)).replace("\\", "/")
@@ -403,8 +412,9 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
     Returns:
       The record dict for `path` (``path``, ``generating_script``,
       ``params``, ``sprint_item_id``, ``decision_id``, ``note``,
-      ``recorded_at``, ``recorded_at_iso``, ``content_hash``), or None if
-      nothing has ever been recorded for this path under this outputs_dir.
+      ``recorded_at``, ``recorded_at_iso``, ``content_hash``,
+      ``experiment_run_id``, ``cited_zotero_keys``), or None if nothing has
+      ever been recorded for this path under this outputs_dir.
 
     Deliberately a PURE exact-match primitive -- bd5b8d79. A bare ``None``
     here is ambiguous ("never recorded" vs. "recorded, but this path was
