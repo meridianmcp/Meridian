@@ -69,6 +69,30 @@ async def admin_health_json(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/admin/pool-load")
+async def admin_pool_load(request: Request, top_n: int = 10) -> dict[str, Any]:
+    """1b2fbebe -- redacted per-tenant / per-Neon-pool load telemetry (admin only).
+
+    Same gate as /admin/health. In-memory and per server process: with several Fly
+    machines each one reports only the requests it served. Advisory only: nothing here
+    moves a tenant or changes a quota."""
+    from ..hosted import get_current_tenant, is_admin_db, check_admin_password  # noqa: PLC0415
+    from ..pool_telemetry import METER  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    if not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
+
+    snapshot = METER.snapshot(top_n=max(1, min(int(top_n), 50)))
+    snapshot["scope"] = "this server process only"
+    return snapshot
+
+
 @router.get("/health/deep")
 async def health_deep(request: Request) -> JSONResponse:
     """4c559d4e — deep health probe for post-deploy checks + external monitoring.

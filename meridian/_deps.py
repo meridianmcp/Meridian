@@ -173,6 +173,9 @@ _DEMO_CONTEXT_COOKIE = "meridian_demo"
 # ---------------------------------------------------------------------------
 
 _tenant_db_cache: dict[str, Any] = {}
+# 1b2fbebe -- tenant_id -> Neon pool project id, filled when the tenant DB is opened so the
+# per-request telemetry below can attribute a request to its pool without another lookup.
+_tenant_pool_ids: dict[str, "str | None"] = {}
 
 # Per-tenant provisioning lock (confirmed production bug, matches the
 # already-established fix pattern in routes/tunnel.py's
@@ -219,6 +222,7 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
         tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
         if not tenant:
             raise HTTPException(status_code=401, detail="tenant not found")
+        _tenant_pool_ids[tenant_id] = tenant.get("neon_project_id")
 
         url: str | None = None
         if tenant.get("neon_db_url"):
@@ -281,6 +285,16 @@ def _authentication_required() -> HTTPException:
         detail="authentication required",
         headers=dict(_AUTH_REQUIRED_HEADERS),
     )
+
+
+def _note_pool_tenant(request: Request, tenant_id: str) -> None:
+    """1b2fbebe -- remember which tenant and Neon pool project this request's database belongs
+    to. PoolTimingMiddleware reads it once the response starts and records the request with
+    its latency (in-memory, redacted; see pool_telemetry). It can never fail a request."""
+    try:
+        request.state._pool_attr = (tenant_id, _tenant_pool_ids.get(tenant_id))
+    except Exception:
+        pass
 
 
 async def _db(request: Request) -> Any:
@@ -357,10 +371,12 @@ async def _db(request: Request) -> Any:
             if any(m["tenant_id"] == ws_header for m in memberships):
                 conn = await _open_tenant_db_by_id(request, ws_header)
                 request.state._db_conn = conn
+                _note_pool_tenant(request, ws_header)
                 return conn
 
         conn = await _open_tenant_db_by_id(request, current_tenant_id)
         request.state._db_conn = conn
+        _note_pool_tenant(request, current_tenant_id)
         return conn
 
     conn = request.app.state.db

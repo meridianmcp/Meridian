@@ -1598,6 +1598,15 @@ async def _role_enforcement_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# 1b2fbebe -- per-tenant / per-Neon-pool request timing (in-memory, redacted, advisory; see
+# pool_telemetry and docs/infra-neon-tenant-pool-isolation.md). Registered LAST so it is the
+# outermost middleware and its clock covers the whole handler chain. Pure ASGI: it must not
+# buffer the streaming and SSE routes.
+from .pool_timing import PoolTimingMiddleware  # noqa: E402
+
+app.add_middleware(PoolTimingMiddleware)
+
+
 # ---------------------------------------------------------------------------
 # Item 39 — error alerting test endpoint
 # ---------------------------------------------------------------------------
