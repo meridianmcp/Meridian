@@ -7,8 +7,11 @@ import {
   classifyArtifactHealth,
   displaySafe,
   isArtifactsUnavailable,
+  nextOffset,
+  prevOffset,
   type ArtifactsEnvelope,
   type ControlPlaneRole,
+  type PageInfo,
   type RelationshipProject,
 } from './dashboard-control-plane';
 
@@ -3504,6 +3507,39 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         artifacts: document.getElementById('cp-panel-artifacts'),
       };
       const loaded: Record<string, boolean> = { relationships: false, proposals: false, artifacts: false };
+      const proposalPageSize = 20;
+      const artifactPageSize = 50;
+      let proposalOffset = 0;
+      let artifactOffset = 0;
+
+      function paginationMarkup(page: PageInfo, itemCount: number, label: string, total?: number): string {
+        const first = itemCount ? page.offset + 1 : 0;
+        const last = page.offset + itemCount;
+        const summary = itemCount === 0
+          ? (total === 0 ? 'No records' : 'No records on this page')
+          : `Showing ${first}–${last}${total == null ? '' : ` of ${total}`}`;
+        const previousPage = prevOffset(page);
+        const followingPage = nextOffset(page);
+        return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0 2px;font-size:10px;color:var(--muted)" aria-label="${escapeHtml(label)} pagination">`
+          + `<span>${escapeHtml(summary)}</span>`
+          + `<div style="display:flex;gap:6px">`
+          + `<button type="button" class="secondary" data-cp-page="previous" aria-label="Previous ${escapeHtml(label)} page" ${previousPage === null ? 'disabled' : ''} style="font-size:9px;padding:3px 8px">Previous</button>`
+          + `<button type="button" class="secondary" data-cp-page="next" aria-label="Next ${escapeHtml(label)} page" ${followingPage === null ? 'disabled' : ''} style="font-size:9px;padding:3px 8px">Next</button>`
+          + `</div></div>`;
+      }
+
+      function bindPagination(el: HTMLElement, page: PageInfo, onPage: (offset: number) => void) {
+        const previous = el.querySelector<HTMLButtonElement>('[data-cp-page="previous"]');
+        const following = el.querySelector<HTMLButtonElement>('[data-cp-page="next"]');
+        if (previous) previous.onclick = () => {
+          const offset = prevOffset(page);
+          if (offset !== null) onPage(offset);
+        };
+        if (following) following.onclick = () => {
+          const offset = nextOffset(page);
+          if (offset !== null) onPage(offset);
+        };
+      }
 
       async function loadRelationships() {
         const el = panels.relationships;
@@ -3526,14 +3562,23 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         const el = panels.proposals;
         if (!el) return;
         try {
-          const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=20`);
-          const items = data.items || [];
-          el.innerHTML = items.length
+          const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=${proposalPageSize}&offset=${proposalOffset}`);
+          const items = Array.isArray(data.items) ? data.items : [];
+          const page: PageInfo = {
+            limit: Number(data.limit) || proposalPageSize,
+            offset: Number.isFinite(Number(data.offset)) ? Number(data.offset) : proposalOffset,
+            hasMore: data.has_more === true,
+          };
+          const total = Number.isFinite(Number(data.total)) ? Number(data.total) : undefined;
+          proposalOffset = page.offset;
+          const rows = items.length
             ? items.map((p: any) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)">`
                 + `<div>${escapeHtml(p.title || '')} <span style="color:var(--muted);font-size:9px">${escapeHtml(p.status || '')}</span></div>`
                 + `<div style="color:var(--muted);font-size:9px">${escapeHtml((p.body || '').slice(0, 160))}</div>`
                 + `</div>`).join('')
             : '<div style="color:var(--muted)">No proposals in scope.</div>';
+          el.innerHTML = rows + paginationMarkup(page, items.length, 'proposals', total);
+          bindPagination(el, page, offset => { proposalOffset = offset; void loadProposals(); });
         } catch (e: any) {
           el.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
         }
@@ -3543,13 +3588,19 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         const el = panels.artifacts;
         if (!el) return;
         try {
-          const data = (await api('/control-plane/artifacts?limit=50')) as ArtifactsEnvelope;
+          const data = (await api(`/control-plane/artifacts?limit=${artifactPageSize}&offset=${artifactOffset}`)) as ArtifactsEnvelope;
           if (isArtifactsUnavailable(data)) {
             el.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : 'Not available.')}</div>`;
             return;
           }
-          const items = data.items || [];
-          el.innerHTML = items.length
+          const items = Array.isArray(data.items) ? data.items : [];
+          const page: PageInfo = {
+            limit: Number(data.limit) || artifactPageSize,
+            offset: Number.isFinite(Number(data.offset)) ? Number(data.offset) : artifactOffset,
+            hasMore: data.has_more === true,
+          };
+          artifactOffset = page.offset;
+          const rows = items.length
             ? items.map((rec: any) => {
                 const health = classifyArtifactHealth(rec);
                 const ident = displaySafe(rec.path || rec.run_id || rec.artifact_id || '(unknown)');
@@ -3559,6 +3610,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
                   + `</div>`;
               }).join('')
             : '<div style="color:var(--muted)">No run manifests, provenance records, or registered artifacts found.</div>';
+          el.innerHTML = rows + paginationMarkup(page, items.length, 'artifacts', data.total);
+          bindPagination(el, page, offset => { artifactOffset = offset; void loadArtifacts(); });
         } catch (e: any) {
           el.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
         }

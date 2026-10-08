@@ -6785,11 +6785,11 @@ function showCopyPreview(title: any, content: any) {
 
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9998;display:flex;align-items:center;justify-content:center';
 
-  overlay.innerHTML = `<div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
+  overlay.innerHTML = `<div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;height:80vh;max-height:calc(100vh - 24px);box-sizing:border-box;overflow:hidden;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
 
     <div style="font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--accent)">${escapeHtml(title)}</div>
 
-    <textarea style="width:100%;height:300px;font-family:var(--font-mono);font-size:11px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:10px;border-radius:4px;resize:vertical;outline:none">${escapeHtml(content)}</textarea>
+    <textarea style="width:100%;max-width:100%;min-width:0;flex:1 1 300px;min-height:0;max-height:calc(80vh - 120px);box-sizing:border-box;overflow:auto;font-family:var(--font-mono);font-size:11px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:10px;border-radius:4px;resize:vertical;outline:none">${escapeHtml(content)}</textarea>
 
     <div style="display:flex;gap:8px;justify-content:flex-end">
 

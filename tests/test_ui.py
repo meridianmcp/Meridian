@@ -140,6 +140,33 @@ def test_tunnel_per_machine_picker_rendered(js):
 # ---------------------------------------------------------------------------
 
 
+def test_control_plane_proposals_and_artifacts_are_paginated_in_the_dashboard():
+    """243608f6 — the control-plane panels consume API offsets and expose page controls."""
+    settings_src = _static_text("dashboard-settings.ts")
+    assert "nextOffset," in settings_src and "prevOffset," in settings_src
+    assert "&limit=${proposalPageSize}&offset=${proposalOffset}" in settings_src
+    assert "&limit=${artifactPageSize}&offset=${artifactOffset}" in settings_src
+    assert "data.has_more === true" in settings_src
+    assert "paginationMarkup(page, items.length, 'proposals', total)" in settings_src
+    assert "paginationMarkup(page, items.length, 'artifacts', data.total)" in settings_src
+    assert 'data-cp-page="previous"' in settings_src
+    assert 'data-cp-page="next"' in settings_src
+    assert "proposalOffset = offset; void loadProposals();" in settings_src
+    assert "artifactOffset = offset; void loadArtifacts();" in settings_src
+
+
+def test_copy_preview_modal_keeps_long_content_inside_the_viewport():
+    """243608f6 — the copy preview dialog and textarea shrink and scroll within the viewport."""
+    dashboard_src = _static_text("dashboard.ts")
+    start = dashboard_src.index("function showCopyPreview(")
+    end = dashboard_src.index("function wireClaudeLaunchPanel(", start)
+    preview = dashboard_src[start:end]
+    assert "height:80vh" in preview and "max-height:calc(100vh - 24px)" in preview
+    assert "box-sizing:border-box" in preview
+    assert "flex:1 1 300px" in preview and "min-height:0" in preview
+    assert "max-height:calc(80vh - 120px)" in preview and "overflow:auto" in preview
+
+
 def test_dashboard_loads_200(client):
     """Dashboard returns HTTP 200 with a valid HTML document (smoke test)."""
     r = client.get("/dashboard")
