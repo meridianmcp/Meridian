@@ -46,7 +46,7 @@ jobs:
         shell: pwsh
         run: |
           git config --global core.autocrlf false
-          "C:\Program Files\Gitin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "C:/Program Files/Git/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
