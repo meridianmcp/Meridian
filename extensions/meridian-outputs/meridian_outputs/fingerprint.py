@@ -39,11 +39,17 @@ import json
 import logging
 import os
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
 from . import outputs_local
+from .path_security import (
+    relative_output_path,
+    relative_reference,
+    _require_within,
+    resolve_reference,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -85,7 +91,7 @@ def _ledger_path(outputs_dir: str) -> str:
 # Script content hashing
 # ---------------------------------------------------------------------------
 
-def script_content_hash(script_path: str) -> str | None:
+def script_content_hash(script_path: str, *, outputs_dir: str | None = None) -> str | None:
     """SHA-256 of a generating script's current on-disk content.
 
     Never raises: an unreadable/missing script yields None, mirroring
@@ -93,9 +99,11 @@ def script_content_hash(script_path: str) -> str | None:
     deleted or moved is itself useful staleness signal, handled by callers).
     """
     try:
+        if outputs_dir is not None:
+            script_path = _require_within(outputs_dir, script_path)
         with open(script_path, "rb") as fh:
             return hashlib.sha256(fh.read()).hexdigest()
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return None
 
 
@@ -232,10 +240,14 @@ def tag_output(
     Returns:
       The :class:`ScriptTaggedFingerprint` that was written to the ledger.
     """
-    fp = outputs_local.file_fingerprint(output_path)
+    resolved_output = _require_within(outputs_dir, output_path)
+    stored_output = relative_output_path(outputs_dir, resolved_output)
+    fp = outputs_local.file_fingerprint(resolved_output)
     resolved = script_path
     if resolved is None and fp.generating_script:
         resolved = _resolve_script_path(fp.generating_script, search_root=search_root)
+    if resolved is not None:
+        resolved = os.path.realpath(os.path.abspath(os.fspath(resolved)))
     # fa600e42 -- hash the script file ONCE and derive both the bare
     # script_hash field and the structured content_digest from that SAME
     # value, rather than calling script_content_hash and
@@ -247,7 +259,7 @@ def tag_output(
     # a single "at this moment" snapshot.
     _script_hash = script_content_hash(resolved) if resolved else None
     tagged = ScriptTaggedFingerprint(
-        path=output_path,
+        path=resolved_output,
         kind=fp.kind,
         csv_columns=fp.csv_columns,
         json_keys=fp.json_keys,
@@ -257,7 +269,23 @@ def tag_output(
         content_digest=_make_content_digest(_script_hash) if _script_hash is not None else None,
         tagged_at=datetime.now(timezone.utc).isoformat(),
     )
-    _write_ledger_entry(outputs_dir, tagged)
+    stored = replace(
+        tagged,
+        path=stored_output,
+        generating_script=(
+            (
+                relative_reference(outputs_dir, tagged.generating_script)
+                or os.path.basename(tagged.generating_script)
+            )
+            if tagged.generating_script and os.path.isabs(tagged.generating_script)
+            else tagged.generating_script
+        ),
+        script_path=(
+            relative_reference(outputs_dir, tagged.script_path)
+            if tagged.script_path else None
+        ),
+    )
+    _write_ledger_entry(outputs_dir, stored)
     return tagged
 
 
@@ -274,7 +302,33 @@ def _write_ledger_entry(outputs_dir: str, tagged: ScriptTaggedFingerprint) -> No
     path = _ledger_path(outputs_dir)
     with _write_lock:
         ledger = _read_ledger(outputs_dir)
-        ledger[tagged.path] = tagged.to_dict()
+        portable: dict[str, dict[str, Any]] = {}
+        for old_key, old_record in ledger.items():
+            if not isinstance(old_record, dict):
+                continue
+            entry = dict(old_record)
+            old_path = entry.get("path") or old_key
+            safe_path = (
+                relative_reference(outputs_dir, old_path)
+                if isinstance(old_path, str) and os.path.isabs(old_path)
+                else str(old_path).replace("\\", "/")
+            )
+            if not safe_path:
+                continue
+            entry["path"] = safe_path
+            script_path = entry.get("script_path")
+            if isinstance(script_path, str) and os.path.isabs(script_path):
+                entry["script_path"] = relative_reference(outputs_dir, script_path)
+            generator = entry.get("generating_script")
+            if isinstance(generator, str) and os.path.isabs(generator):
+                entry["generating_script"] = (
+                    relative_reference(outputs_dir, generator)
+                    or os.path.basename(generator)
+                )
+            safe_key = os.path.normcase(os.path.normpath(safe_path)).replace("\\", "/")
+            portable[safe_key] = entry
+        portable[tagged.path] = tagged.to_dict()
+        ledger = portable
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(ledger, fh, indent=2, sort_keys=True)
@@ -321,37 +375,39 @@ def check_staleness(outputs_dir: str) -> list[StalenessResult]:
     for path in sorted(ledger):
         entry = ledger[path]
         script_path = entry.get("script_path")
+        output_path = resolve_reference(outputs_dir, path)
         # fa600e42 -- tolerant of either the OLD bare-string ``script_hash``
         # field (rows written before content_digest existed) or the NEW
         # structured ``content_digest`` field; see _digest_hex's docstring.
         tagged_hash = _digest_hex(entry.get("content_digest")) or entry.get("script_hash")
         if not script_path:
             results.append(StalenessResult(
-                path=path, script_path=None, tagged_script_hash=tagged_hash,
+                path=output_path, script_path=None, tagged_script_hash=tagged_hash,
                 current_script_hash=None, is_stale=False,
                 reason="no generating script resolved at tag time",
             ))
             continue
-        if script_path not in script_hash_cache:
-            script_hash_cache[script_path] = script_content_hash(script_path)
-        current_hash = script_hash_cache[script_path]
+        resolved_script = resolve_reference(outputs_dir, script_path)
+        if resolved_script not in script_hash_cache:
+            script_hash_cache[resolved_script] = script_content_hash(resolved_script)
+        current_hash = script_hash_cache[resolved_script]
         if current_hash is None:
             results.append(StalenessResult(
-                path=path, script_path=script_path,
+                path=output_path, script_path=resolved_script,
                 tagged_script_hash=tagged_hash, current_script_hash=None,
                 is_stale=True,
                 reason="generating script no longer readable/present",
             ))
         elif tagged_hash is not None and current_hash != tagged_hash:
             results.append(StalenessResult(
-                path=path, script_path=script_path,
+                path=output_path, script_path=resolved_script,
                 tagged_script_hash=tagged_hash, current_script_hash=current_hash,
                 is_stale=True,
                 reason="generating script content changed since tagging",
             ))
         else:
             results.append(StalenessResult(
-                path=path, script_path=script_path,
+                path=output_path, script_path=resolved_script,
                 tagged_script_hash=tagged_hash, current_script_hash=current_hash,
                 is_stale=False,
                 reason="generating script unchanged since tagging",
@@ -372,14 +428,17 @@ def find_stale_by_script(outputs_dir: str, script_path: str) -> list[str]:
 
     Returns paths in stable sorted order.
     """
-    current_hash = script_content_hash(script_path)
-    script_abspath = os.path.abspath(script_path)
+    script_abspath = os.path.realpath(os.path.abspath(script_path))
+    current_hash = script_content_hash(script_abspath)
     ledger = _read_ledger(outputs_dir)
     stale: list[str] = []
     for path in sorted(ledger):
         entry = ledger[path]
         entry_script = entry.get("script_path")
-        if not entry_script or os.path.abspath(entry_script) != script_abspath:
+        if not entry_script:
+            continue
+        entry_script_path = resolve_reference(outputs_dir, entry_script)
+        if os.path.normcase(entry_script_path) != os.path.normcase(script_abspath):
             continue
         # fa600e42 -- same compatibility read as check_staleness (see
         # _digest_hex's docstring): a ledger row's recorded hash may live
@@ -389,5 +448,5 @@ def find_stale_by_script(outputs_dir: str, script_path: str) -> list[str]:
         # script_hash disagree with check_staleness about the same data.
         tagged_hash = _digest_hex(entry.get("content_digest")) or entry.get("script_hash")
         if tagged_hash != current_hash:
-            stale.append(path)
+            stale.append(resolve_reference(outputs_dir, path))
     return stale
