@@ -42,11 +42,25 @@ jobs:
       # dev checkout uses autocrlf=false. (2) `bash` on the runner PATH is the WSL launcher
       # stub ("no installed distributions"), not Git Bash, so every .sh hook test would fail
       # with UTF-16 noise; put Git's bash first, as it is on the dev machine.
-      - name: Match the dev machine (no CRLF rewrite; Git Bash first on PATH)
+      - name: Match the dev machine (no CRLF rewrite; Git Bash, not the WSL stub, answers to 'bash')
         shell: pwsh
         run: |
           git config --global core.autocrlf false
           "C:/Program Files/Git/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # Putting Git first on PATH is not enough: CreateProcess (which subprocess uses for a
+          # bare 'bash') searches System32 BEFORE PATH, and the runner image ships the WSL
+          # launcher stub there (run 37719217133: 170 hook tests got 'no installed
+          # distributions' in UTF-16). The dev machine has no such stub. Move it aside on this
+          # throwaway VM so 'bash' resolves to Git Bash through PATH.
+          $stub = Join-Path $env:SystemRoot 'System32ash.exe'
+          if (Test-Path $stub) {
+            try {
+              takeown /f $stub | Out-Null
+              icacls $stub /grant "$($env:USERNAME):F" | Out-Null
+              Rename-Item -Path $stub -NewName 'bash.exe.wsl-stub' -ErrorAction Stop
+              Write-Host "moved aside $stub"
+            } catch { Write-Warning "could not move the WSL bash stub aside: $_" }
+          }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
@@ -60,7 +74,9 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          pixi run python scripts/run_tests.py tests/ -q --tb=short -rfE --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py -m "not subprocess_isolated"
+          # --deselect: the owner-only-ACE assertion counts the ACEs on a temp file; the runner's temp
+          # directory inherits an extra Administrators ACE that a normal user profile does not.
+          pixi run python scripts/run_tests.py tests/ -q --tb=short -rfE --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py -m "not subprocess_isolated" --deselect tests/test_9784f8ef_install_token_exposure.py::test_curl_header_config_is_really_owner_only_on_windows
       - name: Rate-limit module (serial, wall-clock sensitive)
         if: always()
         run: pixi run python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short -rfE
