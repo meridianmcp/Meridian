@@ -36,6 +36,17 @@ jobs:
       MERIDIAN_TEST_MAX_WORKERS: '4'
       MERIDIAN_TEST_WALL_TIMEOUT_SECONDS: '7200'
     steps:
+      # Mirror the developer machine, not the runner defaults. (1) Git for Windows' default
+      # core.autocrlf=true rewrites every checked-out file to CRLF, which changes the bytes
+      # and so the sha256/size the capability manifest and the dashboard bundle hash pin; the
+      # dev checkout uses autocrlf=false. (2) `bash` on the runner PATH is the WSL launcher
+      # stub ("no installed distributions"), not Git Bash, so every .sh hook test would fail
+      # with UTF-16 noise; put Git's bash first, as it is on the dev machine.
+      - name: Match the dev machine (no CRLF rewrite; Git Bash first on PATH)
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          "C:\Program Files\Gitin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
