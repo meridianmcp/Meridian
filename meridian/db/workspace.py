@@ -3738,3 +3738,75 @@ async def get_member_roles(
     ) as cur:
         rows = await cur.fetchall()
     return [((r["role"] or "member"), r["project_id"]) for r in rows]
+
+
+async def get_member_authorization_context(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str | None,
+) -> dict[str, Any]:
+    """Read explicit scope, role rows, and effective-policy inputs in one query.
+
+    The workspace-member rows are the authority for both explicit project
+    grants and role clamps. Policy rows are returned only when those accepted
+    memberships make the caller project-scoped; a workspace-wide member or a
+    non-member still gets the usual unscoped result. No result is cached, so
+    edits and revocations are visible on the next request.
+
+    ``project_ids`` is ``None`` for an owner/non-member/workspace-wide member,
+    and a list for a project-scoped member. ``memberships`` retains every
+    accepted ``(role, project_id)`` pair for the most-restrictive role clamp.
+    ``policy_rows`` has the same shape as :func:`get_member_policy_rows`.
+    """
+    subject = _member_policy_subject(email)
+    if not subject:
+        return {
+            "project_ids": None,
+            "memberships": [],
+            "policy_rows": {"default": None, "override": None},
+        }
+
+    async with db.execute(
+        "WITH accepted_members AS ("
+        "SELECT role, project_id FROM workspace_members "
+        "WHERE tenant_id = ? AND LOWER(email) = ? AND joined_at IS NOT NULL"
+        ") "
+        "SELECT 'member' AS kind, role, project_id, NULL AS subject, NULL AS policy "
+        "FROM accepted_members "
+        "UNION ALL "
+        "SELECT 'policy' AS kind, NULL AS role, NULL AS project_id, subject, policy "
+        "FROM member_policy "
+        "WHERE tenant_id = ? AND subject IN ('*', ?) "
+        "AND EXISTS (SELECT 1 FROM accepted_members) "
+        "AND NOT EXISTS (SELECT 1 FROM accepted_members WHERE project_id IS NULL)",
+        (tenant_id, subject, tenant_id, subject),
+    ) as cur:
+        rows = await cur.fetchall()
+
+    memberships: list[tuple[str, str | None]] = []
+    policy_rows: dict[str, str | None] = {"default": None, "override": None}
+    for row in rows:
+        if hasattr(row, "keys"):
+            kind = row["kind"]
+            role = row["role"]
+            project_id = row["project_id"]
+            policy_subject = row["subject"]
+            policy = row["policy"]
+        else:
+            kind, role, project_id, policy_subject, policy = row
+        if kind == "member":
+            memberships.append((role or "member", project_id))
+        elif policy_subject == MEMBER_POLICY_DEFAULT_SUBJECT:
+            policy_rows["default"] = policy
+        else:
+            policy_rows["override"] = policy
+
+    if not memberships or any(project_id is None for _, project_id in memberships):
+        project_ids = None
+    else:
+        project_ids = [project_id for _, project_id in memberships]
+    return {
+        "project_ids": project_ids,
+        "memberships": memberships,
+        "policy_rows": policy_rows,
+    }

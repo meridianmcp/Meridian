@@ -25,6 +25,7 @@ import pytest
 import meridian.server  # noqa: F401 -- load the server first (import-cycle ordering, as in wave 1)
 from meridian import _deps
 from meridian import db as db_module
+from meridian.db import workspace as workspace_db
 
 _OUT_OF_SCOPE = "Project is outside your access scope."
 
@@ -743,7 +744,7 @@ def test_hosted_scope_resolution_errors_fail_closed_for_http_and_mcp(monkeypatch
         async def _boom(*args, **kwargs):
             raise RuntimeError("auth db unavailable")
 
-        monkeypatch.setattr(db_module, "get_scoped_project_ids_for_member", _boom)
+        monkeypatch.setattr(workspace_db, "get_member_authorization_context", _boom)
 
         # HTTP middleware: 503, never "treated as unscoped" (which would serve project B).
         for pid in (a, b):

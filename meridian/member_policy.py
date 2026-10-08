@@ -15,13 +15,12 @@ The owner sets the workspace default; each person may carry an override. The
 built-in defaults are ``BUILTIN_DEFAULTS``. Owners, workspace-wide members,
 non-members, self-hosted, demo, stdio and header-less callers are never scoped,
 so none of this runs for them (``resolve_member_scope`` returns ``None`` after
-the one membership SELECT they already paid).
+the one auth-database statement they already paid).
 
 This module is the single place that knows how to
   * resolve the effective policy for a person (``compute_effective_policy``),
   * turn a member's explicit project grants into their full scope, grants plus
-    the live one-level subprojects of those grants (``resolve_member_scope``,
-    the ONLY caller of ``db.get_scoped_project_ids_for_member``),
+    the live one-level subprojects of those grants (``resolve_member_scope``),
   * carry scope and policy together so no call site can hold one without the
     other (``ScopedProjectIds``),
   * decide which capabilities an operation needs (``classify_target`` and the
@@ -581,11 +580,13 @@ def require_capabilities(
 # Resolving a member's scope and policy
 # ---------------------------------------------------------------------------
 
-async def _load_policy(auth_db: Any, workspace_tenant_id: str, email: str) -> EffectivePolicy:
-    from . import db as db_module
-
-    rows = await db_module.get_member_policy_rows(auth_db, workspace_tenant_id, email)
-    roles = await db_module.get_member_roles(auth_db, workspace_tenant_id, email)
+def _policy_from_rows(
+    rows: Mapping[str, str | None],
+    roles: Sequence[tuple[str, str | None]],
+    workspace_tenant_id: str,
+    email: str,
+) -> EffectivePolicy:
+    """Build and diagnose a policy from the already-loaded auth rows."""
     policy = compute_effective_policy(rows.get("default"), rows.get("override"), roles)
     corrupt = {r for r in policy.reasons.values() if r.startswith("corrupt_")}
     if corrupt:
@@ -594,6 +595,14 @@ async def _load_policy(auth_db: Any, workspace_tenant_id: str, email: str) -> Ef
             "/".join(sorted(corrupt)), workspace_tenant_id, email,
         )
     return policy
+
+
+async def _load_policy(auth_db: Any, workspace_tenant_id: str, email: str) -> EffectivePolicy:
+    from . import db as db_module
+
+    rows = await db_module.get_member_policy_rows(auth_db, workspace_tenant_id, email)
+    roles = await db_module.get_member_roles(auth_db, workspace_tenant_id, email)
+    return _policy_from_rows(rows, roles, workspace_tenant_id, email)
 
 
 async def resolve_effective_policy(
@@ -636,11 +645,11 @@ async def resolve_member_scope(
 ) -> "ScopedProjectIds | None":
     """The caller's scope and policy in a workspace, or ``None`` when not scoped.
 
-    The only caller of ``db.get_scoped_project_ids_for_member`` (a CI test keeps
-    it that way): ``None`` from it (owner, workspace-wide member, non-member)
-    returns immediately with no further query. Otherwise the explicit grants are
-    expanded by one level with ``db.get_subproject_map`` on the owner's tenant
-    database, and the member's policy and roles are read from the auth database.
+    The workspace read combines accepted memberships, explicit grants, role
+    clamps, and policy rows in one auth-database statement. ``None`` scope
+    (owner, workspace-wide member, non-member) returns immediately without
+    opening the owner's database. Otherwise the explicit grants are expanded by
+    one live level with ``db.get_subproject_map`` on the owner's tenant database.
     An empty grant list stays a scoped caller with an empty scope.
 
     ``tenant_db`` may be the owner's connection or a callable that opens it (see
@@ -650,7 +659,12 @@ async def resolve_member_scope(
     from . import db as db_module
 
     email = (email or "").strip().lower()
-    explicit = await db_module.get_scoped_project_ids_for_member(auth_db, workspace_tenant_id, email)
+    from .db import workspace as workspace_db
+
+    context = await workspace_db.get_member_authorization_context(
+        auth_db, workspace_tenant_id, email,
+    )
+    explicit = context["project_ids"]
     if explicit is None:
         return None
     explicit_ids = tuple(dict.fromkeys(explicit))
@@ -659,7 +673,9 @@ async def resolve_member_scope(
         children = await db_module.get_subproject_map(await _tenant_db(tenant_db), explicit_ids)
     granted = set(explicit_ids)
     ordered = list(explicit_ids) + sorted(c for c in children if c not in granted)
-    policy = await _load_policy(auth_db, workspace_tenant_id, email)
+    policy = _policy_from_rows(
+        context["policy_rows"], context["memberships"], workspace_tenant_id, email,
+    )
     return ScopedProjectIds(
         ordered,
         explicit=explicit_ids,

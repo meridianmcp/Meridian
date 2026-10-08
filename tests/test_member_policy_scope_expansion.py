@@ -27,6 +27,7 @@ from fastapi import Request
 from meridian import _deps
 from meridian import db as db_module
 from meridian import member_policy as mp
+from meridian.db import workspace as workspace_db
 from member_policy_fixtures import (  # noqa: F401  (fixtures)
     StatementTrace,
     build_split_dbs,
@@ -201,9 +202,13 @@ async def test_an_empty_explicit_list_stays_scoped_and_never_opens_the_tenant_db
     d = split_dbs
 
     async def no_grants(*_a, **_k):
-        return []
+        return {
+            "project_ids": [],
+            "memberships": [],
+            "policy_rows": {"default": None, "override": None},
+        }
 
-    monkeypatch.setattr(db_module, "get_scoped_project_ids_for_member", no_grants)
+    monkeypatch.setattr(workspace_db, "get_member_authorization_context", no_grants)
 
     def never():
         raise AssertionError("the owner's database must not be opened for an empty scope")
@@ -307,10 +312,8 @@ async def test_a_corrupt_policy_row_denies_everything_and_is_logged(split_dbs, c
 # --- errors propagate, nothing is silently narrowed or widened --------------
 
 @pytest.mark.parametrize("which, needle", [
-    ("auth", "SELECT project_id FROM workspace_members"),  # the explicit grants themselves
-    ("tenant", "FROM projects"),                           # the children
-    ("auth", "FROM member_policy"),                        # the policy rows
-    ("auth", "SELECT role, project_id"),                   # the roles
+    ("auth", "FROM workspace_members"),  # combined membership, role, and policy read
+    ("tenant", "FROM projects"),          # live child expansion
 ])
 async def test_a_failing_read_propagates_instead_of_narrowing_the_scope(split_dbs, which, needle):
     d = split_dbs
@@ -383,8 +386,10 @@ async def test_a_scoped_member_pays_a_fixed_budget_split_across_the_two_database
     tenant = StatementTrace(d.tenant_db, label="tenant db")
     scope = await mp.resolve_member_scope(auth, tenant, d.owner["id"], d.member["email"])
     assert d.ids["S1"] in scope
-    # the existing scope SELECT, the policy rows, the member's roles, the owner's email
-    assert auth.tables() == ["workspace_members", "member_policy", "workspace_members", "tenants"]
+    # one authorization-context SELECT plus the best-effort owner-email lookup
+    assert auth.tables() == ["workspace_members", "tenants"]
+    assert len(auth.statements) == 2
+    assert "workspace_members" in auth.statements[0] and "member_policy" in auth.statements[0]
     # one indexed children SELECT, on the owner's database and nowhere else
     assert tenant.tables() == ["projects"]
     assert not any("projects" in s for s in auth.statements)
@@ -533,9 +538,12 @@ async def test_resolution_errors_propagate_out_of_the_request_function(split_dbs
     async def boom(*_a, **_k):
         raise RuntimeError("induced")
 
-    for name in ("get_subproject_map", "get_member_policy_rows", "get_member_roles"):
+    for target, name in (
+        (db_module, "get_subproject_map"),
+        (workspace_db, "get_member_authorization_context"),
+    ):
         with monkeypatch.context() as m:
-            m.setattr(db_module, name, boom)
+            m.setattr(target, name, boom)
             req = _request(d.auth_db, headers=headers)
             with pytest.raises(RuntimeError, match="induced"):
                 await _deps._scoped_project_ids_for_request(req)
@@ -743,7 +751,7 @@ def test_http_scope_is_resolved_once_per_request_across_middleware_and_route(spl
 
     ws.client.app.add_api_route("/projects/{project_id}/probe-scope", probe, methods=["GET"])
     resolver = _count(monkeypatch, mp, "resolve_member_scope")
-    explicit_reads = _count(monkeypatch, db_module, "get_scoped_project_ids_for_member")
+    authorization_reads = _count(monkeypatch, workspace_db, "get_member_authorization_context")
     children_reads = _count(monkeypatch, db_module, "get_subproject_map")
 
     r = ws.client.get(f"/projects/{S1}/probe-scope", headers=ws.member_headers())
@@ -752,10 +760,10 @@ def test_http_scope_is_resolved_once_per_request_across_middleware_and_route(spl
     assert body["same"] is True and body["kind"] == "ScopedProjectIds"
     assert body["scope"] == sorted([P, S1]) and body["explicit"] == [P]
     assert body["capabilities"] == dict(mp.BUILTIN_DEFAULTS)
-    assert resolver["n"] == 1 and explicit_reads["n"] == 1 and children_reads["n"] == 1
+    assert resolver["n"] == 1 and authorization_reads["n"] == 1 and children_reads["n"] == 1
 
 
-def test_http_callers_that_are_not_scoped_run_no_policy_or_expansion_code(split_workspace, monkeypatch):
+def test_http_unscoped_callers_skip_live_project_expansion(split_workspace, monkeypatch):
     ws = split_workspace
     P = ws.ids["P"]
     wide_tenant = ws.run(db_module.upsert_tenant(ws.auth_db, f"wide-{uniq('x')}@example.com"))
@@ -769,42 +777,44 @@ def test_http_callers_that_are_not_scoped_run_no_policy_or_expansion_code(split_
     _deps._tenant_db_cache[stranger["id"]] = stranger_db
     ws.invite("member", P)  # the scoped member exists too, for the control
 
-    counters = {n: _count(monkeypatch, db_module, n)
-                for n in ("get_subproject_map", "get_member_policy_rows", "get_member_roles")}
+    authorization = _count(monkeypatch, workspace_db, "get_member_authorization_context")
+    children = _count(monkeypatch, db_module, "get_subproject_map")
     resolver = _count(monkeypatch, mp, "resolve_member_scope")
-
-    def idle():
-        return all(c["n"] == 0 for c in counters.values())
 
     try:
         # the owner, with no header and with a header naming their own tenant
         for headers in (ws.owner_headers(), {**ws.owner_headers(), "X-Workspace-Tenant-Id": ws.owner["id"]}):
             assert ws.client.get("/projects", headers=headers).status_code == 200
             assert ws.client.get(f"/projects/{P}/tasks", headers=headers).status_code == 200
-        assert resolver["n"] == 0 and idle()
+        assert resolver["n"] == 0 and authorization["n"] == 0 and children["n"] == 0
 
         # a workspace-wide member sees every project and still costs nothing extra
         wide = {"Authorization": f"Bearer {wide_token}", "X-Workspace-Tenant-Id": ws.owner["id"]}
         assert {p["id"] for p in ws.client.get("/projects", headers=wide).json()} == {
             ws.ids[k] for k in ("P", "S1", "F", "FS")}
         assert ws.client.get(f"/projects/{ws.ids['F']}/tasks", headers=wide).status_code == 200
-        assert idle()
+        assert authorization["n"] == 2 and children["n"] == 0
 
         # a non-member naming the workspace is not scoped either (they land on their own DB)
         out = {"Authorization": f"Bearer {stranger_token}", "X-Workspace-Tenant-Id": ws.owner["id"]}
         assert ws.client.get(f"/projects/{P}/tasks", headers=out).status_code in (200, 404)
-        assert idle()
+        assert authorization["n"] == 3 and children["n"] == 0
 
-        # control: the scoped member does run them, once each per request
+        # control: the scoped member reads context and live children
         assert _listing(ws) == {P, ws.ids["S1"]}
-        assert all(c["n"] == 1 for c in counters.values())
+        assert authorization["n"] == 4 and children["n"] == 1
     finally:
         _deps._tenant_db_cache.pop(stranger["id"], None)
         ws.run(stranger_db.close())
 
 
-@pytest.mark.parametrize("name", ["get_subproject_map", "get_member_policy_rows", "get_member_roles"])
-def test_http_a_failing_resolution_step_is_a_503_with_the_header_and_harmless_without(split_workspace, monkeypatch, name):
+@pytest.mark.parametrize(
+    ("target", "name"),
+    [(db_module, "get_subproject_map"), (workspace_db, "get_member_authorization_context")],
+)
+def test_http_a_failing_resolution_step_is_a_503_with_the_header_and_harmless_without(
+    split_workspace, monkeypatch, target, name,
+):
     ws = split_workspace
     P = ws.ids["P"]
     ws.invite("member", P)
@@ -813,7 +823,7 @@ def test_http_a_failing_resolution_step_is_a_503_with_the_header_and_harmless_wi
     async def boom(*_a, **_k):
         raise RuntimeError("induced")
 
-    monkeypatch.setattr(db_module, name, boom)
+    monkeypatch.setattr(target, name, boom)
     for project in (P, ws.ids["F"]):
         r = _tasks(ws, project)
         assert r.status_code == 503 and r.json() == {"detail": "scope check unavailable"}, (project, r.text)
@@ -880,13 +890,11 @@ def _callers() -> set[str]:
     return found
 
 
-def test_the_scope_lookup_has_exactly_one_caller():
+def test_only_the_sse_per_message_path_still_uses_the_legacy_scope_lookup():
     """``db.get_scoped_project_ids_for_member`` returns the EXPLICIT grants only.
-    Anything that calls it directly holds a scope without its subprojects and
-    without its policy, so ``member_policy.resolve_member_scope`` is the only
-    caller (apart from the db package itself and tests). meridian/server.py's
-    per-SSE-message lookup is the one known straggler, covered below."""
-    assert _callers() - {"meridian/server.py"} == {"meridian/member_policy.py"}
+    The regular request resolver uses the combined authorization-context read;
+    only server.py's per-SSE-message lookup remains for its own lane."""
+    assert _callers() == {"meridian/server.py"}
 
 
 @pytest.mark.xfail(
