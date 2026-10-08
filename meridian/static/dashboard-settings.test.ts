@@ -8,7 +8,7 @@
 // single-liners leading with the copy-paste config.
 // 00a1e56a — the settings CARD renderers extracted from loadSettingsTab still
 // emit the same canonical DOM ids/structure they produced inline.
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -21,6 +21,8 @@ import {
   _settingsNotificationPrefsHtml,
   formatTunnelConfigGenerationStatus,
   _renderTunnelConfigGenerationBanner,
+  _settingsTabDataCache,
+  loadSettingsTab,
 } from "./dashboard-settings";
 
 // Vitest runs with cwd = repo root, so resolve the source module from there.
@@ -364,6 +366,197 @@ describe("_renderTunnelConfigGenerationBanner", () => {
     await _renderTunnelConfigGenerationBanner(PID);
     const banners = document.querySelectorAll(`#${HOST_ID} [id="tunnel-config-gen-banner-${PID}"]`);
     expect(banners.length).toBe(1);
+  });
+});
+
+// 61f2... — exercise the owner member-policy UI against a DOM and a controllable
+// API. Source-string assertions alone cannot catch a successful write followed
+// by a failed refresh leaving a disabled, stale control on screen.
+describe("owner member-policy controls", () => {
+  const MEMBER_POLICY_PID = "member-policy-ui-project";
+  const scopedMembers = [
+    {
+      id: "scoped-member-one",
+      email: "scoped@example.com",
+      role: "member",
+      project_id: MEMBER_POLICY_PID,
+      project_name: "Policy UI Project",
+      pending: false,
+    },
+  ];
+
+  const policyState = {
+    catalog: [{ id: "write_project", label: "Write in project", sentence: "Allow project writes." }],
+    default_policy: { write_project: false },
+    builtin_defaults: { write_project: false },
+    default_policy_status: "valid",
+    overrides: [{
+      member_id: "scoped-member-one",
+      email: "scoped@example.com",
+      policy: {},
+      policy_status: "inherited",
+      effective: {
+        role: "member",
+        readout: { write_project: { allowed: false, source: "default", reason: "workspace default" } },
+      },
+    }],
+  };
+
+  const flush = async () => {
+    for (let i = 0; i < 8; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+
+  function setupRuntime(options: {
+    role?: string;
+    failMemberRefresh?: boolean;
+    failPolicySave?: boolean;
+    members?: any[];
+    policy?: any;
+  } = {}) {
+    const g = globalThis as any;
+    const w = window as any;
+    let memberReads = 0;
+    const calls: Array<{ url: string; method: string }> = [];
+    const apiStub = vi.fn(async (url: string, opts: any = {}) => {
+      const method = opts.method || "GET";
+      calls.push({ url, method });
+      if (url === "/workspace/members") {
+        memberReads += 1;
+        if (options.failMemberRefresh && memberReads > 1) throw new Error("member refresh unavailable");
+        return options.members || scopedMembers;
+      }
+      if (url === "/workspace/member-policy") return options.policy || policyState;
+      if (url === "/workspace/members/scoped-member-one/policy" && method === "PATCH") {
+        if (options.failPolicySave) throw new Error("permission denied");
+        return {};
+      }
+      if (url === "/settings/mcp-config") return { base_url: "https://usemeridian.us" };
+      if (url.includes("/github/status")) return { connected: false };
+      return {};
+    });
+
+    g.api = apiStub;
+    w.api = apiStub;
+    g.loadProjectSettings = async () => ({ project_id: MEMBER_POLICY_PID, executor_config: {}, max_pinned_decisions: 50 });
+    w.loadProjectSettings = g.loadProjectSettings;
+    g.saveProjectSettings = async () => ({});
+    w.saveProjectSettings = g.saveProjectSettings;
+    g.getActiveWorkspaceRole = async () => options.role || "owner";
+    w.getActiveWorkspaceRole = g.getActiveWorkspaceRole;
+    g.isHostedMode = () => true;
+    w.isHostedMode = g.isHostedMode;
+    g.isDemoMode = () => false;
+    w.isDemoMode = g.isDemoMode;
+    g.hideDemoAdminControls = () => {};
+    w.hideDemoAdminControls = g.hideDemoAdminControls;
+    g.osExecutorHintBanner = () => "";
+    w.osExecutorHintBanner = g.osExecutorHintBanner;
+    g.githubIconSvg = () => "";
+    w.githubIconSvg = g.githubIconSvg;
+    g.toast = () => {};
+    w.toast = g.toast;
+    g.suggestedFsRoots = () => [];
+    w.suggestedFsRoots = g.suggestedFsRoots;
+    g.DEFAULT_MAX_PINNED_DECISIONS = 100;
+    w.DEFAULT_MAX_PINNED_DECISIONS = g.DEFAULT_MAX_PINNED_DECISIONS;
+    g.DEFAULT_CONTEXT_THRESHOLD = 60;
+    w.DEFAULT_CONTEXT_THRESHOLD = g.DEFAULT_CONTEXT_THRESHOLD;
+    g.DEFAULT_MAX_TURNS = 120;
+    w.DEFAULT_MAX_TURNS = g.DEFAULT_MAX_TURNS;
+    g.loadExecutorRulesSection = null;
+    w.loadExecutorRulesSection = null;
+    g.loadTunnelPluginsSection = null;
+    w.loadTunnelPluginsSection = null;
+    g.state = { tenantEmail: "owner@example.com", tenantPlan: "standard", projects: [{ id: MEMBER_POLICY_PID, name: "Policy UI Project" }], serverConfig: {} };
+    w.state = g.state;
+
+    return { apiStub, calls };
+  }
+
+  async function openSettings() {
+    document.body.innerHTML = `<div id="settings-body-${MEMBER_POLICY_PID}"></div>`;
+    await loadSettingsTab(MEMBER_POLICY_PID, { force: true });
+    await flush();
+  }
+
+  beforeEach(() => {
+    _settingsTabDataCache.clear();
+    document.body.innerHTML = "";
+  });
+
+  afterEach(() => {
+    _settingsTabDataCache.clear();
+    document.body.innerHTML = "";
+    const g = globalThis as any;
+    ["api", "loadProjectSettings", "saveProjectSettings", "getActiveWorkspaceRole", "isHostedMode", "isDemoMode", "hideDemoAdminControls", "osExecutorHintBanner", "githubIconSvg", "toast", "suggestedFsRoots", "loadExecutorRulesSection", "loadTunnelPluginsSection", "state"].forEach((key) => {
+      delete g[key];
+      delete (window as any)[key];
+    });
+  });
+
+  it("renders separate controls and effective readouts for duplicate-email project memberships", async () => {
+    const members = [
+      ...scopedMembers,
+      { ...scopedMembers[0], id: "scoped-member-two", project_id: "second-project", project_name: "Second Project" },
+    ];
+    const policy = {
+      ...policyState,
+      overrides: [
+        policyState.overrides[0],
+        { ...policyState.overrides[0], member_id: "scoped-member-two", effective: { role: "admin", readout: { write_project: { allowed: true, source: "role" } } } },
+      ],
+    };
+    setupRuntime({ members, policy });
+    await openSettings();
+
+    const memberControls = document.querySelectorAll<HTMLSelectElement>(
+      `#member-policy-${MEMBER_POLICY_PID} select.member-policy-select[data-target="member"]`,
+    );
+    expect(memberControls).toHaveLength(2);
+    expect(document.getElementById(`member-policy-${MEMBER_POLICY_PID}`)?.textContent).toContain("Second Project");
+    expect(document.getElementById(`member-policy-${MEMBER_POLICY_PID}`)?.textContent).toContain("Effective: Allow · role");
+  });
+
+  it("reports a successful save with stale data when the follow-up refresh fails", async () => {
+    const { calls } = setupRuntime({ failMemberRefresh: true });
+    await openSettings();
+    const select = document.querySelector<HTMLSelectElement>(
+      `#member-policy-${MEMBER_POLICY_PID} select.member-policy-select[data-target="member"][data-cap="write_project"]`,
+    )!;
+    select.value = "allow";
+
+    await (select.onchange as any)();
+
+    expect(calls.some((call) => call.url.endsWith("/scoped-member-one/policy") && call.method === "PATCH")).toBe(true);
+    expect(select.value).toBe("allow");
+    expect(select.disabled).toBe(false);
+    expect(document.querySelector(`#member-policy-${MEMBER_POLICY_PID} .member-policy-status`)?.textContent)
+      .toContain("Policy saved, but the member and policy views could not refresh.");
+  });
+
+  it("restores the previous choice when the policy save itself fails", async () => {
+    setupRuntime({ failPolicySave: true });
+    await openSettings();
+    const select = document.querySelector<HTMLSelectElement>(
+      `#member-policy-${MEMBER_POLICY_PID} select.member-policy-select[data-target="member"][data-cap="write_project"]`,
+    )!;
+    expect(select.value).toBe("inherit");
+    select.value = "allow";
+
+    await (select.onchange as any)();
+
+    expect(select.value).toBe("inherit");
+    expect(select.disabled).toBe(false);
+    expect(document.querySelector(`#member-policy-${MEMBER_POLICY_PID} .member-policy-status`)?.textContent)
+      .toContain("Policy save failed:");
+  });
+
+  it("does not fetch or render owner policy controls for a project-scoped member", async () => {
+    const { calls } = setupRuntime({ role: "member" });
+    await openSettings();
+
+    expect(calls.some((call) => call.url === "/workspace/member-policy")).toBe(false);
+    expect((document.getElementById(`member-policy-${MEMBER_POLICY_PID}`) as HTMLElement).style.display).toBe("none");
   });
 });
 

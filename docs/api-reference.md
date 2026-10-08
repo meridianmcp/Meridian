@@ -1337,9 +1337,14 @@ No auth required.
 | `DELETE` | `/workspace/decisions/{decision_id}` | Hard-delete a workspace decision. Returns 204 or 404 |
 | `POST` | `/workspace/invite` | Invite a new workspace member. Sends invite email via Resend |
 | `POST` | `/workspace/invite/{member_id}/resend` | Resend invite email for a pending workspace member |
+| `GET` | `/workspace/member-policy` | Return workspace defaults and effective policies for scoped members |
+| `PATCH` | `/workspace/member-policy` | Patch explicit workspace defaults; null clears a key to its built-in value |
 | `GET` | `/workspace/members` | List all workspace members (pending and accepted) for the current tenant |
 | `DELETE` | `/workspace/members/{member_id}` | Remove a workspace member or revoke a pending invite |
 | `PATCH` | `/workspace/members/{member_id}` | v2.8 — change a workspace member's role (and github_access cap) |
+| `DELETE` | `/workspace/members/{member_id}/policy` | Clear the member override so every capability inherits the workspace default |
+| `GET` | `/workspace/members/{member_id}/policy` | Return one accepted project-scoped member's override and effective policy |
+| `PATCH` | `/workspace/members/{member_id}/policy` | Patch a member override; null clears that key to inherit the workspace default |
 | `GET` | `/workspace/notes` | Workspace notes (newest first). ``?tag=X`` filters by substring match |
 | `POST` | `/workspace/notes` | Create a workspace note. Body: {title, body, tags?} |
 | `DELETE` | `/workspace/notes/{note_id}` | Hard-delete a workspace note. Returns 204 or 404 |

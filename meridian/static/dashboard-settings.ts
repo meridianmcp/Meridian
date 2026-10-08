@@ -3789,6 +3789,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Team members</div>
 
+      <div id="member-policy-${projectId}" style="display:none;margin-bottom:12px"></div>
+
       <div id="members-list-${projectId}" style="margin-bottom:10px;font-size:11px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading…</div></div>
 
       <div id="settings-invite-form-${projectId}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
@@ -3827,6 +3829,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       const listEl = document.getElementById(`members-list-${projectId}`)!;
 
+      const policyEl = document.getElementById(`member-policy-${projectId}`);
+
       const inviteBtn = document.getElementById(`invite-btn-${projectId}`);
 
       const inviteEmail = document.getElementById(`invite-email-${projectId}`);
@@ -3837,21 +3841,304 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       const inviteStatus = document.getElementById(`invite-status-${projectId}`);
 
+      function renderMemberPolicyControls(members: any[], policyState: any) {
+
+        if (!policyEl || _activeRole !== 'owner') return;
+
+        policyEl.style.display = '';
+
+        const catalog = Array.isArray(policyState?.catalog) ? policyState.catalog : [];
+
+        const records = Array.isArray(policyState?.overrides) ? policyState.overrides : [];
+
+        const recordById: Record<string, any> = Object.fromEntries(records.map((record: any) => [String(record.member_id), record]));
+
+        const scopedMembers = (members || []).filter((member: any) => !!member.project_id && !member.pending);
+
+        const defaultPolicyCorrupt = policyState.default_policy_status === 'corrupt';
+
+        const projectNameById = Object.fromEntries((window.state.projects || []).map((project: any) => [project.id, project.name || project.id]));
+
+        const controlStyle = 'background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 5px';
+
+        const capabilityRows = (values: any, target: string, memberId = '') => catalog.map((capability: any) => {
+
+          const capId = String(capability.id || '');
+
+          const raw = values?.[capId];
+
+          const corrupt = target === 'default'
+            ? defaultPolicyCorrupt
+            : recordById[memberId]?.policy_status === 'corrupt';
+
+          const current = corrupt
+            ? 'corrupt'
+            : target === 'member'
+              ? (raw === true ? 'allow' : raw === false ? 'deny' : 'inherit')
+              : (raw === true ? 'allow' : raw === false ? 'deny' : 'builtin');
+
+          const choices = target === 'member'
+            ? `${corrupt ? '<option value="corrupt" selected disabled>Corrupt · fail closed</option>' : ''}<option value="inherit" ${current === 'inherit' ? 'selected' : ''}>Inherit</option><option value="allow" ${current === 'allow' ? 'selected' : ''}>Allow</option><option value="deny" ${current === 'deny' ? 'selected' : ''}>Deny</option>`
+            : `${corrupt ? '<option value="corrupt" selected disabled>Corrupt · fail closed</option>' : ''}<option value="builtin" ${current === 'builtin' ? 'selected' : ''}>Built-in (${policyState.builtin_defaults?.[capId] ? 'Allow' : 'Deny'})</option><option value="allow" ${current === 'allow' ? 'selected' : ''}>Allow</option><option value="deny" ${current === 'deny' ? 'selected' : ''}>Deny</option>`;
+
+          const readout = target === 'member'
+            ? recordById[memberId]?.effective?.readout?.[capId]
+            : null;
+
+          const effectiveText = readout
+            ? `Effective: ${readout.allowed ? 'Allow' : 'Deny'} · ${escapeHtml(String(readout.source || 'policy').replace(/_/g, ' '))}${readout.reason ? ` · ${escapeHtml(String(readout.reason))}` : ''}`
+            : '';
+
+          return `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding:5px 0;border-top:1px solid var(--border)">
+            <div style="min-width:0"><div style="font-size:10px">${escapeHtml(String(capability.label || capId))}</div><div style="font-size:9px;color:var(--muted);line-height:1.4">${escapeHtml(String(capability.sentence || ''))}${effectiveText ? `<br>${effectiveText}` : ''}</div></div>
+            <select class="member-policy-select" data-target="${target}" data-mid="${escapeHtml(memberId)}" data-cap="${escapeHtml(capId)}" style="${controlStyle}" aria-label="${escapeHtml(String(capability.label || capId))} policy${target === 'member' ? ` for ${escapeHtml(String(recordById[memberId]?.email || memberId))}` : ' workspace default'}" ${corrupt ? 'disabled' : ''}>${choices}</select>
+          </div>`;
+
+        }).join('');
+
+        const defaults = `<details style="margin:7px 0;padding:7px 8px;border:1px solid var(--border);border-radius:4px">
+          <summary style="cursor:pointer;font-size:10px">Workspace defaults</summary>
+          <div style="font-size:9px;color:var(--muted);margin:5px 0">These defaults apply to accepted project-scoped members unless a member overrides them.</div>
+          ${defaultPolicyCorrupt ? '<div style="font-size:9px;color:var(--danger, #ff6b6b);margin:5px 0">Stored policy data is corrupt. Access is denied fail closed until you reset it.</div>' : ''}
+          ${capabilityRows(policyState.default_policy || {}, 'default')}
+          <button class="member-policy-default-reset secondary" style="font-size:9px;padding:2px 7px;margin-top:6px">Reset workspace policy to built-in defaults</button>
+        </details>`;
+
+        const memberControls = scopedMembers.length
+          ? scopedMembers.map((member: any) => {
+            const memberId = String(member.id || '');
+            const record = recordById[memberId];
+            const role = String(record?.effective?.role || member.role || 'member');
+            const project = String(member.project_name || projectNameById[member.project_id] || member.project_id || 'project');
+            const policyCorrupt = record?.policy_status === 'corrupt';
+            return `<details style="margin:6px 0;padding:7px 8px;border:1px solid var(--border);border-radius:4px">
+              <summary style="cursor:pointer;font-size:10px">${escapeHtml(String(member.email || 'Member'))} · ${escapeHtml(role)} · ${escapeHtml(project)}${policyCorrupt ? ' · Policy corrupt' : ''}</summary>
+              <div style="font-size:9px;color:var(--muted);margin:5px 0">Effective access includes role clamps. An inherited choice follows the workspace default.</div>
+              ${policyCorrupt ? '<div style="font-size:9px;color:var(--danger, #ff6b6b);margin:5px 0">Stored member policy is corrupt. Access is denied fail closed until cleared.</div>' : ''}
+              ${capabilityRows(record?.policy || {}, 'member', memberId)}
+              <button class="member-policy-reset secondary" data-mid="${escapeHtml(memberId)}" style="font-size:9px;padding:2px 7px;margin-top:6px">${policyCorrupt ? 'Clear corrupt policy and inherit' : 'Inherit all'}</button>
+            </details>`;
+          }).join('')
+          : '<div style="font-size:9px;color:var(--muted);padding:5px 0">No accepted project-scoped members.</div>';
+
+        policyEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:5px;background:var(--surface-1)">
+          <div style="font-size:10px;font-weight:600;color:var(--accent)">Project-scoped member access</div>
+          <div style="font-size:9px;color:var(--muted);line-height:1.5;margin:4px 0">Control project writes, subproject creation and deletion, project deletion, and workspace-level changes.</div>
+          ${defaults}<div style="font-size:10px;font-weight:600;margin:9px 0 4px">Member overrides</div>${memberControls}
+          <div class="member-policy-status" style="font-size:9px;color:var(--muted);min-height:12px;margin-top:5px"></div>
+        </div>`;
+
+        const statusEl = policyEl.querySelector('.member-policy-status');
+
+        const showPolicyRefreshFailure = (message: string) => {
+
+          const currentStatus = policyEl.querySelector('.member-policy-status');
+
+          if (currentStatus) {
+
+            currentStatus.textContent = message;
+
+          } else {
+
+            const warning = document.createElement('div');
+
+            warning.className = 'member-policy-status';
+
+            warning.style.cssText = 'font-size:9px;color:var(--danger, #ff6b6b);min-height:12px;margin-top:5px';
+
+            warning.textContent = message;
+
+            policyEl.appendChild(warning);
+
+          }
+
+        };
+
+        policyEl.querySelectorAll('select.member-policy-select').forEach((select: any) => {
+
+          select.dataset.prev = select.value;
+
+          select.onchange = async () => {
+
+            const previous = select.dataset.prev;
+
+            const target = select.dataset.target;
+
+            const value = select.value === 'builtin' || select.value === 'inherit' ? null : select.value === 'allow';
+
+            const url = target === 'default'
+              ? '/workspace/member-policy'
+              : `/workspace/members/${encodeURIComponent(select.dataset.mid)}/policy`;
+
+            select.disabled = true;
+
+            if (statusEl) statusEl.textContent = 'Saving policy…';
+
+            try {
+
+              await api(url, { method: 'PATCH', body: JSON.stringify({ policy: { [select.dataset.cap]: value } }) });
+
+              // The write succeeded; if the follow-up read fails, keep this
+              // selected value as the rollback baseline rather than reverting
+              // a policy change the server has already stored.
+              select.dataset.prev = select.value;
+
+              const refreshed = await renderMembers();
+
+              if (!refreshed) {
+
+                select.disabled = false;
+
+                showPolicyRefreshFailure('Policy saved, but the member and policy views could not refresh. Reload settings to confirm effective access.');
+
+                return;
+
+              }
+
+              if (policyEl) {
+                const refreshedStatus = policyEl.querySelector('.member-policy-status');
+                if (refreshedStatus) refreshedStatus.textContent = 'Policy saved.';
+              }
+
+            } catch (e: any) {
+
+              select.value = previous;
+
+              select.disabled = false;
+
+              if (statusEl) statusEl.textContent = `Policy save failed: ${escapeHtml(String(e))}`;
+
+            }
+
+          };
+
+        });
+
+        policyEl.querySelectorAll('button.member-policy-reset').forEach((button: any) => {
+
+          button.onclick = async () => {
+
+            button.disabled = true;
+
+            if (statusEl) statusEl.textContent = 'Resetting member overrides…';
+
+            try {
+
+              await api(`/workspace/members/${encodeURIComponent(button.dataset.mid)}/policy`, { method: 'DELETE' });
+
+              const refreshed = await renderMembers();
+
+              if (!refreshed) {
+
+                button.disabled = false;
+
+                showPolicyRefreshFailure('Member overrides were reset, but the member and policy views could not refresh. Reload settings to confirm effective access.');
+
+                return;
+
+              }
+
+              if (policyEl) {
+                const refreshedStatus = policyEl.querySelector('.member-policy-status');
+                if (refreshedStatus) refreshedStatus.textContent = 'Member now inherits all workspace defaults.';
+              }
+
+            } catch (e: any) {
+
+              button.disabled = false;
+
+              if (statusEl) statusEl.textContent = `Policy reset failed: ${escapeHtml(String(e))}`;
+
+            }
+
+          };
+
+        });
+
+        policyEl.querySelectorAll('button.member-policy-default-reset').forEach((button: any) => {
+
+          button.onclick = async () => {
+
+            button.disabled = true;
+
+            if (statusEl) statusEl.textContent = 'Resetting workspace policy…';
+
+            try {
+
+              await api('/workspace/member-policy', { method: 'PATCH', body: JSON.stringify({ reset: true }) });
+
+              const refreshed = await renderMembers();
+
+              if (!refreshed) {
+
+                button.disabled = false;
+
+                showPolicyRefreshFailure('Workspace defaults were reset, but the member and policy views could not refresh. Reload settings to confirm effective access.');
+
+                return;
+
+              }
+
+              if (policyEl) {
+                const refreshedStatus = policyEl.querySelector('.member-policy-status');
+                if (refreshedStatus) refreshedStatus.textContent = 'Workspace policy now uses built-in defaults.';
+              }
+
+            } catch (e: any) {
+
+              button.disabled = false;
+
+              if (statusEl) statusEl.textContent = `Workspace policy reset failed: ${escapeHtml(String(e))}`;
+
+            }
+
+          };
+
+        });
+
+      }
 
 
-      async function renderMembers() {
 
-        if (!listEl) return;
+      async function renderMembers(): Promise<boolean> {
+
+        if (!listEl) return false;
+
+        let policyLoaded = true;
 
         try {
 
           const members = await api('/workspace/members');
 
+          if (_activeRole === 'owner' && policyEl) {
+
+            try {
+
+              const policyState = await api('/workspace/member-policy');
+
+              renderMemberPolicyControls(members || [], policyState);
+
+            } catch (e: any) {
+
+              policyLoaded = false;
+
+              policyEl.style.display = '';
+
+              policyEl.innerHTML = `<div style="font-size:9px;color:var(--muted);padding:6px 0">Member policy controls unavailable: ${escapeHtml(String(e))}</div>`;
+
+            }
+
+          } else if (policyEl) {
+
+            policyEl.style.display = 'none';
+
+          }
+
           if (!members || members.length === 0) {
 
             listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No team members yet.</div>';
 
-            return;
+            return policyLoaded;
 
           }
 
@@ -3981,9 +4268,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
           });
 
+          return policyLoaded;
+
         } catch(e) {
 
           if (listEl) listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">Members only available in hosted mode.</div>';
+
+          return false;
 
         }
 
