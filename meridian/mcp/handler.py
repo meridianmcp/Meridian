@@ -1199,6 +1199,97 @@ async def _authorize_scoped_mcp_call(
     it to a plain list makes policy evaluation fail closed as unavailable.
     """
     from .. import member_policy  # noqa: PLC0415
+    from ..mcp_tools import member_policy_operation  # noqa: PLC0415
+
+    operation_name = name.rsplit("__", 1)[-1] if tunnel_candidate else name
+    operation = member_policy_operation(name) or member_policy_operation(operation_name)
+    normalized_name = operation_name.lower().replace("-", "_")
+    operation_words = set(normalized_name.split("_"))
+    has_project_ref = any(
+        key == "project_id" or key.endswith("_project_id")
+        or key == "project_ids"
+        or key == "project_name" or key.endswith("_project_name")
+        for key in args
+    )
+    mutating_prefixes = (
+        "add_", "apply_", "archive_", "batch_", "bulk_", "commit_",
+        "create_", "delete_", "execute_", "hard_delete_", "merge_",
+        "move_", "remove_", "restore_", "set_", "update_", "write_",
+    )
+    bare_mutations = {
+        "add", "apply", "archive", "batch", "bulk", "commit", "create",
+        "delete", "execute", "hard_delete", "merge", "move", "remove",
+        "restore", "set", "update", "write",
+    }
+    read_prefixes = (
+        "check_", "compare_", "describe_", "fetch_", "find_", "get_",
+        "list_", "preview_", "read_", "resolve_", "search_",
+    )
+    non_project_resource_words = {
+        "artifact", "artifacts", "citation", "citations", "decision", "decisions",
+        "doc", "docs", "document", "documents", "experiment", "experiments",
+        "file", "files", "finding", "findings", "figure", "figures", "hook",
+        "hooks", "issue", "issues", "note", "notes", "output", "outputs",
+        "pointer", "pointers", "profile", "profiles", "proposal", "proposals",
+        "research", "run", "runs", "session", "sessions", "sprint", "table",
+        "tables", "task", "tasks", "workspace", "workspaces",
+    }
+    generic_tunnel_ids = (
+        tunnel_candidate
+        and "ids" in args
+        and args.get("ids") is not None
+        and (
+            normalized_name.startswith(mutating_prefixes)
+            or normalized_name in bare_mutations
+        )
+        and not (operation_words & non_project_resource_words)
+    )
+    project_context = (
+        (
+            bool(operation_words & {"project", "projects"})
+            and not (operation_words & non_project_resource_words)
+        )
+        or "project_ids" in args
+        or operation in {
+            "project_create", "project_reparent", "project_merge",
+            "project_delete", "project_status",
+        }
+        or (bool(operation_words & {"bulk", "batch"}) and has_project_ref)
+        or generic_tunnel_ids
+        or bool(operation_words & {"parent", "reparent"})
+        or (
+            "move" in operation_words
+            and ("parent_project_id" in args or "parent_project_name" in args)
+        )
+    )
+
+    # Project id arrays can arrive through noncanonical tunnel aliases. Check
+    # every explicit project_ids target, and ids arrays on recognizable project
+    # or bulk-project operations, before the scope guard performs any lookups.
+    batch_target_ids: list[str] = []
+    for key in ("project_ids", "ids"):
+        if key not in args or (key == "ids" and not project_context):
+            continue
+        value = args[key]
+        if isinstance(value, str):
+            raw_values = [value]
+        elif isinstance(value, (list, tuple, set)):
+            raw_values = list(value)
+        elif value is None and key == "ids":
+            continue
+        else:
+            raise ValueError("project is outside your access scope")
+        for raw_value in raw_values:
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                raise ValueError("project is outside your access scope")
+            project_id = raw_value.strip()
+            if project_id not in batch_target_ids:
+                batch_target_ids.append(project_id)
+    if scoped_project_ids is not None and any(
+        project_id not in scoped_project_ids for project_id in batch_target_ids
+    ):
+        raise ValueError("project is outside your access scope")
+    has_project_ref = has_project_ref or bool(batch_target_ids)
 
     if resolve_references:
         try:
@@ -1237,36 +1328,31 @@ async def _authorize_scoped_mcp_call(
 
     # mcp_tools owns MCP operation intent; member_policy.py remains the only
     # source of capability ids and hierarchy-to-capability rules.
-    from ..mcp_tools import member_policy_operation  # noqa: PLC0415
-    operation_name = name.rsplit("__", 1)[-1] if tunnel_candidate else name
-    operation = member_policy_operation(name) or member_policy_operation(operation_name)
-    if operation is None and tunnel_candidate:
-        has_project_ref = any(
-            key == "project_id" or key.endswith("_project_id")
-            or key == "project_ids"
-            or key == "project_name" or key.endswith("_project_name")
-            for key in args
+    if operation is None:
+        looks_mutating = (
+            normalized_name.startswith(mutating_prefixes)
+            or normalized_name in bare_mutations
+            or (project_context and not normalized_name.startswith(read_prefixes))
         )
-        normalized_name = operation_name.lower().replace("-", "_")
-        mutating_prefixes = (
-            "add_", "apply_", "archive_", "bulk_", "commit_", "create_",
-            "delete_", "execute_", "hard_delete_", "merge_", "move_",
-            "remove_", "restore_", "set_", "update_", "write_",
-        )
-        if has_project_ref and normalized_name.startswith(mutating_prefixes):
+        if has_project_ref and looks_mutating:
             # Tunnel plugins may expose aliases that are not present in the
             # native registry. Preserve the catalog's hierarchy capabilities
             # for obvious project lifecycle operations instead of reducing
             # them to the generic project-write capability. Keep this name
             # based so tools such as delete_note/archive_decision remain
             # ordinary scoped writes.
-            operation_words = set(normalized_name.split("_"))
-            project_operation = "project" in operation_words or "projects" in operation_words
+            project_operation = project_context or bool(
+                {"parent", "reparent"} & operation_words
+            )
             if project_operation and "create" in operation_words:
                 operation = "project_create"
             elif project_operation and (
                 "reparent" in operation_words
                 or "parent" in operation_words
+                or (
+                    "move" in operation_words
+                    and ("parent_project_id" in args or "parent_project_name" in args)
+                )
             ):
                 operation = "project_reparent"
             elif project_operation and "merge" in operation_words:
@@ -1299,8 +1385,17 @@ async def _authorize_scoped_mcp_call(
         elif operation == "project_merge":
             raw_ids.extend((args.get("source_project_id"), args.get("target_project_id")))
         elif operation == "project_delete":
-            values = args.get("project_ids", args.get("project_id", args.get("ids")))
-            raw_ids.extend(values if isinstance(values, (list, tuple, set)) else [values])
+            for key in ("project_ids", "ids"):
+                if key in args:
+                    values = args[key]
+                    raw_ids.extend(
+                        values if isinstance(values, (list, tuple, set)) else [values]
+                    )
+            for key in ("project_id", "id"):
+                if args.get(key) is not None:
+                    raw_ids.append(args[key])
+            if not raw_ids:
+                raw_ids.append(None)
         else:  # archive/restore/status
             raw_ids.append(args.get("project_id", args.get("id")))
         ids = list(dict.fromkeys(
@@ -1331,13 +1426,6 @@ async def _authorize_scoped_mcp_call(
         if operation == "project_delete" and len(ids) != len(raw_ids):
             # A malformed or mixed-id batch must not degrade to a smaller,
             # potentially destructive subset.
-            raise ValueError("project is outside your access scope")
-        if operation == "project_delete" and any(
-            project_id not in scoped_project_ids for project_id in ids
-        ):
-            # scope_guard checks scalar project refs and declared batch
-            # envelopes. Project deletion aliases also accept a flat id list,
-            # so validate every id directly before doing the hierarchy lookup.
             raise ValueError("project is outside your access scope")
         if ids:
             try:
@@ -1397,12 +1485,18 @@ async def _authorize_scoped_mcp_call(
     else:
         required = frozenset({member_policy.WRITE_PROJECT})
 
-    target = next((
-        str(args[key]) for key in (
-            "project_id", "source_project_id", "target_project_id",
-        ) if args.get(key)
-    ), None)
-    member_policy.require_capabilities(scoped_project_ids, required, target=target)
+    policy_targets = list(batch_target_ids)
+    for key in (
+        "project_id", "source_project_id", "target_project_id", "parent_project_id",
+    ):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip() and value.strip() not in policy_targets:
+            policy_targets.append(value.strip())
+    if policy_targets:
+        for target in policy_targets:
+            member_policy.require_capabilities(scoped_project_ids, required, target=target)
+    else:
+        member_policy.require_capabilities(scoped_project_ids, required)
     return args
 
 

@@ -230,7 +230,16 @@ async def test_tunnel_scope_guard_runs_before_forwarding(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_policy_lookup_failure_returns_service_unavailable_before_tunnel(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("delete_projects_batch", {"project_ids": [PROJECT]}),
+        ("tenant__bulk_delete", {"ids": [PROJECT]}),
+    ],
+)
+async def test_policy_lookup_failure_returns_service_unavailable_before_tunnel(
+    monkeypatch, tmp_path, name, arguments,
+):
     monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
     monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)
 
@@ -244,8 +253,8 @@ async def test_policy_lookup_failure_returns_service_unavailable_before_tunnel(m
             "id": 8,
             "method": "tools/call",
             "params": {
-                "name": "delete_projects_batch",
-                "arguments": {"project_ids": [PROJECT]},
+                "name": name,
+                "arguments": arguments,
             },
         },
         object(),
@@ -304,9 +313,95 @@ async def test_tunnel_status_id_alias_stays_inside_member_scope(monkeypatch, tmp
         )
 
 
+@pytest.mark.asyncio
+async def test_move_project_alias_uses_hierarchy_capabilities(monkeypatch, tmp_path):
+    monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
+    monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)
+    rows = {
+        PROJECT: _project_row(PROJECT),
+        PARENT: _project_row(PARENT),
+    }
+
+    async def family(db, ids):
+        return {project_id: rows[project_id] for project_id in ids}
+
+    monkeypatch.setattr(db_module, "get_project_family", family)
+
+    with pytest.raises(member_policy.MemberPolicyDenied):
+        await mcp_handler._authorize_scoped_mcp_call(
+            "tenant__move_project",
+            {"project_id": PROJECT, "parent_project_id": PARENT},
+            object(),
+            str(tmp_path),
+            None,
+            _scoped((PROJECT, PARENT), member_policy.WRITE_PROJECT),
+            tunnel_candidate=True,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("tenant__bulk_update", {"project_ids": [PROJECT, CHILD]}),
+        ("tenant__bulk_update_projects", {"ids": [PROJECT, CHILD]}),
+        ("tenant__bulk_mutate", {"ids": [PROJECT, CHILD]}),
+        ("tenant__delete", {"ids": [PROJECT, CHILD]}),
+        ("tenant__delete", {"ids": CHILD}),
+    ],
+)
+async def test_generic_tunnel_bulk_aliases_check_each_id_before_lookups(
+    monkeypatch, tmp_path, tool_name, args,
+):
+    async def unexpected_lookup(*_args, **_kwargs):
+        raise AssertionError("scope refusal must precede name and hierarchy lookups")
+
+    async def unexpected_scope_guard(*_args, **_kwargs):
+        raise AssertionError("batch scope refusal must precede the regular guard")
+
+    monkeypatch.setattr(mcp_handler, "_resolve_project_reference", unexpected_lookup)
+    monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", unexpected_scope_guard)
+
+    with pytest.raises(ValueError, match="outside your access scope"):
+        await mcp_handler._authorize_scoped_mcp_call(
+            tool_name,
+            args,
+            object(),
+            str(tmp_path),
+            None,
+            _scoped((PROJECT,), member_policy.WRITE_PROJECT),
+            tunnel_candidate=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_bulk_project_write_checks_capability_for_each_target(monkeypatch, tmp_path):
+    monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
+    monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)
+    checked_targets = []
+
+    def record_capability_check(scoped, capabilities, *, target=None):
+        checked_targets.append(target)
+
+    monkeypatch.setattr(member_policy, "require_capabilities", record_capability_check)
+    scoped = _scoped((PROJECT, PARENT), member_policy.WRITE_PROJECT)
+    await mcp_handler._authorize_scoped_mcp_call(
+        "tenant__bulk_update",
+        {"project_ids": [PROJECT, PARENT]},
+        object(),
+        str(tmp_path),
+        None,
+        scoped,
+        tunnel_candidate=True,
+    )
+
+    assert checked_targets == [PROJECT, PARENT]
+
+
 def test_mcp_policy_registry_covers_project_hierarchy_operations():
     assert MCP_MEMBER_POLICY_OPERATIONS["create_project"] == "project_create"
     assert MCP_MEMBER_POLICY_OPERATIONS["set_parent_project"] == "project_reparent"
+    assert MCP_MEMBER_POLICY_OPERATIONS["move_project"] == "project_reparent"
     assert MCP_MEMBER_POLICY_OPERATIONS["merge_project"] == "project_merge"
     assert MCP_MEMBER_POLICY_OPERATIONS["delete_projects_batch"] == "project_delete"
     assert MCP_MEMBER_POLICY_OPERATIONS["archive_project"] == "project_status"

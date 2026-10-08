@@ -4853,6 +4853,9 @@ MCP_MEMBER_POLICY_OPERATIONS["move_workspace_note_to_project"] = "workspace_to_p
 MCP_MEMBER_POLICY_OPERATIONS.update({
     "create_project": "project_create",
     "set_parent_project": "project_reparent",
+    "move_project": "project_reparent",
+    "project_move": "project_reparent",
+    "reparent_project": "project_reparent",
     "merge_project": "project_merge",
 })
 # These names are intentionally recognized even when a particular MCP
