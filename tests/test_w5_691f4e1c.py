@@ -192,8 +192,7 @@ def test_add_sprint_item_persists_durable_symbol_pointer():
 
 
 def test_add_sprint_item_file_only_persists_no_pointer_but_keeps_hint():
-    """BOUNDARY: a file-only item still gets the inline code_context hint, but no
-    durable pointer is fabricated (no exact symbol location tunnel-free)."""
+    """A file-only hint is not durable prospecting evidence."""
     db = _make_db()
     import meridian.db as db_module
     proj = _run(db_module.create_project(db, "prospect-file-only"))
@@ -203,7 +202,7 @@ def test_add_sprint_item_file_only_persists_no_pointer_but_keeps_hint():
         "touches_resources": ["file:meridian/server.py"],
         "force": True,
     }, db, "/tmp"))
-    assert out.get("prospecting_status") == "prospected"
+    assert out.get("prospecting_status") == "unprospected"
     assert "meridian/server.py" in out.get("code_context", {}).get("files", [])
     assert "prospected_pointer" not in out
     assert _run(db_module.get_sprint_item_pointers(db, out["id"])) == []
