@@ -199,8 +199,10 @@ def test_policy_summary_includes_inherited_members_with_fixed_query_count(monkey
         assert {entry["email"] for entry in entries} == {
             "policy-scoped@example.com", "policy-second@example.com",
         }
+        assert summary.json()["default_policy_status"] == "configured"
         for entry in entries:
             assert entry["policy"]["write_project"] is None
+            assert entry["policy_status"] == "inherited"
             assert entry["effective"]["capabilities"]["write_project"] is False
             assert entry["effective"]["sources"]["write_project"] == "default"
         assert row_reads == 1  # workspace default, independent of member count
@@ -239,6 +241,10 @@ def test_corrupt_policy_patch_fails_closed_and_explicit_reset_recovers(monkeypat
         assert asyncio.run(db_module.get_member_policy_rows(
             db, setup["owner_id"], "policy-scoped@example.com",
         )) == {"default": "{broken", "override": "[false]"}
+        corrupt_summary = client.get("/workspace/member-policy", headers=owner)
+        assert corrupt_summary.status_code == 200, corrupt_summary.text
+        assert corrupt_summary.json()["default_policy_status"] == "corrupt"
+        assert corrupt_summary.json()["overrides"][0]["policy_status"] == "corrupt"
 
         default_reset = client.patch(
             "/workspace/member-policy", headers=owner, json={"reset": True},
@@ -257,6 +263,22 @@ def test_corrupt_policy_patch_fails_closed_and_explicit_reset_recovers(monkeypat
         assert asyncio.run(db_module.get_member_policy_rows(
             db, setup["owner_id"], "policy-scoped@example.com",
         ))["override"] is None
+
+        # The default corruption marker is returned even if there are no
+        # scoped member rows for the UI to inspect.
+        asyncio.run(db.execute(
+            "UPDATE member_policy SET policy = ? WHERE tenant_id = ? AND subject = '*'",
+            ("{broken", setup["owner_id"]),
+        ))
+        asyncio.run(db.execute(
+            "DELETE FROM workspace_members WHERE id = ? AND tenant_id = ?",
+            (setup["member_id"], setup["owner_id"]),
+        ))
+        asyncio.run(db.commit())
+        empty_summary = client.get("/workspace/member-policy", headers=owner)
+        assert empty_summary.status_code == 200, empty_summary.text
+        assert empty_summary.json()["default_policy_status"] == "corrupt"
+        assert empty_summary.json()["overrides"] == []
 
 
 def test_role_clamp_cannot_be_overridden_by_member_policy(monkeypatch, tmp_path):

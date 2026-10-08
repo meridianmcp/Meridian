@@ -98,6 +98,28 @@ def _stored_policy_view(raw: str | None) -> dict[str, bool | None]:
     }
 
 
+def _default_policy_status(raw: str | None) -> str:
+    """Distinguish corrupt defaults from an absent/empty built-in policy."""
+    if raw is None:
+        return "built_in"
+    try:
+        explicit = _decode_policy_row(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "corrupt"
+    return "configured" if explicit else "built_in"
+
+
+def _member_override_status(raw: str | None) -> str:
+    """Make a corrupt override visibly different from a clean inherited row."""
+    if raw is None:
+        return "inherited"
+    try:
+        explicit = _decode_policy_row(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "corrupt"
+    return "explicit" if explicit else "inherited"
+
+
 def _member_policy_view_from_rows(
     email: str,
     rows: dict[str, str | None],
@@ -115,6 +137,7 @@ def _member_policy_view_from_rows(
     result: dict[str, Any] = {
         "email": email,
         "policy": _stored_policy_view(rows.get("override")),
+        "policy_status": _member_override_status(rows.get("override")),
         "effective": {
             "capabilities": effective.as_dict(),
             "readout": effective.readout(),
@@ -224,6 +247,7 @@ async def get_workspace_member_policy(request: Request) -> dict[str, Any]:
     return {
         "workspace_tenant_id": tenant_id,
         "default_policy": default_policy,
+        "default_policy_status": _default_policy_status(raw_default),
         "catalog": [
             {
                 "id": capability.id,
