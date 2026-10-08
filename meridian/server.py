@@ -8862,7 +8862,11 @@ async def _mcp_sse_session_context(
         ctx["enforce_role"] = resolved[0]
         from . import member_policy as _member_policy  # noqa: PLC0415
         ctx["scoped_project_ids"] = await _member_policy.resolve_member_scope(
-            auth_db, lambda: _db(request), ws_tid, email,
+            # This follow-up POST intentionally carries no credential. Reuse
+            # the tenant DB connection captured by the authenticated SSE GET;
+            # resolving it again from the request would reject this valid
+            # session with 401 before the scope can be re-applied.
+            auth_db, lambda: ctx["db"], ws_tid, email,
         )
     return ctx
 
