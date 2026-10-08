@@ -1181,6 +1181,231 @@ def _meridian_tool_names() -> "frozenset[str]":
     return _MERIDIAN_TOOL_NAMES_CACHE
 
 
+async def _authorize_scoped_mcp_call(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    scoped_project_ids: "list[str]",
+    *,
+    resolve_references: bool = True,
+    tunnel_candidate: bool = False,
+) -> dict[str, Any]:
+    """Resolve, scope-check, then apply the canonical member capability policy.
+
+    Keep ``scoped_project_ids`` intact: in hosted mode it is a
+    ``ScopedProjectIds`` instance carrying the effective policy, and copying
+    it to a plain list makes policy evaluation fail closed as unavailable.
+    """
+    from .. import member_policy  # noqa: PLC0415
+
+    if resolve_references:
+        try:
+            args = await _resolve_project_reference(db, args, scoped_project_ids)
+            # Hierarchy tools carry project refs beyond the common
+            # project_id/project_name pair handled by the resolver above.
+            for name_key, id_key in (
+                ("parent_project_name", "parent_project_id"),
+                ("source_project_name", "source_project_id"),
+                ("target_project_name", "target_project_id"),
+            ):
+                if args.get(id_key) or not args.get(name_key):
+                    continue
+                row = await db_module.get_project_by_name(db, str(args[name_key]))
+                if row is None:
+                    raise ValueError("project is outside your access scope")
+                args = {**args, id_key: row.get("id")}
+        except ValueError:
+            raise
+        except member_policy.MemberPolicyUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 — lookup failure is a refusal
+            raise member_policy.MemberPolicyUnavailable() from exc
+
+    try:
+        await scope_guard.enforce_scoped_call(
+            name, args, db, scoped_project_ids,
+            doc_store_factory=lambda: _resolve_ingest_doc_store(db, data_dir, tenant),
+        )
+    except (ValueError, member_policy.MemberPolicyDenied):
+        raise
+    except member_policy.MemberPolicyUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 — never forward on an unreadable scope
+        raise member_policy.MemberPolicyUnavailable() from exc
+
+    # mcp_tools owns MCP operation intent; member_policy.py remains the only
+    # source of capability ids and hierarchy-to-capability rules.
+    from ..mcp_tools import member_policy_operation  # noqa: PLC0415
+    operation_name = name.rsplit("__", 1)[-1] if tunnel_candidate else name
+    operation = member_policy_operation(name) or member_policy_operation(operation_name)
+    if operation is None and tunnel_candidate:
+        has_project_ref = any(
+            key == "project_id" or key.endswith("_project_id")
+            or key == "project_ids"
+            or key == "project_name" or key.endswith("_project_name")
+            for key in args
+        )
+        normalized_name = operation_name.lower().replace("-", "_")
+        mutating_prefixes = (
+            "add_", "apply_", "archive_", "bulk_", "commit_", "create_",
+            "delete_", "execute_", "hard_delete_", "merge_", "move_",
+            "remove_", "restore_", "set_", "update_", "write_",
+        )
+        if has_project_ref and normalized_name.startswith(mutating_prefixes):
+            # Tunnel plugins may expose aliases that are not present in the
+            # native registry. Preserve the catalog's hierarchy capabilities
+            # for obvious project lifecycle operations instead of reducing
+            # them to the generic project-write capability. Keep this name
+            # based so tools such as delete_note/archive_decision remain
+            # ordinary scoped writes.
+            operation_words = set(normalized_name.split("_"))
+            project_operation = "project" in operation_words or "projects" in operation_words
+            if project_operation and "create" in operation_words:
+                operation = "project_create"
+            elif project_operation and (
+                "reparent" in operation_words
+                or "parent" in operation_words
+            ):
+                operation = "project_reparent"
+            elif project_operation and "merge" in operation_words:
+                operation = "project_merge"
+            elif project_operation and operation_words & {"delete", "remove", "hard_delete"}:
+                operation = "project_delete"
+            elif project_operation and operation_words & {"archive", "restore", "status"}:
+                operation = "project_status"
+            else:
+                operation = "project_write"
+    if operation is None:
+        return args
+
+    family_ops = {
+        "project_create", "project_reparent", "project_merge",
+        "project_delete", "project_status",
+    }
+    family: dict[str, dict[str, Any]] = {}
+    ids: list[str] = []
+    raw_ids: list[Any] = []
+    if operation in family_ops:
+        if operation == "project_create":
+            parent_id = args.get("parent_project_id")
+            if parent_id is not None and not isinstance(parent_id, str):
+                raise ValueError("project is outside your access scope")
+            if parent_id:
+                raw_ids.append(parent_id)
+        elif operation == "project_reparent":
+            raw_ids.extend((args.get("project_id"), args.get("parent_project_id")))
+        elif operation == "project_merge":
+            raw_ids.extend((args.get("source_project_id"), args.get("target_project_id")))
+        elif operation == "project_delete":
+            values = args.get("project_ids", args.get("project_id", args.get("ids")))
+            raw_ids.extend(values if isinstance(values, (list, tuple, set)) else [values])
+        else:  # archive/restore/status
+            raw_ids.append(args.get("project_id", args.get("id")))
+        ids = list(dict.fromkeys(
+            value.strip() for value in raw_ids if isinstance(value, str) and value.strip()
+        ))
+        if operation == "project_reparent" and (
+            not isinstance(args.get("project_id"), str)
+            or not args.get("project_id", "").strip()
+            or (args.get("parent_project_id") is not None
+                and not isinstance(args.get("parent_project_id"), str))
+        ):
+            raise ValueError("project is outside your access scope")
+        if operation == "project_merge" and any(
+            not isinstance(args.get(key), str) or not args.get(key, "").strip()
+            for key in ("source_project_id", "target_project_id")
+        ):
+            raise ValueError("project is outside your access scope")
+        if operation in {
+            "project_reparent", "project_merge", "project_delete", "project_status",
+        } and not ids:
+            raise ValueError("project is outside your access scope")
+        if scoped_project_ids is not None and any(
+            project_id not in scoped_project_ids for project_id in ids
+        ):
+            # Scope guard covers the standard project_id fields. Keep a direct
+            # check here as well for tunnel aliases that use id/project_ids.
+            raise ValueError("project is outside your access scope")
+        if operation == "project_delete" and len(ids) != len(raw_ids):
+            # A malformed or mixed-id batch must not degrade to a smaller,
+            # potentially destructive subset.
+            raise ValueError("project is outside your access scope")
+        if operation == "project_delete" and any(
+            project_id not in scoped_project_ids for project_id in ids
+        ):
+            # scope_guard checks scalar project refs and declared batch
+            # envelopes. Project deletion aliases also accept a flat id list,
+            # so validate every id directly before doing the hierarchy lookup.
+            raise ValueError("project is outside your access scope")
+        if ids:
+            try:
+                family = await db_module.get_project_family(db, ids)
+            except member_policy.MemberPolicyUnavailable:
+                raise
+            except Exception as exc:  # noqa: BLE001 — no policy from a failed lookup
+                raise member_policy.MemberPolicyUnavailable() from exc
+            if any(project_id not in family for project_id in ids):
+                raise ValueError("project is outside your access scope")
+            family = {
+                project_id: {"id": project_id, **row}
+                for project_id, row in family.items()
+            }
+
+    if operation == "project_create":
+        required = member_policy.required_caps_for_create(args.get("parent_project_id"))
+    elif operation == "project_reparent":
+        project_id = args.get("project_id")
+        row = family[project_id]
+        current_parent_id = row.get("parent_project_id")
+        new_parent_id = args.get("parent_project_id") or None
+        new_parent = family.get(new_parent_id) if new_parent_id else None
+        if new_parent_id and new_parent is None:
+            raise ValueError("project is outside your access scope")
+        required = member_policy.required_caps_for_reparent(
+            row, family.get(current_parent_id), new_parent,
+        )
+    elif operation == "project_merge":
+        source_id = args["source_project_id"]
+        target_id = args["target_project_id"]
+        required = member_policy.required_caps_for_merge(
+            family[source_id], family[target_id], family,
+        )
+    elif operation == "project_delete":
+        required = member_policy.required_caps_for_delete(
+            [family[project_id] for project_id in ids], family,
+        )
+    elif operation == "project_status":
+        project_id = ids[0]
+        new_status = args.get("status", args.get("new_status"))
+        operation_words = set(operation_name.lower().replace("-", "_").split("_"))
+        if "archive" in operation_words:
+            new_status = "archived"
+        elif "restore" in operation_words:
+            new_status = "active"
+        required = member_policy.required_caps_for_status(
+            family[project_id], new_status, family,
+        )
+    elif operation == "workspace_write":
+        required = frozenset({member_policy.WRITE_WORKSPACE_LEVEL})
+    elif operation == "workspace_to_project":
+        required = frozenset({
+            member_policy.WRITE_WORKSPACE_LEVEL,
+            member_policy.WRITE_PROJECT,
+        })
+    else:
+        required = frozenset({member_policy.WRITE_PROJECT})
+
+    target = next((
+        str(args[key]) for key in (
+            "project_id", "source_project_id", "target_project_id",
+        ) if args.get(key)
+    ), None)
+    member_policy.require_capabilities(scoped_project_ids, required, target=target)
+    return args
+
+
 async def _handle_mcp_request(
     body: dict[str, Any], db: Any, data_dir: str,
     tenant: dict[str, Any] | None = None,
@@ -1389,21 +1614,42 @@ async def _handle_mcp_request(
             )
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
-        # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
-        # API tokens (mirrors the HTTP middleware). A scoped member may only touch
-        # projects in their scope; resolve the tool's target project (by project_id,
-        # else project_name → id) and deny when it's out of scope.
+        # 95499c3e / decision 6fe5210c — scope and member-capability checks must
+        # run before either native dispatch or tunnel forwarding. The comprehensive
+        # scope guard covers direct ids, related objects, parent/source/target refs,
+        # and batch envelopes; the attached policy object must remain intact.
         if scoped_project_ids is not None:
-            _tgt_pid = (args.get("project_id") or "").strip()
-            if not _tgt_pid and args.get("project_name"):
-                try:
-                    _sp = await db_module.get_project_by_name(db, str(args["project_name"]))
-                    _tgt_pid = (_sp or {}).get("id", "") if _sp else ""
-                except Exception:  # noqa: BLE001
-                    _tgt_pid = ""
-            if _tgt_pid and _tgt_pid not in scoped_project_ids:
+            from ..member_policy import MemberPolicyDenied, MemberPolicyUnavailable  # noqa: PLC0415
+            try:
+                args = await _authorize_scoped_mcp_call(
+                    name,
+                    args,
+                    db,
+                    data_dir,
+                    tenant,
+                    scoped_project_ids,
+                    tunnel_candidate=(
+                        name not in _meridian_tool_names()
+                        and name not in _server._GITHUB_TOOL_NAMES
+                    ),
+                )
+            except MemberPolicyUnavailable:
                 return _server._jsonrpc_err(
-                    req_id, -32603, "project is outside your access scope",
+                    req_id,
+                    -32000,
+                    "member policy check unavailable",
+                    data={"status_code": 503, "code": "MEMBER_POLICY_UNAVAILABLE"},
+                )
+            except (MemberPolicyDenied, ValueError) as exc:
+                return _server._jsonrpc_err(
+                    req_id, -32603, str(exc),
+                )
+            except Exception:  # noqa: BLE001 — fail closed before any forwarding
+                return _server._jsonrpc_err(
+                    req_id,
+                    -32000,
+                    "member policy check unavailable",
+                    data={"status_code": 503, "code": "MEMBER_POLICY_UNAVAILABLE"},
                 )
         # 393eed0a — workspace-role gate (defense in depth for cross-workspace MCP).
         if enforce_role is not None and name not in _server._mcp_readonly_tools \
@@ -1550,6 +1796,7 @@ async def _handle_mcp_request(
                 result = await _dispatch_mcp_tool(
                     name, _dispatch_args, db, data_dir, tenant=tenant,
                     scoped_project_ids=scoped_project_ids,
+                    _authorization_prechecked=scoped_project_ids is not None,
                 )
                 # 4b698ea5 — implicit last_seen bump on the HOSTED path, mirroring
                 # the stdio handler. Previously ONLY stdio tool calls refreshed a
@@ -1605,6 +1852,15 @@ async def _handle_mcp_request(
                     )
             except Exception:  # noqa: BLE001 — never mask the real error below
                 pass
+            from ..member_policy import MemberPolicyUnavailable  # noqa: PLC0415
+            if isinstance(exc, MemberPolicyUnavailable):
+                return _server._jsonrpc_err(
+                    req_id,
+                    -32000,
+                    "member policy check unavailable",
+                    data={"tool_exception": True, "status_code": 503,
+                          "code": "MEMBER_POLICY_UNAVAILABLE"},
+                )
             return _server._jsonrpc_err(
                 req_id, -32603, str(exc), data={"tool_exception": True},
             )
@@ -7358,6 +7614,8 @@ async def _dispatch_mcp_tool(
     data_dir: str,
     tenant: dict[str, Any] | None = None,
     scoped_project_ids: "list[str] | None" = None,
+    *,
+    _authorization_prechecked: bool = False,
 ) -> Any:
     """Route a tools/call to the appropriate db_module function.
 
@@ -7393,7 +7651,12 @@ async def _dispatch_mcp_tool(
     # project_id, and resolve non-UUID project_id values as human-readable names.
     # 3f47cc6e — an explicit project_id is never silently overridden by a
     # project_name that resolves elsewhere: that conflict is rejected.
-    args = await _resolve_project_reference(db, args, scoped_project_ids)
+    if scoped_project_ids is None:
+        args = await _resolve_project_reference(db, args, scoped_project_ids)
+    elif not _authorization_prechecked:
+        args = await _authorize_scoped_mcp_call(
+            name, args, db, data_dir, tenant, scoped_project_ids,
+        )
     # RT-TI-006 — never trust a caller-supplied scope list: drop it, then (for a
     # scoped caller only) inject the real one for the discovery tools to filter on.
     if name in ("list_projects", "get_project_by_name"):
@@ -7417,13 +7680,14 @@ async def _dispatch_mcp_tool(
     # argument (notes, decisions, HITL requests, sessions, wave runs,
     # proposals ...), listings that span every project when project_id is
     # omitted, and profile-layer scope ids.
-    await scope_guard.enforce_scoped_call(
-        name, args, db, scoped_project_ids,
-        # link_figure_caption / link_table_caption bind a figure or table id to
-        # the caller's own stored document (the doc store is a separate backend,
-        # opened lazily and only for those two tools).
-        doc_store_factory=lambda: _resolve_ingest_doc_store(db, data_dir, tenant),
-    )
+    if scoped_project_ids is None:
+        await scope_guard.enforce_scoped_call(
+            name, args, db, scoped_project_ids,
+            # link_figure_caption / link_table_caption bind a figure or table id to
+            # the caller's own stored document (the doc store is a separate backend,
+            # opened lazily and only for those two tools).
+            doc_store_factory=lambda: _resolve_ingest_doc_store(db, data_dir, tenant),
+        )
     _groups = (
         _handle_project_tools,
         _handle_task_tools,

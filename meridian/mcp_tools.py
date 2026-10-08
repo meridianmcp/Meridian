@@ -4816,6 +4816,64 @@ _READ_ONLY_TOOLS = {
     "get_paper_contract", "list_paper_contract_revisions",
     "get_current_paper_contract_content",
 }
+
+# Member-policy intent for MCP dispatch.  Values describe the operation shape,
+# while capability ids and the policy itself stay canonical in member_policy.py.
+# Project-scoped mutations default to a project write; hierarchy operations
+# have dedicated entries because their required capabilities depend on the
+# affected rows.  Workspace-only mutations are listed explicitly so a project
+# member cannot use a workspace tool as an alternate write path.
+_WORKSPACE_MEMBER_POLICY_WRITES = frozenset({
+    "add_workspace_note",
+    "pin_workspace_decision",
+    "update_workspace_settings",
+    "add_workspace_sprint_item",
+    "update_workspace_sprint_item",
+    "complete_workspace_sprint_item",
+    "add_workspace_proposal",
+    "add_proposal",
+    "advance_proposal_status",
+    "promote_proposal",
+    "commit_proposal_promotion",
+    "create_proposal_successor",
+    "link_proposal_lineage",
+    "save_blog_post",
+    "update_md_section",
+})
+
+MCP_MEMBER_POLICY_OPERATIONS: dict[str, str] = {
+    tool["name"]: "project_write"
+    for tool in _MCP_TOOLS_LIST
+    if tool.get("name") not in _READ_ONLY_TOOLS
+}
+MCP_MEMBER_POLICY_OPERATIONS.update({
+    name: "workspace_write" for name in _WORKSPACE_MEMBER_POLICY_WRITES
+})
+MCP_MEMBER_POLICY_OPERATIONS["move_workspace_note_to_project"] = "workspace_to_project"
+MCP_MEMBER_POLICY_OPERATIONS.update({
+    "create_project": "project_create",
+    "set_parent_project": "project_reparent",
+    "merge_project": "project_merge",
+})
+# These names are intentionally recognized even when a particular MCP
+# manifest does not expose them natively: a tenant tunnel or a future MCP
+# registration must not turn an HTTP project mutation into a policy bypass.
+for _name in (
+    "delete_project", "delete_projects", "delete_projects_batch",
+    "bulk_delete_projects", "hard_delete_project",
+):
+    MCP_MEMBER_POLICY_OPERATIONS[_name] = "project_delete"
+for _name in (
+    "set_project_status", "update_project_status", "archive_project", "restore_project",
+):
+    MCP_MEMBER_POLICY_OPERATIONS[_name] = "project_status"
+
+
+def member_policy_operation(name: str) -> str | None:
+    """Return the policy operation shape for a native or known tunneled tool."""
+    return MCP_MEMBER_POLICY_OPERATIONS.get(name)
+
+
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "relocate_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
 # MCP directory metadata: these tools contact a public third-party service
