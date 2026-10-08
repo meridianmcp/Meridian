@@ -2143,6 +2143,14 @@ async def test_idle_expire_loop_does_not_move_the_expired_sessions_anchor(
     assert "Bravo after the resume" in section
 
 
+# Polls the handoffs table with asyncio.run() from a second event loop while the TestClient's
+# own loop owns the database. SQLite (aiosqlite) tolerates that; the Postgres run's
+# transactional single-connection pool does not (the second loop waits on a connection the
+# first loop holds -> pytest-timeout on the CI Postgres job). The same anchor/amend behaviour
+# is asserted on Postgres by test_unattended_delta_never_amends_a_row_a_session_owns and
+# test_idle_expire_loop_does_not_move_the_expired_sessions_anchor, which use the db fixture.
+# TODO: read the rows through an HTTP route instead so this one can run on both backends.
+@pytest.mark.sqlite_only
 def test_session_close_auto_save_does_not_move_the_closed_sessions_anchor(
     client, _no_claude_md_write, tmp_path,
 ):
