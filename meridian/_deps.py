@@ -18,8 +18,9 @@ from typing import Any
 from fastapi import HTTPException, Request
 from fastapi.templating import Jinja2Templates
 
+from . import member_policy
 from .plans import tenant_entitlement_plan
-from .roles import has_perm, PERM_WRITE, PERM_INVITE, PERM_SETTINGS
+from .roles import has_perm, PERM_WRITE, PERM_INVITE, PERM_SETTINGS, PERM_MANAGE_POLICY
 
 
 # ---------------------------------------------------------------------------
@@ -497,27 +498,44 @@ async def _tenant_for_credential(auth_db: Any, credential: "tuple[str, str]") ->
     return _NO_SUCH_CREDENTIAL
 
 
+# Sentinel for the per-request scope memo (see _scoped_project_ids_for_request).
+_SCOPE_UNSET = object()
+
+
 async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None":
-    """d116642e — listing-only project scoping for the current request.
+    """The project scope of the current request, or ``None`` when it has none.
 
-    Returns the list of project_ids the caller is scoped to when they are a
-    *project-scoped* member of the workspace they are currently viewing
-    (i.e. they switched into a workspace they were invited to with a specific
-    project_id). Returns ``None`` when scoping does not apply — the caller is
-    the workspace owner, a workspace-wide member, in self-hosted/demo mode, or
-    unauthenticated — meaning every project is listed (current behavior).
+    Returns the project ids the caller may reach when they are a *project-scoped*
+    member of the workspace they are currently viewing (they switched into a
+    workspace they were invited to with a specific project_id): their explicit
+    grants plus the live one-level subprojects of those grants, so a subproject
+    created later is reachable on the next request. The list is a
+    :class:`member_policy.ScopedProjectIds`, which also carries the member's
+    effective policy (what they may do inside the scope); consumers that only
+    test membership use it as the flat list it is.
 
-    Scoping only fires when an ``X-Workspace-Tenant-Id`` header points the
-    caller at a *different* workspace than their own (a true cross-workspace
-    view); a caller in their own workspace always sees everything.
+    Returns ``None`` when scoping does not apply (owner, workspace-wide member,
+    non-member, self-hosted, demo, unauthenticated, no workspace header), meaning
+    every project is in play. Those paths run no statement beyond the membership
+    SELECT; the owner's database is opened only once the caller proved to be
+    project-scoped.
 
-    Enforcement is NOT listing-only any more: pinned decision 6fe5210c (Option
-    A) makes a project-scoped member 403 on any other project even by direct
-    id. The ``/projects/{uuid}/*`` routes get that from the
-    ``project_scope_enforcement`` middleware; routes that reach a project only
+    Scoping only fires when an ``X-Workspace-Tenant-Id`` header points the caller
+    at a *different* workspace than their own; a caller in their own workspace
+    always sees everything.
+
+    The result is memoized on ``request.state`` for the life of the request, so
+    the middleware, the gate dependency and the route share one resolution. There
+    is deliberately no cross-request cache: a revoked member or an edited policy
+    applies on the very next request, on every machine.
+
+    A project-scoped member is 403'd on any project outside their scope even by
+    direct id (decision 6fe5210c). The ``/projects/{uuid}/*`` routes get that from
+    the ``project_scope_enforcement`` middleware; routes that reach a project only
     through another object's id (sessions, tasks) call
-    :func:`_require_project_in_scope` themselves. Writes also stay gated by
-    role enforcement (393eed0a).
+    :func:`_require_project_in_scope` themselves. Writes are further gated by role
+    enforcement (393eed0a) and by the member policy. Every error propagates:
+    callers map it to 503, never to "not scoped".
     """
     if not _hosted_mode():
         return None
@@ -528,8 +546,6 @@ async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None
     if not ws_header:
         return None
 
-    from . import db as db_module
-
     caller = await _get_tenant_from_request(request)
     if not caller:
         return None
@@ -538,10 +554,17 @@ async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None
         # Viewing own workspace — never scoped.
         return None
 
+    key = (ws_header, caller_email)
+    memo = getattr(request.state, "_member_scope", _SCOPE_UNSET)
+    if memo is not _SCOPE_UNSET and memo[0] == key:
+        return memo[1]
+
     auth_db = request.app.state.db
-    return await db_module.get_scoped_project_ids_for_member(
-        auth_db, ws_header, caller_email
+    scoped = await member_policy.resolve_member_scope(
+        auth_db, lambda: _db(request), ws_header, caller_email,
     )
+    request.state._member_scope = (key, scoped)
+    return scoped
 
 
 def _deny_unless_in_scope(scoped: "list[str] | None", project_id: "str | None") -> None:
@@ -577,6 +600,57 @@ async def _require_project_in_scope(request: Request, project_id: "str | None") 
     if not project_id:
         return
     _deny_unless_in_scope(await _scoped_project_ids_for_request(request), project_id)
+
+
+def _deny_unless_capability(scoped: "list[str] | None", capability: str) -> None:
+    """403 (``MemberPolicyDenied``) when a project-scoped caller lacks ``capability``.
+
+    ``scoped`` is what :func:`_scoped_project_ids_for_request` returned; ``None``
+    (owner, workspace-wide member, self-hosted, demo) is never refused. The sync
+    sibling of :func:`_deny_unless_in_scope` for a route that already holds the
+    scope. Check the scope of the project first so a foreign id keeps the scope
+    message, then the capability.
+    """
+    member_policy.require_capability(scoped, capability)
+
+
+async def _require_capability(
+    request: Request, capability: str, *, project_id: "str | None" = None,
+) -> "list[str] | None":
+    """Resolve the request's scope and require ``capability`` of a scoped caller.
+
+    No-op (returns ``None``, no statement beyond what the scope lookup already
+    costs) for callers that are not project-scoped. With ``project_id`` the
+    project must also be in scope; that check runs first so a foreign or unknown
+    id keeps the byte-identical scope refusal. Returns the scope for the caller
+    to reuse.
+    """
+    scoped = await _scoped_project_ids_for_request(request)
+    if scoped is None:
+        return None
+    if project_id is not None:
+        _deny_unless_in_scope(scoped, project_id)
+    member_policy.require_capability(scoped, capability)
+    return scoped
+
+
+def _reject_foreign_workspace_header(request: Request, own_tenant_id: "str | None") -> None:
+    """403 when the request carries an ``X-Workspace-Tenant-Id`` naming ANOTHER
+    workspace than the caller's own.
+
+    For routes that act on the caller's own account whatever workspace the
+    dashboard happens to be showing (member-policy administration): the header is
+    ignored by ``hosted.get_current_tenant``, so without this check a workspace
+    switch would look like it targets the other workspace while the write lands on
+    the caller's own. Refusing it keeps the two readings from diverging. A header
+    equal to the caller's own tenant id, or no header, passes.
+    """
+    ws_header = request.headers.get("x-workspace-tenant-id", "").strip()
+    if ws_header and ws_header != (own_tenant_id or ""):
+        raise HTTPException(
+            status_code=403,
+            detail="This action applies to your own workspace; switch back to it first.",
+        )
 
 
 async def _projects_in_scope(request: Request, db: Any) -> "list[dict[str, Any]]":
@@ -1238,6 +1312,15 @@ _ROLE_ENFORCE_SKIP_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _is_member_policy_path(path: str) -> bool:
+    """``/workspace/member-policy[/...]`` and ``/workspace/members/{id}/policy``."""
+    bare = path.rstrip("/")
+    if bare == "/workspace/member-policy" or bare.startswith("/workspace/member-policy/"):
+        return True
+    parts = bare.split("/")
+    return len(parts) == 5 and parts[:3] == ["", "workspace", "members"] and parts[4] == "policy"
+
+
 def _required_perm_for_request(method: str, path: str) -> "str | None":
     """Map a mutating request to the workspace permission it requires, or None
     to skip role enforcement for this path.
@@ -1251,6 +1334,10 @@ def _required_perm_for_request(method: str, path: str) -> "str | None":
         return None
     if any(path.startswith(p) for p in _ROLE_ENFORCE_SKIP_PREFIXES):
         return None
+    # Member-policy administration is owner-only and must not fall into the
+    # generic team-management branch below, which an invited admin satisfies.
+    if _is_member_policy_path(path):
+        return PERM_MANAGE_POLICY
     # Team management — add / remove / modify workspace members.
     if path.startswith("/workspace/invite") or path.startswith("/workspace/members"):
         return PERM_INVITE
