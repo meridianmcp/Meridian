@@ -54,6 +54,21 @@ async def _seed_workspace(db):
     }
 
 
+async def _seed_session_and_task(db, project_id):
+    session = await db_module.register_session(db, project_id, "member-http-session")
+    task = await db_module.log_task(
+        db, session["id"], project_id, "member-http-task", status="done",
+    )
+    return session, task
+
+
+async def _set_member_policy(db, owner_id, policy):
+    await db_module.set_member_policy_override(
+        db, owner_id, "member-http-scoped@example.com", policy,
+        "member-policy-http-test",
+    )
+
+
 def test_scoped_http_create_delete_archive_and_bulk_paths_apply_capabilities(monkeypatch, tmp_path):
     with _hosted_client(monkeypatch, tmp_path) as client:
         setup = asyncio.run(_seed_workspace(client.app.state.db))
@@ -137,4 +152,161 @@ def test_member_policy_lookup_errors_fail_closed_with_http_503(monkeypatch, tmp_
 
         monkeypatch.setattr(member_policy, "resolve_member_scope", unavailable)
         response = client.delete(f"/projects/{setup['project']}", headers=member)
+        assert response.status_code == 503, response.text
+
+
+def test_task_and_session_mutations_require_write_project(monkeypatch, tmp_path):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_workspace(client.app.state.db))
+        session, task = asyncio.run(
+            _seed_session_and_task(client.app.state.db, setup["project"])
+        )
+        member = {
+            "Authorization": f"Bearer {setup['member_token']}",
+            "X-Workspace-Tenant-Id": setup["owner_id"],
+        }
+        asyncio.run(_set_member_policy(
+            client.app.state.db, setup["owner_id"], {"write_project": False},
+        ))
+
+        denied_create = client.post(
+            "/tasks", headers=member,
+            json={
+                "project_id": setup["project"], "session_id": session["id"],
+                "description": "must not be appended",
+            },
+        )
+        denied_register = client.post(
+            "/sessions/register", headers=member,
+            json={"project_id": setup["project"], "name": "must not register"},
+        )
+        denied_patch_task = client.patch(
+            f"/tasks/{task['id']}", headers=member, json={"status": "failed"},
+        )
+        denied_delete_task = client.delete(f"/tasks/{task['id']}", headers=member)
+        denied_patch_session = client.patch(
+            f"/sessions/{session['id']}", headers=member, json={"status": "idle"},
+        )
+        denied_close_session = client.post(
+            f"/sessions/{session['id']}/close", headers=member,
+        )
+        denied_heartbeat = client.post(
+            f"/sessions/{session['id']}/heartbeat", headers=member,
+        )
+
+        for response in (
+            denied_create, denied_register, denied_patch_task, denied_delete_task,
+            denied_patch_session, denied_close_session, denied_heartbeat,
+        ):
+            assert response.status_code == 403, response.text
+            assert response.json().get("capability") == "write_project"
+
+        saved = asyncio.run(db_module.get_task(client.app.state.db, task["id"]))
+        assert saved["status"] == "done"
+
+
+def test_task_session_and_profile_mutations_allow_explicit_capabilities(monkeypatch, tmp_path):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_workspace(client.app.state.db))
+        session, task = asyncio.run(
+            _seed_session_and_task(client.app.state.db, setup["project"])
+        )
+        member = {
+            "Authorization": f"Bearer {setup['member_token']}",
+            "X-Workspace-Tenant-Id": setup["owner_id"],
+        }
+
+        # The built-in project default allows task and session writes.
+        patch_task = client.patch(
+            f"/tasks/{task['id']}", headers=member, json={"status": "failed"},
+        )
+        assert patch_task.status_code == 200, patch_task.text
+        patched_session = client.patch(
+            f"/sessions/{session['id']}", headers=member, json={"status": "idle"},
+        )
+        assert patched_session.status_code == 200, patched_session.text
+        created_task = client.post(
+            "/tasks", headers=member,
+            json={
+                "project_id": setup["project"], "session_id": session["id"],
+                "description": "allowed task write",
+            },
+        )
+        assert created_task.status_code == 201, created_task.text
+
+        # Workspace profile writes inherit the built-in deny; the explicit
+        # workspace capability enables them while retaining project access.
+        denied_workspace_profile = client.put(
+            "/profile-layers/workspace/singleton", headers=member,
+            json={"fields": {}},
+        )
+        assert denied_workspace_profile.status_code == 403
+        assert denied_workspace_profile.json().get("capability") == "write_workspace_level"
+
+        asyncio.run(_set_member_policy(
+            client.app.state.db, setup["owner_id"], {
+                "write_project": True, "write_workspace_level": True,
+            },
+        ))
+        allowed_workspace_profile = client.put(
+            "/profile-layers/workspace/singleton", headers=member,
+            json={"fields": {}},
+        )
+        assert allowed_workspace_profile.status_code == 200, allowed_workspace_profile.text
+        allowed_project_profile = client.put(
+            f"/profile-layers/project/{setup['project']}", headers=member,
+            json={"fields": {}},
+        )
+        assert allowed_project_profile.status_code == 200, allowed_project_profile.text
+
+
+def test_nonproject_member_policy_scope_is_checked_before_capability(monkeypatch, tmp_path):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_workspace(client.app.state.db))
+        foreign_session, foreign_task = asyncio.run(
+            _seed_session_and_task(client.app.state.db, setup["foreign"])
+        )
+        member = {
+            "Authorization": f"Bearer {setup['member_token']}",
+            "X-Workspace-Tenant-Id": setup["owner_id"],
+        }
+        from meridian import member_policy
+
+        capability_checks = []
+
+        def capability_would_allow(_scoped, capabilities, *, target=None):
+            capability_checks.append((capabilities, target))
+
+        monkeypatch.setattr(member_policy, "require_capabilities", capability_would_allow)
+        denied_task = client.patch(
+            f"/tasks/{foreign_task['id']}", headers=member, json={"status": "failed"},
+        )
+        denied_session = client.patch(
+            f"/sessions/{foreign_session['id']}", headers=member,
+            json={"status": "idle"},
+        )
+        assert denied_task.status_code == 403, denied_task.text
+        assert denied_session.status_code == 403, denied_session.text
+        assert capability_checks == []
+
+
+def test_nonproject_policy_lookup_errors_fail_closed_with_http_503(monkeypatch, tmp_path):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_workspace(client.app.state.db))
+        _, task = asyncio.run(
+            _seed_session_and_task(client.app.state.db, setup["project"])
+        )
+        member = {
+            "Authorization": f"Bearer {setup['member_token']}",
+            "X-Workspace-Tenant-Id": setup["owner_id"],
+        }
+        from meridian import member_policy
+
+        async def unavailable(*_args, **_kwargs):
+            raise RuntimeError("auth db temporarily unavailable")
+
+        monkeypatch.setattr(member_policy, "resolve_member_scope", unavailable)
+        response = client.patch(
+            f"/tasks/{task['id']}", headers=member, json={"status": "failed"},
+        )
         assert response.status_code == 503, response.text

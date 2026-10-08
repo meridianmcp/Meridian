@@ -1747,6 +1747,205 @@ async def _member_policy_project_write_response(request: Request) -> Response | 
     return None
 
 
+async def _member_policy_nonproject_write_response(request: Request) -> Response | None:
+    """Gate the remaining project- and workspace-level HTTP mutation routes.
+
+    The project middleware above handles ``/projects`` lifecycle writes. These
+    routes carry their target through a task/session id, a request body, or a
+    profile-layer scope, so resolve the member scope first and validate every
+    project/session target before checking its capability or allowing the
+    handler to mutate state.
+    """
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+
+    path = request.url.path.rstrip("/") or "/"
+    task_match = re.fullmatch(r"/tasks/([^/]+)", path)
+    session_match = re.fullmatch(r"/sessions/([^/]+)(?:/(close|heartbeat))?", path)
+    task_create = request.method == "POST" and path == "/tasks"
+    session_register = request.method == "POST" and path == "/sessions/register"
+    task_mutation = bool(task_match) and request.method in ("PATCH", "DELETE")
+    session_mutation = bool(session_match) and (
+        request.method == "PATCH"
+        or (request.method == "POST" and session_match.group(2) in ("close", "heartbeat"))
+    )
+
+    # Owner-only workspace administration has its own role/capability gate.
+    workspace_admin = (
+        path.startswith("/workspace/invite")
+        or path.startswith("/workspace/members")
+        or path.startswith("/workspace/member-policy")
+    )
+    workspace_mutation = path.startswith("/workspace/") and not workspace_admin
+    github_connection_mutation = (
+        path.startswith("/github/connections/") and request.method == "DELETE"
+    )
+    profile_layer_mutation = path.startswith("/profile-layers/")
+
+    if not (
+        task_create or session_register or task_mutation or session_mutation
+        or workspace_mutation or github_connection_mutation or profile_layer_mutation
+    ):
+        return None
+
+    from . import member_policy  # noqa: PLC0415
+    from ._deps import (  # noqa: PLC0415
+        _deny_unless_in_scope,
+        _scoped_project_ids_for_request,
+        _session_project_id,
+    )
+
+    try:
+        scoped = await _scoped_project_ids_for_request(request)
+        if scoped is None:
+            return None
+
+        capability: str | None = None
+        target: str | None = None
+
+        if task_create:
+            body = await _read_member_policy_json_object(request)
+            project_id = body.get("project_id")
+            session_id = body.get("session_id")
+            # Let FastAPI retain its existing request validation for malformed
+            # bodies; valid targets are scope-checked before the capability.
+            if not isinstance(project_id, str) or not project_id.strip():
+                return None
+            _deny_unless_in_scope(scoped, project_id)
+            if isinstance(session_id, str) and session_id.strip():
+                _deny_unless_in_scope(
+                    scoped, await _session_project_id(request, session_id)
+                )
+            capability = member_policy.WRITE_PROJECT
+            target = project_id
+        elif session_register:
+            body = await _read_member_policy_json_object(request)
+            project_id = body.get("project_id")
+            if not isinstance(project_id, str) or not project_id.strip():
+                return None
+            _deny_unless_in_scope(scoped, project_id)
+            capability = member_policy.WRITE_PROJECT
+            target = project_id
+        elif task_mutation:
+            task_id = task_match.group(1)
+            task = await db_module.get_task(await _db(request), task_id)
+            _deny_unless_in_scope(
+                scoped, task.get("project_id") if task is not None else None
+            )
+            capability = member_policy.WRITE_PROJECT
+            target = task.get("project_id") if task is not None else task_id
+        elif session_mutation:
+            session_id = session_match.group(1)
+            project_id = await _session_project_id(request, session_id)
+            _deny_unless_in_scope(scoped, project_id)
+            capability = member_policy.WRITE_PROJECT
+            target = project_id or session_id
+        elif workspace_mutation or github_connection_mutation:
+            capability = member_policy.WRITE_WORKSPACE_LEVEL
+            target = path
+        elif profile_layer_mutation:
+            # Profile layers use project/session scopes for project content and
+            # workspace/user/hosted_default scopes for workspace-level state.
+            from .profile_contract import normalize_scope_type  # noqa: PLC0415
+
+            parts = [part for part in path.split("/") if part]
+            profile_prefix = parts[:1] == ["profile-layers"]
+            layer_type: str | None = None
+            layer_id: str | None = None
+            target_type: str | None = None
+            target_id: str | None = None
+
+            if profile_prefix and len(parts) >= 3 and parts[1] in {
+                "project", "session", "workspace", "user", "hosted_default",
+            }:
+                layer_type, layer_id = parts[1], parts[2]
+            elif profile_prefix and len(parts) == 3 and parts[1] == "global" and parts[2] == "activate":
+                # Compatibility endpoint for the hosted_default/global layer.
+                capability = member_policy.WRITE_WORKSPACE_LEVEL
+                target = path
+            elif profile_prefix and len(parts) == 4 and parts[1] in {
+                "workspace", "hosted_default",
+            } and parts[3] == "clone":
+                # Static source-layer aliases still take their destination from
+                # the body, just like the canonical clone endpoint.
+                layer_type, layer_id = parts[1], parts[2]
+            elif profile_prefix and len(parts) == 3 and parts[2] == "activate":
+                # Activation is hardcoded by the route to hosted_default.
+                capability = member_policy.WRITE_WORKSPACE_LEVEL
+                target = path
+
+            if layer_type is not None:
+                try:
+                    layer_type = normalize_scope_type(layer_type)
+                except (TypeError, ValueError):
+                    return None  # Keep route-level profile validation intact.
+
+            is_clone = path.endswith("/clone")
+            if is_clone:
+                body = await _read_member_policy_json_object(request)
+                raw_type = body.get("target_scope_type")
+                raw_id = body.get("target_scope_id")
+                if not isinstance(raw_type, str) or not isinstance(raw_id, str):
+                    return None  # The handler reports its existing 400 response.
+                try:
+                    target_type = normalize_scope_type(raw_type)
+                except (TypeError, ValueError):
+                    return None
+                target_id = raw_id.strip()
+                if not target_id:
+                    return None
+
+            # Scope-check both clone endpoints (source first), matching the
+            # route dependency's existing ordering.
+            for scope_type, scope_id in ((layer_type, layer_id), (target_type, target_id)):
+                if scope_type == "project" and scope_id:
+                    _deny_unless_in_scope(scoped, scope_id)
+                elif scope_type == "session" and scope_id:
+                    _deny_unless_in_scope(
+                        scoped, await _session_project_id(request, scope_id)
+                    )
+
+            effective_type = target_type if is_clone else layer_type
+            if capability is None and effective_type is not None:
+                capability = (
+                    member_policy.WRITE_PROJECT
+                    if effective_type in {"project", "session"}
+                    else member_policy.WRITE_WORKSPACE_LEVEL
+                )
+                target = (
+                    f"{effective_type}:{target_id or layer_id or ''}"
+                )
+
+        if capability is not None:
+            member_policy.require_capabilities(scoped, {capability}, target=target)
+    except member_policy.MemberPolicyUnavailable:
+        return JSONResponse(
+            {"detail": "Member policy check unavailable"},
+            status_code=503,
+        )
+    except member_policy.MemberPolicyDenied as exc:
+        return JSONResponse(exc.body(), status_code=403)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+    except Exception:  # noqa: BLE001 — policy lookup errors must fail closed
+        import logging as _l  # noqa: PLC0415
+
+        _l.getLogger("meridian.member_policy").exception(
+            "member policy HTTP check failed"
+        )
+        if request.headers.get("x-workspace-tenant-id", "").strip():
+            return JSONResponse(
+                {"detail": "Member policy check unavailable"},
+                status_code=503,
+            )
+        return None
+    return None
+
+
 @app.middleware("http")
 async def _role_enforcement_middleware(request: Request, call_next):
     """Enforce workspace roles on cross-workspace writes.
@@ -1787,6 +1986,9 @@ async def _role_enforcement_middleware(request: Request, call_next):
             media_type="application/json",
         )
     policy_response = await _member_policy_project_write_response(request)
+    if policy_response is not None:
+        return policy_response
+    policy_response = await _member_policy_nonproject_write_response(request)
     if policy_response is not None:
         return policy_response
     return await call_next(request)
