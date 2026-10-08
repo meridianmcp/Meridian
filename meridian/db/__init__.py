@@ -580,13 +580,27 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     github_access TEXT NOT NULL DEFAULT 'read',
     -- d116642e: project-level invites foundation.
     -- NULL = workspace-wide member (sees all projects, current behavior);
-    -- set = project-scoped member (listing-only scoping, see get_workspaces_for_email).
-    -- Airtight per-request access enforcement is intentionally NOT implemented
-    -- here — it is gated on the open product decision in pin b11c7cf6.
+    -- set = project-scoped member (reads and writes limited to that project and
+    -- its subprojects, with what they may do inside it set by member_policy below).
     project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT (datetime('now')),
     joined_at TEXT
+);
+
+-- Capability policy for project-scoped members. tenant_id is the workspace
+-- OWNER's tenant id. subject is '*' for the workspace default, otherwise
+-- LOWER(email) for one person's override (an email can never equal '*').
+-- policy is a JSON object of {capability_id: bool}. Per person, not per
+-- workspace_members row, because that table has one row per (email, project).
+-- No ALTER anywhere: this is a new table, created idempotently on every boot.
+CREATE TABLE IF NOT EXISTS member_policy (
+    tenant_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    policy TEXT NOT NULL DEFAULT '{}',
+    updated_by TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (tenant_id, subject)
 );
 
 -- v2.1 dark — per-tenant named environments (prod/staging/dev), not exposed at launch
@@ -1306,13 +1320,32 @@ async def create_project(
         execution_mode = _ws["execution_mode_default"]
     pid = _new_id()
     mode = normalize_execution_mode(execution_mode)
-    await db.execute(
-        "INSERT INTO projects "
-        "(id, name, creator_human_id, execution_mode, parent_project_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (pid, name, human_id, mode, parent_project_id),
-    )
-    await db.commit()
+    if parent_project_id is None:
+        await db.execute(
+            "INSERT INTO projects "
+            "(id, name, creator_human_id, execution_mode, parent_project_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (pid, name, human_id, mode, parent_project_id),
+        )
+        await db.commit()
+    else:
+        # The check above and this write are two statements. Make the INSERT itself
+        # conditional on the parent still being top-level, so a set_parent_project
+        # that nested the parent in between cannot leave a two-level chain behind.
+        cur = await db.execute(
+            "INSERT INTO projects "
+            "(id, name, creator_human_id, execution_mode, parent_project_id) "
+            "SELECT ?, ?, ?, ?, ? "
+            "WHERE EXISTS (SELECT 1 FROM projects "
+            "WHERE id = ? AND COALESCE(parent_project_id, '') = '')",
+            (pid, name, human_id, mode, parent_project_id, parent_project_id),
+        )
+        await db.commit()
+        if not cur.rowcount:
+            raise ValueError(
+                f"parent project '{parent_project_id}' changed concurrently - "
+                "it is no longer a top-level project"
+            )
     # Seed the remaining cascade defaults onto the fresh project row.
     _ci_default = _ws.get("code_intel_enabled_default")
     if _ci_default is not None:
@@ -1534,10 +1567,14 @@ async def rename_project(
     return await get_project(db, project_id)
 
 
+_PROJECT_CHANGED_CONCURRENTLY = "project changed concurrently"
+
+
 async def set_parent_project(
     db: aiosqlite.Connection,
     project_id: str,
     parent_project_id: str | None,
+    expect_parent: "str | None | object" = _UNSET,
 ) -> dict[str, Any] | None:
     """7acb8563 — set / change / clear a project's parent AFTER creation.
 
@@ -1552,10 +1589,30 @@ async def set_parent_project(
     detach (make it top-level again). Validates BEFORE any write; raises
     ``ValueError`` on any violation. Returns the updated project, or ``None`` if
     ``project_id`` does not exist.
+
+    ``expect_parent`` makes the write a compare-and-set for a caller that decided
+    what to allow from the project's parent as it saw it: pass the parent id it
+    classified (``None`` or ``""`` for top-level). If the project has a different
+    parent by the time of the write, nothing is changed and ``ValueError("project
+    changed concurrently")`` is raised. Left out, the parent is not compared.
+
+    The write itself is ONE conditional UPDATE (not the validation above followed by
+    a blind UPDATE): when nesting it only matches while the project still has no
+    subprojects and the new parent still exists and is top-level, so a project that
+    gained a child, or a parent that was nested, between validation and write is
+    refused with the same ``ValueError`` instead of building a two-level chain.
+    On Postgres (read committed) the subquery conditions are evaluated against the
+    statement's snapshot, which narrows that window to a single statement rather
+    than closing it entirely; the parent comparison is a plain row predicate and
+    is exact on both backends.
     """
     project = await get_project(db, project_id)
     if project is None:
         return None
+    if expect_parent is not _UNSET and (
+        (project.get("parent_project_id") or "") != (expect_parent or "")
+    ):
+        raise ValueError(_PROJECT_CHANGED_CONCURRENTLY)
     if parent_project_id is not None:
         if parent_project_id == project_id:
             raise ValueError("a project cannot be its own parent")
@@ -1579,15 +1636,113 @@ async def set_parent_project(
                 f"project '{project_id}' has subprojects of its own — cannot make "
                 "it a subproject (subprojects are one level deep)"
             )
-    await db.execute(
-        "UPDATE projects SET parent_project_id = ? WHERE id = ?",
-        (parent_project_id, project_id),
-    )
+    sql = "UPDATE projects SET parent_project_id = ? WHERE id = ?"
+    params: list[Any] = [parent_project_id, project_id]
+    if expect_parent is not _UNSET:
+        sql += " AND COALESCE(parent_project_id, '') = ?"
+        params.append(expect_parent or "")
+    if parent_project_id is not None:
+        sql += (
+            " AND NOT EXISTS (SELECT 1 FROM projects c WHERE c.parent_project_id = ?)"
+            " AND EXISTS (SELECT 1 FROM projects p WHERE p.id = ?"
+            " AND COALESCE(p.parent_project_id, '') = '')"
+        )
+        params.extend([project_id, parent_project_id])
+    cur = await db.execute(sql, tuple(params))
     await db.commit()
+    if not cur.rowcount:
+        raise ValueError(_PROJECT_CHANGED_CONCURRENTLY)
     # 8a665a03 -- see rename_project: the REST route publishes project_parent_changed,
     # the MCP set_parent_project tool published nothing.
     _publish_projects_changed(db, "reparented")
     return await get_project(db, project_id)
+
+
+# Ids per IN (...) list. Stays well under SQLite's bound-variable limit and keeps
+# a Postgres statement small however many projects a caller names.
+_PROJECT_ID_CHUNK = 400
+
+
+def _id_chunks(ids: "list[str]") -> "list[list[str]]":
+    return [ids[i:i + _PROJECT_ID_CHUNK] for i in range(0, len(ids), _PROJECT_ID_CHUNK)]
+
+
+async def get_project_family(
+    db: aiosqlite.Connection, ids: "list[str] | tuple[str, ...] | set[str]",
+) -> dict[str, dict[str, Any]]:
+    """Return what the hierarchy looks like around each of ``ids``.
+
+    ``{id: {name, parent_project_id, status, parent_exists, child_ids}}`` for every
+    id that exists (an unknown id is simply absent). ``parent_project_id`` is the
+    stored value (``None``, ``""`` or an id). ``parent_exists`` is whether a project
+    row with that id is there: a non-empty ``parent_project_id`` with
+    ``parent_exists`` False is a dangling parent (its parent was deleted), which a
+    caller should classify as neither top-level nor a healthy subproject.
+    ``child_ids`` lists the projects whose ``parent_project_id`` is this id.
+
+    Two reads per chunk of 400 ids (rows + parents in one LEFT JOIN, then
+    children). Read-only; takes ids from the caller, never from a name.
+    """
+    wanted = list(dict.fromkeys(i for i in ids if i))
+    family: dict[str, dict[str, Any]] = {}
+    for chunk in _id_chunks(wanted):
+        ph = ", ".join("?" for _ in chunk)
+        async with db.execute(
+            "SELECT c.id AS id, c.name AS name, c.status AS status, "
+            "c.parent_project_id AS parent_project_id, p.id AS parent_row_id "
+            "FROM projects c LEFT JOIN projects p ON p.id = c.parent_project_id "
+            f"WHERE c.id IN ({ph})",
+            tuple(chunk),
+        ) as cur:
+            rows = await cur.fetchall()
+        for r in rows:
+            family[r["id"]] = {
+                "name": r["name"],
+                "parent_project_id": r["parent_project_id"],
+                "status": r["status"],
+                "parent_exists": r["parent_row_id"] is not None,
+                "child_ids": [],
+            }
+    found = list(family)
+    for chunk in _id_chunks(found):
+        ph = ", ".join("?" for _ in chunk)
+        async with db.execute(
+            "SELECT id, parent_project_id FROM projects "
+            f"WHERE parent_project_id IN ({ph}) ORDER BY id ASC",
+            tuple(chunk),
+        ) as cur:
+            rows = await cur.fetchall()
+        for r in rows:
+            family[r["parent_project_id"]]["child_ids"].append(r["id"])
+    return family
+
+
+async def get_subproject_map(
+    db: aiosqlite.Connection, parent_ids: "list[str] | tuple[str, ...] | set[str]",
+) -> dict[str, str]:
+    """Return ``{child_id: parent_id}`` for the subprojects of ``parent_ids``.
+
+    One level, and only under a parent that still exists AND is top-level: the
+    JOIN means the orphans of a deleted parent grant nothing, and a project that
+    was nested after it gained children (a two-level chain) drops out too, so a
+    caller expanding a member's scope with this fails closed. Uses
+    ``idx_projects_parent``; chunked like ``get_project_family``.
+    """
+    wanted = list(dict.fromkeys(i for i in parent_ids if i))
+    out: dict[str, str] = {}
+    for chunk in _id_chunks(wanted):
+        ph = ", ".join("?" for _ in chunk)
+        async with db.execute(
+            "SELECT c.id AS id, c.parent_project_id AS parent_project_id "
+            "FROM projects c JOIN projects p ON p.id = c.parent_project_id "
+            f"WHERE c.parent_project_id IN ({ph}) "
+            "AND (p.parent_project_id IS NULL OR p.parent_project_id = '')",
+            tuple(chunk),
+        ) as cur:
+            rows = await cur.fetchall()
+        for r in rows:
+            out[r["id"]] = r["parent_project_id"]
+    return out
 
 
 # d6bd60e0 — every table that carries a project_id FK to projects(id) and whose
@@ -2341,10 +2496,69 @@ def _is_no_such_table(exc: Exception) -> bool:
     return False
 
 
+PROJECT_CLASS_TOP = "top"
+PROJECT_CLASS_SUBPROJECT = "subproject"
+PROJECT_CLASS_ORPHAN = "orphan"
+_PROJECT_CLASSES = (PROJECT_CLASS_TOP, PROJECT_CLASS_SUBPROJECT, PROJECT_CLASS_ORPHAN)
+
+
+def _project_class(entry: dict[str, Any]) -> str:
+    """Classify a ``get_project_family`` entry: no parent is ``top``, a parent
+    that exists is ``subproject``, a parent id with no row is ``orphan``."""
+    if not entry.get("parent_project_id"):
+        return PROJECT_CLASS_TOP
+    return PROJECT_CLASS_SUBPROJECT if entry.get("parent_exists") else PROJECT_CLASS_ORPHAN
+
+
+async def _verify_delete_expectations(
+    db: aiosqlite.Connection,
+    project_ids: list[str],
+    expect: "str | dict[str, str]",
+) -> None:
+    """Refuse a delete whose projects no longer look the way the caller decided
+    on. Raises ``ValueError("project changed concurrently ...")``."""
+    if isinstance(expect, str):
+        expected = {pid: expect for pid in project_ids}
+    else:
+        expected = dict(expect)
+    bad = [c for c in expected.values() if c not in _PROJECT_CLASSES]
+    if bad:
+        raise ValueError(f"unknown project class {bad[0]!r} (expected one of {_PROJECT_CLASSES})")
+    family = await get_project_family(db, project_ids)
+    in_batch = set(project_ids)
+    for pid in project_ids:
+        entry = family.get(pid)
+        if entry is None:
+            continue  # already gone: the delete below has nothing to remove
+        want = expected.get(pid)
+        if want is not None and _project_class(entry) != want:
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: '{entry['name']}' is no longer a {want}"
+            )
+        left_behind = [c for c in entry["child_ids"] if c not in in_batch]
+        if left_behind:
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: '{entry['name']}' now has "
+                f"{len(left_behind)} subproject(s) that are not part of this delete"
+            )
+
+
 async def delete_project(
-    db: aiosqlite.Connection, project_id: "str | list[str]"
+    db: aiosqlite.Connection,
+    project_id: "str | list[str]",
+    expect: "str | dict[str, str] | None" = None,
 ) -> None:
     """Delete one or more projects and all associated data.
+
+    ``expect`` (default ``None``: no check, exactly the behavior every existing
+    caller has) is for a caller that decided whether the delete is allowed from
+    how each project sat in the hierarchy: ``"top"``, ``"subproject"`` or
+    ``"orphan"`` (a parent id whose row is gone), as one string for every id or a
+    ``{id: class}`` dict. Before anything is touched the rows are read again;
+    if any has a different class now, or has subprojects that are not themselves
+    in this call, nothing is deleted and ``ValueError("project changed
+    concurrently ...")`` is raised. The check closes the gap between the caller's
+    decision and this call, not the (much shorter) gap inside it.
 
     ``project_id`` accepts either a single id (``str``, the original shape —
     all existing callers are unaffected) or a list of ids to batch-delete
@@ -2384,6 +2598,8 @@ async def delete_project(
     project_ids = [project_id] if isinstance(project_id, str) else list(project_id)
     if not project_ids:
         return
+    if expect is not None:
+        await _verify_delete_expectations(db, project_ids, expect)
     placeholders = ", ".join("?" for _ in project_ids)
     ids_params = tuple(project_ids)
 
@@ -12627,6 +12843,18 @@ async def export_tenant_data(
     ) as cur:
         members = [_row_to_dict(r) for r in await cur.fetchall()]
 
+    # What each project-scoped member may do. Workspace-wide like the notebook below,
+    # so a project-restricted export (a scoped member downloading their data) leaves
+    # it out rather than hand over the other members' emails and rights.
+    member_policy: list[dict[str, Any]] = []
+    if _only_projects is None:
+        async with db.execute(
+            "SELECT subject, policy, updated_by, updated_at FROM member_policy "
+            "WHERE tenant_id = ? ORDER BY subject ASC",
+            (tenant_id,),
+        ) as cur:
+            member_policy = [_row_to_dict(r) for r in await cur.fetchall()]
+
     async with pdb.execute(
         "SELECT id, name, creator_human_id, decisions, created_at FROM projects ORDER BY created_at DESC",
     ) as cur:
@@ -12708,6 +12936,7 @@ async def export_tenant_data(
         "tenant": tenant_data,
         "api_tokens": tokens,
         "workspace_members": members,
+        "member_policy": member_policy,
         "workspace_notes": ws_notes,
         "workspace_decisions": ws_decisions,
         "projects": projects,
@@ -12746,6 +12975,7 @@ async def delete_tenant_records(
         ("DELETE FROM user_sessions WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM api_tokens WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM workspace_members WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM member_policy WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM oauth_tokens WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM tenant_environments WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM oauth_codes WHERE tenant_id = ?", (tenant_id,)),
@@ -14142,6 +14372,16 @@ from .workspace import (  # noqa: F401
     update_workspace_member,
     get_workspaces_for_email,
     get_scoped_project_ids_for_member,
+    # Member policy: per-workspace default + per-person override of what a
+    # project-scoped member may do (member_policy table)
+    MEMBER_POLICY_DEFAULT_SUBJECT,
+    MEMBER_POLICY_CHANGED_EVENT,
+    get_member_policy_rows,
+    set_member_policy_default,
+    set_member_policy_override,
+    clear_member_policy_override,
+    list_member_policy_overrides,
+    get_member_roles,
 )
 
 # 5dfe34b2 — manual-issue content-screening extension. Imported last (after

@@ -1470,12 +1470,26 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     github_access TEXT NOT NULL DEFAULT 'read'
         CHECK (github_access IN ('none','read','write')),
     -- d116642e: project-level invites foundation. NULL = workspace-wide
-    -- (current behavior); set = project-scoped (listing-only scoping for now).
-    -- Airtight per-request enforcement deferred (pin b11c7cf6).
+    -- (current behavior), set = project-scoped (that project and its
+    -- subprojects, with what they may do inside it set by member_policy below).
     project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT ({_TS}),
     joined_at TEXT
+);
+
+-- Capability policy for project-scoped members. tenant_id is the workspace
+-- OWNER's tenant id, subject is '*' for the workspace default and LOWER(email)
+-- for one person's override. policy is a JSON object of {{capability_id: bool}}.
+-- Created here (main auth DB only) and never by ALTER: this literal runs on
+-- every boot. Mirrors the SQLite literal in db/__init__.py.
+CREATE TABLE IF NOT EXISTS member_policy (
+    tenant_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    policy TEXT NOT NULL DEFAULT '{{}}',
+    updated_by TEXT,
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    PRIMARY KEY (tenant_id, subject)
 );
 
 -- v2.1 dark — per-tenant named environments, not exposed at launch
@@ -1915,11 +1929,9 @@ async def _migrate_pg_workspace_members_project_scope(conn: PostgresConnection) 
     """d116642e — project-level invites foundation.
 
     Adds a nullable ``project_id`` to ``workspace_members``: NULL = workspace-wide
-    member (current behavior), set = project-scoped member (listing-only scoping
-    for now). ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
-    db._migrate_workspace_members_project_scope. Airtight per-request access
-    enforcement is intentionally deferred pending the product decision (pin
-    b11c7cf6).
+    member (current behavior), set = project-scoped member (that project plus
+    its subprojects). ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_workspace_members_project_scope.
     """
     await conn.executescript(
         "ALTER TABLE workspace_members ADD COLUMN IF NOT EXISTS project_id TEXT"

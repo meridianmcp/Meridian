@@ -1571,11 +1571,11 @@ async def _migrate_workspace_members_project_scope(db: aiosqlite.Connection) -> 
 
     Adds a nullable ``project_id`` to ``workspace_members``:
       - NULL  = workspace-wide member (current behavior, sees all projects)
-      - set   = project-scoped member (listing-only scoping for now)
+      - set   = project-scoped member (that project plus its subprojects)
 
-    Backward compatible: existing rows keep NULL and are unaffected. This is
-    the safe foundation only — airtight per-request access enforcement is
-    intentionally deferred pending the open product decision (pin b11c7cf6).
+    Backward compatible: existing rows keep NULL and are unaffected. Request
+    enforcement and what a scoped member may do live outside this migration
+    (the scope middleware and the member_policy table).
     """
     await _migrate_add_column_if_missing(
         db, "workspace_members", "project_id", "TEXT",
