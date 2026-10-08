@@ -52,7 +52,7 @@ jobs:
           # launcher stub there (run 37719217133: 170 hook tests got 'no installed
           # distributions' in UTF-16). The dev machine has no such stub. Move it aside on this
           # throwaway VM so 'bash' resolves to Git Bash through PATH.
-          $stub = Join-Path $env:SystemRoot 'System32ash.exe'
+          $stub = Join-Path $env:SystemRoot 'System32/bash.exe'
           if (Test-Path $stub) {
             try {
               takeown /f $stub | Out-Null
