@@ -1,0 +1,61 @@
+name: Windows full test run
+
+# On-demand Windows run of the whole suite. The owner's dev machine is Windows, the canonical
+# CI (test.yml) is Linux, and a few failures only show up on Windows (asyncio policy leaks into
+# the Playwright tests, console-window behaviour, path handling). A laptop run of the full suite
+# takes over an hour and exhausts memory on a loaded machine; a hosted runner does not.
+#
+# Not wired to dev pushes or to auto-promote (it takes 60+ minutes): trigger it by hand
+# (Actions -> Windows full test run -> Run workflow, or `gh workflow run windows-tests.yml
+# --ref <branch>`), or by pushing the branch `ci/windows-suite`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_ux:
+        description: 'Also run tests/test_demo_ux.py (Playwright) as a separate step'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+  push:
+    branches: [ci/windows-suite]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONDONTWRITEBYTECODE: 1
+  PYTHONUTF8: 1
+
+jobs:
+  windows-suite:
+    runs-on: windows-latest
+    # The full suite took ~70 minutes on a 2-worker laptop run; leave room, but never hang forever.
+    timeout-minutes: 150
+    env:
+      # windows-latest has 4 vCPUs; run_tests.py caps at 8 by default.
+      MERIDIAN_TEST_MAX_WORKERS: '4'
+      MERIDIAN_TEST_WALL_TIMEOUT_SECONDS: '7200'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          pixi-version: v0.79.0
+          cache: false
+      - run: pixi install
+      - name: Install Playwright Chromium
+        run: pixi run python -m playwright install chromium
+      # Same selection as the local `pixi run test` task, minus the Playwright file (own step below).
+      - name: Full suite (xdist, then the serial and subprocess-isolated groups)
+        shell: bash
+        run: |
+          set -o pipefail
+          pixi run python scripts/run_tests.py tests/ -q --tb=short -rfE --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py -m "not subprocess_isolated"
+      - name: Rate-limit module (serial, wall-clock sensitive)
+        if: always()
+        run: pixi run python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short -rfE
+      - name: Subprocess-isolated tests (serial)
+        if: always()
+        run: pixi run python scripts/run_tests.py --serial tests/ -q --tb=short -rfE -m subprocess_isolated
+      - name: Demo UX (Playwright)
+        if: always() && inputs.include_ux != 'false'
+        run: pixi run python -m pytest tests/test_demo_ux.py -q --tb=short -rfE -n 2
