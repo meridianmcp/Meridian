@@ -10,6 +10,7 @@ from fastapi.responses import Response
 
 from .._deps import _db, _get_tenant_from_request, _require_project_in_scope
 from .. import db as db_module
+from ..db import workspace as workspace_db
 
 router = APIRouter()
 
@@ -48,10 +49,21 @@ async def _member_policy_owner_context(request: Request) -> tuple[str, str, Any]
 
 
 def _decode_policy_row(raw: str | None) -> dict[str, Any]:
-    if not raw:
+    if raw is None:
         return {}
     value = json.loads(raw)
-    return value if isinstance(value, dict) else {}
+    if not isinstance(value, dict):
+        raise ValueError("stored member policy must be a JSON object")
+    return value
+
+
+def _is_policy_reset(body: dict[str, Any]) -> bool:
+    """Recognize the explicit reset operation without accepting mixed bodies."""
+    if "reset" not in body:
+        return False
+    if set(body) == {"reset"} and body["reset"] is True:
+        return True
+    raise HTTPException(status_code=400, detail="reset must be the only field and true")
 
 
 def _policy_patch(body: dict[str, Any], *, allow_null: bool) -> dict[str, bool | None]:
@@ -86,14 +98,17 @@ def _stored_policy_view(raw: str | None) -> dict[str, bool | None]:
     }
 
 
-async def _member_policy_view(
-    auth_db: Any, tenant_id: str, email: str, *, member_id: str | None = None,
-    role: str | None = None, project_id: str | None = None,
+def _member_policy_view_from_rows(
+    email: str,
+    rows: dict[str, str | None],
+    roles: list[tuple[str, str | None]],
+    *,
+    member_id: str | None = None,
+    role: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     from .. import member_policy
 
-    rows = await db_module.get_member_policy_rows(auth_db, tenant_id, email)
-    roles = await db_module.get_member_roles(auth_db, tenant_id, email)
     effective = member_policy.compute_effective_policy(
         rows.get("default"), rows.get("override"), roles,
     )
@@ -114,6 +129,31 @@ async def _member_policy_view(
     if project_id is not None:
         result["project_id"] = project_id
     return result
+
+
+async def _member_policy_view(
+    auth_db: Any, tenant_id: str, email: str, *, member_id: str | None = None,
+    role: str | None = None, project_id: str | None = None,
+) -> dict[str, Any]:
+    rows = await db_module.get_member_policy_rows(auth_db, tenant_id, email)
+    roles = await db_module.get_member_roles(auth_db, tenant_id, email)
+    return _member_policy_view_from_rows(
+        email, rows, roles, member_id=member_id, role=role, project_id=project_id,
+    )
+
+
+def _raise_policy_patch_error(error: Exception) -> None:
+    if isinstance(error, workspace_db.CorruptMemberPolicyRow):
+        raise HTTPException(
+            status_code=409,
+            detail='Stored policy is corrupt; send {"reset":true} to safely reset it',
+        ) from error
+    if isinstance(error, workspace_db.ConcurrentMemberPolicyUpdate):
+        raise HTTPException(
+            status_code=409,
+            detail="Policy changed repeatedly during this update; retry the patch",
+        ) from error
+    raise error
 
 
 async def _require_policy_member(
@@ -142,28 +182,45 @@ async def get_workspace_member_policy(request: Request) -> dict[str, Any]:
     defaults = await db_module.get_member_policy_rows(auth_db, tenant_id, None)
     raw_default = defaults.get("default")
     default_policy = _stored_policy_view(raw_default)
-    members = await db_module.list_workspace_members(auth_db, tenant_id)
-    overrides = await db_module.list_member_policy_overrides(auth_db, tenant_id)
-    seen: set[str] = set()
-    result_overrides = []
+    members = await workspace_db.list_member_policy_members(auth_db, tenant_id)
+    grouped: dict[str, dict[str, Any]] = {}
     for member in members:
         email = str(member.get("email") or "").strip().casefold()
-        if (
-            member.get("joined_at") is None
-            or not member.get("project_id")
-            or not email
-            or email in seen
-            or email not in overrides
-        ):
+        if not email:
             continue
-        seen.add(email)
-        result_overrides.append(
-            await _member_policy_view(
-                auth_db, tenant_id, email, member_id=str(member["id"]),
-                role=str(member.get("role") or "member"),
-                project_id=str(member["project_id"]),
-            )
-        )
+        entry = grouped.get(email)
+        if entry is None:
+            entry = {
+                "member_id": None,
+                "role": None,
+                "project_id": None,
+                "override": None,
+                "roles": [],
+            }
+            grouped[email] = entry
+        if member.get("row_kind") == "member":
+            if entry["member_id"] is None:
+                entry["member_id"] = str(member["member_id"])
+                entry["role"] = str(member.get("role") or "member")
+                entry["project_id"] = str(member["project_id"])
+                entry["override"] = member.get("override")
+        else:
+            entry["roles"].append((
+                str(member.get("policy_role") or "member"),
+                member.get("policy_project_id"),
+            ))
+    result_overrides = []
+    for email, entry in grouped.items():
+        if entry["member_id"] is None:
+            continue
+        result_overrides.append(_member_policy_view_from_rows(
+            email,
+            {"default": raw_default, "override": entry["override"]},
+            entry["roles"],
+            member_id=entry["member_id"],
+            role=entry["role"],
+            project_id=entry["project_id"],
+        ))
     return {
         "workspace_tenant_id": tenant_id,
         "default_policy": default_policy,
@@ -187,20 +244,20 @@ async def patch_workspace_member_policy(
 ) -> dict[str, Any]:
     """Patch explicit workspace defaults; null clears a key to its built-in value."""
     tenant_id, owner_email, auth_db = await _member_policy_owner_context(request)
+    if _is_policy_reset(body):
+        await db_module.set_member_policy_default(auth_db, tenant_id, {}, owner_email)
+        defaults = await db_module.get_member_policy_rows(auth_db, tenant_id, None)
+        return {
+            "workspace_tenant_id": tenant_id,
+            "default_policy": _stored_policy_view(defaults.get("default")),
+        }
     patch = _policy_patch(body, allow_null=True)
-    rows = await db_module.get_member_policy_rows(auth_db, tenant_id, None)
     try:
-        merged = _decode_policy_row(rows.get("default"))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        merged = {}
-    for capability, value in patch.items():
-        if value is None:
-            merged.pop(capability, None)
-        else:
-            merged[capability] = value
-    await db_module.set_member_policy_default(
-        auth_db, tenant_id, merged, owner_email,
-    )
+        await workspace_db.patch_member_policy_default(
+            auth_db, tenant_id, patch, owner_email,
+        )
+    except (workspace_db.CorruptMemberPolicyRow, workspace_db.ConcurrentMemberPolicyUpdate) as exc:
+        _raise_policy_patch_error(exc)
     defaults = await db_module.get_member_policy_rows(auth_db, tenant_id, None)
     return {
         "workspace_tenant_id": tenant_id,
@@ -230,25 +287,22 @@ async def patch_workspace_member_policy_override(
     tenant_id, owner_email, auth_db = await _member_policy_owner_context(request)
     member = await _require_policy_member(auth_db, tenant_id, member_id)
     email = str(member["email"]).strip().casefold()
-    patch = _policy_patch(body, allow_null=True)
-    rows = await db_module.get_member_policy_rows(auth_db, tenant_id, email)
-    try:
-        merged = _decode_policy_row(rows.get("override"))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        merged = {}
-    for capability, value in patch.items():
-        if value is None:
-            merged.pop(capability, None)
-        else:
-            merged[capability] = value
-    if merged:
-        await db_module.set_member_policy_override(
-            auth_db, tenant_id, email, merged, owner_email,
-        )
-    else:
+    if _is_policy_reset(body):
         await db_module.clear_member_policy_override(
             auth_db, tenant_id, email, updated_by=owner_email,
         )
+        return await _member_policy_view(
+            auth_db, tenant_id, email, member_id=member_id,
+            role=str(member.get("role") or "member"),
+            project_id=str(member["project_id"]),
+        )
+    patch = _policy_patch(body, allow_null=True)
+    try:
+        await workspace_db.patch_member_policy_override(
+            auth_db, tenant_id, email, patch, owner_email,
+        )
+    except (workspace_db.CorruptMemberPolicyRow, workspace_db.ConcurrentMemberPolicyUpdate) as exc:
+        _raise_policy_patch_error(exc)
     return await _member_policy_view(
         auth_db, tenant_id, email, member_id=member_id,
         role=str(member.get("role") or "member"),

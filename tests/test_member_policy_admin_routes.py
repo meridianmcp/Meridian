@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import meridian.server  # noqa: F401
 from meridian import db as db_module
+from meridian.db import workspace as workspace_db
 
 
 def _hosted_client(monkeypatch, tmp_path):
@@ -129,6 +130,133 @@ def test_policy_routes_are_owner_only_and_member_ids_are_workspace_scoped(monkey
         assert client.patch(
             url, headers=owner, json={"policy": {"unknown_capability": True}},
         ).status_code == 400
+
+
+def test_policy_summary_includes_inherited_members_with_fixed_query_count(monkeypatch, tmp_path):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_policy_workspace(client.app.state.db))
+        db = client.app.state.db
+        member = asyncio.run(db_module.upsert_tenant(db, "policy-second@example.com"))
+        project = asyncio.run(db_module.create_project(db, "policy-second-project"))
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        asyncio.run(db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, joined_at, project_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("policy-second-member", setup["owner_id"], member["email"], "member", "none", now, project["id"]),
+        ))
+        asyncio.run(db.commit())
+        asyncio.run(db_module.set_member_policy_default(
+            db, setup["owner_id"], {"write_project": False}, "policy-owner@example.com",
+        ))
+
+        row_reads = 0
+        role_reads = 0
+        list_reads = 0
+        original_rows = db_module.get_member_policy_rows
+        original_roles = db_module.get_member_roles
+        original_list = workspace_db.list_member_policy_members
+
+        async def count_rows(*args, **kwargs):
+            nonlocal row_reads
+            row_reads += 1
+            return await original_rows(*args, **kwargs)
+
+        async def count_roles(*args, **kwargs):
+            nonlocal role_reads
+            role_reads += 1
+            return await original_roles(*args, **kwargs)
+
+        class CountingConnection:
+            def __init__(self, inner):
+                self.inner = inner
+                self.statements = []
+
+            def execute(self, sql, params=()):
+                self.statements.append(sql)
+                return self.inner.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        async def count_list(database, tenant_id):
+            nonlocal list_reads
+            list_reads += 1
+            counted = CountingConnection(database)
+            result = await original_list(counted, tenant_id)
+            assert len(counted.statements) == 1
+            return result
+
+        monkeypatch.setattr(db_module, "get_member_policy_rows", count_rows)
+        monkeypatch.setattr(db_module, "get_member_roles", count_roles)
+        monkeypatch.setattr(workspace_db, "list_member_policy_members", count_list)
+        summary = client.get(
+            "/workspace/member-policy",
+            headers={"Authorization": f"Bearer {setup['owner_token']}"},
+        )
+        assert summary.status_code == 200, summary.text
+        entries = summary.json()["overrides"]
+        assert {entry["email"] for entry in entries} == {
+            "policy-scoped@example.com", "policy-second@example.com",
+        }
+        for entry in entries:
+            assert entry["policy"]["write_project"] is None
+            assert entry["effective"]["capabilities"]["write_project"] is False
+            assert entry["effective"]["sources"]["write_project"] == "default"
+        assert row_reads == 1  # workspace default, independent of member count
+        assert role_reads == 0
+        assert list_reads == 1
+
+
+def test_corrupt_policy_patch_fails_closed_and_explicit_reset_recovers(monkeypatch, tmp_path):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_policy_workspace(client.app.state.db))
+        db = client.app.state.db
+        asyncio.run(db.execute(
+            "INSERT INTO member_policy (tenant_id, subject, policy, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (setup["owner_id"], "*", "{broken", "2026-01-01T00:00:00+00:00"),
+        ))
+        asyncio.run(db.execute(
+            "INSERT INTO member_policy (tenant_id, subject, policy, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (setup["owner_id"], "policy-scoped@example.com", "[false]", "2026-01-01T00:00:00+00:00"),
+        ))
+        asyncio.run(db.commit())
+        owner = {"Authorization": f"Bearer {setup['owner_token']}"}
+
+        default_patch = client.patch(
+            "/workspace/member-policy", headers=owner,
+            json={"policy": {"write_project": False}},
+        )
+        assert default_patch.status_code == 409, default_patch.text
+        member_url = f"/workspace/members/{setup['member_id']}/policy"
+        override_patch = client.patch(
+            member_url, headers=owner,
+            json={"policy": {"write_project": False}},
+        )
+        assert override_patch.status_code == 409, override_patch.text
+        assert asyncio.run(db_module.get_member_policy_rows(
+            db, setup["owner_id"], "policy-scoped@example.com",
+        )) == {"default": "{broken", "override": "[false]"}
+
+        default_reset = client.patch(
+            "/workspace/member-policy", headers=owner, json={"reset": True},
+        )
+        assert default_reset.status_code == 200, default_reset.text
+        assert default_reset.json()["default_policy"]["write_project"] is None
+        assert asyncio.run(db_module.get_member_policy_rows(
+            db, setup["owner_id"], None,
+        ))["default"] == "{}"
+
+        override_reset = client.patch(
+            member_url, headers=owner, json={"reset": True},
+        )
+        assert override_reset.status_code == 200, override_reset.text
+        assert override_reset.json()["policy"]["write_project"] is None
+        assert asyncio.run(db_module.get_member_policy_rows(
+            db, setup["owner_id"], "policy-scoped@example.com",
+        ))["override"] is None
 
 
 def test_role_clamp_cannot_be_overridden_by_member_policy(monkeypatch, tmp_path):

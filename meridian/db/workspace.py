@@ -3472,6 +3472,14 @@ MEMBER_POLICY_DEFAULT_SUBJECT = "*"
 MEMBER_POLICY_CHANGED_EVENT = "member_policy_changed"
 
 
+class CorruptMemberPolicyRow(ValueError):
+    """A partial policy edit cannot safely merge with malformed stored JSON."""
+
+
+class ConcurrentMemberPolicyUpdate(RuntimeError):
+    """A policy row kept changing while a bounded compare-and-set retried."""
+
+
 def _member_policy_subject(email: str | None) -> str:
     return (email or "").strip().lower()
 
@@ -3714,6 +3722,186 @@ async def list_member_policy_overrides(
     ) as cur:
         rows = await cur.fetchall()
     return {r["subject"]: r["policy"] for r in rows}
+
+
+async def list_member_policy_members(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> list[dict[str, Any]]:
+    """Return scoped member rows, their overrides and all accepted role rows.
+
+    One bounded query supplies the member-policy summary endpoint. Joining the
+    accepted memberships here preserves the most-restrictive role clamp without
+    issuing a pair of policy/role queries for every member.
+    """
+    async with db.execute(
+        "SELECT 'member' AS row_kind, scoped.id AS member_id, "
+        "scoped.email AS email, scoped.role AS role, "
+        "scoped.project_id AS project_id, NULL AS policy_role, "
+        "NULL AS policy_project_id, overrides.policy AS override_policy "
+        "FROM workspace_members AS scoped "
+        "LEFT JOIN member_policy AS overrides "
+        "ON overrides.tenant_id = scoped.tenant_id "
+        "AND overrides.subject = LOWER(scoped.email) "
+        "WHERE scoped.tenant_id = ? AND scoped.joined_at IS NOT NULL "
+        "AND scoped.project_id IS NOT NULL "
+        "UNION ALL "
+        "SELECT 'role' AS row_kind, NULL AS member_id, roles.email AS email, "
+        "NULL AS role, NULL AS project_id, roles.role AS policy_role, "
+        "roles.project_id AS policy_project_id, NULL AS override_policy "
+        "FROM workspace_members AS roles "
+        "WHERE roles.tenant_id = ? AND roles.joined_at IS NOT NULL "
+        "AND LOWER(roles.email) IN ("
+        "SELECT DISTINCT LOWER(scoped.email) FROM workspace_members AS scoped "
+        "WHERE scoped.tenant_id = ? AND scoped.joined_at IS NOT NULL "
+        "AND scoped.project_id IS NOT NULL) "
+        "ORDER BY email ASC, row_kind ASC, member_id ASC, policy_project_id ASC",
+        (tenant_id, tenant_id, tenant_id),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [
+        {
+            "row_kind": row["row_kind"],
+            "member_id": row["member_id"],
+            "email": row["email"],
+            "role": row["role"],
+            "project_id": row["project_id"],
+            "policy_role": row["policy_role"],
+            "policy_project_id": row["policy_project_id"],
+            "override": row["override_policy"],
+        }
+        for row in rows
+    ]
+
+
+async def _patch_member_policy_row(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    subject: str,
+    patch: dict[str, bool | None],
+    updated_by: str | None,
+    *,
+    delete_empty: bool,
+) -> dict[str, Any]:
+    """Atomically merge a partial policy patch using compare-and-set retries.
+
+    The conditional UPDATE/DELETE and conflict-safe INSERT are single-statement
+    mutations on both SQLite and Postgres. A concurrent patch therefore retries
+    from the newer JSON row instead of replacing another request's changes.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    if not isinstance(patch, dict) or not patch:
+        raise ValueError("policy patch must be a non-empty object")
+    if any(not isinstance(value, bool) and value is not None for value in patch.values()):
+        raise ValueError("policy patch values must be booleans or null")
+
+    for _attempt in range(8):
+        before = await _fetch_member_policy_text(db, tenant_id, subject)
+        if before is None:
+            merged: dict[str, Any] = {}
+        else:
+            try:
+                decoded = json.loads(before)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CorruptMemberPolicyRow(
+                    f"stored policy row for {subject!r} is not valid JSON"
+                ) from exc
+            if not isinstance(decoded, dict):
+                raise CorruptMemberPolicyRow(
+                    f"stored policy row for {subject!r} is not a JSON object"
+                )
+            merged = decoded
+
+        for capability, value in patch.items():
+            if value is None:
+                merged.pop(capability, None)
+            else:
+                merged[capability] = value
+
+        if delete_empty and not merged:
+            if before is None:
+                return {
+                    "tenant_id": tenant_id, "subject": subject, "policy": None,
+                    "previous": None, "updated_by": updated_by,
+                    "updated_at": None, "audited": False,
+                }
+            cur = await db.execute(
+                "DELETE FROM member_policy WHERE tenant_id = ? AND subject = ? "
+                "AND policy = ?",
+                (tenant_id, subject, before),
+            )
+            await db.commit()
+            if not cur.rowcount:
+                continue
+            audited = await _audit_member_policy_change(
+                db, tenant_id, subject, updated_by, before, None,
+            )
+            return {
+                "tenant_id": tenant_id, "subject": subject, "policy": None,
+                "previous": before, "updated_by": updated_by,
+                "updated_at": None, "audited": audited,
+            }
+
+        after = _canonical_policy_json(merged)
+        now = datetime.now(timezone.utc).isoformat()
+        if before is None:
+            cur = await db.execute(
+                "INSERT INTO member_policy "
+                "(tenant_id, subject, policy, updated_by, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT (tenant_id, subject) DO NOTHING",
+                (tenant_id, subject, after, updated_by, now),
+            )
+        else:
+            cur = await db.execute(
+                "UPDATE member_policy SET policy = ?, updated_by = ?, updated_at = ? "
+                "WHERE tenant_id = ? AND subject = ? AND policy = ?",
+                (after, updated_by, now, tenant_id, subject, before),
+            )
+        await db.commit()
+        if not cur.rowcount:
+            continue
+        audited = await _audit_member_policy_change(
+            db, tenant_id, subject, updated_by, before, after,
+        )
+        return {
+            "tenant_id": tenant_id, "subject": subject, "policy": after,
+            "previous": before, "updated_by": updated_by,
+            "updated_at": now, "audited": audited,
+        }
+
+    raise ConcurrentMemberPolicyUpdate(
+        f"member policy row {subject!r} changed repeatedly during partial update"
+    )
+
+
+async def patch_member_policy_default(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    patch: dict[str, bool | None],
+    updated_by: str | None,
+) -> dict[str, Any]:
+    """Atomically merge a partial workspace-default policy update."""
+    return await _patch_member_policy_row(
+        db, tenant_id, MEMBER_POLICY_DEFAULT_SUBJECT, patch, updated_by,
+        delete_empty=False,
+    )
+
+
+async def patch_member_policy_override(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+    patch: dict[str, bool | None],
+    updated_by: str | None,
+) -> dict[str, Any]:
+    """Atomically merge a partial per-member policy update."""
+    subject = _member_policy_subject(email)
+    if not subject or subject == MEMBER_POLICY_DEFAULT_SUBJECT:
+        raise ValueError("a member policy override needs the member's email")
+    return await _patch_member_policy_row(
+        db, tenant_id, subject, patch, updated_by, delete_empty=True,
+    )
 
 
 async def get_member_roles(

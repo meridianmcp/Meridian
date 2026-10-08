@@ -12,6 +12,7 @@ TEST_DATABASE_URL). Nothing here reads a row with the SQLite-only API.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -162,6 +163,63 @@ async def test_unparseable_stored_json_is_returned_verbatim(anydb):
     }
 
 
+@pytest.mark.asyncio
+async def test_partial_policy_patches_reject_corrupt_rows(anydb):
+    db = anydb
+    tid = await _tenant(db)
+    await db.execute(
+        "INSERT INTO member_policy (tenant_id, subject, policy, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        (tid, "*", "{broken", "2026-01-01T00:00:00+00:00"),
+    )
+    await db.execute(
+        "INSERT INTO member_policy (tenant_id, subject, policy, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        (tid, "ann@example.com", "[false]", "2026-01-01T00:00:00+00:00"),
+    )
+    await db.commit()
+
+    with pytest.raises(ws_module.CorruptMemberPolicyRow):
+        await ws_module.patch_member_policy_default(
+            db, tid, {"write_project": False}, "owner@example.com",
+        )
+    with pytest.raises(ws_module.CorruptMemberPolicyRow):
+        await ws_module.patch_member_policy_override(
+            db, tid, "ann@example.com", {"write_project": False}, "owner@example.com",
+        )
+    rows = await db_module.get_member_policy_rows(db, tid, "ann@example.com")
+    assert rows == {"default": "{broken", "override": "[false]"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_partial_policy_patches_keep_both_changes(anydb):
+    db = anydb
+    tid = await _tenant(db)
+    await asyncio.gather(
+        ws_module.patch_member_policy_default(
+            db, tid, {"write_project": False}, "owner@example.com",
+        ),
+        ws_module.patch_member_policy_default(
+            db, tid, {"delete_project": True}, "owner@example.com",
+        ),
+    )
+    await asyncio.gather(
+        ws_module.patch_member_policy_override(
+            db, tid, "ann@example.com", {"write_project": False}, "owner@example.com",
+        ),
+        ws_module.patch_member_policy_override(
+            db, tid, "ann@example.com", {"delete_project": True}, "owner@example.com",
+        ),
+    )
+    rows = await db_module.get_member_policy_rows(db, tid, "ann@example.com")
+    assert json.loads(rows["default"]) == {
+        "delete_project": True, "write_project": False,
+    }
+    assert json.loads(rows["override"]) == {
+        "delete_project": True, "write_project": False,
+    }
+
+
 class _CountingConn:
     """Forwards to the real connection and remembers every statement."""
 
@@ -188,6 +246,35 @@ async def test_policy_rows_and_roles_are_one_query_each(anydb):
     counting.statements.clear()
     await db_module.get_member_roles(counting, tid, "ann@example.com")
     assert len(counting.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_member_policy_summary_context_is_one_query_and_role_complete(anydb):
+    db = anydb
+    tid = await _tenant(db)
+    p1 = await _project(db, "policy-summary-p1")
+    p2 = await _project(db, "policy-summary-p2")
+    ann1 = await _member(db, tid, "ann@example.com", "admin", p1)
+    ann2 = await _member(db, tid, "Ann@Example.com", "viewer", p2)
+    bob = await _member(db, tid, "bob@example.com", "member", p1)
+    await db_module.set_member_policy_override(
+        db, tid, "ann@example.com", {"write_project": True}, "owner@example.com",
+    )
+
+    counting = _CountingConn(db)
+    rows = await ws_module.list_member_policy_members(counting, tid)
+    assert len(counting.statements) == 1
+    member_rows = [row for row in rows if row["row_kind"] == "member"]
+    role_rows = [row for row in rows if row["row_kind"] == "role"]
+    assert {row["member_id"] for row in member_rows} == {
+        ann1["id"], ann2["id"], bob["id"],
+    }
+    assert {row["email"].casefold() for row in member_rows} == {
+        "ann@example.com", "bob@example.com",
+    }
+    assert {row["policy_role"] for row in role_rows} == {"admin", "viewer", "member"}
+    ann_override_rows = [row for row in member_rows if row["email"] == "ann@example.com"]
+    assert all(row["override"] == '{"write_project":true}' for row in ann_override_rows)
 
 
 @pytest.mark.asyncio
