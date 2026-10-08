@@ -23,7 +23,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import aiosqlite
 
@@ -2635,8 +2635,12 @@ async def _verify_delete_expectations(
     db: aiosqlite.Connection,
     project_ids: list[str],
     expect: "str | dict[str, str | dict[str, Any]]",
-) -> None:
-    """Refuse a delete if its observed hierarchy snapshot is stale."""
+) -> list[str]:
+    """Validate existing projects and return the subset that still exists.
+
+    Missing ids are an idempotent expected delete. Existing rows still have
+    their complete hierarchy snapshot checked so a stale delete cannot pass.
+    """
     if isinstance(expect, str):
         expected = {pid: expect for pid in project_ids}
     else:
@@ -2649,12 +2653,28 @@ async def _verify_delete_expectations(
     ]
     if bad:
         raise ValueError(f"unknown project class {bad[0]!r} (expected one of {_PROJECT_CLASSES})")
+    for pid, value in expected.items():
+        if isinstance(value, str):
+            continue
+        if not isinstance(value, dict) or not {
+            "parent_project_id", "parent_exists", "child_ids"
+        }.issubset(value):
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid hierarchy expectation for '{pid}'"
+            )
+        if not isinstance(value["child_ids"], (list, tuple, set)):
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid child membership for '{pid}'"
+            )
+        _project_class(value)
     family = await get_project_family(db, project_ids)
     in_batch = set(project_ids)
+    existing_ids: list[str] = []
     for pid in project_ids:
         entry = family.get(pid)
         if entry is None:
-            raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: project '{pid}' no longer exists")
+            continue
+        existing_ids.append(pid)
         want = expected[pid]
         if isinstance(want, str):
             want_class = want
@@ -2687,6 +2707,7 @@ async def _verify_delete_expectations(
                 f"{_PROJECT_CHANGED_CONCURRENTLY}: '{entry['name']}' now has "
                 f"{len(left_behind)} subproject(s) that are not part of this delete"
             )
+    return existing_ids
 
 
 async def delete_project(
@@ -2701,15 +2722,26 @@ async def delete_project(
     async with _project_hierarchy_write_guard(db):
         if expect is None:
             # Keep the legacy no-expect behavior for existing callers.
-            await _delete_project_data(db, project_ids)
+            nested = bool(getattr(db, "in_transaction", False))
+            await _delete_project_data(db, project_ids, finalize=not nested)
+            if _defer_project_deleted_notifications(db, project_ids):
+                return
             _notify_deleted_projects(db, project_ids)
             return
         async with _expected_project_delete_transaction(db):
-            await _verify_delete_expectations(db, project_ids, expect)
+            existing_ids = await _verify_delete_expectations(db, project_ids, expect)
+            if not existing_ids:
+                return
             await _delete_project_data(
-                db, project_ids, finalize=False, savepoint_table_errors=True
+                db, existing_ids, finalize=False, savepoint_table_errors=True
             )
-    _notify_deleted_projects(db, project_ids)
+            register_after_commit = getattr(db, "add_after_commit_callback", None)
+            deferred = callable(register_after_commit) and register_after_commit(
+                lambda: _notify_deleted_projects(db, existing_ids)
+            )
+    if deferred or _defer_project_deleted_notifications(db, existing_ids):
+        return
+    _notify_deleted_projects(db, existing_ids)
 
 
 def _notify_deleted_projects(db: aiosqlite.Connection, project_ids: list[str]) -> None:
@@ -2718,6 +2750,50 @@ def _notify_deleted_projects(db: aiosqlite.Connection, project_ids: list[str]) -
         _invalidate_sprint_items_cache(_pid)
         _publish_project_event(_pid, "project_deleted", {})
     _publish_projects_changed(db, "deleted")
+
+
+def _defer_project_deleted_notifications(
+    db: aiosqlite.Connection, project_ids: list[str]
+) -> bool:
+    """Defer invalidations to the outer commit when one is observable."""
+    callback = lambda: _notify_deleted_projects(db, list(project_ids))
+    register_after_commit = getattr(db, "add_after_commit_callback", None)
+    if callable(register_after_commit) and register_after_commit(callback):
+        return True
+    if not bool(getattr(db, "in_transaction", False)):
+        return False
+
+    # aiosqlite has no transaction callback API. Wrap its public commit and
+    # rollback methods once per connection so callers using the existing API
+    # cannot publish a delete event before their transaction is durable.
+    state = getattr(db, "_meridian_after_commit_state", None)
+    if state is None:
+        callbacks: list[Callable[[], None]] = []
+        state = {"callbacks": callbacks}
+        setattr(db, "_meridian_after_commit_state", state)
+        commit = db.commit
+        rollback = db.rollback
+
+        async def commit_with_callbacks() -> None:
+            pending_count = len(callbacks)
+            pending = callbacks[:pending_count]
+            await commit()
+            del callbacks[:pending_count]
+            for after_commit in pending:
+                try:
+                    after_commit()
+                except Exception:  # noqa: BLE001 - committed data stays committed
+                    _log.exception("SQLite after-commit callback failed")
+
+        async def rollback_without_callbacks() -> None:
+            pending_count = len(callbacks)
+            await rollback()
+            del callbacks[:pending_count]
+
+        db.commit = commit_with_callbacks
+        db.rollback = rollback_without_callbacks
+    state["callbacks"].append(callback)
+    return True
 
 
 async def _delete_project_data(

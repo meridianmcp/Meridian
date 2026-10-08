@@ -709,9 +709,17 @@ async def test_delete_project_expect_rejects_an_unknown_class(anydb):
 @pytest.mark.asyncio
 async def test_delete_project_expect_on_an_already_deleted_id_is_a_noop(anydb):
     db = anydb
-    p = await _project(db, "expg-p")
-    await db_module.delete_project(db, p)
-    await db_module.delete_project(db, p, expect="top")  # nothing to classify, nothing to delete
+    deleted = await _project(db, "expg-deleted")
+    live = await _project(db, "expg-live")
+    await db_module.delete_project(db, deleted)
+    await db_module.delete_project(db, deleted, expect="top")
+    await db_module.delete_project(
+        db,
+        [deleted, live],
+        expect={deleted: "top", live: "top"},
+    )
+    async with db.execute("SELECT id FROM projects WHERE id = ?", (live,)) as cur:
+        assert await cur.fetchone() is None
 
 
 # ---------------------------------------------------------------------------
