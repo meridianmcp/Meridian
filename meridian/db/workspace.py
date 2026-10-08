@@ -163,8 +163,12 @@ async def get_workspace_notes(
     clauses: list[str] = []
     params: list[Any] = []
     if tag:
-        clauses.append("tags LIKE ?")
-        params.append(f"%{tag}%")
+        # Case-insensitive on both engines: SQLite's LIKE is for ASCII, but
+        # Postgres' is not. The workspace index (0b0b24d8) lists a note tagged
+        # 'Policy' as policy-tagged and prints get_workspace_notes(tag="policy")
+        # as the call that returns it, so that call has to find it on Postgres.
+        clauses.append("LOWER(tags) LIKE ?")
+        params.append(f"%{tag.lower()}%")
     scope, scope_params = _ws_tenant_clause(tenant_id)
     if scope:
         clauses.append(scope)

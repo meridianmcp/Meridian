@@ -21,6 +21,7 @@ from .._deps import (
 from .. import db as db_module
 from .. import goal_md as goal_md_module
 from ..executor_config import normalize_executor_config
+from ..plans import tenant_entitlement_plan
 from ..roles import PERM_SETTINGS, has_perm
 from ..models import (
     GoalModeSet,
@@ -174,7 +175,9 @@ async def create_project(
         raise HTTPException(
             status_code=409, detail=f"project '{body.name}' already exists"
         )
-    if tenant and tenant.get("plan") == "free":
+    # The one-project cap follows the entitlement in force: a playtester has
+    # Pro's (no cap) until its optional end date passes, then Free's.
+    if tenant and tenant_entitlement_plan(tenant, default="") == "free":
         existing_projects = await db_module.list_projects(db)
         if len(existing_projects) >= 1:
             raise HTTPException(
@@ -852,6 +855,7 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
             "version": 0,
             "created_at": "",
             "updated_at": "",
+            "field_updated_at": db_module.goal_field_stamps(None),
             "ambient_tasks": [
                 {
                     "status": t["status"],
@@ -880,6 +884,7 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
     )
     coherence = db_module.compute_coherence_warning(field_ages)
     goal["field_ages"] = field_ages
+    goal["field_updated_at"] = db_module.goal_field_stamps(goal)
     goal["coherence_warning"] = coherence
     # v1.1.4 — append-only decisions log.
     decisions = await db_module.get_decisions(await _db(request), project_id)
@@ -977,11 +982,28 @@ async def set_goal(
         validate_input_size(body.north_star, "north_star", 10_000)
     if body.sprint is not None:
         validate_input_size(body.sprint, "version_goal", 10_000)
-    result = await db_module.set_goal(
-        await _db(request), project_id, body.content,
-        north_star=body.north_star, sprint=body.sprint,
-        minor=body.minor,
-    )
+    # fc779141 — only the fields the caller sent a stamp for are checked.
+    expected = {
+        field: stamp
+        for field, stamp in (
+            ("version_goal", body.expected_updated_at),
+            ("north_star", body.expected_north_star_updated_at),
+            ("sprint", body.expected_sprint_updated_at),
+        )
+        if stamp is not None
+    }
+    try:
+        result = await db_module.set_goal(
+            await _db(request), project_id, body.content,
+            north_star=body.north_star, sprint=body.sprint,
+            minor=body.minor,
+            expected_updated_at=expected or None,
+            actor=db_module.goal_actor(body.source or "api", body.human_id),
+        )
+    except db_module.GoalConflict as exc:
+        raise HTTPException(
+            status_code=409, detail=db_module.goal_conflict_detail(exc)
+        ) from exc
     await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
     return result
 
@@ -1003,10 +1025,16 @@ async def set_north_star(
     # the caller owns this project. human_id check only applies to local no-auth.
     try:
         result = await db_module.set_north_star(
-            await _db(request), project_id, body.north_star
+            await _db(request), project_id, body.north_star,
+            expected_updated_at=body.expected_updated_at,
+            actor=db_module.goal_actor(body.source or "api", body.human_id),
         )
         await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
         return result
+    except db_module.GoalConflict as exc:
+        raise HTTPException(
+            status_code=409, detail=db_module.goal_conflict_detail(exc)
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -1026,10 +1054,16 @@ async def set_sprint(
     validate_input_size(body.sprint, "version_goal", 10_000)
     try:
         result = await db_module.set_sprint(
-            await _db(request), project_id, body.sprint
+            await _db(request), project_id, body.sprint,
+            expected_updated_at=body.expected_updated_at,
+            actor=db_module.goal_actor(body.source or "api", body.session_id),
         )
         await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
         return result
+    except db_module.GoalConflict as exc:
+        raise HTTPException(
+            status_code=409, detail=db_module.goal_conflict_detail(exc)
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 

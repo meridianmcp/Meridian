@@ -20,14 +20,35 @@
 //   * groupForTab — map a data-vtab id to its group.
 //   * wireVtabGroups — collapse/expand the group headers, and expose
 //     revealGroupForTab so programmatic navigation always re-expands a
-//     (possibly user-collapsed) group before landing on one of its tabs.
+//     (possibly collapsed) group before landing on one of its tabs.
+//   * revealGroupInStrip — the same reveal as a plain function over a strip, so
+//     the waffle launcher (dashboard-waffle.ts, 90952bad) can reveal a group
+//     without holding the closure wireVtabGroups returns.
 //
-// Why groups render EXPANDED by default (never hidden on first paint): external
-// code navigates by clicking `.vtab-btn[data-vtab="X"]` directly (demo tour,
-// deep-links, HITL/timeline jumps, and the Playwright UX tests). Those clicks
-// must keep working, and the demo tour measures the button's bounding box, so
-// every button must stay laid out on load. Collapsing is a user action;
-// revealGroupForTab undoes it just-in-time before a navigation.
+// Why groups can START COLLAPSED (90952bad): the rail used to render every
+// group expanded because external code navigates by clicking
+// `.vtab-btn[data-vtab="X"]` directly (demo tour, deep-links, HITL/timeline
+// jumps, the waffle launcher, and the Playwright UX tests). Every one of those
+// programmatic paths goes through `btn.click()`, and a click on a button inside
+// a `display:none` container still runs its onclick, which calls
+// revealGroupForTab BEFORE anything measures or scrolls to the button. The
+// demo tour measures the button only after that click, and the Playwright tests
+// reveal the group before they wait for the button to be visible. So the default
+// is now: every group collapsed except the one holding the active tab, and
+// navigating to a tab in another group swaps the open group (accordion) unless
+// the user opened that group themselves. Flip
+// VTAB_GROUPS_COLLAPSED_BY_DEFAULT to false to restore the old all-expanded rail.
+
+/**
+ * Rail groups start collapsed except the active tab's group (90952bad). One
+ * constant so the owner can revert the default without touching the wiring.
+ */
+export const VTAB_GROUPS_COLLAPSED_BY_DEFAULT = true;
+
+/** Set on a strip when it uses the collapsed-by-default accordion behaviour. */
+const ACCORDION_ATTR = "data-vaccordion";
+/** Set on a group the user opened by hand: the accordion never auto-collapses it. */
+const USER_OPEN_ATTR = "data-vuser-open";
 
 /** A group of tabs, shown as one collapsible header in the rail. */
 export interface VtabGroup {
@@ -50,7 +71,11 @@ export interface VtabGroup {
 export const VTAB_GROUPS: readonly VtabGroup[] = [
   { id: "overview", label: "Overview", tabs: ["status", "live"] },
   { id: "planning", label: "Planning", tabs: ["goal", "insights", "blog"] },
-  { id: "work", label: "Work", tabs: ["queue", "hitl", "team", "sessions"] },
+  // 'experiments' was added to the rail after the grouping shipped and was never
+  // listed here, so groupForTab() returned null for it and revealGroupForTab()
+  // could not expand its group. With groups collapsed by default that would
+  // leave an active Experiments tab invisible in the rail (90952bad).
+  { id: "work", label: "Work", tabs: ["queue", "experiments", "hitl", "team", "sessions"] },
   { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
   { id: "history", label: "History", tabs: ["timeline", "rewind", "settings"] },
 ] as const;
@@ -67,39 +92,76 @@ export function groupForTab(tab: string | null | undefined): string | null {
   return null;
 }
 
+function setGroupExpanded(groupEl: Element, expanded: boolean): void {
+  groupEl.classList.toggle("collapsed", !expanded);
+  const header = groupEl.querySelector(".vtab-group-header");
+  if (header) header.setAttribute("aria-expanded", String(expanded));
+  // Drive collapse via inline display so no CSS-file rule is required.
+  const tabs = groupEl.querySelector<HTMLElement>(".vtab-group-tabs");
+  if (tabs) tabs.style.display = expanded ? "flex" : "none";
+}
+
 /**
- * Wire the group headers so clicking one collapses/expands that group's tabs.
- * Returns a `revealGroupForTab` helper: call it BEFORE programmatically
- * navigating to a tab so its (possibly user-collapsed) group is re-expanded and
- * the target button is visible/measurable. Safe to call with an unknown tab.
+ * Expand the group owning `tab` inside `stripEl` so the tab's button is laid
+ * out. On a collapsed-by-default strip it also collapses every other group that
+ * is only open because of an earlier navigation (not one the user opened by
+ * hand), so the rail shows the active group rather than slowly re-expanding.
+ * Safe to call with an unknown tab or a strip without that group.
+ */
+export function revealGroupInStrip(
+  stripEl: ParentNode,
+  tab: string | null | undefined,
+): void {
+  const groupId = groupForTab(tab);
+  if (!groupId) return;
+  const groupEl = stripEl.querySelector(`.vtab-group[data-vgroup="${groupId}"]`);
+  if (!groupEl) return;
+  setGroupExpanded(groupEl, true);
+  const strip = stripEl as Element;
+  if (typeof strip.hasAttribute === "function" && strip.hasAttribute(ACCORDION_ATTR)) {
+    stripEl.querySelectorAll(".vtab-group").forEach((other) => {
+      if (other === groupEl || other.hasAttribute(USER_OPEN_ATTR)) return;
+      if (!other.classList.contains("collapsed")) setGroupExpanded(other, false);
+    });
+  }
+}
+
+/**
+ * Wire the group headers so clicking one collapses/expands that group's tabs,
+ * and (by default) start every group collapsed except the one holding the
+ * active tab. Returns a `revealGroupForTab` helper: call it BEFORE
+ * programmatically navigating to a tab so its group is expanded and the target
+ * button is visible/measurable. Safe to call with an unknown tab.
  */
 export function wireVtabGroups(
   stripEl: HTMLElement,
+  opts: { collapseByDefault?: boolean } = {},
 ): { revealGroupForTab: (tab: string | null | undefined) => void } {
-  const setExpanded = (groupEl: Element, expanded: boolean) => {
-    groupEl.classList.toggle("collapsed", !expanded);
-    const header = groupEl.querySelector(".vtab-group-header");
-    if (header) header.setAttribute("aria-expanded", String(expanded));
-    // Drive collapse via inline display so no CSS-file rule is required.
-    const tabs = groupEl.querySelector<HTMLElement>(".vtab-group-tabs");
-    if (tabs) tabs.style.display = expanded ? "flex" : "none";
-  };
+  const collapseByDefault = opts.collapseByDefault ?? VTAB_GROUPS_COLLAPSED_BY_DEFAULT;
 
   stripEl.querySelectorAll<HTMLElement>(".vtab-group-header").forEach((header) => {
     header.onclick = () => {
       const groupEl = header.closest(".vtab-group");
       if (!groupEl) return;
       // toggle: collapsed -> expanded, expanded -> collapsed
-      setExpanded(groupEl, groupEl.classList.contains("collapsed"));
+      const willExpand = groupEl.classList.contains("collapsed");
+      setGroupExpanded(groupEl, willExpand);
+      // A group the user opened by hand is exempt from the accordion collapse.
+      if (willExpand) groupEl.setAttribute(USER_OPEN_ATTR, "1");
+      else groupEl.removeAttribute(USER_OPEN_ATTR);
     };
   });
 
-  const revealGroupForTab = (tab: string | null | undefined) => {
-    const groupId = groupForTab(tab);
-    if (!groupId) return;
-    const groupEl = stripEl.querySelector(`.vtab-group[data-vgroup="${groupId}"]`);
-    if (groupEl) setExpanded(groupEl, true);
-  };
+  if (collapseByDefault) {
+    stripEl.setAttribute(ACCORDION_ATTR, "1");
+    const activeTab = stripEl.querySelector<HTMLElement>(".vtab-btn.active")?.dataset.vtab;
+    const activeGroup = groupForTab(activeTab);
+    stripEl.querySelectorAll(".vtab-group").forEach((groupEl) => {
+      setGroupExpanded(groupEl, groupEl.getAttribute("data-vgroup") === activeGroup);
+    });
+  }
+
+  const revealGroupForTab = (tab: string | null | undefined) => revealGroupInStrip(stripEl, tab);
 
   return { revealGroupForTab };
 }

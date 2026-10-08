@@ -654,6 +654,10 @@ async def handle_get_goal(
     goal = await db_module.get_goal(db, args["project_id"])
     if goal and goal.get("decisions") and len(goal["decisions"]) > 3000:
         goal["decisions"] = goal["decisions"][-3000:]
+    if goal:
+        # fc779141 — the stamps set_goal / set_north_star / set_sprint accept
+        # back as ``expected_updated_at`` for an optimistic-concurrency write.
+        goal["field_updated_at"] = db_module.goal_field_stamps(goal)
     return goal
 
 
@@ -665,7 +669,17 @@ async def handle_set_goal(
     _mcp_tenant_id: Any,
 ) -> Any:
     """MCP tool: set_goal."""
-    return await db_module.set_goal(db, args["project_id"], args["content"])
+    expected = args.get("expected_updated_at")
+    try:
+        return await db_module.set_goal(
+            db, args["project_id"], args["content"],
+            expected_updated_at=(
+                {"version_goal": expected} if expected is not None else None
+            ),
+            actor=db_module.goal_actor("mcp"),
+        )
+    except db_module.GoalConflict as exc:
+        return db_module.goal_conflict_detail(exc)
 
 
 async def handle_set_north_star(
@@ -676,7 +690,14 @@ async def handle_set_north_star(
     _mcp_tenant_id: Any,
 ) -> Any:
     """MCP tool: set_north_star."""
-    return await db_module.set_north_star(db, args["project_id"], args["north_star"])
+    try:
+        return await db_module.set_north_star(
+            db, args["project_id"], args["north_star"],
+            expected_updated_at=args.get("expected_updated_at"),
+            actor=db_module.goal_actor("mcp"),
+        )
+    except db_module.GoalConflict as exc:
+        return db_module.goal_conflict_detail(exc)
 
 
 async def handle_merge_project(

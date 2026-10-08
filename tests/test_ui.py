@@ -13,6 +13,8 @@ that hit the FastAPI TestClient.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from bs4 import BeautifulSoup
 
@@ -146,6 +148,46 @@ def test_backburner_section_has_grouping_search_and_archive(js):
     # Per-item archive/delete button (write control → must be demo-hidden).
     assert "sprintArchive(" in js, "backburner archive button missing"
     assert "async function sprintArchive" in js, "sprintArchive impl missing"
+
+
+def test_backburner_delete_repaints_the_queue_tab(js):
+    """8a665a03 -- the trash button lives in the Queue tab, so the delete must repaint
+    the Queue tab (and not only the Live tab, which is all it used to refresh)."""
+    m = re.search(r"async function sprintArchive\(.*?\n\}", js, re.S)
+    assert m, "sprintArchive impl missing"
+    body = m.group(0)
+    assert "applySprintItemDeleted(" in body, "the deleted row must be dropped from the Queue cache"
+    assert "refreshSprintSurfaces(" in body, "the delete must repaint Queue + Live + Goal board"
+    assert "refreshLiveTab(" not in body, "a Live-only refresh is exactly the bug"
+    # The server half: the DELETE route announces the delete, and the client subscribes.
+    assert "sprint_item_deleted" in js, "handleWsEvent must handle sprint_item_deleted"
+
+
+def test_every_sprint_mutation_handler_repaints_all_sprint_views(js):
+    """8a665a03 -- complete/skip/fail/push/edit/notes/resources/feedback/add all end in the
+    shared repaint, never a Live-only refresh."""
+    for name in (
+        "sprintAction", "sprintResetPending", "sprintFeedback",
+        "sprintFeedbackNote", "sprintItemEdit", "sprintItemNotesEdit",
+        "sprintItemResourcesEdit", "addSprintItemFromInput",
+    ):
+        m = re.search(r"async function " + name + r"\(.*?\n\}", js, re.S)
+        assert m, f"{name} impl missing"
+        assert "refreshSprintSurfaces(" in m.group(0), f"{name} must repaint through refreshSprintSurfaces"
+        assert "refreshLiveTab(" not in m.group(0), f"{name} refreshes only the Live tab"
+
+    # 0c30b989 -- the arrow button's move/defer flow lives in dashboard-sprint-move.ts, which
+    # repaints the Live board, the Queue and the Goal board itself (its own vitest pins that).
+    # Here: the inline-onclick entry point must hand straight to it, and the glue must be wired
+    # to all three real loaders, so a move can never leave one of those views stale.
+    m = re.search(r"async function sprintPushPrompt\(.*?\n\}", js, re.S)
+    assert m, "sprintPushPrompt impl missing"
+    assert "_sprintMoveActions.sprintPushPrompt(" in m.group(0)
+    assert "refreshLiveTab(" not in m.group(0)
+    wiring = js[js.index("const _sprintMoveActions = createSprintMoveActions({"):]
+    wiring = wiring[: wiring.index("});")]
+    for loader in ("refreshLiveTab(projectId)", "loadQueue(projectId)", "_sprintBoardReloaders[projectId]"):
+        assert loader in wiring, f"the move actions must be wired to {loader}"
 
 
 def test_notes_tab_has_cursor_load_more(js):
@@ -475,8 +517,10 @@ def test_dashboard_live_tab_exists(client):
 
     Section A: active sessions (filtered to last 24h) with claimed task
     shown indented per session.  Section B: queue (pending + in_progress
-    tasks) with an add-task input and per-row cancel.  Header buttons:
-    [Pause] / [Run All] (stubs).  WebSocket-driven — no setInterval.
+    tasks) with an add-task input and per-row cancel.  Header: the
+    auto-refresh toggle only -- the [Pause] / [Run All] placeholders were
+    removed (3bcb4013) because they did nothing.  WebSocket-driven — no
+    setInterval.
     """
     js = client.get("/static/dashboard.ts").text
     css = client.get("/static/dashboard.css").text
@@ -488,8 +532,13 @@ def test_dashboard_live_tab_exists(client):
     assert "live-sessions-" in js, "live sessions container ID missing"
     assert "live-queue-" in js, "live queue container ID missing"
     assert "live-add-input-" in js, "add task input ID missing"
-    assert "live-pause-" in js, "Pause stub button missing"
-    assert "live-run-" in js, "Run All stub button missing"
+    # 3bcb4013 -- the Pause / Run All header buttons were UI stubs (their own tooltips
+    # said so, and the only handler toasted "coming soon"). They are gone, and nothing
+    # may wire a stub toast in their place.
+    assert "live-pause-" not in js, "Pause stub button is back"
+    assert "live-run-" not in js, "Run All stub button is back"
+    assert "is a stub" not in js and "UI stub" not in js, "a stub placeholder is back in the Live tab"
+    assert "live-auto-btn-" in js, "the real auto-refresh toggle must stay"
     # Add task posts to /tasks with status pending
     assert "addLiveTask" in js, "addLiveTask helper missing"
     assert "'/tasks'" in js or '"/tasks"' in js, "POST /tasks not referenced"
@@ -1030,6 +1079,673 @@ def test_dashboard_responsive_sprint_and_nav_media_block(css):
 
 
 # ---------------------------------------------------------------------------
+# Sprint row layout contract: a long title wraps inside its OWN column and can
+# never paint over the version label or the action buttons (Live tab, "Sprint
+# progress"). The original bug: .sprint-item-title was an inline <span> in a plain
+# <div>, so its flex/overflow/text-overflow rules did nothing while
+# white-space:nowrap stopped it wrapping, and the text ran over .sprint-item-ver
+# and .sprint-item-actions. Source-scanning style, like the rest of this file; the
+# rendered-DOM + computed-style version lives in
+# meridian/static/dashboard-sprint-layout.test.ts, and the pixel overlap is asserted
+# in a real browser by tests/test_demo_ux.py.
+# ---------------------------------------------------------------------------
+
+
+def _css_split(text, sep):
+    """Split `text` on `sep` at nesting depth 0 (outside (), [], {} and quoted strings)."""
+    parts, depth, quote, start, i = [], 0, None, 0, 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(0, depth - 1)
+        elif c == sep and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
+def _css_items(text):
+    """The top-level items of a CSS block body: ("stmt", "prop: value" | "@import ...") for each
+    ``;``-terminated statement and ("block", prelude, body) for each ``prelude { body }``."""
+    items, depth, quote, start, brace, i = [], 0, None, 0, None, 0
+    body_start = 0  # set when a block opens; initialised so the loop-carried read below is a defined name (ruff F821)
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif brace is not None:
+            if c == "{":
+                brace += 1
+            elif c == "}":
+                brace -= 1
+                if brace == 0:
+                    items.append(("block", text[start:body_start].strip(), text[body_start + 1 : i]))
+                    start, brace = i + 1, None
+        elif c in "([":
+            depth += 1
+        elif c in ")]":
+            depth = max(0, depth - 1)
+        elif depth == 0 and c == ";":
+            if text[start:i].strip():
+                items.append(("stmt", text[start:i].strip()))
+            start = i + 1
+        elif depth == 0 and c == "{":
+            body_start, brace = i, 1
+        i += 1
+    if brace is None and text[start:].strip():
+        items.append(("stmt", text[start:].strip()))
+    return items
+
+
+# At-rules whose block holds ordinary rules (or, nested in a style rule, declarations for it).
+_CSS_GROUP_AT_RULES = ("@media", "@supports", "@container", "@layer", "@scope", "@document", "@starting-style")
+
+
+def _css_nest(parents, children):
+    """Resolve nested selectors against their parents (CSS nesting: ``&`` or an implicit descendant)."""
+    if parents is None:
+        return children
+    return [c.replace("&", p) if "&" in c else f"{p} {c}" for p in parents for c in children]
+
+
+def _css_rules(css_text):
+    """Parse CSS into [(gate_or_None, [selectors], {prop: value})] in source order.
+
+    Handles what the dashboard's cascade can contain, not just flat rules: CSS nesting (``&`` and
+    implicit descendants, nested @media), conditional / layer groups at any depth (@media,
+    @supports, @container, @layer, @scope; the gate is their prelude), selector lists containing
+    commas inside :is()/:where(), and declarations holding ``;`` inside url()/strings. Statement
+    at-rules (@import, @layer a, b;) are skipped without swallowing the rule that follows them,
+    and rule-less at-rules (@keyframes, @font-face) are skipped whole."""
+    text = re.sub(r"/\*.*?\*/", "", css_text, flags=re.S)
+    out = []
+
+    def walk(body, selectors, gate):
+        decls = {}
+        for item in _css_items(body):
+            if item[0] == "stmt":
+                if not item[1].startswith("@") and ":" in item[1]:
+                    prop, _, value = item[1].partition(":")
+                    decls[prop.strip().lower()] = " ".join(value.split())
+                continue
+            _, prelude, inner = item
+            prelude = " ".join(prelude.split())
+            if prelude.startswith("@"):
+                if prelude.lower().startswith(_CSS_GROUP_AT_RULES):
+                    group = f"{gate} {prelude}" if gate else prelude
+                    nested = walk(inner, selectors, group)
+                    if nested and selectors is not None:  # `.a { @media (..) { color: red } }`
+                        out.append((group, list(selectors), nested))
+                continue
+            resolved = _css_nest(selectors, [s.strip() for s in _css_split(prelude, ",") if s.strip()])
+            slot = len(out)
+            out.append(None)
+            out[slot] = (gate, resolved, walk(inner, resolved, gate))
+        return decls
+
+    walk(text, None, None)
+    return [rule for rule in out if rule is not None]
+
+
+def _decls(rules, selector, media=None):
+    """Merged declarations of every rule whose selector list contains `selector`."""
+    merged = {}
+    for rule_media, selectors, decls in rules:
+        if rule_media == media and selector in selectors:
+            merged.update(decls)
+    return merged
+
+
+def test_sprint_title_is_a_wrapping_block_in_its_own_column(css):
+    """The title must be block-level, shrinkable and allowed to wrap/break, with no
+    nowrap/ellipsis truncation, in the board rows (wrapper div) AND the sibling rows
+    (needs-attention / your-tasks / backburner) where the title is a direct flex child."""
+    rules = _css_rules(css)
+    title = _decls(rules, ".sprint-item-title")
+    assert title.get("display") == "block", "title must be block-level (an inline span ignores overflow/flex)"
+    assert title.get("min-width") == "0", "title must be able to shrink below its content width"
+    assert title.get("white-space") == "normal", "title must be allowed to wrap"
+    assert title.get("overflow-wrap") == "anywhere", "a 300-char unbreakable token must break in the column"
+    assert "text-overflow" not in title and "overflow" not in title, "title wraps; it must not clip or ellipsize"
+    # the text column: the wrapper div in board rows ...
+    col = _decls(rules, ".sprint-item-main")
+    assert col.get("min-width") == "0"
+    assert col.get("flex") == "1 1 auto", (
+        "the text column is sized by its content: a fixed minimum basis (it was 15em) reserved a long "
+        "title's room for every row, so at the real 347px desktop board the buttons of even a "
+        "10-character title wrapped onto a second line (28px rows became 43px)"
+    )
+    assert col.get("max-width") == "calc(100% - 20px)", (
+        "the column is capped at the room left beside the 14px icon + 6px gap, so a long title takes "
+        "the row's width instead of overflowing it and the icon is never left alone above the text"
+    )
+    # ... and the title span itself in the sibling rows
+    direct = _decls(rules, ".sprint-item-row > .sprint-item-title")
+    assert direct.get("min-width") == "0"
+    assert direct.get("flex") == col.get("flex"), "sibling rows must use the same column basis as board rows"
+    assert direct.get("max-width") == col.get("max-width")
+
+
+def test_sprint_row_wraps_and_aligns_to_the_first_title_line(css):
+    """The row wraps (actions drop UNDER the text when too narrow) and baseline-aligns
+    the icon / version / buttons with the title's first line."""
+    rules = _css_rules(css)
+    row = _decls(rules, ".sprint-item-row")
+    assert row.get("display") == "flex"
+    assert row.get("flex-wrap") == "wrap", "row must wrap so the buttons can drop under the text"
+    assert row.get("align-items") == "baseline", "icon/version/buttons must sit on the first title line"
+    assert row.get("align-content") == "center", "single-line rows stay vertically centred in min-height"
+    ver = _decls(rules, ".sprint-item-ver")
+    assert ver.get("flex-shrink") == "0" and ver.get("max-width") == "100%"
+    actions = _decls(rules, ".sprint-item-actions")
+    assert actions.get("flex-shrink") == "0"
+    assert actions.get("flex-wrap") == "wrap" and actions.get("max-width") == "100%", (
+        "actions wrap inside the row instead of escaping it at narrow widths"
+    )
+    assert actions.get("margin-left") == "auto"
+    assert _decls(rules, ".sprint-item-actions:empty").get("display") == "none", (
+        "an empty actions placeholder must not take a wrapped line"
+    )
+    chip = _decls(rules, ".sprint-item-resources .resource-chip")
+    assert chip.get("max-width") == "100%" and chip.get("overflow-wrap") == "anywhere", (
+        "a long resource chip must wrap inside the column"
+    )
+
+
+def test_sprint_row_layout_rules_use_css_variables_only(css):
+    """Dark/light themes: the sprint-row layout rules carry no literal colours."""
+    rules = _css_rules(css)
+    selectors = [
+        ".sprint-item-row", ".sprint-item-main", ".sprint-item-title", ".sprint-item-ver",
+        ".sprint-item-actions", ".sprint-item-row > .sprint-item-title",
+        ".sprint-item-resources .resource-chip",
+    ]
+    for sel in selectors:
+        decls = _decls(rules, sel)
+        assert decls, f"{sel} rule missing"
+        for prop, value in decls.items():
+            assert not re.search(r"#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(", value), (
+                f"{sel} {prop}: {value!r} hard-codes a colour; use a CSS variable"
+            )
+
+
+def test_sprint_phone_media_queries_are_reconciled_with_the_base_rules(css):
+    """The 768px / 480px passes only tune the base rules: they must not re-introduce
+    nowrap/ellipsis, nor give the title flex-basis:100% (which on the direct-child rows
+    left the status icon alone on a line above the text). On a phone the action buttons
+    take their own line under the text."""
+    rules = _css_rules(css)
+    for media in ("@media (max-width: 768px)", "@media (max-width: 480px)"):
+        sprint = [(sel, d) for m, sels, d in rules if m == media for sel in sels if "sprint-item" in sel]
+        assert sprint, f"{media} must still tune the sprint rows"
+        for sel, d in sprint:
+            assert d.get("white-space") != "nowrap" and d.get("flex-wrap") != "nowrap", (media, sel)
+            assert "text-overflow" not in d and d.get("overflow") != "hidden", (media, sel)
+    phone = "@media (max-width: 768px)"
+    assert _decls(rules, ".sprint-item-row > .sprint-item-title", phone).get("flex-basis", "").startswith("min(")
+    assert _decls(rules, ".sprint-item-main", phone).get("flex-basis", "").startswith("min(")
+    assert _decls(rules, ".sprint-item-title", phone).get("flex-basis") != "100%"
+    actions = _decls(rules, ".sprint-item-actions", phone)
+    assert actions.get("flex-basis") == "100%" and actions.get("justify-content") == "flex-end"
+    # the wrap/align/title-wrapping rules are NOT viewport-gated: they live in the base sheet
+    assert _decls(rules, ".sprint-item-row").get("flex-wrap") == "wrap"
+    assert _decls(rules, ".sprint-item-title").get("white-space") == "normal"
+
+
+def test_sprint_markup_uses_the_main_column_class_and_no_inline_nowrap(js):
+    """The board-row wrapper carries class sprint-item-main (its flex/min-width now live
+    in the stylesheet, where the media queries can reach them) and no title is rendered
+    with an inline nowrap/ellipsis that would out-rank the stylesheet (the backburner rows
+    used to)."""
+    icon = js.index('class="sprint-item-icon" style="color:${color}"')
+    assert 'class="sprint-item-main"' in js[icon : icon + 400], "board-row text column must be .sprint-item-main"
+    titles = [ln for ln in js.splitlines() if 'class="sprint-item-title"' in ln]
+    assert len(titles) >= 4, "expected the board, needs-attention, your-tasks and backburner title spans"
+    for ln in titles:
+        assert "nowrap" not in ln and "ellipsis" not in ln, f"inline truncation on a sprint title: {ln.strip()[:120]}"
+    # the backburner row no longer pins its own flex layout inline (the class rules apply)
+    marker = 'data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version'
+    row = [ln for ln in js.splitlines() if marker in ln]
+    assert row, "backburner row template not found"
+    assert all("display:flex" not in ln and "align-items:center" not in ln for ln in row)
+
+
+# ---------------------------------------------------------------------------
+# Cascade-independent scan. The exact-selector checks above (`_decls` merges only
+# rules whose selector text EQUALS the one asked for) and the jsdom contract (source
+# order only, no @media) are blind to a rule that wins on specificity or applies only on
+# a phone, and two such mutations re-broke the layout in a real browser while every
+# test passed: an earlier `.live-body .sprint-item-title { white-space: nowrap }` and a
+# `@media (max-width: 768px) { .live-body span { white-space: nowrap } }`. This scan
+# ignores specificity, order, layers and viewport gates: for EVERY rule (any @media /
+# @supports / @container / @layer, CSS nesting resolved, :is()/:where() groups unrolled)
+# it asks which sprint-row elements the selector could style, and rejects any declaration
+# that could undo the contract on one of them. A value built from var()/env()/attr()
+# cannot be judged from text, so it counts as harmful wherever the property could do
+# harm; and a rule inside @layer is judged like any other (it can still win: an
+# `!important` layered declaration beats unlayered ones, and a layered declaration of a
+# property no unlayered rule sets on that element applies), so the scan flags it with the
+# rule named rather than guess at the cascade. The pixel layout is asserted in a real
+# browser by tests/test_demo_ux.py (test_sprint_rows_never_overlap_in_a_real_browser).
+# ---------------------------------------------------------------------------
+
+
+def _sprint_static(name):
+    """A file of meridian/static read from disk (no app boot: these checks are pure text)."""
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parent.parent / "meridian" / "static" / name).read_text(encoding="utf-8")
+
+
+# Classes of the elements INSIDE a .sprint-item-row (renderSprintProgress + _sprintHistoryBadges).
+_SPRINT_ROW_CLASSES = frozenset({
+    "sprint-item-row", "sprint-item-icon", "sprint-item-main", "sprint-item-title", "sprint-item-ver",
+    "sprint-item-meta", "sprint-item-actions", "sprint-item-notes", "sprint-item-resources", "resource-chip",
+    "sprint-btn", "sprint-btn-fail", "sprint-btn-push", "sprint-stall-badge", "sprint-retried-badge",
+    "sprint-live-dot",
+})
+# The board's ancestors (dashboard.ts buildTabBody): a selector may qualify itself with these.
+_SPRINT_CHAIN_CLASSES = frozenset({
+    "app", "main", "tab-bodies", "tab-body", "vtab-drawer", "drawer-panel", "live-body", "live-section",
+    "live-sprint-progress", "active", "open",
+})
+# Which row classes a bare element selector (`span`, `div`, `button`) can hit.
+_SPRINT_TYPE_CLASSES = {
+    "span": frozenset({
+        "sprint-item-icon", "sprint-item-title", "sprint-item-ver", "sprint-item-meta", "sprint-item-actions",
+        "resource-chip", "sprint-stall-badge", "sprint-retried-badge", "sprint-live-dot",
+    }),
+    "div": frozenset({"sprint-item-row", "sprint-item-main", "sprint-item-notes", "sprint-item-resources"}),
+    "button": frozenset({"sprint-btn", "sprint-btn-fail", "sprint-btn-push"}),
+}
+# Short fixed labels that are kept on one line / truncated on purpose.
+_SPRINT_DELIBERATE = frozenset({"sprint-item-meta", "sprint-btn", "sprint-btn-fail", "sprint-btn-push"})
+_SPRINT_TEXT_BOXES = frozenset({"sprint-item-title", "sprint-item-main", "sprint-item-ver", "resource-chip"})
+_SPRINT_COLUMN = frozenset({"sprint-item-title", "sprint-item-main"})
+# Boxes that hold wrapping text (or text-bearing children). Pinning one to a fixed height, squashing its
+# line box or shifting it out of the flow paints its content over the NEXT row. The icon, the live dot, the
+# badges and the buttons are fixed-size on purpose and are not in this set.
+_SPRINT_FLOW_BOXES = frozenset({
+    "sprint-item-row", "sprint-item-main", "sprint-item-title", "sprint-item-ver", "sprint-item-actions",
+    "sprint-item-notes", "sprint-item-resources", "resource-chip",
+})
+_SPRINT_ROW_BOXES = frozenset({"sprint-item-row", "sprint-item-actions"})
+# A value taken from a custom property / environment / attribute cannot be judged from the text alone.
+_SPRINT_UNRESOLVED = re.compile(r"\b(?:var|env|attr)\(")
+_SPRINT_GROUP_PSEUDO = r":(?:is|where|matches|-webkit-any|-moz-any)\("
+
+
+def _sprint_alternatives(selector):
+    """`selector` with its :is()/:where() groups unrolled into plain alternatives; None when a
+    group is too nested or too large to unroll."""
+    pending, done = [selector], []
+    while pending:
+        sel = pending.pop()
+        found = re.search(_SPRINT_GROUP_PSEUDO + r"([^()]*)\)", sel, flags=re.I)
+        if found is None:
+            done.append(sel)
+        elif len(pending) + len(done) > 256:
+            return None
+        else:
+            pending.extend(
+                sel[: found.start()] + alt.strip() + sel[found.end() :] for alt in _css_split(found.group(1), ",")
+            )
+    return done
+
+
+def _sprint_strip_pseudos(selector):
+    """`selector` without its pseudo-classes / -elements (their argument lists included, balanced)."""
+    out, i = [], 0
+    while i < len(selector):
+        found = re.compile(r"::?[\w-]+").match(selector, i)
+        if found is None:
+            out.append(selector[i])
+            i += 1
+            continue
+        i = found.end()
+        if i < len(selector) and selector[i] == "(":
+            depth = 0
+            while i < len(selector):
+                depth += (selector[i] == "(") - (selector[i] == ")")
+                i += 1
+                if depth == 0:
+                    break
+    return "".join(out).strip()
+
+
+def _sprint_reach_one(selector):
+    every = frozenset(_SPRINT_ROW_CLASSES)
+    sel = _sprint_strip_pseudos(selector)
+    compounds = [c for c in re.split(r"\s*[>+~]\s*|\s+", sel) if c]
+    if not compounds:
+        return every  # a bare ':hover'
+    for comp in compounds[:-1]:  # ancestors must be satisfiable by the board's own chain
+        classes, ids = re.findall(r"\.([\w-]+)", comp), re.findall(r"#([\w-]+)", comp)
+        tag = re.match(r"[a-zA-Z][\w-]*|\*", comp)
+        if any(c not in _SPRINT_ROW_CLASSES | _SPRINT_CHAIN_CLASSES for c in classes) or any(i != "tab-bodies" for i in ids):
+            return frozenset()
+        if not classes and not ids and tag and tag.group(0) not in ("*", "div", "main", "body", "html", "span"):
+            return frozenset()
+    last = compounds[-1]
+    classes, ids = re.findall(r"\.([\w-]+)", last), re.findall(r"#([\w-]+)", last)
+    if ids or any(c not in _SPRINT_ROW_CLASSES for c in classes):
+        return frozenset()
+    if classes:
+        return frozenset(classes)
+    if "[" in last:  # an attribute selector alone: can't tell, assume every kind
+        return every
+    tag = re.match(r"[a-zA-Z][\w-]*|\*", last)
+    name = tag.group(0) if tag else "*"
+    return every if name == "*" else _SPRINT_TYPE_CLASSES.get(name, frozenset())
+
+
+def _sprint_reach(selector):
+    """The row-element classes `selector` could style (conservative: state pseudo-classes
+    and :not()/:has() arguments are ignored, :is()/:where() groups are unrolled, any
+    ancestor/sibling combinator counts as an ancestor), or an empty set when it cannot match
+    anything inside a sprint row."""
+    alternatives = _sprint_alternatives(selector)
+    if alternatives is None or any(re.search(_SPRINT_GROUP_PSEUDO, a, flags=re.I) for a in alternatives):
+        return frozenset(_SPRINT_ROW_CLASSES)  # too tangled to unroll: assume it can reach anything
+    return frozenset().union(*(_sprint_reach_one(a) for a in alternatives))
+
+
+def _sprint_squashes(line_height):
+    """True when a line-height is small enough to paint wrapped lines over each other."""
+    found = re.fullmatch(r"([0-9.]+)(px|pt|em|rem|%)?", line_height)
+    if not found:
+        return False
+    floor = {None: 1, "px": 9, "pt": 7, "em": 0.75, "rem": 0.75, "%": 75}[found.group(2)]
+    return float(found.group(1)) < floor
+
+
+def _sprint_harm(prop, raw, kinds):
+    """Why `prop: raw` could re-break the layout contract on one of `kinds`, else None. A value
+    built from a custom property cannot be judged here, so it counts as harmful wherever the
+    property could do harm (the real-browser test judges what it really resolves to)."""
+    v = " ".join(raw.replace("!important", "").lower().split())
+    unresolved = bool(_SPRINT_UNRESOLVED.search(v))
+    truncating = kinds - _SPRINT_DELIBERATE
+    flow = kinds & _SPRINT_FLOW_BOXES
+
+    def verdict(applies, harmful, message):
+        if not applies:
+            return None
+        if unresolved:
+            return f"{message} (its value is built from a custom property, which cannot be resolved here)"
+        return message if harmful else None
+
+    if prop == "white-space":
+        return verdict(truncating, v in ("nowrap", "pre"), "stops the text wrapping")
+    if prop in ("text-wrap", "text-wrap-mode"):
+        return verdict(truncating, "nowrap" in v.split(), "stops the text wrapping")
+    if prop == "text-overflow":
+        return verdict(truncating, v not in ("clip", "initial", "unset", "inherit"), "ellipsizes (hides) text")
+    if prop in ("overflow", "overflow-x", "overflow-y", "overflow-block", "overflow-inline"):
+        return verdict(truncating, bool(re.search(r"\b(hidden|clip|scroll|auto)\b", v)), "clips its content")
+    if prop == "flex-wrap":
+        return verdict(kinds & _SPRINT_ROW_BOXES, v == "nowrap", "stops the row wrapping")
+    if prop == "flex-flow":
+        return verdict(kinds & _SPRINT_ROW_BOXES, "nowrap" in v.split(), "stops the row wrapping")
+    if prop in ("overflow-wrap", "word-wrap"):
+        return verdict(kinds & _SPRINT_TEXT_BOXES, v == "normal", "stops a long token breaking")
+    if prop == "word-break":
+        return verdict(kinds, v == "keep-all", "stops a long token breaking")
+    if prop == "display":
+        return verdict(
+            kinds & _SPRINT_COLUMN,
+            not re.fullmatch(r"block|flex|grid|flow-root|inline-block|list-item", v),
+            "makes the text column inline (ignores width / overflow) or hides it",
+        )
+    if prop == "min-width":
+        return verdict(kinds & _SPRINT_COLUMN, not re.fullmatch(r"0(px)?", v), "stops the text column shrinking")
+    if prop == "position":
+        return verdict(kinds, v in ("absolute", "fixed"), "takes a row element out of flow (it can paint over its neighbours)")
+    if prop in ("height", "block-size"):
+        return verdict(
+            flow, not re.fullmatch(r"auto|fit-content|min-content|max-content|initial|unset|revert|revert-layer", v),
+            "pins a text box to a fixed height, so wrapped content paints over the next row",
+        )
+    if prop in ("max-height", "max-block-size"):
+        return verdict(
+            flow, v not in ("none", "initial", "unset", "revert", "revert-layer"),
+            "caps a text box's height, so wrapped content paints over the next row",
+        )
+    if prop == "line-height":
+        return verdict(flow, _sprint_squashes(v), "squashes wrapped lines onto each other")
+    if prop == "font":
+        slash = re.search(r"/\s*([^\s,/]+)", v)
+        return verdict(flow, bool(slash) and _sprint_squashes(slash.group(1)), "squashes wrapped lines onto each other")
+    if prop in ("top", "bottom", "inset", "inset-block", "inset-block-start", "inset-block-end"):
+        return verdict(
+            flow, not re.fullmatch(r"auto|0(px|%|em|rem)?|initial|unset|revert", v),
+            "offsets a text box from its place in the flow (it can paint over the previous row)",
+        )
+    if prop in ("transform", "translate"):
+        return verdict(flow, v not in ("none", "initial", "unset", "revert"), "moves a text box out of its place in the flow")
+    if prop in ("margin", "margin-top", "margin-bottom", "margin-block", "margin-block-start", "margin-block-end"):
+        return verdict(flow, bool(re.search(r"(^|\s)-[0-9.]", v)), "pulls a text box over its neighbours with a negative margin")
+    if prop == "all":
+        return verdict(truncating, True, "resets every property, including the wrapping contract")
+    return None
+
+
+def _sprint_cascade_offenders(css_text):
+    out = []
+    for media, selectors, decls in _css_rules(css_text):
+        for sel in selectors:
+            kinds = _sprint_reach(sel)
+            for prop, value in decls.items():
+                why = kinds and _sprint_harm(prop, value, kinds)
+                if why:
+                    out.append(f"{media + ' ' if media else ''}{sel} {{ {prop}: {value} }} {why}")
+    return out
+
+
+def test_no_stylesheet_rule_can_undo_the_sprint_row_wrapping_contract():
+    """Whatever its specificity, source position or @media gate, no rule in dashboard.css
+    may stop a sprint row's text wrapping, clip or ellipsize it, stop the row wrapping,
+    make the title column inline / unshrinkable, or take a row element out of flow."""
+    assert _sprint_cascade_offenders(_sprint_static("dashboard.css")) == []
+
+
+def test_sprint_cascade_scan_reaches_the_rules_it_must_judge():
+    """The scan is not vacuous: the real sheet's contract rules and its @media-gated
+    rules reach row elements, and the deliberately truncated '-> v2' pill is tolerated."""
+    rules = _css_rules(_sprint_static("dashboard.css"))
+    reaching = [(m, s) for m, sels, _ in rules for s in sels if _sprint_reach(s)]
+    assert sum(1 for m, _ in reaching if m is None) >= 10
+    assert sum(1 for m, _ in reaching if m == "@media (max-width: 768px)") >= 3
+    assert sum(1 for m, _ in reaching if m == "@media (max-width: 480px)") >= 1
+    meta = _decls(rules, ".sprint-item-meta")
+    assert meta.get("white-space") == "nowrap" and meta.get("text-overflow") == "ellipsis"
+    assert _sprint_cascade_offenders(".sprint-item-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }") == []
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        # the two that used to survive every suite
+        ".live-body .sprint-item-title { white-space: nowrap; }",
+        "@media (max-width: 768px) { .live-body span { white-space: nowrap; } }",
+        # other shapes of the same regression
+        "@media (max-width: 480px) { span { white-space: pre; } }",
+        "@supports (display: grid) { .tab-body .sprint-item-row span { white-space: nowrap; } }",
+        ".sprint-item-title { overflow: hidden; text-overflow: ellipsis; }",
+        ".sprint-item-row * { overflow-x: clip; }",
+        ".sprint-item-row .sprint-item-title { white-space: nowrap !important; }",
+        ".sprint-item-title:hover { white-space: nowrap; }",
+        "@media (max-width: 480px) { .sprint-item-row { flex-wrap: nowrap; } }",
+        ".sprint-item-actions { flex-wrap: nowrap; }",
+        "@media (max-width: 768px) { .sprint-item-title { display: inline; } }",
+        ".sprint-item-main { min-width: auto; }",
+        ".sprint-item-ver { overflow-wrap: normal; }",
+        ".sprint-item-resources .resource-chip { white-space: nowrap; }",
+        ".sprint-item-title { position: absolute; }",
+        "#tab-bodies div { white-space: nowrap; }",
+        "[class*='sprint-item'] { white-space: nowrap; }",
+        # --- syntax the scan used to be blind to (every one of these re-breaks a real browser) ---
+        # CSS nesting: the child rule inherits its parent's selector
+        ".live-body { .sprint-item-title { white-space: nowrap; } }",
+        ".sprint-item-row { & .sprint-item-title { white-space: nowrap; } }",
+        ".sprint-item-row { > .sprint-item-title { overflow: hidden; } }",
+        ".sprint-item-title { @media (max-width: 768px) { white-space: nowrap; } }",
+        # a value taken from a custom property cannot be judged from the text
+        ".sprint-item-title { white-space: var(--ws); }",
+        ".sprint-item-row { display: flex; flex-wrap: var(--wrap); }",
+        # :is() / :where() groups (their commas used to split the selector list apart)
+        ":is(.live-body, .tab-body) :is(.sprint-item-title) { white-space: nowrap; }",
+        ".sprint-item-row :where(.sprint-item-title, .sprint-item-ver) { white-space: nowrap; }",
+        ":is(.sprint-item-title) { white-space: nowrap; }",
+        ".sprint-item-title:not(.x) { white-space: nowrap; }",
+        ".sprint-item-row:has(> .sprint-item-ver) .sprint-item-title { white-space: nowrap; }",
+        # layers / containers, and statement at-rules that used to swallow the rule after them
+        "@layer base { .sprint-item-title { white-space: nowrap !important; } }",
+        "@container (min-width: 1px) { .sprint-item-title { white-space: nowrap; } }",
+        "@layer base, theme;\n.sprint-item-title { white-space: nowrap; }",
+        "@import url('x.css');\n.sprint-item-title { white-space: nowrap; }",
+        # --- vertical and spacing: rows pinned / squashed / shifted so their content paints over the next row ---
+        ".sprint-item-row { height: 28px; }",
+        ".sprint-item-row { max-height: 28px; }",
+        "@media (max-width: 768px) { .sprint-item-row { block-size: 28px; } }",
+        ".sprint-item-actions { height: 0; }",
+        ".sprint-item-main { max-height: 1.4em; }",
+        ".sprint-item-title { line-height: 0.5; }",
+        ".sprint-item-title { line-height: 4px; }",
+        ".sprint-item-title { font: 12px/0.5 sans-serif; }",
+        ".sprint-item-title { position: relative; top: -22px; }",
+        ".sprint-item-title { transform: translateY(-20px); }",
+        ".sprint-item-ver { translate: 0 -20px; }",
+        ".sprint-item-title { margin-top: -20px; }",
+        ".sprint-item-row { margin: 0 0 -10px; }",
+        # shorthands and newer longhands of the properties already watched
+        ".sprint-item-row { flex-flow: row nowrap; }",
+        ".sprint-item-title { text-wrap: nowrap; }",
+        ".sprint-item-title { text-wrap-mode: nowrap; }",
+        ".sprint-item-row { overflow-y: hidden; }",
+        ".sprint-item-title { all: unset; }",
+    ],
+)
+def test_sprint_cascade_scan_catches_each_regression_shape(mutant):
+    assert _sprint_cascade_offenders(mutant), f"scan is blind to: {mutant}"
+    assert _sprint_cascade_offenders(_sprint_static("dashboard.css") + "\n" + mutant), f"scan is blind to (appended): {mutant}"
+
+
+@pytest.mark.parametrize(
+    "benign",
+    [
+        ".tabs span { white-space: nowrap; }",
+        ".sidebar button { overflow: hidden; }",
+        "@media (max-width: 768px) { .vtab-strip .vtab-btn { white-space: nowrap; overflow: hidden; } }",
+        ".sprint-item-row { gap: 10px; color: red; }",
+        "button { white-space: nowrap; }",
+        ".sprint-btn { white-space: nowrap; overflow: hidden; }",
+        ".live-session-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+        # fixed-size parts of a row are not text boxes
+        ".sprint-btn { height: 20px; line-height: 1; }",
+        ".sprint-item-icon { height: 14px; line-height: 1; transform: scale(1.1); }",
+        ".sprint-live-dot { width: 7px; height: 7px; }",
+        "@keyframes sprintPulse { from { height: 0; top: -4px; } to { height: 7px; top: 0; } }",
+        # values that are fine on a text box
+        ".sprint-item-row { min-height: 28px; line-height: 1.4; margin: 0 0 2px; height: auto; max-height: none; }",
+        ".sprint-item-title { line-height: normal; transform: none; top: auto; margin-top: 2px; font: 12px/1.4 sans-serif; }",
+        ".sprint-item-actions { margin-left: auto; gap: 2px; flex-wrap: wrap; }",
+        ".sprint-item-row { padding: var(--row-pad); gap: var(--gap); color: var(--text); }",
+        # the same rules written with nesting, groups, layers or custom properties, but not reaching a row
+        ".sidebar { .tab { white-space: nowrap; } }",
+        ".tabs { span { white-space: nowrap; } }",
+        ".tabs { @media (max-width: 768px) { white-space: nowrap; } }",
+        ":is(.tabs, .sidebar) span { white-space: nowrap; }",
+        ".vtab-btn:is(.a, .b), .tab:where(.x) { white-space: nowrap; overflow: hidden; }",
+        "@layer base { .tabs span { white-space: nowrap; } }",
+        "@container (min-width: 1px) { .sidebar button { overflow: hidden; } }",
+        ".tabs span { white-space: var(--ws); }",
+        "@font-face { font-family: X; src: url(data:font/woff2;base64,AAAA) format('woff2'); }",
+        "@import url('x.css');\n.tabs span { white-space: nowrap; }",
+    ],
+)
+def test_sprint_cascade_scan_does_not_cry_wolf(benign):
+    assert _sprint_cascade_offenders(benign) == [], benign
+
+
+def test_css_rules_parser_models_nesting_groups_and_statement_at_rules():
+    """The scan is only as good as the parser feeding it: it must resolve nesting, keep the
+    conditional gate of every rule, split selector lists only on top-level commas, not stop at a
+    `;` inside url()/strings, and not lose the rule that follows a statement at-rule."""
+    rules = _css_rules(
+        "@import url('x.css');\n"
+        "@layer base, theme;\n"
+        ".a, :is(.b, .c) > .d { color: red; background: url(data:image/png;base64,AAA=); content: 'a;b'; }\n"
+        ".live-body { .sprint-item-title { white-space: nowrap } &:hover { color: blue } > .x { top: 1px }\n"
+        "  @media (max-width: 768px) { gap: 2px } }\n"
+        "@media (max-width: 768px) { @supports (display: grid) { .g { display: grid } } }\n"
+        "@keyframes k { from { height: 0 } to { height: 5px } }\n"
+        "@font-face { font-family: F; src: url(f.woff2) }\n"
+        "@layer base { .layered { white-space: pre } }\n"
+        ".last { color: green }"
+    )
+    by_selector = {tuple(sels): (gate, decls) for gate, sels, decls in rules}
+    assert by_selector[(".a", ":is(.b, .c) > .d")][1] == {
+        "color": "red", "background": "url(data:image/png;base64,AAA=)", "content": "'a;b'",
+    }
+    assert by_selector[(".live-body .sprint-item-title",)][1] == {"white-space": "nowrap"}
+    assert by_selector[(".live-body:hover",)][1] == {"color": "blue"}
+    assert by_selector[(".live-body > .x",)][1] == {"top": "1px"}
+    assert by_selector[(".live-body",)] == ("@media (max-width: 768px)", {"gap": "2px"}), (
+        "a nested @media must style its parent selector under that gate"
+    )
+    assert by_selector[(".g",)] == ("@media (max-width: 768px) @supports (display: grid)", {"display": "grid"})
+    assert by_selector[(".layered",)] == ("@layer base", {"white-space": "pre"})
+    assert by_selector[(".last",)] == (None, {"color": "green"}), "the rule after statement at-rules must survive"
+    assert all("k" not in sels and "from" not in sels for _, sels, _ in rules), "@keyframes steps are not rules"
+    assert not any("font-family" in decls for _, _, decls in rules), "@font-face has no selector: skipped"
+
+
+def test_sprint_reach_unrolls_is_and_where_groups_and_strips_other_pseudo_classes():
+    assert _sprint_reach(":is(.live-body, .tab-body) :is(.sprint-item-title)") == {"sprint-item-title"}
+    assert _sprint_reach(".sprint-item-row :where(.sprint-item-title, .sprint-item-ver)") == {
+        "sprint-item-title", "sprint-item-ver",
+    }
+    assert _sprint_reach(".sprint-item-row:has(> .sprint-item-ver):not(.x)") == {"sprint-item-row"}
+    assert _sprint_reach(":is(.sidebar, .tabs) .sprint-item-title") == frozenset(), "ancestors outside the board's chain"
+    assert _sprint_reach(":is(.tabs, .sidebar) span") == frozenset()
+    assert _sprint_reach(":is(:is(.sprint-item-title))") == {"sprint-item-title"}
+    # too deeply nested to unroll: assume it can reach anything rather than miss it
+    assert _sprint_reach(":is(:not(.a)) .b") == frozenset(_SPRINT_ROW_CLASSES)
+
+
+def test_sprint_cascade_scan_knows_every_class_the_row_markup_renders():
+    """Drift guard for _SPRINT_ROW_CLASSES: the scan can only judge the classes it
+    knows; every static class in the row markup must be listed, and none may be stale."""
+    src = _sprint_static("dashboard-sprint.ts")
+    board = src[src.index("export function renderSprintProgress") : src.index("export function renderQueue")]
+    helper = src[src.index("function _sprintHistoryBadges") : src.index("function _sprintHistoryBadges") + 1700]
+    rendered = set()
+    for chunk in (board, helper):
+        for attr in re.findall(r'class="([^"$]*)"', chunk):
+            rendered.update(attr.split())
+    row_like = {c for c in rendered if c.startswith(("sprint-item-", "sprint-btn", "sprint-stall", "sprint-retried", "sprint-live-dot")) or c == "resource-chip"}
+    assert row_like <= _SPRINT_ROW_CLASSES, f"row classes missing from _SPRINT_ROW_CLASSES: {sorted(row_like - _SPRINT_ROW_CLASSES)}"
+    assert _SPRINT_ROW_CLASSES <= rendered, f"stale classes in _SPRINT_ROW_CLASSES: {sorted(_SPRINT_ROW_CLASSES - rendered)}"
+
+
+# ---------------------------------------------------------------------------
 # b03be6a6 — Minimal installable PWA: manifest + icons + network-first SW.
 # ---------------------------------------------------------------------------
 
@@ -1153,3 +1869,419 @@ def test_pwa_install_prompt_wired(js):
     # Never shown when already running as an installed app.
     assert "display-mode: standalone" in js, "standalone display-mode check missing"
     assert "navigator.standalone" in js, "legacy iOS standalone check missing"
+
+
+# ---------------------------------------------------------------------------
+# 0c30b989 -- the sprint arrow button: the wiring no unit test can import.
+#
+# dashboard-sprint-move.test.ts (vitest) drives the glue's behaviour through
+# injected dependencies and the real renderer markup. What it cannot see is
+# dashboard.ts itself -- a ~13,800-line script with side effects -- so these
+# source scans pin the three seams that file owns: the real loaders handed to
+# the glue, the global name the inline onclick resolves, and the served bundle.
+# ---------------------------------------------------------------------------
+
+
+def _static(name: str) -> str:
+    from pathlib import Path
+
+    return (Path(__file__).parent.parent / "meridian" / "static" / name).read_text(
+        encoding="utf-8"
+    )
+
+
+def _balanced_call(src: str, opener: str) -> str:
+    """The text of ``opener(...)`` up to its matching close paren."""
+    start = src.index(opener)
+    depth = 0
+    for i in range(start + len(opener) - 1, len(src)):
+        if src[i] == "(":
+            depth += 1
+        elif src[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    raise AssertionError(f"unbalanced call after {opener!r}")
+
+
+def test_sprint_arrow_glue_is_handed_the_real_loaders():
+    """dashboard.ts must give the glue the real api/toast and the three repaint
+    targets (Live tab, Queue tab, Goal tab's sprint board). A dropped or
+    swapped dependency would leave a view stale after a move while every
+    vitest case (which injects its own fakes) stayed green."""
+    import re
+
+    src = _static("dashboard.ts")
+    wiring = _balanced_call(src, "createSprintMoveActions(")
+    assert re.search(r"\bapi:\s*\(path, init\)\s*=>\s*api\(path, init\)", wiring), wiring
+    assert re.search(r"\btoast:\s*\(message, isError\)\s*=>\s*toast\(message, isError\)", wiring), wiring
+    assert re.search(r"\brefreshLiveTab:\s*\(projectId\)\s*=>\s*refreshLiveTab\(projectId\)", wiring), wiring
+    assert re.search(r"\bloadQueue:\s*\(projectId\)\s*=>\s*loadQueue\(projectId\)", wiring), wiring
+    # The Goal tab's board registers its reloader per project at build time.
+    assert re.search(
+        r"reloadSprintBoard:.*_sprintBoardReloaders\[projectId\].*reload\(\)", wiring, re.S
+    ), wiring
+    assert "from \"./dashboard-sprint-move\"" in src
+
+
+def test_sprint_arrow_inline_onclick_resolves_a_real_global():
+    """The arrow's inline onclick calls the bare name sprintPushPrompt; it must
+    exist as a function in dashboard.ts, delegate to the glue, and be on the
+    list re-exposed on window (the bundle is an IIFE, so a top-level function
+    is otherwise invisible to inline handlers)."""
+    import re
+
+    src = _static("dashboard.ts")
+    m = re.search(r"async function sprintPushPrompt\([^)]*\)\s*\{(.*?)\n\}", src, re.S)
+    assert m, "sprintPushPrompt is no longer a top-level function in dashboard.ts"
+    assert "_sprintMoveActions.sprintPushPrompt(projectId, itemId, anchor)" in m.group(1)
+    assert "prompt(" not in m.group(1), "the arrow must not fall back to window.prompt"
+    exports = [line for line in src.splitlines() if line.startswith("try { Object.assign(window, {")]
+    assert exports and re.search(r"[{ ,]sprintPushPrompt[ ,}]", exports[0]), (
+        "sprintPushPrompt must stay in the Object.assign(window, ...) export list"
+    )
+
+
+def test_sprint_arrow_markup_carries_what_the_glue_looks_up():
+    """Both boards render the arrow with data-act/data-item-id and the exact
+    onclick; the Queue card carries data-item-id and the Live row data-item,
+    because flashMovedItem and the popover's focus-return find rows by them."""
+    sprint = _static("dashboard-sprint.ts")
+    onclick = (
+        "onclick=\"sprintPushPrompt('${escapeHtml(projectId)}',"
+        "'${escapeHtml(it.id)}',this)\""
+    )
+    assert sprint.count('data-act="move-version" data-item-id="${escapeHtml(it.id)}"') == 2
+    assert sprint.count(onclick) == 2
+    assert 'class="queue-item" data-item-id="${escapeHtml(it.id || \'\')}"' in sprint
+    assert 'class="sprint-item-row" data-item="${escapeHtml(it.id)}"' in sprint
+    versions = _static("dashboard-versions.ts")
+    assert '.sprint-item-row[data-item="${esc}"], .queue-item[data-item-id="${esc}"]' in versions
+
+
+def test_sprint_arrow_glue_endpoints_and_bodies_in_source():
+    """Belt and braces for the vitest behaviour cases: the move goes to /move
+    (never /push), the legacy defer to /push with {to_version}, the move sends
+    the version the human saw, and nothing here reaches for window.prompt."""
+    glue = _static("dashboard-sprint-move.ts")
+    assert "/sprint-items/${itemId}/move`" in glue
+    assert "/sprint-items/${itemId}/push`" in glue
+    assert "JSON.stringify({ to_version: targetVersion })" in glue
+    assert "{ next: true, expected_version: currentVersion }" in glue
+    assert "{ to_version: version, expected_version: currentVersion }" in glue
+    assert "out.item.version !== out.to_version" in glue
+    assert "`Moved to ${out.to_version}`" in glue
+    assert "prompt(" not in glue
+
+
+def test_sprint_arrow_glue_is_in_the_served_bundle():
+    """The server ships the committed dashboard.bundle.js, not the .ts files: a
+    forgotten rebuild would keep the old window.prompt flow in front of users."""
+    bundle = _static("dashboard.bundle.js")
+    assert "createSprintMoveActions" in bundle
+    assert "/sprint-items/${itemId}/move`" in bundle
+    assert "expected_version: currentVersion" in bundle
+    assert "Moved to ${out.to_version}" in bundle
+    assert "Push to version (e.g. v2.0)" not in bundle
+
+
+# ---------------------------------------------------------------------------
+# 90952bad - waffle launcher + collapsed-by-default vtab rail
+# ---------------------------------------------------------------------------
+
+
+def _static_text(name: str) -> str:
+    from pathlib import Path
+
+    return (Path(__file__).parent.parent / "meridian" / "static" / name).read_text(encoding="utf-8")
+
+
+def test_waffle_launcher_has_popup_semantics_and_keyboard_support():
+    """90952bad - the launcher is a real button with aria-haspopup/aria-expanded
+    opening a labelled dialog that holds a filter box and a menu of menuitems; it
+    closes on Escape (returning focus), on an outside click and when focus leaves,
+    and it traps Tab. The behaviour itself is covered by vitest
+    (dashboard-waffle.test.ts); this guards the source contract."""
+    waffle = _static_text("dashboard-waffle.ts")
+    for needle in (
+        'button.setAttribute("aria-haspopup", "dialog")',
+        'button.setAttribute("aria-expanded", "false")',
+        'button.setAttribute("aria-controls", "waffle-popover")',
+        'popover.setAttribute("role", "dialog")',
+        'popover.setAttribute("aria-modal", "true")',
+        'role="menu"',
+        'role="menuitem"',
+        'aria-keyshortcuts="P"',
+        'type="search"',
+        'aria-label="Filter tabs"',
+        'aria-live="polite"',
+        'ev.key !== "Escape"',
+        'document.addEventListener("keydown", onDocKey, true)',
+        'ev.key === "Tab"',
+        '"mousedown"',
+        '"focusin"',
+        'ArrowDown',
+    ):
+        assert needle in waffle, f"waffle launcher source contract missing: {needle}"
+    # Every localStorage access is guarded: the page must work without storage.
+    assert "safeLocalStorage" in waffle
+    # The only code that touches window.localStorage is the guarded accessor.
+    guard = waffle[waffle.index("export function safeLocalStorage") :]
+    guard = guard[: guard.index("\n}\n")]
+    assert "try {" in guard and "catch" in guard
+    assert waffle.count("window.localStorage ?") == 1 and waffle.count("localStorage.getItem") == 0
+
+
+def test_waffle_activation_reuses_the_rail_button_path():
+    """90952bad - choosing a tile is ADDITIVE: it reveals the tab's group and then
+    clicks the matching .vtab-btn (whose own onclick owns the drawer switch, the
+    persisted last tab and the loaders), instead of re-implementing navigation."""
+    waffle = _static_text("dashboard-waffle.ts")
+    start = waffle.index("export function activateWaffleTab")
+    body = waffle[start : start + 1400]
+    reveal = body.index("revealGroupInStrip(strip, tab)")
+    click = body.index("btn.click()")
+    assert reveal < click, "the waffle must reveal the tab's group BEFORE clicking its button"
+    assert ".goal-subtab-btn" in body, "Goal sub-entries must click the Goal sub-tab button"
+    # It never touches panel state or loaders directly.
+    for forbidden in ("activeVtab", "loadNotesTab", "loadQueue", "drawer-panel"):
+        assert forbidden not in body
+
+
+def test_waffle_wired_into_dashboard_and_template():
+    """90952bad - dashboard.ts mounts the launcher first thing in init(), feeds the
+    Queue badge from the sprint loaders, and the template wraps the project tabs in
+    the #topbar the launcher is inserted into."""
+    dash = _static_text("dashboard.ts")
+    assert 'from "./dashboard-waffle"' in dash
+    init = dash.index("(async function init() {")
+    assert "_mountDashboardWaffle();" in dash[init : init + 400]
+    assert dash.count("_setWaffleQueueCount(") >= 4  # definition + goal/live/queue loaders
+    assert "host: document.getElementById('topbar')" in dash
+    assert "storageKey: STORAGE_KEY('waffle.v1')" in dash
+
+    html_path = __import__("pathlib").Path(__file__).parent.parent / "meridian" / "templates" / "dashboard.html"
+    html = html_path.read_text(encoding="utf-8")
+    top = html.index('id="topbar"')
+    assert html.index('id="tabs"') > top, "#tabs must live inside #topbar"
+    assert html.index('id="tab-bodies"') > html.index('id="tabs"')
+
+
+def test_waffle_refresh_keeps_focus_and_skips_identical_swaps():
+    """90952bad - the HITL fallback poll (every 10 s) and the sprint loaders call
+    refreshWaffle() while the popover may be open. render() must read focus before
+    it replaces the grid and put it back afterwards, and must not rebuild the grid
+    at all when the generated HTML is unchanged; otherwise a keyboard user is
+    dropped onto <body> and arrows/Enter/P/Esc go dead. Behaviour is covered by
+    vitest (\"refreshing while open keeps keyboard control\"); this guards the
+    source contract."""
+    waffle = _static_text("dashboard-waffle.ts")
+    start = waffle.index("const render = () => {")
+    body = waffle[start : waffle.index("const place = () => {", start)]
+    focus_read = body.index("document.activeElement")
+    swap = body.index("body.innerHTML = html")
+    assert focus_read < swap, "focus must be read BEFORE the grid is replaced"
+    assert "if (html !== lastHtml)" in body, "an identical refresh must not swap the grid"
+    assert "focusEntry(target)" in body, "focus must be restored onto the same entry after a swap"
+    # Esc is heard at the document so it still works when focus has fallen to <body>.
+    assert 'document.addEventListener("keydown", onDocKey, true)' in waffle
+    assert 'document.removeEventListener("keydown", onDocKey, true)' in waffle
+
+
+def test_waffle_state_writes_are_read_modify_write_and_follow_other_tabs():
+    """90952bad - pins, usage and recents are ONE localStorage value shared by every
+    open dashboard tab. A launcher that loaded it at mount and wrote its whole
+    in-memory copy back lost whatever another tab had pinned or counted since. Every
+    write must re-read the latest stored value and apply only its own change, and a
+    window 'storage' listener (plus a re-read on open) must keep an open popover
+    current. Behaviour is covered by vitest ("two tabs share one stored state");
+    this guards the source contract."""
+    waffle = _static_text("dashboard-waffle.ts")
+    start = waffle.index("const mutate = (")
+    mutate = waffle[start : waffle.index("};", start)]
+    assert mutate.index("syncFromStorage()") < mutate.index("state = change(state)"), (
+        "the latest stored value must be read BEFORE the one change is applied"
+    )
+    assert mutate.index("state = change(state)") < mutate.index("saveState(storage, storageKey, state)")
+    # The only save in the launcher is that read-modify-write: no path persists a stale copy.
+    assert waffle.count("saveState(storage, storageKey") == 1
+    assert "persist()" not in waffle
+    start = waffle.index("const noteUse = (tab: string) => {")
+    assert "mutate((latest) => recordUse(latest, tab))" in waffle[start : start + 300]
+    start = waffle.index("const togglePinFor = (")
+    assert "mutate((latest) => setPinned(latest, tab, wantPinned))" in waffle[start : start + 900]
+    # Other tabs' writes arrive through the storage event, and opening re-reads too.
+    on_storage = waffle[waffle.index("const onStorage = (") : waffle.index("const onDocKey")]
+    assert "ev.key !== storageKey" in on_storage and "render()" in on_storage
+    assert 'window.addEventListener("storage", onStorage)' in waffle
+    assert 'window.removeEventListener("storage", onStorage)' in waffle
+    opened = waffle[waffle.index("function open(): void {") :]
+    assert opened.index("syncFromStorage()") < opened.index("render()")
+    # Reading storage stays guarded: unreadable storage is "no answer", never a throw.
+    raw = waffle[waffle.index("export function readRawState") : waffle.index("export function parseRawState")]
+    assert "try {" in raw and "catch" in raw
+
+
+def test_waffle_usage_is_recorded_from_the_shared_rail_onclick():
+    """90952bad - usage adaptation must learn from every way of opening a tab, not
+    only waffle activations: the rail's shared .vtab-btn onclick calls
+    recordWaffleUse before any loader, while the scripted clicks (restoring the last
+    tab on load, the demo tour) run inside withoutWaffleUse so they do not count."""
+    dash = _static_text("dashboard.ts").replace(chr(13) + chr(10), chr(10))
+    waffle = _static_text("dashboard-waffle.ts")
+    assert "export function recordWaffleUse" in waffle
+    assert "export function withoutWaffleUse" in waffle
+    onclick = dash.index("btn.onclick = () => {", dash.index("wireVtabGroups(vtabStrip)"))
+    record = dash.index("recordWaffleUse(vtab);", onclick)
+    first_loader = dash.index("if (vtab === 'files') loadFilesTab", onclick)
+    assert onclick < record < first_loader, "recordWaffleUse must run before any loader"
+    assert "withoutWaffleUse(() => savedBtn.click())" in dash
+    tour = dash[dash.index("function _tourActivateVtab") : dash.index("function startDemoTour")]
+    assert "withoutWaffleUse(() => btn.click())" in tour
+    # The waffle's own activation is counted once: it guards the rail onclick's call.
+    start = waffle.index("const activateKey = (key: string | null) => {")
+    activate = waffle[start : start + 900]
+    assert "withoutWaffleUse(() => activateWaffleTab(" in activate
+    assert "noteUse(entry.tab)" in activate
+
+
+def test_waffle_css_is_theme_driven_and_responsive(css):
+    """90952bad - the launcher styles use the theme variables only (no hard-coded
+    palette, so a light theme restyles it), keep the popover above the sidebar,
+    honour [hidden], and clear the fixed hamburger on phones."""
+    import re
+
+    start = css.index("90952bad - waffle launcher")
+    block = css[start:]
+    for selector in (
+        ".waffle-btn",
+        ".waffle-popover",
+        ".waffle-tile",
+        ".waffle-sub",
+        ".waffle-badge",
+        ".waffle-filter",
+        ".waffle-popover[hidden]",
+    ):
+        assert selector in block, f"missing CSS rule {selector}"
+    # No hex colours inside the block (rgba shadow aside): theme variables only.
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b", block), "waffle CSS hard-codes a colour"
+    z = int(re.search(r"\.waffle-popover\s*\{[^}]*z-index:\s*(\d+)", block).group(1))
+    assert z > 300, "popover must sit above the mobile sidebar (200) and hamburger (300)"
+    assert re.search(r"@media \(max-width: 768px\)\s*\{[^}]*\.waffle-slot\s*\{[^}]*padding-left", block), (
+        "phone layout must clear the fixed hamburger"
+    )
+    assert "grid-template-columns: repeat(3" in block, "tiles are a 3-column grid at every width"
+    assert ":focus-visible" in block, "keyboard focus needs a visible ring"
+
+
+def test_vtab_groups_start_collapsed_except_the_active_one():
+    """90952bad - the rail groups are collapsed by default except the active tab's
+    group, and every in-repo consumer that navigates by clicking a rail button
+    reveals the group first: the rail's own onclick, the restored last tab, and the
+    demo tour (which measures the button right after)."""
+    groups = _static_text("dashboard-tabgroups.ts")
+    assert "export const VTAB_GROUPS_COLLAPSED_BY_DEFAULT = true;" in groups
+    assert '"experiments"' in groups, "Experiments must belong to a group so its group can be revealed"
+    dash = _static_text("dashboard.ts")
+
+    onclick = dash.index("btn.onclick = () => {", dash.index("wireVtabGroups(vtabStrip)"))
+    assert dash.index("revealGroupForTab(vtab);", onclick) < dash.index("if (vtab === 'files') loadFilesTab", onclick)
+
+    restore = dash.index("// Restore last active vtab from localStorage")
+    assert dash.index("revealGroupForTab(saved);", restore) < dash.index("savedBtn.click()", restore)
+
+    tour = dash.index("function _tourActivateVtab")
+    tour_body = dash[tour : tour + 900]
+    assert tour_body.index("revealGroupInStrip(") < tour_body.index("btn.click()"), (
+        "the demo tour must reveal the step's rail group before clicking/measuring its button"
+    )
+
+
+def test_playwright_ux_tests_open_a_collapsed_group_before_waiting_for_its_button():
+    """90952bad - Playwright click/wait_for_selector wait for VISIBILITY, and a tab
+    outside the active group is hidden on load. Every UX test that clicks a rail
+    button must go through the _open_vtab helper (which opens the group first)."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).parent / "test_demo_ux.py").read_text(encoding="utf-8")
+    assert "def _open_vtab(page, tab" in src
+    raw_clicks = re.findall(r"page\.click\(['\"]\.vtab-btn", src)
+    assert not raw_clicks, "a UX test clicks a .vtab-btn directly; use _open_vtab(page, tab).click()"
+    for tab in ("sessions", "rewind", "documents", "live"):
+        assert f'_open_vtab(page, "{tab}")' in src, f"UX test for the {tab} vtab no longer opens its group first"
+
+
+# ---------------------------------------------------------------------------
+# 90952bad - the fixed /demo banner must not cover the launcher or the hamburger
+# ---------------------------------------------------------------------------
+
+
+def test_demo_page_publishes_the_banner_height_and_other_pages_do_not(client):
+    """/demo's banner is position:fixed and wraps to ~76px on a phone, where it used
+    to sit on top of the hamburger and the waffle button (a tap landed on the
+    banner). The page now publishes the banner's measured height as --demo-banner-h,
+    re-measuring on resize, load, web-font arrival and ResizeObserver; non-demo
+    pages must not carry the banner, its script or the variable."""
+    demo = client.get("/demo")
+    assert demo.status_code == 200
+    text = demo.text
+    banner = text.index('id="demo-banner"')
+    script_start = text.index("<script>(function(){var b=document.getElementById('demo-banner')", banner)
+    script = text[script_start : text.index("</script>", script_start)]
+    assert script_start < text.index("window.MERIDIAN_DEMO_MODE"), "the height must be set before the app is laid out"
+    assert "--demo-banner-h" in script
+    assert "Math.ceil(b.getBoundingClientRect().height)" in script, "round UP: a floor would leave a sub-pixel strip covered"
+    for trigger in ("'resize'", "'load'", "'loadingdone'", "new ResizeObserver"):
+        assert trigger in script, f"the banner height is not re-measured on {trigger}"
+
+    plain = client.get("/dashboard")
+    assert plain.status_code == 200
+    assert "--demo-banner-h" not in plain.text and "demo-banner" not in plain.text
+
+
+def test_app_reserves_the_demo_banner_height_with_a_zero_fallback(css):
+    """The reservation is padding on .app (so it stays 100vh and nothing scrolls),
+    plus moving the fixed phone drawer and its hamburger down by the same amount.
+    Every rule falls back to 0px, so a page without the variable is unchanged."""
+    import re
+
+    start = css.index("room for the fixed demo banner")
+    block = css[start:]
+    assert re.search(r"\.app\s*\{\s*padding-top:\s*var\(--demo-banner-h,\s*0px\);\s*\}", block)
+    mobile = block[block.index("@media (max-width: 768px)") :]
+    assert re.search(r"\.sidebar\s*\{\s*top:\s*var\(--demo-banner-h,\s*0px\);\s*\}", mobile)
+    assert re.search(r"#sidebar-toggle\s*\{\s*top:\s*calc\(var\(--demo-banner-h,\s*0px\)\s*\+\s*10px\);\s*\}", mobile)
+    # The original declarations are untouched: the override rules only add the offset.
+    assert re.search(r"\.app\s*\{\s*display:\s*grid;[^}]*height:\s*100vh;", css)
+    assert re.search(r"#sidebar-toggle\s*\{[^}]*top:\s*10px;", css)
+
+
+def test_js_demo_banner_does_not_pad_when_the_page_banner_reserves_room():
+    """dashboard.ts's own 22px 'Preview mode' bar sits UNDER the server-rendered
+    banner on /demo. Its inline body padding would stack 22px of dead space on top of
+    the room .app already reserves for that banner, so it pads only when
+    #demo-banner is absent (the /dashboard page running with MERIDIAN_DEMO set)."""
+    dash = _static_text("dashboard.ts").replace(chr(13) + chr(10), chr(10))
+    start = dash.index("b.id = 'demo-mode-banner';")
+    block = dash[start : dash.index("resumeDemoTour();", start)]
+    guard = block.index("if (!document.getElementById('demo-banner')) {")
+    pad = block.index("document.body.style.paddingTop")
+    assert guard < pad, "the 22px padding must sit inside the no-page-banner guard"
+    # The tour still resumes from the same place regardless of the guard.
+    assert "resumeDemoTour();" in dash[start : start + 3000]
+
+
+def test_waffle_playwright_test_keeps_the_demo_banner_and_hit_tests_the_controls():
+    """The first version of the launcher's Playwright test deleted #demo-banner before
+    measuring, which hid the covered-button bug. It must keep the real banner and
+    hit-test the button and hamburger at phone widths."""
+    from pathlib import Path
+
+    src = (Path(__file__).parent / "test_demo_ux.py").read_text(encoding="utf-8")
+    start = src.index("def test_waffle_launcher_stays_in_viewport_and_navigates")
+    body = src[start : src.index("def test_subproject_hierarchy_ui", start)]
+    assert "'demo-banner'" not in body.split("page.evaluate(")[1], "the demo banner must not be removed"
+    assert "elementFromPoint" in body and "--demo-banner-h" in body
+    for width in ("(375, 812)", "(320, 640)", "(768, 900)", "(1280, 800)"):
+        assert width in body, f"the banner hit-test no longer runs at {width}"

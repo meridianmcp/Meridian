@@ -52,6 +52,7 @@ from ._deps import (
     _tenant_rl_hits,
     _tenant_rl_plan_cache,
     _tenant_rl_over_limit,
+    _tenant_rl_plan,
     _shared_rate_limit_enabled,
     _get_authenticated_tenant,
     _authentication_required,
@@ -64,6 +65,7 @@ from ._deps import (
     _enforcement_context,
     _required_perm_for_request,
     _render_workspace_block,
+    _build_workspace_context_block,
     _render_context_block,
 )
 from .pid_probe import pid_is_alive
@@ -1352,7 +1354,8 @@ async def _tenant_rate_limit_decision_shared(
 #
 # Executors poll get_sprint_progress between tasks; this meters the programmatic
 # (Bearer-token) surface per tenant per minute by plan — free=500, standard=2000,
-# pro/admin=unlimited. Dashboard/cookie, demo, unauthenticated, /health and
+# pro/admin=unlimited (a playtester is metered as pro). Dashboard/cookie, demo,
+# unauthenticated, /health and
 # /static traffic is never metered. FAIL-OPEN: any error resolving the tenant or
 # counting hits lets the request through, so a limiter bug can never take down
 # live traffic. In-memory sliding window (process-local, no Redis), matching the
@@ -1385,7 +1388,7 @@ async def _tenant_rate_limit_decision(request: Request):
         if not tenant:
             return None  # unknown token — let the route's own auth reject it
         tenant_id = tenant.get("id") or token_hash
-        plan = (tenant.get("plan") or "free").lower()
+        plan = _tenant_rl_plan(tenant)  # entitlement plan (playtester -> pro)
         _tenant_rl_plan_cache[token_hash] = (now, (tenant_id, plan))
 
     limit = _TENANT_RL_PER_MINUTE.get(plan, _TENANT_RL_PER_MINUTE["free"])
@@ -2172,11 +2175,20 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     from .hosted import _admin_emails
     from . import __version__ as _meridian_version
     from datetime import datetime, timezone
+    from .plans import (
+        is_playtester,
+        plan_has_end_date,
+        playtester_access_expired,
+        tenant_entitlement_plan,
+    )
     plan = tenant.get("plan") or "standard"
     expires_raw = tenant.get("inactivity_expires_at")
     days_remaining: int | None = None
     expired = False
-    if expires_raw:
+    # Only a plan that carries an end date can expire: a tenant that went from a
+    # trial or playtester period to a paying plan keeps the old date in the
+    # column, and it must not read as "Pro expired".
+    if expires_raw and plan_has_end_date(plan):
         try:
             expires_dt = datetime.strptime(expires_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             delta = expires_dt - datetime.now(timezone.utc)
@@ -2199,6 +2211,11 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
                 days_remaining = max(0, 30 - _elapsed)
             except (ValueError, TypeError):
                 pass
+    # A playtester has no trial clock; inactivity_expires_at is its optional end
+    # date (NULL = none). Use the same verdict the gates use so the banner and
+    # the entitlement can never disagree (an unparseable value counts as expired).
+    if is_playtester(plan):
+        expired = playtester_access_expired(tenant)
     # G2.10 — internal tenants never see the "expired" / "days remaining"
     # banner. The lifecycle jobs already skip them, but a positive UX cue
     # is cleaner than leaving the expired flag set with no consequence.
@@ -2216,6 +2233,11 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     )
     return {
         "plan": plan,
+        # The plan whose entitlements apply right now (playtester -> 'pro', a
+        # lapsed playtester -> 'free'). Clients gate features on this; `plan`
+        # stays the stored value for labels. Same verdict as the server's gates.
+        "entitlement_plan": tenant_entitlement_plan(tenant, default="standard"),
+        "is_playtester": is_playtester(plan),
         # Tunnel client reads this to nudge an upgrade when it's behind the
         # deployed server (see tunnel_client._update_notice). Single source:
         # meridian.__version__.
@@ -3426,6 +3448,60 @@ async def ws_project(ws: WebSocket, project_id: str) -> None:
     await broadcaster.serve(ws, project_id)
 
 
+@app.websocket("/ws-account")
+async def ws_account(ws: WebSocket) -> None:
+    """Push project-LIST events (``projects_changed``) to a dashboard page.
+
+    8a665a03: ``/ws/{project_id}`` is one socket per open project TAB, so a dashboard with
+    no tab open (the last one closed, a brand-new account) held no socket and never heard a
+    project being created, renamed, merged or deleted from another tab, an agent or the API.
+    This is the page's own socket, independent of the tabs; it carries only account-level
+    events, so a project's data never travels on it.
+
+    The stream is keyed by the DATABASE the caller reads (``db_module.subscribe_account``),
+    resolved exactly as the HTTP routes resolve it, so a caller only ever hears about a
+    project list it can read -- the same boundary ``GET /projects`` applies (4bea8629's
+    reasoning for ``ws_project``: the per-project registry is process-wide, this one cannot
+    cross a tenant). Hosted mode needs a resolved tenant (cookie or bearer token), rejects
+    with ``code=4401`` like ``ws_project`` and the tunnel sockets, and honours the dashboard's
+    workspace switch through ``?workspace=<tenant_id>`` (a WebSocket cannot carry the
+    ``X-Workspace-Tenant-Id`` header the HTTP calls use) for a workspace-wide member, the
+    membership check ``_db`` makes. Self-hosted has no tenant concept: the one database.
+    """
+    await ws.accept()
+
+    if _hosted_mode():
+        tenant = await _get_tenant_from_request(ws)  # type: ignore[arg-type]
+        if tenant is None:
+            await ws.close(code=4401, reason="authentication required")
+            return
+        target_tenant_id = tenant["id"]
+        workspace = (ws.query_params.get("workspace") or "").strip()
+        if workspace and workspace != target_tenant_id:
+            memberships = await db_module.get_workspaces_for_email(
+                ws.app.state.db, tenant.get("email", "")
+            )
+            # A project-scoped member (project_id set) sees only their one project through
+            # GET /projects, so the owner's whole-workspace stream -- which says that SOME
+            # project was created or deleted -- is not theirs to hear.
+            if not any(
+                m["tenant_id"] == workspace and not m.get("project_id") for m in memberships
+            ):
+                await ws.close(code=4401, reason="not a workspace-wide member")
+                return
+            target_tenant_id = workspace
+        try:
+            account_db = await _open_tenant_db_by_id(ws, target_tenant_id)  # type: ignore[arg-type]
+        except HTTPException:
+            await ws.close(code=4401, reason="invalid tenant")
+            return
+    else:
+        account_db = ws.app.state.db
+
+    broadcaster: dashboard_module.WebSocketBroadcaster = (
+        ws.app.state.ws_broadcaster
+    )
+    await broadcaster.serve_account(ws, account_db)
 
 
 @app.get("/admin/login", response_class=HTMLResponse)
@@ -3602,6 +3678,16 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
 _WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"standard": 25, "pro": 50}
 
 
+def _workspace_member_limit(tenant: dict[str, Any]) -> int:
+    """Team-size cap for the entitlement in force on ``tenant`` (a playtester has
+    Pro's; a plan the table does not know gets the Standard-sized default)."""
+    from .plans import tenant_entitlement_plan  # noqa: PLC0415
+
+    return _WORKSPACE_MEMBER_LIMITS.get(
+        tenant_entitlement_plan(tenant, default="standard"), 25
+    )
+
+
 @app.post("/workspace/invite", status_code=201)
 async def workspace_invite(request: Request) -> dict[str, Any]:
     """Invite a new workspace member. Sends invite email via Resend."""
@@ -3644,7 +3730,7 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
     project_id = raw_project_id.strip() if isinstance(raw_project_id, str) else None
     project_id = project_id or None
     db = request.app.state.db
-    limit = _WORKSPACE_MEMBER_LIMITS.get(tenant.get("plan", "standard"), 25)
+    limit = _workspace_member_limit(tenant)
     count = await db_module.count_workspace_members(db, tenant["id"])
     if count >= limit:
         raise HTTPException(status_code=402, detail=f"Team member limit ({limit}) reached for your plan")
@@ -3895,10 +3981,11 @@ async def get_usage_settings(request: Request) -> dict[str, Any]:
     """Return current compute + storage usage and overage caps for the tenant."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
-    from .hosted import get_current_tenant, PLAN_LIMITS, COMPUTE_OVERAGE_RATE, STORAGE_OVERAGE_RATE
+    from .hosted import get_current_tenant, plan_limits_for, COMPUTE_OVERAGE_RATE, STORAGE_OVERAGE_RATE
+    from .plans import is_unbilled_plan  # noqa: PLC0415
     tenant = await get_current_tenant(request)
     plan = tenant.get("plan") or "standard"
-    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    limits = plan_limits_for(tenant)
     unlimited = math.isinf(limits["cu_hours"])
     # float('inf') is not valid JSON for the browser's JSON.parse — emit null + a flag.
     cu_limit = None if math.isinf(limits["cu_hours"]) else limits["cu_hours"]
@@ -3906,6 +3993,9 @@ async def get_usage_settings(request: Request) -> dict[str, Any]:
     gb_limit = None if math.isinf(limits["storage_gb"]) else limits["storage_gb"]
     return {
         "plan": plan,
+        # False for an unbilled plan (playtester): the ceilings are hard, there
+        # is no overage budget to set, and nothing is ever metered.
+        "overage_billing": not is_unbilled_plan(plan),
         "unlimited": unlimited,
         "compute": {
             "used": float(tenant.get("compute_cu_hours_used") or 0),
@@ -3932,7 +4022,13 @@ async def update_usage_caps(request: Request) -> dict[str, Any]:
     if not _hosted_mode():
         raise HTTPException(status_code=404)
     from .hosted import get_current_tenant
+    from .plans import is_unbilled_plan  # noqa: PLC0415
     tenant = await get_current_tenant(request)
+    if is_unbilled_plan(tenant.get("plan")):
+        raise HTTPException(
+            status_code=400,
+            detail="this account has fixed usage limits and no overage budget",
+        )
     body = await request.json()
     compute_cap = float(body.get("compute_cap") or 0)
     storage_cap = float(body.get("storage_cap") or 0)
@@ -4788,7 +4884,43 @@ async def api_reference_doc() -> str:
         "\n"
         "### `POST /projects/{project_id}/sprint-items/{item_id}/push`\n"
         "\n"
-        'Push to future version. Body: `{"to_version": "v2.4"}`\n'
+        'Defer to the backburner. Body: `{"to_version": "v2.4"}`. The item becomes'
+        " `pushed` (terminal), `pushed_to` records the target and its own `version`"
+        " is left alone.\n"
+        "\n"
+        "### `POST /projects/{project_id}/sprint-items/{item_id}/move`\n"
+        "\n"
+        "Move to another version while staying pending (what the dashboard's arrow"
+        " button offers first). The title and status are never touched.\n"
+        "\n"
+        "**Body:** exactly one of `{\"next\": true}` (the server computes the version"
+        " after the item's own: `v2.1` to `v2.2`, `v2.9` to `v2.10`, `v0.2.x` to"
+        " `v0.3.x`, `1.0.0` to `1.0.1`) or `{\"to_version\": \"v2.5\"}`; optional"
+        " `expected_version` (the version the caller saw; a mismatch is a 409, so a"
+        " replayed `next` cannot move the item twice).\n"
+        "\n"
+        "**Response:** `{item, from_version, to_version, via, unchanged,"
+        " moved_children, history_recorded}` -- `to_version` is the number actually"
+        " used. `422` with `detail.code = \"next_version_unavailable\"` when the item's"
+        " label has no unambiguous successor (e.g. `current sprint v0.2`); `409` when"
+        " the item is finished or deferred. Subtasks still in the old version move"
+        " with the parent. The move is recorded in the audit log as"
+        " `sprint_item_version_moved`.\n"
+        "\n"
+        "### `POST /projects/{project_id}/sprint-items/move`\n"
+        "\n"
+        'Bulk move. Body: `{"item_ids": [...], "next": true}` or `{"item_ids": [...],'
+        ' "to_version": "v2.5"}` (at most 100 ids). Each item is moved independently;'
+        " the response lists one outcome per id.\n"
+        "\n"
+        "> Agents: `update_sprint_item(version=...)` (the MCP twin of `PATCH"
+        " /projects/{project_id}/sprint-items/{item_id}`) also re-versions a single item"
+        " and keeps it pending, but it is a bare field edit, not this move: it does not"
+        " work out a next version, does not carry subtasks along (a parent can end up in"
+        " a newer version than its subtasks), writes no `sprint_item_version_moved`"
+        " history entry (open dashboards still repaint, as for any edit). The MCP"
+        " `push_sprint_item` tool is"
+        " the deferral above.\n"
         "\n"
         "### `DELETE /projects/{project_id}/sprint-items/{item_id}`\n"
         "\n"
@@ -5079,8 +5211,26 @@ async def _expire_and_generate_handoffs(
         try:
             # v2.4 — auto-generated handoffs from the idle-expire loop
             # skip the Haiku ai_summary unless the key is set.
+            # 0b0b24d8 — explicit mode="delta": omitting it inherited 'full'
+            # and rewrote every cross-project workspace decision/note into
+            # each affected project's handoff on every idle-expire pass.
+            # delta (not goal) keeps refreshing <stem>_handoff.md, the file
+            # start_session reports as handoff_path.
+            # The most recently seen expired session bounds delta's "completed
+            # since" list: with no session it is unbounded and would show the
+            # OLDEST 20 items the project ever completed. It is passed as
+            # window_session_id, NOT session_id: an idle session can resume,
+            # and an unattended write attributed to it would become its "last
+            # handoff", so its next explicit delta would silently drop
+            # everything completed before this pass.
+            # refresh_retrospective=True: the old 'full' default also refreshed
+            # the Sprint Retrospective note (aef94e4a) on every pass and delta
+            # skips that step. With no API key (_skip) the note is written from
+            # its deterministic body instead of being skipped altogether.
+            _expired = (result.get("session_ids_by_project") or {}).get(pid) or [None]
             await handoff_module.generate_handoff(
-                db, pid, data_dir, skip_ai_summary=_skip
+                db, pid, data_dir, skip_ai_summary=_skip, mode="delta",
+                window_session_id=_expired[0], refresh_retrospective=True,
             )
             generated = True
         except Exception:  # noqa: BLE001
@@ -6299,10 +6449,11 @@ async def _start_session_composite(
     # v3.4 — inject workspace-level decisions + notes so a cold executor sees
     # tenant-global conventions on entry without a separate get_context_block
     # round-trip. Same source + renderer as get_context_block.
+    # 0b0b24d8 — a bounded index by default (capped decision summaries, a note
+    # count, policy-note titles, the fetch calls); the full text only when
+    # include_workspace_context is on. See _build_workspace_context_block.
     try:
-        ws_decisions = await db_module.get_workspace_decisions(db)
-        ws_notes = await db_module.get_workspace_notes(db)
-        workspace_context = _render_workspace_block(ws_decisions, ws_notes)
+        workspace_context = await _build_workspace_context_block(db)
     except Exception:
         workspace_context = ""
 

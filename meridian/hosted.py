@@ -17,6 +17,14 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 
+# Plan values and what each entitles live in plans.py; this module only asks it.
+from .plans import (
+    UNBILLED_PLANS,
+    effective_entitlement_plan,
+    is_unbilled_plan,
+    tenant_entitlement_plan,
+)
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -656,7 +664,8 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
             has_slot = bool(
                 (tenant or {}).get("neon_project_id")
                 or (tenant or {}).get("neon_db_url")
-                or (tenant or {}).get("plan") in {"standard", "pro", "admin"}
+                or effective_entitlement_plan((tenant or {}).get("plan"))
+                in {"standard", "pro", "admin"}
             )
             if not has_slot:
                 # G5.22 — invitees who already accepted an invite into another
@@ -1210,7 +1219,12 @@ _ALERT_THRESHOLD_PRO = int(os.environ.get("ALERT_THRESHOLD_PRO", "90"))
 
 
 def _neon_api_key_for_tier(tier: str) -> str:
-    """Return the Neon API key for the given tier.  Raises if not configured."""
+    """Return the Neon API key for the given tier.  Raises if not configured.
+
+    ``tier`` may be a plan value: an alias plan (playtester) resolves to the
+    canonical plan whose pool it lives in.
+    """
+    tier = effective_entitlement_plan(tier)
     if tier == "pro":
         key = _cfg("NEON_API_KEY_PRO")
         if not key:
@@ -1221,6 +1235,59 @@ def _neon_api_key_for_tier(tier: str) -> str:
     return _require_cfg("NEON_API_KEY")
 
 
+async def _pool_tiers_by_project(db: Any) -> dict[str, str]:
+    """neon_project_id -> registered tier ('free' / 'standard' / 'pro') of every pool project.
+
+    The tier names the Neon account that owns the project, so it decides which
+    API key can see it. Empty on any error: callers then fall back to the plan.
+    """
+    try:
+        async with db.execute("SELECT neon_project_id, tier FROM neon_pool_projects") as cur:
+            rows = await cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Pool registry unreadable, Neon keys fall back to each tenant's plan: %s",
+            type(exc).__name__,
+        )
+        return {}
+    tiers: dict[str, str] = {}
+    for row in rows or []:
+        found = row if isinstance(row, dict) else {k: row[k] for k in row.keys()}
+        if found.get("neon_project_id") and found.get("tier"):
+            tiers[found["neon_project_id"]] = found["tier"]
+    return tiers
+
+
+def _neon_api_key_for_tenant(tenant: dict[str, Any], pool_tiers: dict[str, str]) -> str:
+    """Neon API key of the account the tenant's database actually lives in.
+
+    The database stays in the pool it was provisioned into when the plan
+    changes later (free -> playtester or pro, pro -> standard), so the plan is
+    only the fallback for a database that is not a registered pool project.
+    Asking the wrong account is refused by Neon: a usage job then cannot measure
+    the tenant and a database drop silently does nothing.
+    """
+    tier = pool_tiers.get(tenant.get("neon_project_id") or "") or tenant.get("plan") or "standard"
+    return _neon_api_key_for_tier(tier)
+
+
+def _neon_api_key_for_usage(tenant: dict[str, Any], pool_tiers: dict[str, str]) -> str:
+    """Neon API key the usage jobs (daily overage, hourly storage) poll a tenant with.
+
+    Every ordinary tenant is polled with its plan's key, exactly as before the
+    playtester plan: following the pool registry for them too would start
+    measuring (and, through the existing no-budget throttle, clamping) pools that
+    are today skipped because plan and pool disagree. Only an unbilled plan
+    follows the registry, because it is normally made by flipping the plan of a
+    tenant that already has a database in a free/standard pool, and polling that
+    pool with the Pro key would leave the playtester unmeasured.
+    """
+    if is_unbilled_plan(tenant.get("plan")):
+        return _neon_api_key_for_tenant(tenant, pool_tiers)
+    return _neon_api_key_for_tier(tenant.get("plan") or "standard")
+
+
 def _neon_org_id_for_tier(tier: str) -> str | None:
     """Return the optional Neon organization id for project creation.
 
@@ -1228,6 +1295,7 @@ def _neon_org_id_for_tier(tier: str) -> str | None:
     scoped keys infer it, so the setting stays optional for those deployments.
     Pro may use a separate Neon organization and can override the common id.
     """
+    tier = effective_entitlement_plan(tier)
     if tier == "pro":
         return _cfg("NEON_ORG_ID_PRO") or _cfg("NEON_ORG_ID")
     return _cfg("NEON_ORG_ID")
@@ -1534,6 +1602,16 @@ async def _provision_tenant_background(tenant_id: str, db: Any) -> None:
         )
 
 
+def pool_tier_for(tenant: dict[str, Any]) -> str:
+    """The plan whose Neon pool a tenant is provisioned into.
+
+    An aliased plan (playtester) lands in its canonical plan's pool, because the
+    pool-tier CHECK constraint only knows free/standard/pro; a lapsed playtester
+    lands in free's. A tenant with no plan is provisioned as standard.
+    """
+    return tenant_entitlement_plan(tenant, default="standard")
+
+
 async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     """Provision a Neon database for a tenant using the pool architecture.
 
@@ -1548,6 +1626,10 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
       - Standard tenants use NEON_API_KEY (hello@usemeridian.us).
       - Pro tenants use NEON_API_KEY_PRO (pro@usemeridian.us — future).
 
+    A playtester skips steps 2-3: its database is created in a Neon project of
+    its own (in the pool tier its entitlement maps to), registered as full so no
+    other tenant is ever placed beside it.
+
     Returns the updated tenant dict.
     """
     from . import db as db_module
@@ -1561,7 +1643,7 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     if tenant.get("plan") == "admin":
         return tenant  # admin accounts use manually-assigned DBs, never auto-provisioned
 
-    tier = tenant.get("plan") or "standard"
+    tier = pool_tier_for(tenant)
     # Treat free-tier as standard for pool allocation (same API key, smaller quota pool)
     pool_tier = "free" if tier == "free" else tier
     api_key = _neon_api_key_for_tier("standard" if tier == "free" else tier)
@@ -1569,21 +1651,33 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     # Capacity check
     await check_capacity(db)
 
+    # A playtester gets a Neon project of its own instead of a slot in a shared
+    # pool (see plans.py): Neon reports usage per project, so a database that
+    # shared one could not be measured or bounded on its own.
+    dedicated = is_unbilled_plan(tenant.get("plan"))
+
     # Item 38 — atomic claim+increment to avoid the overprovisioning race
     # where two concurrent signups both pick a pool with 7/8 slots and bump
     # it to 9/8. claim_pool_project_slot returns the row already-incremented.
-    pool = await db_module.claim_pool_project_slot(
+    pool = None if dedicated else await db_module.claim_pool_project_slot(
         db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
     )
 
     if pool is None:
-        # All existing pool projects are full (or all last-slot races lost).
+        # All existing pool projects are full (or all last-slot races lost), or
+        # this tenant needs a project of its own.
         # Create a new one and claim a slot from it. claim() on the fresh pool
         # is still atomic, so even if a sibling signup raced to create another
         # new pool, both claims succeed harmlessly.
         neon_project_id, _first_conn_uri = await _create_neon_pool_project(api_key, pool_tier)
-        await db_module.register_pool_project(db, neon_project_id, pool_tier)
-        pool = await db_module.claim_pool_project_slot(
+        # A dedicated project is registered already full: nobody else can be
+        # placed in it before this tenant's row names it (from then on the claim
+        # query itself skips any project that holds a playtester).
+        registered = await db_module.register_pool_project(
+            db, neon_project_id, pool_tier,
+            customer_count=_MAX_CUSTOMERS_PER_PROJECT if dedicated else 0,
+        )
+        pool = registered if dedicated else await db_module.claim_pool_project_slot(
             db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
         )
         if pool is None:  # extremely unlikely — fresh pool with cap-1 capacity
@@ -1775,15 +1869,24 @@ async def cancel_stripe_subscription(stripe_customer_id: str) -> None:
         pass
 
 
-async def _drop_tenant_neon_database(tenant: dict[str, Any]) -> None:
-    """Drop the customer's database within their pool Neon project. Best-effort."""
+async def _drop_tenant_neon_database(tenant: dict[str, Any], db: Any = None) -> None:
+    """Drop the customer's database within their pool Neon project. Best-effort.
+
+    The Neon API key is that of the account owning the pool project the database
+    lives in (``neon_pool_projects.tier``), not the one the plan names today: a
+    plan can change after provisioning (a playtester is usually a free or
+    standard tenant whose plan was flipped), and Neon refuses a project to any
+    other account's key, which this best-effort call would swallow, leaving the
+    customer's data behind a "deleted" answer. Pass ``db`` (the control-plane
+    DB) so the registry can be read; without it the plan is the only hint.
+    """
     import httpx
     neon_project_id = tenant.get("neon_project_id")
     if not neon_project_id:
         return
-    plan = tenant.get("plan", "standard")
+    pool_tiers = await _pool_tiers_by_project(db) if db is not None else {}
     try:
-        api_key = _neon_api_key_for_tier(plan)
+        api_key = _neon_api_key_for_tenant(tenant, pool_tiers)
     except RuntimeError:
         api_key = _cfg("NEON_API_KEY") or ""
     if not api_key:
@@ -1802,6 +1905,12 @@ async def _drop_tenant_neon_database(tenant: dict[str, Any]) -> None:
             if not branch_id and branches:
                 branch_id = branches[0]["id"]
             if not branch_id:
+                # A refused or empty answer used to end here without a trace.
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "Neon database not dropped, no branch listed: pool=%s tenant=%s status=%s",
+                    neon_project_id, tenant_id, getattr(br, "status_code", "?"),
+                )
                 return
             await http.delete(
                 f"https://console.neon.tech/api/v2/projects/{neon_project_id}/branches/{branch_id}/databases/{db_name}",
@@ -1843,7 +1952,7 @@ async def reset_tenant_provisioning(db: Any, tenant_id: str) -> dict[str, Any]:
     neon_project_id = tenant.get("neon_project_id")
 
     if had_neon_project:
-        await _drop_tenant_neon_database(tenant)
+        await _drop_tenant_neon_database(tenant, db)
         try:
             await db_module.decrement_pool_project_count(db, neon_project_id)
         except Exception:  # noqa: BLE001
@@ -1967,6 +2076,112 @@ async def _send_capacity_alert(tier: str, projects: int, cap: int) -> None:
         pass
 
 
+async def _send_owner_alert(subject: str, html: str) -> None:
+    """Best-effort Resend email to ADMIN_EMAIL (the owner)."""
+    admin_email = _cfg("ADMIN_EMAIL")
+    api_key = _cfg("RESEND_API_KEY")
+    if not admin_email or not api_key:
+        return
+    try:
+        import httpx
+        from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+        async with httpx.AsyncClient(timeout=10) as http:
+            await http.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"from": from_addr, "to": [admin_email], "subject": subject, "html": html},
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _alert_owner_playtester_limit(playtester_email: str, kind: str, detail: str) -> None:
+    """Tell the owner a playtester crossed a usage ceiling.
+
+    Playtester usage is bounded but never billed, so nothing else surfaces an
+    over-limit account to the person who granted it.
+    """
+    import html as _html
+
+    await _send_owner_alert(
+        f"[Meridian] Playtester over {kind} limit: {playtester_email}",
+        f"<p>Playtester <strong>{_html.escape(playtester_email)}</strong> is over the "
+        f"{kind} ceiling: {_html.escape(detail)}</p>",
+    )
+
+
+async def _claim_playtester_notice(
+    db: Any, tenant: dict[str, Any], kind: str, now: "datetime"
+) -> bool:
+    """True the first time a notice of ``kind`` is due for ``tenant`` this calendar month.
+
+    The daily job re-checks every tenant every day and an unbilled plan has no
+    throttle flag to stop the repeats, so the month is recorded in the tenant's
+    ``notification_prefs`` blob. The blob is read fresh: an earlier notice for
+    this tenant in the same run has already written its own flag, and writing
+    back the caller's stale copy would erase it. If the flag cannot be written the
+    notice is still sent (a repeat is better than a ceiling nobody hears about).
+    """
+    import json as _json
+    from . import db as db_module  # noqa: PLC0415
+
+    flag = f"playtester_{kind}_notice_month"
+    month = now.strftime("%Y-%m")
+    fresh = await db_module.get_tenant_by_id(db, tenant["id"]) or tenant
+    prefs = _parse_notification_prefs(fresh)
+    if prefs.get(flag) == month:
+        return False
+    prefs[flag] = month
+    try:
+        await db_module.update_tenant(db, tenant["id"], notification_prefs=_json.dumps(prefs))
+    except Exception:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Playtester notice month not recorded, it may repeat: tenant=%s kind=%s",
+            tenant.get("email", ""), kind,
+        )
+    return True
+
+
+async def _notify_playtester_over_ceiling(
+    db: Any,
+    tenant: dict[str, Any],
+    kind: str,
+    now: "datetime",
+    *,
+    detail: str,
+    subject: str,
+    html: str,
+) -> None:
+    """A playtester is past a hard ceiling (past grace, for compute).
+
+    The tenant and the owner are both told, once a month per ``kind``.
+    """
+    import logging as _logging
+
+    email = tenant.get("email", "")
+    if not await _claim_playtester_notice(db, tenant, kind, now):
+        return
+    _logging.getLogger(__name__).warning(
+        "Playtester %s ceiling exceeded: tenant=%s: %s", kind, email, detail,
+    )
+    await _send_overage_email(email, subject, html)
+    await _alert_owner_playtester_limit(email, kind, detail)
+
+
+async def _notify_playtester_warning(
+    db: Any,
+    tenant: dict[str, Any],
+    now: "datetime",
+    *,
+    subject: str,
+    html: str,
+) -> None:
+    """Compute warning at the Pro threshold, once a month, to the tenant only."""
+    if await _claim_playtester_notice(db, tenant, "compute_warning", now):
+        await _send_overage_email(tenant.get("email", ""), subject, html)
+
+
 async def check_capacity(db: Any) -> dict[str, Any]:
     """Return Neon pool usage stats and emit alerts when thresholds are hit.
 
@@ -2026,6 +2241,13 @@ async def check_capacity(db: Any) -> dict[str, Any]:
 _PLAN_STORAGE_LIMIT_GB = {"standard": 1.0, "pro": 10.0}
 
 
+def storage_limit_gb_for(tenant: dict[str, Any]) -> float:
+    """Hourly storage-job ceiling (GB) for the entitlement in force on ``tenant``."""
+    return _PLAN_STORAGE_LIMIT_GB.get(
+        tenant_entitlement_plan(tenant, default="standard"), 1.0
+    )
+
+
 async def get_neon_storage_gb(neon_project_id: str, neon_api_key: str) -> float:
     """Return current storage for a Neon project in GB.
 
@@ -2045,7 +2267,12 @@ async def get_neon_storage_gb(neon_project_id: str, neon_api_key: str) -> float:
             bytes_hour = float(data.get("data_storage_bytes_hour", 0) or 0)
             # bytes_hour is cumulative GB-hours; treat as proxy for GB
             return bytes_hour / 1e9
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # 0.0 reads as "nothing stored": leave a trace that it was not measured.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Neon storage unavailable: pool=%s (%s)", neon_project_id, type(exc).__name__
+        )
         return 0.0
 
 
@@ -2086,7 +2313,8 @@ async def run_storage_overage_check(db: Any) -> None:
     stripe_api_key = _cfg("STRIPE_API_KEY", "")
 
     async with db.execute(
-        "SELECT id, email, plan, neon_project_id, stripe_customer_id, stripe_metered_item_id, is_internal "
+        "SELECT id, email, plan, neon_project_id, stripe_customer_id, stripe_metered_item_id, is_internal, "
+        "inactivity_expires_at "
         "FROM tenants WHERE neon_project_id IS NOT NULL"
     ) as cur:
         rows = await cur.fetchall()
@@ -2095,6 +2323,7 @@ async def run_storage_overage_check(db: Any) -> None:
         return r if isinstance(r, dict) else {k: r[k] for k in r.keys()}
 
     tenants = [_to_d(r) for r in rows] if rows else []
+    pool_tiers = await _pool_tiers_by_project(db)
 
     for tenant in tenants:
         # G2.10 — internal tenants are never charged for storage overage.
@@ -2104,12 +2333,23 @@ async def run_storage_overage_check(db: Any) -> None:
         if not neon_project_id:
             continue
         plan = tenant.get("plan") or "standard"
-        api_key = _neon_api_key_for_tier(plan)
+        # An unbilled plan's API key follows the pool the database lives in;
+        # the ceiling follows the entitlement currently in force.
+        try:
+            api_key = _neon_api_key_for_usage(tenant, pool_tiers)
+        except RuntimeError as exc:
+            # One account's key missing must not end the pass for every tenant after it.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Storage check skipped, no Neon key for the pool: tenant=%s plan=%s pool=%s (%s)",
+                tenant["email"], plan, neon_project_id, exc,
+            )
+            continue
         if not api_key:
             continue
 
         usage_gb = await get_neon_storage_gb(neon_project_id, api_key)
-        limit_gb = _PLAN_STORAGE_LIMIT_GB.get(plan, 1.0)
+        limit_gb = storage_limit_gb_for(tenant)
 
         if usage_gb > limit_gb:
             overage_gb = usage_gb - limit_gb
@@ -2120,7 +2360,8 @@ async def run_storage_overage_check(db: Any) -> None:
             )
 
             stripe_customer_id = tenant.get("stripe_customer_id")
-            if stripe_api_key and stripe_customer_id:
+            # An unbilled plan (playtester) is only ever logged here, never metered.
+            if stripe_api_key and stripe_customer_id and not is_unbilled_plan(plan):
                 await report_stripe_overage(stripe_customer_id, overage_gb, stripe_api_key)
 
 
@@ -2134,6 +2375,23 @@ PLAN_LIMITS: dict[str, dict[str, float]] = {
     "pro":      {"cu_hours": 200.0, "grace_cu_hours": 20.0, "storage_gb": 10.0},
     "free":     {"cu_hours": 10.0,  "grace_cu_hours": 5.0,  "storage_gb": 0.1},
 }
+# A playtester has Pro's ceilings (derived, not retyped, so the two cannot
+# drift). Lookups also go through effective_entitlement_plan; this row keeps a
+# direct PLAN_LIMITS[plan] correct for any caller that skips the helper.
+PLAN_LIMITS["playtester"] = dict(PLAN_LIMITS["pro"])
+
+
+def plan_limits_for(tenant: dict[str, Any]) -> dict[str, float]:
+    """Compute/storage ceilings for the entitlement in force on ``tenant``.
+
+    A playtester reads as Pro and a lapsed one as Free; a plan no table knows
+    gets the lowest tier's ceilings.
+    """
+    return PLAN_LIMITS.get(
+        tenant_entitlement_plan(tenant, default="standard"), PLAN_LIMITS["free"]
+    )
+
+
 COMPUTE_OVERAGE_RATE = 0.16   # $/CU-hour
 STORAGE_OVERAGE_RATE = 0.50   # $/GB-month
 
@@ -2254,6 +2512,20 @@ async def run_overage_check(db: Any) -> None:
 
     Excluded: EXCLUDED_NEON_PROJECTS, admin emails, tenants with no stripe_customer_id.
     Reset: columns are reset to 0 each month via overage_reset_at.
+
+    An unbilled plan (playtester, see plans.py) is judged by the same Pro
+    ceilings but is never metered and never throttled (it has no budget to bill
+    instead): it gets the warning at the Pro threshold, and past the grace
+    allowance the tenant and the owner are told, once a month. Its Neon API key
+    follows the pool registry; every other tenant is polled with its plan's
+    key, as before.
+
+    A playtester is kept out of shared pools by construction (the plan is only
+    granted on a project of its own, see ``db.require_dedicated_pool``), so
+    Neon's per-project figure is its own and no other tenant is treated any
+    differently because a playtester exists.
+
+    A tenant whose consumption Neon will not return is logged and skipped.
     """
     from datetime import datetime, timezone as _tz, timedelta as _td
     from . import db as db_module
@@ -2266,6 +2538,7 @@ async def run_overage_check(db: Any) -> None:
     base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
 
     tenants = await db_module.list_tenants_with_neon(db)
+    pool_tiers = await _pool_tiers_by_project(db)
 
     for tenant in tenants:
         email = tenant.get("email", "")
@@ -2281,10 +2554,13 @@ async def run_overage_check(db: Any) -> None:
             continue
 
         plan = tenant.get("plan") or "standard"
-        limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+        unbilled = is_unbilled_plan(plan)
+        # Ceilings follow the entitlement in force (a lapsed playtester drops to
+        # free).
+        limits = plan_limits_for(tenant)
 
         try:
-            api_key = _neon_api_key_for_tier(plan)
+            api_key = _neon_api_key_for_usage(tenant, pool_tiers)
         except RuntimeError:
             api_key = _cfg("NEON_API_KEY") or ""
         if not api_key:
@@ -2309,6 +2585,13 @@ async def run_overage_check(db: Any) -> None:
         # Fetch Neon consumption for current billing month
         raw = await _fetch_neon_consumption(neon_project_id, api_key, month_start, now_iso)
         if not raw:
+            # Nothing can be warned, throttled or billed for this tenant today.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Neon consumption unavailable, tenant not checked: tenant=%s plan=%s "
+                "pool=%s pool_tier=%s",
+                email, plan, neon_project_id, pool_tiers.get(neon_project_id, "unregistered"),
+            )
             continue
 
         metrics = _parse_consumption_metrics(raw)
@@ -2334,7 +2617,26 @@ async def run_overage_check(db: Any) -> None:
             overage_hours = cu_used - cu_limit
             charge = overage_hours * COMPUTE_OVERAGE_RATE
 
-            if compute_cap > 0 and charge <= compute_cap and stripe_id and stripe_api_key:
+            if unbilled:
+                # Never metered and never throttled: this plan has no budget to
+                # bill instead. The bound is the Pro table: the tenant and the
+                # owner are told, and the quota of the playtester's own Neon
+                # project is the hard stop behind that.
+                await _notify_playtester_over_ceiling(
+                    db, tenant, "compute", now,
+                    detail=(
+                        f"{cu_used:.1f} CU-hours this month (ceiling {cu_limit:.0f} + "
+                        f"{limits['grace_cu_hours']:.0f} grace). Nothing was billed or throttled."
+                    ),
+                    subject="Meridian: compute limit reached",
+                    html=(
+                        f"<p>Your Meridian playtester account has used <strong>{cu_used:.1f} CU-hours</strong> "
+                        f"this month (limit: {cu_limit:.0f} + {limits['grace_cu_hours']:.0f} grace).</p>"
+                        "<p>Playtester accounts are not billed and have no overage budget; "
+                        "please bring usage back under the limit.</p>"
+                    ),
+                )
+            elif compute_cap > 0 and charge <= compute_cap and stripe_id and stripe_api_key:
                 # Bill via Stripe meter event
                 try:
                     import stripe as _stripe
@@ -2361,6 +2663,20 @@ async def run_overage_check(db: Any) -> None:
                     ),
                 )
 
+        elif unbilled and cu_used >= cu_limit:
+            # Grace period for a playtester: one warning a month, no budget to set.
+            await _notify_playtester_warning(
+                db, tenant, now,
+                subject="Meridian: compute approaching limit",
+                html=(
+                    f"<p>You've used <strong>{cu_used:.1f} of {cu_limit:.0f} CU-hours</strong> "
+                    f"this month. You have {cu_grace - cu_used:.1f} grace hours remaining before "
+                    "the limit is exceeded.</p>"
+                    "<p>Playtester accounts are not billed, so there is no overage budget; "
+                    "please keep usage within the limit.</p>"
+                ),
+            )
+
         elif cu_used >= cu_limit and not tenant.get("compute_throttled_at"):
             # Grace period — send one warning
             remaining = cu_grace - cu_used
@@ -2380,7 +2696,23 @@ async def run_overage_check(db: Any) -> None:
             overage_gb = gb_used - gb_limit
             charge = overage_gb * STORAGE_OVERAGE_RATE
 
-            if storage_cap > 0 and charge <= storage_cap and stripe_id and stripe_api_key:
+            if unbilled:
+                # The storage path has no write-refusal step for any tenant, so
+                # for a playtester the bound is: tell them, tell the owner.
+                await _notify_playtester_over_ceiling(
+                    db, tenant, "storage", now,
+                    detail=(
+                        f"{gb_used:.2f} GB stored (limit {gb_limit:.1f} GB); nothing is billed "
+                        "and no write refusal exists on this path."
+                    ),
+                    subject="Meridian: storage limit exceeded",
+                    html=(
+                        f"<p>Your Meridian playtester storage is at <strong>{gb_used:.2f} GB</strong> "
+                        f"(limit: {gb_limit:.1f} GB, over by {overage_gb:.2f} GB).</p>"
+                        "<p>Playtester accounts are not billed; please delete data you no longer need.</p>"
+                    ),
+                )
+            elif storage_cap > 0 and charge <= storage_cap and stripe_id and stripe_api_key:
                 await report_stripe_overage(stripe_id, overage_gb, stripe_api_key)
             else:
                 await _send_overage_email(
@@ -2417,11 +2749,14 @@ async def run_churn_cleanup(db: Any) -> None:
     base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
 
     # Churned = had a Neon project but no active Stripe customer (payment lapsed)
-    # G2.10 — internal tenants are never churned.
+    # G2.10 — internal tenants are never churned. Neither are unbilled plans
+    # (playtester): having no Stripe customer is their normal state.
+    _unbilled_sql = ", ".join(f"'{p}'" for p in sorted(UNBILLED_PLANS))
     async with db.execute(
         "SELECT id, email, neon_project_id, pool_project_id, created_at FROM tenants "
         "WHERE stripe_customer_id IS NULL AND neon_project_id IS NOT NULL "
-        "AND (is_internal IS NULL OR is_internal = 0)"
+        "AND (is_internal IS NULL OR is_internal = 0) "
+        f"AND (plan IS NULL OR plan NOT IN ({_unbilled_sql}))"
     ) as cur:
         rows = await cur.fetchall()
     def _to_d(r: Any) -> dict[str, Any]:
@@ -2457,7 +2792,7 @@ async def run_churn_cleanup(db: Any) -> None:
             # the matching pool-slot decrement that was also missing here.
             neon_id = tenant.get("neon_project_id")
             if neon_id:
-                await _drop_tenant_neon_database(tenant)
+                await _drop_tenant_neon_database(tenant, db)
                 try:
                     await db_module.decrement_pool_project_count(db, neon_id)
                 except Exception:  # noqa: BLE001
@@ -2515,7 +2850,8 @@ async def run_churn_cleanup(db: Any) -> None:
 TRIAL_REMINDER_THRESHOLDS: tuple[int, ...] = (14, 7, 1)
 
 # Only these plans are on a free trial that can expire. Paying plans
-# (standard/pro) renew via Stripe and never receive a trial-expiry reminder.
+# (standard/pro) renew via Stripe and never receive a trial-expiry reminder;
+# a playtester has no trial clock at all (its optional end date is not a trial).
 _TRIAL_PLANS: frozenset[str] = frozenset({"free", "trial"})
 
 
@@ -3011,6 +3347,10 @@ async def run_dunning_cleanup(db: Any) -> None:
         # G2.10 — internal tenants are never sent dunning warnings.
         if tenant.get("is_internal"):
             continue
+        # An unbilled plan has no payment to fail; a stray payment_failed_at
+        # must never reach the day-15 hard delete below.
+        if is_unbilled_plan(tenant.get("plan")):
+            continue
         raw_ts = tenant.get("payment_failed_at") or ""
         if not raw_ts:
             continue
@@ -3030,7 +3370,7 @@ async def run_dunning_cleanup(db: Any) -> None:
             if stripe_id:
                 await cancel_stripe_subscription(stripe_id)
             if tenant.get("neon_project_id"):
-                await _drop_tenant_neon_database(tenant)
+                await _drop_tenant_neon_database(tenant, db)
             await db_module.delete_tenant_records(db, tenant_id)
             if email:
                 try:

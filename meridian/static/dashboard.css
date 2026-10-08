@@ -331,6 +331,51 @@ body.meridian-guest .guest-hidden { display: none !important; }
 .goal-area.readonly { background: var(--surface-1); color: var(--muted); cursor: default; }
 .goal-area.sprint { min-height: 100px; }
 .goal-area.dirty { border-color: var(--accent) !important; }
+.goal-area.save-failed { border-color: var(--status-failed) !important; }
+
+/* fc779141 — "Changed elsewhere" bar above a goal field whose server value moved while the
+   person had unsaved text in it (Keep mine / Take theirs / See both), and the same bar in its
+   error form when a save failed. Wraps on a narrow screen; the diff scrolls instead of growing. */
+.goal-conflict-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+  margin: 0 0 6px; padding: 6px 8px; min-width: 0;
+  background: rgba(240,198,116,0.10); border: 1px solid rgba(240,198,116,0.45);
+  border-radius: 4px; color: var(--text);
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; line-height: 1.4;
+}
+.goal-conflict-bar[hidden] { display: none; }
+.goal-conflict-bar.is-error { background: rgba(255,107,107,0.10); border-color: rgba(255,107,107,0.45); }
+.goal-conflict-msg { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+.goal-conflict-lead { color: var(--status-pending); }
+.goal-conflict-bar.is-error .goal-conflict-lead { color: var(--status-failed); }
+.goal-conflict-detail { color: var(--muted); }
+.goal-conflict-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.goal-conflict-actions button { padding: 3px 8px; font-size: 11px; }
+.goal-conflict-actions button[hidden] { display: none; }
+.goal-conflict-diff {
+  flex: 1 1 100%; max-height: 220px; overflow: auto; padding: 6px 0;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 4px;
+}
+.gcd-legend { padding: 0 8px 4px; color: var(--muted); font-size: 10px; white-space: pre-wrap; }
+.gcd-line { display: flex; gap: 6px; padding: 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.gcd-mark { flex: 0 0 1ch; user-select: none; color: var(--muted); }
+.gcd-mine { background: rgba(255,107,107,0.14); }
+.gcd-theirs { background: rgba(0,212,170,0.14); }
+
+/* fc779141 — Save / Discard / Stay prompt when leaving the Goal tab with unsaved goal edits. */
+.goal-leave-overlay {
+  position: fixed; inset: 0; z-index: 10001; padding: 16px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.55);
+}
+.goal-leave-dialog {
+  width: 100%; max-width: 380px; padding: 14px 16px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.goal-leave-title { font-weight: 600; margin-bottom: 6px; }
+.goal-leave-body { color: var(--muted); margin-bottom: 12px; overflow-wrap: anywhere; }
+.goal-leave-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .goal-label { font-size: 10px; font-family: 'IBM Plex Mono', monospace; font-weight: 600;
   letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
 .goal-label .goal-ts { font-weight: 400; opacity: 0.6; margin-left: 6px; text-transform: none; letter-spacing: 0; }
@@ -564,17 +609,56 @@ input[type=text] {
   color: var(--accent); margin: 8px 0 3px; padding: 2px 0;
   border-bottom: 1px solid var(--border);
 }
+/* Sprint row layout contract: a long title wraps inside ITS OWN column and can
+   never paint over the version label or the action buttons.
+   - The title is block-level with min-width:0 and overflow-wrap:anywhere, so a
+     long phrase wraps and even a 300-character unbreakable token breaks inside
+     the column (an inline span ignores flex/overflow, which is how the old
+     nowrap title ran straight over .sprint-item-ver and .sprint-item-actions).
+   - The row wraps (flex-wrap) and the text column is content-sized (capped at the
+     row width), so when the row is too narrow for text + buttons the actions drop
+     onto their own line UNDER the text instead of squeezing it or overlapping it,
+     while a short title keeps its buttons beside it.
+   - align-items:baseline keeps the status icon, version and buttons on the
+     first line of the title, so a wrapped title reads cleanly. */
 .sprint-item-row {
-  display: flex; align-items: center; gap: 6px;
+  display: flex; align-items: baseline; align-content: center;
+  flex-wrap: wrap; gap: 3px 6px;
   padding: 3px 0; border-bottom: 1px solid var(--border);
   font-size: 12px; min-height: 28px;
 }
 .sprint-item-icon { flex-shrink: 0; width: 14px; text-align: center; font-size: 11px; }
-.sprint-item-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sprint-item-ver { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+/* The text column: the wrapper div in board rows, the title span itself in the
+   needs-attention / your-tasks / backburner rows. It is sized by its CONTENT
+   (flex-basis:auto), so a short title takes only the room it needs and the version
+   label and buttons stay beside it on one line; a title that is too long to share the
+   line with them takes the whole line and they drop UNDER it. (A fixed minimum basis
+   reserved room even for a 10-character title, which pushed the buttons of every
+   row onto a second line at the real desktop board width.) The max-width cap is the
+   room left beside the icon (20px = 14px icon + 6px gap), so the text never outgrows
+   the row and the icon is never left alone on a line above it. */
+.sprint-item-main,
+.sprint-item-row > .sprint-item-title {
+  flex: 1 1 auto; min-width: 0; max-width: calc(100% - 20px);
+}
+.sprint-item-title {
+  display: block; min-width: 0;
+  white-space: normal; overflow-wrap: anywhere;
+}
+.sprint-item-ver {
+  color: var(--muted); font-size: 10px; flex-shrink: 0;
+  max-width: 100%; overflow-wrap: anywhere;
+}
 .sprint-item-meta { color: var(--muted); font-size: 10px; flex-shrink: 0;
   max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sprint-item-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.sprint-item-actions {
+  display: flex; flex-wrap: wrap; gap: 2px; flex-shrink: 0;
+  max-width: 100%; margin-left: auto;
+}
+.sprint-item-actions:empty { display: none; }
+/* Resource chips (touches_resources) sit under the title; a long path must wrap
+   inside the column rather than push past it. */
+.sprint-item-resources .resource-chip { max-width: 100%; overflow-wrap: anywhere; }
 .sprint-btn {
   background: none; border: 1px solid var(--border); border-radius: 3px;
   padding: 1px 5px; font-size: 11px; cursor: pointer;
@@ -583,6 +667,80 @@ input[type=text] {
 .sprint-btn:hover { color: var(--accent-green); border-color: var(--accent-green); }
 .sprint-btn-fail:hover { color: #e05; border-color: #e05; }
 .sprint-btn-push:hover { color: var(--accent); border-color: var(--accent); }
+/* 0c30b989 — "move to a version" popover on the sprint arrow button
+   (dashboard-versions.ts). Fixed-position, placed by script under the button. */
+.version-move-popover {
+  position: fixed; z-index: 9998; box-sizing: border-box;
+  width: 300px; max-width: calc(100vw - 16px);
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-2); color: var(--text); font-size: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+.version-move-popover .vmp-head { display: flex; align-items: center; gap: 8px; }
+.version-move-popover .vmp-title {
+  flex: 1; min-width: 0; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.version-move-popover .vmp-close {
+  background: none; border: 0; padding: 2px 4px; line-height: 1;
+  color: var(--muted); font-size: 14px; cursor: pointer;
+}
+.version-move-popover .vmp-close:hover { color: var(--text); }
+.version-move-popover .vmp-current { color: var(--muted); font-size: 11px; }
+.version-move-popover .vmp-current code { color: var(--text); font-family: 'IBM Plex Mono', monospace; }
+.version-move-popover .vmp-hint { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.version-move-popover .vmp-or {
+  margin-top: 2px; color: var(--muted); font-size: 10px;
+  letter-spacing: 0.06em; text-transform: uppercase;
+}
+.version-move-popover .vmp-row { display: flex; gap: 6px; }
+.version-move-popover button {
+  border-radius: 4px; cursor: pointer;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+}
+.version-move-popover .vmp-next {
+  padding: 8px 10px; border: 1px solid var(--accent);
+  background: var(--accent); color: #001020; font-weight: 600; text-align: left;
+}
+.version-move-popover .vmp-next:hover { filter: brightness(1.1); }
+.version-move-popover .vmp-go,
+.version-move-popover .vmp-defer {
+  padding: 6px 10px; border: 1px solid var(--border);
+  background: var(--surface-1); color: var(--text);
+}
+.version-move-popover .vmp-go:hover,
+.version-move-popover .vmp-defer:hover { background: var(--border); }
+.version-move-popover .vmp-defer { color: var(--muted); text-align: left; }
+.version-move-popover .vmp-input {
+  flex: 1; min-width: 0; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface-1); color: var(--text);
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+}
+.version-move-popover .vmp-input[aria-invalid="true"] { border-color: var(--status-failed); }
+.version-move-popover .vmp-sep { margin: 2px 0; border-top: 1px solid var(--border); }
+.version-move-popover .vmp-error { color: var(--status-failed); font-size: 11px; line-height: 1.4; }
+.version-move-popover button:focus-visible,
+.version-move-popover .vmp-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Phone / touch: finger-sized targets inside the popover. */
+@media (max-width: 480px), (pointer: coarse) {
+  .version-move-popover .vmp-next,
+  .version-move-popover .vmp-go,
+  .version-move-popover .vmp-defer,
+  .version-move-popover .vmp-input { min-height: 38px; }
+  .version-move-popover .vmp-close { min-width: 36px; min-height: 36px; font-size: 16px; }
+}
+/* The row that was just moved: a short highlight, so it is easy to see it land
+   under its new version. */
+.sprint-row-moved { animation: sprintRowMoved 2.4s ease-out; }
+@keyframes sprintRowMoved {
+  0% { background: rgba(0, 212, 170, 0.28); box-shadow: inset 3px 0 0 var(--accent-green); }
+  100% { background: transparent; box-shadow: inset 3px 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sprint-row-moved { animation: none; box-shadow: inset 3px 0 0 var(--accent-green); }
+}
 .sprint-footer {
   margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 6px;
@@ -896,19 +1054,21 @@ select option {
   /* Leave room for the fixed hamburger so the first tab isn't hidden under it. */
   .tabs { padding-left: 44px; }
 
-  /* Sprint board: it's a single-column flex list, so the real phone breakage is
-     horizontal overflow from the meta column + action buttons crowding the
-     title. Let rows wrap, keep the title from forcing overflow, and give the
-     meta room to sit under the title instead of pushing off-screen. */
-  .sprint-item-row {
-    flex-wrap: wrap;
-    gap: 4px 6px;
-  }
-  .sprint-item-title {
-    min-width: 0;
-    flex-basis: 100%;
-    white-space: normal;
-  }
+  /* Sprint board: wrapping, the title's own-column behaviour and the baseline
+     alignment all live in the base .sprint-item-row / .sprint-item-title rules
+     (they depend on the container's width, not the viewport's); this block only
+     tunes them for a phone-width column. A wrapped row gets a bit more air between
+     its lines, and the action buttons ALWAYS take their own line under the text
+     (right-aligned) so every row reads the same instead of some squeezing the
+     title and some not. Because the buttons never sit beside the text here, the
+     text column can start from a small fixed basis (instead of its full content
+     width, which would push the version label onto a line of its own between a
+     long title and the buttons), so the version label stays beside the title. The
+     meta chip gets room to sit under the title instead of pushing off-screen. */
+  .sprint-item-row { gap: 4px 6px; }
+  .sprint-item-main,
+  .sprint-item-row > .sprint-item-title { flex-basis: min(11em, calc(100% - 20px)); }
+  .sprint-item-actions { flex-basis: 100%; justify-content: flex-end; }
   .sprint-item-meta { max-width: 60%; }
   .sprint-add-row { flex-wrap: wrap; }
 }
@@ -918,8 +1078,149 @@ select option {
   .tab { padding: 8px 9px; font-size: 10px; }
   .sprint-group-header { font-size: 9px; }
   .sprint-item-row { font-size: 11px; }
-  /* Actions can wrap to their own line rather than squeezing the title. */
-  .sprint-item-actions { flex-wrap: wrap; }
 }
 
 .tab-context-menu div:hover { background: var(--hover); cursor: pointer; }
+
+/* 90952bad - waffle launcher. A 9-dot button at the left of the top bar opens a
+   popover grid of icon tiles (dashboard-waffle.ts). Colours come only from the
+   theme variables, so any theme that redefines them restyles the launcher too. */
+.topbar { display: flex; align-items: stretch; flex-shrink: 0; min-width: 0; }
+.topbar > .tabs { flex: 1 1 auto; min-width: 0; }
+.waffle-slot {
+  display: flex; align-items: center; flex-shrink: 0;
+  padding: 0 6px; background: var(--surface);
+  border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
+}
+.waffle-btn {
+  position: relative; width: 32px; height: 32px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--muted); cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.waffle-btn:hover { background: var(--surface-2); color: var(--text); }
+.waffle-btn[aria-expanded="true"] { background: var(--surface-2); color: var(--accent); border-color: var(--border); }
+.waffle-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.waffle-dot {
+  position: absolute; top: 3px; right: 3px; width: 8px; height: 8px;
+  border-radius: 50%; background: var(--status-hitl);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.waffle-popover {
+  position: fixed; z-index: 950;
+  width: min(352px, calc(100vw - 16px)); max-height: calc(100vh - 16px);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif; font-size: 12px;
+}
+.waffle-popover[hidden] { display: none; }
+.waffle-popover:focus { outline: none; }
+.waffle-search {
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  padding: 10px 12px; border-bottom: 1px solid var(--border);
+}
+.waffle-search-icon { color: var(--muted); flex-shrink: 0; }
+.waffle-filter {
+  flex: 1; min-width: 0; padding: 6px 8px;
+  background: var(--surface-1); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-family: inherit; font-size: 12px;
+}
+.waffle-filter:focus { outline: none; border-color: var(--accent); }
+.waffle-filter:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.waffle-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px 10px 10px; }
+.waffle-section + .waffle-section { margin-top: 10px; }
+.waffle-heading {
+  padding: 2px 2px 6px; color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.waffle-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-bottom: 6px; }
+.waffle-tile {
+  position: relative; min-width: 0; min-height: 72px;
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 5px;
+  padding: 8px 4px 6px; border: 1px solid transparent; border-radius: 8px;
+  background: transparent; color: var(--text); cursor: pointer;
+  font-family: inherit; font-size: 11.5px; text-align: center;
+}
+.waffle-tile:hover { background: var(--surface-2); }
+.waffle-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--surface-2); }
+.waffle-tile[aria-current="true"] { border-color: var(--border); background: var(--surface-2); }
+.waffle-icon-wrap {
+  width: 34px; height: 34px; flex-shrink: 0; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--waffle-tint, var(--accent));
+  background: var(--surface-2); /* fallback for browsers without color-mix */
+  background: color-mix(in srgb, var(--waffle-tint, var(--accent)) 14%, var(--surface-2));
+}
+.waffle-tile[data-group="planning"], .waffle-sub[data-group="planning"] { --waffle-tint: var(--accent-green); }
+.waffle-tile[data-group="work"] { --waffle-tint: var(--status-hitl); }
+.waffle-tile[data-group="history"] { --waffle-tint: var(--muted); }
+.waffle-label { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.2; }
+.waffle-badge {
+  position: absolute; top: 4px; right: 6px; min-width: 16px; padding: 0 4px;
+  border-radius: 8px; background: var(--status-hitl); color: var(--bg);
+  font-family: 'IBM Plex Mono', monospace; font-size: 9px; font-weight: 700; line-height: 16px; text-align: center;
+}
+.waffle-badge[data-badge-tab="queue"] { background: var(--accent); }
+.waffle-pin {
+  position: absolute; top: 3px; left: 3px; width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center; border-radius: 6px;
+  color: var(--muted); opacity: 0;
+}
+.waffle-tile:hover .waffle-pin, .waffle-tile:focus-visible .waffle-pin { opacity: 0.75; }
+.waffle-tile[data-pinned="true"] .waffle-pin { opacity: 0.9; color: var(--accent); }
+.waffle-pin:hover { background: var(--border); opacity: 1; }
+.waffle-subs {
+  margin: 0 0 6px; padding: 6px 6px 0 8px; border-left: 2px solid var(--accent);
+  border-radius: 0 8px 8px 0; background: var(--surface-1);
+}
+.waffle-subs-title {
+  padding: 0 0 5px; color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.waffle-sub {
+  min-width: 0; min-height: 30px; padding: 4px 6px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+  font-family: inherit; font-size: 11px; text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.waffle-sub:hover { background: var(--surface-2); }
+.waffle-sub:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--surface-2); }
+.waffle-empty { padding: 20px 10px; color: var(--muted); text-align: center; }
+.waffle-hint {
+  flex-shrink: 0; padding: 6px 12px; border-top: 1px solid var(--border);
+  color: var(--muted); font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+}
+.waffle-sr {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+@media (hover: none) {
+  .waffle-hint { display: none; }
+  .waffle-pin { opacity: 0.55; }
+}
+@media (max-width: 768px) {
+  /* The fixed hamburger (left 10px, 36px wide) overlays the start of the top bar:
+     clear it here instead of through the .tabs padding-left rule above. */
+  .waffle-slot { padding-left: 52px; }
+  .topbar > .tabs { padding-left: 0; }
+}
+
+/* 90952bad - room for the fixed demo banner. /demo's banner is position:fixed, so it
+   used to paint over the top of the app: on a phone it wraps to ~76px and covered the
+   hamburger and the waffle button completely (a click landed on the banner). The
+   template publishes the banner's measured height as --demo-banner-h; reserve exactly
+   that much above the app (padding keeps .app at 100vh, so nothing scrolls) and move the
+   fixed phone drawer and its hamburger down with it. The variable exists only on /demo,
+   so on every other page each rule below resolves to the old value (0px). */
+.app { padding-top: var(--demo-banner-h, 0px); }
+@media (max-width: 768px) {
+  .sidebar { top: var(--demo-banner-h, 0px); }
+  #sidebar-toggle { top: calc(var(--demo-banner-h, 0px) + 10px); }
+}

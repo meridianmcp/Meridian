@@ -3945,7 +3945,9 @@ async def _handle_task_tools(
             _regen_result = await handoff_module_local.regenerate_handoff_correction(
                 db, _pid, _correction["id"], _out_dir,
                 session_id=args.get("session_id"),
-                mode=args.get("mode") or "full",
+                # 0b0b24d8 — an omitted mode resolves by intent (never a silent
+                # 'full', which would prepend every workspace note).
+                mode=args.get("mode") or None,
             )
         except handoff_module_local.HandoffCorrectionError as exc:
             return {
@@ -4240,7 +4242,9 @@ async def _resolve_ingest_doc_store(
         plan: str | None = None
         tenant_pg_url: str | None = None
         if tenant:
-            plan = tenant.get("plan")
+            from ..plans import tenant_entitlement_plan  # noqa: PLC0415
+
+            plan = tenant_entitlement_plan(tenant, default="")  # playtester -> pro
             enc = tenant.get("neon_db_url")
             tid = tenant.get("id")
             if enc and tid:

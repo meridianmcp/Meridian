@@ -396,11 +396,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}}, "required": []}},
     {"name": "set_goal", "description": "Set or update the goal state.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "content": {"type": "string"}}, "required": ["content"]}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "content": {"type": "string"},
+         "expected_updated_at": {"type": "string", "description": "Optional optimistic-concurrency stamp: field_updated_at.version_goal from get_goal. If the version goal changed since, returns a goal_conflict error with the current value and writes nothing. Omit for last-write-wins."}}, "required": ["content"]}},
     {"name": "set_north_star", "description": "Update only the north star — the long-lived product vision that rarely changes. Distinct from the version goal (set_goal). Any team member can call this.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "north_star": {"type": "string"}},
+         "north_star": {"type": "string"},
+         "expected_updated_at": {"type": "string", "description": "Optional optimistic-concurrency stamp: field_updated_at.north_star from get_goal. If the north star changed since, returns a goal_conflict error with the current value and writes nothing. Omit for last-write-wins."}},
          "required": ["north_star"]}},
     {"name": "log_task", "description": "Log a task this session completed or is working on. Valid statuses: pending, in_progress, done, failed, backlog, future, backburner.",
      "inputSchema": {"type": "object", "properties": {
@@ -2507,8 +2509,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "add_workspace_note", "description":
         "Add a workspace-level wiki note that applies across ALL projects in this "
         "workspace (onboarding, cross-cutting conventions, shared infra). Unlike "
-        "add_note, it is not tied to a project and is injected at the top of every "
-        "project's context block + handoff. Comma-separated tags optional.",
+        "add_note, it is not tied to a project. Its body is NOT inlined by default: "
+        "session start and get_context_block carry only a short index (a note "
+        "count plus the titles of notes tagged policy or workspace-policy), and a "
+        "handoff carries notes only when generate_handoff(mode=\"full\") is "
+        "requested explicitly. Read bodies with get_workspace_notes "
+        "(tag=\"policy\" for the policy-tagged ones); the operator setting "
+        "include_workspace_context inlines them into session start and "
+        "get_context_block. Comma-separated tags optional.",
      "inputSchema": {"type": "object", "properties": {
          "title": {"type": "string"},
          "body": {"type": "string"},
@@ -2535,9 +2543,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["note_id"]}},
     {"name": "pin_workspace_decision", "description":
         "Pin a workspace-level decision that applies across ALL projects (shared "
-        "architecture, org-wide standards). Injected at the top of every project's "
-        "context block + handoff. category is free-text (STRATEGIC, TECHNICAL, "
-        "ARCHITECTURAL, PRODUCT, ...).",
+        "architecture, org-wide standards). Session start and get_context_block show "
+        "only a short index of the newest few decisions (one clipped line each, plus "
+        "a count of the rest); a handoff carries none unless "
+        "generate_handoff(mode=\"full\") is requested explicitly. Read the full text "
+        "with get_workspace_decisions; the operator setting include_workspace_context "
+        "inlines it into session start and get_context_block. category is free-text "
+        "(STRATEGIC, TECHNICAL, ARCHITECTURAL, PRODUCT, ...).",
      "inputSchema": {"type": "object", "properties": {
          "title": {"type": "string"},
          "body": {"type": "string"},
@@ -2955,7 +2967,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint": {"type": "string"},
          "force": {"type": "boolean",
-                   "description": "Skip the unstarted-items guard and overwrite the sprint anyway."}},
+                   "description": "Skip the unstarted-items guard and overwrite the sprint anyway."},
+         "expected_updated_at": {"type": "string", "description": "Optional optimistic-concurrency stamp: field_updated_at.sprint from get_goal. If the sprint changed since, returns a goal_conflict error with the current value and writes nothing. Omit for last-write-wins."}},
          "required": ["sprint"]}},
     {"name": "get_sprint_progress", "description":
         "Read-only: Return a SUMMARY of sprint items by status (pending/in_progress/done/failed) "

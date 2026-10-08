@@ -334,6 +334,131 @@ export async function _loadSettingsAccountPane(projectId: any) {
 }
 window._loadSettingsAccountPane = _loadSettingsAccountPane;
 
+// 8a665a03 -- keep the Account tab's data cache truthful after a save. The cache holds
+// the pre-save GET /projects/{id}/ntfy result; a later repaint of the card (every
+// project-tab switch rebuilds the Settings body) would otherwise show the old value.
+// PATCH /ntfy answers with the same shape as GET, so the response replaces the cached
+// result wholesale.
+function _syncAccountCacheAfterSave(projectId: any, saved: any) {
+  const data = _settingsTabDataCache.get(`${projectId}:account`);
+  if (!data || !saved || typeof saved !== 'object') return;
+  data.ntfyResult = { status: 'fulfilled', value: saved };
+}
+// 8a665a03 -- wire the Account card's handlers (ntfy Save/Test/ack, email Save, the
+// email-notification checkboxes). These used to be wired inside loadSettingsTab, which
+// runs BEFORE the card exists since 116e0245 made it lazy, so every lookup returned
+// null and the buttons did nothing. They are attached from _applySettingsAccountPaneData
+// instead, i.e. right after the card's markup is swapped in -- on first load and on every
+// repaint from the cache. Idempotent: it only assigns on* properties.
+function _wireAccountPaneHandlers(projectId: any) {
+  const body = document.getElementById(`settings-body-${projectId}`);
+  // Wire notification Save button
+  const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
+  if (ntfySaveBtn) {
+    ntfySaveBtn.onclick = async () => {
+      const inp = document.getElementById(`ntfy-url-${projectId}`);
+      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+      // G1.7 — send the raw user input; the server canonicalizes ntfy
+      // entries to topic-only and suffixes for per-DB uniqueness. The
+      // response carries the saved value, which we reflect back into
+      // the field so the user sees what we actually stored.
+      const raw = (inp ? inp.value : '').trim() || null;
+      try {
+        const saved = await api(`/projects/${projectId}/ntfy`, {
+          method: 'PATCH',
+          body: JSON.stringify({ notify_url: raw, ntfy_url: raw }),
+        });
+        _syncAccountCacheAfterSave(projectId, saved);
+        const savedVal = saved && (saved.notify_url || saved.ntfy_url || '');
+        const shownVal = displayNotifyTarget(savedVal || '');
+        if (inp) inp.value = shownVal || '';
+        if (statusEl) {
+          statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase()
+            ? `saved as ${shownVal}`
+            : 'saved';
+          setTimeout(() => { statusEl.textContent = ''; }, 2400);
+        }
+      } catch (e: any) {
+        if (statusEl) statusEl.textContent = 'error';
+      }
+    };
+  }
+  // Wire notification email Save button
+  const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
+  if (notifyEmailSaveBtn) {
+    notifyEmailSaveBtn.onclick = async () => {
+      const inp = document.getElementById(`notify-email-${projectId}`);
+      const statusEl = document.getElementById(`notify-email-status-${projectId}`);
+      const raw = (inp ? inp.value : '').trim() || null;
+      try {
+        const savedEmail = await api(`/projects/${projectId}/ntfy`, {
+          method: 'PATCH',
+          body: JSON.stringify({ notify_email: raw }),
+        });
+        _syncAccountCacheAfterSave(projectId, savedEmail);
+        if (statusEl) {
+          statusEl.textContent = 'saved';
+          setTimeout(() => { statusEl.textContent = ''; }, 2400);
+        }
+      } catch (e: any) {
+        if (statusEl) statusEl.textContent = 'error';
+      }
+    };
+  }
+  // Wire notification Test button
+  const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
+  if (ntfyTestBtn) {
+    ntfyTestBtn.onclick = async () => {
+      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+      ntfyTestBtn.disabled = true;
+      try {
+        await api(`/projects/${projectId}/notify/test`, { method: 'POST', body: '{}' });
+        if (statusEl) { statusEl.textContent = 'sent!'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
+      } catch (e: any) {
+        if (statusEl) {
+          const raw = String(e?.message || e || '');
+          let msg = raw.replace(/^\d+:\s*/, '');
+          try {
+            const parsed = JSON.parse(msg);
+            msg = parsed.detail || parsed.message || parsed.error || msg;
+          } catch (_err) {
+            // Keep the plain text message when the server did not return JSON.
+          }
+          statusEl.textContent = msg.includes('No notify URL configured') ? 'save a URL first' : msg;
+        }
+      } finally {
+        ntfyTestBtn.disabled = false;
+      }
+    };
+  }
+  // Wire ntfy security warning acknowledgement checkbox
+  const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
+  if (ntfyWarnAckCb) {
+    ntfyWarnAckCb.onchange = () => {
+      if (!ntfyWarnAckCb.checked) return;
+      try { localStorage.setItem(STORAGE_KEY('ntfy.warn.dismissed'), '1'); } catch(e) {}
+      const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
+      if (warnEl) warnEl.style.display = 'none';
+      const inp = document.getElementById(`ntfy-url-${projectId}`);
+      const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
+      const testBtn = document.getElementById(`ntfy-test-${projectId}`);
+      [inp, saveBtn, testBtn].forEach(el => { if (el) { el.disabled = false; el.style.opacity = '1'; } });
+    };
+  }
+  if (body) body.querySelectorAll('input[data-pref]').forEach(cb => {
+    cb.onchange = async () => {
+      const statusEl = document.getElementById(`settings-save-status-${projectId}`);
+      const payload: Record<string, any> = {};
+      body.querySelectorAll('input[data-pref]').forEach(c => { payload[c.dataset.pref] = c.checked; });
+      try {
+        await api('/settings/notifications', { method: 'PATCH', body: JSON.stringify(payload) });
+        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 1800); }
+      } catch (e: any) {
+        if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+      }
+    };
+  });
+}
 function _applySettingsAccountPaneData(projectId: any, data: any) {
   const { notifResult, ntfyResult, mcpResult, PREFS } = data;
   const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
@@ -344,6 +469,7 @@ function _applySettingsAccountPaneData(projectId: any, data: any) {
 
   const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
   if (prefsPlaceholder) prefsPlaceholder.outerHTML = _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+  _wireAccountPaneHandlers(projectId);
 }
 window._applySettingsAccountPaneData = _applySettingsAccountPaneData;
 
@@ -353,11 +479,12 @@ function _activateSettingsTab(projectId: any, key: any) {
   body.dataset.activeStab = key;
   _applyActiveTabVisibility(projectId);
   // 116e0245 — lazy-load account tab data only when the Account tab is first clicked.
+  // 8a665a03 -- always go through the loader: it re-applies cached data to a fresh
+  // placeholder WITHOUT refetching, which is what a rebuilt Settings body needs. The old
+  // `if (!cache.has(key))` guard skipped it, so after the first visit a rebuilt body kept
+  // the "Notifications load when you open the Account tab." placeholder forever.
   if (key === 'account') {
-    const cacheKey = `${projectId}:account`;
-    if (!_settingsTabDataCache.has(cacheKey)) {
-      _loadSettingsAccountPane(projectId).catch(() => {});
-    }
+    _loadSettingsAccountPane(projectId).catch(() => {});
   }
 }
 window._activateSettingsTab = _activateSettingsTab;
@@ -446,7 +573,8 @@ export function _settingsAccountCardHtml(projectId: any): string {
     // Admin / internal accounts: no billing UI. Stripe customers: POST portal
     // button (avoids GET redirect leak). Free tier: prominent upgrade link.
 
-    const noUpgrade = plan === 'admin' || !!window.state.tenantIsInternal;
+    // A playtester has no Stripe relationship, so it never gets a billing button.
+    const noUpgrade = plan === 'admin' || plan === 'playtester' || !!window.state.tenantIsInternal;
 
     let billingBtn = '';
 
@@ -495,6 +623,18 @@ export function _settingsAccountCardHtml(projectId: any): string {
       const payLink = window.state.serverConfig?.stripe_payment_link || '/pricing';
 
       resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? 'Resubscribe' : 'Upgrade to Standard'}</a>`;
+
+    }
+
+    // A playtester's optional end date (the server's inactivity_expires_at): say
+    // when access ends, with no purchase button.
+    if (plan === 'playtester' && !window.state.tenantIsInternal && (expiresAt || window.state.tenantExpired)) {
+
+      const ptDate = expiresAt ? String(expiresAt).slice(0, 10) : '';
+
+      expiryLine = window.state.tenantExpired
+        ? `<div style="color:#f87171">Playtester access ended${ptDate ? ` on ${escapeHtml(ptDate)}` : ''}.</div>`
+        : `<div>Playtester access ends${ptDate ? ` on <span style="color:var(--text)">${escapeHtml(ptDate)}</span>` : ''}${days != null ? ` <span style="color:var(--muted)">(${days} day${days === 1 ? '' : 's'} left)</span>` : ''}.</div>`;
 
     }
 
@@ -3483,7 +3623,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
   html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
     <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. Notes and decisions here are injected at the top of every project's context block.</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. A session's start and the context block show only a short index of these (the newest few decisions as one-line summaries, a note count and the titles of notes tagged <code>policy</code>), not note bodies. Fetch the full text with <code>get_workspace_notes</code> and <code>get_workspace_decisions</code>.</div>
     <div style="margin-bottom:12px">
       <div style="font-size:10px;color:var(--text);margin-bottom:4px">Default settings</div>
       <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
@@ -4128,6 +4268,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
           </div>`;
 
 
+
+        // A playtester is never billed: there is no overage budget to set, so the
+        // budget row is replaced by a note (the Save wiring below then finds no button).
+        if (u.overage_billing === false) {
+          const capsRow = document.getElementById(`save-caps-${projectId}`)?.parentElement;
+          if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; you are emailed when usage passes them.</span>';
+        }
 
         const saveBtn = document.getElementById(`save-caps-${projectId}`);
 
@@ -4941,223 +5088,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  // Wire notification Save button
-
-  const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
-
-  if (ntfySaveBtn) {
-
-    ntfySaveBtn.onclick = async () => {
-
-      const inp = document.getElementById(`ntfy-url-${projectId}`);
-
-      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-
-      // G1.7 — send the raw user input; the server canonicalizes ntfy
-
-      // entries to topic-only and suffixes for per-DB uniqueness. The
-
-      // response carries the saved value, which we reflect back into
-
-      // the field so the user sees what we actually stored.
-
-      const raw = (inp ? inp.value : '').trim() || null;
-
-      try {
-
-        const saved = await api(`/projects/${projectId}/ntfy`, {
-
-          method: 'PATCH',
-
-          body: JSON.stringify({ notify_url: raw, ntfy_url: raw }),
-
-        });
-
-        const savedVal = saved && (saved.notify_url || saved.ntfy_url || '');
-
-        const shownVal = displayNotifyTarget(savedVal || '');
-
-        if (inp) inp.value = shownVal || '';
-
-        if (statusEl) {
-
-          statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase()
-
-            ? `saved as ${shownVal}`
-
-            : 'saved';
-
-          setTimeout(() => { statusEl.textContent = ''; }, 2400);
-
-        }
-
-      } catch (e: any) {
-
-        if (statusEl) statusEl.textContent = 'error';
-
-      }
-
-    };
-
-  }
-
-
-
-  // Wire notification email Save button
-
-  const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
-
-  if (notifyEmailSaveBtn) {
-
-    notifyEmailSaveBtn.onclick = async () => {
-
-      const inp = document.getElementById(`notify-email-${projectId}`);
-
-      const statusEl = document.getElementById(`notify-email-status-${projectId}`);
-
-      const raw = (inp ? inp.value : '').trim() || null;
-
-      try {
-
-        await api(`/projects/${projectId}/ntfy`, {
-
-          method: 'PATCH',
-
-          body: JSON.stringify({ notify_email: raw }),
-
-        });
-
-        if (statusEl) {
-
-          statusEl.textContent = 'saved';
-
-          setTimeout(() => { statusEl.textContent = ''; }, 2400);
-
-        }
-
-      } catch (e: any) {
-
-        if (statusEl) statusEl.textContent = 'error';
-
-      }
-
-    };
-
-  }
-
-
-
-  // Wire notification Test button
-
-  const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
-
-  if (ntfyTestBtn) {
-
-    ntfyTestBtn.onclick = async () => {
-
-      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-
-      ntfyTestBtn.disabled = true;
-
-      try {
-
-        await api(`/projects/${projectId}/notify/test`, { method: 'POST', body: '{}' });
-
-        if (statusEl) { statusEl.textContent = 'sent!'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
-
-      } catch (e: any) {
-
-        if (statusEl) {
-
-          const raw = String(e?.message || e || '');
-
-          let msg = raw.replace(/^\d+:\s*/, '');
-
-          try {
-
-            const parsed = JSON.parse(msg);
-
-            msg = parsed.detail || parsed.message || parsed.error || msg;
-
-          } catch (_err) {
-
-            // Keep the plain text message when the server did not return JSON.
-
-          }
-
-          statusEl.textContent = msg.includes('No notify URL configured') ? 'save a URL first' : msg;
-
-        }
-
-      } finally {
-
-        ntfyTestBtn.disabled = false;
-
-      }
-
-    };
-
-  }
-
-
-
-  // Wire ntfy security warning acknowledgement checkbox
-
-  const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
-
-  if (ntfyWarnAckCb) {
-
-    ntfyWarnAckCb.onchange = () => {
-
-      if (!ntfyWarnAckCb.checked) return;
-
-      try { localStorage.setItem(STORAGE_KEY('ntfy.warn.dismissed'), '1'); } catch(e) {}
-
-      const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
-
-      if (warnEl) warnEl.style.display = 'none';
-
-      const inp = document.getElementById(`ntfy-url-${projectId}`);
-
-      const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
-
-      const testBtn = document.getElementById(`ntfy-test-${projectId}`);
-
-      [inp, saveBtn, testBtn].forEach(el => { if (el) { el.disabled = false; el.style.opacity = '1'; } });
-
-    };
-
-  }
-
-
-
-  body.querySelectorAll('input[data-pref]').forEach(cb => {
-
-    cb.onchange = async () => {
-
-      const statusEl = document.getElementById(`settings-save-status-${projectId}`);
-
-      const payload: Record<string, any> = {};
-
-      body.querySelectorAll('input[data-pref]').forEach(c => { payload[c.dataset.pref] = c.checked; });
-
-      try {
-
-        await api('/settings/notifications', { method: 'PATCH', body: JSON.stringify(payload) });
-
-        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 1800); }
-
-      } catch (e: any) {
-
-        if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
-
-      }
-
-    };
-
-  });
-
-
+  // Account-card handlers (ntfy / email Save, Test, acknowledge, notification prefs)
+  // are wired by _wireAccountPaneHandlers once the lazy card is rendered.
 
   // Wire GitHub OAuth connect button
 

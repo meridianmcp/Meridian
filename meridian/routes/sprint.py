@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from .. import _deps
 from .._deps import _db, _get_tenant_from_request, validate_input_size
 from .. import db as db_module
+from ..versioning import validate_version_label
 
 router = APIRouter()
 
@@ -487,13 +488,15 @@ async def fail_sprint_item_endpoint(
 async def delete_sprint_item_endpoint(
     project_id: str, item_id: str, request: Request
 ) -> None:
-    """Delete a sprint item permanently."""
+    """Delete a sprint item permanently.
+
+    8a665a03 -- goes through ``db_module.delete_sprint_item`` so the delete also busts
+    the sprint-items cache and publishes ``sprint_item_deleted``; the raw DELETE this
+    route used to run published nothing, which is why the Backburner trash button only
+    took effect on screen after a reload. Stays idempotent (204 for an unknown id).
+    """
     db = await _db(request)
-    await db.execute(
-        "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
-        (item_id, project_id),
-    )
-    await db.commit()
+    await db_module.delete_sprint_item(db, project_id, item_id)
 
 
 @router.patch("/projects/{project_id}/sprint-items/{item_id}")
@@ -542,7 +545,13 @@ async def patch_sprint_item_endpoint(
 async def push_sprint_item_endpoint(
     project_id: str, item_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    """Push a sprint item to a future version. Body: ``{to_version}``."""
+    """Push a sprint item to a future version. Body: ``{to_version}``.
+
+    This DEFERS the item: its status becomes ``pushed`` (the Backburner),
+    ``pushed_to`` records the target, and its own version is left alone. To
+    move an item to another version and keep it pending, use ``POST
+    /projects/{project_id}/sprint-items/{item_id}/move`` (0c30b989).
+    """
     to_version = (body.get("to_version") or "").strip()
     if not to_version:
         raise HTTPException(status_code=422, detail="to_version is required")
@@ -557,6 +566,134 @@ async def push_sprint_item_endpoint(
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
     return item
+
+
+def _parse_move_body(
+    body: dict[str, Any],
+) -> tuple[bool, str | None, str | None]:
+    """Validate a move request body into ``(use_next, to_version, expected_version)``.
+
+    Exactly one of ``{"next": true}`` / ``{"to_version": "<label>"}`` is
+    required. ``expected_version`` is optional. Anything malformed is a 422
+    here so the db layer only ever sees well-typed arguments.
+    """
+    nxt = body.get("next")
+    if nxt is not None and not isinstance(nxt, bool):
+        raise HTTPException(status_code=422, detail="next must be true or false")
+    to_version = body.get("to_version")
+    if to_version is not None and not isinstance(to_version, str):
+        raise HTTPException(status_code=422, detail="to_version must be a string")
+    expected = body.get("expected_version")
+    if expected is not None and not isinstance(expected, str):
+        raise HTTPException(status_code=422, detail="expected_version must be a string")
+    use_next = nxt is True
+    if use_next and to_version is not None:
+        raise HTTPException(
+            status_code=422, detail="pass either next or to_version, not both"
+        )
+    if not use_next and to_version is None:
+        raise HTTPException(
+            status_code=422,
+            detail='pass {"next": true} or {"to_version": "<version>"}',
+        )
+    return use_next, to_version, expected
+
+
+def _move_error(exc: Exception) -> HTTPException:
+    """Map the move functions' exceptions to the REST error contract."""
+    if isinstance(exc, (db_module.SprintItemStatusRace, db_module.SprintItemVersionConflict)):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, db_module.NextVersionUnavailable):
+        # Machine-readable so the dashboard can ask for an explicit version
+        # instead of showing a generic validation failure.
+        return HTTPException(
+            status_code=422,
+            detail={
+                "code": "next_version_unavailable",
+                "message": str(exc),
+                "current_version": exc.current_version,
+            },
+        )
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+@router.post("/projects/{project_id}/sprint-items/{item_id}/move")
+async def move_sprint_item_endpoint(
+    project_id: str, item_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Move a sprint item to another version, keeping its status and title.
+
+    Body: ``{"next": true}`` (the server computes the version following the
+    item's own and returns it) or ``{"to_version": "v2.5"}``; optionally
+    ``expected_version`` (the version the caller saw -- a mismatch is a 409,
+    which keeps a replayed ``next`` from moving the item twice). Unlike
+    ``/push`` the item is NOT deferred: it stays pending and shows up under the
+    target version. Response: ``{item, from_version, to_version, via,
+    unchanged, moved_children, history_recorded}``.
+    """
+    use_next, to_version, expected = _parse_move_body(body)
+    db = await _db(request)
+    tenant = await _get_tenant_from_request(request)
+    try:
+        moved = await db_module.move_sprint_item_to_version(
+            db, project_id, item_id,
+            to_version=to_version, use_next=use_next, expected_version=expected,
+            actor="rest-api", tenant_id=(tenant or {}).get("id"),
+        )
+    except ValueError as exc:
+        raise _move_error(exc)
+    if moved is None:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return moved
+
+
+@router.post("/projects/{project_id}/sprint-items/move")
+async def move_sprint_items_endpoint(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Move several sprint items to another version in one call.
+
+    Body: ``{"item_ids": [...], "next": true}`` or ``{"item_ids": [...],
+    "to_version": "v2.5"}``. Each item is moved independently and the response
+    lists one outcome per distinct id (``ok`` plus the move result, or an
+    ``error``/``message``), so one finished or missing item never blocks the
+    rest. With ``next`` every item advances from its own version.
+    """
+    item_ids = body.get("item_ids")
+    if (
+        not isinstance(item_ids, list)
+        or not item_ids
+        or not all(isinstance(i, str) and i for i in item_ids)
+    ):
+        raise HTTPException(
+            status_code=422, detail="item_ids must be a non-empty list of item ids"
+        )
+    if len(item_ids) > db_module.MAX_BULK_MOVE_ITEMS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"at most {db_module.MAX_BULK_MOVE_ITEMS} items can be moved at once",
+        )
+    use_next, to_version, _expected = _parse_move_body(body)
+    if to_version is not None:
+        # One bad label would otherwise be reported once per item.
+        try:
+            validate_version_label(to_version)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    db = await _db(request)
+    tenant = await _get_tenant_from_request(request)
+    results = await db_module.move_sprint_items_to_version(
+        db, project_id, item_ids,
+        to_version=to_version, use_next=use_next,
+        actor="rest-api", tenant_id=(tenant or {}).get("id"),
+    )
+    moved = sum(1 for r in results if r.get("ok") and not r.get("unchanged"))
+    return {
+        "results": results,
+        "moved": moved,
+        "failed": sum(1 for r in results if not r.get("ok")),
+        "unchanged": sum(1 for r in results if r.get("ok") and r.get("unchanged")),
+    }
 
 
 @router.get("/projects/{project_id}/reconcile")

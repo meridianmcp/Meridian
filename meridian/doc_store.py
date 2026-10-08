@@ -5992,7 +5992,9 @@ def resolve_doc_store_target(
     if override_url and str(override_url).strip():
         return override_url.strip(), "override"
 
-    normalized_plan = (plan or "").strip().lower()
+    from .plans import effective_entitlement_plan  # noqa: PLC0415 — alias plan (playtester) -> pro
+
+    normalized_plan = effective_entitlement_plan((plan or "").strip().lower())
     if hosted and normalized_plan in _CLOUD_PLANS and _is_pg_url(tenant_pg_url):
         return tenant_pg_url, "cloud_pg"  # type: ignore[return-value]
 

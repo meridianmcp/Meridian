@@ -108,7 +108,8 @@
     standard: "Standard",
     pro: "Pro",
     trial: "Trial",
-    admin: "Admin"
+    admin: "Admin",
+    playtester: "Playtester"
   };
   var QUEUE_DONE_PAGE_SIZE2 = 10;
   var SESSION_LIVE_WINDOW_MS = 10 * 60 * 1e3;
@@ -130,13 +131,13 @@
   }
   var _toastTimer;
   function toast2(msg, isError = false) {
-    const el2 = document.getElementById("toast");
-    if (!el2) return;
-    el2.textContent = msg;
-    el2.classList.toggle("error", isError);
-    el2.classList.add("show");
+    const el3 = document.getElementById("toast");
+    if (!el3) return;
+    el3.textContent = msg;
+    el3.classList.toggle("error", isError);
+    el3.classList.add("show");
     clearTimeout(_toastTimer);
-    _toastTimer = setTimeout(() => el2.classList.remove("show"), 2600);
+    _toastTimer = setTimeout(() => el3.classList.remove("show"), 2600);
   }
   function escapeHtml2(s3) {
     const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -192,6 +193,81 @@
     add(cfg.repo_path);
     return out;
   }
+  var _DRAFT_FIELDS = 'textarea, input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="tel"], input[type="number"], input[type="password"]';
+  function fieldHoldsDraft(el3) {
+    const fields = el3.matches(_DRAFT_FIELDS) ? [el3] : Array.from(el3.querySelectorAll(_DRAFT_FIELDS));
+    return fields.some((f4) => f4 === document.activeElement || f4.value !== f4.defaultValue);
+  }
+  function _collectDrafts(root, units) {
+    const kept = [];
+    for (const unit of units) {
+      const seen = /* @__PURE__ */ new Map();
+      root.querySelectorAll(unit.selector).forEach((el3) => {
+        const key = unit.key(el3);
+        if (!key) return;
+        const ordinal = seen.get(key) || 0;
+        seen.set(key, ordinal + 1);
+        if ((unit.keep || fieldHoldsDraft)(el3)) kept.push({ unit, key, ordinal, el: el3 });
+      });
+    }
+    return kept;
+  }
+  function _findTwin(root, k3) {
+    let n2 = 0;
+    for (const el3 of Array.from(root.querySelectorAll(k3.unit.selector))) {
+      if (k3.unit.key(el3) !== k3.key) continue;
+      if (n2++ === k3.ordinal) return el3;
+    }
+    return null;
+  }
+  function hasUnsentDrafts(root, units) {
+    return !!root && _collectDrafts(root, units).length > 0;
+  }
+  function paintKeepingDrafts(root, html, units) {
+    const kept = _collectDrafts(root, units);
+    if (!kept.length) {
+      root.innerHTML = html;
+      return 0;
+    }
+    const active = document.activeElement;
+    const focused = active && kept.some((k3) => k3.el === active || k3.el.contains(active)) ? active : null;
+    let caret = null;
+    if (focused) {
+      try {
+        caret = { start: focused.selectionStart, end: focused.selectionEnd, dir: focused.selectionDirection };
+      } catch (_2) {
+      }
+    }
+    const scrolls = /* @__PURE__ */ new Map();
+    for (const k3 of kept) {
+      const fields = k3.el.matches("textarea") ? [k3.el] : Array.from(k3.el.querySelectorAll("textarea"));
+      for (const f4 of fields) scrolls.set(f4, f4.scrollTop);
+    }
+    root.innerHTML = html;
+    let carried = 0;
+    for (const k3 of kept) {
+      const twin = _findTwin(root, k3);
+      if (!twin) continue;
+      twin.replaceWith(k3.el);
+      carried += 1;
+    }
+    scrolls.forEach((top, f4) => {
+      if (f4.isConnected) f4.scrollTop = top;
+    });
+    if (focused && focused.isConnected) {
+      try {
+        focused.focus({ preventScroll: true });
+      } catch (_2) {
+      }
+      if (caret && caret.start != null && caret.end != null) {
+        try {
+          focused.setSelectionRange(caret.start, caret.end, caret.dir || void 0);
+        } catch (_2) {
+        }
+      }
+    }
+    return carried;
+  }
   try {
     Object.assign(window, {
       getPanelState: getPanelState2,
@@ -210,7 +286,10 @@
       DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2,
       DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2,
       DEFAULT_MAX_TURNS: DEFAULT_MAX_TURNS2,
-      suggestedFsRoots: suggestedFsRoots2
+      suggestedFsRoots: suggestedFsRoots2,
+      fieldHoldsDraft,
+      hasUnsentDrafts,
+      paintKeepingDrafts
     });
   } catch (e3) {
   }
@@ -401,8 +480,8 @@
       '[id^="codex-regen-goal-"]'
     ];
     selectors.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((el2) => {
-        el2.style.display = "none";
+      document.querySelectorAll(sel).forEach((el3) => {
+        el3.style.display = "none";
       });
     });
     const writeBtnSelectors = [
@@ -437,12 +516,12 @@
     });
   }
   function showDemoReadonlyToast2() {
-    const el2 = document.getElementById("toast");
-    if (!el2) return;
-    el2.innerHTML = 'Read-only demo \u2014 <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access \u2192</a>';
-    el2.classList.add("error", "show");
+    const el3 = document.getElementById("toast");
+    if (!el3) return;
+    el3.innerHTML = 'Read-only demo \u2014 <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access \u2192</a>';
+    el3.classList.add("error", "show");
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => el2.classList.remove("show"), 3200);
+    toast._t = setTimeout(() => el3.classList.remove("show"), 3200);
   }
   function showDemoOnboardingOverlay2() {
     if (document.getElementById("demo-onboarding-overlay")) return;
@@ -1514,7 +1593,7 @@
   }
   if (typeof window !== "undefined") window._sprintHistoryBadges = _sprintHistoryBadges;
   function _renderPlanBadge2(me) {
-    const planColors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af" };
+    const planColors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", playtester: "#0891b2" };
     const planLabels = _PLAN_LABELS;
     const plan = me.is_internal || me.is_admin ? "admin" : me.plan || "free";
     const verEl = document.getElementById("server-version");
@@ -1522,13 +1601,13 @@
       const badge = document.createElement("span");
       badge.id = "plan-badge";
       const badgeColor = planColors[plan] || "#9ca3af";
-      const badgeLabel = plan === "free" && me.days_remaining != null ? `Free \xB7 ${me.days_remaining}d left` : planLabels[plan] || plan;
+      const badgeLabel = plan === "free" && me.days_remaining != null ? `Free \xB7 ${me.days_remaining}d left` : plan === "playtester" && me.days_remaining != null && !me.expired ? `Playtester \xB7 ${me.days_remaining}d left` : planLabels[plan] || plan;
       badge.title = `${planLabels[plan] || plan} plan`;
       badge.style = `margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${badgeColor}22;color:${badgeColor};border:1px solid ${badgeColor}44;vertical-align:middle`;
       badge.textContent = badgeLabel;
       verEl.parentNode.insertBefore(badge, verEl.nextSibling);
     }
-    const noUpgrade = plan === "admin" || !!me.is_internal;
+    const noUpgrade = plan === "admin" || plan === "playtester" || !!me.is_internal;
     const planBadge = document.getElementById("plan-badge");
     if (planBadge && !document.getElementById("billing-link")) {
       const hasStripe = !!me.has_stripe_customer;
@@ -1590,6 +1669,19 @@
     ensureSignOutLink(me.email);
     ensureWorkspaceSwitcher();
   }
+  var _SPRINT_BOARD_DRAFTS = [
+    { selector: "input.live-add-input", key: (el3) => el3.id },
+    {
+      selector: ".sprint-item-row",
+      key: (el3) => el3.dataset.item,
+      keep: (row) => !!row.querySelector(
+        ".sprint-edit-input:not([data-saved]), .sprint-notes-textarea:not([data-saved]), .sprint-resources-textarea:not([data-saved])"
+      )
+    }
+  ];
+  function _paintSprintBoard(root, html) {
+    paintKeepingDrafts(root, html, _SPRINT_BOARD_DRAFTS);
+  }
   function renderSprintProgress2(projectId, items) {
     const root = document.getElementById(`live-sprint-progress-${projectId}`);
     if (!root) return;
@@ -1615,7 +1707,7 @@
     })[s3] || "var(--muted)";
     const activeSet = /* @__PURE__ */ new Set(["pending", "todo", "in_progress"]);
     if (items.length === 0) {
-      root.innerHTML = `
+      _paintSprintBoard(root, `
 
       <div class="live-empty">No sprint items. Add one below.</div>
 
@@ -1629,7 +1721,7 @@
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
       root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
       wireSprintAddEnter(projectId, root);
       return;
@@ -1641,7 +1733,7 @@
     );
     if (displayItems.length === 0) displayItems = items.filter((it) => activeStatuses.has(it.status));
     if (displayItems.length === 0) {
-      root.innerHTML = `
+      _paintSprintBoard(root, `
 
       <div class="live-empty" style="color:var(--accent-green)">\u{1F389} Sprint complete! All items done.</div>
 
@@ -1655,7 +1747,7 @@
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
       root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
       wireSprintAddEnter(projectId, root);
       return;
@@ -1684,7 +1776,7 @@
 
           <button class="sprint-btn" title="Back to pending"
 
-            onclick="fetch('/projects/${escapeHtml(projectId)}/sprint-items/${escapeHtml(it.id)}',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'pending'})}).then(()=>renderSprintProgress(${JSON.stringify(projectId)},items.map(x=>x.id===it.id?{...x,status:'pending'}:x)))">\u21A9 Pending</button>
+            onclick="sprintResetPending('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u21A9 Pending</button>
 
           <button class="sprint-btn sprint-btn-fail" title="Mark failed"
 
@@ -1736,8 +1828,15 @@
       displayItems.map((it) => it.id).filter((id) => allChildrenOf.has(id))
     );
     const displayChildrenOf = /* @__PURE__ */ new Map();
+    const detachedParentOf = /* @__PURE__ */ new Map();
+    const displayedById = new Map(displayItems.map((it) => [it.id, it]));
     displayItems.forEach((it) => {
       if (it.parent_id && displayedParentIds.has(it.parent_id)) {
+        const parent = displayedById.get(it.parent_id);
+        if (parent && (it.version || "") !== (parent.version || "")) {
+          detachedParentOf.set(it.id, parent);
+          return;
+        }
         if (!displayChildrenOf.has(it.parent_id)) displayChildrenOf.set(it.parent_id, []);
         displayChildrenOf.get(it.parent_id).push(it);
       }
@@ -1783,9 +1882,9 @@
 
              onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">\u2715</button>
 
-           <button class="sprint-btn sprint-btn-push" title="Push to next version"
-
-             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u2192</button>
+           <button class="sprint-btn sprint-btn-push" title="Move to the next version, pick one, or defer" aria-label="Move to another version" aria-haspopup="dialog"
+             data-act="move-version" data-item-id="${escapeHtml(it.id)}"
+             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this)">\u2192</button>
 
            ${canEdit ? editBtn : ""}
 
@@ -1798,6 +1897,8 @@
       const kidDone = allKids.filter((c3) => c3.status === "done").length;
       const childBadge = allKids.length > 0 ? `<span style="font-size:10px;color:var(--muted);margin-left:4px">[${kidDone}/${allKids.length}]</span>` : "";
       const indBadge = it.status === "indeterminate" ? `<span style="color:#fbbf24;margin-left:4px;font-size:11px">\u26A0</span>` : "";
+      const detachedParent = detachedParentOf.get(it.id);
+      const parentTag = detachedParent ? `<span class="sprint-subtask-tag" data-subtask-of="${escapeHtml(detachedParent.id)}" title="Subtask of ${escapeHtml(detachedParent.title)} (${escapeHtml(detachedParent.version || "no version")})" style="display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;margin-left:6px;font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px">subtask of ${escapeHtml(detachedParent.title)}</span>` : "";
       const indentStyle = isChild ? "margin-left:16px;border-left:2px solid var(--border);padding-left:8px;" : "";
       const rowHtml = `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}"
 
@@ -1809,9 +1910,9 @@
 
       <span class="sprint-item-icon" style="color:${color}">${icon}</span>
 
-      <div style="flex:1;min-width:0">
+      <div class="sprint-item-main">
 
-        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
+        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${parentTag}${_sprintHistoryBadges(it)}</span>
 
         ${notesHtml}
 
@@ -1853,7 +1954,7 @@
       if (groupName) {
         html += `<div class="sprint-group-header">${escapeHtml(groupName)}</div>`;
       }
-      const topLevel = groupItems.filter((it) => !it.parent_id || !displayedParentIds.has(it.parent_id));
+      const topLevel = groupItems.filter((it) => !it.parent_id || !displayedParentIds.has(it.parent_id) || detachedParentOf.has(it.id));
       html += topLevel.map((it) => renderItem(it, false)).join("");
     }
     const total = displayItems.length;
@@ -1889,13 +1990,13 @@
 
       <div style="padding:4px 10px 8px">
 
-        ${pushedItems.map((it) => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || "")}" style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
+        ${pushedItems.map((it) => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || "")}" style="border-top:1px solid var(--border)">
 
           <span style="color:var(--muted);font-size:10px;flex-shrink:0">\u2192</span>
 
-          <span class="sprint-item-title" style="font-family:var(--font-mono);font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
+          <span class="sprint-item-title" style="font-family:var(--font-mono);font-size:10px;color:var(--muted)" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
 
-          ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ""}
+          ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;max-width:100%;overflow-wrap:anywhere;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ""}
 
           <span class="sprint-item-ver" style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(it.version || "")}</span>
 
@@ -1907,7 +2008,7 @@
 
     </details>`;
     }
-    root.innerHTML = html;
+    _paintSprintBoard(root, html);
     root.querySelector(".sprint-add-btn").onclick = () => addSprintItemFromInput(projectId);
     wireSprintAddEnter(projectId, root);
     try {
@@ -1975,9 +2076,9 @@
 
           onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">\u2715</button>
 
-        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Push to next version"
-
-          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u2192</button>
+        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Move to the next version, pick one, or defer" aria-label="Move to another version" aria-haspopup="dialog"
+          data-act="move-version" data-item-id="${escapeHtml(it.id)}"
+          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this)">\u2192</button>
 
       </div>` : "";
       const isBackburner = ["pushed", "skipped"].includes(it.status);
@@ -1990,7 +2091,7 @@
           onclick="sprintArchive('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u{1F5D1}</button>
 
       </div>` : "";
-      return `<div class="queue-item" data-bb-title="${escapeHtml((it.title || "").toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || "").toLowerCase())}">
+      return `<div class="queue-item" data-item-id="${escapeHtml(it.id || "")}" data-bb-title="${escapeHtml((it.title || "").toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || "").toLowerCase())}">
 
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
 
@@ -2060,6 +2161,8 @@
       }
       const groupNames = Object.keys(groups).sort((a3, b2) => a3.localeCompare(b2));
       const search = `<input type="text" id="backburner-search-${escapeHtml(projectId)}" placeholder="filter backburner\u2026"
+
+      value="${escapeHtml(panel.backburnerFilter || "")}"
 
       oninput="filterBackburner('${escapeHtml(projectId)}', this.value)"
 
@@ -2531,11 +2634,11 @@
     const info = status && status.config_generation && status.config_generation.default;
     const formatted = formatTunnelConfigGenerationStatus(info);
     if (formatted.tone !== "warn") return;
-    const esc = window.escapeHtml || String;
+    const esc2 = window.escapeHtml || String;
     const banner = document.createElement("div");
     banner.id = bannerId;
     banner.style.cssText = "margin-top:18px;padding:8px 10px;border-radius:4px;font-size:10px;line-height:1.5;background:#f59e0b1a;border:1px solid #f59e0b55";
-    banner.innerHTML = `<strong style="color:#f59e0b">${esc(formatted.label)}</strong><div style="margin-top:3px;color:var(--muted)">${esc(formatted.detail)}</div>`;
+    banner.innerHTML = `<strong style="color:#f59e0b">${esc2(formatted.label)}</strong><div style="margin-top:3px;color:var(--muted)">${esc2(formatted.detail)}</div>`;
     const section = document.getElementById(`tunnel-plugins-section-${projectId}`);
     if (section && section.parentElement === host) {
       host.insertBefore(banner, section);
@@ -2550,8 +2653,8 @@
     return slug;
   }
   function _execTurnsNumberInputHtml(field, projectId, value, min, max, step) {
-    const esc = window.escapeHtml || String;
-    return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
+    const esc2 = window.escapeHtml || String;
+    return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc2(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
   }
   window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
   var DEFAULT_PARALLELISM_TARGET = 4;
@@ -2559,8 +2662,8 @@
   function claudeRcWatcherBlurb() {
     return "For <code>claude --rc</code> (headless) mode, where SessionStart hooks don't fire \u2014 installs a background watcher that fires the hook per session.";
   }
-  function codexSetupBlurb(mcpHttpUrl, esc) {
-    return `Add to <code>~/.codex/config.toml</code>, or run <code>codex mcp add meridian ${esc(mcpHttpUrl)}</code>.`;
+  function codexSetupBlurb(mcpHttpUrl, esc2) {
+    return `Add to <code>~/.codex/config.toml</code>, or run <code>codex mcp add meridian ${esc2(mcpHttpUrl)}</code>.`;
   }
   function _applySettingsRoleVisibility(projectId, guest) {
     if (!guest) return;
@@ -2584,8 +2687,8 @@
       `tunnel-plugins-section-${projectId}`
       // tunnel plugin config
     ].forEach((id) => {
-      const el2 = document.getElementById(id);
-      if (el2) el2.style.display = "none";
+      const el3 = document.getElementById(id);
+      if (el3) el3.style.display = "none";
     });
     const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
     if (inviteForm) inviteForm.style.display = "none";
@@ -2638,8 +2741,8 @@
       link.onclick = (e3) => {
         e3.preventDefault();
         const expanded = link.dataset.expanded === "1";
-        grid.querySelectorAll("[data-connect-platform]").forEach((el2) => {
-          el2.style.display = expanded ? el2.dataset.connectPlatform === os ? "" : "none" : "";
+        grid.querySelectorAll("[data-connect-platform]").forEach((el3) => {
+          el3.style.display = expanded ? el3.dataset.connectPlatform === os ? "" : "none" : "";
         });
         link.dataset.expanded = expanded ? "" : "1";
         link.textContent = expanded ? "Show other platforms" : "Show detected platform only";
@@ -2647,8 +2750,8 @@
       grid.insertAdjacentElement("afterend", link);
     });
   }
-  function _classifySettingsSection(el2, projectId) {
-    const id = el2 && el2.id || "";
+  function _classifySettingsSection(el3, projectId) {
+    const id = el3 && el3.id || "";
     const has = (frag) => id.indexOf(frag) !== -1;
     if (has("workspace-section")) return "workspace";
     if (has("settings-account-card") || has("settings-account-danger") || has("settings-grp-aw") || has("settings-grp-blog") || has("members-section") || has("fs-mcp-section") || has("tunnel-plugins") || has("github-card")) return "account";
@@ -2700,6 +2803,133 @@
     }
   }
   window._loadSettingsAccountPane = _loadSettingsAccountPane;
+  function _syncAccountCacheAfterSave(projectId, saved) {
+    const data = _settingsTabDataCache.get(`${projectId}:account`);
+    if (!data || !saved || typeof saved !== "object") return;
+    data.ntfyResult = { status: "fulfilled", value: saved };
+  }
+  function _wireAccountPaneHandlers(projectId) {
+    const body = document.getElementById(`settings-body-${projectId}`);
+    const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
+    if (ntfySaveBtn) {
+      ntfySaveBtn.onclick = async () => {
+        const inp = document.getElementById(`ntfy-url-${projectId}`);
+        const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+        const raw = (inp ? inp.value : "").trim() || null;
+        try {
+          const saved = await api(`/projects/${projectId}/ntfy`, {
+            method: "PATCH",
+            body: JSON.stringify({ notify_url: raw, ntfy_url: raw })
+          });
+          _syncAccountCacheAfterSave(projectId, saved);
+          const savedVal = saved && (saved.notify_url || saved.ntfy_url || "");
+          const shownVal = displayNotifyTarget(savedVal || "");
+          if (inp) inp.value = shownVal || "";
+          if (statusEl) {
+            statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase() ? `saved as ${shownVal}` : "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 2400);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = "error";
+        }
+      };
+    }
+    const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
+    if (notifyEmailSaveBtn) {
+      notifyEmailSaveBtn.onclick = async () => {
+        const inp = document.getElementById(`notify-email-${projectId}`);
+        const statusEl = document.getElementById(`notify-email-status-${projectId}`);
+        const raw = (inp ? inp.value : "").trim() || null;
+        try {
+          const savedEmail = await api(`/projects/${projectId}/ntfy`, {
+            method: "PATCH",
+            body: JSON.stringify({ notify_email: raw })
+          });
+          _syncAccountCacheAfterSave(projectId, savedEmail);
+          if (statusEl) {
+            statusEl.textContent = "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 2400);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = "error";
+        }
+      };
+    }
+    const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
+    if (ntfyTestBtn) {
+      ntfyTestBtn.onclick = async () => {
+        const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+        ntfyTestBtn.disabled = true;
+        try {
+          await api(`/projects/${projectId}/notify/test`, { method: "POST", body: "{}" });
+          if (statusEl) {
+            statusEl.textContent = "sent!";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 3e3);
+          }
+        } catch (e3) {
+          if (statusEl) {
+            const raw = String(e3?.message || e3 || "");
+            let msg = raw.replace(/^\d+:\s*/, "");
+            try {
+              const parsed = JSON.parse(msg);
+              msg = parsed.detail || parsed.message || parsed.error || msg;
+            } catch (_err) {
+            }
+            statusEl.textContent = msg.includes("No notify URL configured") ? "save a URL first" : msg;
+          }
+        } finally {
+          ntfyTestBtn.disabled = false;
+        }
+      };
+    }
+    const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
+    if (ntfyWarnAckCb) {
+      ntfyWarnAckCb.onchange = () => {
+        if (!ntfyWarnAckCb.checked) return;
+        try {
+          localStorage.setItem(STORAGE_KEY("ntfy.warn.dismissed"), "1");
+        } catch (e3) {
+        }
+        const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
+        if (warnEl) warnEl.style.display = "none";
+        const inp = document.getElementById(`ntfy-url-${projectId}`);
+        const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
+        const testBtn = document.getElementById(`ntfy-test-${projectId}`);
+        [inp, saveBtn, testBtn].forEach((el3) => {
+          if (el3) {
+            el3.disabled = false;
+            el3.style.opacity = "1";
+          }
+        });
+      };
+    }
+    if (body) body.querySelectorAll("input[data-pref]").forEach((cb) => {
+      cb.onchange = async () => {
+        const statusEl = document.getElementById(`settings-save-status-${projectId}`);
+        const payload = {};
+        body.querySelectorAll("input[data-pref]").forEach((c3) => {
+          payload[c3.dataset.pref] = c3.checked;
+        });
+        try {
+          await api("/settings/notifications", { method: "PATCH", body: JSON.stringify(payload) });
+          if (statusEl) {
+            statusEl.textContent = "saved";
+            setTimeout(() => {
+              statusEl.textContent = "";
+            }, 1800);
+          }
+        } catch (e3) {
+          if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
+        }
+      };
+    });
+  }
   function _applySettingsAccountPaneData(projectId, data) {
     const { notifResult, ntfyResult, mcpResult, PREFS } = data;
     const prefs = notifResult.status === "fulfilled" ? notifResult.value.prefs || {} : null;
@@ -2708,6 +2938,7 @@
     if (ntfyPlaceholder) ntfyPlaceholder.outerHTML = _settingsNotificationsCardHtml(projectId, ntfyResult);
     const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
     if (prefsPlaceholder) prefsPlaceholder.outerHTML = _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+    _wireAccountPaneHandlers(projectId);
   }
   window._applySettingsAccountPaneData = _applySettingsAccountPaneData;
   function _activateSettingsTab(projectId, key) {
@@ -2716,11 +2947,8 @@
     body.dataset.activeStab = key;
     _applyActiveTabVisibility(projectId);
     if (key === "account") {
-      const cacheKey = `${projectId}:account`;
-      if (!_settingsTabDataCache.has(cacheKey)) {
-        _loadSettingsAccountPane(projectId).catch(() => {
-        });
-      }
+      _loadSettingsAccountPane(projectId).catch(() => {
+      });
     }
   }
   window._activateSettingsTab = _activateSettingsTab;
@@ -2747,8 +2975,8 @@
       btn.onclick = () => _activateSettingsTab(projectId, key);
       bar.appendChild(btn);
     });
-    Array.from(body.children).forEach((el2) => {
-      panes[_classifySettingsSection(el2, projectId)].appendChild(el2);
+    Array.from(body.children).forEach((el3) => {
+      panes[_classifySettingsSection(el3, projectId)].appendChild(el3);
     });
     body.appendChild(bar);
     TABS.forEach(([key]) => body.appendChild(panes[key]));
@@ -2776,7 +3004,7 @@
     if (window.state.tenantEmail) {
       const plan = window.state.tenantPlan || "free";
       const hasStripe = !!window.state.tenantHasStripe;
-      const noUpgrade = plan === "admin" || !!window.state.tenantIsInternal;
+      const noUpgrade = plan === "admin" || plan === "playtester" || !!window.state.tenantIsInternal;
       let billingBtn = "";
       if (hasStripe) {
         billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing \u2192</button>`;
@@ -2799,6 +3027,10 @@
         }
         const payLink = window.state.serverConfig?.stripe_payment_link || "/pricing";
         resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
+      }
+      if (plan === "playtester" && !window.state.tenantIsInternal && (expiresAt || window.state.tenantExpired)) {
+        const ptDate = expiresAt ? String(expiresAt).slice(0, 10) : "";
+        expiryLine = window.state.tenantExpired ? `<div style="color:#f87171">Playtester access ended${ptDate ? ` on ${escapeHtml(ptDate)}` : ""}.</div>` : `<div>Playtester access ends${ptDate ? ` on <span style="color:var(--text)">${escapeHtml(ptDate)}</span>` : ""}${days != null ? ` <span style="color:var(--muted)">(${days} day${days === 1 ? "" : "s"} left)</span>` : ""}.</div>`;
       }
       out += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
@@ -4956,44 +5188,44 @@ project_id = "${displayPid}"`;
           };
           const loaded = { relationships: false, proposals: false, artifacts: false };
           async function loadRelationships() {
-            const el2 = panels.relationships;
-            if (!el2) return;
+            const el3 = panels.relationships;
+            if (!el3) return;
             try {
               const data = await api("/control-plane/relationships");
               const rows = buildRelationshipRows(data.scope, data.projects || []);
-              el2.innerHTML = rows.length ? rows.map((r3) => `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);padding-left:${r3.depth * 14}px"><span>${r3.depth ? "\u21B3 " : ""}${escapeHtml(displaySafe(r3.project.name || r3.project.id))}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(r3.scopeLabel)}</span></div>`).join("") : '<div style="color:var(--muted)">No projects visible in this scope.</div>';
+              el3.innerHTML = rows.length ? rows.map((r3) => `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);padding-left:${r3.depth * 14}px"><span>${r3.depth ? "\u21B3 " : ""}${escapeHtml(displaySafe(r3.project.name || r3.project.id))}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(r3.scopeLabel)}</span></div>`).join("") : '<div style="color:var(--muted)">No projects visible in this scope.</div>';
             } catch (e3) {
-              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+              el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
           }
           async function loadProposals() {
-            const el2 = panels.proposals;
-            if (!el2) return;
+            const el3 = panels.proposals;
+            if (!el3) return;
             try {
               const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=20`);
               const items = data.items || [];
-              el2.innerHTML = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
+              el3.innerHTML = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
             } catch (e3) {
-              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+              el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
           }
           async function loadArtifacts() {
-            const el2 = panels.artifacts;
-            if (!el2) return;
+            const el3 = panels.artifacts;
+            if (!el3) return;
             try {
               const data = await api("/control-plane/artifacts?limit=50");
               if (isArtifactsUnavailable(data)) {
-                el2.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : "Not available.")}</div>`;
+                el3.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : "Not available.")}</div>`;
                 return;
               }
               const items = data.items || [];
-              el2.innerHTML = items.length ? items.map((rec) => {
+              el3.innerHTML = items.length ? items.map((rec) => {
                 const health = classifyArtifactHealth(rec);
                 const ident = displaySafe(rec.path || rec.run_id || rec.artifact_id || "(unknown)");
                 return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)"><span>[${escapeHtml(rec.record_kind)}] ${escapeHtml(ident)}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(health)}</span></div>`;
               }).join("") : '<div style="color:var(--muted)">No run manifests, provenance records, or registered artifacts found.</div>';
             } catch (e3) {
-              el2.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+              el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
           }
           const loaders = {
@@ -5040,7 +5272,7 @@ project_id = "${displayPid}"`;
       html += _secHtml("account", "Account");
       html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
     <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. Notes and decisions here are injected at the top of every project's context block.</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. A session's start and the context block show only a short index of these (the newest few decisions as one-line summaries, a note count and the titles of notes tagged <code>policy</code>), not note bodies. Fetch the full text with <code>get_workspace_notes</code> and <code>get_workspace_decisions</code>.</div>
     <div style="margin-bottom:12px">
       <div style="font-size:10px;color:var(--text);margin-bottom:4px">Default settings</div>
       <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
@@ -5265,7 +5497,7 @@ project_id = "${displayPid}"`;
             </div>`;
               }).join("");
               if (_guest) {
-                listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach((el2) => el2.remove());
+                listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach((el3) => el3.remove());
               }
               listEl.querySelectorAll("select.member-role-select").forEach((sel) => {
                 sel.dataset.prev = sel.value;
@@ -5519,6 +5751,10 @@ project_id = "${displayPid}"`;
             <span id="caps-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;align-self:flex-end"></span>
 
           </div>`;
+            if (u4.overage_billing === false) {
+              const capsRow = document.getElementById(`save-caps-${projectId}`)?.parentElement;
+              if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; you are emailed when usage passes them.</span>';
+            }
             const saveBtn = document.getElementById(`save-caps-${projectId}`);
             const capsStatus = document.getElementById(`caps-status-${projectId}`);
             if (saveBtn) {
@@ -5949,8 +6185,8 @@ project_id = "${displayPid}"`;
             [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet2("unix", needsAuth)
           };
           Object.entries(snippets).forEach(([id, text]) => {
-            const el2 = document.getElementById(id);
-            if (el2) el2.textContent = text;
+            const el3 = document.getElementById(id);
+            if (el3) el3.textContent = text;
           });
           const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
           if (statusEl) {
@@ -6126,123 +6362,6 @@ project_id = "${displayPid}"`;
         renderHooks();
         if (tokenListEl) loadHooksTokens();
       }, 0);
-      const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
-      if (ntfySaveBtn) {
-        ntfySaveBtn.onclick = async () => {
-          const inp = document.getElementById(`ntfy-url-${projectId}`);
-          const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-          const raw = (inp ? inp.value : "").trim() || null;
-          try {
-            const saved = await api(`/projects/${projectId}/ntfy`, {
-              method: "PATCH",
-              body: JSON.stringify({ notify_url: raw, ntfy_url: raw })
-            });
-            const savedVal = saved && (saved.notify_url || saved.ntfy_url || "");
-            const shownVal = displayNotifyTarget(savedVal || "");
-            if (inp) inp.value = shownVal || "";
-            if (statusEl) {
-              statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase() ? `saved as ${shownVal}` : "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 2400);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = "error";
-          }
-        };
-      }
-      const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
-      if (notifyEmailSaveBtn) {
-        notifyEmailSaveBtn.onclick = async () => {
-          const inp = document.getElementById(`notify-email-${projectId}`);
-          const statusEl = document.getElementById(`notify-email-status-${projectId}`);
-          const raw = (inp ? inp.value : "").trim() || null;
-          try {
-            await api(`/projects/${projectId}/ntfy`, {
-              method: "PATCH",
-              body: JSON.stringify({ notify_email: raw })
-            });
-            if (statusEl) {
-              statusEl.textContent = "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 2400);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = "error";
-          }
-        };
-      }
-      const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
-      if (ntfyTestBtn) {
-        ntfyTestBtn.onclick = async () => {
-          const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-          ntfyTestBtn.disabled = true;
-          try {
-            await api(`/projects/${projectId}/notify/test`, { method: "POST", body: "{}" });
-            if (statusEl) {
-              statusEl.textContent = "sent!";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 3e3);
-            }
-          } catch (e3) {
-            if (statusEl) {
-              const raw = String(e3?.message || e3 || "");
-              let msg = raw.replace(/^\d+:\s*/, "");
-              try {
-                const parsed = JSON.parse(msg);
-                msg = parsed.detail || parsed.message || parsed.error || msg;
-              } catch (_err) {
-              }
-              statusEl.textContent = msg.includes("No notify URL configured") ? "save a URL first" : msg;
-            }
-          } finally {
-            ntfyTestBtn.disabled = false;
-          }
-        };
-      }
-      const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
-      if (ntfyWarnAckCb) {
-        ntfyWarnAckCb.onchange = () => {
-          if (!ntfyWarnAckCb.checked) return;
-          try {
-            localStorage.setItem(STORAGE_KEY("ntfy.warn.dismissed"), "1");
-          } catch (e3) {
-          }
-          const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
-          if (warnEl) warnEl.style.display = "none";
-          const inp = document.getElementById(`ntfy-url-${projectId}`);
-          const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
-          const testBtn = document.getElementById(`ntfy-test-${projectId}`);
-          [inp, saveBtn, testBtn].forEach((el2) => {
-            if (el2) {
-              el2.disabled = false;
-              el2.style.opacity = "1";
-            }
-          });
-        };
-      }
-      body.querySelectorAll("input[data-pref]").forEach((cb) => {
-        cb.onchange = async () => {
-          const statusEl = document.getElementById(`settings-save-status-${projectId}`);
-          const payload = {};
-          body.querySelectorAll("input[data-pref]").forEach((c3) => {
-            payload[c3.dataset.pref] = c3.checked;
-          });
-          try {
-            await api("/settings/notifications", { method: "PATCH", body: JSON.stringify(payload) });
-            if (statusEl) {
-              statusEl.textContent = "saved";
-              setTimeout(() => {
-                statusEl.textContent = "";
-              }, 1800);
-            }
-          } catch (e3) {
-            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
-          }
-        };
-      });
       const ghConnectBtn = document.getElementById(`github-connect-btn-${projectId}`);
       if (ghConnectBtn) {
         ghConnectBtn.onclick = () => {
@@ -6828,9 +6947,22 @@ project_id = "${displayPid}"`;
       };
       document.getElementById(`tp-save-${projectId}`).onclick = async () => {
         try {
-          await api("/tunnel/plugins" + _hq, { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
+          const saved = await api("/tunnel/plugins" + _hq, { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
           toast(_selHost ? `Saved for ${_selHost}` : "Tunnel plugins saved");
-          setStatus("Saved \u2014 restart the tunnel to apply.");
+          const restartNotNeeded = !!(saved && saved.config_generation && saved.config_generation.restart_required === false);
+          await loadTunnelPluginsSection2(projectId, _selHost);
+          try {
+            await window._renderTunnelConfigGenerationBanner?.(projectId);
+          } catch (_2) {
+          }
+          const msg = restartNotNeeded ? "Saved." : "Saved \u2014 restart the tunnel to apply.";
+          const fresh = document.getElementById(`tp-status-${projectId}`);
+          if (fresh) {
+            fresh.textContent = msg;
+            setTimeout(() => {
+              if (fresh.textContent === msg) fresh.textContent = "";
+            }, 2500);
+          }
         } catch (e3) {
           toast("Save failed: " + e3.message, true);
         }
@@ -7699,17 +7831,17 @@ ${n2.tags || ""}`.toLowerCase();
       for (const f4 of g2.findings) html += _findingRow(f4);
     }
     target.innerHTML = html;
-    target.querySelectorAll(".review-copy-locator-btn").forEach((el2) => {
-      el2.addEventListener("click", () => {
-        const txt = el2.getAttribute("data-locator") || "";
+    target.querySelectorAll(".review-copy-locator-btn").forEach((el3) => {
+      el3.addEventListener("click", () => {
+        const txt = el3.getAttribute("data-locator") || "";
         try {
           navigator.clipboard.writeText(txt);
         } catch (_2) {
         }
-        const prev = el2.textContent;
-        el2.textContent = "Copied \u2713";
+        const prev = el3.textContent;
+        el3.textContent = "Copied \u2713";
         setTimeout(() => {
-          el2.textContent = prev || "Copy Word Ctrl+F text";
+          el3.textContent = prev || "Copy Word Ctrl+F text";
         }, 1500);
       });
     });
@@ -7730,8 +7862,8 @@ ${n2.tags || ""}`.toLowerCase();
   }
   function _selectedJournalFor(root, did) {
     let value = "";
-    root.querySelectorAll(".doc-review-journal-select").forEach((el2) => {
-      if (el2.getAttribute("data-did") === did) value = el2.value || "";
+    root.querySelectorAll(".doc-review-journal-select").forEach((el3) => {
+      if (el3.getAttribute("data-did") === did) value = el3.value || "";
     });
     return value;
   }
@@ -8987,7 +9119,7 @@ ${n2.tags || ""}`.toLowerCase();
   }
   function filterCyElements(elements, enabled) {
     return elements.filter(
-      (el2) => el2.group === "nodes" || enabled.has(el2.data.etype)
+      (el3) => el3.group === "nodes" || enabled.has(el3.data.etype)
     );
   }
   function mountCytoscapeGraph(container, elements, opts = {}) {
@@ -9757,10 +9889,17 @@ ${n2.tags || ""}`.toLowerCase();
   var createStore = ((createState) => createState ? createStoreImpl(createState) : createStoreImpl);
 
   // meridian/static/dashboard-tabgroups.ts
+  var VTAB_GROUPS_COLLAPSED_BY_DEFAULT = true;
+  var ACCORDION_ATTR = "data-vaccordion";
+  var USER_OPEN_ATTR = "data-vuser-open";
   var VTAB_GROUPS = [
     { id: "overview", label: "Overview", tabs: ["status", "live"] },
     { id: "planning", label: "Planning", tabs: ["goal", "insights", "blog"] },
-    { id: "work", label: "Work", tabs: ["queue", "hitl", "team", "sessions"] },
+    // 'experiments' was added to the rail after the grouping shipped and was never
+    // listed here, so groupForTab() returned null for it and revealGroupForTab()
+    // could not expand its group. With groups collapsed by default that would
+    // leave an active Experiments tab invisible in the rail (90952bad).
+    { id: "work", label: "Work", tabs: ["queue", "experiments", "hitl", "team", "sessions"] },
     { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
     { id: "history", label: "History", tabs: ["timeline", "rewind", "settings"] }
   ];
@@ -9772,28 +9911,1293 @@ ${n2.tags || ""}`.toLowerCase();
     }
     return null;
   }
-  function wireVtabGroups(stripEl) {
-    const setExpanded = (groupEl, expanded) => {
-      groupEl.classList.toggle("collapsed", !expanded);
-      const header = groupEl.querySelector(".vtab-group-header");
-      if (header) header.setAttribute("aria-expanded", String(expanded));
-      const tabs = groupEl.querySelector(".vtab-group-tabs");
-      if (tabs) tabs.style.display = expanded ? "flex" : "none";
-    };
+  function setGroupExpanded(groupEl, expanded) {
+    groupEl.classList.toggle("collapsed", !expanded);
+    const header = groupEl.querySelector(".vtab-group-header");
+    if (header) header.setAttribute("aria-expanded", String(expanded));
+    const tabs = groupEl.querySelector(".vtab-group-tabs");
+    if (tabs) tabs.style.display = expanded ? "flex" : "none";
+  }
+  function revealGroupInStrip(stripEl, tab) {
+    const groupId = groupForTab(tab);
+    if (!groupId) return;
+    const groupEl = stripEl.querySelector(`.vtab-group[data-vgroup="${groupId}"]`);
+    if (!groupEl) return;
+    setGroupExpanded(groupEl, true);
+    const strip = stripEl;
+    if (typeof strip.hasAttribute === "function" && strip.hasAttribute(ACCORDION_ATTR)) {
+      stripEl.querySelectorAll(".vtab-group").forEach((other) => {
+        if (other === groupEl || other.hasAttribute(USER_OPEN_ATTR)) return;
+        if (!other.classList.contains("collapsed")) setGroupExpanded(other, false);
+      });
+    }
+  }
+  function wireVtabGroups(stripEl, opts = {}) {
+    const collapseByDefault = opts.collapseByDefault ?? VTAB_GROUPS_COLLAPSED_BY_DEFAULT;
     stripEl.querySelectorAll(".vtab-group-header").forEach((header) => {
       header.onclick = () => {
         const groupEl = header.closest(".vtab-group");
         if (!groupEl) return;
-        setExpanded(groupEl, groupEl.classList.contains("collapsed"));
+        const willExpand = groupEl.classList.contains("collapsed");
+        setGroupExpanded(groupEl, willExpand);
+        if (willExpand) groupEl.setAttribute(USER_OPEN_ATTR, "1");
+        else groupEl.removeAttribute(USER_OPEN_ATTR);
       };
     });
-    const revealGroupForTab = (tab) => {
-      const groupId = groupForTab(tab);
-      if (!groupId) return;
-      const groupEl = stripEl.querySelector(`.vtab-group[data-vgroup="${groupId}"]`);
-      if (groupEl) setExpanded(groupEl, true);
-    };
+    if (collapseByDefault) {
+      stripEl.setAttribute(ACCORDION_ATTR, "1");
+      const activeTab = stripEl.querySelector(".vtab-btn.active")?.dataset.vtab;
+      const activeGroup = groupForTab(activeTab);
+      stripEl.querySelectorAll(".vtab-group").forEach((groupEl) => {
+        setGroupExpanded(groupEl, groupEl.getAttribute("data-vgroup") === activeGroup);
+      });
+    }
+    const revealGroupForTab = (tab) => revealGroupInStrip(stripEl, tab);
     return { revealGroupForTab };
+  }
+
+  // meridian/static/dashboard-versions.ts
+  var MAX_VERSION_LENGTH = 64;
+  var MAX_COMPONENT_DIGITS = 9;
+  var VERSION_RE = /^([vV]?)([0-9]+(?:\.[0-9]+)*)(\.[xX])?$/;
+  var ASCII_WS_ENDS = /^[ \t\r\n]+|[ \t\r\n]+$/g;
+  function nextVersion(version) {
+    if (typeof version !== "string") return null;
+    const text = version.replace(ASCII_WS_ENDS, "");
+    if (!text || text.length > MAX_VERSION_LENGTH) return null;
+    const m3 = VERSION_RE.exec(text);
+    if (!m3) return null;
+    const parts = m3[2].split(".");
+    if (parts.some((p3) => p3.length > MAX_COMPONENT_DIGITS)) return null;
+    const last = parts[parts.length - 1];
+    let bumped = String(parseInt(last, 10) + 1);
+    if (last.length > 1 && last[0] === "0") bumped = bumped.padStart(last.length, "0");
+    parts[parts.length - 1] = bumped;
+    const result = m3[1] + parts.join(".") + (m3[3] || "");
+    return result.length <= MAX_VERSION_LENGTH ? result : null;
+  }
+  var FORBIDDEN_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}]/u;
+  function validateVersionLabel(value) {
+    if (typeof value !== "string") return { ok: false, error: "Enter a version." };
+    const label = value.replace(ASCII_WS_ENDS, "");
+    if (!label) return { ok: false, error: "Enter a version." };
+    if (Array.from(label).length > MAX_VERSION_LENGTH) {
+      return { ok: false, error: `A version can be at most ${MAX_VERSION_LENGTH} characters.` };
+    }
+    if (FORBIDDEN_CHARS.test(label.replace(/ /g, ""))) {
+      return { ok: false, error: "A version cannot contain control or invisible characters." };
+    }
+    return { ok: true, label };
+  }
+  function versionKey(label) {
+    const m3 = VERSION_RE.exec(label.replace(ASCII_WS_ENDS, ""));
+    return m3 ? m3[2].split(".").map((p3) => parseInt(p3, 10)) : null;
+  }
+  function compareVersionLabels(a3, b2) {
+    const ka = versionKey(a3);
+    const kb = versionKey(b2);
+    if (ka && kb) {
+      const n2 = Math.max(ka.length, kb.length);
+      for (let i3 = 0; i3 < n2; i3++) {
+        const d3 = (ka[i3] ?? 0) - (kb[i3] ?? 0);
+        if (d3 !== 0) return d3;
+      }
+      return a3.localeCompare(b2);
+    }
+    if (ka) return -1;
+    if (kb) return 1;
+    return a3.localeCompare(b2);
+  }
+  function collectBoardVersions(items, excludeVersion) {
+    const seen = /* @__PURE__ */ new Set();
+    for (const it of items || []) {
+      const v3 = typeof it?.version === "string" ? it.version.trim() : "";
+      if (v3 && v3 !== (excludeVersion || "").trim()) seen.add(v3);
+    }
+    return Array.from(seen).sort(compareVersionLabels);
+  }
+  function describeMoveError(err) {
+    if (err && err.message === "demo_readonly") return "The demo is read-only.";
+    const raw = err && typeof err.responseText === "string" ? err.responseText : "";
+    if (raw) {
+      try {
+        const detail = JSON.parse(raw)?.detail;
+        if (typeof detail === "string" && detail) return detail;
+        if (detail && typeof detail.message === "string") return detail.message;
+        if (Array.isArray(detail) && typeof detail[0]?.msg === "string") return detail[0].msg;
+      } catch {
+      }
+    }
+    const status = err && typeof err.status === "number" ? err.status : 0;
+    if (status === 404) return "That sprint item no longer exists. Refresh the board.";
+    const message = err && err.message ? String(err.message) : "";
+    if (/<[a-z!]/i.test(message)) return status ? `The request failed (${status}).` : "The request failed.";
+    return message || "The request failed.";
+  }
+  function isNextUnavailableError(err) {
+    if (!err || err.status !== 422 || typeof err.responseText !== "string") return false;
+    try {
+      return JSON.parse(err.responseText)?.detail?.code === "next_version_unavailable";
+    } catch {
+      return false;
+    }
+  }
+  function computePopoverPosition(anchor, size, viewport, gap = 6, margin = 8) {
+    const clamp = (v3, lo, hi) => Math.max(lo, Math.min(v3, Math.max(lo, hi)));
+    if (!anchor) {
+      return {
+        left: clamp((viewport.width - size.width) / 2, margin, viewport.width - size.width - margin),
+        top: clamp((viewport.height - size.height) / 2, margin, viewport.height - size.height - margin)
+      };
+    }
+    const left = clamp(anchor.right - size.width, margin, viewport.width - size.width - margin);
+    let top = anchor.bottom + gap;
+    if (top + size.height > viewport.height - margin) {
+      const above = anchor.top - gap - size.height;
+      if (above >= margin) top = above;
+    }
+    return { left, top: clamp(top, margin, viewport.height - size.height - margin) };
+  }
+  var VERSION_POPOVER_CLASS = "version-move-popover";
+  var openPopover = null;
+  function closeVersionMovePopover() {
+    if (!openPopover) return false;
+    openPopover.close();
+    return true;
+  }
+  function openVersionMovePopoverItemId() {
+    return openPopover ? openPopover.itemId : null;
+  }
+  function el2(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== void 0) node.textContent = text;
+    return node;
+  }
+  function openVersionMovePopover(opts) {
+    closeVersionMovePopover();
+    const { itemId, itemTitle, currentVersion, boardVersions, anchor } = opts;
+    const next = nextVersion(currentVersion);
+    const uid = `vmp-${Math.random().toString(36).slice(2, 8)}`;
+    const pop = el2("div", VERSION_POPOVER_CLASS);
+    pop.setAttribute("role", "dialog");
+    pop.setAttribute("aria-modal", "false");
+    pop.setAttribute("aria-label", "Move sprint item to a version");
+    pop.dataset.itemId = itemId;
+    const head = el2("div", "vmp-head");
+    const title = el2("span", "vmp-title", itemTitle || "Sprint item");
+    title.title = itemTitle || "";
+    const closeBtn = el2("button", "vmp-close", "\u2715");
+    closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "Close");
+    head.append(title, closeBtn);
+    const cur = el2("div", "vmp-current");
+    cur.append("Now in ");
+    cur.append(el2("code", "", currentVersion || "(no version)"));
+    const nextBtn = el2("button", "vmp-next");
+    nextBtn.type = "button";
+    nextBtn.dataset.action = "next";
+    const nextHint = el2("div", "vmp-hint");
+    nextHint.id = `${uid}-next-hint`;
+    if (next) {
+      nextBtn.textContent = `Move to ${next} (next)`;
+      nextHint.textContent = "Stays pending; only its version changes.";
+    } else {
+      nextBtn.textContent = "Move to next version";
+      nextBtn.disabled = true;
+      nextHint.textContent = currentVersion ? `No next version can be worked out from "${currentVersion}". Type one below.` : "This item has no version. Type one below.";
+    }
+    nextBtn.setAttribute("aria-describedby", nextHint.id);
+    const or = el2("div", "vmp-or", "or a specific version");
+    const row = el2("div", "vmp-row");
+    const input = el2("input", "vmp-input");
+    input.type = "text";
+    input.placeholder = "e.g. v2.5";
+    input.maxLength = MAX_VERSION_LENGTH;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.setAttribute("aria-label", "Specific version");
+    const listId = `${uid}-versions`;
+    input.setAttribute("list", listId);
+    const datalist = el2("datalist");
+    datalist.id = listId;
+    for (const v3 of boardVersions) {
+      const opt = el2("option");
+      opt.value = v3;
+      datalist.append(opt);
+    }
+    const goBtn = el2("button", "vmp-go", "Move");
+    goBtn.type = "button";
+    goBtn.dataset.action = "specific";
+    row.append(input, goBtn, datalist);
+    const sep = el2("div", "vmp-sep");
+    const deferBtn = el2("button", "vmp-defer", "Defer to backburner");
+    deferBtn.type = "button";
+    deferBtn.dataset.action = "defer";
+    const deferHint = el2("div", "vmp-hint");
+    deferHint.id = `${uid}-defer-hint`;
+    deferBtn.setAttribute("aria-describedby", deferHint.id);
+    const error = el2("div", "vmp-error");
+    error.setAttribute("role", "alert");
+    error.hidden = true;
+    pop.append(head, cur, nextBtn, nextHint, or, row, sep, deferBtn, deferHint, error);
+    const deferTarget = () => {
+      const typed = input.value.replace(ASCII_WS_ENDS, "");
+      if (typed) {
+        const c3 = validateVersionLabel(typed);
+        return c3.ok ? c3.label : null;
+      }
+      return next;
+    };
+    const refreshDeferHint = () => {
+      const t3 = deferTarget();
+      deferHint.textContent = t3 ? `Hides it in the Backburner, marked as pushed to ${t3}.` : "Type the version it is deferred to, above.";
+    };
+    refreshDeferHint();
+    const controls = [closeBtn, nextBtn, input, goBtn, deferBtn];
+    const frozenWhileBusy = [nextBtn, input, goBtn, deferBtn];
+    const showError = (msg, invalidInput = false) => {
+      error.textContent = msg;
+      error.hidden = false;
+      input.setAttribute("aria-invalid", invalidInput ? "true" : "false");
+    };
+    const clearError = () => {
+      error.textContent = "";
+      error.hidden = true;
+      input.setAttribute("aria-invalid", "false");
+    };
+    let closed = false;
+    let busy = false;
+    const onDocMouseDown = (ev) => {
+      const t3 = ev.target;
+      if (!t3 || pop.contains(t3)) return;
+      if (anchor && anchor.contains(t3)) return;
+      close();
+    };
+    const onResize = () => close();
+    const onKeyDown = (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        close();
+      } else if (ev.key === "Tab") {
+        const live = controls.filter((c3) => !c3.disabled);
+        if (!live.length) return;
+        const first = live[0];
+        const last = live[live.length - 1];
+        const active = document.activeElement;
+        if (ev.shiftKey && (active === first || !pop.contains(active))) {
+          ev.preventDefault();
+          last.focus();
+        } else if (!ev.shiftKey && (active === last || !pop.contains(active))) {
+          ev.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    function close() {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener("mousedown", onDocMouseDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("resize", onResize);
+      const hadFocus = pop.contains(document.activeElement);
+      pop.remove();
+      if (openPopover && openPopover.close === close) openPopover = null;
+      if (hadFocus) {
+        const esc2 = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(itemId) : itemId;
+        const target = anchor && anchor.isConnected ? anchor : document.querySelector(
+          `[data-act="move-version"][data-item-id="${esc2}"]`
+        );
+        if (target) target.focus();
+      }
+    }
+    const setBusy = (on, working) => {
+      busy = on;
+      pop.setAttribute("aria-busy", on ? "true" : "false");
+      for (const c3 of frozenWhileBusy) c3.disabled = on || c3 === nextBtn && !next;
+      if (on && working) {
+        working.dataset.label = working.textContent || "";
+        working.textContent = "Working\u2026";
+      }
+      if (!on) {
+        for (const c3 of [nextBtn, goBtn, deferBtn]) {
+          if (c3.dataset.label) {
+            c3.textContent = c3.dataset.label;
+            delete c3.dataset.label;
+          }
+        }
+      }
+    };
+    const run = async (working, job) => {
+      if (busy) return;
+      clearError();
+      setBusy(true, working);
+      try {
+        await job();
+        close();
+      } catch (err) {
+        if (closed) {
+          if (opts.onError) opts.onError(describeMoveError(err));
+          return;
+        }
+        setBusy(false);
+        showError(describeMoveError(err));
+        (isNextUnavailableError(err) ? input : working).focus();
+      }
+    };
+    nextBtn.addEventListener("click", () => {
+      if (!next) return;
+      void run(nextBtn, () => opts.onMoveNext());
+    });
+    const submitSpecific = () => {
+      if (busy) return;
+      const check = validateVersionLabel(input.value);
+      if (!check.ok) {
+        showError(check.error, true);
+        input.focus();
+        return;
+      }
+      if (check.label === currentVersion) {
+        showError(`It is already in ${check.label}.`, true);
+        input.focus();
+        return;
+      }
+      void run(goBtn, () => opts.onMoveSpecific(check.label));
+    };
+    goBtn.addEventListener("click", submitSpecific);
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        submitSpecific();
+      }
+    });
+    input.addEventListener("input", () => {
+      if (!error.hidden) clearError();
+      refreshDeferHint();
+    });
+    deferBtn.addEventListener("click", () => {
+      if (busy) return;
+      const target = deferTarget();
+      if (!target) {
+        const typed = input.value.replace(ASCII_WS_ENDS, "");
+        const check = typed ? validateVersionLabel(typed) : null;
+        showError(check && !check.ok ? check.error : "Type the version it is deferred to, above.", true);
+        input.focus();
+        return;
+      }
+      void run(deferBtn, () => opts.onDefer(target));
+    });
+    closeBtn.addEventListener("click", () => close());
+    pop.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+    });
+    document.body.appendChild(pop);
+    document.addEventListener("mousedown", onDocMouseDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("resize", onResize);
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    pop.style.position = "fixed";
+    pop.style.visibility = "hidden";
+    const rect = pop.getBoundingClientRect();
+    const size = { width: rect.width || 300, height: rect.height || 220 };
+    const anchorRect = anchor ? anchor.getBoundingClientRect() : null;
+    const pos = computePopoverPosition(anchorRect, size, { width: vw, height: vh });
+    pop.style.left = `${Math.round(pos.left)}px`;
+    pop.style.top = `${Math.round(pos.top)}px`;
+    pop.style.visibility = "";
+    (next ? nextBtn : input).focus();
+    openPopover = { itemId, close };
+    return { el: pop, close };
+  }
+  function flashMovedItem(itemId, root = document) {
+    try {
+      const esc2 = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(itemId) : itemId;
+      const rows = root.querySelectorAll(
+        `.sprint-item-row[data-item="${esc2}"], .queue-item[data-item-id="${esc2}"]`
+      );
+      rows.forEach((row, i3) => {
+        row.classList.add("sprint-row-moved");
+        if (i3 === 0 && typeof row.scrollIntoView === "function") {
+          row.scrollIntoView({ block: "nearest" });
+        }
+        setTimeout(() => row.classList.remove("sprint-row-moved"), 2400);
+      });
+    } catch {
+    }
+  }
+
+  // meridian/static/dashboard-sprint-move.ts
+  var queueBodyId = (projectId) => `queue-body-${projectId}`;
+  function createSprintMoveActions(deps) {
+    async function repaintSprintViews(projectId) {
+      const run = async (job) => {
+        await job();
+      };
+      const queueOpen = !!document.getElementById(queueBodyId(projectId));
+      await Promise.allSettled([
+        run(() => deps.refreshLiveTab(projectId)),
+        queueOpen ? run(() => deps.loadQueue(projectId)) : Promise.resolve(),
+        run(() => deps.reloadSprintBoard(projectId))
+      ]);
+    }
+    async function sprintMoveItem(projectId, itemId, body) {
+      const out = await deps.api(`/projects/${projectId}/sprint-items/${itemId}/move`, {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+      if (!out || !out.item || out.item.version !== out.to_version) {
+        throw new Error("The move could not be verified. Refresh and check the item.");
+      }
+      deps.toast(out.unchanged ? `Already in ${out.to_version}` : `Moved to ${out.to_version}`);
+      void repaintSprintViews(projectId).then(() => flashMovedItem(itemId));
+      return out;
+    }
+    async function sprintDeferItem(projectId, itemId, targetVersion) {
+      await deps.api(`/projects/${projectId}/sprint-items/${itemId}/push`, {
+        method: "POST",
+        body: JSON.stringify({ to_version: targetVersion })
+      });
+      deps.toast(`Deferred to backburner (${targetVersion})`);
+      void repaintSprintViews(projectId);
+    }
+    async function sprintPushPrompt2(projectId, itemId, anchor) {
+      if (openVersionMovePopoverItemId() === itemId) {
+        closeVersionMovePopover();
+        return;
+      }
+      closeVersionMovePopover();
+      let list = [];
+      try {
+        const payload = await deps.api(`/projects/${projectId}/sprint-items`);
+        list = Array.isArray(payload) ? payload : payload && payload.items || [];
+      } catch (e3) {
+        deps.toast(`Could not load the item: ${e3.message}`, true);
+        return;
+      }
+      const item = list.find((it) => it.id === itemId);
+      if (!item) {
+        deps.toast("That sprint item no longer exists.", true);
+        await repaintSprintViews(projectId);
+        return;
+      }
+      const esc2 = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(itemId) : itemId;
+      const clicked = anchor instanceof HTMLElement && anchor.isConnected ? anchor : null;
+      const live = clicked || document.querySelector(`[data-act="move-version"][data-item-id="${esc2}"]`);
+      const currentVersion = item.version || "";
+      openVersionMovePopover({
+        itemId,
+        itemTitle: item.title || "",
+        currentVersion,
+        boardVersions: collectBoardVersions(list, currentVersion),
+        anchor: live instanceof HTMLElement ? live : null,
+        // expected_version makes a retried request safe: if the item moved in the
+        // meantime the server answers 409 instead of advancing it a second time.
+        onMoveNext: () => sprintMoveItem(projectId, itemId, { next: true, expected_version: currentVersion }),
+        onMoveSpecific: (version) => sprintMoveItem(projectId, itemId, { to_version: version, expected_version: currentVersion }),
+        onDefer: (target) => sprintDeferItem(projectId, itemId, target),
+        onError: (message) => deps.toast(`Move failed: ${message}`, true)
+      });
+    }
+    return { repaintSprintViews, sprintMoveItem, sprintDeferItem, sprintPushPrompt: sprintPushPrompt2 };
+  }
+
+  // meridian/static/dashboard-waffle.ts
+  var WAFFLE_TABS = [
+    { id: "status", label: "Status", icon: "status", keywords: ["overview", "active sessions", "health"] },
+    { id: "live", label: "Live", icon: "live", keywords: ["right now", "in progress", "parallel", "waves"] },
+    { id: "goal", label: "Goal", icon: "goal", keywords: ["north star", "target", "targets", "version", "sprint", "focus", "decisions"] },
+    { id: "insights", label: "Insights", icon: "insights", keywords: ["strategy", "understanding", "ideas"] },
+    { id: "blog", label: "Blog", icon: "blog", keywords: ["posts", "drafts", "publish", "writing"] },
+    { id: "queue", label: "Queue", icon: "queue", keywords: ["active work", "sprint items", "todo", "backlog", "tasks"] },
+    { id: "experiments", label: "Experiments", icon: "experiments", keywords: ["trials", "runs", "registry", "research"] },
+    { id: "hitl", label: "HITL", icon: "hitl", keywords: ["review", "approvals", "questions", "human in the loop", "researcher"] },
+    { id: "team", label: "Team", icon: "team", keywords: ["people", "humans", "members", "activity"] },
+    { id: "sessions", label: "Sessions", icon: "sessions", keywords: ["run history", "runs", "history"] },
+    { id: "files", label: "Files", icon: "files", keywords: ["repo", "code", "browse", "folders"] },
+    { id: "notes", label: "Notes", icon: "notes", keywords: ["wiki", "memory", "write"] },
+    { id: "devlog", label: "Dev log", icon: "devlog", keywords: ["tasks", "log", "journal", "terminal"] },
+    { id: "documents", label: "Documents", icon: "documents", keywords: ["ingested", "structure", "word", "pdf", "docx"] },
+    { id: "docs", label: "Tool docs", icon: "docs", keywords: ["mcp", "tool reference", "reference", "manual"] },
+    { id: "codeintel", label: "Code intel", icon: "codeintel", keywords: ["codebase", "index", "architecture", "graph", "symbols"] },
+    { id: "timeline", label: "Timeline", icon: "timeline", keywords: ["activity", "history", "swimlane", "events"] },
+    { id: "rewind", label: "Rewind", icon: "rewind", keywords: ["last days", "charts", "history", "replay"] },
+    { id: "settings", label: "Settings", icon: "settings", keywords: ["notifications", "hooks", "integrations", "config", "preferences"] }
+  ];
+  var WAFFLE_DEFAULT_RANK = [
+    "goal",
+    "notes",
+    "insights",
+    "queue",
+    "live",
+    "hitl",
+    "status",
+    "timeline",
+    "team",
+    "experiments",
+    "documents",
+    "docs",
+    "files",
+    "codeintel",
+    "devlog",
+    "rewind",
+    "blog",
+    "sessions",
+    "settings"
+  ];
+  var WAFFLE_DEFAULT_PINS = ["goal", "notes", "insights"];
+  var WAFFLE_USAGE_THRESHOLD = 25;
+  var WAFFLE_RECENT_MAX = 3;
+  var WAFFLE_COLUMNS = 3;
+  var WAFFLE_SUBTABS = [
+    { id: "north-star", parent: "goal", label: "North Star", keywords: ["vision", "target", "targets"] },
+    { id: "version-goal", parent: "goal", label: "Version Goal", keywords: ["milestone", "release", "target", "targets"] },
+    { id: "sprint", parent: "goal", label: "Current Focus", keywords: ["sprint", "now", "target", "targets"] },
+    { id: "decisions", parent: "goal", label: "Decisions", keywords: ["pinned", "constitution", "decide", "log"] }
+  ];
+  var ICON_PATHS = {
+    status: '<polyline points="3 12 7 12 9.5 6 14.5 18 17 12 21 12"/>',
+    live: '<path d="M13 3 6 13.5h5.5L10.5 21 18 10.5h-5.5z"/>',
+    goal: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/>',
+    insights: '<path d="M9.5 17.5h5"/><path d="M10.5 20.5h3"/><path d="M12 3.5a5.5 5.5 0 0 0-3.2 10c.7.5 1.2 1.3 1.2 2.2v1.8h4v-1.8c0-.9.5-1.7 1.2-2.2A5.5 5.5 0 0 0 12 3.5z"/>',
+    blog: '<path d="M4 20l.8-4L16.2 4.6a2 2 0 0 1 2.8 2.8L7.6 18.8z"/><path d="M14.5 6.4l3.1 3.1"/>',
+    queue: '<path d="M9 6.5h11M9 12h11M9 17.5h11"/><circle cx="4.8" cy="6.5" r=".9" fill="currentColor"/><circle cx="4.8" cy="12" r=".9" fill="currentColor"/><circle cx="4.8" cy="17.5" r=".9" fill="currentColor"/>',
+    experiments: '<path d="M9.5 3.5h5"/><path d="M10.5 3.5v5.2L5 18.6a1.6 1.6 0 0 0 1.4 2.4h11.2a1.6 1.6 0 0 0 1.4-2.4l-5.5-9.9V3.5"/><path d="M7.8 15h8.4"/>',
+    hitl: '<circle cx="12" cy="12" r="8.5"/><path d="M9.7 9.6a2.4 2.4 0 1 1 3.4 2.2c-.7.4-1.1.9-1.1 1.7"/><circle cx="12" cy="16.6" r=".9" fill="currentColor"/>',
+    team: '<circle cx="9" cy="8.5" r="3"/><path d="M3.5 19.5a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="9.5" r="2.3"/><path d="M16.2 14.2a4.6 4.6 0 0 1 4.8 4.3"/>',
+    sessions: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+    files: '<path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.2h7a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
+    notes: '<path d="M5 4.5h14v10l-5.5 5.5H5z"/><path d="M13.5 20v-5.5H19"/><path d="M8.5 9h7M8.5 12.5h4"/>',
+    devlog: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M7.5 10l3 2.2-3 2.2M12.5 15h4"/>',
+    documents: '<path d="M6.5 3.5h7.5l4.5 4.5v12.5h-12z"/><path d="M14 3.5V8h4.5"/><path d="M9.2 12.5h5.6M9.2 16h5.6"/>',
+    docs: '<path d="M3.5 6c2.6-1.1 5.6-.9 8.5.9 2.9-1.8 5.9-2 8.5-.9v12.5c-2.6-1.1-5.6-.9-8.5.9-2.9-1.8-5.9-2-8.5-.9z"/><path d="M12 6.9v12.5"/>',
+    codeintel: '<path d="M8.5 8l-4 4 4 4M15.5 8l4 4-4 4M13.3 6.5l-2.6 11"/>',
+    timeline: '<path d="M7 4.5v15"/><circle cx="7" cy="6.5" r="1.7"/><circle cx="7" cy="12" r="1.7"/><circle cx="7" cy="17.5" r="1.7"/><path d="M11.5 6.5H20M11.5 12H17M11.5 17.5H19"/>',
+    rewind: '<path d="M4.5 12a7.5 7.5 0 1 0 2.4-5.5"/><path d="M4.2 4.5v3.9h3.9"/><path d="M12 8.5V12l2.4 1.6"/>',
+    settings: '<path d="M4 7h9M18 7h2M4 17h2M11 17h9"/><circle cx="15.5" cy="7" r="2.3"/><circle cx="8.5" cy="17" r="2.3"/>',
+    generic: '<rect x="4" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5"/>'
+  };
+  function waffleIconSvg(name, size = 20) {
+    const body = ICON_PATHS[name] ?? ICON_PATHS.generic;
+    return `<svg class="waffle-icon" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${body}</svg>`;
+  }
+  function waffleGlyphSvg() {
+    const dots = [];
+    for (const cy of [6, 12, 18]) {
+      for (const cx of [6, 12, 18]) dots.push(`<circle cx="${cx}" cy="${cy}" r="1.9"/>`);
+    }
+    return `<svg class="waffle-glyph" viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true" focusable="false">${dots.join("")}</svg>`;
+  }
+  function pinSvg(filled) {
+    return `<svg class="waffle-pin-icon" viewBox="0 0 24 24" width="13" height="13" fill="${filled ? "currentColor" : "none"}" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 21v-6"/><path d="M8 4h8l-1.2 5.4L18 13v2H6v-2l3.2-3.6z"/></svg>`;
+  }
+  function searchSvg() {
+    return `<svg class="waffle-search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></svg>`;
+  }
+  function emptyState() {
+    return { pins: null, usage: {}, recent: [] };
+  }
+  var MAX_RECENT_KEPT = 8;
+  var MAX_USAGE_KEYS = 64;
+  var MAX_COUNT = 1e6;
+  function cleanId(v3) {
+    return typeof v3 === "string" && v3.length > 0 && v3.length <= 40 && /^[\w.-]+$/.test(v3) ? v3 : null;
+  }
+  function uniqueIds(list) {
+    const seen = /* @__PURE__ */ new Set();
+    const out = [];
+    for (const item of list) {
+      const id = cleanId(item);
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        out.push(id);
+      }
+    }
+    return out;
+  }
+  function parseState(raw) {
+    const out = emptyState();
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+    const r3 = raw;
+    if (Array.isArray(r3.pins)) out.pins = uniqueIds(r3.pins).slice(0, 64);
+    if (r3.usage && typeof r3.usage === "object" && !Array.isArray(r3.usage)) {
+      let kept = 0;
+      for (const [k3, v3] of Object.entries(r3.usage)) {
+        const id = cleanId(k3);
+        const n2 = Number(v3);
+        if (id && Number.isFinite(n2) && n2 > 0 && kept < MAX_USAGE_KEYS) {
+          out.usage[id] = Math.min(Math.floor(n2), MAX_COUNT);
+          kept += 1;
+        }
+      }
+    }
+    if (Array.isArray(r3.recent)) out.recent = uniqueIds(r3.recent).slice(0, MAX_RECENT_KEPT);
+    return out;
+  }
+  function safeLocalStorage() {
+    try {
+      return typeof window !== "undefined" && window.localStorage ? window.localStorage : null;
+    } catch {
+      return null;
+    }
+  }
+  function readRawState(storage, key) {
+    if (!storage) return void 0;
+    try {
+      return storage.getItem(key);
+    } catch {
+      return void 0;
+    }
+  }
+  function parseRawState(raw) {
+    if (!raw) return emptyState();
+    try {
+      return parseState(JSON.parse(raw));
+    } catch {
+      return emptyState();
+    }
+  }
+  function serializeState(state2) {
+    return JSON.stringify({ v: 1, pins: state2.pins, usage: state2.usage, recent: state2.recent });
+  }
+  function saveState(storage, key, state2) {
+    if (!storage) return false;
+    try {
+      storage.setItem(key, serializeState(state2));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function effectivePins(state2) {
+    return state2.pins ? [...state2.pins] : [...WAFFLE_DEFAULT_PINS];
+  }
+  function recordUse(state2, tab) {
+    const id = cleanId(tab);
+    if (!id) return state2;
+    return {
+      pins: state2.pins ? [...state2.pins] : null,
+      usage: { ...state2.usage, [id]: Math.min((state2.usage[id] || 0) + 1, MAX_COUNT) },
+      recent: [id, ...state2.recent.filter((t3) => t3 !== id)].slice(0, MAX_RECENT_KEPT)
+    };
+  }
+  function setPinned(state2, tab, pinned) {
+    const id = cleanId(tab);
+    if (!id) return state2;
+    const pins = effectivePins(state2);
+    if (pins.includes(id) === pinned) return state2;
+    return { ...state2, pins: pinned ? [...pins, id] : pins.filter((t3) => t3 !== id) };
+  }
+  function usageTotal(usage) {
+    let total = 0;
+    for (const n2 of Object.values(usage)) total += n2;
+    return total;
+  }
+  function orderTabs(available, state2, opts = {}) {
+    const rank = opts.rank ?? WAFFLE_DEFAULT_RANK;
+    const threshold = opts.threshold ?? WAFFLE_USAGE_THRESHOLD;
+    const avail = uniqueIds([...available]);
+    const availSet = new Set(avail);
+    const pinned = effectivePins(state2).filter((id, i3, all) => availSet.has(id) && all.indexOf(id) === i3);
+    const pinnedSet = new Set(pinned);
+    const position = (id) => {
+      const i3 = rank.indexOf(id);
+      return i3 >= 0 ? i3 : rank.length + avail.indexOf(id);
+    };
+    const adaptive = usageTotal(state2.usage) >= threshold;
+    const rest = avail.filter((id) => !pinnedSet.has(id));
+    rest.sort((a3, b2) => {
+      if (adaptive) {
+        const byUse = (state2.usage[b2] || 0) - (state2.usage[a3] || 0);
+        if (byUse !== 0) return byUse;
+      }
+      return position(a3) - position(b2);
+    });
+    return { pinned, rest };
+  }
+  function recentTabs(state2, available, pinned, max = WAFFLE_RECENT_MAX) {
+    const availSet = new Set(available);
+    const pinnedSet = new Set(pinned);
+    return state2.recent.filter((id) => availSet.has(id) && !pinnedSet.has(id)).slice(0, max);
+  }
+  var META_BY_ID = new Map(WAFFLE_TABS.map((m3) => [m3.id, m3]));
+  function humanize(id) {
+    const s3 = id.replace(/[^A-Za-z0-9]+/g, " ").trim();
+    return s3 ? s3.charAt(0).toUpperCase() + s3.slice(1) : id;
+  }
+  function metaFor(id, labels) {
+    return META_BY_ID.get(id) ?? { id, label: labels?.[id] || humanize(id), icon: "generic", keywords: [] };
+  }
+  function tokenize(query) {
+    return query.toLowerCase().split(/\s+/).filter(Boolean);
+  }
+  function matchesTokens(haystack, tokens) {
+    const h3 = haystack.toLowerCase();
+    return tokens.every((t3) => h3.includes(t3));
+  }
+  function tabMatches(meta, query) {
+    const tokens = tokenize(query);
+    if (!tokens.length) return true;
+    return matchesTokens(`${meta.label} ${meta.id} ${meta.keywords.join(" ")}`, tokens);
+  }
+  function subMatches(sub, query) {
+    const tokens = tokenize(query);
+    if (!tokens.length) return true;
+    return matchesTokens(`${sub.label} ${sub.id} ${sub.keywords.join(" ")}`, tokens);
+  }
+  function cleanBadge(n2) {
+    const v3 = Number(n2);
+    return Number.isFinite(v3) && v3 > 0 ? Math.floor(v3) : 0;
+  }
+  function buildWaffleModel(input) {
+    const query = (input.query ?? "").trim();
+    const badges = input.badges ?? {};
+    const { pinned, rest } = orderTabs(input.available, input.state, {
+      rank: input.rank,
+      threshold: input.threshold
+    });
+    const pinnedSet = new Set(pinned);
+    const availSet = /* @__PURE__ */ new Set([...pinned, ...rest]);
+    const recent = recentTabs(input.state, [...availSet], pinned);
+    const tabEntry = (id) => {
+      const meta = metaFor(id, input.labels);
+      return {
+        key: `tab:${id}`,
+        kind: "tab",
+        tab: id,
+        label: meta.label,
+        icon: meta.icon,
+        group: groupForTab(id),
+        badge: cleanBadge(badges[id]),
+        pinned: pinnedSet.has(id),
+        active: input.activeTab === id
+      };
+    };
+    const subEntry = (sub) => ({
+      key: `sub:${sub.parent}:${sub.id}`,
+      kind: "sub",
+      tab: sub.parent,
+      sub: sub.id,
+      label: sub.label,
+      icon: metaFor(sub.parent, input.labels).icon,
+      group: groupForTab(sub.parent),
+      badge: 0,
+      pinned: false,
+      active: false
+    });
+    const subsFor = (tab, parentMatched) => WAFFLE_SUBTABS.filter((s3) => s3.parent === tab).filter((s3) => !query || parentMatched || subMatches(s3, query)).map(subEntry);
+    const buildRows = (ids, parentMatched) => {
+      const rows = [];
+      for (let i3 = 0; i3 < ids.length; i3 += WAFFLE_COLUMNS) {
+        const chunk = ids.slice(i3, i3 + WAFFLE_COLUMNS);
+        rows.push({ kind: "tiles", entries: chunk.map(tabEntry) });
+        for (const id of chunk) {
+          const subs = subsFor(id, parentMatched(id));
+          for (let j3 = 0; j3 < subs.length; j3 += WAFFLE_COLUMNS) {
+            rows.push({
+              kind: "subs",
+              parent: id,
+              parentLabel: metaFor(id, input.labels).label,
+              entries: subs.slice(j3, j3 + WAFFLE_COLUMNS)
+            });
+          }
+        }
+      }
+      return rows;
+    };
+    let sections;
+    if (query) {
+      const everyone = [...pinned, ...recent, ...rest.filter((id) => !recent.includes(id))];
+      const matched = everyone.filter((id) => tabMatches(metaFor(id, input.labels), query));
+      const rows = buildRows(matched, () => true);
+      const matchedSet = new Set(matched);
+      for (const tab of new Set(WAFFLE_SUBTABS.map((s3) => s3.parent))) {
+        if (!availSet.has(tab) || matchedSet.has(tab)) continue;
+        const subs = subsFor(tab, false);
+        for (let j3 = 0; j3 < subs.length; j3 += WAFFLE_COLUMNS) {
+          rows.push({
+            kind: "subs",
+            parent: tab,
+            parentLabel: metaFor(tab, input.labels).label,
+            entries: subs.slice(j3, j3 + WAFFLE_COLUMNS)
+          });
+        }
+      }
+      sections = rows.length ? [{ id: "results", label: "Results", rows }] : [];
+    } else {
+      const recentSet = new Set(recent);
+      const allIds = rest.filter((id) => !recentSet.has(id));
+      sections = [];
+      if (pinned.length) sections.push({ id: "pinned", label: "Pinned", rows: buildRows(pinned, () => true) });
+      if (recent.length) sections.push({ id: "recent", label: "Recent", rows: buildRows(recent, () => true) });
+      if (allIds.length) {
+        sections.push({
+          id: "all",
+          label: pinned.length || recent.length ? "All tabs" : "Tabs",
+          rows: buildRows(allIds, () => true)
+        });
+      }
+    }
+    const keys = sections.flatMap((s3) => s3.rows.map((r3) => r3.entries.map((e3) => e3.key)));
+    return { sections, keys, count: keys.reduce((n2, row) => n2 + row.length, 0), query };
+  }
+  function moveFocus(rows, current2, key, ctrl = false) {
+    const flat = rows.flat();
+    if (!flat.length) return null;
+    const r3 = current2 === null ? -1 : rows.findIndex((row) => row.includes(current2));
+    if (r3 < 0) {
+      return ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(key) ? flat[0] : null;
+    }
+    const cur = current2;
+    const c3 = rows[r3].indexOf(cur);
+    const at = flat.indexOf(cur);
+    switch (key) {
+      case "ArrowRight":
+        return flat[Math.min(at + 1, flat.length - 1)];
+      case "ArrowLeft":
+        return flat[Math.max(at - 1, 0)];
+      case "ArrowDown":
+        return r3 + 1 >= rows.length ? cur : rows[r3 + 1][Math.min(c3, rows[r3 + 1].length - 1)];
+      case "ArrowUp":
+        return r3 === 0 ? cur : rows[r3 - 1][Math.min(c3, rows[r3 - 1].length - 1)];
+      case "Home":
+        return ctrl ? flat[0] : rows[r3][0];
+      case "End":
+        return ctrl ? flat[flat.length - 1] : rows[r3][rows[r3].length - 1];
+      default:
+        return null;
+    }
+  }
+  function computePopoverPlacement(args) {
+    const margin = args.margin ?? 8;
+    const gap = args.gap ?? 6;
+    const minHeight = args.minHeight ?? 120;
+    const width = Math.max(0, Math.min(args.width, args.viewport.width - 2 * margin));
+    const left = Math.max(margin, Math.min(args.anchor.left, args.viewport.width - margin - width));
+    const top = Math.max(margin, Math.min(args.anchor.bottom + gap, args.viewport.height - margin - minHeight));
+    return { left, top, width, maxHeight: Math.max(0, args.viewport.height - top - margin) };
+  }
+  var ACTIVE_SPRINT_STATUSES = /* @__PURE__ */ new Set(["pending", "todo", "in_progress"]);
+  function countActiveSprintItems(items) {
+    if (!Array.isArray(items)) return 0;
+    return items.filter((it) => it && ACTIVE_SPRINT_STATUSES.has(it.status ?? "")).length;
+  }
+  function readWaffleBadges(strip, panel) {
+    const out = {};
+    const hitl = strip?.querySelector(".hitl-vtab-badge");
+    if (hitl && hitl.style.display !== "none") {
+      const n2 = parseInt(hitl.textContent || "0", 10);
+      if (n2 > 0) out.hitl = n2;
+    }
+    const q2 = cleanBadge(panel?.sprintActiveCount);
+    if (q2 > 0) out.queue = q2;
+    return out;
+  }
+  function activateWaffleTab(strip, tab, sub) {
+    const btn = Array.from(strip.querySelectorAll(".vtab-btn")).find((b2) => b2.dataset.vtab === tab);
+    if (!btn) return false;
+    revealGroupInStrip(strip, tab);
+    btn.click();
+    if (sub) {
+      const pid = strip.id.replace(/^vtab-strip-/, "");
+      const drawer = document.getElementById(`drawer-${tab}-${pid}`);
+      const subBtn = Array.from(drawer?.querySelectorAll(".goal-subtab-btn") ?? []).find(
+        (b2) => b2.dataset.gtab === sub
+      );
+      subBtn?.click();
+    }
+    return true;
+  }
+  function readRailTabs(strip) {
+    const out = { ids: [], labels: {}, active: null };
+    if (!strip) return out;
+    strip.querySelectorAll(".vtab-btn[data-vtab]").forEach((btn) => {
+      const id = btn.dataset.vtab;
+      if (!id || btn.style.display === "none") return;
+      out.ids.push(id);
+      const title = (btn.getAttribute("title") || "").split(/\s+[—-]\s+/)[0].trim();
+      if (title) out.labels[id] = title;
+      if (btn.classList.contains("active")) out.active = id;
+    });
+    return out;
+  }
+  var DEFAULT_STORAGE_KEY = "meridian_waffle.v1";
+  function esc(s3) {
+    return s3.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function tileHtml(e3) {
+    const badge = e3.badge > 0 ? `<span class="waffle-badge" data-badge-tab="${esc(e3.tab)}" aria-hidden="true">${e3.badge > 99 ? "99+" : e3.badge}</span>` : "";
+    const name = e3.label + (e3.pinned ? ", pinned" : "") + (e3.badge > 0 ? `, ${e3.badge} pending` : "");
+    return `<button type="button" class="waffle-tile" role="menuitem" tabindex="-1" data-waffle-key="${esc(e3.key)}" data-waffle-tab="${esc(e3.tab)}" data-group="${esc(e3.group ?? "")}" data-pinned="${e3.pinned}" aria-label="${esc(name)}" aria-keyshortcuts="P"${e3.active ? ' aria-current="true"' : ""}><span class="waffle-pin" data-waffle-pin="${esc(e3.tab)}" title="${e3.pinned ? "Unpin" : "Pin"} ${esc(e3.label)}" aria-hidden="true">${pinSvg(e3.pinned)}</span><span class="waffle-icon-wrap">${waffleIconSvg(e3.icon, 20)}</span><span class="waffle-label">${esc(e3.label)}</span>${badge}</button>`;
+  }
+  function subHtml(e3) {
+    return `<button type="button" class="waffle-sub" role="menuitem" tabindex="-1" data-waffle-key="${esc(e3.key)}" data-waffle-tab="${esc(e3.tab)}" data-waffle-sub="${esc(e3.sub ?? "")}" data-group="${esc(e3.group ?? "")}">${esc(e3.label)}</button>`;
+  }
+  function sectionHtml(section) {
+    let html = "";
+    let openParent = null;
+    const closeSubs = () => {
+      if (openParent !== null) html += "</div>";
+      openParent = null;
+    };
+    for (const row of section.rows) {
+      if (row.kind === "subs") {
+        if (openParent !== row.parent) {
+          closeSubs();
+          openParent = row.parent ?? "";
+          html += `<div class="waffle-subs" role="group" aria-label="${esc(row.parentLabel ?? "")} sections" data-waffle-subs-of="${esc(row.parent ?? "")}"><div class="waffle-subs-title" aria-hidden="true">${esc(row.parentLabel ?? "")}</div>`;
+        }
+        html += `<div class="waffle-row" role="none">${row.entries.map(subHtml).join("")}</div>`;
+      } else {
+        closeSubs();
+        html += `<div class="waffle-row" role="none">${row.entries.map(tileHtml).join("")}</div>`;
+      }
+    }
+    closeSubs();
+    return `<div class="waffle-section" role="group" aria-label="${esc(section.label)}" data-waffle-section="${section.id}"><div class="waffle-heading" aria-hidden="true">${esc(section.label)}</div>${html}</div>`;
+  }
+  var current = null;
+  function refreshWaffle() {
+    current?.refresh();
+  }
+  var scriptedDepth = 0;
+  function withoutWaffleUse(fn) {
+    scriptedDepth += 1;
+    try {
+      return fn();
+    } finally {
+      scriptedDepth -= 1;
+    }
+  }
+  function recordWaffleUse(tab) {
+    if (scriptedDepth > 0) return;
+    current?.recordUse(tab);
+  }
+  function mountWaffle(deps) {
+    const host = deps.host;
+    if (!host) return null;
+    current?.destroy();
+    const storage = deps.storage === void 0 ? safeLocalStorage() : deps.storage;
+    const storageKey = deps.storageKey ?? DEFAULT_STORAGE_KEY;
+    const initialRaw = readRawState(storage, storageKey);
+    let synced = initialRaw === void 0 ? null : initialRaw;
+    let state2 = parseRawState(initialRaw);
+    let isOpen = false;
+    let query = "";
+    let focusKey = null;
+    let model = { sections: [], keys: [], count: 0, query: "" };
+    const slot = document.createElement("div");
+    slot.className = "waffle-slot";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.id = "waffle-btn";
+    button.className = "waffle-btn";
+    button.setAttribute("aria-haspopup", "dialog");
+    button.setAttribute("aria-expanded", "false");
+    button.setAttribute("aria-controls", "waffle-popover");
+    button.setAttribute("aria-label", "Dashboard tabs");
+    button.title = "Jump to a tab";
+    button.innerHTML = `${waffleGlyphSvg()}<span class="waffle-dot" hidden></span>`;
+    slot.appendChild(button);
+    host.insertBefore(slot, host.firstChild);
+    const dot = button.querySelector(".waffle-dot");
+    const popover = document.createElement("div");
+    popover.id = "waffle-popover";
+    popover.className = "waffle-popover";
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("aria-modal", "true");
+    popover.setAttribute("aria-label", "Dashboard tabs");
+    popover.hidden = true;
+    popover.tabIndex = -1;
+    popover.innerHTML = `<div class="waffle-search">${searchSvg()}<input type="search" class="waffle-filter" placeholder="Filter tabs" aria-label="Filter tabs" aria-controls="waffle-menu" autocomplete="off" spellcheck="false" enterkeyhint="go"></div><div class="waffle-body" id="waffle-menu" role="menu" aria-label="Dashboard tabs"></div><div class="waffle-sr" role="status" aria-live="polite"></div><div class="waffle-hint">Arrows move, Enter opens, P pins, Esc closes</div>`;
+    document.body.appendChild(popover);
+    const input = popover.querySelector(".waffle-filter");
+    const body = popover.querySelector(".waffle-body");
+    const live = popover.querySelector(".waffle-sr");
+    const syncFromStorage = () => {
+      const raw = readRawState(storage, storageKey);
+      if (raw === void 0 || raw === synced) return false;
+      synced = raw;
+      state2 = parseRawState(raw);
+      return true;
+    };
+    const mutate = (change) => {
+      syncFromStorage();
+      state2 = change(state2);
+      if (saveState(storage, storageKey, state2)) synced = serializeState(state2);
+    };
+    const readBadges = () => {
+      try {
+        return deps.getBadges ? deps.getBadges() : {};
+      } catch {
+        return {};
+      }
+    };
+    const compute = () => {
+      const strip = deps.getStrip();
+      const rail = readRailTabs(strip);
+      return buildWaffleModel({
+        available: rail.ids,
+        state: state2,
+        query,
+        badges: readBadges(),
+        activeTab: rail.active,
+        labels: rail.labels,
+        rank: deps.rank,
+        threshold: deps.threshold
+      });
+    };
+    const updateDot = () => {
+      const hitl = cleanBadge(readBadges().hitl);
+      dot.hidden = hitl <= 0;
+      button.setAttribute(
+        "aria-label",
+        hitl > 0 ? `Dashboard tabs, ${hitl} review request${hitl === 1 ? "" : "s"} pending` : "Dashboard tabs"
+      );
+    };
+    const entryEl = (key) => {
+      if (!key) return null;
+      return Array.from(body.querySelectorAll("[data-waffle-key]")).find(
+        (el3) => el3.dataset.waffleKey === key
+      ) ?? null;
+    };
+    const setRoving = (key) => {
+      focusKey = key;
+      body.querySelectorAll("[data-waffle-key]").forEach((el3) => {
+        el3.tabIndex = el3.dataset.waffleKey === key ? 0 : -1;
+      });
+    };
+    let lastHtml = "";
+    const heldFocusKey = () => {
+      const a3 = document.activeElement;
+      if (!a3 || !body.contains(a3)) return null;
+      return a3.closest("[data-waffle-key]")?.dataset.waffleKey ?? null;
+    };
+    const render = () => {
+      const hadGridFocus = !!document.activeElement && body.contains(document.activeElement);
+      const heldKey = heldFocusKey();
+      if (heldKey) focusKey = heldKey;
+      model = compute();
+      updateDot();
+      let html;
+      if (!model.sections.length) {
+        const strip = deps.getStrip();
+        html = query ? `<div class="waffle-empty" role="none">No tabs match &quot;${esc(query)}&quot;</div>` : `<div class="waffle-empty" role="none">${strip ? "No tabs available" : "Open a project to jump between its tabs"}</div>`;
+      } else {
+        html = model.sections.map(sectionHtml).join("");
+      }
+      if (html !== lastHtml) {
+        const scroll = body.scrollTop;
+        body.innerHTML = html;
+        body.scrollTop = scroll;
+        lastHtml = html;
+      }
+      const flat = model.keys.flat();
+      setRoving(focusKey && flat.includes(focusKey) ? focusKey : flat[0] ?? null);
+      live.textContent = query ? model.count === 1 ? "1 match" : `${model.count} matches` : "";
+      if (hadGridFocus && !body.contains(document.activeElement)) {
+        const target = heldKey && flat.includes(heldKey) ? heldKey : flat[0] ?? null;
+        if (target) focusEntry(target);
+        else input.focus();
+      }
+    };
+    const place = () => {
+      const r3 = button.getBoundingClientRect();
+      popover.style.maxHeight = "";
+      const placement = computePopoverPlacement({
+        anchor: { left: r3.left, bottom: r3.bottom },
+        width: popover.offsetWidth || 352,
+        viewport: { width: window.innerWidth, height: window.innerHeight }
+      });
+      popover.style.left = `${placement.left}px`;
+      popover.style.top = `${placement.top}px`;
+      popover.style.maxHeight = `${placement.maxHeight}px`;
+    };
+    const focusEntry = (key) => {
+      const el3 = entryEl(key);
+      if (!el3) return;
+      setRoving(key);
+      el3.focus();
+    };
+    const onDocPointer = (ev) => {
+      const t3 = ev.target;
+      if (t3 && (popover.contains(t3) || button.contains(t3))) return;
+      close(false);
+    };
+    const onFocusIn = (ev) => {
+      const t3 = ev.target;
+      if (t3 && (popover.contains(t3) || button.contains(t3))) return;
+      close(false);
+    };
+    const onResize = () => {
+      if (isOpen) place();
+    };
+    const onStorage = (ev) => {
+      if (ev.key !== null && ev.key !== storageKey) return;
+      if (syncFromStorage() && isOpen) render();
+    };
+    const onDocKey = (ev) => {
+      if (ev.key !== "Escape" || ev.isComposing) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      close(true);
+    };
+    function close(returnFocus = true) {
+      if (!isOpen) return;
+      isOpen = false;
+      popover.hidden = true;
+      button.setAttribute("aria-expanded", "false");
+      document.removeEventListener("keydown", onDocKey, true);
+      document.removeEventListener("mousedown", onDocPointer, true);
+      document.removeEventListener("touchstart", onDocPointer, true);
+      document.removeEventListener("focusin", onFocusIn, true);
+      window.removeEventListener("resize", onResize);
+      query = "";
+      input.value = "";
+      if (returnFocus) button.focus();
+    }
+    function open() {
+      if (isOpen) return;
+      isOpen = true;
+      query = "";
+      input.value = "";
+      focusKey = null;
+      popover.hidden = false;
+      button.setAttribute("aria-expanded", "true");
+      syncFromStorage();
+      render();
+      place();
+      document.addEventListener("keydown", onDocKey, true);
+      document.addEventListener("mousedown", onDocPointer, true);
+      document.addEventListener("touchstart", onDocPointer, true);
+      document.addEventListener("focusin", onFocusIn, true);
+      window.addEventListener("resize", onResize);
+      const fine = typeof window.matchMedia !== "function" || window.matchMedia("(pointer: fine)").matches;
+      if (fine) input.focus();
+      else focusEntry(focusKey);
+    }
+    const noteUse = (tab) => {
+      mutate((latest) => recordUse(latest, tab));
+      if (isOpen) render();
+    };
+    const activateKey = (key) => {
+      if (!key) return;
+      const entry = model.sections.flatMap((s3) => s3.rows.flatMap((r3) => r3.entries)).find((e3) => e3.key === key);
+      if (!entry) return;
+      const strip = deps.getStrip();
+      if (!strip) return;
+      close(true);
+      const activated = withoutWaffleUse(() => activateWaffleTab(strip, entry.tab, entry.sub));
+      if (activated) noteUse(entry.tab);
+      updateDot();
+    };
+    const togglePinFor = (tab, keyToFocus) => {
+      const wantPinned = !effectivePins(state2).includes(tab);
+      mutate((latest) => setPinned(latest, tab, wantPinned));
+      const hadFocus = popover.contains(document.activeElement);
+      render();
+      if (hadFocus) focusEntry(keyToFocus);
+    };
+    button.addEventListener("click", () => isOpen ? close(true) : open());
+    button.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowDown" && !isOpen) {
+        ev.preventDefault();
+        open();
+      }
+    });
+    input.addEventListener("input", () => {
+      query = input.value;
+      focusKey = null;
+      render();
+    });
+    body.addEventListener("click", (ev) => {
+      const target = ev.target;
+      const pin = target.closest("[data-waffle-pin]");
+      if (pin) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const pinTab = pin.dataset.wafflePin || "";
+        togglePinFor(pinTab, `tab:${pinTab}`);
+        return;
+      }
+      const el3 = target.closest("[data-waffle-key]");
+      if (el3) activateKey(el3.dataset.waffleKey || null);
+    });
+    popover.addEventListener("keydown", (ev) => {
+      const target = ev.target;
+      if (ev.key === "Tab") {
+        const stops = [input, body.querySelector('[data-waffle-key][tabindex="0"]')].filter(
+          (el4) => !!el4
+        );
+        const idx = stops.indexOf(document.activeElement);
+        if (ev.shiftKey && idx <= 0) {
+          ev.preventDefault();
+          stops[stops.length - 1].focus();
+        } else if (!ev.shiftKey && idx === stops.length - 1) {
+          ev.preventDefault();
+          stops[0].focus();
+        }
+        return;
+      }
+      if (target === input) {
+        const first = model.keys[0]?.[0] ?? null;
+        if (ev.key === "ArrowDown") {
+          ev.preventDefault();
+          focusEntry(first);
+        } else if (ev.key === "Enter") {
+          ev.preventDefault();
+          activateKey(first);
+        }
+        return;
+      }
+      const el3 = target.closest("[data-waffle-key]");
+      if (!el3) return;
+      const key = el3.dataset.waffleKey || null;
+      if (ev.key === "ArrowUp" && model.keys[0]?.includes(key)) {
+        ev.preventDefault();
+        input.focus();
+        return;
+      }
+      const next = moveFocus(model.keys, key, ev.key, ev.ctrlKey || ev.metaKey);
+      if (next !== null) {
+        ev.preventDefault();
+        focusEntry(next);
+        return;
+      }
+      if ((ev.key === "p" || ev.key === "P") && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        const tab = el3.dataset.waffleTab;
+        if (tab && el3.dataset.waffleSub === void 0) {
+          ev.preventDefault();
+          togglePinFor(tab, key);
+        }
+      }
+    });
+    updateDot();
+    window.addEventListener("storage", onStorage);
+    const controller = {
+      button,
+      popover,
+      open,
+      close,
+      isOpen: () => isOpen,
+      refresh: () => {
+        if (isOpen) render();
+        else updateDot();
+      },
+      recordUse: noteUse,
+      getModel: () => model,
+      getState: () => state2,
+      destroy: () => {
+        close(false);
+        window.removeEventListener("storage", onStorage);
+        slot.remove();
+        popover.remove();
+        if (current === controller) current = null;
+      }
+    };
+    current = controller;
+    return controller;
   }
 
   // meridian/static/dashboard-folders.ts
@@ -9916,6 +11320,601 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
+  // meridian/static/dashboard-goal-conflict.ts
+  function normalizeGoalText(key, text) {
+    const t3 = String(text ?? "").replace(/\r\n?/g, "\n");
+    return key === "version_goal" ? t3.replace(/\s+$/, "") : t3.trim();
+  }
+  var GOAL_AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---";
+  function splitGoalText(text) {
+    const splitIdx = text.indexOf(GOAL_AUTO_SPLIT);
+    const mainText = splitIdx !== -1 ? text.slice(0, splitIdx).trimEnd() : text;
+    const allLines = mainText.split("\n");
+    const firstLine = allLines[0] || "";
+    const isVersionLabel = /^v\d+\.\d+/.test(firstLine.trim()) || firstLine.trim().length === 0;
+    const titleLine = isVersionLabel ? firstLine : "";
+    const body = (isVersionLabel ? allLines.slice(1) : allLines).join("\n").replace(/^\n/, "");
+    const editStart = body.search(/^(CURRENT FOCUS|KEY FILES)/m);
+    return {
+      titleLine,
+      shipped: editStart > 0 ? body.slice(0, editStart).trimEnd() : "",
+      editable: editStart > 0 ? body.slice(editStart) : body,
+      autoBlocks: splitIdx !== -1 ? text.slice(splitIdx + GOAL_AUTO_SPLIT.length).trimStart() : null
+    };
+  }
+  var MAX_DIFF_LINES = 1e3;
+  var RECENT_SAVE_MS = 2e3;
+  function diffLines(mine, theirs) {
+    const a3 = mine.split("\n");
+    const b2 = theirs.split("\n");
+    if (a3.length > MAX_DIFF_LINES || b2.length > MAX_DIFF_LINES) {
+      return [
+        ...a3.map((text) => ({ type: "mine", text })),
+        ...b2.map((text) => ({ type: "theirs", text }))
+      ];
+    }
+    const w3 = b2.length + 1;
+    const lcs = new Int32Array((a3.length + 1) * w3);
+    for (let i4 = a3.length - 1; i4 >= 0; i4--) {
+      for (let j4 = b2.length - 1; j4 >= 0; j4--) {
+        lcs[i4 * w3 + j4] = a3[i4] === b2[j4] ? lcs[(i4 + 1) * w3 + j4 + 1] + 1 : Math.max(lcs[(i4 + 1) * w3 + j4], lcs[i4 * w3 + j4 + 1]);
+      }
+    }
+    const ops = [];
+    let i3 = 0;
+    let j3 = 0;
+    while (i3 < a3.length && j3 < b2.length) {
+      if (a3[i3] === b2[j3]) {
+        ops.push({ type: "same", text: a3[i3] });
+        i3++;
+        j3++;
+      } else if (lcs[(i3 + 1) * w3 + j3] >= lcs[i3 * w3 + j3 + 1]) {
+        ops.push({ type: "mine", text: a3[i3++] });
+      } else {
+        ops.push({ type: "theirs", text: b2[j3++] });
+      }
+    }
+    while (i3 < a3.length) ops.push({ type: "mine", text: a3[i3++] });
+    while (j3 < b2.length) ops.push({ type: "theirs", text: b2[j3++] });
+    return ops;
+  }
+  function describeRemoteChange(meta, stamp) {
+    const who = meta?.kind === "agent" ? "by an agent" : meta?.kind === "human" ? "by a person" : "";
+    const when = stamp ? formatRelativeTime2(stamp) : "";
+    return [who, when].filter(Boolean).join(", ");
+  }
+  function parseGoalConflict(err) {
+    const e3 = err;
+    if (!e3 || e3.status !== 409 || typeof e3.responseText !== "string") return null;
+    try {
+      const detail = JSON.parse(e3.responseText)?.detail;
+      if (!detail || detail.error !== "goal_conflict" || !detail.current) return null;
+      return { value: detail.current.value, stamp: String(detail.current.updated_at ?? "") };
+    } catch (_2) {
+      return null;
+    }
+  }
+  function errorMessage(err) {
+    const e3 = err;
+    if (e3 && typeof e3.responseText === "string") {
+      try {
+        const d3 = JSON.parse(e3.responseText)?.detail;
+        if (typeof d3 === "string") return d3;
+        if (d3 && typeof d3.message === "string") return d3.message;
+      } catch (_2) {
+      }
+    }
+    const msg = e3 && e3.message || "request failed";
+    return msg === "demo_readonly" ? "this demo is read-only" : msg;
+  }
+  var GoalField = class {
+    constructor(cfg) {
+      /** Server text the editor content is compared against (what it was last populated with / saved as). */
+      this.base = "";
+      /** Server stamp of `base`; sent as expected_updated_at. null = not known. */
+      this.stamp = null;
+      this.pending = null;
+      this.error = null;
+      this.touched = false;
+      this.lastSavedAt = 0;
+      this.inflight = null;
+      /** A blur / Save arrived while a save was on its way: save again once it lands if text is left over. */
+      this.resaveWanted = false;
+      this.recent = null;
+      this.bar = null;
+      this.diffOpen = false;
+      this.cfg = cfg;
+    }
+    // -- state ----------------------------------------------------------------
+    norm(text) {
+      return normalizeGoalText(this.cfg.key, text);
+    }
+    current() {
+      return this.norm(this.cfg.getValue());
+    }
+    /** The editor holds text that differs from `base` and the person put it there (or asked to save it). */
+    isDirty(explicit = false) {
+      return (this.touched || explicit) && this.current() !== this.norm(this.base);
+    }
+    isSaving() {
+      return this.inflight !== null;
+    }
+    /** Unsaved edits, or a save still on its way: a live update must not replace the text. */
+    isEditing() {
+      return this.isDirty() || this.isSaving();
+    }
+    isAttached() {
+      return this.cfg.el.isConnected;
+    }
+    isFocused() {
+      return this.cfg.el.ownerDocument.activeElement === this.cfg.el;
+    }
+    /** Resolves once an in-flight save (if any, and the follow-up save it may chain) has finished, whatever its outcome. */
+    async settle() {
+      while (this.inflight) {
+        try {
+          await this.inflight;
+        } catch (_2) {
+        }
+      }
+    }
+    /** Remember who made the latest remote change; matched to a refresh by its stamp. */
+    noteRemoteMeta(meta) {
+      this.recent = meta;
+    }
+    metaFor(stamp) {
+      return this.recent && this.recent.stamp && this.recent.stamp === stamp ? this.recent : null;
+    }
+    paintDirty() {
+      this.cfg.el.classList.toggle("dirty", this.isDirty());
+      this.cfg.el.classList.toggle("save-failed", this.error !== null);
+    }
+    /** Put text in the editor, keeping the caret where it was when the person is in the field. */
+    writeEditor(text) {
+      const el3 = this.cfg.el;
+      const keep = this.isFocused() && typeof el3.selectionStart === "number";
+      const start = keep ? el3.selectionStart : null;
+      const end = keep ? el3.selectionEnd : null;
+      this.cfg.setValue(text);
+      if (keep && start !== null && end !== null) {
+        try {
+          el3.setSelectionRange(Math.min(start, text.length), Math.min(end, text.length));
+        } catch (_2) {
+        }
+      }
+    }
+    adopt(text, stamp) {
+      this.base = text;
+      this.stamp = stamp;
+      this.touched = false;
+      this.pending = null;
+      this.error = null;
+      this.diffOpen = false;
+    }
+    // -- server data ----------------------------------------------------------
+    /**
+     * The only way server data reaches the editor.  `text` is the server's value
+     * for this field in editor form, `stamp` its per-field updated_at (null when
+     * the server did not say).
+     *
+     *  unchanged  the server text is what the edit is based on (another field, or
+     *             only the read-only zones, moved): adopt the stamp so the next
+     *             save is not a false conflict, touch nothing else.
+     *  converged  the person's draft already equals the server text: nothing to ask.
+     *  applied    nothing to protect: the editor takes the new text live.
+     *  conflict   unsaved edits: keep the draft, remember `text`, show the bar.
+     */
+    applyServer(text, stamp, meta) {
+      const incoming = this.norm(text);
+      const cur = this.current();
+      if (incoming === this.norm(this.base)) {
+        this.stamp = stamp;
+        if (this.pending) {
+          this.pending = null;
+          this.diffOpen = false;
+        }
+        this.renderBar();
+        this.paintDirty();
+        return "unchanged";
+      }
+      if (cur === incoming && this.isEditing()) {
+        this.adopt(text, stamp);
+        this.renderBar();
+        this.paintDirty();
+        return "converged";
+      }
+      if (!this.isEditing()) {
+        this.writeEditor(text);
+        this.adopt(text, stamp);
+        this.recent = meta ?? this.metaFor(stamp);
+        this.renderBar();
+        this.paintDirty();
+        return "applied";
+      }
+      this.pending = { text, stamp, meta: meta ?? this.metaFor(stamp) };
+      this.renderBar();
+      this.paintDirty();
+      return "conflict";
+    }
+    // -- user actions ---------------------------------------------------------
+    /** An input/change event from the person (not a programmatic setValue). */
+    onUserInput() {
+      this.touched = true;
+      if (this.pending && !this.isDirty()) {
+        const p3 = this.pending;
+        this.writeEditor(p3.text);
+        this.adopt(p3.text, p3.stamp);
+      } else if (this.error !== null) {
+        this.error = null;
+      }
+      this.renderBar();
+      this.paintDirty();
+    }
+    /** Blur / explicit save.  Never writes over an unresolved "Changed elsewhere" prompt. */
+    async saveNow(opts = {}) {
+      if (this.inflight) {
+        this.resaveWanted = true;
+        return this.inflight;
+      }
+      this.resaveWanted = false;
+      const explicit = !!opts.explicit;
+      if (this.pending) {
+        if (explicit) this.cfg.notify?.("Resolve the change from elsewhere first: Keep mine or Take theirs.", true);
+        return "blocked";
+      }
+      if (!this.isDirty(explicit)) {
+        if (explicit && Date.now() - this.lastSavedAt > RECENT_SAVE_MS) this.cfg.notify?.("No changes to save");
+        return "skipped";
+      }
+      const text = this.current();
+      if (!text && !this.cfg.allowEmpty) return "skipped";
+      if (!opts.skipConfirm && this.cfg.confirmSave && !this.cfg.confirmSave(text, this.norm(this.base))) {
+        this.writeEditor(this.base);
+        this.touched = false;
+        this.paintDirty();
+        return "skipped";
+      }
+      const run = this.runSave(text, false);
+      this.inflight = run;
+      let outcome;
+      try {
+        outcome = await run;
+      } finally {
+        this.inflight = null;
+        this.renderBar();
+        this.paintDirty();
+      }
+      if (outcome === "saved" && this.resaveWanted && !this.pending && this.isDirty()) return this.saveNow();
+      return outcome;
+    }
+    async runSave(text, retried) {
+      this.error = null;
+      this.renderBar();
+      try {
+        const res = await this.cfg.persist(text, this.stamp);
+        this.base = text;
+        this.touched = this.current() !== text;
+        this.error = null;
+        if (res && res.stamp) this.stamp = res.stamp;
+        this.lastSavedAt = Date.now();
+        if (this.pending && this.norm(this.pending.text) === text) this.pending = null;
+        this.cfg.onSaved?.();
+        return "saved";
+      } catch (err) {
+        const conflict = parseGoalConflict(err);
+        if (conflict) {
+          const incoming = this.cfg.fromServer ? this.cfg.fromServer(conflict.value) : String(conflict.value ?? "");
+          const outcome = this.applyServer(incoming, conflict.stamp, this.metaFor(conflict.stamp));
+          if (outcome === "converged") return "saved";
+          if (outcome === "unchanged" && !retried) return this.runSave(text, true);
+          return "conflict";
+        }
+        this.error = errorMessage(err);
+        this.cfg.notify?.("save failed: " + this.error, true);
+        return "error";
+      }
+    }
+    /** "Keep mine": the person's text stays and is saved over the remote change. */
+    async keepMine() {
+      const p3 = this.pending;
+      if (!p3) return "skipped";
+      if (this.cfg.confirmSave && !this.cfg.confirmSave(this.current(), this.norm(p3.text))) return "skipped";
+      this.base = p3.text;
+      this.stamp = p3.stamp;
+      this.pending = null;
+      this.diffOpen = false;
+      this.touched = true;
+      this.renderBar();
+      this.paintDirty();
+      return this.saveNow({ explicit: true, skipConfirm: true });
+    }
+    /** "Take theirs": the editor shows the server's text; the draft is dropped. */
+    takeTheirs() {
+      const p3 = this.pending;
+      if (!p3) return;
+      this.writeEditor(p3.text);
+      this.adopt(p3.text, p3.stamp);
+      this.renderBar();
+      this.paintDirty();
+    }
+    /** Revert the editor to the last saved (or, with a pending remote change, the current server) text. */
+    discard() {
+      const target = this.pending ? { text: this.pending.text, stamp: this.pending.stamp } : { text: this.base, stamp: this.stamp };
+      this.writeEditor(target.text);
+      this.adopt(target.text, target.stamp);
+      this.renderBar();
+      this.paintDirty();
+    }
+    /** Esc: offer to discard, but only when there is something to lose. */
+    handleEscape() {
+      if (!this.isDirty()) return "noop";
+      const ask = this.cfg.confirm ?? ((m3) => window.confirm(m3));
+      if (!ask(`Discard your unsaved changes to the ${this.cfg.label}?`)) return "cancelled";
+      this.discard();
+      return "discarded";
+    }
+    /** Attach blur-save, dirty tracking and Esc-to-discard to the editor element(s). */
+    wire(opts) {
+      for (const el3 of opts.blur) el3.addEventListener("blur", () => {
+        void this.saveNow();
+      });
+      for (const el3 of opts.input) {
+        el3.addEventListener("input", () => this.onUserInput());
+        el3.addEventListener("change", () => this.onUserInput());
+      }
+      for (const el3 of opts.keys) {
+        el3.addEventListener("keydown", (ev) => {
+          const e3 = ev;
+          if (e3.key === "Escape" && this.handleEscape() !== "noop") e3.preventDefault();
+        });
+      }
+    }
+    destroy() {
+      this.bar?.remove();
+      this.bar = null;
+    }
+    // -- the bar --------------------------------------------------------------
+    buildBar() {
+      const anchor = this.cfg.anchor();
+      if (!anchor || !anchor.parentNode) return null;
+      const doc = anchor.ownerDocument;
+      const bar = doc.createElement("div");
+      bar.className = "goal-conflict-bar";
+      bar.setAttribute("role", "alert");
+      bar.dataset.goalField = this.cfg.key;
+      bar.hidden = true;
+      const msg = doc.createElement("div");
+      msg.className = "goal-conflict-msg";
+      const lead = doc.createElement("strong");
+      lead.className = "goal-conflict-lead";
+      const detail = doc.createElement("span");
+      detail.className = "goal-conflict-detail";
+      msg.append(lead, detail);
+      const actions = doc.createElement("div");
+      actions.className = "goal-conflict-actions";
+      const button = (act, label, onClick) => {
+        const b2 = doc.createElement("button");
+        b2.type = "button";
+        b2.className = "secondary";
+        b2.dataset.act = act;
+        b2.textContent = label;
+        b2.addEventListener("click", onClick);
+        return b2;
+      };
+      actions.append(
+        button("keep", "Keep mine", () => {
+          void this.keepMine();
+        }),
+        button("take", "Take theirs", () => this.takeTheirs()),
+        button("both", "See both", () => {
+          this.diffOpen = !this.diffOpen;
+          this.renderBar();
+        }),
+        button("retry", "Retry save", () => {
+          void this.saveNow({ explicit: true });
+        })
+      );
+      const diff = doc.createElement("div");
+      diff.className = "goal-conflict-diff";
+      diff.hidden = true;
+      bar.append(msg, actions, diff);
+      anchor.parentNode.insertBefore(bar, anchor);
+      return bar;
+    }
+    /** Paint the bar from current state: conflict, failed save, or hidden. */
+    renderBar() {
+      const conflict = this.pending !== null;
+      const failed = !conflict && this.error !== null;
+      if (!this.bar || !this.bar.isConnected) {
+        if (!conflict && !failed) return;
+        this.bar = this.buildBar();
+        if (!this.bar) return;
+      }
+      const bar = this.bar;
+      bar.hidden = !conflict && !failed;
+      bar.classList.toggle("is-error", failed);
+      if (bar.hidden) return;
+      const lead = bar.querySelector(".goal-conflict-lead");
+      const detail = bar.querySelector(".goal-conflict-detail");
+      const show = (act, on) => {
+        const b2 = bar.querySelector(`button[data-act="${act}"]`);
+        if (b2) b2.hidden = !on;
+      };
+      show("keep", conflict);
+      show("take", conflict);
+      show("both", conflict);
+      show("retry", failed);
+      const diff = bar.querySelector(".goal-conflict-diff");
+      if (failed) {
+        lead.textContent = "Save failed";
+        detail.textContent = ` ${this.error}. Your text is kept.`;
+        diff.hidden = true;
+        return;
+      }
+      const p3 = this.pending;
+      const who = describeRemoteChange(p3.meta, p3.stamp);
+      lead.textContent = "Changed elsewhere";
+      detail.textContent = `${who ? ` ${who}.` : "."} Your unsaved ${this.cfg.label} is kept.`;
+      const both = bar.querySelector('button[data-act="both"]');
+      both.textContent = this.diffOpen ? "Hide diff" : "See both";
+      both.setAttribute("aria-expanded", String(this.diffOpen));
+      diff.hidden = !this.diffOpen;
+      if (this.diffOpen) this.paintDiff(diff, p3);
+    }
+    paintDiff(diff, p3) {
+      const doc = diff.ownerDocument;
+      diff.replaceChildren();
+      const legend = doc.createElement("div");
+      legend.className = "gcd-legend";
+      legend.textContent = "- only in your text    + only in the current version";
+      diff.append(legend);
+      for (const op of diffLines(this.current(), this.norm(p3.text))) {
+        const line = doc.createElement("div");
+        line.className = `gcd-line gcd-${op.type}`;
+        const mark = doc.createElement("span");
+        mark.className = "gcd-mark";
+        mark.textContent = op.type === "mine" ? "-" : op.type === "theirs" ? "+" : " ";
+        const body = doc.createElement("span");
+        body.className = "gcd-text";
+        body.textContent = op.text;
+        line.append(mark, body);
+        diff.append(line);
+      }
+    }
+  };
+  var registry = /* @__PURE__ */ new Map();
+  function registerGoalFields(projectId, fields) {
+    const old = registry.get(projectId);
+    if (old) {
+      for (const f4 of Object.values(old)) if (f4 && !Object.values(fields).includes(f4)) f4.destroy();
+    }
+    registry.set(projectId, fields);
+  }
+  function getGoalField(projectId, key) {
+    return registry.get(projectId)?.[key] ?? null;
+  }
+  function attachedFields(projectId) {
+    for (const [id, set] of registry) {
+      if (!Object.values(set).some((f4) => f4 && f4.isAttached())) registry.delete(id);
+    }
+    const sets = projectId === void 0 ? [...registry.values()] : [registry.get(projectId)].filter(Boolean);
+    return sets.flatMap((s3) => Object.values(s3)).filter((f4) => f4 && f4.isAttached());
+  }
+  function hasUnsavedGoalEdits(projectId) {
+    return attachedFields(projectId).some((f4) => f4.isDirty() || f4.isSaving());
+  }
+  function noteGoalEvent(projectId, event) {
+    const changed = event && event.changed_fields;
+    if (!Array.isArray(changed)) return;
+    const by = event.changed_by || {};
+    for (const key of changed) {
+      const f4 = getGoalField(projectId, key);
+      if (!f4) continue;
+      f4.noteRemoteMeta({
+        kind: by.kind ?? null,
+        source: by.source ?? null,
+        id: by.id ?? null,
+        stamp: event.field_updated_at ? event.field_updated_at[key] ?? null : null
+      });
+    }
+  }
+  var unloadGuardInstalled = false;
+  function installGoalUnloadGuard(win = window) {
+    if (unloadGuardInstalled) return;
+    unloadGuardInstalled = true;
+    win.addEventListener("beforeunload", (e3) => {
+      if (!hasUnsavedGoalEdits()) return;
+      e3.preventDefault();
+      e3.returnValue = "";
+    });
+  }
+  function promptGoalLeave(fields, doc = document) {
+    return new Promise((resolve) => {
+      const overlay = doc.createElement("div");
+      overlay.className = "goal-leave-overlay";
+      const dlg = doc.createElement("div");
+      dlg.className = "goal-leave-dialog";
+      dlg.setAttribute("role", "dialog");
+      dlg.setAttribute("aria-modal", "true");
+      dlg.setAttribute("aria-label", "Unsaved goal changes");
+      const h3 = doc.createElement("div");
+      h3.className = "goal-leave-title";
+      h3.textContent = "Unsaved changes";
+      const p3 = doc.createElement("div");
+      p3.className = "goal-leave-body";
+      p3.textContent = `You have unsaved changes to the ${fields.map((f4) => f4.cfg.label).join(" and the ")}.`;
+      const row = doc.createElement("div");
+      row.className = "goal-leave-actions";
+      const finish = (choice) => {
+        doc.removeEventListener("keydown", onKey, true);
+        overlay.remove();
+        resolve(choice);
+      };
+      const mk = (cls, label, choice) => {
+        const b2 = doc.createElement("button");
+        b2.type = "button";
+        b2.className = cls;
+        b2.textContent = label;
+        b2.dataset.choice = choice;
+        b2.addEventListener("click", () => finish(choice));
+        return b2;
+      };
+      const save = mk("primary", "Save", "save");
+      row.append(save, mk("secondary", "Discard", "discard"), mk("secondary", "Stay here", "stay"));
+      dlg.append(h3, p3, row);
+      overlay.append(dlg);
+      overlay.addEventListener("click", (e3) => {
+        if (e3.target === overlay) finish("stay");
+      });
+      const onKey = (e3) => {
+        if (e3.key === "Escape") {
+          e3.preventDefault();
+          e3.stopPropagation();
+          finish("stay");
+        }
+      };
+      doc.addEventListener("keydown", onKey, true);
+      doc.body.append(overlay);
+      save.focus();
+    });
+  }
+  function guardGoalLeave(projectId, proceed) {
+    const fields = attachedFields(projectId);
+    if (!fields.some((f4) => f4.isDirty() || f4.isSaving())) return false;
+    void (async () => {
+      await Promise.all(fields.map((f4) => f4.settle()));
+      const dirty = fields.filter((f4) => f4.isDirty());
+      if (!dirty.length) {
+        proceed();
+        return;
+      }
+      const choice = await promptGoalLeave(dirty);
+      if (choice === "stay") return;
+      if (choice === "discard") {
+        dirty.forEach((f4) => f4.discard());
+        proceed();
+        return;
+      }
+      const outcomes = await Promise.all(dirty.map((f4) => f4.saveNow({ explicit: true })));
+      if (outcomes.every((o3) => o3 === "saved" || o3 === "skipped")) proceed();
+    })();
+    return true;
+  }
+  try {
+    Object.assign(window, {
+      GoalField,
+      registerGoalFields,
+      getGoalField,
+      hasUnsavedGoalEdits,
+      noteGoalEvent,
+      installGoalUnloadGuard,
+      guardGoalLeave,
+      splitGoalText,
+      normalizeGoalText
+    });
+  } catch (e3) {
+  }
+
   // meridian/static/dashboard.ts
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
@@ -9965,8 +11964,8 @@ ${n2.tags || ""}`.toLowerCase();
       // check-updates and update banner
     ];
     toHide.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((el2) => {
-        el2.style.display = "none";
+      document.querySelectorAll(sel).forEach((el3) => {
+        el3.style.display = "none";
       });
     });
     const ctrlRow = document.getElementById("server-controls-row");
@@ -9976,7 +11975,7 @@ ${n2.tags || ""}`.toLowerCase();
       if (connInd) connInd.style.display = "none";
       document.querySelectorAll(".conn-popup").forEach((p3) => p3.remove());
     } else {
-      document.querySelectorAll(".hosted-label").forEach((el2) => el2.remove());
+      document.querySelectorAll(".hosted-label").forEach((el3) => el3.remove());
     }
     const footer = document.querySelector(".sidebar-footer");
     if (!isHostedAdmin() && footer && !footer.querySelector(".hosted-label")) {
@@ -10070,6 +12069,7 @@ ${n2.tags || ""}`.toLowerCase();
         } catch (_2) {
         }
       });
+      connectAccountWs();
       await loadProjects();
       const active = workspaces.find((w3) => w3.tenant_id === chosen);
       sel.title = active ? active.is_own ? "My workspace" : `${active.owner_email} (${active.role})` : "";
@@ -10121,7 +12121,7 @@ ${n2.tags || ""}`.toLowerCase();
       wrap.appendChild(badge);
     }
     const active = (workspaces || []).find((w3) => state.activeWorkspaceTenantId ? w3.tenant_id === state.activeWorkspaceTenantId : w3.is_own);
-    const colors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", invite: "#f59e0b" };
+    const colors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", playtester: "#0891b2", invite: "#f59e0b" };
     let label, color;
     if (active && !active.is_own) {
       label = `invite \xB7 ${active.role || "member"}`;
@@ -10224,8 +12224,8 @@ ${n2.tags || ""}`.toLowerCase();
   function showLocalServerControls() {
     if (isHostedMode() || isDemoMode()) return;
     ["#git-check-btn", "#restart-server-btn", "#stop-server-btn"].forEach((sel) => {
-      const el2 = document.querySelector(sel);
-      if (el2) el2.style.display = "";
+      const el3 = document.querySelector(sel);
+      if (el3) el3.style.display = "";
     });
   }
   var STORAGE_KEY2 = (k3) => (isDemoMode() ? "meridian_demo_" : "meridian_") + k3.replace(/^meridian[._]/, "");
@@ -10379,10 +12379,10 @@ ${n2.tags || ""}`.toLowerCase();
       item.classList.toggle("active", item.dataset.projectId === state.activeTab);
     });
   }
-  function autosizeGoalField(el2, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
-    if (!el2) return;
-    el2.style.height = "auto";
-    el2.style.height = `${Math.max(el2.scrollHeight, minPx)}px`;
+  function autosizeGoalField(el3, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
+    if (!el3) return;
+    el3.style.height = "auto";
+    el3.style.height = `${Math.max(el3.scrollHeight, minPx)}px`;
   }
   function githubIconSvg2(size = 12, color = "currentColor") {
     return `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false" style="color:${color};flex-shrink:0"><path d="${GITHUB_OCTICON_PATH}"></path></svg>`;
@@ -10427,7 +12427,7 @@ ${n2.tags || ""}`.toLowerCase();
         projectApi(projectId, `/projects/${projectId}/agent-instructions/default`),
         projectApi(projectId, `/projects/${projectId}/settings`)
       ]);
-      const current = data.agent_instructions || "";
+      const current2 = data.agent_instructions || "";
       const defaultText = defaultData.default_agent_instructions || "";
       const codeIntelEnabled = settingsData ? !!settingsData.code_intel_enabled : false;
       section.innerHTML = `
@@ -10445,11 +12445,11 @@ ${n2.tags || ""}`.toLowerCase();
           rows="24"
           style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:8px;resize:vertical;outline:none;line-height:1.5"
           placeholder="Enter executor rules\u2026"
-        >${escapeHtml(current)}</textarea>
+        >${escapeHtml(current2)}</textarea>
 
         <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
 
-          <span id="agent-instructions-chars-${projectId}" style="font-size:10px;color:var(--muted)">${current.length} chars</span>
+          <span id="agent-instructions-chars-${projectId}" style="font-size:10px;color:var(--muted)">${current2.length} chars</span>
 
           <span style="display:flex;gap:6px">
 
@@ -10665,7 +12665,8 @@ ${n2.tags || ""}`.toLowerCase();
     const pid = state.activeTab;
     if (!pid || !vtab) return;
     const btn = document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${vtab}"]`);
-    if (btn) btn.click();
+    revealGroupInStrip(document.getElementById(`vtab-strip-${pid}`) || document, vtab);
+    if (btn) withoutWaffleUse(() => btn.click());
     if (gtab) {
       const gbtn = document.querySelector(`#drawer-goal-${pid} .goal-subtab-btn[data-gtab="${gtab}"]`);
       if (gbtn) gbtn.click();
@@ -10783,7 +12784,9 @@ ${n2.tags || ""}`.toLowerCase();
         b2.style = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:4px 12px;font-size:11px;font-family:inherit;letter-spacing:0.02em";
         b2.innerHTML = 'Preview mode \u2014 read only \xB7 <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in \u2192</a>';
         document.body.prepend(b2);
-        document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 22 + "px";
+        if (!document.getElementById("demo-banner")) {
+          document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 22 + "px";
+        }
         if (!_demoTourDone2()) {
           resumeDemoTour();
         }
@@ -10849,7 +12852,9 @@ ${n2.tags || ""}`.toLowerCase();
         loadNotesTab(pid),
         refreshProjectCountBadges(pid),
         refreshHitl(pid),
-        loadSprintBoard(pid)
+        // 8a665a03 -- loadSprintBoard is a closure inside buildTabBody, so the bare
+        // call that used to be here threw a ReferenceError (swallowed by the catch).
+        reloadGoalSprintBoard(pid)
       ]);
     } catch (_2) {
     }
@@ -10889,7 +12894,8 @@ ${n2.tags || ""}`.toLowerCase();
   function updateTunnelConnectionIndicator(me) {
     const wrap = document.getElementById("connection-tunnel");
     if (!wrap || !me) return;
-    const isPro = me.plan === "pro" || me.plan === "admin" || me.is_internal;
+    const _ent = me.entitlement_plan || me.plan;
+    const isPro = _ent === "pro" || _ent === "admin" || me.is_internal;
     if (!isPro) {
       wrap.style.display = "none";
       return;
@@ -11276,14 +13282,14 @@ ${n2.tags || ""}`.toLowerCase();
   }
   function _moveProjectToFolder(t3) {
     const assignments = loadFolderAssignments(STORAGE_KEY2("projectFolders"));
-    const current = assignments[t3.id] || "";
+    const current2 = assignments[t3.id] || "";
     const existing = knownFolderNames(state.projects, assignments);
     const hint = existing.length ? `
 
 Existing folders: ${existing.join(", ")}` : "";
     const next = window.prompt(
       `Move "${t3.project.name}" to a folder (leave blank for ${UNGROUPED_LABEL}).${hint}`,
-      current
+      current2
     );
     if (next === null) return;
     const updated = assignProjectToFolder(assignments, t3.id, next);
@@ -11493,6 +13499,7 @@ Existing folders: ${existing.join(", ")}` : "";
     close.textContent = "\xD7";
     close.onclick = (e3) => {
       e3.stopPropagation();
+      if (guardGoalLeave(t3.id, () => closeTab2(t3.id))) return;
       closeTab2(t3.id);
     };
     div.appendChild(close);
@@ -11569,12 +13576,12 @@ Existing folders: ${existing.join(", ")}` : "";
     setTimeout(() => document.addEventListener("click", dismiss), 0);
   }
   async function _setProjectIcon(t3) {
-    const current = t3.project.icon || "";
+    const current2 = t3.project.icon || "";
     const next = window.prompt(
       `Paste a single emoji to use as the project icon (or leave blank to clear).
 
-Current: ${current || "(none)"}`,
-      current
+Current: ${current2 || "(none)"}`,
+      current2
     );
     if (next === null) return;
     const icon = next.trim() ? next.trim().slice(0, 8) : null;
@@ -11633,6 +13640,7 @@ Current: ${current || "(none)"}`,
       };
       box.querySelector("#del-proj-confirm").onclick = async () => {
         overlay.remove();
+        (state.deletingProjects = state.deletingProjects || {})[t3.id] = true;
         try {
           await api(`/projects/${t3.id}`, { method: "DELETE" });
           closeTab2(t3.id);
@@ -11648,6 +13656,8 @@ Current: ${current || "(none)"}`,
           } else {
             toast(e3.message.includes("409") ? "Cannot delete \u2014 active tasks in progress." : "Delete failed: " + e3.message, true);
           }
+        } finally {
+          delete state.deletingProjects[t3.id];
         }
         resolve();
       };
@@ -11657,7 +13667,7 @@ Current: ${current || "(none)"}`,
     state.activeTab = id;
     renderTabs();
     syncSidebarActiveProject();
-    document.querySelectorAll(".tab-body").forEach((el2) => el2.classList.remove("active"));
+    document.querySelectorAll(".tab-body").forEach((el3) => el3.classList.remove("active"));
     const body = document.getElementById(`tab-body-${id}`);
     if (body) body.classList.add("active");
     const empty = document.querySelector(".tab-bodies > .empty");
@@ -11668,6 +13678,7 @@ Current: ${current || "(none)"}`,
     }
     const switcher = document.getElementById("project-switcher");
     if (switcher) switcher.value = id;
+    refreshWaffle();
     try {
       const _panel = getPanelState(id);
       let _activeVtab = _panel && _panel.activeVtab;
@@ -11825,10 +13836,6 @@ Current: ${current || "(none)"}`,
           <span style="display:flex;gap:6px;align-items:center">
 
             <button class="secondary" id="live-auto-btn-${project.id}" title="Toggle auto-refresh" style="padding:2px 8px;font-size:10px">\u21BB Auto</button>
-
-            <button class="secondary" id="live-pause-${project.id}" title="Pause queue (UI stub)" style="padding:2px 8px;font-size:10px">Pause</button>
-
-            <button class="secondary" id="live-run-${project.id}" title="Run all pending (UI stub)" style="padding:2px 8px;font-size:10px">Run All</button>
 
           </span>
 
@@ -12812,6 +14819,12 @@ Current: ${current || "(none)"}`,
         btn.onclick = () => {
           const vtab = btn.dataset.vtab;
           const p3 = state.panels[project.id];
+          if (btn._goalLeaveOk) btn._goalLeaveOk = false;
+          else if (p3.activeVtab === "goal" && vtab !== "goal" && guardGoalLeave(project.id, () => {
+            btn._goalLeaveOk = true;
+            btn.click();
+          })) return;
+          recordWaffleUse(vtab);
           revealGroupForTab(vtab);
           vtabStrip.querySelectorAll(".vtab-btn").forEach((b2) => {
             b2.classList.toggle("active", b2.dataset.vtab === vtab);
@@ -12825,6 +14838,7 @@ Current: ${current || "(none)"}`,
           } catch (_2) {
           }
           if (vtab === "files") loadFilesTab(project.id);
+          if (vtab === "goal") reloadGoalSprintBoard(project.id);
           if (vtab === "devlog") refreshTasks(project.id);
           if (vtab === "timeline") loadTimeline2(project.id);
           if (vtab === "rewind") initRewindTab(project.id);
@@ -12859,7 +14873,7 @@ Current: ${current || "(none)"}`,
         if (saved) {
           revealGroupForTab(saved);
           const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
-          if (savedBtn) savedBtn.click();
+          if (savedBtn) withoutWaffleUse(() => savedBtn.click());
         }
       } catch (_2) {
       }
@@ -12942,8 +14956,8 @@ Current: ${current || "(none)"}`,
         decFormBody.style.borderColor = over ? "var(--red, #f87171)" : near ? "var(--warning, #fb923c)" : "";
         if (decFormStatus) decFormStatus.textContent = over || near ? `Body: ${len.toLocaleString()}/${limit.toLocaleString()}` : "";
       };
-      [decFormTitle, decFormBody].forEach((el2) => {
-        if (el2) el2.addEventListener("keydown", (e3) => {
+      [decFormTitle, decFormBody].forEach((el3) => {
+        if (el3) el3.addEventListener("keydown", (e3) => {
           if ((e3.ctrlKey || e3.metaKey) && e3.key === "Enter") doAddDecision();
         });
       });
@@ -12956,10 +14970,11 @@ Current: ${current || "(none)"}`,
     if (saveNorthStarBtn) saveNorthStarBtn.onclick = () => saveNorthStar(project.id);
     const saveSprintBtn = document.getElementById(`save-sprint-${project.id}`);
     if (saveSprintBtn) saveSprintBtn.onclick = () => saveSprint(project.id);
-    async function loadSprintBoard2() {
+    async function loadSprintBoard() {
       const sprintItemsPath = `/projects/${project.id}/sprint-items`;
       try {
         const items = await projectApi(project.id, sprintItemsPath);
+        _setWaffleQueueCount(project.id, items);
         const board = document.getElementById(`sprint-board-goal-${project.id}`);
         if (!board) return;
         if (!items || !items.length) {
@@ -13001,8 +15016,8 @@ Current: ${current || "(none)"}`,
         wireProjectLoadRetry2(board, project.id);
       }
     }
-    _sprintBoardReloaders[project.id] = loadSprintBoard2;
-    loadSprintBoard2();
+    _sprintBoardReloaders[project.id] = loadSprintBoard;
+    loadSprintBoard();
     setTimeout(async () => {
       const sel = document.getElementById(`goal-sprint-select-${project.id}`);
       const inp = document.getElementById(`goal-sprint-${project.id}`);
@@ -13042,6 +15057,7 @@ Current: ${current || "(none)"}`,
           inp.style.display = "none";
           inp.value = sel.value;
         }
+        getGoalField(project.id, "sprint")?.onUserInput();
       };
     }, 200);
     const sprintAddBtn = document.getElementById(`sprint-add-btn-${project.id}`);
@@ -13053,7 +15069,7 @@ Current: ${current || "(none)"}`,
         try {
           await api(`/projects/${project.id}/sprint-items`, { method: "POST", body: JSON.stringify({ title, version: state.panels[project.id]?.sprint || "current" }) });
           sprintAddInput.value = "";
-          loadSprintBoard2();
+          loadSprintBoard();
         } catch (e3) {
           console.error("Add sprint item failed:", e3);
         }
@@ -13089,22 +15105,7 @@ Current: ${current || "(none)"}`,
       }
     }
     wireClaudeLaunchPanel(project.id);
-    document.getElementById(`goal-${project.id}`).addEventListener("blur", () => saveGoal(project.id));
-    document.getElementById(`goal-north-star-${project.id}`).addEventListener("blur", () => saveNorthStar(project.id));
-    document.getElementById(`goal-sprint-${project.id}`).addEventListener("blur", () => saveSprint(project.id));
-    document.getElementById(`goal-${project.id}`).addEventListener("input", function() {
-      const p3 = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p3._lastSaved || ""));
-    });
-    document.getElementById(`goal-north-star-${project.id}`).addEventListener("input", function() {
-      const p3 = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p3._serverNorthStar || ""));
-      autosizeGoalField(this);
-    });
-    document.getElementById(`goal-sprint-${project.id}`).addEventListener("input", function() {
-      const p3 = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p3._serverSprint || ""));
-    });
+    initGoalFields(project.id);
     autosizeGoalField(document.getElementById(`goal-north-star-${project.id}`));
     const fileBackBtn = document.getElementById(`file-back-${project.id}`);
     const fileSaveBtn = document.getElementById(`file-save-${project.id}`);
@@ -13217,10 +15218,6 @@ Current: ${current || "(none)"}`,
     if (!panel) return;
     panel.liveWired = panel.liveWired || false;
     if (!panel.liveWired) {
-      const pause = document.getElementById(`live-pause-${projectId}`);
-      const runAll = document.getElementById(`live-run-${projectId}`);
-      if (pause) pause.onclick = () => toast("Pause is a stub \u2014 coming soon");
-      if (runAll) runAll.onclick = () => toast("Run All is a stub \u2014 coming soon");
       const input = document.getElementById(`live-add-input-${projectId}`);
       if (input) input.addEventListener("keydown", (ev) => {
         if (ev.key !== "Enter") return;
@@ -13358,6 +15355,7 @@ Current: ${current || "(none)"}`,
       ]);
       if (sprintItemsResult.status === "fulfilled") {
         renderSprintProgress(projectId, sprintItemsResult.value || []);
+        _setWaffleQueueCount(projectId, sprintItemsResult.value);
         renderWaveProgress(projectId, sprintItemsResult.value || []);
       } else {
         const sprintRoot = document.getElementById(`live-sprint-progress-${projectId}`);
@@ -13400,6 +15398,51 @@ Current: ${current || "(none)"}`,
     } catch (e3) {
     }
   }
+  function reloadGoalSprintBoard(projectId) {
+    try {
+      const reload = _sprintBoardReloaders[projectId];
+      if (reload) Promise.resolve(reload()).catch(() => {
+      });
+    } catch (_2) {
+    }
+  }
+  var _repaintTimers = {};
+  function _debounceRepaint(key, fn, ms = 150) {
+    clearTimeout(_repaintTimers[key]);
+    _repaintTimers[key] = setTimeout(fn, ms);
+  }
+  function scheduleGoalBoardReload(projectId) {
+    const panel = state.panels[projectId];
+    if (panel && panel.activeVtab === "goal") {
+      _debounceRepaint(`goal:${projectId}`, () => reloadGoalSprintBoard(projectId));
+    }
+  }
+  function repaintVisibleSprintViews(projectId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    if (panel.activeVtab === "queue") {
+      _debounceRepaint(`queue:${projectId}`, () => loadQueue(projectId, { quiet: true }));
+    }
+    scheduleGoalBoardReload(projectId);
+  }
+  async function refreshSprintSurfaces(projectId) {
+    repaintVisibleSprintViews(projectId);
+    await refreshLiveTab(projectId);
+  }
+  function applySprintItemDeleted(projectId, itemId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    if (Array.isArray(panel.queueSprintItems)) {
+      const gone = panel.queueSprintItems.find((it) => it.id === itemId);
+      panel.queueSprintItems = panel.queueSprintItems.filter((it) => it.id !== itemId);
+      if (gone && gone.status === "done" && panel.queueTotalDoneCount > 0) panel.queueTotalDoneCount -= 1;
+    }
+    if (panel.activeVtab === "queue" && !queueSearchActive(projectId)) renderQueueBody(projectId);
+  }
+  function queueSearchActive(projectId) {
+    const box = document.getElementById(`task-search-${projectId}`);
+    return !!(box && box.value && box.value.trim());
+  }
   function wireSprintAddEnter2(projectId, root) {
     const inp = root.querySelector(`#sprint-add-input-${projectId}`);
     if (inp) inp.onkeydown = (e3) => {
@@ -13413,7 +15456,7 @@ Current: ${current || "(none)"}`,
         { method: "POST", body: JSON.stringify({}) }
       );
       toast(`Sprint item ${action}d`);
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast(`Failed: ${e3.message}`, true);
     }
@@ -13421,39 +15464,57 @@ Current: ${current || "(none)"}`,
   async function sprintArchive(projectId, itemId) {
     if (!confirm("Permanently delete this backburner item? This cannot be undone.")) return;
     try {
-      const r3 = await fetch(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
-      if (!r3.ok && r3.status !== 204) throw new Error(`${r3.status}`);
+      await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
       toast("Backburner item deleted");
-      await refreshLiveTab(projectId);
+      applySprintItemDeleted(projectId, itemId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast(`Delete failed: ${e3.message}`, true);
     }
   }
   function filterBackburner(projectId, value) {
-    const q2 = (value || "").trim().toLowerCase();
-    const sec = document.querySelector('.queue-section[data-section="backburner"]');
+    const panel = state.panels[projectId];
+    if (panel) panel.backburnerFilter = value || "";
+    applyBackburnerFilter(projectId);
+  }
+  function applyBackburnerFilter(projectId) {
+    const panel = state.panels[projectId];
+    const q2 = (panel && panel.backburnerFilter || "").trim().toLowerCase();
+    const scope = document.getElementById(`queue-body-${projectId}`) || document;
+    const sec = scope.querySelector('.queue-section[data-section="backburner"]');
     if (!sec) return;
-    sec.querySelectorAll(".queue-item").forEach((el2) => {
-      const hit = !q2 || (el2.dataset.bbTitle || "").includes(q2) || (el2.dataset.bbGroup || "").includes(q2);
-      el2.style.display = hit ? "" : "none";
+    sec.querySelectorAll(".queue-item").forEach((el3) => {
+      const hit = !q2 || (el3.dataset.bbTitle || "").includes(q2) || (el3.dataset.bbGroup || "").includes(q2);
+      el3.style.display = hit ? "" : "none";
     });
     sec.querySelectorAll(".bb-group").forEach((g2) => {
-      const anyVisible = Array.from(g2.querySelectorAll(".queue-item")).some((el2) => el2.style.display !== "none");
+      const anyVisible = Array.from(g2.querySelectorAll(".queue-item")).some((el3) => el3.style.display !== "none");
       g2.style.display = anyVisible ? "" : "none";
     });
   }
-  async function sprintPushPrompt(projectId, itemId) {
-    const toVersion = window.prompt("Push to version (e.g. v2.0):");
-    if (!toVersion) return;
+  var _sprintMoveActions = createSprintMoveActions({
+    api: (path, init2) => api(path, init2),
+    toast: (message, isError) => toast(message, isError),
+    refreshLiveTab: (projectId) => refreshLiveTab(projectId),
+    loadQueue: (projectId) => loadQueue(projectId),
+    reloadSprintBoard: (projectId) => {
+      const reload = _sprintBoardReloaders[projectId];
+      return reload ? reload() : void 0;
+    }
+  });
+  async function sprintPushPrompt(projectId, itemId, anchor) {
+    return _sprintMoveActions.sprintPushPrompt(projectId, itemId, anchor);
+  }
+  async function sprintResetPending(projectId, itemId) {
     try {
       await api(
-        `/projects/${projectId}/sprint-items/${itemId}/push`,
-        { method: "POST", body: JSON.stringify({ to_version: toVersion }) }
+        `/projects/${projectId}/sprint-items/${itemId}`,
+        { method: "PATCH", body: JSON.stringify({ status: "pending" }) }
       );
-      toast("Sprint item pushed to " + toVersion);
-      await refreshLiveTab(projectId);
+      toast("Sprint item back to pending");
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
-      toast(`Push failed: ${e3.message}`, true);
+      toast(`Failed: ${e3.message}`, true);
     }
   }
   async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
@@ -13464,7 +15525,7 @@ Current: ${current || "(none)"}`,
         `/projects/${projectId}/sprint-items/${itemId}`,
         { method: "PATCH", body: JSON.stringify({ feedback_thumb: newThumb }) }
       );
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Feedback failed: " + e3.message, true);
     }
@@ -13476,7 +15537,7 @@ Current: ${current || "(none)"}`,
         `/projects/${projectId}/sprint-items/${itemId}`,
         { method: "PATCH", body: JSON.stringify({ feedback_note: note.trim() }) }
       );
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Note save failed: " + e3.message, true);
     }
@@ -13514,7 +15575,8 @@ Current: ${current || "(none)"}`,
           method: "PATCH",
           body: JSON.stringify({ title: newTitle, version: newVersion || void 0 })
         });
-        await refreshLiveTab(projectId);
+        titleInput.dataset.saved = verInput.dataset.saved = "1";
+        await refreshSprintSurfaces(projectId);
       } catch (e3) {
         toast(`Save failed: ${e3.message}`, true);
         cancel();
@@ -13523,6 +15585,7 @@ Current: ${current || "(none)"}`,
     const cancel = () => {
       titleInput.replaceWith(titleSpan);
       verInput.replaceWith(verSpan);
+      refreshSprintSurfaces(projectId);
     };
     titleInput.onkeydown = verInput.onkeydown = (e3) => {
       if (e3.key === "Enter") {
@@ -13536,6 +15599,147 @@ Current: ${current || "(none)"}`,
         if (!row.contains(document.activeElement)) save();
       }, 150);
     };
+  }
+  async function sprintItemNotesEdit(projectId, itemId) {
+    const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+    if (!row) return;
+    const curNotes = row.dataset.notes || "";
+    if (row.querySelector(".sprint-notes-textarea")) return;
+    const existingNotesEl = row.querySelector(".sprint-item-notes");
+    const textarea = document.createElement("textarea");
+    textarea.className = "sprint-notes-textarea";
+    textarea.value = curNotes;
+    textarea.placeholder = "Add context, links, or notes\u2026";
+    textarea.style.cssText = "width:100%;min-height:56px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:3px 5px;color:var(--text);font-size:10px;font-family:var(--font-mono);line-height:1.4;resize:vertical;box-sizing:border-box;margin-top:3px";
+    if (existingNotesEl) {
+      existingNotesEl.replaceWith(textarea);
+    } else {
+      const titleSpan = row.querySelector(".sprint-item-title");
+      if (titleSpan) titleSpan.parentNode.insertBefore(textarea, titleSpan.nextSibling);
+      else row.appendChild(textarea);
+    }
+    textarea.focus();
+    const save = async () => {
+      const newNotes = textarea.value.trim() || null;
+      try {
+        await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ notes: newNotes })
+        });
+        row.dataset.notes = newNotes || "";
+        textarea.dataset.saved = "1";
+        await refreshSprintSurfaces(projectId);
+      } catch (e3) {
+        toast(`Save failed: ${e3.message}`, true);
+        cancel();
+      }
+    };
+    const cancel = () => {
+      if (existingNotesEl) textarea.replaceWith(existingNotesEl);
+      else textarea.remove();
+      refreshSprintSurfaces(projectId);
+    };
+    textarea.onkeydown = (e3) => {
+      if (e3.key === "Escape") {
+        e3.preventDefault();
+        cancel();
+      }
+      if (e3.key === "Enter" && (e3.ctrlKey || e3.metaKey)) {
+        e3.preventDefault();
+        save();
+      }
+    };
+    textarea.onblur = () => setTimeout(() => {
+      if (!row.contains(document.activeElement)) save();
+    }, 150);
+  }
+  async function sprintItemResourcesEdit(projectId, itemId, rawJson) {
+    const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+    if (!row) return;
+    if (row.querySelector(".sprint-resources-textarea")) return;
+    let current2 = [];
+    try {
+      current2 = JSON.parse(rawJson || "[]");
+    } catch {
+      current2 = [];
+    }
+    const existingEl = row.querySelector(".sprint-item-resources");
+    const textarea = document.createElement("textarea");
+    textarea.className = "sprint-resources-textarea";
+    textarea.value = current2.join("\n");
+    textarea.placeholder = "One resource per line, e.g.\nfile:meridian/db/__init__.py\nnote:my-note\ndecision:abc123";
+    textarea.style.cssText = "width:100%;min-height:56px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:3px 5px;color:var(--text);font-size:10px;font-family:var(--font-mono);line-height:1.4;resize:vertical;box-sizing:border-box;margin-top:3px";
+    if (existingEl) {
+      existingEl.replaceWith(textarea);
+    } else {
+      const notesEl = row.querySelector(".sprint-item-notes");
+      const anchor = notesEl || row.querySelector(".sprint-item-title");
+      if (anchor) anchor.parentNode.insertBefore(textarea, anchor.nextSibling);
+      else row.appendChild(textarea);
+    }
+    textarea.focus();
+    const save = async () => {
+      const lines = textarea.value.split("\n").map((s3) => s3.trim()).filter(Boolean);
+      try {
+        await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ touches_resources: lines.length ? lines : null })
+        });
+        textarea.dataset.saved = "1";
+        await refreshSprintSurfaces(projectId);
+      } catch (e3) {
+        toast(`Save failed: ${e3.message}`, true);
+        cancel();
+      }
+    };
+    const cancel = () => {
+      if (existingEl) textarea.replaceWith(existingEl);
+      else textarea.remove();
+      refreshSprintSurfaces(projectId);
+    };
+    textarea.onkeydown = (e3) => {
+      if (e3.key === "Escape") {
+        e3.preventDefault();
+        cancel();
+      }
+      if (e3.key === "Enter" && (e3.ctrlKey || e3.metaKey)) {
+        e3.preventDefault();
+        save();
+      }
+    };
+    textarea.onblur = () => setTimeout(() => {
+      if (!row.contains(document.activeElement)) save();
+    }, 150);
+  }
+  async function resourceChipClick(projectId, resourceId) {
+    const existing = document.getElementById("resource-chip-popover");
+    if (existing) existing.remove();
+    let items = [];
+    try {
+      items = await api(`/projects/${projectId}/resources/sprint-items?resource=${encodeURIComponent(resourceId)}`);
+    } catch (e3) {
+      toast(`Lookup failed: ${e3.message}`, true);
+      return;
+    }
+    const pop = document.createElement("div");
+    pop.id = "resource-chip-popover";
+    pop.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--surface-0,#1a1a1a);border:1px solid var(--border);border-radius:6px;padding:12px 14px;z-index:9999;min-width:280px;max-width:480px;max-height:320px;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.6)";
+    const esc2 = (s3) => (s3 || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    pop.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-size:11px;font-weight:600;color:var(--text)">Sprint items touching <code style="font-size:10px">${esc2(resourceId)}</code></span>
+      <button onclick="document.getElementById('resource-chip-popover')!.remove()" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px;line-height:1;padding:0 2px">\u2715</button>
+    </div>
+    ${items.length === 0 ? `<div style="font-size:10px;color:var(--muted)">No sprint items reference this resource.</div>` : items.map((it) => `<div style="font-size:10px;padding:4px 0;border-top:1px solid var(--border);color:var(--text)"><span style="color:var(--muted);margin-right:4px">${esc2(it.status)}</span>${esc2(it.title)}</div>`).join("")}
+  `;
+    document.body.appendChild(pop);
+    const close = (e3) => {
+      if (!pop.contains(e3.target)) {
+        pop.remove();
+        document.removeEventListener("click", close);
+      }
+    };
+    setTimeout(() => document.addEventListener("click", close), 50);
   }
   async function loadSprintNotesPanel(projectId, sessionId) {
     const section = document.getElementById(`sprint-notes-section-${projectId}`);
@@ -13607,7 +15811,7 @@ Current: ${current || "(none)"}`,
       inp.value = "";
       inp.style.borderColor = "";
       toast("Sprint item added");
-      await refreshLiveTab(projectId);
+      await refreshSprintSurfaces(projectId);
     } catch (e3) {
       toast("Add failed: " + e3.message, true);
     }
@@ -14477,13 +16681,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   if (typeof window !== "undefined") window._buildCodebaseForceGraph = _buildCodebaseForceGraph;
   function _renderCodebaseGraph(containerId, packages, edges) {
     if (typeof window === "undefined" || !window.echarts) return;
-    const el2 = document.getElementById(containerId);
-    if (!el2) return;
+    const el3 = document.getElementById(containerId);
+    if (!el3) return;
     const opt = _buildCodebaseForceGraph(packages, edges, "packages");
     if (!opt) return;
     let chart;
     try {
-      chart = window.echarts.init(el2);
+      chart = window.echarts.init(el3);
     } catch (_2) {
       return;
     }
@@ -14797,18 +17001,18 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       html += `</div>`;
     }
     body.innerHTML = html;
-    body.querySelectorAll(".doc-peek-ingest-btn").forEach((el2) => {
-      el2.addEventListener("click", () => {
-        const fp = el2.getAttribute("data-fp") || "";
+    body.querySelectorAll(".doc-peek-ingest-btn").forEach((el3) => {
+      el3.addEventListener("click", () => {
+        const fp = el3.getAttribute("data-fp") || "";
         const cmd = `ingest_document(file_path="${fp}")`;
         try {
           navigator.clipboard.writeText(cmd);
         } catch (_2) {
         }
-        const prev = el2.textContent;
-        el2.textContent = "Copied \u2713";
+        const prev = el3.textContent;
+        el3.textContent = "Copied \u2713";
         setTimeout(() => {
-          el2.textContent = prev || "Ingest this";
+          el3.textContent = prev || "Ingest this";
         }, 1500);
       });
     });
@@ -15120,10 +17324,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = html;
       if (window.Chart && archCharts.length) {
         for (const c3 of archCharts) {
-          const el2 = document.getElementById(c3.id);
-          if (el2) {
+          const el3 = document.getElementById(c3.id);
+          if (el3) {
             try {
-              new Chart(el2, c3.config);
+              new Chart(el3, c3.config);
             } catch (_2) {
             }
           }
@@ -15274,8 +17478,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     });
   }
   function _removeHitlCard(id) {
-    document.querySelectorAll(`[data-hitl-id="${id}"]`).forEach((el2) => {
-      (el2.closest(".hitl-row") || el2).remove();
+    document.querySelectorAll(`[data-hitl-id="${id}"]`).forEach((el3) => {
+      (el3.closest(".hitl-row") || el3).remove();
     });
   }
   window._removeHitlCard = _removeHitlCard;
@@ -15286,8 +17490,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!body) return;
     const urgencyColor = { blocking: "var(--red,#e05252)", high: "var(--yellow,#d4a017)", normal: "var(--muted)" };
     const statusBadge = { pending: "#f59e0b", answered: "#22c55e", dismissed: "var(--muted)" };
+    const draftUnits = [{ selector: 'input[id^="hitl-ans-"]', key: (el3) => el3.id }];
     const render = async () => {
-      body.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
+      if (!hasUnsentDrafts(body, draftUnits)) body.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
       const status = statusFilter && statusFilter.value || "pending";
       const qs = status === "all" ? "?status=all" : `?status=${status}`;
       try {
@@ -15417,7 +17622,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           html += `<div style="color:var(--muted);font-size:10px;margin:12px 0 6px;border-top:1px solid var(--border);padding-top:8px">RESOLVED (${resolved.length})</div>`;
           html += resolved.map(renderCard).join("");
         }
-        body.innerHTML = html;
+        paintKeepingDrafts(body, html, draftUnits);
         _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, ".hitl-row");
         body.querySelectorAll(".hitl-answer-btn").forEach((btn) => {
           btn.onclick = async () => {
@@ -15527,7 +17732,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           };
         });
       } catch (e3) {
-        body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e3))}</div>`;
+        if (hasUnsentDrafts(body, draftUnits)) console.warn("[meridian] HITL queue refresh failed:", e3);
+        else body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e3))}</div>`;
       }
     };
     if (statusFilter) statusFilter.onchange = render;
@@ -15841,15 +18047,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     render();
   }
   async function updateLiveFeed(projectId) {
-    const el2 = document.getElementById(`live-session-${projectId}`);
-    if (!el2) return;
+    const el3 = document.getElementById(`live-session-${projectId}`);
+    if (!el3) return;
     const panel = getPanelState(projectId);
     try {
       const sessions = await api(`/projects/${projectId}/sessions?active_only=true`);
       const active = sessions && sessions.filter((s3) => s3.status === "active");
       if (!active || active.length === 0) {
         panel.liveSessionId = null;
-        el2.style.display = "none";
+        el3.style.display = "none";
         return;
       }
       const sess = active[0];
@@ -15880,7 +18086,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${ageStr ? `<span style="font-size:9px;color:var(--muted);margin-left:auto">${ageStr}</span>` : ""}
       </div>`;
       }).join("");
-      el2.innerHTML = `
+      el3.innerHTML = `
 
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
 
@@ -15904,8 +18110,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
       </div>`;
       if (extraCount > 0) {
-        const toggleBtn = el2.querySelector(`#live-feed-extra-toggle-${projectId}`);
-        const extraEl = el2.querySelector(`#live-feed-extra-${projectId}`);
+        const toggleBtn = el3.querySelector(`#live-feed-extra-toggle-${projectId}`);
+        const extraEl = el3.querySelector(`#live-feed-extra-${projectId}`);
         if (toggleBtn && extraEl) {
           toggleBtn.onclick = () => {
             const open = extraEl.style.display !== "none";
@@ -15914,15 +18120,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           };
         }
       }
-      el2.style.display = "block";
+      el3.style.display = "block";
     } catch (e3) {
       panel.liveSessionId = null;
-      el2.style.display = "none";
+      el3.style.display = "none";
     }
   }
   async function loadRecentSessions(projectId, sessions = null) {
-    const el2 = document.getElementById(`recent-sessions-${projectId}`);
-    if (!el2) return;
+    const el3 = document.getElementById(`recent-sessions-${projectId}`);
+    if (!el3) return;
     try {
       const panel = getPanelState(projectId);
       const allSessions = Array.isArray(sessions) ? sessions : await api(`/projects/${projectId}/sessions?active_only=false`);
@@ -15930,10 +18136,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         (allSessions || []).filter((s3) => s3.id !== panel.liveSessionId && !isLiveSession(s3))
       ).slice(0, 5);
       if (!recent.length) {
-        el2.style.display = "none";
+        el3.style.display = "none";
         return;
       }
-      el2.innerHTML = `
+      el3.innerHTML = `
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Recent Sessions</div>
 
@@ -15975,20 +18181,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
         </div>`;
       }).join("")}`;
-      el2.querySelectorAll(".resume-session-btn").forEach((btn) => {
+      el3.querySelectorAll(".resume-session-btn").forEach((btn) => {
         btn.onclick = (event) => {
           event.stopPropagation();
           const cmd = btn.dataset.cmd || "";
           navigator.clipboard.writeText(cmd).then(() => toast("Copied start_session() to clipboard")).catch(() => toast("copy failed", true));
         };
       });
-      el2.querySelectorAll(".recent-session-timeline-btn").forEach((btn) => {
+      el3.querySelectorAll(".recent-session-timeline-btn").forEach((btn) => {
         btn.onclick = (event) => {
           event.stopPropagation();
           openTimelineForSession(projectId, btn.dataset.sessionId);
         };
       });
-      el2.querySelectorAll(".recent-session-row").forEach((row) => {
+      el3.querySelectorAll(".recent-session-row").forEach((row) => {
         row.onclick = async (evt) => {
           if (evt.target.closest(".resume-session-btn, .recent-session-timeline-btn")) return;
           const target = row.querySelector(".recent-session-tasks");
@@ -16017,14 +18223,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           if (chevron) chevron.textContent = "\u25B2";
         };
       });
-      el2.style.display = "block";
+      el3.style.display = "block";
     } catch (_2) {
-      el2.style.display = "none";
+      el3.style.display = "none";
     }
   }
   async function loadMilestones(projectId) {
-    const el2 = document.getElementById(`milestones-strip-${projectId}`);
-    if (!el2) return;
+    const el3 = document.getElementById(`milestones-strip-${projectId}`);
+    if (!el3) return;
     try {
       const all = await api(`/projects/${projectId}/sprint-items`);
       const doneStatuses = /* @__PURE__ */ new Set(["done", "skipped", "failed", "pushed"]);
@@ -16036,12 +18242,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         return bTs.localeCompare(aTs);
       });
       if (!milestones.length) {
-        el2.style.display = "none";
+        el3.style.display = "none";
         return;
       }
       const statusIcon = (s3) => s3 === "done" ? "\u2713" : s3 === "failed" ? "\u2717" : s3 === "pushed" ? "\u2192" : s3 === "skipped" ? "\u2014" : s3 === "in_progress" ? "\u25B6" : "\u25E6";
       const statusColor = (s3) => s3 === "done" ? "var(--accent-green,#34d399)" : s3 === "failed" ? "#e05" : s3 === "pushed" ? "var(--accent)" : s3 === "in_progress" ? "var(--accent)" : "var(--muted)";
-      el2.innerHTML = `
+      el3.innerHTML = `
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Completed (${milestones.length})</div>
 
@@ -16065,9 +18271,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         ${milestones.length > 20 ? `<span style="font-size:10px;color:var(--muted);padding:3px 4px">+${milestones.length - 20} more</span>` : ""}
 
       </div>`;
-      el2.style.display = "block";
+      el3.style.display = "block";
     } catch (_2) {
-      el2.style.display = "none";
+      el3.style.display = "none";
     }
   }
   async function loadRecentRuns(projectId) {
@@ -16141,12 +18347,46 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = '<div style="color:var(--muted);font-size:10px">Could not load runs.</div>';
     }
   }
-  async function loadQueue(projectId) {
+  function renderQueueBody(projectId) {
+    const body = document.getElementById(`queue-body-${projectId}`);
+    const panel = state.panels[projectId];
+    if (!body || !panel) return;
+    const filterId = `backburner-search-${projectId}`;
+    const active = document.activeElement;
+    const hadFilterFocus = !!(active && active.id === filterId);
+    const caret = hadFilterFocus ? { start: active.selectionStart, end: active.selectionEnd } : null;
+    const scrollTop = body.scrollTop;
+    body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
+    applyBackburnerFilter(projectId);
+    if (scrollTop) body.scrollTop = scrollTop;
+    if (hadFilterFocus) {
+      const next = document.getElementById(filterId);
+      if (next) {
+        next.focus();
+        try {
+          if (caret && caret.start != null) next.setSelectionRange(caret.start, caret.end ?? caret.start);
+        } catch (_2) {
+        }
+      }
+    }
+    wireQueueSectionToggles(projectId);
+    const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
+    if (moreBtn) {
+      moreBtn.onclick = () => {
+        panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
+        renderQueueBody(projectId);
+      };
+    }
+  }
+  async function loadQueue(projectId, opts = {}) {
     const body = document.getElementById(`queue-body-${projectId}`);
     if (!body) return;
     const panel = getPanelState(projectId);
     if (!panel.queueDoneLimit) panel.queueDoneLimit = QUEUE_DONE_PAGE_SIZE;
-    body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    const quietKeep = !!(opts && opts.quiet && (body.querySelector(".queue-section") || queueSearchActive(projectId)));
+    if (!quietKeep) {
+      body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    }
     try {
       const [sessions, sprintItems] = await Promise.all([
         projectApi(projectId, `/projects/${projectId}/sessions?active_only=false`).catch(() => []),
@@ -16156,19 +18396,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       panel.liveSessionId = liveSession ? liveSession.id : null;
       const sprintPayload = sprintItems || [];
       panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : sprintPayload.items || [];
+      _setWaffleQueueCount(projectId, panel.queueSprintItems);
       panel.queueTotalDoneCount = Array.isArray(sprintPayload) ? panel.queueSprintItems.filter((it) => it.status === "done").length : sprintPayload.total_done_count || 0;
-      const renderCurrentQueue = () => {
-        body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
-        wireQueueSectionToggles(projectId);
-        const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
-        if (moreBtn) {
-          moreBtn.onclick = () => {
-            panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
-            renderCurrentQueue();
-          };
-        }
-      };
-      renderCurrentQueue();
+      const renderCurrentQueue = () => renderQueueBody(projectId);
+      if (!(opts && opts.quiet && queueSearchActive(projectId))) renderCurrentQueue();
       loadRecentSessions(projectId, sessions || []);
       const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
       if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
@@ -16390,8 +18621,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       } else if (action === "backlog") {
         await api(`/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ status: "backlog" }) });
       }
-      document.querySelectorAll('[id^="queue-body-"]').forEach((el2) => {
-        const pid = el2.id.replace("queue-body-", "");
+      document.querySelectorAll('[id^="queue-body-"]').forEach((el3) => {
+        const pid = el3.id.replace("queue-body-", "");
         loadQueue(pid);
       });
     } catch (e3) {
@@ -16421,63 +18652,31 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         state.panels[projectId].goalIsJson = true;
         text = JSON.stringify(goal.content, null, 2);
       }
-      const AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---";
-      const splitIdx = text.indexOf(AUTO_SPLIT);
-      const mainText = splitIdx !== -1 ? text.slice(0, splitIdx).trimEnd() : text;
-      const allLines = mainText.split("\n");
-      const _firstLine = allLines[0] || "";
-      const _isVersionLabel = /^v\d+\.\d+/.test(_firstLine.trim()) || _firstLine.trim().length === 0;
-      const titleLine = _isVersionLabel ? _firstLine : "";
-      const titleEl = document.getElementById(`goal-title-${projectId}`);
-      if (titleEl) {
-        titleEl.textContent = titleLine;
-        const hasTitle = !!titleLine.trim();
-        titleEl.style.display = hasTitle ? "block" : "none";
-        const taEl = document.getElementById(`goal-${projectId}`);
-        if (taEl) taEl.style.borderRadius = hasTitle ? "0 0 4px 4px" : "4px";
-      }
-      const body = (_isVersionLabel ? allLines.slice(1) : allLines).join("\n").replace(/^\n/, "");
-      const editStart = body.search(/^(CURRENT FOCUS|KEY FILES)/m);
-      if (editStart > 0) {
-        const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
-        if (shippedEl2) {
-          shippedEl2.textContent = body.slice(0, editStart).trimEnd();
-          shippedEl2.style.display = shippedEl2.textContent.trim() ? "block" : "none";
-        }
-        ta.value = body.slice(editStart);
-      } else {
-        const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
-        if (shippedEl2) shippedEl2.style.display = "none";
-        ta.value = body;
-      }
-      const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
-      if (shippedEl && !shippedEl.textContent.trim()) shippedEl.style.display = "none";
+      const parts = splitGoalText(text);
+      applyGoalZones(projectId, parts);
+      const stamps = goal.field_updated_at || {};
+      const vgField = getGoalField(projectId, "version_goal");
+      if (vgField) vgField.applyServer(parts.editable, stamps.version_goal ?? null);
+      else ta.value = parts.editable;
       autosizeGoalField(ta);
-      const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
-      if (autoBlocksEl) {
-        if (splitIdx !== -1) {
-          const abWrapper = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
-          if (abWrapper) abWrapper.style.display = "block";
-          autoBlocksEl.style.display = "block";
-          autoBlocksEl.textContent = text.slice(splitIdx + "--- AUTO BLOCKS BELOW ---".length).trimStart();
-        } else {
-          const abWrapper2 = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
-          if (abWrapper2) abWrapper2.style.display = "none";
-          autoBlocksEl.style.display = "none";
-        }
-      }
       v3.textContent = `v${goal.version}`;
       const vState = document.getElementById(`goal-state-${projectId}`);
       if (vState) vState.textContent = `v${goal.version}`;
       const nsTA = document.getElementById(`goal-north-star-${projectId}`);
       const spTA = document.getElementById(`goal-sprint-${projectId}`);
       if (nsTA && "north_star" in goal) {
-        nsTA.value = goal.north_star || "";
+        const nsField = getGoalField(projectId, "north_star");
+        if (nsField) nsField.applyServer(goal.north_star || "", stamps.north_star ?? null);
+        else nsTA.value = goal.north_star || "";
         autosizeGoalField(nsTA);
       }
       if (spTA && "sprint" in goal) {
-        spTA.value = goal.sprint || "";
-        if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || "");
+        const spField = getGoalField(projectId, "sprint");
+        if (spField) spField.applyServer(goal.sprint || "", stamps.sprint ?? null);
+        else {
+          spTA.value = goal.sprint || "";
+          if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || "");
+        }
       }
       const p3 = state.panels[projectId];
       p3._serverNorthStar = goal.north_star || "";
@@ -16499,14 +18698,6 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           nsInherited.style.display = "none";
         }
       }
-      p3._lastSaved = text;
-      if (nsTA) {
-        nsTA.classList.remove("dirty");
-      }
-      if (spTA) {
-        spTA.classList.remove("dirty");
-      }
-      ta.classList.remove("dirty");
       const tsNs = document.getElementById(`goal-ns-ts-${projectId}`);
       const tsVg = document.getElementById(`goal-vg-ts-${projectId}`);
       const tsSp = document.getElementById(`goal-sp-ts-${projectId}`);
@@ -16517,11 +18708,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       renderDecisionsTable(projectId, goal.decisions || "");
       loadPinnedDecisions(projectId);
     } catch (e3) {
-      ta.value = "";
+      const vgField = getGoalField(projectId, "version_goal");
+      if (!vgField || !vgField.isEditing()) ta.value = "";
       ta.placeholder = "Goal state failed to load.";
       v3.textContent = "(load failed)";
       const titleEl = document.getElementById(`goal-title-${projectId}`);
       if (titleEl) titleEl.textContent = "Goal state unavailable";
+    }
+  }
+  async function refreshDecisionsLog(projectId) {
+    if (!document.getElementById(`decisions-table-${projectId}`)) return;
+    try {
+      const goal = await projectApi(projectId, `/projects/${projectId}/goal`);
+      renderDecisionsTable(projectId, goal.decisions || "");
+    } catch (_2) {
     }
   }
   function parseDecisionsBlob(blob) {
@@ -16639,6 +18839,29 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       badge.textContent = String(count);
       badge.style.display = count > 0 ? "inline-block" : "none";
     });
+    refreshWaffle();
+  }
+  function _setWaffleQueueCount(projectId, items) {
+    try {
+      getPanelState(projectId).sprintActiveCount = countActiveSprintItems(items);
+      refreshWaffle();
+    } catch (_2) {
+    }
+  }
+  function _mountDashboardWaffle() {
+    try {
+      mountWaffle({
+        host: document.getElementById("topbar"),
+        getStrip: () => state.activeTab ? document.getElementById(`vtab-strip-${state.activeTab}`) : null,
+        getBadges: () => {
+          const pid = state.activeTab;
+          return pid ? readWaffleBadges(document.getElementById(`vtab-strip-${pid}`), state.panels[pid]) : {};
+        },
+        storageKey: STORAGE_KEY2("waffle.v1")
+      });
+    } catch (e3) {
+      console.warn("waffle launcher unavailable", e3);
+    }
   }
   async function refreshProjectCountBadges(projectId) {
     if (!projectId) return;
@@ -16700,7 +18923,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         return;
       }
       bar.style.display = "flex";
-      list.innerHTML = items.map((r3) => {
+      const draftUnits = [{ selector: "input.hitl-answer-input", key: (el3) => el3.dataset.hitlId }];
+      paintKeepingDrafts(list, items.map((r3) => {
         const color = _HITL_URGENCY_COLOR[r3.urgency] || _HITL_URGENCY_COLOR.normal;
         const ts = formatRelativeTime(r3.created_at);
         const ctx = r3.context ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--muted);font-size:10px">context</summary><pre style="margin:6px 0 0;padding:6px 8px;background:var(--surface-1);border-radius:3px;font-size:11px;white-space:pre-wrap;word-break:break-word">${escapeHtml(r3.context)}</pre></details>` : "";
@@ -16742,7 +18966,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         </div>
 
       </div>`;
-      }).join("");
+      }).join(""), draftUnits);
       list.querySelectorAll(".hitl-answer-btn").forEach((btn) => {
         btn.onclick = () => _hitlAnswer(btn.dataset.hitlId);
       });
@@ -16808,6 +19032,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       getPanelState(projectId)._pinnedDecisions = items || [];
       setVtabCountBadge2(`.decisions-gtab-badge[data-pid="${projectId}"]`, (items || []).length);
       renderConstitutionWarning2(projectId);
+      if (Array.from(host.querySelectorAll(".decision-edit-area")).some((el3) => el3.style.display === "block")) return;
       if (!items || items.length === 0) {
         host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet \u2014 call <code>pin_decision</code> from MCP)</div>`;
         return;
@@ -16887,8 +19112,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         card.querySelector(".decision-title-view").style.display = "";
         card.querySelector(".decision-edit-area").style.display = "none";
       };
-      host.querySelectorAll(".decision-body-view, .decision-title-view").forEach((el2) => {
-        el2.onclick = () => showEdit(el2.dataset.id);
+      host.querySelectorAll(".decision-body-view, .decision-title-view").forEach((el3) => {
+        el3.onclick = () => showEdit(el3.dataset.id);
       });
       const _CATS = ["TECHNICAL", "STRATEGIC", "ARCHITECTURAL", "PRODUCT", "TACTICAL", "BUSINESS", "COMPETITIVE"];
       host.querySelectorAll(".decision-cat-tag").forEach((tag) => {
@@ -16937,7 +19162,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         };
       });
       host.querySelectorAll(".decision-edit-cancel").forEach((btn) => {
-        btn.onclick = () => hideEdit(btn.dataset.id);
+        btn.onclick = () => {
+          hideEdit(btn.dataset.id);
+          loadPinnedDecisions(projectId, { showArchived });
+        };
       });
       host.querySelectorAll(".decision-edit-save").forEach((btn) => {
         btn.onclick = async () => {
@@ -17003,8 +19231,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         } else {
           api(`/projects/${projectId}/decisions-pinned?include_superseded=true`).then((all) => {
             const n2 = (all || []).filter((d3) => d3.status === "superseded").length;
-            const el2 = document.getElementById(`decisions-view-archived-${projectId}`);
-            if (el2) el2.innerHTML = n2 > 0 ? `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:true})">View archived (${n2}) \u25B8</button>` : "";
+            const el22 = document.getElementById(`decisions-view-archived-${projectId}`);
+            if (el22) el22.innerHTML = n2 > 0 ? `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:true})">View archived (${n2}) \u25B8</button>` : "";
           }).catch(() => {
           });
         }
@@ -17284,74 +19512,156 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     });
   }
   async function saveGoal(projectId) {
-    const ta = document.getElementById(`goal-${projectId}`);
-    if (!ta) return;
+    await getGoalField(projectId, "version_goal")?.saveNow({ explicit: true });
+  }
+  async function saveNorthStar(projectId) {
+    await getGoalField(projectId, "north_star")?.saveNow({ explicit: true });
+  }
+  async function saveSprint(projectId) {
+    await getGoalField(projectId, "sprint")?.saveNow({ explicit: true });
+  }
+  function composeGoalRaw(projectId, editable) {
     const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
     const autoBlocksText = autoBlocksEl && autoBlocksEl.style.display !== "none" ? "\n--- AUTO BLOCKS BELOW ---\n" + autoBlocksEl.textContent : "";
     const titleEl = document.getElementById(`goal-title-${projectId}`);
     const titleLine = titleEl && titleEl.textContent ? titleEl.textContent + "\n" : "";
-    const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
-    const shippedText = shippedEl2 && shippedEl2.style.display !== "none" && shippedEl2.textContent ? "\n" + shippedEl2.textContent + "\n" : "";
-    const raw = titleLine + shippedText + ta.value + autoBlocksText;
-    if (raw === state.panels[projectId]._lastSaved) return;
-    let content = raw;
-    if (state.panels[projectId].goalIsJson) {
-      try {
-        content = JSON.parse(raw);
-      } catch (e3) {
+    const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+    const shippedText = shippedEl && shippedEl.style.display !== "none" && shippedEl.textContent ? "\n" + shippedEl.textContent + "\n" : "";
+    return titleLine + shippedText + editable + autoBlocksText;
+  }
+  function applyGoalZones(projectId, parts) {
+    const titleEl = document.getElementById(`goal-title-${projectId}`);
+    if (titleEl) {
+      titleEl.textContent = parts.titleLine;
+      const hasTitle = !!parts.titleLine.trim();
+      titleEl.style.display = hasTitle ? "block" : "none";
+      const taEl = document.getElementById(`goal-${projectId}`);
+      if (taEl) taEl.style.borderRadius = hasTitle ? "0 0 4px 4px" : "4px";
+    }
+    const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+    if (shippedEl) {
+      shippedEl.textContent = parts.shipped;
+      shippedEl.style.display = shippedEl.textContent.trim() ? "block" : "none";
+    }
+    const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
+    if (autoBlocksEl) {
+      const abWrapper = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
+      if (parts.autoBlocks !== null) {
+        if (abWrapper) abWrapper.style.display = "block";
+        autoBlocksEl.style.display = "block";
+        autoBlocksEl.textContent = parts.autoBlocks;
+      } else {
+        if (abWrapper) abWrapper.style.display = "none";
+        autoBlocksEl.style.display = "none";
       }
     }
-    try {
-      await api(`/projects/${projectId}/goal`, { method: "POST", body: JSON.stringify({ content }) });
-      state.panels[projectId]._lastSaved = raw;
-      toast("version goal saved");
-      refreshGoal(projectId);
-    } catch (e3) {
-      toast("save failed: " + e3.message, true);
-    }
   }
-  async function saveNorthStar(projectId) {
-    const ta = document.getElementById(`goal-north-star-${projectId}`);
-    if (!ta) return;
-    const val = ta.value.trim();
-    if (!val) return;
-    const saved = state.panels[projectId]?._serverNorthStar || "";
-    if (saved && val !== saved && !confirm("North star is intended to be stable. Save changes?")) {
-      ta.value = saved;
-      autosizeGoalField(ta);
-      ta.classList.remove("dirty");
-      return;
-    }
-    try {
-      const humanInput = document.getElementById("new-project-human");
-      const humanId = humanInput ? humanInput.value.trim() : "";
-      await api(`/projects/${projectId}/goal/north-star`, {
-        method: "POST",
-        body: JSON.stringify({ north_star: val, human_id: humanId || "owner" })
-      });
-      toast("north star saved");
-      refreshGoal(projectId);
-    } catch (e3) {
-      toast("save failed: " + e3.message, true);
-    }
-  }
-  async function saveSprint(projectId) {
-    const ta = document.getElementById(`goal-sprint-${projectId}`);
-    const sel = document.getElementById(`goal-sprint-select-${projectId}`);
-    if (!ta) return;
-    const rawVal = ta.style.display === "none" && sel && sel.value && sel.value !== "__custom__" ? sel.value : ta.value;
-    const val = rawVal.trim();
-    if (!val) return;
-    try {
-      await api(`/projects/${projectId}/goal/sprint`, {
-        method: "POST",
-        body: JSON.stringify({ sprint: val })
-      });
-      toast("sprint saved");
-      refreshGoal(projectId);
-    } catch (e3) {
-      toast("save failed: " + e3.message, true);
-    }
+  function initGoalFields(projectId) {
+    const ta = document.getElementById(`goal-${projectId}`);
+    const nsTA = document.getElementById(`goal-north-star-${projectId}`);
+    const spTA = document.getElementById(`goal-sprint-${projectId}`);
+    const spSel = document.getElementById(`goal-sprint-select-${projectId}`);
+    if (!ta || !nsTA || !spTA) return;
+    const stampOf = (res, key) => res && res.field_updated_at && res.field_updated_at[key] || void 0;
+    const send = (path, body) => api(`/projects/${projectId}${path}`, {
+      method: "POST",
+      body: JSON.stringify({ ...body, source: "dashboard" })
+    });
+    const notify = (msg, isError) => toast(msg, isError);
+    const fields = {
+      version_goal: new GoalField({
+        key: "version_goal",
+        label: "version goal",
+        el: ta,
+        anchor: () => document.getElementById(`goal-title-${projectId}`),
+        getValue: () => ta.value,
+        setValue: (t3) => {
+          ta.value = t3;
+          autosizeGoalField(ta);
+        },
+        // A 409 carries the whole stored content; resolve it to the editable zone the same way
+        // refreshGoal does, and let the read-only zones follow it.
+        fromServer: (v3) => {
+          const parts = splitGoalText(typeof v3 === "string" ? v3 : JSON.stringify(v3, null, 2));
+          applyGoalZones(projectId, parts);
+          return parts.editable;
+        },
+        allowEmpty: true,
+        persist: async (_text, stamp) => {
+          const raw = composeGoalRaw(projectId, ta.value);
+          let content = raw;
+          if (state.panels[projectId].goalIsJson) {
+            try {
+              content = JSON.parse(raw);
+            } catch (e3) {
+            }
+          }
+          const res = await send("/goal", { content, expected_updated_at: stamp ?? void 0 });
+          return { stamp: stampOf(res, "version_goal") };
+        },
+        notify,
+        onSaved: () => {
+          toast("version goal saved");
+          refreshGoal(projectId);
+        }
+      }),
+      north_star: new GoalField({
+        key: "north_star",
+        label: "north star",
+        el: nsTA,
+        anchor: () => nsTA,
+        getValue: () => nsTA.value,
+        setValue: (t3) => {
+          nsTA.value = t3;
+          autosizeGoalField(nsTA);
+        },
+        // Changing an existing north star asks first; declining reverts to the saved text.
+        confirmSave: (text, base) => !base || text === base || confirm("North star is intended to be stable. Save changes?"),
+        persist: async (text, stamp) => {
+          const humanInput = document.getElementById("new-project-human");
+          const humanId = humanInput ? humanInput.value.trim() : "";
+          const res = await send("/goal/north-star", {
+            north_star: text,
+            human_id: humanId || "owner",
+            expected_updated_at: stamp ?? void 0
+          });
+          return { stamp: stampOf(res, "north_star") };
+        },
+        notify,
+        onSaved: () => {
+          toast("north star saved");
+          refreshGoal(projectId);
+        }
+      }),
+      sprint: new GoalField({
+        key: "sprint",
+        label: "current focus",
+        el: spTA,
+        anchor: () => spTA.parentElement,
+        // The session select owns the value while the free-text input is hidden.
+        getValue: () => spTA.style.display === "none" && spSel && spSel.value && spSel.value !== "__custom__" ? spSel.value : spTA.value,
+        setValue: (t3) => {
+          spTA.value = t3;
+          if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](t3);
+        },
+        persist: async (text, stamp) => {
+          const res = await send("/goal/sprint", { sprint: text, expected_updated_at: stamp ?? void 0 });
+          return { stamp: stampOf(res, "sprint") };
+        },
+        notify,
+        onSaved: () => {
+          toast("sprint saved");
+          refreshGoal(projectId);
+        }
+      })
+    };
+    fields.version_goal.wire({ blur: [ta], input: [ta], keys: [ta] });
+    fields.north_star.wire({ blur: [nsTA], input: [nsTA], keys: [nsTA] });
+    nsTA.addEventListener("input", () => autosizeGoalField(nsTA));
+    const sprintEls = spSel ? [spTA, spSel] : [spTA];
+    fields.sprint.wire({ blur: [spTA], input: [spTA], keys: sprintEls });
+    registerGoalFields(projectId, fields);
+    installGoalUnloadGuard();
   }
   function _sessionPresenceDot(last_seen) {
     if (!last_seen) return "\u26AB";
@@ -17436,7 +19746,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!root || !hitlRoot) return;
     const hitl = tasks.filter((t3) => t3.status === "pending-hitl");
     banner.style.display = hitl.length ? "block" : "none";
-    hitlRoot.innerHTML = hitl.map((t3) => renderHitlRow(projectId, t3)).join("");
+    paintKeepingDrafts(
+      hitlRoot,
+      hitl.map((t3) => renderHitlRow(projectId, t3)).join(""),
+      [{ selector: "input[data-input]", key: (el3) => el3.dataset.input }]
+    );
     hitl.forEach((t3) => wireHitlRow(projectId, t3));
     root.innerHTML = tasks.map((t3) => renderTaskRow(t3)).join("");
     _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, ".task");
@@ -17501,10 +19815,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (!confirm(warn)) return;
     try {
       await api("/tasks/" + taskId, { method: "DELETE" });
+      dropTaskFromCaches(taskId);
       const row = document.getElementById("task-row-" + taskId);
       if (row) row.remove();
     } catch (e22) {
       console.error("Delete failed:", e22);
+    }
+  }
+  function dropTaskFromCaches(taskId, onlyProjectId) {
+    const ids = onlyProjectId ? [onlyProjectId] : Object.keys(state.panels);
+    for (const pid of ids) {
+      const p3 = state.panels[pid];
+      if (!p3 || !Array.isArray(p3.taskCache)) continue;
+      const before = p3.taskCache.length;
+      p3.taskCache = p3.taskCache.filter((t3) => t3.id !== taskId);
+      if (p3.taskCache.length < before) p3.taskOffset = Math.max(0, (p3.taskOffset || 0) - 1);
     }
   }
   function renderHitlRow(projectId, t3) {
@@ -17567,13 +19892,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     });
   }
   async function appendToGoal(projectId, line) {
-    let current = "";
+    let current2 = "";
     try {
       const goal = await api(`/projects/${projectId}/goal`);
-      current = typeof goal.content === "string" ? goal.content : JSON.stringify(goal.content, null, 2);
+      current2 = typeof goal.content === "string" ? goal.content : JSON.stringify(goal.content, null, 2);
     } catch (e3) {
     }
-    const next = current ? current.trimEnd() + "\n" + line : line;
+    const next = current2 ? current2.trimEnd() + "\n" + line : line;
     await api(`/projects/${projectId}/goal`, { method: "POST", body: JSON.stringify({ content: next }) });
   }
   async function hitlReply(projectId, taskId, text) {
@@ -17606,6 +19931,17 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const dot = document.getElementById(`ws-${projectId}`);
     ws.onopen = () => {
       dot && dot.classList.add("connected");
+      const panel = state.panels[projectId];
+      if (panel) {
+        const reopened = !!panel.wsOpenedBefore;
+        panel.wsOpenedBefore = true;
+        if (reopened) {
+          try {
+            resyncProjectViews(projectId);
+          } catch (_2) {
+          }
+        }
+      }
     };
     ws.onclose = () => {
       dot && dot.classList.remove("connected");
@@ -17624,6 +19960,86 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
     };
     state.panels[projectId].ws = ws;
+  }
+  function connectAccountWs() {
+    const previous = state.accountWs;
+    state.accountWs = null;
+    if (previous) {
+      try {
+        previous.close();
+      } catch (_2) {
+      }
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const workspace = state.activeWorkspaceTenantId ? `?workspace=${encodeURIComponent(state.activeWorkspaceTenantId)}` : "";
+    let sock;
+    try {
+      sock = new WebSocket(`${proto}//${location.host}/ws-account${workspace}`);
+    } catch (_2) {
+      return;
+    }
+    state.accountWs = sock;
+    let opened = false;
+    sock.onopen = () => {
+      opened = true;
+      state.accountWsFailures = 0;
+      refreshProjectListFromAccount();
+    };
+    sock.onclose = (ev) => {
+      if (state.accountWs !== sock) return;
+      state.accountWs = null;
+      if (ev && ev.code === 4401) return;
+      const failures = opened ? 0 : (state.accountWsFailures || 0) + 1;
+      state.accountWsFailures = failures;
+      const delay = failures === 0 ? 1500 : Math.min(3e4, 1500 * 2 ** (failures - 1));
+      setTimeout(() => {
+        if (!state.accountWs) connectAccountWs();
+      }, delay);
+    };
+    sock.onerror = () => {
+    };
+    sock.onmessage = (ev) => {
+      try {
+        handleAccountEvent(JSON.parse(ev.data));
+      } catch (_2) {
+      }
+    };
+  }
+  function refreshProjectListFromAccount() {
+    _debounceRepaint("projects", async () => {
+      await loadProjects();
+      dismissEmptyAccountWizard();
+    });
+  }
+  function dismissEmptyAccountWizard() {
+    const wizard = document.getElementById("ez-wizard");
+    if (!wizard || wizard.style.display !== "flex" || state.projects.length === 0) return;
+    wizard.style.display = "none";
+    restoreTabs();
+  }
+  function handleAccountEvent(event) {
+    if (event.type === "projects_changed") {
+      refreshProjectListFromAccount();
+    }
+  }
+  function resyncProjectViews(projectId) {
+    const panel = state.panels[projectId];
+    if (!panel) return;
+    _debounceRepaint("projects", () => {
+      loadProjects();
+    });
+    repaintVisibleSprintViews(projectId);
+    const jobs = [
+      refreshTab(projectId),
+      // goal + Active Sessions + the Devlog task list
+      loadPinnedDecisions(projectId),
+      refreshProjectCountBadges(projectId),
+      refreshHitl()
+    ];
+    if (panel.activeVtab === "live") jobs.push(refreshLiveTab(projectId));
+    if (panel.activeVtab === "notes") jobs.push(loadNotesTab(projectId));
+    if (panel.activeVtab === "insights") jobs.push(loadInsightsTab(projectId));
+    Promise.allSettled(jobs);
   }
   function handleWsEvent(projectId, event) {
     if (event.type === "update_available") {
@@ -17650,38 +20066,97 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
       return;
     }
+    if (event.type === "project_icon_changed") {
+      const tab = state.tabs.find((t3) => t3.id === event.project_id);
+      if (tab) tab.project = { ...tab.project, icon: event.icon || null };
+      const proj = state.projects.find((p3) => p3.id === event.project_id);
+      if (proj) proj.icon = event.icon || null;
+      renderTabs();
+      return;
+    }
+    if (event.type === "project_parent_changed") {
+      const tab = state.tabs.find((t3) => t3.id === event.project_id);
+      if (tab) tab.project = { ...tab.project, parent_project_id: event.parent_project_id || null };
+      loadProjects();
+      return;
+    }
+    if (event.type === "project_deleted") {
+      if (state.tabs.some((t3) => t3.id === projectId)) {
+        if (!(state.deletingProjects && state.deletingProjects[projectId])) toast("This project was deleted");
+        closeTab2(projectId);
+      }
+      _debounceRepaint("projects", () => {
+        loadProjects();
+      });
+      return;
+    }
+    if (event.type === "project_merged") {
+      resyncProjectViews(projectId);
+      return;
+    }
     if (event.type === "sprint_item_updated") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+      repaintVisibleSprintViews(projectId);
+      scheduleLiveRefresh(projectId);
+      return;
+    }
+    if (event.type === "sprint_item_deleted") {
+      applySprintItemDeleted(projectId, event.item_id);
+      scheduleGoalBoardReload(projectId);
       scheduleLiveRefresh(projectId);
       return;
     }
     if (event.type === "goal_updated") {
+      noteGoalEvent(projectId, event);
+      if (event.field === "decisions") {
+        _debounceRepaint(`decisions-log:${projectId}`, () => {
+          refreshDecisionsLog(projectId);
+        });
+        return;
+      }
       refreshGoal(projectId);
       return;
     }
-    if (event.type === "session_started") {
+    if (event.type === "session_started" || event.type === "session_updated") {
       const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId, { quiet: true });
       scheduleLiveRefresh(projectId);
+      refreshSessions(projectId);
       return;
     }
-    if (event.type === "sprint_item_added") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
+    if (event.type === "sprint_item_added" || event.type === "sprint_items_fanned_out") {
+      repaintVisibleSprintViews(projectId);
       scheduleLiveRefresh(projectId);
       refreshProjectCountBadges(projectId);
       return;
     }
-    if (event.type === "note_added") {
-      const panel2 = state.panels[projectId];
-      if (panel2 && panel2.activeVtab === "notes") loadNotesTab(projectId);
-      refreshProjectCountBadges(projectId);
+    if (event.type === "note_added" || event.type === "note_updated" || event.type === "note_deleted") {
+      _debounceRepaint(`notes:${projectId}`, () => {
+        const panel2 = state.panels[projectId];
+        if (panel2 && panel2.activeVtab === "notes") loadNotesTab(projectId);
+        refreshProjectCountBadges(projectId);
+      });
       return;
     }
-    if (event.type === "decision_pinned") {
-      if (state.panels[projectId]) loadPinnedDecisions(projectId);
-      refreshProjectCountBadges(projectId);
+    if (event.type === "decision_pinned" || event.type === "decision_updated" || event.type === "decision_deleted") {
+      _debounceRepaint(`decisions:${projectId}`, () => {
+        if (state.panels[projectId]) loadPinnedDecisions(projectId);
+        refreshProjectCountBadges(projectId);
+      });
+      return;
+    }
+    if (event.type === "insight_added") {
+      const panel2 = state.panels[projectId];
+      if (panel2 && panel2.activeVtab === "insights") loadInsightsTab(projectId);
+      return;
+    }
+    if (event.type === "task_deleted") {
+      dropTaskFromCaches(event.task_id, projectId);
+      const panel2 = state.panels[projectId];
+      if (panel2) {
+        renderTasks(projectId);
+        if (panel2.activeVtab === "queue") updateLiveFeed(projectId);
+      }
+      scheduleLiveRefresh(projectId);
       return;
     }
     if (event.type === "hitl_filed") {
@@ -17761,6 +20236,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   (async function init() {
+    _mountDashboardWaffle();
     const _wsParam = new URLSearchParams(window.location.search).get("ws");
     if (_wsParam && !state.activeWorkspaceTenantId) {
       state.activeWorkspaceTenantId = _wsParam;
@@ -17787,6 +20263,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       } catch (_2) {
       }
     }
+    if (!isDemoMode()) connectAccountWs();
     if (isDemoMode()) hideDemoAdminControls();
     if (isHostedMode()) hideHostedAdminControls();
     if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher2();
@@ -17872,39 +20349,6 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   })();
   var _sprintBoardReloaders = {};
   var _sprintSelectSyncers = {};
-  async function _deleteSprintItem(projectId, itemId) {
-    if (!confirm("Remove this sprint item?")) return;
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Delete sprint item failed:", e3);
-    }
-  }
-  async function _sprintAction(projectId, itemId, action) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/${action}`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Sprint action failed:", action, e3);
-    }
-  }
-  async function completeSprintItem(projectId, itemId) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/complete`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Complete sprint item failed:", e3);
-    }
-  }
-  async function failSprintItem(projectId, itemId) {
-    try {
-      await api(`/projects/${projectId}/sprint-items/${itemId}/fail`, { method: "POST" });
-      if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e3) {
-      console.error("Fail sprint item failed:", e3);
-    }
-  }
   document.getElementById("ez-create-btn").onclick = async () => {
     const nameEl = document.getElementById("ez-project-name");
     const humanEl = document.getElementById("ez-human-name");
@@ -18040,18 +20484,18 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     };
   })();
   function toggleExpand(id) {
-    const el2 = document.getElementById(id);
-    if (!el2) return;
-    const open = el2.style.display !== "none";
-    el2.style.display = open ? "none" : "";
-    const trigger = el2.previousElementSibling;
+    const el3 = document.getElementById(id);
+    if (!el3) return;
+    const open = el3.style.display !== "none";
+    el3.style.display = open ? "none" : "";
+    const trigger = el3.previousElementSibling;
     if (trigger) {
       const arrow = trigger.querySelector(".expand-arrow");
       if (arrow) arrow.textContent = open ? "\u25B6" : "\u25BC";
     }
   }
   try {
-    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, flattenHierarchy, eligibleParents, state });
+    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, connectAccountWs, handleAccountEvent, dismissEmptyAccountWizard, refreshDecisionsLog, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state });
   } catch (e3) {
   }
 })();

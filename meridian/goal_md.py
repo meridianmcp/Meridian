@@ -327,6 +327,7 @@ async def sync_goal_md_to_db(
         parsed.get("version_goal") or (existing or {}).get("content") or "",
         north_star=parsed.get("north_star"),
         sprint=parsed.get("sprint"),
+        actor=db_module.goal_actor("goal_md"),
     )
 
     # ── Attribution (v1.1.2) ──────────────────────────────────────────

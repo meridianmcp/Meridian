@@ -278,9 +278,22 @@ async def delete_task_endpoint(task_id: str, request: Request) -> Response:
     # needs no row otherwise). For an unscoped caller an unknown id stays a 204
     # no-op, as before; a scoped caller gets the same 403 for unknown and foreign.
     scoped = await _deps._scoped_project_ids_for_request(request)
+    existing = None
     if scoped is not None:
         existing = await db_module.get_task(db, task_id)
         _deny_unless_in_scope(scoped, existing["project_id"] if existing is not None else None)
+    # 8a665a03 -- the task_deleted event needs the task's project, read BEFORE the row is gone. A
+    # scoped caller already loaded it above; everyone else reads just that column (not get_task, which
+    # is the scope lookup H7 keeps off the unscoped path).
+    event_pid = existing["project_id"] if existing is not None else None
+    if scoped is None:
+        async with db.execute("SELECT project_id FROM task_log WHERE id = ?", (task_id,)) as _cur:
+            _row = await _cur.fetchone()
+        event_pid = _row["project_id"] if _row is not None else None
     await db.execute("DELETE FROM task_log WHERE id = ?", (task_id,))
     await db.commit()
+    if event_pid:
+        # a hard delete used to leave every other open dashboard (and the deleting tab's own
+        # task cache) showing the row until a reload.
+        db_module._publish_project_event(event_pid, "task_deleted", {"task_id": task_id})
     return Response(status_code=204)

@@ -9,6 +9,20 @@ name: Deploy to Fly.io
 #
 # Regression evidence: canonical run 30182367824 failed while direct-main
 # deploy run 30182376358 passed its narrower supplemental checks.
+#
+# CI speed (2026-10-07): the supplemental `test` job re-ran the ENTIRE suite
+# (~19 min) on every dev push (in parallel with test.yml) and AGAIN on the main
+# dispatch that auto-promote fires for a commit test.yml had just passed, so a
+# routine promote paid for the same tree three times before prod moved. Now:
+#   * a dev PUSH skips the supplemental suite (test.yml is the canonical run of
+#     that exact commit; the preview deploy no longer waits ~19 min behind it);
+#   * the `attest` job asks GitHub whether the canonical "Test (dev branch)" run
+#     succeeded on this commit - or on the second parent of the auto-promote
+#     merge, differing at most in CHANGELOG.md - and the supplemental suite is
+#     skipped only on a positive answer. Any doubt (lookup failure, a differing
+#     tree, no green run) means "not attested", and the suite runs as before;
+#   * `deploy` needs `attest` to have SUCCEEDED (it never fails by design), so a
+#     broken attestation step stops the deploy instead of skipping the tests.
 
 # Pipeline: dev push → test → preview → smoke → merge main → prod (with rollback)
 # Production deploys ONLY happen when:
@@ -58,13 +72,71 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ─── 1. Tests (skipped entirely for hotfix) ────────────────────────────────
+  # ─── 0. Attest: did the canonical CI already pass on this exact tree? ──────
+  # Never fails on purpose (every error path says attested=false); the jobs that
+  # consume it treat a skipped/failed attest as "do not deploy", not "skip tests".
+  attest:
+    name: Attest commit against canonical CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: >
+      inputs.hotfix != 'yes' &&
+      github.event_name != 'workflow_run' &&
+      !(github.event_name == 'push' && github.ref == 'refs/heads/dev')
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      attested: ${{ steps.check.outputs.attested }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Look for a green canonical run on this tree
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          attested=false
+          head=$(git rev-parse HEAD)
+          cands="$head"
+          # An auto-promote merge commit has the CI-green dev commit as its second parent.
+          p2=$(git rev-parse -q --verify "HEAD^2" 2>/dev/null) && cands="$cands $p2"
+          for c in $cands; do
+            n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/test.yml/runs?head_sha=${c}&event=push&branch=dev&status=success&per_page=1" --jq '.total_count' 2>/dev/null)
+            echo "canonical green runs for ${c}: ${n:-lookup failed}"
+            case "${n:-0}" in ''|*[!0-9]*) continue;; esac
+            [ "${n:-0}" -ge 1 ] || continue
+            if changed=$(git diff --name-only "$c" "$head" 2>/dev/null); then
+              extra=$(printf '%s\n' "$changed" | grep -v -x -e '' -e 'CHANGELOG.md')
+              if [ -z "$extra" ]; then
+                echo "tree of ${head} matches canonical-green ${c} (changed: ${changed:-nothing}) -> attested"
+                attested=true
+                break
+              fi
+              echo "${head} differs from canonical-green ${c} beyond CHANGELOG.md: ${extra}"
+            else
+              echo "could not diff ${c}..${head}"
+            fi
+          done
+          echo "attested=${attested}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+  # ─── 1. Tests (skipped for hotfix, dev pushes and attested trees) ──────────
   test:
     name: Supplemental preview/release test gate
+    needs: attest
     runs-on: ubuntu-latest
     # Skip on the workflow_run auto-promote event — test.yml already ran the full
     # suite; re-running it here would be wasteful and pointless. (427b7902)
-    if: inputs.hotfix != 'yes' && github.event_name != 'workflow_run'
+    # Also skip a dev PUSH (test.yml runs that exact commit) and a tree the
+    # attest job found green under test.yml (see the header).
+    if: >
+      inputs.hotfix != 'yes' &&
+      github.event_name != 'workflow_run' &&
+      !(github.event_name == 'push' && github.ref == 'refs/heads/dev') &&
+      needs.attest.outputs.attested != 'true'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
@@ -96,7 +168,12 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     # Skip on the workflow_run auto-promote event (test.yml already covers UX). (427b7902)
-    if: github.event_name != 'workflow_run'
+    # Same extra skips as `test`: test.yml's test-ux job already ran this file on dev.
+    needs: attest
+    if: >
+      github.event_name != 'workflow_run' &&
+      !(github.event_name == 'push' && github.ref == 'refs/heads/dev') &&
+      needs.attest.outputs.attested != 'true'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
@@ -128,7 +205,12 @@ jobs:
   # exact `flyctl deploy` on a dev trigger would just run it twice per push.)
   deploy-preview:
     needs: test
-    if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
+    # A dev push skips the supplemental suite (test.yml covers it), so a skipped
+    # `test` must not skip the preview: always() + the explicit result check.
+    if: >
+      always() &&
+      github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -141,7 +223,12 @@ jobs:
   # ─── 3. Smoke tests against preview (skip for hotfix) ────────────────────
   smoke-preview:
     needs: deploy-preview
-    if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
+    # GitHub skips a job whose ANCESTOR was skipped unless its condition has a
+    # status function; the dev-push suite skip (see the header) is such an ancestor.
+    if: >
+      always() &&
+      github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes' &&
+      needs.deploy-preview.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Wait for preview to boot (retry /health up to 90s)
@@ -187,12 +274,18 @@ jobs:
 
   # ─── 4. Merge dev → main on operator-gated promotion ──────────────────────
   merge-to-main:
-    needs: [smoke-preview, test]
+    needs: [attest, smoke-preview, test]
+    # `test` is skipped when attest found the tree green under test.yml, so the
+    # status function + explicit results replace the implicit success() (which
+    # would skip this job behind any skipped need).
     if: >
+      always() &&
       github.event_name == 'workflow_dispatch' &&
       inputs.promote == 'yes' &&
       github.ref == 'refs/heads/dev' &&
-      (inputs.hotfix == 'yes' || needs.smoke-preview.result == 'success')
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (inputs.hotfix == 'yes' ||
+       (needs.attest.result == 'success' && needs.smoke-preview.result == 'success'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -349,7 +442,7 @@ jobs:
 
   # ─── 5. Production deploy ─────────────────────────────────────────────────
   deploy:
-    needs: [test, merge-to-main]
+    needs: [attest, test, merge-to-main]
     # NOTE (priority_zero fix): the deploy job used to additionally require
     # `github.actor == 'github-actions[bot]'` on a main push. That silently SKIPPED
     # this job on any direct/human push to main while the workflow still reported
@@ -373,6 +466,7 @@ jobs:
       always() &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
       (needs.merge-to-main.result == 'success' || needs.merge-to-main.result == 'skipped') &&
+      (inputs.hotfix == 'yes' || needs.attest.result == 'success') &&
       ((github.ref == 'refs/heads/main' &&
         github.event_name == 'push') ||
        (github.event_name == 'workflow_dispatch' &&
@@ -516,7 +610,12 @@ jobs:
   # ─── 6. CHANGELOG ─────────────────────────────────────────────────────────
   changelog:
     needs: deploy
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # always() + the explicit result: an attested tree skips `test`, and a skipped
+    # ancestor would otherwise skip this job too.
+    if: >
+      always() &&
+      github.ref == 'refs/heads/main' && github.event_name == 'push' &&
+      needs.deploy.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

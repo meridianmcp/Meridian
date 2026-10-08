@@ -3,6 +3,8 @@
 
 // 233bae67 — sprint dependency DAG (Cytoscape, guarded/CDN-global).
 import { buildSprintDagElements, mountSprintDag } from "./components/sprintGraph";
+// 8a665a03 -- a repaint of the Live sprint board keeps what the user is typing.
+import { paintKeepingDrafts, type DraftUnit } from "./dashboard-utils";
 
 // c2fe20c3 — history-signal badges for a sprint item so pending items aren't
 // indistinguishable: a stall counter (↻N), a "retried" tag (claimed before, now
@@ -38,7 +40,7 @@ if (typeof window !== 'undefined') window._sprintHistoryBadges = _sprintHistoryB
 
 export function _renderPlanBadge(me: any) {
 
-  const planColors: Record<string, string> = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af' };
+  const planColors: Record<string, string> = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af', playtester: '#0891b2' };
 
   const planLabels = _PLAN_LABELS;
 
@@ -56,9 +58,12 @@ export function _renderPlanBadge(me: any) {
 
     const badgeColor = planColors[plan] || '#9ca3af';
 
+    // A playtester with an end date shows how long it has left, like the trial badge.
     const badgeLabel = plan === 'free' && me.days_remaining != null
       ? `Free · ${me.days_remaining}d left`
-      : (planLabels[plan] || plan);
+      : (plan === 'playtester' && me.days_remaining != null && !me.expired
+        ? `Playtester · ${me.days_remaining}d left`
+        : (planLabels[plan] || plan));
 
     badge.title = `${planLabels[plan] || plan} plan`;
 
@@ -80,7 +85,8 @@ export function _renderPlanBadge(me: any) {
 
   // billing affordance when there's a real Stripe customer to manage.
 
-  const noUpgrade = plan === 'admin' || !!me.is_internal;
+  // A playtester has no Stripe relationship either: nothing to upgrade or manage.
+  const noUpgrade = plan === 'admin' || plan === 'playtester' || !!me.is_internal;
 
   const planBadge = document.getElementById('plan-badge');
 
@@ -223,6 +229,31 @@ export function _renderPlanBadge(me: any) {
 
 }
 
+// 8a665a03 -- the Live tab repaints this board ~10 s after any sprint_item_added/updated
+// event (and on every reconnect / mutation), and rebuilding it used to replace the add-item
+// box and any open inline editor: a half-typed item or title edit vanished mid-sentence. The
+// live nodes below are carried across the repaint instead (see paintKeepingDrafts):
+//   - the add-item box, while it has the focus or text in it;
+//   - an item row that has an inline editor open (title/version, notes, touches_resources),
+//     whether or not anything was typed yet -- the editor's own handlers keep working, and
+//     its Save / Cancel / blur paths repaint the row when the user is done. (Save marks its
+//     editor data-saved once the server has the edit, so the repaint it triggers replaces the
+//     row with the saved values instead of carrying the finished editor across.)
+const _SPRINT_BOARD_DRAFTS: DraftUnit[] = [
+  { selector: 'input.live-add-input', key: (el) => el.id },
+  {
+    selector: '.sprint-item-row',
+    key: (el) => el.dataset.item,
+    keep: (row) => !!row.querySelector(
+      '.sprint-edit-input:not([data-saved]), .sprint-notes-textarea:not([data-saved]), .sprint-resources-textarea:not([data-saved])',
+    ),
+  },
+];
+
+function _paintSprintBoard(root: HTMLElement, html: string) {
+  paintKeepingDrafts(root, html, _SPRINT_BOARD_DRAFTS);
+}
+
 export function renderSprintProgress(projectId: string, items: any) {
 
   /** Full grouped sprint board — replaces the old plain progress bar. */
@@ -265,7 +296,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
   if (items.length === 0) {
 
-    root.innerHTML = `
+    _paintSprintBoard(root, `
 
       <div class="live-empty">No sprint items. Add one below.</div>
 
@@ -279,7 +310,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
 
     root.querySelector('.sprint-add-btn')!.onclick =
 
@@ -317,7 +348,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
   if (displayItems.length === 0) {
 
-    root.innerHTML = `
+    _paintSprintBoard(root, `
 
       <div class="live-empty" style="color:var(--accent-green)">🎉 Sprint complete! All items done.</div>
 
@@ -331,7 +362,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
                 style="margin-left:4px">+ Add</button>
 
-      </div>`;
+      </div>`);
 
     root.querySelector('.sprint-add-btn')!.onclick = () => addSprintItemFromInput(projectId);
 
@@ -373,7 +404,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
           <button class="sprint-btn" title="Back to pending"
 
-            onclick="fetch('/projects/${escapeHtml(projectId)}/sprint-items/${escapeHtml(it.id)}',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'pending'})}).then(()=>renderSprintProgress(${JSON.stringify(projectId)},items.map(x=>x.id===it.id?{...x,status:'pending'}:x)))">↩ Pending</button>
+            onclick="sprintResetPending('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">↩ Pending</button>
 
           <button class="sprint-btn sprint-btn-fail" title="Mark failed"
 
@@ -450,12 +481,32 @@ export function renderSprintProgress(projectId: string, items: any) {
   );
 
   // Children of displayed parents, keyed by parent id (to render under parent, not standalone).
+  // 0c30b989 — only children in the SAME version as their parent fold into the
+  // parent's collapsed subtasks block. A subtask moved to another version on its
+  // own is listed in detachedParentOf instead (child id -> its displayed parent):
+  // it renders as a top-level row under ITS version header, tagged with the
+  // parent's title, so it is visible where the human just sent it. The parent's
+  // [done/total] badge still counts it (that reads allChildrenOf, not this map).
 
   const displayChildrenOf = new Map();
+
+  const detachedParentOf = new Map<string, any>();
+
+  const displayedById = new Map<string, any>(displayItems.map((it: any) => [it.id, it]));
 
   displayItems.forEach((it: any) => {
 
     if (it.parent_id && displayedParentIds.has(it.parent_id)) {
+
+      const parent = displayedById.get(it.parent_id);
+
+      if (parent && (it.version || '') !== (parent.version || '')) {
+
+        detachedParentOf.set(it.id, parent);
+
+        return;
+
+      }
 
       if (!displayChildrenOf.has(it.parent_id)) displayChildrenOf.set(it.parent_id, []);
 
@@ -522,9 +573,9 @@ export function renderSprintProgress(projectId: string, items: any) {
 
              onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
 
-           <button class="sprint-btn sprint-btn-push" title="Push to next version"
-
-             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
+           <button class="sprint-btn sprint-btn-push" title="Move to the next version, pick one, or defer" aria-label="Move to another version" aria-haspopup="dialog"
+             data-act="move-version" data-item-id="${escapeHtml(it.id)}"
+             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this)">→</button>
 
            ${canEdit ? editBtn : ''}
 
@@ -554,6 +605,14 @@ export function renderSprintProgress(projectId: string, items: any) {
 
       : '';
 
+    // A subtask listed on its own under another version's header says whose
+    // subtask it is, since its parent sits under a different header.
+    const detachedParent = detachedParentOf.get(it.id);
+
+    const parentTag = detachedParent
+      ? `<span class="sprint-subtask-tag" data-subtask-of="${escapeHtml(detachedParent.id)}" title="Subtask of ${escapeHtml(detachedParent.title)} (${escapeHtml(detachedParent.version || 'no version')})" style="display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;margin-left:6px;font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px">subtask of ${escapeHtml(detachedParent.title)}</span>`
+      : '';
+
     const indentStyle = isChild
 
       ? 'margin-left:16px;border-left:2px solid var(--border);padding-left:8px;'
@@ -570,9 +629,9 @@ export function renderSprintProgress(projectId: string, items: any) {
 
       <span class="sprint-item-icon" style="color:${color}">${icon}</span>
 
-      <div style="flex:1;min-width:0">
+      <div class="sprint-item-main">
 
-        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
+        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${parentTag}${_sprintHistoryBadges(it)}</span>
 
         ${notesHtml}
 
@@ -638,9 +697,12 @@ export function renderSprintProgress(projectId: string, items: any) {
 
     }
 
-    // Render only top-level items; children of displayed parents are rendered under their parent.
+    // Render only top-level items; children of displayed parents are rendered under their parent,
+    // unless they were moved to a different version than the parent (0c30b989): those stand on
+    // their own row under their own version header, tagged with the parent's title.
 
-    const topLevel = groupItems.filter((it: any) => !it.parent_id || !displayedParentIds.has(it.parent_id));
+    const topLevel = groupItems.filter((it: any) =>
+      !it.parent_id || !displayedParentIds.has(it.parent_id) || detachedParentOf.has(it.id));
 
     html += topLevel.map((it: any) => renderItem(it, false)).join('');
 
@@ -704,13 +766,13 @@ export function renderSprintProgress(projectId: string, items: any) {
 
       <div style="padding:4px 10px 8px">
 
-        ${pushedItems.map((it: any) => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || '')}" style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
+        ${pushedItems.map((it: any) => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || '')}" style="border-top:1px solid var(--border)">
 
           <span style="color:var(--muted);font-size:10px;flex-shrink:0">→</span>
 
-          <span class="sprint-item-title" style="font-family:var(--font-mono);font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
+          <span class="sprint-item-title" style="font-family:var(--font-mono);font-size:10px;color:var(--muted)" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
 
-          ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ''}
+          ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;max-width:100%;overflow-wrap:anywhere;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ''}
 
           <span class="sprint-item-ver" style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(it.version || '')}</span>
 
@@ -726,7 +788,7 @@ export function renderSprintProgress(projectId: string, items: any) {
 
 
 
-  root.innerHTML = html;
+  _paintSprintBoard(root, html);
 
   root.querySelector('.sprint-add-btn')!.onclick =
 
@@ -868,9 +930,9 @@ export function renderQueue(projectId: string, sprintItems: any = []) {
 
           onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
 
-        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Push to next version"
-
-          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
+        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Move to the next version, pick one, or defer" aria-label="Move to another version" aria-haspopup="dialog"
+          data-act="move-version" data-item-id="${escapeHtml(it.id)}"
+          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this)">→</button>
 
       </div>` : '';
 
@@ -887,7 +949,7 @@ export function renderQueue(projectId: string, sprintItems: any = []) {
 
       </div>` : '';
 
-    return `<div class="queue-item" data-bb-title="${escapeHtml((it.title || '').toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || '').toLowerCase())}">
+    return `<div class="queue-item" data-item-id="${escapeHtml(it.id || '')}" data-bb-title="${escapeHtml((it.title || '').toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || '').toLowerCase())}">
 
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
 
@@ -981,7 +1043,12 @@ export function renderQueue(projectId: string, sprintItems: any = []) {
 
     const groupNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));
 
+    // The filter text lives in panel state (filterBackburner) and is rendered back into
+    // the input: this section is rebuilt on every repaint (delete, WebSocket event), and
+    // an empty fresh input used to drop the user's filter after each single delete.
     const search = `<input type="text" id="backburner-search-${escapeHtml(projectId)}" placeholder="filter backburner…"
+
+      value="${escapeHtml(panel.backburnerFilter || '')}"
 
       oninput="filterBackburner('${escapeHtml(projectId)}', this.value)"
 

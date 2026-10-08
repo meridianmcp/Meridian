@@ -388,7 +388,21 @@ Mark skipped. Body: `{"reason": "..."}` (optional)
 
 ### `POST /projects/{project_id}/sprint-items/{item_id}/push`
 
-Push to future version. Body: `{"to_version": "v2.4"}`
+Defer to the backburner. Body: `{"to_version": "v2.4"}`. The item becomes `pushed` (terminal), `pushed_to` records the target and its own `version` is left alone.
+
+### `POST /projects/{project_id}/sprint-items/{item_id}/move`
+
+Move to another version while staying pending (what the dashboard's arrow button offers first). The title and status are never touched.
+
+**Body:** exactly one of `{"next": true}` (the server computes the version after the item's own: `v2.1` to `v2.2`, `v2.9` to `v2.10`, `v0.2.x` to `v0.3.x`, `1.0.0` to `1.0.1`) or `{"to_version": "v2.5"}`; optional `expected_version` (the version the caller saw; a mismatch is a 409, so a replayed `next` cannot move the item twice).
+
+**Response:** `{item, from_version, to_version, via, unchanged, moved_children, history_recorded}` -- `to_version` is the number actually used. `422` with `detail.code = "next_version_unavailable"` when the item's label has no unambiguous successor (e.g. `current sprint v0.2`); `409` when the item is finished or deferred. Subtasks still in the old version move with the parent. The move is recorded in the audit log as `sprint_item_version_moved`.
+
+### `POST /projects/{project_id}/sprint-items/move`
+
+Bulk move. Body: `{"item_ids": [...], "next": true}` or `{"item_ids": [...], "to_version": "v2.5"}` (at most 100 ids). Each item is moved independently; the response lists one outcome per id.
+
+> Agents: `update_sprint_item(version=...)` (the MCP twin of `PATCH /projects/{project_id}/sprint-items/{item_id}`) also re-versions a single item and keeps it pending, but it is a bare field edit, not this move: it does not work out a next version, does not carry subtasks along (a parent can end up in a newer version than its subtasks), writes no `sprint_item_version_moved` history entry (open dashboards still repaint, as for any edit). The MCP `push_sprint_item` tool is the deferral above.
 
 ### `DELETE /projects/{project_id}/sprint-items/{item_id}`
 
@@ -681,6 +695,7 @@ No auth required.
 | `POST` | `/admin/shutdown` | Gracefully stop the server process |
 | `GET` | `/admin/snapshot` | Download the current DB as a SQLite snapshot file |
 | `GET` | `/admin/stats` | d1cb1100 — launch/user stats for the admin Users widget: free-tier count |
+| `POST` | `/admin/tenants/plan` | Set or revoke a tenant's plan by account email (grant the playtester plan) |
 | `POST` | `/admin/tenants/{tenant_id}/reset-provisioning` | Reset a tenant back to a de-novo, never-provisioned state -- admin/ops |
 | `GET` | `/admin/waitlist` | Admin waitlist management page — shows signups, tenant stats, approve/delete buttons |
 | `DELETE` | `/admin/waitlist/{entry_id}` | Delete a waitlist entry by id. Admin only |
@@ -1150,11 +1165,13 @@ No auth required.
 | `POST` | `/projects/{project_id}/sprint-batch` | Run a homogeneous batch of sprint-management writes |
 | `GET` | `/projects/{project_id}/sprint-items` | List sprint items, optionally filtered by status |
 | `POST` | `/projects/{project_id}/sprint-items` | Append a todo sprint item. Body: ``{version, title, group?, human_id?}`` |
+| `POST` | `/projects/{project_id}/sprint-items/move` | Move several sprint items to another version in one call |
 | `DELETE` | `/projects/{project_id}/sprint-items/{item_id}` | Delete a sprint item permanently |
 | `GET` | `/projects/{project_id}/sprint-items/{item_id}` | 4ef6ce5e — fetch ONE sprint item's live row, scoped to ``project_id`` |
 | `PATCH` | `/projects/{project_id}/sprint-items/{item_id}` | Update editable fields (title, version) of a sprint item |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/complete` | Mark a sprint item ``done``. Optional body: ``{task_id}`` |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/fail` | Mark a sprint item ``failed``. Optional body: ``{reason}`` |
+| `POST` | `/projects/{project_id}/sprint-items/{item_id}/move` | Move a sprint item to another version, keeping its status and title |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/push` | Push a sprint item to a future version. Body: ``{to_version}`` |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/skip` | Mark a sprint item ``skipped``. Optional body: ``{reason}`` |
 | `GET` | `/projects/{project_id}/sprint/pending_count` | c0d2356d — count of not-yet-done sprint items for a project. Powers the |

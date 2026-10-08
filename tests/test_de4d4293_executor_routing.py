@@ -39,6 +39,24 @@ import meridian.server  # noqa: F401 — load the server before handler to avoid
 from meridian.mcp import handler as mcp_handler
 
 
+@pytest.fixture(autouse=True)
+def _no_git_history_inference(monkeypatch):
+    """Keep these tests independent of the checkout's recent git history.
+
+    ``handoff._annotate_touches_files`` infers an item's resources from ``git diff --name-only
+    HEAD~3`` by matching its title words to the changed files: "Claim sprint items for wave 2"
+    matches ``meridian/routes/sprint.py`` whenever the last three commits touched it, and an item
+    with a declared resource and no pointer evidence is (correctly) left out of the executor
+    sections, so ``<executor_routing>`` vanished. CI never saw that because a shallow checkout has
+    no ``HEAD~3``. Item routing is what is under test here, not that inference."""
+
+    async def _passthrough(db, project_id, pending_items):
+        return pending_items
+
+    monkeypatch.setattr(handoff_module, "_annotate_touches_files", _passthrough)
+
+
+
 _GOAL_TOKEN_RE = re.compile(r"<goal_token>[^<]*</goal_token>")
 
 

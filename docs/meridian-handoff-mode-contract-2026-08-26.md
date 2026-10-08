@@ -182,6 +182,41 @@ full intent-based resolution order (resumed session → `delta`; role=executor
 `tests/test_aec043cb_handoff_mode_scoping.py` is the existing regression
 suite for this table's workspace-context-exclusion column.
 
+The same invariant now holds for the Python API (0b0b24d8):
+`generate_handoff(mode=None)` — its default, and the default of
+`regenerate_handoff_correction` / `amend_handoff` — resolves through
+`resolve_handoff_mode`, where it used to default to `"full"`. Internal callers
+that never go through a transport pass an explicit bounded mode: the
+session-close auto-save and the idle-expire loop use `delta` (they refresh
+`<stem>_handoff.md`), proposal promotion's `executable_handoff` depth uses
+`goal`. Both `delta` callers also pass a `window_session_id` (the closed session;
+for the idle-expire loop, the most recently seen session that just expired): a
+delta takes the lower bound of its "Completed since last handoff" list from a
+session, and without one that list is unbounded. It is `window_session_id`, not
+`session_id`, on purpose: `session_id` also makes the unattended write that
+session's own handoff (its row, its "last handoff" anchor, its resumed-session
+marker, its goal-compliance record), and a session that resumes after an idle
+expiry or a reopened close would then get an explicit delta that starts at the
+auto-save and drops the work completed before it. For the same reason a write
+with no `session_id` never amends (edd9c54b) a `handoffs` row a session owns
+while its `pending_goal` is unconsumed: an amend keeps the owner but bumps
+`created_at`, which is that session's anchor, so it records a separate unowned
+row instead. An unowned latest row is still amended in place.
+Both `delta` callers also pass `refresh_retrospective=True`: delta skips the
+automatic Sprint Retrospective note (aef94e4a) like its other Haiku seams
+(4c7cd788), and the two session-end writers used to get that note refreshed for
+free from the old `full` default. The flag runs only that step for a delta (with
+`skip_ai_summary`, its deterministic body and no network call, so no API key is
+needed); an explicit delta and `checkpoint()` still skip it.
+`tests/test_0b0b24d8_workspace_notes_opt_in.py` runs every call site
+and source-scans for any `generate_handoff(` call that omits `mode=`.
+
+Session start and `get_context_block` are separate from handoff modes: they
+carry a bounded workspace *index* (capped decision summaries, a note count,
+policy-note titles, the fetch calls), and the full text only when
+`include_workspace_context` is on — see
+[configuration](configuration.md#workspace--workspace-notes-and-decisions).
+
 ## Default mode selection
 
 Already governed by `resolve_handoff_mode` (aec043cb) — restated here as

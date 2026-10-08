@@ -80,11 +80,31 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     except Exception:
         pass
     # v2.5 — auto-save handoff on session close so the file is always fresh.
+    # 0b0b24d8 — mode="delta" is explicit on purpose: this call used to omit it
+    # and inherit the 'full' default, i.e. an unattended background write of
+    # every cross-project workspace decision AND note on EVERY session close.
+    # delta (not goal) because it still writes the <stem>_handoff.md file this
+    # auto-save exists to keep fresh (goal writes a different file), it is
+    # bounded, and it skips the Haiku summary calls this 30s budget raced.
+    # window_session_id is passed because delta's "Completed since last
+    # handoff" list takes its lower bound from a session (its prior handoff,
+    # else its own start); without one the list has no bound and shows the
+    # OLDEST 20 items the project ever completed under a "since last handoff"
+    # label. It is NOT session_id: a closed session can be reopened (PATCH
+    # status=active), and an unattended write attributed to it would become its
+    # "last handoff", so its next explicit delta would silently drop everything
+    # completed before this close.
+    # refresh_retrospective=True: the old 'full' default also refreshed the
+    # project's Sprint Retrospective note (aef94e4a) on every session close;
+    # delta skips that step, so without this the note silently stopped updating.
+    # It does not bring back the Haiku summary calls or any workspace text.
     async def _auto_save_handoff() -> None:
         try:
             await asyncio.wait_for(
                 handoff_module.generate_handoff(
-                    await _db(request), project_id, request.app.state.data_dir
+                    await _db(request), project_id, request.app.state.data_dir,
+                    mode="delta", window_session_id=session_id,
+                    refresh_retrospective=True,
                 ),
                 timeout=30.0,
             )
@@ -114,6 +134,14 @@ async def patch_session(
     await db.commit()
     if cursor.rowcount == 0:
         raise HTTPException(status_code=404, detail="session not found")
+    # 8a665a03 -- "Mark idle" / reopen used to repaint only the acting tab. The event needs the
+    # project id, which is a read of its own (NOT the scope lookup H7 keeps off the unscoped path).
+    async with db.execute("SELECT project_id FROM sessions WHERE id = ?", (session_id,)) as _cur:
+        _row = await _cur.fetchone()
+    if _row is not None and _row["project_id"]:
+        db_module._publish_project_event(
+            _row["project_id"], "session_updated", {"session_id": session_id, "status": status}
+        )
     return {"status": status, "session_id": session_id}
 
 

@@ -693,7 +693,15 @@ async def handle_set_sprint(
                 "unstarted_ids": [it["id"] for it in _unstarted],
                 "sprint_not_updated": True,
             }
-    result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
+    try:
+        result = await db_module.set_sprint(
+            db, args["project_id"], args["sprint"],
+            expected_updated_at=args.get("expected_updated_at"),
+            actor=db_module.goal_actor("mcp"),
+        )
+    except db_module.GoalConflict as exc:
+        # fc779141 — stale expected_updated_at: nothing was written.
+        return db_module.goal_conflict_detail(exc)
     await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
     return result
 
