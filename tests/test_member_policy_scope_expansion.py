@@ -16,6 +16,7 @@ single-caller rule.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import types
@@ -104,6 +105,40 @@ async def test_children_of_a_deleted_parent_grant_nothing(split_dbs):
     scope = await d.resolve()
     assert list(scope) == [doomed]  # the ghost grant stays, the orphan is gone
     assert orphan not in scope and scope.parent_of == {}
+
+
+async def test_expected_delete_serializes_same_connection_hierarchy_changes(split_dbs, monkeypatch):
+    d = split_dbs
+    child = d.ids["S1"]
+    snapshot = await db_module.get_project_family(d.tenant_db, [child])
+    verified = asyncio.Event()
+    resume = asyncio.Event()
+    verify = db_module._verify_delete_expectations
+
+    async def pause_after_verify(db, project_ids, expect):
+        await verify(db, project_ids, expect)
+        verified.set()
+        await resume.wait()
+
+    monkeypatch.setattr(db_module, "_verify_delete_expectations", pause_after_verify)
+    deleting = asyncio.create_task(
+        db_module.delete_project(d.tenant_db, child, expect={child: snapshot[child]})
+    )
+    changing = None
+    try:
+        await asyncio.wait_for(verified.wait(), timeout=5)
+        changing = asyncio.create_task(
+            db_module.set_parent_project(d.tenant_db, child, None)
+        )
+        await asyncio.sleep(0)
+        assert not changing.done()
+    finally:
+        resume.set()
+        await deleting
+        if changing is not None:
+            await changing
+    assert changing is not None and await changing is None
+    assert await db_module.get_project(d.tenant_db, child) is None
 
 
 async def test_a_depth_two_grandchild_is_never_in_scope(split_dbs):
@@ -700,6 +735,49 @@ def test_http_detach_reparent_orphan_and_depth_two_change_the_next_request(split
     ws.run(db_module.delete_project(ws.owner_db, P))  # parent deleted, stray orphaned
     assert _tasks(ws, stray).status_code == 403
     assert _listing(ws) == set()
+
+
+def test_http_single_delete_rejects_a_changed_child_set(split_workspace, monkeypatch):
+    ws = split_workspace
+    parent, child = ws.ids["P"], ws.ids["S1"]
+    delete = db_module.delete_project
+    set_parent = db_module.set_parent_project
+
+    async def detach_between_read_and_delete(db, project_id, expect=None):
+        assert project_id == parent and child in expect[parent]["child_ids"]
+        await set_parent(db, child, None)
+        return await delete(db, project_id, expect=expect)
+
+    monkeypatch.setattr(db_module, "delete_project", detach_between_read_and_delete)
+    response = ws.client.delete(f"/projects/{parent}", headers=ws.owner_headers())
+
+    assert response.status_code == 409, response.text
+    assert ws.run(db_module.get_project(ws.owner_db, parent)) is not None
+    assert ws.run(db_module.get_project(ws.owner_db, child))["parent_project_id"] is None
+
+
+def test_http_batch_delete_rejects_a_changed_hierarchy_class(split_workspace, monkeypatch):
+    ws = split_workspace
+    parent, child = ws.ids["P"], ws.ids["S1"]
+    delete = db_module.delete_project
+    set_parent = db_module.set_parent_project
+
+    async def detach_between_read_and_delete(db, project_ids, expect=None):
+        assert set(project_ids) == {parent, child}
+        assert expect[child]["parent_project_id"] == parent
+        await set_parent(db, child, None)
+        return await delete(db, project_ids, expect=expect)
+
+    monkeypatch.setattr(db_module, "delete_project", detach_between_read_and_delete)
+    response = ws.client.delete(
+        "/projects",
+        params={"project_id": [parent, child]},
+        headers=ws.owner_headers(),
+    )
+
+    assert response.status_code == 409, response.text
+    assert ws.run(db_module.get_project(ws.owner_db, parent)) is not None
+    assert ws.run(db_module.get_project(ws.owner_db, child))["parent_project_id"] is None
 
 
 def test_http_each_workspace_expands_against_its_own_owners_database(split_workspace):

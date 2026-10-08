@@ -21,6 +21,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,94 @@ from meridian.finding_identity import finding_identity as _finding_identity
 _log = logging.getLogger(__name__)
 
 _UNSET = object()  # sentinel for "not passed" in optional keyword args
+
+# SQLite connections are shared by async requests in the self-hosted server.
+# Serialize the three operations that can change project hierarchy membership
+# on a given connection; BEGIN IMMEDIATE cannot protect against another task
+# interleaving statements on that very same connection.
+_PROJECT_HIERARCHY_WRITE_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def _project_hierarchy_write_lock(db: aiosqlite.Connection) -> asyncio.Lock:
+    key = (id(asyncio.get_running_loop()), id(db))
+    lock = _PROJECT_HIERARCHY_WRITE_LOCKS.get(key)
+    if lock is None:
+        lock = _PROJECT_HIERARCHY_WRITE_LOCKS[key] = asyncio.Lock()
+    return lock
+
+
+@asynccontextmanager
+async def _project_hierarchy_write_guard(db: aiosqlite.Connection):
+    # Postgres' table lock below is shared across processes; the in-memory lock
+    # exists only to serialize tasks sharing one SQLite connection.
+    if callable(getattr(db, "begin_transaction", None)):
+        yield
+        return
+    async with _project_hierarchy_write_lock(db):
+        yield
+
+
+@asynccontextmanager
+async def _expected_project_delete_transaction(db: aiosqlite.Connection):
+    """Hold the hierarchy stable from the final check through every delete."""
+    begin_transaction = getattr(db, "begin_transaction", None)
+    if callable(begin_transaction):
+        # PostgresConnection normally autocommits one statement at a time.
+        # Its explicit transaction pins one connection, and this table lock
+        # conflicts with all project INSERT/UPDATE/DELETE statements on every
+        # server process, including operations that do not know about this lock.
+        async with begin_transaction():
+            try:
+                await db.execute("LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE")
+                yield
+            except BaseException:
+                try:
+                    await db.rollback()
+                except BaseException:  # preserve the error that caused rollback
+                    _log.exception("could not roll back expected project delete")
+                raise
+        return
+
+    # SQLite's reserved write lock stops writers on other connections. A
+    # savepoint composes with callers/tests that already own a transaction;
+    # the no-op UPDATE upgrades an existing deferred read transaction before
+    # the hierarchy snapshot is re-read.
+    nested = bool(getattr(db, "in_transaction", False))
+    savepoint = f"sp_project_delete_{uuid.uuid4().hex}"
+    if nested:
+        await db.execute(f"SAVEPOINT {savepoint}")
+    else:
+        await db.execute("BEGIN IMMEDIATE")
+    try:
+        if nested:
+            await db.execute("UPDATE projects SET id = id WHERE 0")
+        yield
+    except BaseException:
+        try:
+            if nested:
+                await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                await db.execute("ROLLBACK")
+        except BaseException:  # preserve the error that caused rollback
+            _log.exception("could not roll back expected project delete")
+        raise
+    else:
+        try:
+            if nested:
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                await db.execute("COMMIT")
+        except BaseException:
+            try:
+                if nested:
+                    await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    await db.execute("ROLLBACK")
+            except BaseException:
+                _log.exception("could not roll back expected project delete")
+            raise
 
 # ecf69de8 — per-project executor posture. 'autonomous' (default): claim and run
 # pending sprint items immediately without asking for direction. 'interactive':
@@ -1266,7 +1355,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     return db
 
 
-async def create_project(
+async def _create_project_unlocked(
     db: aiosqlite.Connection,
     name: str,
     human_id: str | None = None,
@@ -1358,6 +1447,25 @@ async def create_project(
     # 8a665a03 -- another open dashboard's sidebar never learned of the new project.
     _publish_projects_changed(db, "created")
     return project
+
+
+async def create_project(
+    db: aiosqlite.Connection,
+    name: str,
+    human_id: str | None = None,
+    execution_mode: str | None = None,
+    tenant_id: str | None = None,
+    parent_project_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a project, serializing child membership changes per connection."""
+    if parent_project_id is None:
+        return await _create_project_unlocked(
+            db, name, human_id, execution_mode, tenant_id, parent_project_id
+        )
+    async with _project_hierarchy_write_guard(db):
+        return await _create_project_unlocked(
+            db, name, human_id, execution_mode, tenant_id, parent_project_id
+        )
 
 
 async def set_project_execution_mode(
@@ -1570,7 +1678,7 @@ async def rename_project(
 _PROJECT_CHANGED_CONCURRENTLY = "project changed concurrently"
 
 
-async def set_parent_project(
+async def _set_parent_project_unlocked(
     db: aiosqlite.Connection,
     project_id: str,
     parent_project_id: str | None,
@@ -1656,6 +1764,19 @@ async def set_parent_project(
     # the MCP set_parent_project tool published nothing.
     _publish_projects_changed(db, "reparented")
     return await get_project(db, project_id)
+
+
+async def set_parent_project(
+    db: aiosqlite.Connection,
+    project_id: str,
+    parent_project_id: str | None,
+    expect_parent: "str | None | object" = _UNSET,
+) -> dict[str, Any] | None:
+    """Set a project's parent under the per-connection hierarchy write lock."""
+    async with _project_hierarchy_write_guard(db):
+        return await _set_parent_project_unlocked(
+            db, project_id, parent_project_id, expect_parent
+        )
 
 
 # Ids per IN (...) list. Stays well under SQLite's bound-variable limit and keeps
@@ -2513,15 +2634,19 @@ def _project_class(entry: dict[str, Any]) -> str:
 async def _verify_delete_expectations(
     db: aiosqlite.Connection,
     project_ids: list[str],
-    expect: "str | dict[str, str]",
+    expect: "str | dict[str, str | dict[str, Any]]",
 ) -> None:
-    """Refuse a delete whose projects no longer look the way the caller decided
-    on. Raises ``ValueError("project changed concurrently ...")``."""
+    """Refuse a delete if its observed hierarchy snapshot is stale."""
     if isinstance(expect, str):
         expected = {pid: expect for pid in project_ids}
     else:
         expected = dict(expect)
-    bad = [c for c in expected.values() if c not in _PROJECT_CLASSES]
+    if set(expected) != set(project_ids):
+        raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: incomplete hierarchy expectation")
+    bad = [
+        value for value in expected.values()
+        if isinstance(value, str) and value not in _PROJECT_CLASSES
+    ]
     if bad:
         raise ValueError(f"unknown project class {bad[0]!r} (expected one of {_PROJECT_CLASSES})")
     family = await get_project_family(db, project_ids)
@@ -2529,11 +2654,32 @@ async def _verify_delete_expectations(
     for pid in project_ids:
         entry = family.get(pid)
         if entry is None:
-            continue  # already gone: the delete below has nothing to remove
-        want = expected.get(pid)
-        if want is not None and _project_class(entry) != want:
+            raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: project '{pid}' no longer exists")
+        want = expected[pid]
+        if isinstance(want, str):
+            want_class = want
+        elif isinstance(want, dict):
+            if not {"parent_project_id", "parent_exists", "child_ids"}.issubset(want):
+                raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid hierarchy expectation for '{pid}'")
+            want_class = _project_class(want)
+            expected_parent = want.get("parent_project_id") or None
+            actual_parent = entry.get("parent_project_id") or None
+            expected_children = want.get("child_ids")
+            if not isinstance(expected_children, (list, tuple, set)):
+                raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid child membership for '{pid}'")
+            if (
+                actual_parent != expected_parent
+                or bool(entry.get("parent_exists")) != bool(want.get("parent_exists"))
+                or set(entry["child_ids"]) != set(expected_children)
+            ):
+                raise ValueError(
+                    f"{_PROJECT_CHANGED_CONCURRENTLY}: hierarchy membership for '{entry['name']}' changed"
+                )
+        else:
+            raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid hierarchy expectation for '{pid}'")
+        if _project_class(entry) != want_class:
             raise ValueError(
-                f"{_PROJECT_CHANGED_CONCURRENTLY}: '{entry['name']}' is no longer a {want}"
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: '{entry['name']}' is no longer a {want_class}"
             )
         left_behind = [c for c in entry["child_ids"] if c not in in_batch]
         if left_behind:
@@ -2546,23 +2692,46 @@ async def _verify_delete_expectations(
 async def delete_project(
     db: aiosqlite.Connection,
     project_id: "str | list[str]",
-    expect: "str | dict[str, str] | None" = None,
+    expect: "str | dict[str, str | dict[str, Any]] | None" = None,
+) -> None:
+    """Delete one or more projects, rechecking a supplied hierarchy snapshot atomically."""
+    project_ids = [project_id] if isinstance(project_id, str) else list(project_id)
+    if not project_ids:
+        return
+    async with _project_hierarchy_write_guard(db):
+        if expect is None:
+            # Keep the legacy no-expect behavior for existing callers.
+            await _delete_project_data(db, project_ids)
+            _notify_deleted_projects(db, project_ids)
+            return
+        async with _expected_project_delete_transaction(db):
+            await _verify_delete_expectations(db, project_ids, expect)
+            await _delete_project_data(
+                db, project_ids, finalize=False, savepoint_table_errors=True
+            )
+    _notify_deleted_projects(db, project_ids)
+
+
+def _notify_deleted_projects(db: aiosqlite.Connection, project_ids: list[str]) -> None:
+    """Publish invalidations only after the project rows are durably deleted."""
+    for _pid in project_ids:
+        _invalidate_sprint_items_cache(_pid)
+        _publish_project_event(_pid, "project_deleted", {})
+    _publish_projects_changed(db, "deleted")
+
+
+async def _delete_project_data(
+    db: aiosqlite.Connection,
+    project_ids: list[str],
+    *,
+    finalize: bool = True,
+    savepoint_table_errors: bool = False,
 ) -> None:
     """Delete one or more projects and all associated data.
 
-    ``expect`` (default ``None``: no check, exactly the behavior every existing
-    caller has) is for a caller that decided whether the delete is allowed from
-    how each project sat in the hierarchy: ``"top"``, ``"subproject"`` or
-    ``"orphan"`` (a parent id whose row is gone), as one string for every id or a
-    ``{id: class}`` dict. Before anything is touched the rows are read again;
-    if any has a different class now, or has subprojects that are not themselves
-    in this call, nothing is deleted and ``ValueError("project changed
-    concurrently ...")`` is raised. The check closes the gap between the caller's
-    decision and this call, not the (much shorter) gap inside it.
-
-    ``project_id`` accepts either a single id (``str``, the original shape —
-    all existing callers are unaffected) or a list of ids to batch-delete
-    many projects in one call (0e4980d4). Batching runs each table's DELETE
+    This internal helper receives normalized IDs. The public wrapper owns
+    hierarchy validation, locking, and transaction boundaries when requested.
+    Batching runs each table's DELETE
     once with a single ``WHERE project_id IN (...)`` across every id in the
     batch, rather than looping the whole per-table statement list once per
     project — the same number of round trips regardless of batch size.
@@ -2595,11 +2764,6 @@ async def delete_project(
     constraint error, connection failure — is re-raised so the caller sees a
     real failure rather than a silent false-success.
     """
-    project_ids = [project_id] if isinstance(project_id, str) else list(project_id)
-    if not project_ids:
-        return
-    if expect is not None:
-        await _verify_delete_expectations(db, project_ids, expect)
     placeholders = ", ".join("?" for _ in project_ids)
     ids_params = tuple(project_ids)
 
@@ -2679,25 +2843,29 @@ async def delete_project(
         (f"DELETE FROM projects WHERE id IN ({placeholders})", ids_params),
     ]
 
-    for stmt, params in stmts:
+    for index, (stmt, params) in enumerate(stmts):
+        savepoint = f"sp_project_delete_stmt_{index}"
+        if savepoint_table_errors:
+            await db.execute(f"SAVEPOINT {savepoint}")
         try:
             await db.execute(stmt, params)
         except Exception as exc:  # noqa: BLE001
             if _is_no_such_table(exc):
+                if savepoint_table_errors:
+                    await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
                 # Table added in a later schema version — safe to skip on older installs.
                 _log.debug("delete_project: skipping missing table in: %s", stmt)
             else:
                 # Real error (FK violation, connection failure, …) — propagate.
                 raise
-    await db.commit()
-    # 8a665a03 -- the sidebar of every other open dashboard still listed the deleted
-    # project(s), and a tab open on one kept polling a project that no longer exists.
-    # The deleted project's own stream gets project_deleted (it is no longer in the
-    # table, so the list announcement cannot reach it); everyone else refetches the list.
-    for _pid in project_ids:
-        _invalidate_sprint_items_cache(_pid)
-        _publish_project_event(_pid, "project_deleted", {})
-    _publish_projects_changed(db, "deleted")
+        else:
+            if savepoint_table_errors:
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+    if finalize and not callable(getattr(db, "begin_transaction", None)):
+        # SQLite uses this to finish its implicit transaction. Postgres runs in
+        # autocommit mode, so each statement is already durable.
+        await db.execute("COMMIT")
 
 
 def _stale_collapse_map(

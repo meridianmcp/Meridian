@@ -741,11 +741,13 @@ async def delete_project(project_id: str, request: Request) -> None:
     (batch form, ``delete_projects_batch`` below) — this single-id endpoint
     is unchanged and still the right choice for one project.
     """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
+    db = await _db(request)
+    family = await db_module.get_project_family(db, [project_id])
+    expected = family.get(project_id)
+    if expected is None:
         raise HTTPException(404, "project not found")
     try:
-        await db_module.delete_project(await _db(request), project_id)
+        await db_module.delete_project(db, project_id, expect={project_id: expected})
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -809,11 +811,14 @@ async def delete_projects_batch(
     if scoped is not None and any(pid not in scoped for pid in project_ids):
         raise HTTPException(403, "Project is outside your access scope.")
     db = await _db(request)
-    missing = [pid for pid in project_ids if await db_module.get_project(db, pid) is None]
+    family = await db_module.get_project_family(db, project_ids)
+    missing = [pid for pid in project_ids if pid not in family]
     if missing:
         raise HTTPException(404, f"project(s) not found: {', '.join(missing)}")
     try:
-        await db_module.delete_project(db, project_ids)
+        await db_module.delete_project(
+            db, project_ids, expect={pid: family[pid] for pid in project_ids}
+        )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"deleted": project_ids, "count": len(project_ids)}
