@@ -3740,8 +3740,17 @@ def test_add_sprint_item_surfaces_prospecting_status_and_context():
         "touches_resources": ["file:meridian/mcp/handler.py"],
         "force": True,  # skip the drift guard so the test is deterministic
     }, db, "/tmp"))
-    assert out.get("prospecting_status") == "prospected"
+    # The inline search found context, but a file-only declaration cannot
+    # produce the durable symbol pointer required by the shared handoff gate.
+    assert out.get("prospecting_status") == "unprospected"
     assert "meridian/mcp/handler.py" in out.get("code_context", {}).get("files", [])
+    from meridian.handoff import _build_quick_start_goal
+    pointer_ids = _run(db_module.get_pointer_evidence_item_ids(db, [out["id"]]))
+    goal = _build_quick_start_goal([out], pointer_evidence_ids=pointer_ids)
+    excluded = goal.split("<excluded_unprospected", 1)[1].split(
+        "</excluded_unprospected>", 1
+    )[0]
+    assert out["id"] in excluded
 
 
 def test_update_sprint_item_auto_prospects_on_update():
