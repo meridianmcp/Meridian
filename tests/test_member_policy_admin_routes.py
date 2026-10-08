@@ -210,6 +210,59 @@ def test_policy_summary_includes_inherited_members_with_fixed_query_count(monkey
         assert list_reads == 1
 
 
+def test_policy_summary_preserves_each_scoped_membership_for_duplicate_email(monkeypatch, tmp_path):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_policy_workspace(client.app.state.db))
+        db = client.app.state.db
+        second_project = asyncio.run(db_module.create_project(db, "policy-second-scope"))
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        asyncio.run(db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, joined_at, project_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "policy-member-second-scope", setup["owner_id"],
+                "policy-scoped@example.com", "member", "none", now,
+                second_project["id"],
+            ),
+        ))
+        asyncio.run(db.commit())
+        asyncio.run(db_module.set_member_policy_default(
+            db, setup["owner_id"], {"write_project": False}, "policy-owner@example.com",
+        ))
+        owner = {"Authorization": f"Bearer {setup['owner_token']}"}
+
+        first = client.get("/workspace/member-policy", headers=owner)
+        assert first.status_code == 200, first.text
+        entries = [
+            entry for entry in first.json()["overrides"]
+            if entry["email"] == "policy-scoped@example.com"
+        ]
+        assert {entry["member_id"] for entry in entries} == {
+            setup["member_id"], "policy-member-second-scope",
+        }
+        assert {entry["project_id"] for entry in entries} == {
+            setup["project_id"], second_project["id"],
+        }
+        for entry in entries:
+            assert entry["policy_status"] == "inherited"
+            assert entry["effective"]["role"]
+            readout = entry["effective"]["readout"]["write_project"]
+            assert readout["allowed"] is False
+            assert readout["source"] == "default"
+
+        second = client.get("/workspace/member-policy", headers=owner)
+        assert second.status_code == 200, second.text
+        assert {
+            entry["member_id"]: (entry["project_id"], entry["policy_status"])
+            for entry in second.json()["overrides"]
+            if entry["email"] == "policy-scoped@example.com"
+        } == {
+            setup["member_id"]: (setup["project_id"], "inherited"),
+            "policy-member-second-scope": (second_project["id"], "inherited"),
+        }
+
+
 def test_corrupt_policy_patch_fails_closed_and_explicit_reset_recovers(monkeypatch, tmp_path):
     with _hosted_client(monkeypatch, tmp_path) as client:
         setup = asyncio.run(_seed_policy_workspace(client.app.state.db))

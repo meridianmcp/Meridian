@@ -214,19 +214,20 @@ async def get_workspace_member_policy(request: Request) -> dict[str, Any]:
         entry = grouped.get(email)
         if entry is None:
             entry = {
-                "member_id": None,
-                "role": None,
-                "project_id": None,
-                "override": None,
+                "members": [],
                 "roles": [],
             }
             grouped[email] = entry
         if member.get("row_kind") == "member":
-            if entry["member_id"] is None:
-                entry["member_id"] = str(member["member_id"])
-                entry["role"] = str(member.get("role") or "member")
-                entry["project_id"] = str(member["project_id"])
-                entry["override"] = member.get("override")
+            # A person-level policy can have multiple project-scoped membership
+            # rows. Preserve every id so the owner UI can key each project's
+            # control/readout to its own membership.
+            entry["members"].append({
+                "member_id": str(member["member_id"]),
+                "role": str(member.get("role") or "member"),
+                "project_id": str(member["project_id"]),
+                "override": member.get("override"),
+            })
         else:
             entry["roles"].append((
                 str(member.get("policy_role") or "member"),
@@ -234,16 +235,15 @@ async def get_workspace_member_policy(request: Request) -> dict[str, Any]:
             ))
     result_overrides = []
     for email, entry in grouped.items():
-        if entry["member_id"] is None:
-            continue
-        result_overrides.append(_member_policy_view_from_rows(
-            email,
-            {"default": raw_default, "override": entry["override"]},
-            entry["roles"],
-            member_id=entry["member_id"],
-            role=entry["role"],
-            project_id=entry["project_id"],
-        ))
+        for scoped_member in entry["members"]:
+            result_overrides.append(_member_policy_view_from_rows(
+                email,
+                {"default": raw_default, "override": scoped_member["override"]},
+                entry["roles"],
+                member_id=scoped_member["member_id"],
+                role=scoped_member["role"],
+                project_id=scoped_member["project_id"],
+            ))
     return {
         "workspace_tenant_id": tenant_id,
         "default_policy": default_policy,
