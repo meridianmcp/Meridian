@@ -1556,6 +1556,197 @@ async def _demo_read_only_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 # 393eed0a — workspace-role enforcement (viewer read-only / member-limited)
 # ---------------------------------------------------------------------------
+async def _read_member_policy_json_object(request: Request) -> dict[str, Any]:
+    """Read an object body for the capability gate, then replay it downstream."""
+    raw = await request.body()
+    sent = False
+
+    async def _replay_body():
+        nonlocal sent
+        if sent:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent = True
+        return {"type": "http.request", "body": raw, "more_body": False}
+
+    # BaseHTTPMiddleware's call_next reads request.receive after dispatch. Restore
+    # the cached bytes so FastAPI's route body validation still sees the request.
+    request._receive = _replay_body  # type: ignore[attr-defined]
+    if not raw:
+        return {}
+    try:
+        body = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "Request body must be a JSON object.") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Request body must be a JSON object.")
+    return body
+
+
+async def _member_policy_project_write_response(request: Request) -> Response | None:
+    """Apply member capability policy to every mutating project HTTP endpoint.
+
+    Project-scoped members get the same policy checks as MCP. This gate runs
+    after the path-only scope middleware, and repeats scope checks for ids in
+    bodies/query parameters before looking those ids up. Workspace-wide callers
+    and owners receive None from the scope resolver and keep the role gate.
+    """
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    path = request.url.path.rstrip("/") or "/"
+    if path != "/projects" and not path.startswith("/projects/"):
+        return None
+
+    from . import member_policy  # noqa: PLC0415
+    from ._deps import _deny_unless_in_scope, _scoped_project_ids_for_request  # noqa: PLC0415
+
+    try:
+        scoped = await _scoped_project_ids_for_request(request)
+        if scoped is None:
+            return None
+
+        match = _PROJECT_ID_PATH_RE.match(path)
+        project_id = match.group(1) if match else None
+        if project_id is not None:
+            # Preserve the scope refusal before any capability lookup or DB query.
+            _deny_unless_in_scope(scoped, project_id)
+
+        caps: set[str] = {member_policy.WRITE_PROJECT}
+        target = project_id
+        if request.method == "POST" and path == "/projects":
+            body = await _read_member_policy_json_object(request)
+            parent_id = body.get("parent_project_id")
+            if parent_id:
+                _deny_unless_in_scope(scoped, parent_id)
+            caps = set(member_policy.required_caps_for_create(parent_id))
+            target = str(parent_id) if parent_id is not None else None
+        elif request.method == "POST" and project_id and path == f"/projects/{project_id}/parent":
+            body = await _read_member_policy_json_object(request)
+            raw_parent = body.get("parent_project_id")
+            if raw_parent is not None and not isinstance(raw_parent, str):
+                raise HTTPException(400, "parent_project_id must be a string or null")
+            parent_id = str(raw_parent).strip() if raw_parent else None
+            if parent_id:
+                _deny_unless_in_scope(scoped, parent_id)
+
+            db = await _db(request)
+            project = await db_module.get_project(db, project_id)
+            if project is None:
+                raise HTTPException(403, "Project is outside your access scope.")
+            current_parent_id = project.get("parent_project_id")
+            current_parent = (
+                await db_module.get_project(db, current_parent_id)
+                if current_parent_id else None
+            )
+            new_parent = (
+                await db_module.get_project(db, parent_id)
+                if parent_id else None
+            )
+            caps = set(member_policy.required_caps_for_reparent(
+                project, current_parent, new_parent,
+            ))
+            target = project_id
+        elif request.method == "PATCH" and project_id and path == f"/projects/{project_id}/organization":
+            body = await _read_member_policy_json_object(request)
+            db = await _db(request)
+            project = await db_module.get_project(db, project_id)
+            if project is None:
+                raise HTTPException(403, "Project is outside your access scope.")
+            rows = await db_module.list_projects(db)
+            by_id = {str(row.get("id")): row for row in rows}
+            family = {
+                str(row.get("id")): {
+                    "parent_exists": bool(
+                        row.get("parent_project_id")
+                        and row.get("parent_project_id") in by_id
+                    ),
+                    "child_ids": [
+                        str(child.get("id")) for child in rows
+                        if child.get("parent_project_id") == row.get("id")
+                    ],
+                }
+                for row in rows
+            }
+            caps = set(member_policy.required_caps_for_status(
+                project, body.get("status"), family,
+            ))
+            target = project_id
+        elif request.method == "DELETE" and path == "/projects":
+            project_ids = list(dict.fromkeys(request.query_params.getlist("project_id")))
+            # The entire batch is scope-checked before project existence is read.
+            for pid in project_ids:
+                _deny_unless_in_scope(scoped, pid)
+            db = await _db(request)
+            rows = await db_module.list_projects(db)
+            by_id = {str(row.get("id")): row for row in rows}
+            family = {
+                str(row.get("id")): {
+                    "parent_exists": bool(
+                        row.get("parent_project_id")
+                        and row.get("parent_project_id") in by_id
+                    ),
+                    "child_ids": [
+                        str(child.get("id")) for child in rows
+                        if child.get("parent_project_id") == row.get("id")
+                    ],
+                }
+                for row in rows
+            }
+            caps = set(member_policy.required_caps_for_delete(
+                [by_id[pid] for pid in project_ids if pid in by_id],
+                family,
+            ))
+            target = ",".join(project_ids) if project_ids else None
+        elif request.method == "DELETE" and project_id and path == f"/projects/{project_id}":
+            db = await _db(request)
+            project = await db_module.get_project(db, project_id)
+            if project is not None:
+                rows = await db_module.list_projects(db)
+                by_id = {str(row.get("id")): row for row in rows}
+                family = {
+                    str(row.get("id")): {
+                        "parent_exists": bool(
+                            row.get("parent_project_id")
+                            and row.get("parent_project_id") in by_id
+                        ),
+                        "child_ids": [
+                            str(child.get("id")) for child in rows
+                            if child.get("parent_project_id") == row.get("id")
+                        ],
+                    }
+                    for row in rows
+                }
+                caps = set(member_policy.required_caps_for_delete(project, family))
+            target = project_id
+
+        member_policy.require_capabilities(scoped, caps, target=target)
+    except member_policy.MemberPolicyUnavailable:
+        return JSONResponse(
+            {"detail": "Member policy check unavailable"},
+            status_code=503,
+        )
+    except member_policy.MemberPolicyDenied as exc:
+        return JSONResponse(exc.body(), status_code=403)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+    except Exception:  # noqa: BLE001 — policy lookup errors must fail closed
+        import logging as _l  # noqa: PLC0415
+
+        _l.getLogger("meridian.member_policy").exception(
+            "member policy HTTP check failed"
+        )
+        if request.headers.get("x-workspace-tenant-id", "").strip():
+            return JSONResponse(
+                {"detail": "Member policy check unavailable"},
+                status_code=503,
+            )
+        return None
+    return None
+
+
 @app.middleware("http")
 async def _role_enforcement_middleware(request: Request, call_next):
     """Enforce workspace roles on cross-workspace writes.
@@ -1595,6 +1786,9 @@ async def _role_enforcement_middleware(request: Request, call_next):
             status_code=403,
             media_type="application/json",
         )
+    policy_response = await _member_policy_project_write_response(request)
+    if policy_response is not None:
+        return policy_response
     return await call_next(request)
 
 
