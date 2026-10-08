@@ -7112,6 +7112,31 @@ async def _hook_scoped_project_ids(request: Request) -> "list[str] | None":
         return None
 
 
+def _require_hook_project_write(
+    scoped: "list[str] | None", project_id: str | None = None,
+) -> None:
+    """Require project-write authority for a scoped session hook caller.
+
+    Unscoped owners, workspace-wide members, and local callers retain the
+    historical behavior. Policy failures are translated to explicit HTTP
+    refusals so an unavailable policy can never fall through as a 500/pass.
+    """
+    if scoped is None:
+        return
+    from . import member_policy  # noqa: PLC0415
+
+    try:
+        member_policy.require_capability(
+            scoped, member_policy.WRITE_PROJECT, target=project_id,
+        )
+    except member_policy.MemberPolicyDenied as exc:
+        raise HTTPException(status_code=403, detail=exc.detail) from exc
+    except member_policy.MemberPolicyUnavailable as exc:
+        raise HTTPException(status_code=503, detail="member policy check unavailable") from exc
+    except Exception as exc:  # noqa: BLE001 — policy failures must refuse the hook
+        raise HTTPException(status_code=503, detail="member policy check unavailable") from exc
+
+
 def _hook_is_executor(body: dict[str, Any]) -> bool:
     """True when a SessionStart hook payload denotes an executor session.
 
@@ -7185,6 +7210,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         if hook_scope is not None and project_id:
             from ._deps import _deny_unless_in_scope  # noqa: PLC0415
             _deny_unless_in_scope(hook_scope, project_id)
+        _require_hook_project_write(hook_scope, project_id or None)
 
     def _normalize_hook_cwd(path: str) -> str:
         value = (path or "").strip().replace("\\", "/")
@@ -7700,6 +7726,7 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     if hook_scope is not None and project_id:
         from ._deps import _deny_unless_in_scope  # noqa: PLC0415
         _deny_unless_in_scope(hook_scope, project_id)
+    _require_hook_project_write(hook_scope, project_id or None)
     # No explicit project — try to route by cwd/hostname like session-start does.
     if not project_id:
         project_id = await _resolve_hook_project_id(

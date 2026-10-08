@@ -593,6 +593,31 @@ def test_hooks_session_start_explicit_project_happy(client):
     assert p["id"] in ctx["additionalContext"]
 
 
+def test_hooks_fail_closed_when_member_policy_is_unavailable(client, monkeypatch):
+    from meridian import member_policy
+    import meridian.server as server_module
+
+    project = _create_project(client, "hooks-policy-unavailable")
+    scoped = member_policy.ScopedProjectIds((project["id"],))
+
+    async def _scope(_request):
+        return scoped
+
+    def _policy_unavailable(_scoped):
+        raise member_policy.MemberPolicyUnavailable()
+
+    monkeypatch.setattr(server_module, "_hook_scoped_project_ids", _scope)
+    monkeypatch.setattr(member_policy, "policy_of", _policy_unavailable)
+
+    for path, body in (
+        ("/hooks/session-start", {"project_id": project["id"]}),
+        ("/hooks/stop", {"project_id": project["id"]}),
+    ):
+        response = client.post(path, json=body)
+        assert response.status_code == 503, (path, response.text)
+        assert response.json()["detail"] == "member policy check unavailable"
+
+
 def test_hooks_session_start_autoroute_single_project(client):
     # Exactly one project, no project_id -> auto-route to it.
     p = _create_project(client, "hooks-ss-only")

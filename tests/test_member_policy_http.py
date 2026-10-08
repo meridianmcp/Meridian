@@ -310,3 +310,70 @@ def test_nonproject_policy_lookup_errors_fail_closed_with_http_503(monkeypatch, 
             f"/tasks/{task['id']}", headers=member, json={"status": "failed"},
         )
         assert response.status_code == 503, response.text
+
+
+import meridian.server as server_module
+from meridian import db as db_module
+from meridian import member_policy
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _scoped(project_id: str, *capabilities: str) -> member_policy.ScopedProjectIds:
+    return member_policy.ScopedProjectIds(
+        (project_id,),
+        policy=member_policy.EffectivePolicy(
+            caps=frozenset(capabilities), role=member_policy.ROLE_MEMBER,
+        ),
+    )
+
+
+def _set_hook_scope(monkeypatch, scoped):
+    async def _scope(_request):
+        return scoped
+
+    monkeypatch.setattr(server_module, "_hook_scoped_project_ids", _scope)
+
+
+def _create_project(client):
+    return _run(db_module.create_project(client.app.state.db, "member-policy-hooks"))
+
+
+def test_scoped_member_without_write_project_is_denied_by_both_hooks(client, monkeypatch):
+    project = _create_project(client)
+    _set_hook_scope(monkeypatch, _scoped(project["id"]))
+
+    start = client.post(
+        "/hooks/session-start",
+        json={"project_id": project["id"], "session_name": "denied-hook"},
+    )
+    stop = client.post("/hooks/stop", json={"project_id": project["id"]})
+
+    for response in (start, stop):
+        assert response.status_code == 403, response.text
+        assert "write_project" in response.json()["detail"]
+
+
+def test_scoped_member_with_write_project_can_use_both_hooks(client, monkeypatch):
+    project = _create_project(client)
+    session = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "allowed-hook"},
+    ).json()
+    _set_hook_scope(monkeypatch, _scoped(project["id"], member_policy.WRITE_PROJECT))
+
+    start = client.post(
+        "/hooks/session-start",
+        json={"project_id": project["id"], "session_name": "allowed-hook"},
+    )
+    stop = client.post(
+        "/hooks/stop",
+        json={"project_id": project["id"], "session_id": session["id"]},
+    )
+
+    assert start.status_code == 200, start.text
+    assert start.json()["meridian_session_id"]
+    assert stop.status_code == 200, stop.text
+    assert stop.json()["ok"] is True
