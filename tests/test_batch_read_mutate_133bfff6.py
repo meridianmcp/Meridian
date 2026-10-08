@@ -54,6 +54,7 @@ import meridian.server as server_module  # noqa: F401 -- load before mcp.handler
 from meridian import batch_mutate as bmut_module
 from meridian import batch_read as br_module
 from meridian import db as db_module
+from meridian import member_policy
 from meridian import mcp_tools
 from meridian import tool_manifest as tool_manifest_module
 from meridian.db import batch_management as bm
@@ -73,6 +74,23 @@ async def project(db):
 @pytest_asyncio.fixture
 async def other_project(db):
     return await db_module.create_project(db, "batch-rw-other-proj")
+
+
+def _member_scope(project_id: str, *capabilities: str) -> member_policy.ScopedProjectIds:
+    return member_policy.ScopedProjectIds(
+        (project_id,),
+        policy=member_policy.EffectivePolicy(
+            caps=frozenset(capabilities), role=member_policy.ROLE_MEMBER,
+        ),
+    )
+
+
+async def _identity_project_reference(db, args, scoped):
+    return dict(args)
+
+
+async def _allow_member_scope(name, args, db, scoped, **kwargs):
+    return None
 
 
 def _sleepy_adapters(call_log: list, default_delay: float = 0.15):
@@ -611,6 +629,69 @@ async def test_batch_mutate_profile_layer_all_or_nothing_success(db, project):
     layer = await db_module.get_profile_layer(db, "workspace", "singleton")
     assert layer["fields"] == {"auto_worktrees": 0}
     assert layer["revision"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_type", "scope_id"),
+    [("workspace", "singleton"), ("hosted_default", "global")],
+)
+async def test_batch_mutate_profile_layer_tenant_targets_require_workspace_capability(
+    db, project, monkeypatch, tmp_path, scope_type, scope_id,
+):
+    monkeypatch.setattr(handler_module, "_resolve_project_reference", _identity_project_reference)
+    monkeypatch.setattr(handler_module.scope_guard, "enforce_scoped_call", _allow_member_scope)
+    args = {
+        "project_id": project["id"],
+        "entries": [{
+            "kind": "profile_layer", "scope_type": scope_type, "scope_id": scope_id,
+            "fields": {"auto_worktrees": 0}, "correlation_key": "profile-policy",
+        }],
+    }
+
+    with pytest.raises(member_policy.MemberPolicyDenied):
+        await handler_module._authorize_scoped_mcp_call(
+            "batch_mutate", args, db, str(tmp_path), None,
+            _member_scope(project["id"], member_policy.WRITE_PROJECT),
+        )
+
+    # The envelope's project write and the tenant profile's workspace write
+    # are separate grants; both must be present for this mixed batch surface.
+    result = await handler_module._authorize_scoped_mcp_call(
+        "batch_mutate", args, db, str(tmp_path), None,
+        _member_scope(
+            project["id"], member_policy.WRITE_PROJECT,
+            member_policy.WRITE_WORKSPACE_LEVEL,
+        ),
+    )
+    assert result == args
+
+
+@pytest.mark.asyncio
+async def test_batch_mutate_project_profile_target_uses_project_capability(
+    db, project, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(handler_module, "_resolve_project_reference", _identity_project_reference)
+    monkeypatch.setattr(handler_module.scope_guard, "enforce_scoped_call", _allow_member_scope)
+    args = {
+        "project_id": project["id"],
+        "entries": [{
+            "kind": "profile_layer", "scope_type": "project", "scope_id": project["id"],
+            "fields": {"auto_worktrees": 0}, "correlation_key": "project-profile-policy",
+        }],
+    }
+
+    with pytest.raises(member_policy.MemberPolicyDenied):
+        await handler_module._authorize_scoped_mcp_call(
+            "batch_mutate", args, db, str(tmp_path), None,
+            _member_scope(project["id"], member_policy.WRITE_WORKSPACE_LEVEL),
+        )
+
+    result = await handler_module._authorize_scoped_mcp_call(
+        "batch_mutate", args, db, str(tmp_path), None,
+        _member_scope(project["id"], member_policy.WRITE_PROJECT),
+    )
+    assert result == args
 
 
 @pytest.mark.asyncio

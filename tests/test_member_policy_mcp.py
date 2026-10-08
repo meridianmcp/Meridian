@@ -204,6 +204,68 @@ async def test_workspace_write_requires_workspace_capability(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("save_profile_layer", {"scope_type": "workspace", "scope_id": "singleton"}),
+        ("reset_profile_layer", {"scope_type": "hosted_default", "scope_id": "global"}),
+        ("set_capability_profile", {"scope_type": "user", "scope_id": "member"}),
+        ("clear_capability_profile", {"scope_type": "hosted_default", "scope_id": "global"}),
+        (
+            "clone_profile_layer",
+            {
+                "source_scope_type": "project", "source_scope_id": PROJECT,
+                "target_scope_type": "workspace", "target_scope_id": "singleton",
+            },
+        ),
+        ("activate_profile_layer", {"scope_id": "global"}),
+        ("plugin__save_profile_layer", {"scope_type": "workspace", "scope_id": "singleton"}),
+    ],
+)
+async def test_tenant_profile_mutations_require_workspace_capability(
+    monkeypatch, tmp_path, name, args,
+):
+    monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
+    monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)
+
+    with pytest.raises(member_policy.MemberPolicyDenied):
+        await mcp_handler._authorize_scoped_mcp_call(
+            name, args, object(), str(tmp_path), None,
+            _scoped((PROJECT,), member_policy.WRITE_PROJECT),
+            tunnel_candidate=name.startswith("plugin__"),
+        )
+
+    # Tenant-level profile authority stands on its own. A member granted the
+    # workspace capability can mutate these targets without borrowing a
+    # project's write grant.
+    result = await mcp_handler._authorize_scoped_mcp_call(
+        name, args, object(), str(tmp_path), None,
+        _scoped((PROJECT,), member_policy.WRITE_WORKSPACE_LEVEL),
+        tunnel_candidate=name.startswith("plugin__"),
+    )
+    assert result == args
+
+
+@pytest.mark.asyncio
+async def test_project_profile_mutation_still_requires_project_capability(monkeypatch, tmp_path):
+    monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
+    monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)
+    args = {"scope_type": "project", "scope_id": PROJECT}
+
+    with pytest.raises(member_policy.MemberPolicyDenied):
+        await mcp_handler._authorize_scoped_mcp_call(
+            "save_profile_layer", args, object(), str(tmp_path), None,
+            _scoped((PROJECT,), member_policy.WRITE_WORKSPACE_LEVEL),
+        )
+
+    result = await mcp_handler._authorize_scoped_mcp_call(
+        "save_profile_layer", args, object(), str(tmp_path), None,
+        _scoped((PROJECT,), member_policy.WRITE_PROJECT),
+    )
+    assert result == args
+
+
+@pytest.mark.asyncio
 async def test_merge_and_archive_use_catalog_helpers(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
     monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)

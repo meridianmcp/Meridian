@@ -1205,6 +1205,36 @@ async def _authorize_scoped_mcp_call(
     operation = member_policy_operation(name) or member_policy_operation(operation_name)
     normalized_name = operation_name.lower().replace("-", "_")
     operation_words = set(normalized_name.split("_"))
+    tenant_profile_scopes = {"workspace", "user", "hosted_default"}
+    profile_scope_args = {
+        "save_profile_layer": "scope_type",
+        "reset_profile_layer": "scope_type",
+        "set_capability_profile": "scope_type",
+        "clear_capability_profile": "scope_type",
+        "clone_profile_layer": "target_scope_type",
+    }
+    profile_write_tools = set(profile_scope_args) | {"activate_profile_layer"}
+    if normalized_name == "activate_profile_layer":
+        profile_target_scope_type = "hosted_default"
+    else:
+        scope_arg = profile_scope_args.get(normalized_name)
+        profile_target_scope_type = args.get(scope_arg) if scope_arg else None
+    tenant_profile_mutation = (
+        normalized_name in profile_write_tools
+        and isinstance(profile_target_scope_type, str)
+        and profile_target_scope_type.strip().lower() in tenant_profile_scopes
+    )
+    batch_has_tenant_profile_mutation = (
+        normalized_name == "batch_mutate"
+        and isinstance(args.get("entries"), list)
+        and any(
+            isinstance(entry, dict)
+            and entry.get("kind") == "profile_layer"
+            and isinstance(entry.get("scope_type"), str)
+            and entry["scope_type"].strip().lower() in tenant_profile_scopes
+            for entry in args["entries"]
+        )
+    )
     has_project_ref = any(
         key == "project_id" or key.endswith("_project_id")
         or key == "project_ids"
@@ -1482,6 +1512,12 @@ async def _authorize_scoped_mcp_call(
             member_policy.WRITE_WORKSPACE_LEVEL,
             member_policy.WRITE_PROJECT,
         })
+    elif tenant_profile_mutation:
+        # Profile writes target either a project (the usual project_write
+        # policy) or tenant-wide policy.  The latter must be authorized by the
+        # workspace capability instead of inheriting project_write merely
+        # because these tools share the project-tools MCP namespace.
+        required = frozenset({member_policy.WRITE_WORKSPACE_LEVEL})
     else:
         required = frozenset({member_policy.WRITE_PROJECT})
 
@@ -1497,6 +1533,13 @@ async def _authorize_scoped_mcp_call(
             member_policy.require_capabilities(scoped_project_ids, required, target=target)
     else:
         member_policy.require_capabilities(scoped_project_ids, required)
+    if batch_has_tenant_profile_mutation:
+        # batch_mutate remains a project-write operation because its envelope
+        # may also update project-owned objects.  Each tenant-scoped profile
+        # entry adds the workspace-level grant requirement independently.
+        member_policy.require_capabilities(
+            scoped_project_ids, {member_policy.WRITE_WORKSPACE_LEVEL},
+        )
     return args
 
 
