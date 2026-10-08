@@ -183,7 +183,8 @@ Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) a
 - **HITL recommended option** — `request_hitl` can flag a safe-default option the
   dashboard highlights; Enter submits it, number keys pick others.
 - **GitHub hub** (hosted) — connect your repo once in Settings; sessions get `read_file`,
-  `list_files`, `search_code`, `git_log`, `get_commit` injected automatically. No extra install.
+  `list_files`, `meridian_github_search_code`, `git_log`, and
+  `meridian_github_get_commit` injected automatically. No extra install.
 - **Tiered handoffs** — L0/L1/L2 compression so a fresh session can resume in seconds.
 - **Webhook intake** — push events from LangGraph / Autogen / custom agents into the same dashboard.
 - **Works everywhere** — Claude Code, Claude Desktop, Cursor, Windsurf, LangGraph, custom.

@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **245 tools** over MCP.
+Meridian exposes **247 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -780,8 +780,8 @@ read_note(project_id="abc-123", slug="deploy-note")
 
 ## Projects
 
-### `create_project`
-[MAINTENANCE] Create a new Meridian project. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+### `meridian_project_create`
+[MAINTENANCE] Create a new Meridian project. Use `meridian_project_create` as the canonical Meridian tool name. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -791,7 +791,18 @@ read_note(project_id="abc-123", slug="deploy-note")
 
 **Example:**
 ```
-create_project(name="my-app")
+meridian_project_create(name="my-app")
+```
+
+---
+
+
+### `meridian_project_list`
+[MAINTENANCE] Read-only: List all projects — find, browse, or look up your projects and their IDs. Call this first when you have a project name but need its project_id, or to discover which projects exist. Returns [{id, name, sprint, created_at}] newest first. Use `meridian_project_list` as the canonical Meridian tool name.
+
+**Example:**
+```
+meridian_project_list()
 ```
 
 ---
@@ -814,6 +825,24 @@ merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")
 ---
 
 ## Legacy
+
+### `create_project`
+[MAINTENANCE] DEPRECATED: use `meridian_project_create`. This legacy alias remains supported during the migration window. Create a new Meridian project. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | required |  |
+| `execution_mode` | string | optional | Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings. |
+| `parent_project_id` | string | optional | Optional parent project id — makes this a subproject that inherits the parent's north_star when it has none of its own. Subprojects are one level deep: the parent must exist and must not itself be a subproject. |
+
+---
+
+
+### `list_projects`
+[MAINTENANCE] DEPRECATED: use `meridian_project_list`. This legacy alias remains supported during the migration window. Read-only: List all projects — find, browse, or look up your projects and their IDs. Call this first when you have a project name but need its project_id, or to discover which projects exist. Returns [{id, name, sprint, created_at}] newest first.
+
+---
+
 
 ### `register_session`
 !!! note "Deprecated"

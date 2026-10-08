@@ -26,6 +26,7 @@ OPENAI_PUBLIC_PROFILE = "openai"
 OPENAI_PUBLIC_TOOL_NAMES: FrozenSet[str] = frozenset(
     {
         "create_project",
+        "meridian_project_create",
         "get_project_by_name",
         "start_session",
         "get_goal",

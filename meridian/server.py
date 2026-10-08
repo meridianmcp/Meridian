@@ -20,6 +20,7 @@ import os
 import re
 import signal
 import time
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -164,7 +165,13 @@ from .models import (
     TaskUpdate,
     WorktreeCreate,
 )
-from .mcp_tools import _MCP_TOOLS_LIST, _TOOL_EXAMPLES, _READ_ONLY_TOOLS as _mcp_readonly_tools
+from .mcp_tools import (
+    GITHUB_CANONICAL_TOOL_NAMES,
+    _MCP_TOOLS_LIST,
+    _TOOL_EXAMPLES,
+    _READ_ONLY_TOOLS as _mcp_readonly_tools,
+    normalize_public_tool_name,
+)
 
 # Default on-disk location. Overridable via MERIDIAN_DB env var, which the
 # test suite uses to redirect to ``:memory:``.
@@ -4078,7 +4085,7 @@ The 5 tools you use 90% of the time:
 
 ## Session lifecycle
 
-  list_projects()        ← first, if you don't know the project_id
+  meridian_project_list() ← first, if you don't know the project_id
   start_session()       ← always first
   log_task()            ← after any meaningful work
   pin_decision()        ← for architectural choices
@@ -4331,9 +4338,12 @@ async def mcp_tools_doc() -> str:
         "from `get_notes`). The pull half of the list→read model.")
     lines += _render_tool("delete_note")
     lines += ["## Projects\n"]
-    lines += _render_tool("create_project")
+    lines += _render_tool("meridian_project_create")
+    lines += _render_tool("meridian_project_list")
     lines += _render_tool("merge_project")
     lines += ["## Legacy\n"]
+    lines += _render_tool("create_project")
+    lines += _render_tool("list_projects")
     lines += _render_tool("register_session",
         "!!! note \"Deprecated\"\n    Use `start_session` instead — it registers the session **and** returns "
         "goal + context in one call.")
@@ -6284,13 +6294,13 @@ async def _start_session_composite(
                 )
             )
         # dc462628 — surface GitHub connection status so executors know upfront
-        # whether search_code / read_file / etc. are usable for this project.
+        # whether meridian_github_search_code / read_file / etc. are usable for this project.
         _c_github_repo = (_c_project or {}).get("github_repo") or ""
         _c_github_branch = (_c_project or {}).get("github_branch") or "main"
         _c_github_status = (
             f"connected (repo: {_c_github_repo}, branch: {_c_github_branch})"
             if _c_github_repo
-            else "not connected — GitHub tools (search_code, read_file, etc.) will error until you connect a repo in Settings"
+            else "not connected — GitHub tools (meridian_github_search_code, read_file, etc.) will error until you connect a repo in Settings"
         )
         from datetime import datetime as _dt, timezone as _tz  # de193a81
         _c_now = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -7977,31 +7987,45 @@ _GITHUB_TOOL_NAMES = frozenset({
     "read_file", "patch_file", "list_files", "search_code", "get_commits", "get_commit", "search_commits",
     "get_workflow_runs", "get_workflow_run_logs", "trigger_workflow", "git_diff",
     "list_branches", "list_issues", "create_issue", "get_issue",
-})
+} | set(GITHUB_CANONICAL_TOOL_NAMES.values()))
 
 
 _GITHUB_READ_ONLY = frozenset({
     "read_file", "list_files", "search_code", "get_commits", "search_commits",
     "get_commit", "get_workflow_runs", "get_workflow_run_logs",
     "git_diff", "list_branches", "list_issues", "get_issue",
+} | {
+    GITHUB_CANONICAL_TOOL_NAMES[name]
+    for name in ("search_code", "get_commit", "search_commits", "list_branches", "list_issues")
 })
-_GITHUB_DESTRUCTIVE = frozenset({"patch_file", "trigger_workflow", "create_issue"})
+_GITHUB_DESTRUCTIVE = frozenset({
+    "patch_file",
+    "trigger_workflow",
+    "create_issue",
+    GITHUB_CANONICAL_TOOL_NAMES["create_issue"],
+})
 _GITHUB_TITLE_OVERRIDES: dict[str, str] = {
     "read_file": "Read File",
     "patch_file": "Patch File",
     "list_files": "List Files",
-    "search_code": "Search Code",
+    "search_code": "DEPRECATED: use meridian_github_search_code",
     "get_commits": "Get Commits",
-    "search_commits": "Search Commits",
-    "get_commit": "Get Commit",
+    "search_commits": "DEPRECATED: use meridian_github_search_commits",
+    "get_commit": "DEPRECATED: use meridian_github_get_commit",
     "get_workflow_runs": "Get Workflow Runs",
     "get_workflow_run_logs": "Get Workflow Run Logs",
     "trigger_workflow": "Trigger Workflow",
     "git_diff": "Git Diff",
-    "list_branches": "List Branches",
-    "list_issues": "List Issues",
-    "create_issue": "Create Issue",
+    "list_branches": "DEPRECATED: use meridian_github_list_branches",
+    "list_issues": "DEPRECATED: use meridian_github_list_issues",
+    "create_issue": "DEPRECATED: use meridian_github_create_issue",
     "get_issue": "Get Issue",
+    "meridian_github_search_code": "Meridian GitHub Search Code",
+    "meridian_github_get_commit": "Meridian GitHub Get Commit",
+    "meridian_github_search_commits": "Meridian GitHub Search Commits",
+    "meridian_github_list_branches": "Meridian GitHub List Branches",
+    "meridian_github_list_issues": "Meridian GitHub List Issues",
+    "meridian_github_create_issue": "Meridian GitHub Create Issue",
 }
 
 
@@ -8211,6 +8235,23 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
             },
         },
     ]
+    for _legacy_name, _canonical_name in GITHUB_CANONICAL_TOOL_NAMES.items():
+        _legacy_tool = next(
+            tool for tool in _tools if tool["name"] == _legacy_name
+        )
+        _canonical_tool = deepcopy(_legacy_tool)
+        _canonical_tool["name"] = _canonical_name
+        _legacy_description = _legacy_tool["description"]
+        _canonical_tool["description"] = (
+            _legacy_description.rstrip()
+            + f" Use `{_canonical_name}` as the canonical Meridian GitHub tool name."
+        )
+        _legacy_tool["description"] = (
+            f"DEPRECATED: use `{_canonical_name}`. This legacy alias remains "
+            f"supported during the migration window. {_legacy_description}"
+        )
+        _tools.insert(_tools.index(_legacy_tool), _canonical_tool)
+
     for _t in _tools:
         _ro = _t["name"] in _GITHUB_READ_ONLY
         _gh_title = _GITHUB_TITLE_OVERRIDES.get(_t["name"], _t["name"].replace("_", " ").title())
@@ -8233,10 +8274,35 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
 # server.py's HTTP routes and mcp.stdio_handler keep importing from .server.
 from .mcp.handler import (  # noqa: E402
     _dispatch_github_tool,
-    _handle_mcp_request,
+    _handle_mcp_request as _handle_mcp_request_internal,
     _dispatch_mcp_tool,
     _maybe_add_log_task_nudge,
 )
+
+
+def _normalize_public_mcp_call(body: Any) -> Any:
+    """Normalize canonical public names before hosted MCP authorization/routing."""
+    if not isinstance(body, dict) or body.get("method") != "tools/call":
+        return body
+    params = body.get("params")
+    if not isinstance(params, dict):
+        return body
+    name = params.get("name")
+    if not isinstance(name, str):
+        return body
+    internal_name = normalize_public_tool_name(name)
+    if internal_name == name:
+        return body
+    return {**body, "params": {**params, "name": internal_name}}
+
+
+async def _handle_mcp_request(
+    body: Any, db: Any, data_dir: str, **kwargs: Any
+) -> dict[str, Any]:
+    """Accept canonical tool names, then share the existing secured dispatcher."""
+    return await _handle_mcp_request_internal(
+        _normalize_public_mcp_call(body), db, data_dir, **kwargs
+    )
 
 # ---------------------------------------------------------------------------
 # 9768d806 — MCP SSE transport (for dnakov/claude-mcp Chrome extension)

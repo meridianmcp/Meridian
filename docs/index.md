@@ -64,7 +64,7 @@ Both modes are configurable per-project in **Settings → Parallel Safety**.
 | `claim_sprint_item` | Claim a sprint item; returns git worktree setup commands by default |
 | `get_sprint_items` | See the sprint board — pending, in-progress, done |
 | `pin_workspace_decision` | Cross-project decisions surfaced in every session's context as capped one-line summaries (full text via `get_workspace_decisions`) |
-| `get_commits` / `list_branches` | GitHub hub: read commits, branches, PRs, issues from connected repo |
+| `get_commits` / `meridian_github_list_branches` | GitHub hub: read commits, branches, PRs, issues from connected repo |
 | `generate_handoff` | Compress full context into a resumable file (also returned by `checkpoint`) |
 
 ## Architecture

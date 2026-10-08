@@ -88,6 +88,27 @@ async def _call_stdio_tool(server, name: str, arguments: dict) -> dict:
     return json.loads(called.root.content[0].text)
 
 
+@pytest.mark.asyncio
+async def test_stdio_project_names_accept_canonical_and_legacy_aliases(db, monkeypatch):
+    server = _build_stdio_server(monkeypatch, db)
+
+    canonical_create = await _call_stdio_tool(
+        server, "meridian_project_create", {"name": "stdio-canonical-project"}
+    )
+    legacy_create = await _call_stdio_tool(
+        server, "create_project", {"name": "stdio-legacy-project"}
+    )
+    assert canonical_create["name"] == "stdio-canonical-project"
+    assert legacy_create["name"] == "stdio-legacy-project"
+
+    canonical_list = await _call_stdio_tool(server, "meridian_project_list", {})
+    legacy_list = await _call_stdio_tool(server, "list_projects", {})
+    assert {item["id"] for item in canonical_list} == {item["id"] for item in legacy_list}
+    assert {canonical_create["id"], legacy_create["id"]} <= {
+        item["id"] for item in canonical_list
+    }
+
+
 def _assert_batch_result_shape(result: dict) -> None:
     """The response CONTRACT every transport must expose identically.
 

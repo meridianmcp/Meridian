@@ -12,6 +12,13 @@ Connect your GitHub repo to Meridian and your AI sessions get live code access â
 
 That's it. Meridian validates the token against the GitHub API, encrypts it at rest, and injects the GitHub MCP tools into your planning sessions.
 
+For names also used by common MCP servers, Meridian provides collision-safe
+canonical names: `meridian_github_search_code`, `meridian_github_get_commit`,
+`meridian_github_search_commits`, `meridian_github_list_branches`, and
+`meridian_github_list_issues`, and `meridian_github_create_issue`. The former bare names remain available as
+deprecated aliases during the migration window; their tool descriptions name
+the canonical replacement.
+
 ## GitHub tools
 
 Once connected, every MCP session for your account gets these tools automatically. The connection is account-level, while each operation uses the target project's configured repository.
@@ -34,13 +41,13 @@ list_files()                  # entire repo
 list_files(path="src/")       # only files under src/
 ```
 
-### `search_code(query)`
+### `meridian_github_search_code(query)`
 
 Search the codebase using GitHub's code search. Returns up to 20 matches with file paths and links.
 
 ```
-search_code(query="def authenticate")
-search_code(query="TODO rate limit")
+meridian_github_search_code(query="def authenticate")
+meridian_github_search_code(query="TODO rate limit")
 ```
 
 ### `get_commits(limit?, since?)`
@@ -52,18 +59,19 @@ get_commits()
 get_commits(limit=25)
 ```
 
-### `get_commit(sha)`
+### `meridian_github_get_commit(sha)`
 
 Return full details for a specific commit: message, author, date, and list of changed files.
 
 ```
-get_commit(sha="a1b2c3d")
+meridian_github_get_commit(sha="a1b2c3d")
 ```
 
 ### Additional read tools
 
-The connection also exposes `search_commits`, `get_workflow_runs`,
-`get_workflow_run_logs`, `git_diff`, `list_branches`, `list_issues`, and
+The connection also exposes `meridian_github_search_commits`, `get_workflow_runs`,
+`get_workflow_run_logs`, `git_diff`, `meridian_github_list_branches`,
+`meridian_github_list_issues`, and
 `get_issue` for repository history, diffs, GitHub Actions status/logs, branches,
 and issue inspection. These operations read data from the connected repository
 and GitHub Actions/Issues APIs; they do not modify repository contents.
@@ -72,7 +80,8 @@ and GitHub Actions/Issues APIs; they do not modify repository contents.
 
 `patch_file` makes a targeted replacement and commits it to the selected
 repository branch. `trigger_workflow` dispatches a GitHub Actions workflow, and
-`create_issue` opens an issue. These are the currently exposed GitHub operations
+`meridian_github_create_issue` opens an issue (`create_issue` is its deprecated
+compatibility alias). These are the currently exposed GitHub operations
 that modify repository-adjacent state, and they require a token with the
 corresponding write permission. Meridian does not silently invoke them.
 
@@ -91,7 +100,7 @@ See [Data Handling](data-handling.md) for how this fits into Meridian's broader 
 |-------|-----|
 | "GitHub PAT is invalid or expired" | Regenerate the PAT on GitHub and reconnect. |
 | `read_file` returns 404 | Check the path (case-sensitive) and the `ref` (branch/tag/SHA). |
-| `search_code` returns 0 results | GitHub code search has a short indexing delay for new repos. Wait a minute and retry. |
+| `meridian_github_search_code` returns 0 results | GitHub code search has a short indexing delay for new repos. Wait a minute and retry. |
 | `list_files` is slow on large repos | Normal â€” GitHub returns the full recursive tree in one call. Results are cached per session. |
 
 ## Disconnecting
