@@ -4849,7 +4849,7 @@ MCP_MEMBER_POLICY_OPERATIONS: dict[str, str] = {
 MCP_MEMBER_POLICY_OPERATIONS.update({
     name: "workspace_write" for name in _WORKSPACE_MEMBER_POLICY_WRITES
 })
-MCP_MEMBER_POLICY_OPERATIONS["move_workspace_note_to_project"] = "workspace_to_project"
+MCP_MEMBER_POLICY_OPERATIONS["move_workspace_note_to_project"] = "project_write"
 MCP_MEMBER_POLICY_OPERATIONS.update({
     "create_project": "project_create",
     "set_parent_project": "project_reparent",

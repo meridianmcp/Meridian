@@ -160,6 +160,33 @@ async def test_bulk_project_ids_are_checked_against_member_scope(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_move_workspace_note_to_project_requires_only_project_write(monkeypatch, tmp_path):
+    monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
+    monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)
+    args = {"note_id": "workspace-note", "project_id": PROJECT}
+
+    with pytest.raises(member_policy.MemberPolicyDenied):
+        await mcp_handler._authorize_scoped_mcp_call(
+            "move_workspace_note_to_project",
+            args,
+            object(),
+            str(tmp_path),
+            None,
+            _scoped((PROJECT,), member_policy.WRITE_WORKSPACE_LEVEL),
+        )
+
+    result = await mcp_handler._authorize_scoped_mcp_call(
+        "move_workspace_note_to_project",
+        args,
+        object(),
+        str(tmp_path),
+        None,
+        _scoped((PROJECT,), member_policy.WRITE_PROJECT),
+    )
+    assert result == args
+
+
+@pytest.mark.asyncio
 async def test_workspace_write_requires_workspace_capability(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
     monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)

@@ -8860,8 +8860,9 @@ async def _mcp_sse_session_context(
         if resolved is None:
             return None
         ctx["enforce_role"] = resolved[0]
-        ctx["scoped_project_ids"] = await db_module.get_scoped_project_ids_for_member(
-            auth_db, ws_tid, email,
+        from . import member_policy as _member_policy  # noqa: PLC0415
+        ctx["scoped_project_ids"] = await _member_policy.resolve_member_scope(
+            auth_db, lambda: _db(request), ws_tid, email,
         )
     return ctx
 
