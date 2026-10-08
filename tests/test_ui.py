@@ -145,7 +145,7 @@ def test_control_plane_proposals_and_artifacts_are_paginated_in_the_dashboard():
     settings_src = _static_text("dashboard-settings.ts")
     assert "nextOffset," in settings_src and "prevOffset," in settings_src
     assert "&limit=${proposalPageSize}&offset=${proposalOffset}" in settings_src
-    assert "&limit=${artifactPageSize}&offset=${artifactOffset}" in settings_src
+    assert "/control-plane/artifacts?limit=${artifactPageSize}&offset=${artifactOffset}" in settings_src
     assert "data.has_more === true" in settings_src
     assert "paginationMarkup(page, items.length, 'proposals', total)" in settings_src
     assert "paginationMarkup(page, items.length, 'artifacts', data.total)" in settings_src
