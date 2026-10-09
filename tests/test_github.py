@@ -107,17 +107,25 @@ def test_new_github_tools_registered():
     ("public_name", "internal_name"),
     [
         ("meridian_project_create", "create_project"),
+        ("meridian.meridian_project_create", "create_project"),
+        ("meridian.create_project", "create_project"),
         ("meridian_project_list", "list_projects"),
+        ("meridian.meridian_project_list", "list_projects"),
         ("meridian_github_search_code", "search_code"),
+        ("meridian.meridian_github_search_code", "search_code"),
         ("meridian_github_get_commit", "get_commit"),
         ("meridian_github_search_commits", "search_commits"),
         ("meridian_github_list_branches", "list_branches"),
         ("meridian_github_list_issues", "list_issues"),
         ("meridian_github_create_issue", "create_issue"),
+        ("meridian.meridian_github_create_issue", "create_issue"),
+        ("meridian.create_issue", "create_issue"),
     ],
 )
-def test_hosted_dispatch_normalizes_canonical_names(public_name, internal_name, monkeypatch):
-    """Canonical hosted names route to existing authorization/dispatch names."""
+def test_hosted_dispatch_normalizes_canonical_and_qualified_names(
+    public_name, internal_name, monkeypatch
+):
+    """Public names route to existing authorization/dispatch names."""
     captured = []
 
     async def _capture(body, _db, _data_dir, **_kwargs):

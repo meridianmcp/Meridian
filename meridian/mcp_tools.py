@@ -30,7 +30,9 @@ PUBLIC_TOOL_NAME_TO_INTERNAL: dict[str, str] = {
 
 
 def normalize_public_tool_name(name: str) -> str:
-    """Map a canonical public tool name to its stable internal dispatcher name."""
+    """Normalize the accepted server prefix and public alias to an internal name."""
+    if name.startswith("meridian."):
+        name = name.removeprefix("meridian.")
     return PUBLIC_TOOL_NAME_TO_INTERNAL.get(name, name)
 
 
