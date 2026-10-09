@@ -3204,6 +3204,16 @@ async def get_pending_invites_for_email(
     return [r for r in (_row_to_dict(row) for row in rows) if r]
 
 
+_VALID_WORKSPACE_MEMBER_ROLES = frozenset({"owner", "admin", "member", "viewer"})
+
+
+def _workspace_member_role_or_viewer(role: Any) -> str:
+    """Fail closed when a persisted workspace role is malformed."""
+    if isinstance(role, str) and role in _VALID_WORKSPACE_MEMBER_ROLES:
+        return role
+    return "viewer"
+
+
 async def resolve_member_role(
     db: aiosqlite.Connection,
     tenant_id: str,
@@ -3237,7 +3247,7 @@ async def resolve_member_role(
     if row is None:
         return None
     return (
-        (row["role"] or "member"),
+        _workspace_member_role_or_viewer(row["role"]),
         (row["github_access"] or "read"),
     )
 
@@ -3925,7 +3935,7 @@ async def get_member_roles(
         (tenant_id, e),
     ) as cur:
         rows = await cur.fetchall()
-    return [((r["role"] or "member"), r["project_id"]) for r in rows]
+    return [(_workspace_member_role_or_viewer(r["role"]), r["project_id"]) for r in rows]
 
 
 async def get_member_authorization_context(
@@ -3983,7 +3993,7 @@ async def get_member_authorization_context(
         else:
             kind, role, project_id, policy_subject, policy = row
         if kind == "member":
-            memberships.append((role or "member", project_id))
+            memberships.append((_workspace_member_role_or_viewer(role), project_id))
         elif policy_subject == MEMBER_POLICY_DEFAULT_SUBJECT:
             policy_rows["default"] = policy
         else:

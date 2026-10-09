@@ -713,12 +713,28 @@ async def set_project_parent(
     # (parent None) needs no extra check.
     await _require_project_in_scope(request, parent_project_id)
     db = await _db(request)
+    from .. import member_policy  # noqa: PLC0415
+
+    authorized = getattr(
+        request.state, "_meridian_member_policy_authorized_parent", None,
+    )
+    compare_and_set: dict[str, Any] = {}
+    if authorized is not None:
+        if not isinstance(authorized, member_policy.AuthorizedParentSnapshot):
+            raise HTTPException(409, "project authorization snapshot is invalid")
+        if authorized.project_id != project_id:
+            raise HTTPException(409, "project authorization snapshot does not match")
+        compare_and_set = {
+            "expect_parent": authorized.parent_project_id,
+            "expect_parent_exists": authorized.parent_exists,
+        }
     try:
         updated = await db_module.set_parent_project(
-            db, project_id, parent_project_id
+            db, project_id, parent_project_id, **compare_and_set,
         )
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        status_code = 409 if str(exc) == "project changed concurrently" else 400
+        raise HTTPException(status_code, str(exc)) from exc
     if updated is None:
         raise HTTPException(404, "project not found")
     db_module.publish_global(
@@ -742,7 +758,11 @@ async def delete_project(project_id: str, request: Request) -> None:
     is unchanged and still the right choice for one project.
     """
     db = await _db(request)
-    family = await db_module.get_project_family(db, [project_id])
+    family = getattr(
+        request.state, "_meridian_member_policy_authorized_delete_family", None,
+    )
+    if family is None:
+        family = await db_module.get_project_family(db, [project_id])
     expected = family.get(project_id)
     if expected is None:
         raise HTTPException(404, "project not found")
@@ -811,7 +831,11 @@ async def delete_projects_batch(
     if scoped is not None and any(pid not in scoped for pid in project_ids):
         raise HTTPException(403, "Project is outside your access scope.")
     db = await _db(request)
-    family = await db_module.get_project_family(db, project_ids)
+    family = getattr(
+        request.state, "_meridian_member_policy_authorized_delete_family", None,
+    )
+    if family is None:
+        family = await db_module.get_project_family(db, project_ids)
     missing = [pid for pid in project_ids if pid not in family]
     if missing:
         raise HTTPException(404, f"project(s) not found: {', '.join(missing)}")
@@ -945,11 +969,17 @@ async def patch_project_organization(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    expected_status_snapshot = getattr(
+        request.state, "_meridian_member_policy_authorized_status_snapshot", None,
+    )
     try:
         updated = await db_module.set_project_status(
-            db, project_id, status=body.status, priority=body.priority
+            db, project_id, status=body.status, priority=body.priority,
+            expect_status_snapshot=expected_status_snapshot,
         )
     except ValueError as exc:
+        if str(exc).startswith(db_module._PROJECT_CHANGED_CONCURRENTLY):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise HTTPException(status_code=422, detail=str(exc))
     return updated
 

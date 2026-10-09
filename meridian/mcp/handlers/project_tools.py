@@ -72,6 +72,17 @@ async def handle_set_parent_project(
         _pid = (_p or {}).get("id", "") if _p else ""
     if not _pid:
         return {"error": "project_id (or project_name) is required"}
+    from ... import member_policy  # noqa: PLC0415
+
+    authorized = args.pop(member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG, None)
+    compare_and_set: dict[str, Any] = {}
+    if isinstance(authorized, member_policy.AuthorizedParentSnapshot):
+        if authorized.project_id != _pid:
+            return {"error": "project authorization snapshot does not match"}
+        compare_and_set = {
+            "expect_parent": authorized.parent_project_id,
+            "expect_parent_exists": authorized.parent_exists,
+        }
     _parent = args.get("parent_project_id")
     if not _parent and args.get("parent_project_name"):
         _pp = await db_module.get_project_by_name(db, str(args["parent_project_name"]))
@@ -79,7 +90,9 @@ async def handle_set_parent_project(
     if not _parent:  # "" / missing -> detach
         _parent = None
     try:
-        updated = await db_module.set_parent_project(db, _pid, _parent)
+        updated = await db_module.set_parent_project(
+            db, _pid, _parent, **compare_and_set,
+        )
     except ValueError as exc:
         return {"error": str(exc)}
     if updated is None:

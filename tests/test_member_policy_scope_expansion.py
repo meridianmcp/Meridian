@@ -116,9 +116,10 @@ async def test_expected_delete_serializes_same_connection_hierarchy_changes(spli
     verify = db_module._verify_delete_expectations
 
     async def pause_after_verify(db, project_ids, expect):
-        await verify(db, project_ids, expect)
+        result = await verify(db, project_ids, expect)
         verified.set()
         await resume.wait()
+        return result
 
     monkeypatch.setattr(db_module, "_verify_delete_expectations", pause_after_verify)
     deleting = asyncio.create_task(
@@ -968,11 +969,13 @@ def _callers() -> set[str]:
     return found
 
 
-def test_only_the_sse_per_message_path_still_uses_the_legacy_scope_lookup():
-    """``db.get_scoped_project_ids_for_member`` returns the EXPLICIT grants only.
-    The regular request resolver uses the combined authorization-context read;
-    only server.py's per-SSE-message lookup remains for its own lane."""
-    assert _callers() == {"meridian/server.py"}
+def test_regular_request_resolution_no_longer_uses_legacy_scope_lookup():
+    """The request resolver now reads one atomic authorization context.
+
+    No callers should use the legacy explicit-grants-only lookup; SSE has also
+    moved to the combined context path.
+    """
+    assert _callers() == set()
 
 
 @pytest.mark.xfail(

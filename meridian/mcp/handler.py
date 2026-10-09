@@ -1201,6 +1201,12 @@ async def _authorize_scoped_mcp_call(
     from .. import member_policy  # noqa: PLC0415
     from ..mcp_tools import member_policy_operation  # noqa: PLC0415
 
+    # Never trust an argument that resembles our private compare-and-set
+    # context. A fresh, typed snapshot is attached only after this call passes
+    # the member capability check below.
+    args = dict(args)
+    args.pop(member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG, None)
+
     operation_name = name.rsplit("__", 1)[-1] if tunnel_candidate else name
     operation = member_policy_operation(name) or member_policy_operation(operation_name)
     normalized_name = operation_name.lower().replace("-", "_")
@@ -1539,6 +1545,22 @@ async def _authorize_scoped_mcp_call(
         # entry adds the workspace-level grant requirement independently.
         member_policy.require_capabilities(
             scoped_project_ids, {member_policy.WRITE_WORKSPACE_LEVEL},
+        )
+    if (
+        operation == "project_reparent"
+        and normalized_name == "set_parent_project"
+        and not tunnel_candidate
+    ):
+        project_id = args.get("project_id")
+        row = family.get(project_id)
+        if row is None:
+            raise ValueError("project is outside your access scope")
+        args[member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG] = (
+            member_policy.AuthorizedParentSnapshot(
+                project_id=project_id,
+                parent_project_id=row.get("parent_project_id") or None,
+                parent_exists=bool(row.get("parent_exists")),
+            )
         )
     return args
 

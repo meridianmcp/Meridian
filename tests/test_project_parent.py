@@ -7,6 +7,9 @@ the DB layer and both tools through the real _dispatch_mcp_tool path.
 """
 from __future__ import annotations
 
+import asyncio
+import uuid
+
 import pytest
 
 from meridian import db as db_module
@@ -310,3 +313,90 @@ async def test_create_project_under_a_top_level_parent_still_works(db):
         await db_module.create_project(db, "cas-create-grandkid", parent_project_id=kid["id"])
     with pytest.raises(ValueError, match="does not exist"):
         await db_module.create_project(db, "cas-create-nobody", parent_project_id="nope")
+
+
+@pytest.mark.asyncio
+async def test_postgres_hierarchy_writes_wait_for_other_connection_lock():
+    """Child creation and reparenting take a cross-connection PG table lock."""
+    import conftest
+
+    pg_url = conftest._pg_test_url()
+    if not pg_url:
+        pytest.skip("Postgres hierarchy locking requires TEST_DATABASE_URL")
+    await conftest._ensure_pg_schema_built(pg_url)
+
+    from meridian.pg_adapter import open_pg_connection
+
+    blocker = await open_pg_connection(pg_url)
+    writer = await open_pg_connection(pg_url)
+    created_ids: list[str] = []
+    suffix = uuid.uuid4().hex
+    async with writer.execute("SELECT 1") as cur:
+        await cur.fetchone()
+
+    class _ObservedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+            self.lock_attempted = asyncio.Event()
+
+        async def execute(self, sql, params=()):
+            if sql.strip().upper() == "LOCK TABLE PROJECTS IN SHARE ROW EXCLUSIVE MODE":
+                self.lock_attempted.set()
+            return await self.inner.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    observed_writer = _ObservedConnection(writer)
+
+    async def must_wait_for_row_exclusive(operation):
+        observed_writer.lock_attempted.clear()
+        task = None
+        async with blocker.begin_transaction():
+            try:
+                await blocker.execute("LOCK TABLE projects IN ROW EXCLUSIVE MODE")
+                task = asyncio.create_task(operation())
+                await asyncio.wait_for(observed_writer.lock_attempted.wait(), timeout=5)
+                await asyncio.sleep(0.05)
+                completed_while_lock_held = task.done()
+                await blocker.commit()
+            except BaseException:
+                await blocker.rollback()
+                if task is not None and not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
+        assert task is not None
+        if completed_while_lock_held:
+            await task
+            pytest.fail("hierarchy mutation skipped its conflicting table lock")
+        return await asyncio.wait_for(task, timeout=10)
+
+    try:
+        parent = await db_module.create_project(writer, f"cas-lock-parent-{suffix}")
+        created_ids.append(parent["id"])
+        target = await db_module.create_project(writer, f"cas-lock-target-{suffix}")
+        created_ids.append(target["id"])
+        source = await db_module.create_project(writer, f"cas-lock-source-{suffix}")
+        created_ids.append(source["id"])
+
+        child = await must_wait_for_row_exclusive(
+            lambda: db_module.create_project(
+                observed_writer,
+                f"cas-lock-child-{suffix}",
+                parent_project_id=parent["id"],
+            )
+        )
+        created_ids.append(child["id"])
+        assert child["parent_project_id"] == parent["id"]
+
+        moved = await must_wait_for_row_exclusive(
+            lambda: db_module.set_parent_project(
+                observed_writer, source["id"], target["id"]
+            )
+        )
+        assert moved["parent_project_id"] == target["id"]
+    finally:
+        for project_id in reversed(created_ids):
+            await db_module.delete_project(writer, project_id)
+        await blocker.close()
+        await writer.close()

@@ -7,6 +7,7 @@ import meridian.server  # noqa: F401 -- load server before handler to avoid its 
 from meridian import db as db_module
 from meridian import member_policy
 from meridian.mcp import handler as mcp_handler
+from meridian.mcp.handlers import project_tools
 from meridian.mcp_tools import MCP_MEMBER_POLICY_OPERATIONS
 
 
@@ -494,3 +495,71 @@ def test_mcp_policy_registry_covers_project_hierarchy_operations():
     assert MCP_MEMBER_POLICY_OPERATIONS["merge_project"] == "project_merge"
     assert MCP_MEMBER_POLICY_OPERATIONS["delete_projects_batch"] == "project_delete"
     assert MCP_MEMBER_POLICY_OPERATIONS["archive_project"] == "project_status"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["detach", "delete_parent"])
+async def test_mcp_reparent_uses_the_authorized_parent_snapshot(
+    anydb, monkeypatch, tmp_path, race,
+):
+    db = anydb
+    parent = await db_module.create_project(db, f"member-mcp-source-{race}")
+    target = await db_module.create_project(db, f"member-mcp-target-{race}")
+    child = await db_module.create_project(
+        db, f"member-mcp-child-{race}", parent_project_id=parent["id"],
+    )
+
+    monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
+    monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)
+    authorized_args = await mcp_handler._authorize_scoped_mcp_call(
+        "set_parent_project",
+        {
+            "project_id": child["id"],
+            "parent_project_id": target["id"],
+            # Caller-supplied lookalike context must be discarded and replaced
+            # with the exact, typed snapshot observed by the policy gate.
+            member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG: {
+                "project_id": child["id"],
+                "parent_project_id": None,
+                "parent_exists": False,
+            },
+        },
+        db,
+        str(tmp_path),
+        None,
+        _scoped(
+            (child["id"], parent["id"], target["id"]),
+            member_policy.WRITE_PROJECT,
+            member_policy.CREATE_SUBPROJECT,
+            member_policy.DELETE_SUBPROJECT,
+        ),
+    )
+
+    snapshot = authorized_args[member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG]
+    assert isinstance(snapshot, member_policy.AuthorizedParentSnapshot)
+    assert snapshot.project_id == child["id"]
+    assert snapshot.parent_project_id == parent["id"]
+    assert snapshot.parent_exists is True
+
+    if race == "detach":
+        await db_module.set_parent_project(db, child["id"], None)
+    else:
+        # Parent deletion leaves a supported orphan state: the parent id stays
+        # the same while the policy classification changes from subproject to
+        # orphan, which needs the additional delete_project capability.
+        await db_module.delete_project(db, parent["id"])
+
+    result = await project_tools.handle_set_parent_project(
+        authorized_args, db, str(tmp_path), None, None,
+    )
+    assert "project changed concurrently" in result["error"]
+
+    saved = await db_module.get_project(db, child["id"])
+    assert saved is not None
+    if race == "detach":
+        assert saved["parent_project_id"] is None
+    else:
+        assert saved["parent_project_id"] == parent["id"]
+        assert (await db_module.get_project(db, parent["id"])) is None
+    target_after = await db_module.get_project(db, target["id"])
+    assert target_after["parent_project_id"] is None

@@ -5,6 +5,8 @@ import asyncio
 import importlib
 from datetime import datetime, timezone
 
+import pytest
+
 import meridian.server  # noqa: F401
 from meridian import db as db_module
 
@@ -260,6 +262,37 @@ def test_task_session_and_profile_mutations_allow_explicit_capabilities(monkeypa
         assert allowed_project_profile.status_code == 200, allowed_project_profile.text
 
 
+def test_malformed_empty_workspace_role_fails_closed_for_project_writes(
+    monkeypatch, tmp_path,
+):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_workspace(client.app.state.db))
+        member = {
+            "Authorization": f"Bearer {setup['member_token']}",
+            "X-Workspace-Tenant-Id": setup["owner_id"],
+        }
+
+        async def _corrupt_member_role():
+            await client.app.state.db.execute(
+                "UPDATE workspace_members SET role='' WHERE tenant_id=? AND email=?",
+                (setup["owner_id"], "member-http-scoped@example.com"),
+            )
+            await client.app.state.db.commit()
+
+        asyncio.run(_corrupt_member_role())
+
+        response = client.post(
+            "/sessions/register", headers=member,
+            json={"project_id": setup["project"], "name": "malformed-role-write"},
+        )
+
+        assert response.status_code == 403, response.text
+        payload = response.json()
+        assert payload["error"] == "forbidden"
+        assert "viewer" in payload["message"]
+        assert "cannot perform this action" in payload["message"]
+
+
 def test_nonproject_member_policy_scope_is_checked_before_capability(monkeypatch, tmp_path):
     with _hosted_client(monkeypatch, tmp_path) as client:
         setup = asyncio.run(_seed_workspace(client.app.state.db))
@@ -310,6 +343,156 @@ def test_nonproject_policy_lookup_errors_fail_closed_with_http_503(monkeypatch, 
             f"/tasks/{task['id']}", headers=member, json={"status": "failed"},
         )
         assert response.status_code == 503, response.text
+
+
+def test_scoped_http_reparent_uses_the_parent_that_was_authorized(monkeypatch, tmp_path):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_workspace(client.app.state.db))
+        db = client.app.state.db
+        child = _run(db_module.create_project(
+            db, "member-http-reparent-race-child", parent_project_id=setup["project"],
+        ))
+        _run(_set_member_policy(
+            db, setup["owner_id"], {
+                "create_subproject": True,
+                "delete_subproject": True,
+                "delete_project": False,
+            },
+        ))
+        member = {
+            "Authorization": f"Bearer {setup['member_token']}",
+            "X-Workspace-Tenant-Id": setup["owner_id"],
+        }
+
+        original_gate = server_module._member_policy_project_write_response
+        raced = []
+
+        async def authorize_then_detach(request):
+            response = await original_gate(request)
+            if request.method == "POST" and request.url.path == (
+                f"/projects/{child['id']}/parent"
+            ):
+                raced.append(True)
+                await db_module.set_parent_project(db, child["id"], None)
+            return response
+
+        monkeypatch.setattr(
+            server_module, "_member_policy_project_write_response", authorize_then_detach,
+        )
+        response = client.post(
+            f"/projects/{child['id']}/parent", headers=member,
+            json={"parent_project_id": setup["other"]},
+        )
+
+        assert raced == [True]
+        assert response.status_code == 409, response.text
+        saved = _run(db_module.get_project(db, child["id"]))
+        assert saved is not None
+        assert saved["parent_project_id"] is None
+
+
+def test_scoped_http_archive_revalidates_the_hierarchy_snapshot(
+    monkeypatch, tmp_path,
+):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_workspace(client.app.state.db))
+        db = client.app.state.db
+        _run(_set_member_policy(
+            db, setup["owner_id"],
+            {
+                "write_project": True,
+                "delete_project": True,
+                "delete_subproject": False,
+            },
+        ))
+        member = {
+            "Authorization": f"Bearer {setup['member_token']}",
+            "X-Workspace-Tenant-Id": setup["owner_id"],
+        }
+
+        original_gate = server_module._member_policy_project_write_response
+        raced = []
+
+        async def authorize_then_add_child(request):
+            response = await original_gate(request)
+            if (
+                request.method == "PATCH"
+                and request.url.path
+                == f"/projects/{setup['project']}/organization"
+            ):
+                raced.append(True)
+                await db_module.create_project(
+                    db,
+                    "member-http-archive-race-child",
+                    parent_project_id=setup["project"],
+                )
+            return response
+
+        monkeypatch.setattr(
+            server_module,
+            "_member_policy_project_write_response",
+            authorize_then_add_child,
+        )
+        response = client.patch(
+            f"/projects/{setup['project']}/organization",
+            headers=member,
+            json={"status": "archived"},
+        )
+
+        assert raced == [True]
+        assert response.status_code == 409, response.text
+        saved = _run(db_module.get_project(db, setup["project"]))
+        assert saved is not None
+        assert saved["status"] == "active"
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_scoped_http_delete_uses_the_hierarchy_snapshot_that_was_authorized(
+    monkeypatch, tmp_path, batch,
+):
+    with _hosted_client(monkeypatch, tmp_path) as client:
+        setup = asyncio.run(_seed_workspace(client.app.state.db))
+        db = client.app.state.db
+        child = _run(db_module.create_project(
+            db, "member-http-delete-race-child", parent_project_id=setup["project"],
+        ))
+        _run(_set_member_policy(
+            db, setup["owner_id"],
+            {"delete_subproject": True, "delete_project": False},
+        ))
+        member = {
+            "Authorization": f"Bearer {setup['member_token']}",
+            "X-Workspace-Tenant-Id": setup["owner_id"],
+        }
+
+        original_gate = server_module._member_policy_project_write_response
+        raced = []
+
+        async def authorize_then_detach(request):
+            response = await original_gate(request)
+            if request.method == "DELETE" and request.url.path in {
+                f"/projects/{child['id']}", "/projects",
+            }:
+                raced.append(True)
+                await db_module.set_parent_project(db, child["id"], None)
+            return response
+
+        monkeypatch.setattr(
+            server_module, "_member_policy_project_write_response", authorize_then_detach,
+        )
+        if batch:
+            response = client.delete(
+                "/projects", headers=member,
+                params=[("project_id", child["id"])],
+            )
+        else:
+            response = client.delete(f"/projects/{child['id']}", headers=member)
+
+        assert raced == [True]
+        assert response.status_code == 409, response.text
+        saved = _run(db_module.get_project(db, child["id"]))
+        assert saved is not None
+        assert saved["parent_project_id"] is None
 
 
 import meridian.server as server_module

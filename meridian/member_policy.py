@@ -46,6 +46,23 @@ _log = logging.getLogger(__name__)
 
 POLICY_REFUSAL: Final[str] = "member policy"
 
+# Private dispatch context carrying the hierarchy decision from the scoped MCP
+# authorization gate to the database compare-and-set used by set_parent_project.
+# JSON callers can provide a string under this key, but only this in-process
+# value type is accepted by the mutating handler.
+MEMBER_POLICY_AUTHORIZED_PARENT_ARG: Final[str] = (
+    "_meridian_member_policy_authorized_parent"
+)
+
+
+@dataclass(frozen=True)
+class AuthorizedParentSnapshot:
+    """The exact parent classification used to authorize one re-parent call."""
+
+    project_id: str
+    parent_project_id: str | None
+    parent_exists: bool
+
 # ---------------------------------------------------------------------------
 # Capability catalog
 # ---------------------------------------------------------------------------

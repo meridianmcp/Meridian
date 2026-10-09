@@ -51,12 +51,32 @@ def _project_hierarchy_write_lock(db: aiosqlite.Connection) -> asyncio.Lock:
 
 
 @asynccontextmanager
-async def _project_hierarchy_write_guard(db: aiosqlite.Connection):
-    # Postgres' table lock below is shared across processes; the in-memory lock
-    # exists only to serialize tasks sharing one SQLite connection.
-    if callable(getattr(db, "begin_transaction", None)):
-        yield
+async def _project_hierarchy_write_guard(
+    db: aiosqlite.Connection, *, postgres_serialization: bool = False
+):
+    begin_transaction = getattr(db, "begin_transaction", None)
+    if callable(begin_transaction):
+        if not postgres_serialization:
+            yield
+            return
+        # Row-level CAS predicates cannot serialize writes to different rows
+        # when one statement checks the other's membership subquery. Pin a
+        # transaction and take the same table lock used by expected deletes;
+        # it conflicts with every INSERT/UPDATE/DELETE on projects, including
+        # writes from another process that do not use this helper.
+        async with begin_transaction():
+            try:
+                await db.execute("LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE")
+                yield
+            except BaseException:
+                try:
+                    await db.rollback()
+                except BaseException:  # preserve the error that caused rollback
+                    _log.exception("could not roll back project hierarchy write")
+                raise
         return
+    # SQLite's database write lock serializes independent connections; this
+    # asyncio lock also prevents tasks sharing one connection from interleaving.
     async with _project_hierarchy_write_lock(db):
         yield
 
@@ -1457,12 +1477,12 @@ async def create_project(
     tenant_id: str | None = None,
     parent_project_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create a project, serializing child membership changes per connection."""
+    """Create a project, serializing child membership changes across writers."""
     if parent_project_id is None:
         return await _create_project_unlocked(
             db, name, human_id, execution_mode, tenant_id, parent_project_id
         )
-    async with _project_hierarchy_write_guard(db):
+    async with _project_hierarchy_write_guard(db, postgres_serialization=True):
         return await _create_project_unlocked(
             db, name, human_id, execution_mode, tenant_id, parent_project_id
         )
@@ -1544,9 +1564,15 @@ async def set_project_status(
     project_id: str,
     status: str | None = None,
     priority: str | None = None,
+    expect_status_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """8db00fcb — update a project's organization fields (status/priority).
-    Validates the enums; only the provided fields change."""
+    """8db00fcb -- update a project's organization fields (status/priority).
+
+    Validates the enums; only the provided fields change. When a status
+    authorization snapshot is supplied, hierarchy and current status are
+    revalidated under the hierarchy write guard in the same transaction as
+    the update.
+    """
     sets: list[str] = []
     params: list[Any] = []
     if status is not None:
@@ -1563,12 +1589,65 @@ async def set_project_status(
             )
         sets.append("priority = ?")
         params.append(priority)
-    if sets:
+
+    if expect_status_snapshot is not None:
+        required = {
+            "project_id", "current_status", "requested_status",
+            "parent_project_id", "parent_exists", "child_ids",
+        }
+        if not isinstance(expect_status_snapshot, dict):
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid status snapshot"
+            )
+        child_ids = expect_status_snapshot.get("child_ids")
+        expected_parent = expect_status_snapshot.get("parent_project_id")
+        if (
+            not required.issubset(expect_status_snapshot)
+            or status is None
+            or expect_status_snapshot.get("project_id") != project_id
+            or expect_status_snapshot.get("requested_status") != status
+            or not isinstance(expected_parent, (str, type(None)))
+            or not isinstance(expect_status_snapshot.get("parent_exists"), bool)
+            or not isinstance(child_ids, (list, tuple, set))
+            or any(not isinstance(child_id, str) for child_id in child_ids)
+        ):
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid status snapshot"
+            )
+        expected_children = set(child_ids)
+        expected_parent = expected_parent or None
+        async with _project_hierarchy_write_guard(db):
+            async with _expected_project_delete_transaction(db):
+                family = await get_project_family(db, [project_id])
+                current = family.get(project_id)
+                if current is None:
+                    raise ValueError(
+                        f"{_PROJECT_CHANGED_CONCURRENTLY}: project no longer exists"
+                    )
+                if (
+                    current.get("status")
+                    != expect_status_snapshot.get("current_status")
+                    or (current.get("parent_project_id") or None) != expected_parent
+                    or bool(current.get("parent_exists"))
+                    != bool(expect_status_snapshot.get("parent_exists"))
+                    or set(current.get("child_ids") or ()) != expected_children
+                ):
+                    raise ValueError(
+                        f"{_PROJECT_CHANGED_CONCURRENTLY}: project status or hierarchy changed"
+                    )
+                if sets:
+                    params.append(project_id)
+                    await db.execute(
+                        f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
+                    )
+    elif sets:
         params.append(project_id)
         await db.execute(
             f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
         )
         await db.commit()
+
+    if sets:
         # 8a665a03 -- status / priority decide how the sidebar groups and badges a project.
         _publish_projects_changed(db, "organization")
     return await get_project(db, project_id)
@@ -1683,6 +1762,7 @@ async def _set_parent_project_unlocked(
     project_id: str,
     parent_project_id: str | None,
     expect_parent: "str | None | object" = _UNSET,
+    expect_parent_exists: "bool | object" = _UNSET,
 ) -> dict[str, Any] | None:
     """7acb8563 — set / change / clear a project's parent AFTER creation.
 
@@ -1700,9 +1780,12 @@ async def _set_parent_project_unlocked(
 
     ``expect_parent`` makes the write a compare-and-set for a caller that decided
     what to allow from the project's parent as it saw it: pass the parent id it
-    classified (``None`` or ``""`` for top-level). If the project has a different
-    parent by the time of the write, nothing is changed and ``ValueError("project
-    changed concurrently")`` is raised. Left out, the parent is not compared.
+    classified (``None`` or ``""`` for top-level). ``expect_parent_exists`` can
+    additionally bind that decision to whether that parent row existed, so a
+    concurrent parent deletion/recreation cannot change a subproject into an
+    orphan (or vice versa) after authorization. If either value differs by the
+    time of the write, nothing is changed and ``ValueError("project changed
+    concurrently")`` is raised. Leave both out for the legacy behavior.
 
     The write itself is ONE conditional UPDATE (not the validation above followed by
     a blind UPDATE): when nesting it only matches while the project still has no
@@ -1721,6 +1804,18 @@ async def _set_parent_project_unlocked(
         (project.get("parent_project_id") or "") != (expect_parent or "")
     ):
         raise ValueError(_PROJECT_CHANGED_CONCURRENTLY)
+    if expect_parent_exists is not _UNSET:
+        if not isinstance(expect_parent_exists, bool) or expect_parent is _UNSET:
+            raise ValueError("expect_parent_exists requires a parent compare-and-set")
+        current_parent_id = project.get("parent_project_id")
+        current_parent_exists = False
+        if current_parent_id:
+            async with db.execute(
+                "SELECT 1 FROM projects WHERE id = ?", (current_parent_id,)
+            ) as cur:
+                current_parent_exists = await cur.fetchone() is not None
+        if current_parent_exists is not expect_parent_exists:
+            raise ValueError(_PROJECT_CHANGED_CONCURRENTLY)
     if parent_project_id is not None:
         if parent_project_id == project_id:
             raise ValueError("a project cannot be its own parent")
@@ -1749,6 +1844,15 @@ async def _set_parent_project_unlocked(
     if expect_parent is not _UNSET:
         sql += " AND COALESCE(parent_project_id, '') = ?"
         params.append(expect_parent or "")
+    if expect_parent_exists is not _UNSET:
+        current_parent_id = project.get("parent_project_id")
+        if current_parent_id:
+            existence_clause = "EXISTS" if expect_parent_exists else "NOT EXISTS"
+            sql += (
+                f" AND {existence_clause} "
+                "(SELECT 1 FROM projects expected_parent WHERE expected_parent.id = ?)"
+            )
+            params.append(current_parent_id)
     if parent_project_id is not None:
         sql += (
             " AND NOT EXISTS (SELECT 1 FROM projects c WHERE c.parent_project_id = ?)"
@@ -1771,11 +1875,12 @@ async def set_parent_project(
     project_id: str,
     parent_project_id: str | None,
     expect_parent: "str | None | object" = _UNSET,
+    expect_parent_exists: "bool | object" = _UNSET,
 ) -> dict[str, Any] | None:
-    """Set a project's parent under the per-connection hierarchy write lock."""
-    async with _project_hierarchy_write_guard(db):
+    """Set a project's parent under the backend's hierarchy write lock."""
+    async with _project_hierarchy_write_guard(db, postgres_serialization=True):
         return await _set_parent_project_unlocked(
-            db, project_id, parent_project_id, expect_parent
+            db, project_id, parent_project_id, expect_parent, expect_parent_exists
         )
 
 

@@ -1599,6 +1599,9 @@ async def _member_policy_project_write_response(request: Request) -> Response | 
     from . import member_policy  # noqa: PLC0415
     from ._deps import _deny_unless_in_scope, _scoped_project_ids_for_request  # noqa: PLC0415
 
+    authorized_parent = None
+    authorized_delete_family = None
+    authorized_status_snapshot = None
     try:
         scoped = await _scoped_project_ids_for_request(request)
         if scoped is None:
@@ -1629,22 +1632,33 @@ async def _member_policy_project_write_response(request: Request) -> Response | 
                 _deny_unless_in_scope(scoped, parent_id)
 
             db = await _db(request)
-            project = await db_module.get_project(db, project_id)
+            ids = [project_id] + ([parent_id] if parent_id else [])
+            family = await db_module.get_project_family(db, ids)
+            project = family.get(project_id)
             if project is None:
                 raise HTTPException(403, "Project is outside your access scope.")
             current_parent_id = project.get("parent_project_id")
-            current_parent = (
-                await db_module.get_project(db, current_parent_id)
-                if current_parent_id else None
-            )
-            new_parent = (
-                await db_module.get_project(db, parent_id)
-                if parent_id else None
-            )
+            new_parent = family.get(parent_id) if parent_id else None
+            if parent_id and new_parent is None:
+                raise HTTPException(403, "Project is outside your access scope.")
+            project = {"id": project_id, **project}
+            if current_parent_id and current_parent_id in family:
+                current_parent = {
+                    "id": current_parent_id, **family[current_parent_id],
+                }
+            else:
+                current_parent = None
+            if new_parent is not None:
+                new_parent = {"id": parent_id, **new_parent}
             caps = set(member_policy.required_caps_for_reparent(
                 project, current_parent, new_parent,
             ))
             target = project_id
+            authorized_parent = member_policy.AuthorizedParentSnapshot(
+                project_id=project_id,
+                parent_project_id=current_parent_id or None,
+                parent_exists=bool(project.get("parent_exists")),
+            )
         elif request.method == "PATCH" and project_id and path == f"/projects/{project_id}/organization":
             body = await _read_member_policy_json_object(request)
             db = await _db(request)
@@ -1670,55 +1684,60 @@ async def _member_policy_project_write_response(request: Request) -> Response | 
                 project, body.get("status"), family,
             ))
             target = project_id
+            if body.get("status") is not None:
+                snapshot_family = family.get(project_id)
+                if snapshot_family is None:
+                    raise HTTPException(403, "Project is outside your access scope.")
+                authorized_status_snapshot = {
+                    "project_id": project_id,
+                    "current_status": project.get("status"),
+                    "requested_status": body.get("status"),
+                    "parent_project_id": project.get("parent_project_id"),
+                    "parent_exists": bool(snapshot_family.get("parent_exists")),
+                    "child_ids": list(snapshot_family.get("child_ids") or ()),
+                }
         elif request.method == "DELETE" and path == "/projects":
             project_ids = list(dict.fromkeys(request.query_params.getlist("project_id")))
             # The entire batch is scope-checked before project existence is read.
             for pid in project_ids:
                 _deny_unless_in_scope(scoped, pid)
             db = await _db(request)
-            rows = await db_module.list_projects(db)
-            by_id = {str(row.get("id")): row for row in rows}
+            family = await db_module.get_project_family(db, project_ids)
             family = {
-                str(row.get("id")): {
-                    "parent_exists": bool(
-                        row.get("parent_project_id")
-                        and row.get("parent_project_id") in by_id
-                    ),
-                    "child_ids": [
-                        str(child.get("id")) for child in rows
-                        if child.get("parent_project_id") == row.get("id")
-                    ],
-                }
-                for row in rows
+                pid: {"id": pid, **row}
+                for pid, row in family.items()
             }
             caps = set(member_policy.required_caps_for_delete(
-                [by_id[pid] for pid in project_ids if pid in by_id],
+                [family[pid] for pid in project_ids if pid in family],
                 family,
             ))
             target = ",".join(project_ids) if project_ids else None
+            authorized_delete_family = family
         elif request.method == "DELETE" and project_id and path == f"/projects/{project_id}":
             db = await _db(request)
-            project = await db_module.get_project(db, project_id)
-            if project is not None:
-                rows = await db_module.list_projects(db)
-                by_id = {str(row.get("id")): row for row in rows}
+            family = await db_module.get_project_family(db, [project_id])
+            if project_id in family:
                 family = {
-                    str(row.get("id")): {
-                        "parent_exists": bool(
-                            row.get("parent_project_id")
-                            and row.get("parent_project_id") in by_id
-                        ),
-                        "child_ids": [
-                            str(child.get("id")) for child in rows
-                            if child.get("parent_project_id") == row.get("id")
-                        ],
-                    }
-                    for row in rows
+                    pid: {"id": pid, **row}
+                    for pid, row in family.items()
                 }
-                caps = set(member_policy.required_caps_for_delete(project, family))
+                caps = set(member_policy.required_caps_for_delete(
+                    family[project_id], family,
+                ))
             target = project_id
+            authorized_delete_family = family
 
         member_policy.require_capabilities(scoped, caps, target=target)
+        if authorized_parent is not None:
+            request.state._meridian_member_policy_authorized_parent = authorized_parent
+        if authorized_delete_family is not None:
+            request.state._meridian_member_policy_authorized_delete_family = (
+                authorized_delete_family
+            )
+        if authorized_status_snapshot is not None:
+            request.state._meridian_member_policy_authorized_status_snapshot = (
+                authorized_status_snapshot
+            )
     except member_policy.MemberPolicyUnavailable:
         return JSONResponse(
             {"detail": "Member policy check unavailable"},
