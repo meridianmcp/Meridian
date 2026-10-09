@@ -100,7 +100,7 @@ In the dashboard, click **New Project** and give it a name (e.g. `my-project`).
 
 Or via the MCP tools (after Step 3):
 ```
-create_project(name="my-project")
+meridian_project_create(name="my-project")
 ```
 
 ---

@@ -3,7 +3,37 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any
+
+
+# Public MCP names that are unambiguous in multi-server clients. Keep the
+# legacy names as deprecated aliases during the migration window; the call
+# transports normalize canonical names back to the existing internal routes.
+NATIVE_CANONICAL_TOOL_NAMES: dict[str, str] = {
+    "create_project": "meridian_project_create",
+    "list_projects": "meridian_project_list",
+}
+GITHUB_CANONICAL_TOOL_NAMES: dict[str, str] = {
+    "search_code": "meridian_github_search_code",
+    "get_commit": "meridian_github_get_commit",
+    "search_commits": "meridian_github_search_commits",
+    "list_branches": "meridian_github_list_branches",
+    "list_issues": "meridian_github_list_issues",
+    "create_issue": "meridian_github_create_issue",
+}
+PUBLIC_TOOL_NAME_TO_INTERNAL: dict[str, str] = {
+    canonical: legacy
+    for names in (NATIVE_CANONICAL_TOOL_NAMES, GITHUB_CANONICAL_TOOL_NAMES)
+    for legacy, canonical in names.items()
+}
+
+
+def normalize_public_tool_name(name: str) -> str:
+    """Normalize the accepted server prefix and public alias to an internal name."""
+    if name.startswith("meridian."):
+        name = name.removeprefix("meridian.")
+    return PUBLIC_TOOL_NAME_TO_INTERNAL.get(name, name)
 
 
 _TOOL_EXAMPLES: dict[str, str] = {
@@ -4763,6 +4793,32 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["hook_id"]}},
 ]
 
+# Publish the distinctive canonical names first so clients that rank the
+# registry see them before the deprecated, collision-prone aliases. The
+# dispatcher still uses the original internal names via
+# normalize_public_tool_name().
+for _legacy_name, _canonical_name in NATIVE_CANONICAL_TOOL_NAMES.items():
+    _legacy_tool = next(
+        tool for tool in _MCP_TOOLS_LIST if tool["name"] == _legacy_name
+    )
+    _canonical_tool = deepcopy(_legacy_tool)
+    _canonical_tool["name"] = _canonical_name
+    _legacy_description = _legacy_tool["description"]
+    _canonical_tool["description"] = (
+        _legacy_description.rstrip()
+        + f" Use `{_canonical_name}` as the canonical Meridian tool name."
+    )
+    _legacy_tool["description"] = (
+        f"DEPRECATED: use `{_canonical_name}`. This legacy alias remains "
+        f"supported during the migration window. {_legacy_description}"
+    )
+    _MCP_TOOLS_LIST.insert(_MCP_TOOLS_LIST.index(_legacy_tool), _canonical_tool)
+    _example = _TOOL_EXAMPLES.pop(_legacy_name, None)
+    if _example:
+        _TOOL_EXAMPLES[_canonical_name] = _example.replace(
+            _legacy_name, _canonical_name, 1
+        )
+
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
@@ -5808,6 +5864,29 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }
+
+for _legacy_name, _canonical_name in NATIVE_CANONICAL_TOOL_NAMES.items():
+    if _legacy_name in _READ_ONLY_TOOLS:
+        _READ_ONLY_TOOLS.add(_canonical_name)
+    if _legacy_name in _DESTRUCTIVE_TOOLS:
+        _DESTRUCTIVE_TOOLS.add(_canonical_name)
+    if _legacy_name in _TOOL_CATEGORY:
+        _TOOL_CATEGORY[_canonical_name] = _TOOL_CATEGORY[_legacy_name]
+    if _legacy_name in _TOOL_ROLE_RELEVANCE:
+        _TOOL_ROLE_RELEVANCE[_canonical_name] = _TOOL_ROLE_RELEVANCE[
+            _legacy_name
+        ]
+    if _legacy_name in _TOOL_WORKFLOW_TIER:
+        _TOOL_WORKFLOW_TIER[_canonical_name] = _TOOL_WORKFLOW_TIER[
+            _legacy_name
+        ]
+
+_TITLE_OVERRIDES.update({
+    "meridian_project_create": "Meridian Project Create",
+    "meridian_project_list": "Meridian Project List",
+    "create_project": "DEPRECATED: use meridian_project_create",
+    "list_projects": "DEPRECATED: use meridian_project_list",
+})
 
 for _tool in _MCP_TOOLS_LIST:
     _is_read_only = _tool["name"] in _READ_ONLY_TOOLS
