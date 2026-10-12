@@ -4798,6 +4798,11 @@ async def _handle_session_tools(
     extraction: zero behaviour change, same tool names, same arguments, same
     return values.
     """
+    from ..agent_packets import handle_build_agent_packet  # noqa: PLC0415
+    from ..fanout_ledger import (  # noqa: PLC0415
+        handle_get_fanout_run,
+        handle_record_fanout_results,
+    )
     from .handlers.session_tools import (  # noqa: PLC0415
         handle_checkpoint,
         handle_register_external_job,
@@ -4903,6 +4908,10 @@ async def _handle_session_tools(
         "start_remote_task": handle_start_remote_task,
         "get_remote_task_status": handle_get_remote_task_status,
         "list_remote_tasks": handle_list_remote_tasks,
+        # 5c78017e slice 1 — fan-out ledger: per-agent digests in ai_log_events.
+        "record_fanout_results": handle_record_fanout_results,
+        "get_fanout_run": handle_get_fanout_run,
+        "build_agent_packet": handle_build_agent_packet,
     }
 
     if name in _standard_dispatch:

@@ -4761,6 +4761,55 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "blocking": {"type": "boolean", "description": "true = real exit-code-blocking semantics. false = advisory/non-blocking."},
          "enabled": {"type": "boolean", "description": "Enable/disable this hook. Disabling immediately removes any already-written artifact files for it (best-effort)."}},
          "required": ["hook_id"]}},
+    {"name": "record_fanout_results", "description":
+        "Record the per-agent results of one fan-out run (a batch of parallel "
+        "research subagents) as durable digests in ai_log_events, correlated by "
+        "run_id. Each entry is one agent's verdict with a url, a quote of at most "
+        "280 characters and an optional source hash; raw page content is refused. "
+        "Idempotent per (run_id, agent_key): a retried entry returns status "
+        "'duplicate' instead of a second row. Per-entry status is recorded, "
+        "duplicate, rejected or error.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "run_id": {"type": "string", "description": "Caller-chosen id for the whole fan-out run: letters, digits, '.', '_' or '-', max 128 characters."},
+         "session_id": {"type": "string", "description": "Optional session that dispatched the run."},
+         "entries": {"type": "array", "maxItems": 100, "description": "One digest per agent (max 100 per call).", "items": {"type": "object", "properties": {
+             "agent_key": {"type": "string", "description": "Stable id of the subagent within the run (same characters as run_id)."},
+             "verdict": {"type": "string", "enum": ["supports", "refutes", "mixed", "inconclusive", "not_found"]},
+             "url": {"type": "string", "description": "Source URL the agent cited."},
+             "quote": {"type": "string", "description": "Short quote from the source; stored up to 280 characters, longer quotes are truncated and flagged."},
+             "source_hash": {"type": "string", "description": "Optional sha256 of the full source page as the agent read it (64 hex characters, optionally prefixed 'sha256:')."},
+             "note": {"type": "string", "description": "Optional short note, at most 500 characters."}},
+           "required": ["agent_key", "verdict"]}}},
+         "required": ["run_id", "entries"]}},
+    {"name": "get_fanout_run", "description":
+        "Read-only: return the recorded agent results of one fan-out run (by run_id) as a "
+        "deterministic timeline with a verdict tally. Digests only; raw page content is never stored or returned.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "run_id": {"type": "string", "description": "The run_id passed to record_fanout_results."},
+         "limit": {"type": "integer", "description": "Max events to return (default 200, max 1000). When truncated, the newest are kept."}},
+         "required": ["run_id"]}},
+    {"name": "build_agent_packet", "description":
+        "Build the plain-text task packet an orchestrator embeds in a research subagent's prompt: "
+        "objective, output format, key questions, starting pointers, allowed tools, boundaries, "
+        "effort tier and prior evidence. Pure and read-only; no database or network access. Prior "
+        "evidence is rendered as a nonce-fenced UNTRUSTED block of quote, url and sha256 digest only; "
+        "control characters and fence-like tokens are stripped and counted.",
+     "inputSchema": {"type": "object", "properties": {
+         "objective": {"type": "string", "description": "What the agent must establish (max 2000 characters)."},
+         "output_format": {"type": "string", "description": "The shape the agent must return its answer in (max 1000 characters)."},
+         "background": {"type": "string", "description": "Optional context the agent needs (max 4000 characters)."},
+         "key_questions": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "Questions to answer, each at most 500 characters."},
+         "starting_pointers": {"type": "array", "maxItems": 50, "items": {"type": "string"}, "description": "Files, symbols or notes the agent may start from, each at most 300 characters."},
+         "allowed_tools": {"type": "array", "maxItems": 50, "items": {"type": "string"}, "description": "Tool names the agent may use. Empty means none."},
+         "boundaries": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "Extra rules, appended after the built-in read-only and digest-only rules."},
+         "effort_tier": {"type": "string", "enum": ["quick", "standard", "deep"], "description": "How much verification the agent should do (default standard)."},
+         "prior_evidence": {"type": "array", "maxItems": 50, "description": "Digests the caller already holds. Rendered as untrusted data.", "items": {"type": "object", "properties": {
+             "quote": {"type": "string", "description": "Short quote, capped at 280 characters."},
+             "url": {"type": "string", "description": "http(s) source url."},
+             "hash": {"type": "string", "description": "sha256 of the full source (64 hex characters, optionally prefixed 'sha256:')."}}}}},
+         "required": ["objective", "output_format", "key_questions"]}},
 ]
 
 _READ_ONLY_TOOLS = {
@@ -4768,6 +4817,8 @@ _READ_ONLY_TOOLS = {
     "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
     "paper_search", "social_search", "github_search", "zotero_search",
     "list_watchlist_queries",
+    "get_fanout_run",
+    "build_agent_packet",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "get_external_job", "list_external_jobs",
     "list_remote_tasks",
@@ -5132,6 +5183,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "list_watchlist_queries": "research",
     "run_watchlist_query": "research",
     "delete_watchlist_query": "research",
+    "record_fanout_results": "research",
+    "get_fanout_run": "research",
+    "build_agent_packet": "research",
 }
 
 _TOOL_ROLE_RELEVANCE: dict[str, str] = {
@@ -5280,6 +5334,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "list_watchlist_queries":    "planner",
     "run_watchlist_query":       "planner",
     "delete_watchlist_query":    "planner",
+    "record_fanout_results":     "both",
+    "get_fanout_run":            "both",
+    "build_agent_packet":        "both",
     "capture_research_finding":  "planner",
     "add_insight":               "planner",
     "get_insights":              "planner",
@@ -5562,6 +5619,9 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "list_watchlist_queries":     "common-support",
     "run_watchlist_query":        "common-support",
     "delete_watchlist_query":     "common-support",
+    "record_fanout_results":      "common-support",
+    "get_fanout_run":             "common-support",
+    "build_agent_packet":         "common-support",
     "capture_research_finding":   "common-support",
     "save_finding":               "common-support",
     # workspace proposals workflow arc
