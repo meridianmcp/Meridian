@@ -3,10 +3,10 @@
 Every evidence record built from ``meridian_outputs.provenance_status`` now
 carries an explicit ``receipt_state`` (exact / fallback / ambiguous / partial /
 unregistered / unknown / unavailable) and a ``clean_provenance`` flag. The flag
-is True only for an exact, non-stale record backed by a converged index. An
-index-dependent answer reached while the outputs index is still converging, or
-while it cannot be read at all, is flagged partial and is never presented as a
-VERIFIED resolver result.
+is True only for an exact, non-stale record with both content hashes confirmed,
+backed by a converged index. An index-dependent answer reached while the outputs
+index is still converging, or while it cannot be read at all, is flagged partial
+and is never presented as a VERIFIED resolver result.
 """
 
 from __future__ import annotations
@@ -222,6 +222,54 @@ class TestReceiptStateMatrix:
         assert "receipt_state" in rec.attributes
         assert "clean_provenance" in rec.attributes
         assert rec.attributes["provenance_type"] == PS.EXACT
+
+
+class TestCleanProvenanceRequiresConfirmedHashes:
+    """An EXACT record whose staleness cannot be confirmed (a recorded or
+    current content hash is None) resolves AMBIGUOUS. ``clean_provenance`` must
+    agree with that: an unconfirmed hash is never a clean verdict, even on a
+    converged index with no staleness flagged.
+    """
+
+    @pytest.mark.parametrize(
+        "unconfirmed",
+        [
+            {"recorded_content_hash": None},
+            {"current_content_hash": None},
+            {"recorded_content_hash": None, "current_content_hash": None},
+        ],
+        ids=["recorded_hash_none", "current_hash_none", "both_hashes_none"],
+    )
+    def test_unconfirmed_hash_is_never_clean(
+        self, unconfirmed: dict[str, Any],
+    ) -> None:
+        status = _status(PS.EXACT, converged=True)
+        status["staleness"].update(unconfirmed)
+        rec = _record(status)
+
+        assert rec.resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert rec.attributes["receipt_state"] == "exact"
+        assert rec.attributes["clean_provenance"] is False
+        assert rec.is_authoritative is False
+
+    def test_missing_staleness_block_is_never_clean(self) -> None:
+        status = _status(PS.EXACT, converged=True)
+        status["staleness"] = None
+        rec = _record(status)
+
+        assert rec.resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert rec.attributes["clean_provenance"] is False
+        assert rec.is_authoritative is False
+
+    def test_both_hashes_confirmed_and_fresh_stays_clean(self) -> None:
+        # Control: the hash guard must not over-reject a fully confirmed record.
+        status = _status(PS.EXACT, converged=True)
+        assert status["staleness"]["recorded_content_hash"] is not None
+        assert status["staleness"]["current_content_hash"] is not None
+        rec = _record(status)
+
+        assert rec.attributes["clean_provenance"] is True
+        assert rec.is_authoritative is True
 
 
 # ---------------------------------------------------------------------------

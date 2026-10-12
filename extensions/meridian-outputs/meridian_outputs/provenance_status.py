@@ -1093,9 +1093,10 @@ def _receipt_state_for_status(status: "dict[str, Any]") -> "tuple[str, bool]":
                               convergence snapshot).
 
     ``clean_provenance`` is True only for an exact, non-stale record whose
-    answer is backed by a converged index. It is the one boolean a promotion
-    gate should read before claiming clean provenance; an incomplete index
-    must never make that claim.
+    answer is backed by a converged index and whose recorded and current
+    content hashes are both confirmed (non-None). It is the one boolean a
+    promotion gate should read before claiming clean provenance; an incomplete
+    index, or an unconfirmed hash, must never make that claim.
     """
     ptype = status.get("provenance_type")
     convergence = status.get("convergence")
@@ -1104,7 +1105,13 @@ def _receipt_state_for_status(status: "dict[str, Any]") -> "tuple[str, bool]":
 
     if ptype in (EXACT, STALE_BY_SCRIPT):
         stale = bool(staleness.get("stale")) or ptype == STALE_BY_SCRIPT
-        return "exact", converged and not stale
+        # A None recorded or current hash leaves staleness unconfirmed; the
+        # resolver reports that as AMBIGUOUS, so it must not be clean either.
+        hashes_confirmed = (
+            staleness.get("recorded_content_hash") is not None
+            and staleness.get("current_content_hash") is not None
+        )
+        return "exact", converged and not stale and hashes_confirmed
     if ptype == DIRECTORY_FALLBACK:
         return "fallback", False
     if ptype == RELOCATED and status.get("relocation_evidence") != "basename":
