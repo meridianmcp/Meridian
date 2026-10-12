@@ -25,9 +25,11 @@ Usage
 """
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, NamedTuple
 
@@ -50,10 +52,12 @@ def _p(name: str, pattern: str, flags: int = 0) -> _Pattern:
 # Order matters only for cosmetics in redacted output -- all patterns are
 # applied independently; the first match wins per span in redact().
 SECRET_PATTERNS: list[_Pattern] = [
-    # PEM private key blocks (multi-line)
+    # PEM private key blocks (multi-line). A block whose END line is missing
+    # (truncated, or cut off by a length cap) runs to end-of-text so the key
+    # body is still masked: fail closed, never leak a partial key (RT-HC-003).
     _p(
         "pem-private-key",
-        r"-----BEGIN (?:[A-Z ]+)?PRIVATE KEY-----[\s\S]+?-----END (?:[A-Z ]+)?PRIVATE KEY-----",
+        r"-----BEGIN (?:[A-Z ]+)?PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z ]+)?PRIVATE KEY-----|\Z)",
         re.DOTALL,
     ),
     # AWS access key ID
@@ -62,7 +66,7 @@ SECRET_PATTERNS: list[_Pattern] = [
     _p("stripe-live-key", r"sk_live_[A-Za-z0-9]{24,}"),
     # Meridian's own bearer token (ba31dedf). Underscore-delimited, unlike the
     # hyphenated openai-anthropic-key pattern below, so it needs its own entry --
-    # a bare `"BEARER_TOKEN": "sk_meridian_..."` JSON/TOML/env pair otherwise slips
+    # a bare BEARER_TOKEN JSON/TOML/env pair (quoted name and value) otherwise slips
     # past every existing pattern here (confirmed: none of stripe-live-key,
     # openai-anthropic-key, or dotenv-credential's `KEY=value`-shaped match fire on
     # it, since the value is quoted/colon-joined, not a bare `=` assignment, and the
@@ -77,23 +81,60 @@ SECRET_PATTERNS: list[_Pattern] = [
     # OpenAI / Anthropic-style keys (sk-... with at least 20 chars total after sk-).
     # Modern OpenAI keys use sk-proj-..., sk-org-..., sk-None-...; Anthropic uses
     # sk-ant-...; all have dashes in the body, so allow [A-Za-z0-9-] in the suffix.
-    _p("openai-anthropic-key", r"sk-[A-Za-z0-9-]{20,}"),
-    # Generic JWT (three base64url segments)
+    # Underscores also occur inside provider key bodies (RT-HC-001), so the
+    # suffix class includes "_" as well.
+    _p("openai-anthropic-key", r"sk-[A-Za-z0-9_-]{20,}"),
+    # Generic JWT (three base64url segments). The left edge must not be a
+    # base64url character: without it, a long run of "eyJ" with no dot re-scans
+    # the whole run from every "eyJ" start, which is quadratic (RT-HC-004 class).
     _p(
         "jwt",
-        r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
     ),
     # dotenv-style KEY=value where KEY looks credential-like.
     # Captures the whole assignment so the value is redacted. The value must
     # be at least 6 non-whitespace/quote chars to avoid false positives on
     # trivial values (e.g. "KEY=yes", "FLAG=on"). Anchored to start-of-line
     # (via MULTILINE) so we don't accidentally match comments or mid-line prose.
+    # Credential-named assignment, optionally prefixed by a shell verb
+    # (``export NAME=``, ``set NAME=``, ``setx NAME=``, ``$env:NAME=``).
+    # The credential-word test is a lookahead and the name is then consumed
+    # in ONE greedy run: the earlier form ``[A-Z0-9_]*(?:KEY|...)[A-Z0-9_]*``
+    # backtracked over every keyword occurrence on a long line, which made the
+    # scan quadratic on repeated keywords (RT-HC-004). Value may be quoted.
     _p(
         "dotenv-credential",
-        r"^[ \t]*[A-Z0-9_]*(?:SECRET|KEY|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*[ \t]*=[ \t]*[^\s\"']{6,}",
+        r"^[ \t]*(?:(?:export|setx?|\$env:)[ \t]+)?"
+        r"(?=[A-Z0-9_]*?(?:SECRET|KEY|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH))"
+        r"[A-Z0-9_]+[ \t]*=[ \t]*[\"']?[^\s\"']{6,}",
         re.IGNORECASE | re.MULTILINE,
     ),
+    # Credential carriers that are not a bare NAME=value line (RT-HC-002).
+    # Both are linear: each starts on a fixed delimiter and the name run is
+    # consumed in one greedy pass after a lookahead.
+    # A JSON / quoted-dict pair whose key is credential-named. Redaction only:
+    # structured payloads carry keys such as "secret_name" or "monkey", so this
+    # shape is not a hard-reject gate on DB writes (see check_for_secrets).
+    _p(
+        "credential-json-pair",
+        r"[\"'](?=[A-Z0-9_-]*?(?:SECRET|KEY|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH))[A-Z0-9_-]+[\"'][ \t]*:[ \t]*[\"'][^\s\"']{6,}[\"']",
+        re.IGNORECASE,
+    ),
+    # An Authorization header carrying a scheme (Basic / Bearer / Token / Digest).
+    # Enforced on DB writes as well: prose rarely contains one.
+    _p(
+        "credential-carrier",
+        r"\bauthorization[ \t]*[:=][ \t]*(?:basic|bearer|token|digest)[ \t]+[A-Za-z0-9+/=._~-]{8,}",
+        re.IGNORECASE,
+    ),
 ]
+
+
+# Patterns that only report text no specific shape already claims (see scan()).
+_FALLBACK_PATTERN_NAMES: frozenset[str] = frozenset({"credential-json-pair", "credential-carrier"})
+
+# Patterns scanned for redaction but not hard-rejected by check_for_secrets().
+_ADVISORY_ON_WRITE_PATTERN_NAMES: frozenset[str] = frozenset({"credential-json-pair"})
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +151,67 @@ class SecretMatch:
 
 
 # ---------------------------------------------------------------------------
+# Matching-time normalisation (RT-HC-006)
+# ---------------------------------------------------------------------------
+
+# Format (Cf) characters that are invisible in output but break a literal
+# match when interleaved into a key: zero-width space/joiner/non-joiner, bidi
+# marks and overrides, word joiner, soft hyphen, BOM, interlinear marks, tag
+# characters. Matching runs on text with these removed.
+_FORMAT_CHARS_RE = re.compile(
+    r"[\u00ad\u0600-\u0605\u061c\u06dd\u070f\u08e2\u180e\u200b-\u200f"
+    r"\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb"
+    r"\U000110bd\U000110cd\U0001d173-\U0001d17a\U000e0001\U000e0020-\U000e007f]"
+)
+
+_FOLD_CACHE: dict[str, str] = {}
+_FOLD_CACHE_MAX = 4096
+
+
+def _fold_char(ch: str) -> str:
+    """NFKC form of one character; format (Cf) characters fold to nothing."""
+    cached = _FOLD_CACHE.get(ch)
+    if cached is None:
+        if unicodedata.category(ch) == "Cf":
+            cached = ""
+        else:
+            cached = unicodedata.normalize("NFKC", ch)
+        if len(_FOLD_CACHE) < _FOLD_CACHE_MAX:
+            _FOLD_CACHE[ch] = cached
+    return cached
+
+
+def fold_for_matching(text: str) -> str:
+    """Return *text* folded for pattern matching.
+
+    Fullwidth and other compatibility look-alikes are mapped to their plain
+    forms (NFKC) and format characters are dropped, so ``ｓｋ－`` and
+    ``sk\\u200b-`` match the same patterns as ``sk-``. ASCII text, and text
+    with no format characters that is already NFKC-stable, is returned as-is
+    (fast path). Use only for matching: :func:`scan` maps offsets back onto
+    the original text, so redaction never rewrites benign characters.
+    """
+    if not text or text.isascii():
+        return text
+    if _FORMAT_CHARS_RE.search(text) is None and unicodedata.normalize("NFKC", text) == text:
+        return text
+    return "".join([_fold_char(ch) for ch in text])
+
+
+def _fold_with_offsets(text: str) -> tuple[str, list[int], list[int]]:
+    """Folded text plus, per folded char, the original (start, end) index."""
+    chars: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    for i, ch in enumerate(text):
+        for out in _fold_char(ch):
+            chars.append(out)
+            starts.append(i)
+            ends.append(i + 1)
+    return "".join(chars), starts, ends
+
+
+# ---------------------------------------------------------------------------
 # scan(): find all matches, return list of SecretMatch
 # ---------------------------------------------------------------------------
 
@@ -121,22 +223,46 @@ def scan(text: str) -> list[SecretMatch]:
     match in document order (shortest start wins; ties go to the pattern
     appearing first in SECRET_PATTERNS).
 
+    Matching runs on :func:`fold_for_matching` output; the returned offsets
+    and snippets always refer to the original *text*.
+
     The returned list is sorted by ``start`` offset.
     """
     if not text:
         return []
 
-    # Collect all raw matches across all patterns.
-    raw: list[tuple[int, int, str]] = []  # (start, end, name)
+    # Collect all raw matches across all patterns (on the folded text).
+    folded = fold_for_matching(text)
+    primary: list[tuple[int, int, str]] = []  # (start, end, name)
+    fallback: list[tuple[int, int, str]] = []
     for pat in SECRET_PATTERNS:
-        for m in pat.regex.finditer(text):
-            raw.append((m.start(), m.end(), pat.name))
+        bucket = fallback if pat.name in _FALLBACK_PATTERN_NAMES else primary
+        for m in pat.regex.finditer(folded):
+            bucket.append((m.start(), m.end(), pat.name))
 
-    if not raw:
+    if not primary and not fallback:
         return []
 
-    # Sort by start offset, then by pattern order (stable sort preserves insertion order
-    # for equal starts, and we appended in SECRET_PATTERNS order).
+    # A fallback (credential-carrier) span survives only where no specific
+    # shape claims the same text, so a provider key inside an Authorization
+    # header or a JSON pair is still reported under its own pattern name.
+    raw = list(primary)
+    if fallback:
+        claimed: list[tuple[int, int]] = []  # disjoint, sorted union of primary spans
+        for start, end, _ in sorted(primary):
+            if claimed and start < claimed[-1][1]:
+                claimed[-1] = (claimed[-1][0], max(claimed[-1][1], end))
+            else:
+                claimed.append((start, end))
+        claimed_starts = [s for s, _ in claimed]
+        for start, end, name in fallback:
+            j = bisect.bisect_left(claimed_starts, end)
+            if j > 0 and claimed[j - 1][1] > start:
+                continue
+            raw.append((start, end, name))
+
+    # Sort by start offset. Stable, so ties between specific matches keep
+    # SECRET_PATTERNS order (a fallback span never ties with one it overlaps).
     raw.sort(key=lambda t: t[0])
 
     # Merge overlapping/adjacent spans (keep first match at each position).
@@ -149,13 +275,24 @@ def scan(text: str) -> list[SecretMatch]:
         merged.append((start, end, name))
         last_end = end
 
+    # Map folded offsets back onto the original text (identity when the
+    # folding changed nothing).
+    if folded != text:
+        _, starts, ends = _fold_with_offsets(text)
+    else:
+        starts = ends = None
+
     # Build SecretMatch objects with a safe preview snippet.
     results: list[SecretMatch] = []
     for start, end, name in merged:
-        matched = text[start:end]
+        if starts is not None:
+            orig_start, orig_end = starts[start], ends[end - 1]
+        else:
+            orig_start, orig_end = start, end
+        matched = text[orig_start:orig_end]
         # Truncate to 12 chars + "..." to avoid leaking the full secret in logs.
         preview = matched[:12] + ("..." if len(matched) > 12 else "")
-        results.append(SecretMatch(name=name, start=start, end=end, snippet=preview))
+        results.append(SecretMatch(name=name, start=orig_start, end=orig_end, snippet=preview))
 
     return results
 
@@ -352,8 +489,11 @@ def check_for_secrets(text: str | None, context: str = "text") -> None:
     """
     if not text:
         return
+    folded = fold_for_matching(text)
     for pattern in SECRET_PATTERNS:
-        if pattern.regex.search(text):
+        if pattern.name in _ADVISORY_ON_WRITE_PATTERN_NAMES:
+            continue
+        if pattern.regex.search(folded):
             raise ValueError(
                 f"Refusing to persist {context}: text matches a {pattern.name} pattern. "
                 "Remove or redact the secret before writing to the database."

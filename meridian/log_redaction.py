@@ -39,7 +39,7 @@ import ipaddress
 import re
 from typing import Any, Iterable, Mapping
 
-from .secret_redaction import SECRET_PATTERNS
+from .secret_redaction import SECRET_PATTERNS, fold_for_matching
 
 __all__ = [
     "MERIDIAN_TOKEN_PREFIX",
@@ -331,13 +331,32 @@ _QUOTED_KV_RE = re.compile(
     r"(?P<kq>['\"])(?P<k>[A-Za-z0-9_.-]{1,100})(?P=kq)(?P<sep>\s*:\s*)"
     rf"(?P<val>'{_SQ_BODY}(?:'|$)|\"{_DQ_BODY}(?:\"|$))"
 )
+# The left edge must not be a scheme character: otherwise every position inside a
+# run such as "sk-sk-sk-..." restarts the scheme scan over the rest of the run
+# (quadratic on one long log line). A scheme always starts at the run's head.
 _URL_USERINFO_RE = re.compile(
-    r"\b(?P<head>[A-Za-z][A-Za-z0-9+.-]*://[^\s:/?#@'\"]+):(?P<pw>[^\s@/'\"]+)@"
+    r"(?<![A-Za-z0-9_+.-])(?P<head>[A-Za-z][A-Za-z0-9+.-]*://[^\s:/?#@'\"]+):(?P<pw>[^\s@/'\"]+)@"
 )
 _QUERY_SECRET_RE = re.compile(
     r"(?P<head>[?&;](?:access_token|refresh_token|id_token|token|api_key|apikey|key|"
     r"secret|client_secret|password|passwd|code|sig|signature)=)(?P<v>[^&\s'\"#]+)",
     re.IGNORECASE,
+)
+# Credential header lines the value-shape passes cannot see as a whole:
+# ``Authorization: Basic <b64>`` (scheme + credential are two tokens), cookies.
+# The value runs to end of line.
+_AUTH_HEADER_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<head>(?:proxy-)?authorization|(?:set-)?cookie)"
+    r"(?P<sep>[ \t]*[:=][ \t]*)(?P<v>[^\r\n'\"]+)",
+    re.IGNORECASE,
+)
+# Unquoted credential-named pair: ``password: hunter2``, ``x-api-key: abc``,
+# ``token=abc123``. Only ``:`` (optionally spaced) or a bare ``=`` separates
+# name and value, so a traceback source line ``token = request.headers.get(...)``
+# is left intact (see the dotenv-credential note above).
+_CRED_PAIR_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?P<k>[A-Za-z][A-Za-z0-9_.-]{0,63})(?P<sep>:[ \t]*|=)"
+    r"(?P<v>[^\s'\"&,;(){}<>]+)"
 )
 
 # Reused from secret_redaction.SECRET_PATTERNS, minus:
@@ -456,6 +475,51 @@ def _redact_other_secrets(text: str) -> str:
     return text
 
 
+_CREDENTIAL_NAME_PARTS = frozenset({
+    "token", "secret", "secrets", "password", "passwd", "passphrase",
+    "credential", "credentials", "auth", "authorization",
+})
+_CREDENTIAL_NAME_SUBSTRINGS: tuple[str, ...] = (
+    "apikey", "accesskey", "privatekey", "secretkey", "clientsecret",
+)
+
+
+def _redact_credential_pairs(text: str) -> str:
+    """Mask credential-named pairs and credential header lines (RT-SFS-007).
+
+    The value-shape passes miss a credential whose shape is unknown, so the
+    *name* is the signal here: ``password: hunter2``, ``api_key=...``,
+    ``x-api-key: ...``, ``Authorization: Basic <b64>``, ``Cookie: ...``.
+    A value that already carries a fingerprint, an earlier mask, or a Meridian
+    token prefix is left alone, so the pass is idempotent.
+    """
+
+    def _is_credential_name(name: str) -> bool:
+        lower = name.lower()
+        squashed = lower.replace("-", "").replace("_", "").replace(".", "")
+        if any(s in squashed for s in _CREDENTIAL_NAME_SUBSTRINGS):
+            return True
+        return any(part in _CREDENTIAL_NAME_PARTS for part in re.split(r"[-_.]", lower))
+
+    def _already_masked(value: str) -> bool:
+        # A fingerprint (Bearer[...], legacy auth=...), an earlier mask, or a
+        # Meridian token already shortened by the token pass.
+        return "[" in value or value.startswith(MERIDIAN_TOKEN_PREFIX)
+
+    def _header_repl(m: "re.Match[str]") -> str:
+        if _already_masked(m.group("v")):
+            return m.group(0)
+        return f"{m.group('head')}{m.group('sep')}[REDACTED]"
+
+    def _pair_repl(m: "re.Match[str]") -> str:
+        if _already_masked(m.group("v")) or not _is_credential_name(m.group("k")):
+            return m.group(0)
+        return f"{m.group('k')}{m.group('sep')}[REDACTED]"
+
+    text = _AUTH_HEADER_RE.sub(_header_repl, text)
+    return _CRED_PAIR_RE.sub(_pair_repl, text)
+
+
 def redact_log_text(text: Any) -> Any:
     """Mask credentials and client IPs in a log message / traceback.
 
@@ -466,20 +530,27 @@ def redact_log_text(text: Any) -> Any:
       ``'signature': ...``) -> ``'[REDACTED]'``;
     - URL userinfo passwords and secret-named query parameters;
     - other known secret shapes (Stripe, GitHub, Slack, OpenAI/Anthropic,
-      AWS, JWT, PEM keys) -> ``[REDACTED:<kind>]``;
+      AWS, JWT, PEM keys, credential carriers) -> ``[REDACTED:<kind>]``;
+    - credential-named pairs and credential header lines (``password: ...``,
+      ``Authorization: Basic ...``) -> ``[REDACTED]``;
     - IPv4 -> ``a.b.c.0/24``, IPv6 -> ``/48`` (loopback/unspecified kept).
+
+    Text is first folded (:func:`fold_for_matching`) so fullwidth look-alikes
+    and zero-width characters cannot hide a credential from the passes below.
 
     Idempotent.  Non-``str`` input (``None``) is returned unchanged.
     """
     if not isinstance(text, str) or not text:
         return text
-    out = _LEGACY_RAW_AUTH_RE.sub(_legacy_raw_repl, text)
+    out = fold_for_matching(text)
+    out = _LEGACY_RAW_AUTH_RE.sub(_legacy_raw_repl, out)
     out = _BEARER_RE.sub(_bearer_repl, out)
     out = _MERIDIAN_TOKEN_RE.sub(_meridian_token_repl, out)
     out = _QUOTED_KV_RE.sub(_quoted_kv_repl, out)
     out = _URL_USERINFO_RE.sub(r"\g<head>:[REDACTED]@", out)
     out = _QUERY_SECRET_RE.sub(r"\g<head>[REDACTED]", out)
     out = _redact_other_secrets(out)
+    out = _redact_credential_pairs(out)
     out = _IPV6_RE.sub(_ip_repl, out)
     out = _IPV4_RE.sub(_ip_repl, out)
     return out
