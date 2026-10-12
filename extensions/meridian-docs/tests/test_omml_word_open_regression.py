@@ -72,9 +72,11 @@ def _omml(body: str) -> str:
 # confirmed by direct execution against this exact worktree, not assumed.
 # ---------------------------------------------------------------------------
 
-# -> <m:r>{</m:r><m:eqArr><m:e><m:e>x</m:e><m:e>x&gt;0</m:e></m:e>
-#          <m:e><m:e>-x</m:e><m:e>x<=0</m:e></m:e></m:eqArr>
-# Two rows, two cells each -- a genuine piecewise/cases equation.
+# -> <m:r>{</m:r><m:eqArr><m:eqArrPr>(ctrlPr)</m:eqArrPr>
+#          <m:e>x<m:r>&amp;</m:r>x&gt;0</m:e>
+#          <m:e>-x<m:r>&amp;</m:r>x<=0</m:e></m:eqArr>
+# Two rows, each one m:e whose two cells are split by an "&" alignment run --
+# a genuine piecewise/cases equation with no m:e nested inside an m:e.
 _CASES_LATEX = r"\begin{cases} x & x>0 \\ -x & x \le 0 \end{cases}"
 
 # -> <m:r>{</m:r><m:eqArr><m:e><m:e><m:f>...1/x...</m:f></m:e><m:e>x != 0</m:e></m:e>
@@ -84,7 +86,7 @@ _NESTED_FRACTION_CASES_LATEX = (
     r"\begin{cases} \frac{1}{x} & x \ne 0 \\ 0 & x = 0 \end{cases}"
 )
 
-# -> <m:func><m:fName><m:r>max</m:r></m:fName><m:e/></m:func><m:r>(</m:r>...
+# -> <m:func><m:funcPr>(ctrlPr)</m:funcPr><m:fName><m:r>max</m:r></m:fName><m:e/></m:func><m:r>(</m:r>...
 # "max"/"min"/"argmin"/"argmax"/"sup"/"inf" are the special-cased names that
 # convert to a real m:func node (see _stdlib_append_mathml).
 _MAX_FUNC_LATEX = r"\max(a,b)"
@@ -270,11 +272,16 @@ class TestPiecewiseCasesEquations:
         root = docs_intel._validate_omml_structure(omml)
         eqarr = root.find(_qm("eqArr"))
         assert eqarr is not None, "cases LaTeX must convert to a real m:eqArr, not flattened text"
-        rows = list(eqarr)
+        rows = eqarr.findall(_qm("e"))
         assert len(rows) == 2, f"expected 2 case branches, got {len(rows)}"
         for row in rows:
-            cells = list(row)
-            assert len(cells) == 2, "each case branch must have a value cell and a condition cell"
+            # Cells sit directly in the row m:e, split by one "&" alignment run.
+            assert all(child.tag != _qm("e") for child in row), "no m:e may be nested in a row m:e"
+            alignment = [
+                child for child in row
+                if "".join(t.text or "" for t in child.iter(_qm("t"))) == "&"
+            ]
+            assert len(alignment) == 1, "each case branch must have a value cell and a condition cell"
 
     def test_cases_semantic_manifest_reports_eqarr_structural_tag(self):
         omml = docs_intel.latex_to_omml_local(_CASES_LATEX)
@@ -315,7 +322,7 @@ class TestPiecewiseCasesEquations:
         reparsed_root = ET.fromstring(equations[0]["omml_raw"])
         assert reparsed_root.tag == _qm("oMath")
         eqarr = reparsed_root.find(_qm("eqArr"))
-        assert eqarr is not None and len(list(eqarr)) == 2
+        assert eqarr is not None and len(eqarr.findall(_qm("e"))) == 2
         assert "x>0" in equations[0]["flat_text"] or "x&gt;0" in equations[0]["omml_raw"]
 
     def test_insert_equation_local_rejects_malformed_cases_without_mutating_file(

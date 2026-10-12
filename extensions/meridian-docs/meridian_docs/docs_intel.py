@@ -8214,6 +8214,18 @@ def _qm(tag: str) -> str:
     return f"{{{_M}}}{tag}"
 
 
+def _omml_append_ctrl_pr(parent: ET.Element) -> None:
+    """Append Word's standard ``<m:ctrlPr>`` (Cambria Math run formatting) to ``parent``.
+
+    Word writes this inside ``m:funcPr`` / ``m:eqArrPr`` to format the
+    construct's control characters; generated function and equation-array nodes
+    carry the same shape so they match Word-authored equations.
+    """
+    rpr = ET.SubElement(ET.SubElement(parent, _qm("ctrlPr")), _q(_W, "rPr"))
+    ET.SubElement(rpr, _q(_W, "rFonts"), {_q(_W, "ascii"): "Cambria Math", _q(_W, "hAnsi"): "Cambria Math"})
+    ET.SubElement(rpr, _q(_W, "i"))
+
+
 def _omml_flatten_text_local(omml_raw: str | None) -> str:
     """Concatenate every <m:t> text run inside a raw OMML string (best-effort).
 
@@ -8254,8 +8266,11 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
             # expects for min/max/argmin-style operators.
             if text.strip().casefold() in {"min", "max", "argmin", "argmax", "sup", "inf"}:
                 func = ET.SubElement(parent, _qm("func"))
+                _omml_append_ctrl_pr(ET.SubElement(func, _qm("funcPr")))
                 f_name = ET.SubElement(func, _qm("fName"))
                 run = ET.SubElement(f_name, _qm("r"))
+                # Function names are upright, as Word writes them (m:sty="p").
+                ET.SubElement(ET.SubElement(run, _qm("rPr")), _qm("sty")).set(_qm("val"), "p")
                 ET.SubElement(run, _qm("t")).text = text
                 ET.SubElement(func, _qm("e"))
                 return
@@ -8355,15 +8370,21 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
     if tag == "mtable":
         # MathML cases/aligned systems become a real OMML equation array.  A
         # flattened m:r here is visually plausible but semantically unusable.
+        # Each mtr is one m:e row; its cells sit directly in that row, separated
+        # by "&" alignment points.  A cell m:e nested inside the row m:e is not a
+        # math element, so Word rejects it.
         arr = ET.SubElement(parent, _qm("eqArr"))
+        _omml_append_ctrl_pr(ET.SubElement(arr, _qm("eqArrPr")))
         for row in node:
             if (row.tag.rsplit("}", 1)[-1] if "}" in row.tag else row.tag) != "mtr":
                 continue
             row_expr = ET.SubElement(arr, _qm("e"))
-            for cell in row:
-                cell_expr = ET.SubElement(row_expr, _qm("e"))
+            for index, cell in enumerate(row):
+                if index:
+                    align = ET.SubElement(row_expr, _qm("r"))
+                    ET.SubElement(align, _qm("t")).text = "&"
                 for child in cell:
-                    _stdlib_append_mathml(child, cell_expr)
+                    _stdlib_append_mathml(child, row_expr)
         return
 
     if tag in {"munder", "mover", "munderover"}:
