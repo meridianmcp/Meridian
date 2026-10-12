@@ -77,6 +77,26 @@ async def handle_checkpoint(
     # trusted executable continuation block instead of an independently
     # assembled, un-tokenized summary string.
     _goal_string_out: dict[str, Any] = {}
+    # 1c132e10 — adopt the pending_goal receiver argument in checkpoint(). The
+    # continuation this call persists is ADDRESSED to the checkpointing
+    # session's own session_name (the executor identity known at this point),
+    # so a sibling start_session in the same project cannot silently consume
+    # it: projects.pending_goal is one read-once slot. Matching is a routing
+    # guard, not an authorization boundary; load_handoff stays readable. A
+    # session with no usable name (blank, or longer than the receiver limit)
+    # keeps today's unaddressed behaviour, and the receiver is best-effort so
+    # it can never block the checkpoint itself.
+    _ckpt_receiver: dict[str, str] | None = None
+    try:
+        async with db.execute(
+            "SELECT name FROM sessions WHERE id = ?", (session_id,)
+        ) as _ckpt_name_cur:
+            _ckpt_name_row = await _ckpt_name_cur.fetchone()
+        _ckpt_receiver = db_module.normalize_pending_goal_receiver(
+            {"session_name": (_ckpt_name_row["name"] if _ckpt_name_row else None) or ""}
+        )
+    except Exception:  # noqa: BLE001
+        _ckpt_receiver = None
     try:
         # 60eed526 — checkpoint=True bounds the RETURNED delta content to
         # _DEFAULT_CHECKPOINT_MAX_BYTES instead of full/delta's generous
@@ -94,6 +114,7 @@ async def handle_checkpoint(
                 proposal_scope=_proposal_scope,
                 version=_explicit_version,
                 goal_string_out=_goal_string_out,
+                pending_goal_receiver=_ckpt_receiver,
             ),
             timeout=30.0,
         )
