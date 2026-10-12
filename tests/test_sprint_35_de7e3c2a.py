@@ -28,8 +28,22 @@ Required cases from the item notes:
 Honesty caveat (handoff_receipt precedent): every verdict here is
 agent-cooperative, not transport-level. A test in this file never implies a
 wire-level guarantee.
+
+Review finding (de7e3c2a): the live-inventory probe is awaited on every one of
+those paths, and a cold tunnel slot can stall it for ~60s while its verdict is
+warn-only. The probe is therefore bounded by a short budget, and a probe that
+never returns degrades to the unverified state instead of holding the call.
+The bound tests at the bottom of this file pin that behaviour, and the wiring
+test pins that generate_handoff and both REST handoff routes pass
+``contract_availability_kwargs``.
 """
 from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -365,3 +379,261 @@ async def test_claim_sprint_item_dispatch_attaches_contract_end_to_end(db, proje
     assert result.get("status") == "in_progress", result
     assert "capability_contract" in result
     assert result["capability_contract"]["executable"] is False  # local floor, warn-only
+
+
+# ---------------------------------------------------------------------------
+# Review finding (de7e3c2a): the live-inventory probe must be bounded.
+#
+# start_session, generate_handoff, both REST handoff routes and the claim-time
+# contract all await the tenant probe through build_effective_capability_contract.
+# A cold tunnel slot can stall that probe for ~60s, and its verdict is only a
+# warn-only field, so an unbounded await held a trusted response for nothing.
+# ---------------------------------------------------------------------------
+
+# Outer guard for every bound test. On unbounded code the awaited call would
+# hang forever, so the guard turns that hang into a TimeoutError and the test
+# fails instead of stalling the suite. It sits well above the ~5s budget.
+_PROBE_GUARD_SECONDS = 15.0
+
+# The production budget is about 5s. Allow scheduling slack on top of it.
+_DEFAULT_BUDGET_CEILING_SECONDS = 7.0
+
+
+# How long the modelled cold tunnel slot stalls. Deliberately longer than the
+# guard: a bounded call cancels the probe long before this, and an unbounded
+# call is cut off by the guard. The probe never silently succeeds (it fails if
+# it ever runs to completion), so a leftover request cannot stall teardown.
+_HANG_SECONDS = 20.0
+
+
+def _hanging_probe(calls: list):
+    """A live-inventory probe that stalls, modelling a cold tunnel slot."""
+    async def _probe(tenant):
+        calls.append(tenant)
+        await asyncio.sleep(_HANG_SECONDS)
+        raise AssertionError("probe ran to completion: the call was not bounded")
+    return _probe
+
+
+def _shrink_probe_budget(monkeypatch) -> None:
+    """Keep path tests fast. The default budget is asserted by the canonical
+    test below; the path tests only need the mechanism to fire quickly."""
+    monkeypatch.setattr(
+        handoff_module, "_LIVE_INVENTORY_PROBE_BUDGET_SECONDS", 0.2, raising=False,
+    )
+
+
+async def test_never_returning_probe_resolves_within_budget_in_unverified_state(
+    db, project, monkeypatch,
+):
+    """Regression (de7e3c2a review): a probe that never returns must not hold
+    build_effective_capability_contract past the ~5s budget. The contract comes
+    back in the unverified state, never a faked verdict."""
+    await db_module.set_project_capability_manifest(db, project["id"], [_cap()])
+    calls: list = []
+    monkeypatch.setattr(pt_mod, "_build_live_inventory", _hanging_probe(calls))
+
+    started = time.monotonic()
+    contract = await asyncio.wait_for(
+        handoff_module.build_effective_capability_contract(
+            db, project["id"], tenant={"id": "tenant-cold"},
+        ),
+        timeout=_PROBE_GUARD_SECONDS,
+    )
+    elapsed = time.monotonic() - started
+
+    assert calls == [{"id": "tenant-cold"}]  # the probe really was awaited
+    assert elapsed < _DEFAULT_BUDGET_CEILING_SECONDS, elapsed
+    assert contract is not None
+    assert contract["availability"]["status"] == "unknown"
+    assert contract["availability"]["available"] == "unknown"
+    # Unverified, not faked: a required capability cannot be claimed executable.
+    assert contract["executable"] is False
+    assert "required_capabilities_unverified:alpha" in contract["executable_reasons"]
+
+
+async def test_start_session_hanging_probe_is_bounded(db, project, monkeypatch):
+    await db_module.set_project_capability_manifest(db, project["id"], [_cap()])
+    _shrink_probe_budget(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(pt_mod, "_build_live_inventory", _hanging_probe(calls))
+    result = await asyncio.wait_for(
+        pt_mod.handle_start_session(
+            {"project_id": project["id"], "session_name": "sprint-35-cold-probe"},
+            db,
+            "/tmp/meridian-test",
+            tenant={"id": "tenant-cold"},
+            _mcp_tenant_id=None,
+            executor_sessions=set(),
+        ),
+        timeout=_PROBE_GUARD_SECONDS,
+    )
+    assert calls == [{"id": "tenant-cold"}]
+    contract = result["capability_contract"]
+    assert contract["availability"]["status"] == "unknown"
+    assert contract["executable"] is False
+
+
+async def test_claim_contract_hanging_probe_is_bounded_and_never_blocks(db, project, monkeypatch):
+    """claim_sprint_item's attach step: the claim is annotated, not refused."""
+    await db_module.set_project_capability_manifest(db, project["id"], [_cap()])
+    item = await db_module.add_sprint_item(
+        db, project["id"], "v1", "Needs search_graph",
+        tool_requirements=_search_requirement(),
+    )
+    stored = await db_module.get_sprint_item(db, item["id"])
+    _shrink_probe_budget(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(pt_mod, "_build_live_inventory", _hanging_probe(calls))
+    args = {"project_id": project["id"], "item_id": item["id"], "session_id": "s35-cold"}
+    claimed = {**stored, "status": "in_progress"}
+    annotated = await asyncio.wait_for(
+        mcp_handler._attach_claim_capability_contract(claimed, args, db, {"id": "tenant-cold"}),
+        timeout=_PROBE_GUARD_SECONDS,
+    )
+    assert calls == [{"id": "tenant-cold"}]
+    assert annotated["status"] == "in_progress"  # warn-only: the claim stands
+    contract = annotated["capability_contract"]
+    assert contract["availability"]["status"] == "unknown"
+    assert contract["executable"] is False
+
+
+async def test_generate_handoff_hanging_probe_is_bounded(db, project, monkeypatch, tmp_path):
+    await db_module.set_project_capability_manifest(db, project["id"], [_cap()])
+    _shrink_probe_budget(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(pt_mod, "_build_live_inventory", _hanging_probe(calls))
+    result = await asyncio.wait_for(
+        mcp_handler._handle_task_tools(
+            "generate_handoff",
+            {"project_id": project["id"], "mode": "goal"},
+            db, str(tmp_path), {"id": "tenant-cold"}, None,
+        ),
+        timeout=_PROBE_GUARD_SECONDS,
+    )
+    assert calls == [{"id": "tenant-cold"}]
+    contract = result["capability_contract"]
+    assert contract["availability"]["status"] == "unknown"
+    assert contract["executable"] is False
+
+
+# --- REST: both handoff routes, driven through the real app (TestClient). ---
+
+def _mcp_call(client, name: str, arguments: dict) -> dict:
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    assert r.status_code == 200
+    return r.json()
+
+
+def _mcp_result(client, name: str, arguments: dict) -> Any:
+    resp = _mcp_call(client, name, arguments)
+    assert resp.get("result") is not None, resp
+    return json.loads(resp["result"]["content"][0]["text"])
+
+
+def _client_project(client, name: str, capabilities: list[dict]) -> str:
+    pid = client.post("/projects", json={"name": name}).json()["id"]
+    _mcp_result(client, "set_capability_manifest", {
+        "project_id": pid, "capabilities": capabilities,
+    })
+    return pid
+
+
+def _native_capability(cap_id: str = "native-only") -> dict:
+    """Resolves genuinely available with no tunnel (native builtin tool)."""
+    return {
+        "id": cap_id,
+        "purpose": "native capability",
+        "required_tools": ["paper_search"],
+        "availability_policy": "required",
+    }
+
+
+def _call_with_guard(fn):
+    """Run a blocking TestClient call under a hard ceiling. A hung request in a
+    daemon thread becomes an assertion failure instead of stalling the suite."""
+    box: dict[str, Any] = {}
+
+    def _run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 — re-raised below
+            box["error"] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(_PROBE_GUARD_SECONDS)
+    if worker.is_alive():
+        raise AssertionError("REST request still running after the guard: probe is unbounded")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+@pytest.mark.parametrize(
+    "method,path_suffix",
+    [("GET", "/handoff/planner"), ("POST", "/handoff")],
+)
+def test_rest_handoff_route_hanging_probe_is_bounded(client, monkeypatch, method, path_suffix):
+    pid = _client_project(
+        client, f"sprint-35-rest-cold-{method.lower()}",
+        [{"id": "alpha", "purpose": "regression capability",
+          "required_tools": ["Serena: find_symbol"], "availability_policy": "required"}],
+    )
+    _shrink_probe_budget(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(pt_mod, "_build_live_inventory", _hanging_probe(calls))
+
+    async def _hosted(_request):
+        return {"id": "tenant-cold"}
+
+    monkeypatch.setattr(routes_handoff, "_get_authenticated_tenant", _hosted)
+    response = _call_with_guard(lambda: client.request(method, f"/projects/{pid}{path_suffix}"))
+    assert response.status_code == 200, response.text
+    assert calls == [{"id": "tenant-cold"}]
+    contract = response.json()["capability_contract"]
+    assert contract["availability"]["status"] == "unknown"
+    assert contract["executable"] is False
+
+
+# --- Wiring: generate_handoff and both REST routes pass contract_availability_kwargs. ---
+
+def test_generate_handoff_and_rest_routes_pass_contract_availability_kwargs(client, monkeypatch):
+    """Wiring (de7e3c2a review): the probe-selection decision must reach every
+    trusted call site. Each of the three sites must call the helper for this
+    project, and the resulting contract must carry the real verdict (the
+    local-first floor resolves the native capability available), proving the
+    returned kwargs are spliced into build_effective_capability_contract."""
+    seen: list[tuple[str, Any]] = []
+    real_kwargs = handoff_module.contract_availability_kwargs
+
+    async def _spy(db, project_id, tenant):
+        seen.append((project_id, tenant))
+        return await real_kwargs(db, project_id, tenant)
+
+    monkeypatch.setattr(handoff_module, "contract_availability_kwargs", _spy)
+    pid = _client_project(client, "sprint-35-wiring", [_native_capability()])
+
+    def _during(fn):
+        before = len(seen)
+        response = fn()
+        return response, [p for p, _ in seen[before:]]
+
+    post, post_calls = _during(lambda: client.post(f"/projects/{pid}/handoff"))
+    assert post.status_code == 200, post.text
+    assert post_calls and set(post_calls) == {pid}
+    assert post.json()["capability_contract"]["availability"]["available"] == ["native-only"]
+
+    planner, planner_calls = _during(lambda: client.get(f"/projects/{pid}/handoff/planner"))
+    assert planner.status_code == 200, planner.text
+    assert planner_calls and set(planner_calls) == {pid}
+    assert planner.json()["capability_contract"]["availability"]["available"] == ["native-only"]
+
+    mcp_result, mcp_calls = _during(
+        lambda: _mcp_result(client, "generate_handoff", {"project_id": pid, "mode": "goal"}),
+    )
+    assert mcp_calls and set(mcp_calls) == {pid}
+    assert mcp_result["capability_contract"]["availability"]["available"] == ["native-only"]

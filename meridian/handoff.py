@@ -9547,6 +9547,16 @@ def _summarize_capability_availability(
     }
 
 
+# de7e3c2a review — budget for the tenant live-inventory probe that the trusted
+# capability-contract call sites await: start_session, generate_handoff, both
+# REST handoff routes and the claim-time contract (all via
+# build_effective_capability_contract). A cold tunnel slot can stall that probe
+# for ~60s, and its verdict is only a warn-only availability field. A probe that
+# overruns this budget is therefore treated as unverified: the contract keeps its
+# "unknown" availability and the call moves on instead of being held.
+_LIVE_INVENTORY_PROBE_BUDGET_SECONDS = 5.0
+
+
 def _availability_checker_from_live_inventory(
     live_inventory: "dict[str, Any]",
 ) -> "Callable[[list[dict[str, Any]]], dict[str, Any]]":
@@ -9641,6 +9651,11 @@ async def build_effective_capability_contract(
     additive, so every existing caller that passes neither argument is
     completely unaffected.
 
+    The tenant probe is bounded by ``_LIVE_INVENTORY_PROBE_BUDGET_SECONDS``
+    (de7e3c2a review): a probe that overruns it degrades to the same unverified
+    ``"unknown"`` availability as an absent probe, so no trusted call site is
+    ever held waiting on a cold tunnel slot.
+
     de7e3c2a — every trusted call site now passes ``tenant`` or
     ``live_inventory`` via :func:`contract_availability_kwargs`, so the
     real-availability wiring above is the production path, not test-only.
@@ -9666,7 +9681,15 @@ async def build_effective_capability_contract(
         if _live_inventory is None and tenant is not None:
             try:
                 from meridian.mcp.handlers import project_tools as _project_tools_module  # noqa: PLC0415
-                _live_inventory = await _project_tools_module._build_live_inventory(tenant)
+                _live_inventory = await asyncio.wait_for(
+                    _project_tools_module._build_live_inventory(tenant),
+                    timeout=_LIVE_INVENTORY_PROBE_BUDGET_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # de7e3c2a review — a probe that overruns its budget is
+                # unverified, not a failure: fall through to the "unknown"
+                # availability path so the call keeps moving.
+                _live_inventory = None
             except Exception:  # noqa: BLE001 — live-inventory probing is best-effort
                 _live_inventory = None
         if _live_inventory is not None:
