@@ -20,6 +20,7 @@ from .._deps import (
 )
 from .. import db as db_module
 from .. import goal_md as goal_md_module
+from ..capability_manifest import CapabilityManifestError
 from ..executor_config import normalize_executor_config
 from ..plans import tenant_entitlement_plan
 from ..roles import PERM_SETTINGS, has_perm
@@ -356,6 +357,57 @@ async def patch_project_settings(
     if settings is None:
         raise HTTPException(status_code=404, detail="project not found")
     return settings
+
+
+@router.get("/projects/{project_id}/capability-manifest")
+async def get_capability_manifest_route(project_id: str, request: Request) -> dict[str, Any]:
+    """Return a project's declared capability manifest (read-only).
+
+    A project that never set a manifest gets the empty profile, not an error.
+    An unknown project is a 404, matching the sibling settings route.
+    """
+    db = await _db(request)
+    if await db_module.get_project(db, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.get_project_capability_manifest(db, project_id)
+
+
+@router.put("/projects/{project_id}/capability-manifest")
+async def put_capability_manifest_route(project_id: str, request: Request) -> dict[str, Any]:
+    """Replace a project's capability manifest wholesale.
+
+    Body: ``{"capabilities": [...]}``. Validation is the same as the
+    ``set_capability_manifest`` MCP tool: a malformed manifest is a 422 and
+    nothing is written. The generic role middleware maps only paths ending in
+    ``/settings`` to PERM_SETTINGS, so this route enforces PERM_SETTINGS itself:
+    a capability manifest is project configuration, not ordinary project data.
+    """
+    ctx = await _enforcement_context(request)
+    if ctx is not None and not has_perm(ctx[2], PERM_SETTINGS):
+        raise HTTPException(
+            403,
+            f"Workspace role '{ctx[2]}' lacks permission '{PERM_SETTINGS}'",
+        )
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict) or not isinstance(body.get("capabilities"), list):
+        raise HTTPException(
+            status_code=400,
+            detail="body must be an object with a 'capabilities' list",
+        )
+    db = await _db(request)
+    try:
+        return await db_module.set_project_capability_manifest(
+            db, project_id, body["capabilities"]
+        )
+    except CapabilityManifestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ValueError:
+        # set_project_capability_manifest raises a plain ValueError only for an
+        # unknown project; manifest-validation errors were caught above.
+        raise HTTPException(status_code=404, detail="project not found")
 
 
 # ---------------------------------------------------------------------------
