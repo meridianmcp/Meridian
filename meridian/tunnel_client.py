@@ -2265,10 +2265,37 @@ async def _run_connection_lazy(
                         # 0e973e52 — run_verification: spawn test_cmd as a real local
                         # process and send the structured result back to the server.
                         # Only the FS slot handles this; other slots ignore it.
+                        # 189fde6b (RT-LEAD-004) — the hosted server can send run_cmd to
+                        # any connected client, so spawning one needs LOCAL consent: the
+                        # user must set MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 in the tunnel
+                        # client's own environment. Without it nothing is spawned and the
+                        # server gets an explicit refusal instead.
                         req_id = msg.get("id", "")
                         cmd_val = msg.get("cmd") or ""
                         cwd_val = (msg.get("cwd") or "").strip() or None
-                        run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        _run_cmd_consent = os.environ.get("MERIDIAN_TUNNEL_ALLOW_RUN_CMD", "")
+                        if _run_cmd_consent.strip().lower() in ("1", "true", "yes", "on"):
+                            run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        else:
+                            print(
+                                f"tunnel:{label}: refused run_cmd from server (no local consent; "
+                                "set MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 to allow)",
+                                flush=True,
+                            )
+                            run_result = {
+                                "status": "error",
+                                "refused": True,
+                                "message": (
+                                    "run_cmd refused: this tunnel client has no local consent to "
+                                    "run commands from the hosted server (set "
+                                    "MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 in the client's environment)"
+                                ),
+                                "exit_code": None,
+                                "passed": None,
+                                "failed": None,
+                                "stdout_tail": "",
+                                "stderr_tail": "",
+                            }
                         run_result["type"] = "run_cmd_result"
                         run_result["id"] = req_id
                         await ws.send(json.dumps(run_result))
