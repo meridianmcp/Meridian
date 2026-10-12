@@ -31,6 +31,7 @@ Namespace declarations are preserved through
 
 from __future__ import annotations
 
+import hashlib
 import io
 import secrets
 import zipfile
@@ -347,10 +348,28 @@ def _commit_package_write(
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Stage, verify, promote, then run the render gate, as insert_word_comment does.
 
+    ``raw`` is the package the caller read, and ``updated_parts`` were built on
+    top of it before the promotion lock was taken. The lock holder therefore
+    re-checks the file first (compare-and-swap): promoting from stale bytes would
+    revert whatever another writer promoted in between. A changed file is refused
+    with a retryable ``conflict`` and left untouched.
+
     Returns ``(error, render_info)``. Exactly one side is meaningful: a
     non-``None`` ``error`` already carries ``identity`` and ``docx_path``.
     """
     with _docx_promotion_lock(docx_path):
+        if _docx_file_sha256(docx_path) != hashlib.sha256(raw).hexdigest():
+            return {
+                "error": (
+                    f"{docx_path} changed after this write read it, or could not be "
+                    "re-read to confirm it is unchanged; the write was refused so no "
+                    "other writer's update is reverted. Retry the call."
+                ),
+                "status": "conflict",
+                "retryable": True,
+                **identity,
+                "docx_path": docx_path,
+            }, {}
         try:
             _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
         except DocxWriteVerificationError as exc:
