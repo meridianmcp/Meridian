@@ -455,6 +455,10 @@ def _is_proposal_schema_drift_error(exc: BaseException) -> bool:
     Matches sqlite3's ``no such table`` / ``no such column`` message shape
     and psycopg3's ``UndefinedColumn`` / ``UndefinedTable`` (the exception
     class name and/or "... does not exist" text both appear in ``str(exc)``).
+    sqlite3 words an unknown column in an INSERT/UPDATE differently from a
+    SELECT ("table X has no column named Y" rather than "no such column: Y"),
+    so that shape is matched too (40786e0d — a legacy database without
+    workspace_proposals.family_id otherwise surfaced as a raw OperationalError).
     Pure string heuristic — never raises, never imports a driver module
     (this backend may not have psycopg installed at all, e.g. a SQLite-only
     test environment)."""
@@ -462,6 +466,7 @@ def _is_proposal_schema_drift_error(exc: BaseException) -> bool:
     return (
         "no such table" in msg
         or "no such column" in msg
+        or "has no column named" in msg
         or "undefinedcolumn" in msg
         or "undefinedtable" in msg
         or ("column" in msg and "does not exist" in msg)
@@ -660,14 +665,37 @@ async def add_workspace_proposal(
         db, tenant_id, _sprint_item_nickname_base(title, pid)
     )
     try:
-        await db.execute(
-            "INSERT INTO workspace_proposals "
-            "(id, title, body, tags, tenant_id, family_id, slug, nickname, "
-            "idempotency_key, scope_type, project_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (pid, title, body, tags, tenant_id, family_id, _slug, _nickname,
-             idempotency_key, scope_type, project_id),
-        )
+        try:
+            await db.execute(
+                "INSERT INTO workspace_proposals "
+                "(id, title, body, tags, tenant_id, family_id, slug, nickname, "
+                "idempotency_key, scope_type, project_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (pid, title, body, tags, tenant_id, family_id, _slug, _nickname,
+                 idempotency_key, scope_type, project_id),
+            )
+        except Exception as first_exc:  # noqa: BLE001 — fallback or re-raise
+            # 40786e0d — backward-compatible insert path. A caller that did
+            # not ask for family_id must not fail just because this database
+            # predates the column, so retry without it. The failed INSERT
+            # wrote nothing on either backend, so the retry starts clean, and
+            # family_id stays NULL (what an unset family_id stores anyway).
+            # A caller that DID supply family_id still gets the explicit
+            # ProposalSchemaError below rather than a silent drop.
+            if (
+                family_id is not None
+                or "family_id" not in str(first_exc).lower()
+                or not _is_proposal_schema_drift_error(first_exc)
+            ):
+                raise
+            await db.execute(
+                "INSERT INTO workspace_proposals "
+                "(id, title, body, tags, tenant_id, slug, nickname, "
+                "idempotency_key, scope_type, project_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (pid, title, body, tags, tenant_id, _slug, _nickname,
+                 idempotency_key, scope_type, project_id),
+            )
     except Exception as exc:  # noqa: BLE001 — classified below
         if idempotency_key and _is_proposal_unique_violation(exc):
             # Lost a create race against another caller using the same key —
@@ -682,10 +710,19 @@ async def add_workspace_proposal(
                 return winner
         await _undo_proposal_writes(db, [])
         if _is_proposal_schema_drift_error(exc):
+            # 40786e0d — name the missing column when family_id was the reason
+            # the caller asked for, so the failure is actionable, not generic.
+            family_hint = ""
+            if family_id is not None and "family_id" in str(exc).lower():
+                family_hint = (
+                    " family_id was supplied, but workspace_proposals.family_id "
+                    "is missing on this backend; retry without family_id or "
+                    "run pending migrations."
+                )
             raise ProposalSchemaError(
                 "add_workspace_proposal aborted: workspace_proposals schema "
                 f"looks mid-migration on this backend ({exc}). No row was "
-                "created; run pending migrations and retry."
+                "created; run pending migrations and retry." + family_hint
             ) from exc
         raise
 
