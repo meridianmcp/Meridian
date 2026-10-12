@@ -10,26 +10,77 @@ Pins three things:
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
 from meridian import docx_capabilities as dc
 from meridian.routes import tunnel as tun
 
-KNOWN_UNGATED_WRITERS = {
-    "remove_cross_reference",
-    "insert_media_part",
-    "remove_package_part",
-    "flag_for_review",
-}
+# The meridian-docs MCP server is the source of truth for which DOCX writers
+# exist and which of them name the tunnel-layer guard. The parity checks below
+# derive their expected sets from it, so a guard-mentioning writer that the
+# manifest omits fails this file instead of reading as nonexistent.
+DOCS_SERVER_SOURCE = (
+    Path(__file__).resolve().parents[1]
+    / "extensions"
+    / "meridian-docs"
+    / "meridian_docs"
+    / "server.py"
+)
+GUARD_PHRASE = "region-claim guard"
+
+# DOCX writers whose docstrings name the guard but that the manifest previously
+# omitted, so they were reported as nonexistent rather than as ungated.
+TABLE_WRITERS_PREVIOUSLY_MISSING = (
+    "insert_table",
+    "insert_column",
+    "remove_table",
+    "split_cell",
+    "transpose_table",
+)
 SIDECAR_WRITERS = {"index_document", "index_document_structure", "index_equations"}
 
 
 def _entries(manifest: dict) -> dict[str, dict]:
     return {entry["operation"]: entry for entry in manifest["operations"]}
+
+
+def _is_mcp_tool(node: ast.AST) -> bool:
+    for decorator in node.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Attribute) and target.attr == "tool":
+            return True
+    return False
+
+
+def _source_guard_writers() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Return every meridian-docs MCP tool whose docstring names the guard.
+
+    Parsed statically (no import of the extension), keyed by function name.
+    Whitespace in the docstring is normalised so a phrase wrapped across lines
+    still matches.
+    """
+    source = DOCS_SERVER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(DOCS_SERVER_SOURCE))
+    found: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not _is_mcp_tool(node):
+            continue
+        docstring = " ".join((ast.get_docstring(node) or "").split())
+        if GUARD_PHRASE in docstring:
+            found[node.name] = node
+    return found
+
+
+def _guard_writer_names() -> set[str]:
+    return set(_source_guard_writers())
 
 
 # ---------------------------------------------------------------------------
@@ -85,18 +136,61 @@ def test_gated_operations_match_tunnel_write_table_exactly():
     assert gated == dict(tun._DOCS_WRITE_TOOLS)
 
 
-def test_known_ungated_writers_are_exactly_the_reported_gap():
+def test_source_scan_finds_the_guard_writers_it_is_meant_to_check():
+    # Guards the scan itself: an empty or broken scan would make the parity
+    # checks below pass vacuously.
+    names = _guard_writer_names()
+    assert names, "no guard-mentioning MCP tools found in meridian-docs server.py"
+    assert DOCS_SERVER_SOURCE.is_file()
+    assert set(TABLE_WRITERS_PREVIOUSLY_MISSING) <= names
+
+
+@pytest.mark.parametrize("name", TABLE_WRITERS_PREVIOUSLY_MISSING)
+def test_table_writers_are_declared_as_ungated_docx_writers(name):
+    entries = _entries(dc.build_docx_capability_manifest())
+    assert name in entries, f"{name} names the tunnel guard but is missing from the manifest"
+    entry = entries[name]
+    assert entry["rw_class"] == dc.RW_DOCX_WRITE
+    assert entry["gated_by_tunnel_guard"] is False
+    assert name in dc.UNGATED_DOCX_WRITERS
+    assert name not in tun._DOCS_WRITE_TOOLS
+    target = dc.extract_docx_write_target(name, {"docx_path": "C:/d/x.docx"})
+    assert target is not None
+    assert target.gated_by_tunnel_guard is False
+
+
+def test_ungated_writers_are_exactly_the_guard_writers_missing_from_the_gate():
+    expected_ungated = {name for name in _guard_writer_names() if name not in tun._DOCS_WRITE_TOOLS}
+    assert expected_ungated, "expected at least one guard-mentioning writer outside the gate"
     manifest = dc.build_docx_capability_manifest()
     ungated = {
         entry["operation"]
         for entry in manifest["operations"]
         if entry["rw_class"] == dc.RW_DOCX_WRITE and not entry["gated_by_tunnel_guard"]
     }
-    assert ungated == KNOWN_UNGATED_WRITERS
-    assert dc.UNGATED_DOCX_WRITERS == frozenset(KNOWN_UNGATED_WRITERS)
+    assert ungated == expected_ungated
+    assert dc.UNGATED_DOCX_WRITERS == frozenset(expected_ungated)
     # Tripwire: none of them may appear in the live gate table without the
     # manifest flag being flipped in the same change.
-    assert KNOWN_UNGATED_WRITERS.isdisjoint(tun._DOCS_WRITE_TOOLS)
+    assert expected_ungated.isdisjoint(tun._DOCS_WRITE_TOOLS)
+
+
+def test_every_guard_mentioning_docs_writer_is_declared_with_matching_gate_status():
+    entries = _entries(dc.build_docx_capability_manifest())
+    for name in sorted(_guard_writer_names()):
+        assert name in entries, f"{name} names the tunnel guard but is missing from the manifest"
+        assert entries[name]["gated_by_tunnel_guard"] is (name in tun._DOCS_WRITE_TOOLS), name
+
+
+def test_declared_path_and_anchor_args_exist_in_source_signatures():
+    entries = _entries(dc.build_docx_capability_manifest())
+    for name, node in _source_guard_writers().items():
+        assert name in entries, name
+        params = {arg.arg for arg in [*node.args.args, *node.args.kwonlyargs]}
+        entry = entries[name]
+        assert entry["path_arg"] in params, name
+        if entry["anchor_arg"] is not None:
+            assert entry["anchor_arg"] in params, name
 
 
 def test_sidecar_writers_are_not_gated_and_take_no_lock():

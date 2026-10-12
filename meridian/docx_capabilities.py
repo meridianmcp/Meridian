@@ -160,11 +160,19 @@ _GATED_DOCX_WRITES: tuple[tuple[str, str, str | None], ...] = (
 # guard but that are absent from _DOCS_WRITE_TOOLS. Reported, not gated here.
 # flag_for_review takes anchor as str | dict, so no element id is declared.
 # remove_package_part mutates only when dry_run is False (default True).
+# The table writers (insert_table, insert_column, remove_table, split_cell,
+# transpose_table) address their target by table_index / row_index / col_index
+# or, for insert_table, by anchor_para_id; none of them is gated today.
 _UNGATED_DOCX_WRITES: tuple[tuple[str, str, str | None], ...] = (
     ("remove_cross_reference", "docx_path", "anchor_para_id"),
     ("insert_media_part", "docx_path", "anchor_para_id"),
     ("remove_package_part", "docx_path", None),
     ("flag_for_review", "docx_path", None),
+    ("insert_table", "docx_path", "anchor_para_id"),
+    ("insert_column", "docx_path", None),
+    ("remove_table", "docx_path", None),
+    ("split_cell", "docx_path", None),
+    ("transpose_table", "docx_path", None),
 )
 
 # Sidecar-only writers: they read the .docx and write a local SQLite index cache,
