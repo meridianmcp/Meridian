@@ -238,3 +238,104 @@ async def test_lock_owner_is_relayed_for_new_mutator(db, monkeypatch):
         db=db, session_id=owner,
     )
     assert called["relayed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Review finding (a9794fb9): apply_and_merge_batch_transform also WRITES its
+# draft_output_path (apply_batch_transform stages the transformed bytes there
+# before promoting them). The gate used to look only at canonical_path, so a
+# draft another session had claimed was overwritten without any check.
+# ---------------------------------------------------------------------------
+
+_BATCH_TOOL = "docs__apply_and_merge_batch_transform"
+
+
+async def test_whole_file_lock_on_draft_output_path_blocks_batch_transform(db, monkeypatch):
+    """A whole-file lock another session holds on the DRAFT path refuses the call."""
+    owner = await _mk_session(db, "a9794-draft-lock-owner")
+    draft = "a9794-draft-locked.docx"
+    await db_module.claim_file(db, draft, owner, mode="write")
+
+    tenant = "tenant-a9794-draft-lock"
+    monkeypatch.setitem(tun._tunnel_tool_routes, tenant, {_BATCH_TOOL: "docs"})
+    monkeypatch.setitem(tun._tunnel_docs_sockets, tenant, object())
+
+    async def _fake_jsonrpc(*a, **k):
+        raise AssertionError("must not relay when the draft path is locked by another session")
+
+    monkeypatch.setattr(tun, "_tunnel_jsonrpc", _fake_jsonrpc)
+
+    # canonical_path is unclaimed, so only the draft path can trigger the refusal.
+    with pytest.raises(RuntimeError, match="whole-file write lock"):
+        await tun.call_tunnel_tool(
+            tenant, _BATCH_TOOL,
+            {"canonical_path": "a9794-draft-canon.docx", "operations": [],
+             "draft_output_path": draft},
+            db=db, session_id="other-session",
+        )
+
+
+async def test_scoped_region_claim_on_draft_output_path_blocks_batch_transform(db, monkeypatch):
+    """A scoped element claim another session holds on the DRAFT path refuses the call."""
+    owner = await _mk_session(db, "a9794-draft-region-owner")
+    draft = "a9794-draft-region.docx"
+    await db_module.claim_docx_region(db, owner, draft, "P1")
+
+    tenant = "tenant-a9794-draft-region"
+    monkeypatch.setitem(tun._tunnel_tool_routes, tenant, {_BATCH_TOOL: "docs"})
+    monkeypatch.setitem(tun._tunnel_docs_sockets, tenant, object())
+
+    async def _fake_jsonrpc(*a, **k):
+        raise AssertionError("must not relay when the draft path is region-claimed by another session")
+
+    monkeypatch.setattr(tun, "_tunnel_jsonrpc", _fake_jsonrpc)
+
+    with pytest.raises(RuntimeError, match="scoped-edit mode"):
+        await tun.call_tunnel_tool(
+            tenant, _BATCH_TOOL,
+            {"canonical_path": "a9794-draft-region-canon.docx", "operations": [],
+             "draft_output_path": draft},
+            db=db, session_id="other-session",
+        )
+
+
+async def test_lock_owner_is_relayed_for_draft_output_path(db, monkeypatch):
+    """The session holding the draft's own claim may still write its draft."""
+    owner = await _mk_session(db, "a9794-draft-owner-passes")
+    draft = "a9794-draft-owner-passes.docx"
+    await db_module.claim_file(db, draft, owner, mode="write")
+
+    tenant = "tenant-a9794-draft-owner"
+    monkeypatch.setitem(tun._tunnel_tool_routes, tenant, {_BATCH_TOOL: "docs"})
+    monkeypatch.setitem(tun._tunnel_docs_sockets, tenant, object())
+
+    called = {"relayed": False}
+
+    async def _fake_jsonrpc(*a, **k):
+        called["relayed"] = True
+        return {"result": {"content": [{"type": "text", "text": "{}"}]}}
+
+    monkeypatch.setattr(tun, "_tunnel_jsonrpc", _fake_jsonrpc)
+
+    await tun.call_tunnel_tool(
+        tenant, _BATCH_TOOL,
+        {"canonical_path": "a9794-draft-owner-canon.docx", "operations": [],
+         "draft_output_path": draft},
+        db=db, session_id=owner,
+    )
+    assert called["relayed"] is True
+
+
+def test_draft_output_path_is_gated_for_batch_transform():
+    """The draft argument is recognised as a write target alongside canonical_path."""
+    assert tun._docs_extra_write_targets(
+        "apply_and_merge_batch_transform",
+        {"canonical_path": "c.docx", "draft_output_path": " d.docx "},
+    ) == ["d.docx"]
+    assert tun._docs_extra_write_targets(
+        "apply_and_merge_batch_transform", {"canonical_path": "c.docx"},
+    ) == []
+    # A tool that writes no extra path contributes nothing.
+    assert tun._docs_extra_write_targets(
+        "insert_table", {"docx_path": "t.docx", "draft_output_path": "d.docx"},
+    ) == []
