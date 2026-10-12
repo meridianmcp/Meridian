@@ -11,9 +11,17 @@ unaffected.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import logging
+import uuid
+import weakref
+from contextlib import asynccontextmanager
 from typing import Any
 
 import aiosqlite
+
+_log = logging.getLogger(__name__)
 
 # Shared helpers from the parent db package.  These are imported at the BOTTOM
 # of db/__init__.py (after the parent module defines them), then re-used here.
@@ -160,20 +168,24 @@ async def expire_file_locks(db: aiosqlite.Connection) -> int:
 
 
 async def expire_stale_symbol_claims(db: aiosqlite.Connection) -> int:
-    """Soft-release symbol claims whose owning session's heartbeat has gone stale.
+    """Soft-release symbol claims whose holder is no longer live.
 
     39544099 — parallel to expire_file_locks but for file_symbol_claims. Uses the
     same _CLAIM_LIVE_HOURS cutoff so both expiry mechanisms share one constant.
-    Marks claims as released (sets released_at) rather than deleting so the hotspot
-    history (session_count aggregation) is preserved.
+    "Live" is the conflict check's own rule (see _live_symbol_claims_for_file): the
+    holder's session is active/live and its heartbeat is inside the window. A
+    session that went idle or closed, or whose row is gone, is dead. Marks claims
+    as released (sets released_at) rather than deleting so the hotspot history
+    (session_count aggregation) is preserved.
     """
     stale_cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
     cursor = await db.execute(
         "UPDATE file_symbol_claims SET released_at = datetime('now') "
         "WHERE released_at IS NULL "
-        "AND session_id IN ("
+        "AND session_id NOT IN ("
         "    SELECT id FROM sessions "
-        "    WHERE last_seen IS NOT NULL AND last_seen < ?"
+        "    WHERE status IN ('active', 'live') "
+        "    AND (last_seen IS NULL OR last_seen > ?)"
         ")",
         (stale_cutoff,),
     )
@@ -356,6 +368,36 @@ async def _amend_sprint_item_resources_for_session(
 
 
 async def claim_file(
+    db: aiosqlite.Connection,
+    file_path: str,
+    session_id: str,
+    *,
+    symbol: str | None = None,
+    ttl_hours: int = _FILE_LOCK_TTL_HOURS,
+    mode: str = "write",
+    item_id: str | None = None,
+    amend_sprint_item: bool = True,
+    fallback_reason: str | None = None,
+) -> dict[str, Any]:
+    """Claim a whole file (see :func:`_claim_file_core` for the full contract).
+
+    Every result carries ``claim_granularity="file"``. When this whole-file lock
+    stands in for a symbol claim that could not be made, pass ``fallback_reason``
+    (for example ``"unparseable"`` or ``"no_source_supplied"``) so the caller can
+    see the grain was widened rather than silently receiving a file lock.
+    """
+    result = await _claim_file_core(
+        db, file_path, session_id,
+        symbol=symbol, ttl_hours=ttl_hours, mode=mode,
+        item_id=item_id, amend_sprint_item=amend_sprint_item,
+    )
+    result["claim_granularity"] = "file"
+    if fallback_reason is not None:
+        result["fallback_reason"] = fallback_reason
+    return result
+
+
+async def _claim_file_core(
     db: aiosqlite.Connection,
     file_path: str,
     session_id: str,
@@ -712,15 +754,26 @@ async def get_file_conflict_warnings(
     project_id: str,
     exclude_session_id: str,
 ) -> list[str]:
-    """Return warning strings for files claimed by other recently-active sessions.
+    """Return warning strings for claims held by other live sessions in the project.
 
-    Checks the file_locks table for locks held by sessions other than
-    ``exclude_session_id`` whose owning session is still live (status active/live
-    and last_seen within the last 10 minutes). Returns human-readable strings
-    like ``"dashboard.js claimed by session pre-launch-final (2h ago)"``.
+    Covers the three claim kinds enforcement blocks on, each under that kind's own
+    live rule (the same one the conflict check applies):
+
+    * whole-file locks (``file_locks``): holder session active/live with a
+      heartbeat inside the 2-hour window (_CLAIM_LIVE_HOURS), and the lock not
+      yet expired;
+    * symbol claims (``file_symbol_claims``): the same holder rule as
+      :func:`_live_symbol_claims_for_file`, with ``released_at`` unset;
+    * shared read claims (``file_read_claims``): not yet expired.
+
+    Returns human-readable strings such as
+    ``"dashboard.js claimed by session pre-launch-final (last_seen ...)"``.
     """
-    from datetime import datetime, timezone, timedelta
-    cutoff_10m = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
+    read_live = (
+        "fr.expires_at > now()" if hasattr(db, "_pool")  # Postgres TIMESTAMPTZ
+        else "fr.expires_at > datetime('now')"
+    )
     warnings: list[str] = []
     try:
         async with db.execute(
@@ -730,8 +783,9 @@ async def get_file_conflict_warnings(
             "WHERE fl.session_id != ? "
             "AND s.project_id = ? "
             "AND s.status IN ('active', 'live') "
-            "AND (s.last_seen IS NULL OR s.last_seen > ?)",
-            (exclude_session_id, project_id, cutoff_10m),
+            "AND (s.last_seen IS NULL OR s.last_seen > ?) "
+            "AND fl.expires_at > datetime('now')",
+            (exclude_session_id, project_id, cutoff),
         ) as cur:
             rows = await cur.fetchall()
         for row in rows:
@@ -746,6 +800,47 @@ async def get_file_conflict_warnings(
                 )
             else:
                 warnings.append(f"{r['file_path']} claimed by session {name}")
+
+        async with db.execute(
+            "SELECT fsc.file_path, fsc.symbol_name, fsc.line_start, fsc.line_end, "
+            "       fsc.session_id, s.name AS session_name "
+            "FROM file_symbol_claims fsc "
+            "JOIN sessions s ON s.id = fsc.session_id "
+            "WHERE fsc.session_id != ? "
+            "AND s.project_id = ? "
+            "AND fsc.released_at IS NULL "
+            "AND s.status IN ('active', 'live') "
+            "AND (s.last_seen IS NULL OR s.last_seen > ?) "
+            "ORDER BY fsc.claimed_at DESC",
+            (exclude_session_id, project_id, cutoff),
+        ) as cur:
+            sym_rows = await cur.fetchall()
+        for row in sym_rows:
+            r = _row_to_dict(row)
+            if not r:
+                continue
+            name = r.get("session_name") or (r.get("session_id") or "unknown")[:8]
+            warnings.append(
+                f"{r['file_path']} symbol {r['symbol_name']} "
+                f"(lines {r['line_start']}-{r['line_end']}) claimed by session {name}"
+            )
+
+        async with db.execute(
+            "SELECT fr.file_path, fr.session_id, s.name AS session_name "
+            "FROM file_read_claims fr "
+            "JOIN sessions s ON s.id = fr.session_id "
+            "WHERE fr.session_id != ? "
+            "AND s.project_id = ? "
+            f"AND {read_live}",
+            (exclude_session_id, project_id),
+        ) as cur:
+            read_rows = await cur.fetchall()
+        for row in read_rows:
+            r = _row_to_dict(row)
+            if not r:
+                continue
+            name = r.get("session_name") or (r.get("session_id") or "unknown")[:8]
+            warnings.append(f"{r['file_path']} read-claimed by session {name}")
     except Exception:  # noqa: BLE001
         pass
     return warnings
@@ -1059,6 +1154,82 @@ async def _live_symbol_claims_for_file(
     return [r for r in (_row_to_dict(row) for row in rows) if r]
 
 
+_SYMBOL_CLAIM_GATES: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = weakref.WeakKeyDictionary()
+
+
+def _symbol_claim_gate(db: Any) -> asyncio.Lock:
+    """One gate per SQLite connection so claimants sharing it cannot interleave."""
+    gate = _SYMBOL_CLAIM_GATES.get(db)
+    if gate is None:
+        gate = asyncio.Lock()
+        _SYMBOL_CLAIM_GATES[db] = gate
+    return gate
+
+
+@asynccontextmanager
+async def _symbol_claim_transaction(db: Any, file_path: str):
+    """Run one symbol-claim overlap check and its insert as a single transaction.
+
+    Without this the check and the insert are separate statements, so two
+    overlapping claims can each see no conflict and both insert.
+
+    * Postgres (autocommit): a pinned transaction holding a transaction-scoped
+      advisory lock keyed on the file, so claims on the same file serialize.
+    * SQLite: ``BEGIN IMMEDIATE`` reserves the single writer before the check, so
+      a claim in another process waits for this commit and then sees its row. An
+      asyncio gate serializes claimants that share one connection. If the
+      connection already has a transaction open, a SAVEPOINT scopes this claim
+      inside it instead.
+
+    The block commits on normal exit and rolls back when the body raises. Do not
+    call ``db.commit()`` inside the block.
+
+    Deliberately not a UNIQUE index: an index on ``file_symbol_claims`` can fail
+    against existing duplicate rows and needs its own migration.
+    """
+    if callable(getattr(db, "begin_transaction", None)):  # Postgres
+        advisory_key = hashlib.sha256(
+            f"meridian.file_symbol_claims\0{file_path}".encode("utf-8")
+        ).digest()[:8]
+        advisory_id = int.from_bytes(advisory_key, byteorder="big", signed=True)
+        async with db.begin_transaction():
+            try:
+                await db.execute("SELECT pg_advisory_xact_lock(?)", (advisory_id,))
+                yield
+                await db.commit()
+            except BaseException:
+                try:
+                    await db.rollback()
+                except BaseException:  # noqa: BLE001 — keep the original failure
+                    _log.exception("Failed to roll back symbol-claim transaction")
+                raise
+        return
+
+    async with _symbol_claim_gate(db):  # SQLite
+        nested = bool(getattr(db, "in_transaction", False))
+        savepoint = f"symbol_claim_{uuid.uuid4().hex}"
+        if nested:
+            await db.execute(f"SAVEPOINT {savepoint}")
+        else:
+            await db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            if nested:
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                await db.commit()
+        except BaseException:
+            try:
+                if nested:
+                    await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    await db.rollback()
+            except BaseException:  # noqa: BLE001 — keep the original failure
+                _log.exception("Failed to roll back symbol-claim transaction")
+            raise
+
+
 async def claim_symbol(
     db: aiosqlite.Connection,
     session_id: str,
@@ -1095,6 +1266,9 @@ async def claim_symbol(
     # WHOLE-FILE lock on this file, no symbol-level claim is allowed (the file
     # owner may touch any symbol). Mirror the inverse block in claim_file.
     await expire_file_locks(db)
+    # Soft-release symbol claims whose holder is dead (idle, closed, or stale), so
+    # the conflict check below never has to consider them.
+    await expire_stale_symbol_claims(db)
     async with db.execute(
         "SELECT session_id, claimed_at, expires_at FROM file_locks WHERE file_path = ?",
         (_normalize_file_path(normalized),),
@@ -1192,11 +1366,29 @@ async def claim_symbol(
         }
     target = matches[0]
 
-    others = await _live_symbol_claims_for_file(db, normalized, session_id)
-    conflicts = [
-        c for c in others
-        if _ranges_overlap(target["line_start"], target["line_end"], c["line_start"], c["line_end"])
-    ]
+    # The overlap check and the insert run in ONE transaction, so two overlapping
+    # claims cannot both pass the check (see _symbol_claim_transaction).
+    async with _symbol_claim_transaction(db, normalized):
+        others = await _live_symbol_claims_for_file(db, normalized, session_id)
+        conflicts = [
+            c for c in others
+            if _ranges_overlap(target["line_start"], target["line_end"], c["line_start"], c["line_end"])
+        ]
+        if not conflicts:
+            # No conflict — (re)claim this symbol for the session (idempotent per
+            # symbol). Drop any prior row for this exact (session, file, symbol),
+            # active or released, so a re-claim is a single fresh active row.
+            await db.execute(
+                "DELETE FROM file_symbol_claims WHERE session_id = ? AND file_path = ? AND symbol_name = ?",
+                (session_id, normalized, symbol),
+            )
+            await db.execute(
+                "INSERT INTO file_symbol_claims "
+                "(id, session_id, file_path, symbol_name, symbol_type, line_start, line_end) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (_new_id(), session_id, normalized, symbol, target["type"],
+                 target["line_start"], target["line_end"]),
+            )
     if conflicts:
         claimed_ranges = [(c["line_start"], c["line_end"]) for c in others]
         safe = [
@@ -1238,21 +1430,6 @@ async def claim_symbol(
             ),
         }
 
-    # No conflict — (re)claim this symbol for the session (idempotent per symbol).
-    # Drop any prior row for this exact (session, file, symbol), active or
-    # released, so a re-claim is a single fresh active row.
-    await db.execute(
-        "DELETE FROM file_symbol_claims WHERE session_id = ? AND file_path = ? AND symbol_name = ?",
-        (session_id, normalized, symbol),
-    )
-    await db.execute(
-        "INSERT INTO file_symbol_claims "
-        "(id, session_id, file_path, symbol_name, symbol_type, line_start, line_end) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (_new_id(), session_id, normalized, symbol, target["type"],
-         target["line_start"], target["line_end"]),
-    )
-    await db.commit()
     # 2593a5fe — amend the active sprint item's touches_resources if this symbol
     # was not in the original declaration (mid-execution pivot detection).
     # Use "symbol:<path>::<symbol>" as resource id for symbol-level precision.
@@ -1288,13 +1465,22 @@ async def get_symbol_claims(
     db: aiosqlite.Connection,
     file_path: str,
 ) -> list[dict[str, Any]]:
-    """Return active symbol claims on a file (released_at IS NULL), newest first."""
+    """Return live symbol claims on a file (released_at IS NULL), newest first.
+
+    A claim whose holder is not live is omitted, using the same rule the conflict
+    check applies (see :func:`_live_symbol_claims_for_file`): the holder's session
+    must be active/live and its heartbeat inside the 2-hour window. A dead
+    holder's row is never reported as held.
+    """
+    cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
     async with db.execute(
         "SELECT fsc.*, s.name AS session_name FROM file_symbol_claims fsc "
         "LEFT JOIN sessions s ON s.id = fsc.session_id "
         "WHERE fsc.file_path = ? AND fsc.released_at IS NULL "
+        "AND s.status IN ('active', 'live') "
+        "AND (s.last_seen IS NULL OR s.last_seen > ?) "
         "ORDER BY fsc.claimed_at DESC",
-        (_normalize_file_path(file_path),),
+        (_normalize_file_path(file_path), cutoff),
     ) as cur:
         rows = await cur.fetchall()
     return [r for r in (_row_to_dict(row) for row in rows) if r]

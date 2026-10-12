@@ -5106,9 +5106,11 @@ async def _handle_file_claims(
             if result.get("reason") == "unparseable":
                 # 771c00d7 — still surface code-anchored notes (symbol-scoped) on
                 # the whole-file fallback so the executor never misses a warning.
+                # The fallback is marked (claim_granularity="file" + fallback_reason)
+                # so a whole-file lock is never mistaken for a symbol claim.
                 return await db_module.claim_file(
                     db, args["file_path"], args["session_id"], symbol=_symbol,
-                    item_id=_item_id,
+                    item_id=_item_id, fallback_reason="unparseable",
                 )
             # 771c00d7 — attach symbol-scoped code notes to the symbol claim too,
             # resolving the project from the session (same as claim_file does).
@@ -5117,9 +5119,12 @@ async def _handle_file_claims(
             )
             return result
         # ffa03655 — read|write claim grain (default write/exclusive).
+        # A symbol requested without content cannot be resolved, so this
+        # whole-file lock is a marked fallback (no_source_supplied).
         return await db_module.claim_file(
             db, args["file_path"], args["session_id"], symbol=_symbol,
             mode=args.get("mode", "write"), item_id=_item_id,
+            fallback_reason="no_source_supplied" if _symbol else None,
         )
     if name == "get_file_claims":
         return await db_module.get_file_claims(
