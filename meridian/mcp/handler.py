@@ -3614,6 +3614,10 @@ async def _handle_task_tools(
             items=_selected_closure_items,
             max_executor_contracts=handoff_module_local._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
             max_contract_list_items=handoff_module_local._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+            # de7e3c2a — tenant (hosted) or local-first floor (self-hosted).
+            **(await handoff_module_local.contract_availability_kwargs(
+                db, args["project_id"], tenant,
+            )),
         )
         # 6cdc5df3 — machine-readable proposal-to-evidence linkage, emitted on
         # every generate_handoff mode alongside the capability contract above.
@@ -5077,9 +5081,36 @@ async def _handle_sprint_tools(
     }
 
     if name in _standard_dispatch:
-        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+        _result = await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+        if name == "claim_sprint_item":
+            _result = await _attach_claim_capability_contract(_result, args, db, tenant)
+        return _result
 
     return _MISS
+
+
+async def _attach_claim_capability_contract(
+    result: Any, args: dict[str, Any], db: Any, tenant: dict[str, Any] | None,
+) -> Any:
+    """de7e3c2a — attach the claim-time capability contract to a SUCCESSFUL
+    ``claim_sprint_item`` response (see handoff.build_claim_capability_contract).
+
+    Only a real claim (``status == "in_progress"`` with an id) is annotated;
+    refusals and errors pass through untouched. Never raises and never blocks
+    the claim: the contract is warn-only information for the executor.
+    """
+    if not isinstance(result, dict) or result.get("error") or result.get("status") != "in_progress":
+        return result
+    from .. import handoff as handoff_module_local  # noqa: PLC0415
+    _project_id = result.get("project_id") or args.get("project_id")
+    if not _project_id:
+        return result
+    _claim_contract = await handoff_module_local.build_claim_capability_contract(
+        db, _project_id, result, tenant=tenant,
+    )
+    if _claim_contract is None:
+        return result
+    return {**result, "capability_contract": _claim_contract}
 
 
 async def _handle_file_claims(

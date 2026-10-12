@@ -530,9 +530,12 @@ async def handle_start_session(
             if _is_compact:
                 _cc_kwargs["max_executor_contracts"] = 0
                 _cc_kwargs["max_contract_list_items"] = 0
+            # de7e3c2a — pass tenant (hosted) or the local-first floor
+            # (self-hosted) so executable/availability are real, not "unknown".
             result["capability_contract"] = await _handoff_module.build_effective_capability_contract(
                 db, _pid, board_stale=bool(result.get("pending_goal_stale")),
                 **_cc_kwargs,
+                **(await _handoff_module.contract_availability_kwargs(db, _pid, tenant)),
             )
     except Exception:  # noqa: BLE001 — capability contract is best-effort
         pass

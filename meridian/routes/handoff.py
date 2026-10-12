@@ -7,13 +7,31 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db, _data_dir
+from .._deps import _db, _data_dir, _get_authenticated_tenant
 from .. import db as db_module
 from .. import handoff as handoff_module
 from ..db import ai_log as ai_log_module
 from ..models import HandoffResult
 
 router = APIRouter()
+
+
+async def _contract_availability_kwargs(
+    request: Request, db: Any, project_id: str,
+) -> dict[str, Any]:
+    """de7e3c2a — availability kwargs for this REST request's capability contract.
+
+    These routes carry no tenant of their own, so resolve it the same way every
+    other authenticated route does (``_get_authenticated_tenant``). Hosted
+    requests get their tenant; self-hosted and demo requests have none and fall
+    through to the local-first floor. Best-effort: a failed lookup means no
+    tenant, never a failed handoff.
+    """
+    try:
+        _tenant = await _get_authenticated_tenant(request)
+    except Exception:  # noqa: BLE001 — no credential (self-hosted/demo): no tenant
+        _tenant = None
+    return await handoff_module.contract_availability_kwargs(db, project_id, _tenant)
 
 
 async def _log_correction_event(
@@ -95,6 +113,7 @@ async def planner_handoff_endpoint(
         db, project_id,
         max_executor_contracts=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
         max_contract_list_items=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+        **(await _contract_availability_kwargs(request, db, project_id)),
     )
     # 89a06e40 — machine-readable effective profile identity/generation;
     # best-effort, never breaks the planner handoff. See pinned decision
@@ -366,6 +385,7 @@ async def generate_handoff_endpoint(
         items=_selected_closure_items,
         max_executor_contracts=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
         max_contract_list_items=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+        **(await _contract_availability_kwargs(request, db, project_id)),
     )
     # 89a06e40 — machine-readable effective profile identity/generation;
     # best-effort, never breaks the mandatory handoff. See pinned decision
