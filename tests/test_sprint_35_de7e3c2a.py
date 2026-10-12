@@ -52,6 +52,7 @@ import meridian.server  # noqa: F401 — import first to avoid cycle
 from meridian import capability_availability as ca
 from meridian import db as db_module
 from meridian import handoff as handoff_module
+from meridian import handoff_receipt as receipt_module
 from meridian.mcp import handler as mcp_handler
 from meridian.mcp.handlers import project_tools as pt_mod
 from meridian.routes import handoff as routes_handoff
@@ -637,3 +638,107 @@ def test_generate_handoff_and_rest_routes_pass_contract_availability_kwargs(clie
     )
     assert mcp_calls and set(mcp_calls) == {pid}
     assert mcp_result["capability_contract"]["availability"]["available"] == ["native-only"]
+
+
+# ---------------------------------------------------------------------------
+# Review finding (de7e3c2a), claim_sprint_item path: the handoff-provenance
+# check awaited the same live-inventory probe with no bound.
+#
+# handle_claim_sprint_item calls handoff_receipt.verify_handoff_provenance after
+# the claim has already committed. That check reaches check_capability_availability
+# -> _build_live_inventory, which had no bound, so a cold tunnel slot could hold
+# the claim response for ~60s while its verdict is warn-only. The probe is now
+# bounded by the same shared budget, resolves in the unverified state, and the
+# claim still commits.
+# ---------------------------------------------------------------------------
+
+def _provenance_cap() -> dict:
+    return _cap(
+        id=receipt_module.HANDOFF_PROVENANCE_CAPABILITY_ID,
+        required_tools=["verify_handoff_token"],
+    )
+
+
+async def test_claim_sprint_item_hanging_provenance_probe_is_bounded_and_claim_commits(
+    db, project, monkeypatch,
+):
+    """Regression (de7e3c2a review, claim path): a never-returning live-inventory
+    probe must not hold claim_sprint_item past the budget. The claim still
+    commits, and the provenance result stays warn-only, never a block."""
+    await db_module.set_project_capability_manifest(db, project["id"], [_provenance_cap()])
+    item = await db_module.add_sprint_item(db, project["id"], "v1", "Claim on a cold tunnel")
+    _shrink_probe_budget(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(pt_mod, "_build_live_inventory", _hanging_probe(calls))
+
+    started = time.monotonic()
+    result = await asyncio.wait_for(
+        mcp_handler._handle_sprint_tools(
+            "claim_sprint_item",
+            {"project_id": project["id"], "item_id": item["id"], "session_id": "s35-provenance-cold"},
+            db, "/tmp/meridian-test", {"id": "tenant-cold"}, None,
+        ),
+        timeout=_PROBE_GUARD_SECONDS,
+    )
+    elapsed = time.monotonic() - started
+
+    assert calls == [{"id": "tenant-cold"}]  # the probe really was awaited
+    assert elapsed < 3.0, elapsed  # 0.2s shrunk budget plus scheduling slack
+    assert result.get("status") == "in_progress", result  # the claim stands
+    stored = await db_module.get_sprint_item(db, item["id"])
+    assert stored["status"] == "in_progress"  # committed, not rolled back
+    # Unverified, not faked: no receipt exists, so the warn-only field is set.
+    assert result.get("handoff_provenance_warning")
+    assert "handoff_provenance_receipt" not in result
+
+
+async def test_provenance_check_hanging_probe_resolves_within_default_budget(
+    db, project, monkeypatch,
+):
+    """Canonical budget pin for the claim path: at the production budget a
+    never-returning probe resolves in the unverified state instead of being held."""
+    await db_module.set_project_capability_manifest(db, project["id"], [_provenance_cap()])
+    calls: list = []
+    monkeypatch.setattr(pt_mod, "_build_live_inventory", _hanging_probe(calls))
+
+    started = time.monotonic()
+    check = await asyncio.wait_for(
+        receipt_module.verify_handoff_provenance(
+            db, {"id": "tenant-cold"}, project["id"], session_id="s35-cold",
+        ),
+        timeout=_PROBE_GUARD_SECONDS,
+    )
+    elapsed = time.monotonic() - started
+
+    assert calls == [{"id": "tenant-cold"}]
+    assert elapsed < _DEFAULT_BUDGET_CEILING_SECONDS, elapsed
+    assert check["applicable"] is True  # the project declared the capability
+    assert check["ok"] is True  # warn-only: never blocks
+    assert check["degraded"] is True  # no receipt, so the warning path is taken
+    assert check["capability"]["status"] == "unknown"  # unverified, not faked
+
+
+async def test_provenance_timeout_still_honours_a_real_receipt(db, project, monkeypatch):
+    """A timed-out probe must not discard the receipt lookup: the receipt comes
+    from the DB, not the probe, so a genuine verification still resolves."""
+    await db_module.set_project_capability_manifest(db, project["id"], [_provenance_cap()])
+    await receipt_module.record_handoff_provenance_receipt(
+        db, tenant_id="tenant-cold", project_id=project["id"],
+        session_id="s35-cold", tool_name="verify_handoff_token", outcome="valid",
+    )
+    _shrink_probe_budget(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(pt_mod, "_build_live_inventory", _hanging_probe(calls))
+
+    check = await asyncio.wait_for(
+        receipt_module.verify_handoff_provenance(
+            db, {"id": "tenant-cold"}, project["id"], session_id="s35-cold",
+        ),
+        timeout=_PROBE_GUARD_SECONDS,
+    )
+
+    assert calls == [{"id": "tenant-cold"}]
+    assert check["applicable"] is True
+    assert check["receipt"] is not None
+    assert check["degraded"] is False
+    assert check["warning"] is None
