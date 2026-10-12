@@ -72,7 +72,8 @@ async def handle_start_research_run(
     Read-only runs need no claim_file. Isolated-write runs require the
     caller to explicitly attest ``is_isolated_worktree=true`` (never
     inferred) and a non-empty ``allowed_paths`` list bounding what may be
-    written.
+    written. ``guard_mode`` (off | warn | strict, default off) opts into
+    the symbol-lock guard; an invalid value is rejected, never defaulted.
     """
     from meridian.db import research_runs as run_db  # noqa: PLC0415
 
@@ -86,6 +87,7 @@ async def handle_start_research_run(
             turn_budget=args.get("turn_budget"),
             ttl_seconds=args.get("ttl_seconds"),
             is_isolated_worktree=bool(args.get("is_isolated_worktree", False)),
+            guard_mode=args.get("guard_mode"),
         )
     except ValueError as exc:
         return {"error": str(exc)}
