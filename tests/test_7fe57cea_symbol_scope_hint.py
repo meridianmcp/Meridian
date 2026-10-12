@@ -8,7 +8,8 @@ Covers:
   (d) fan_out_sprint_items with a file:-only resource in one item produces
       symbol_scope_hints in the batch result.
   (e) The pure helper _check_file_only_resources_warning covers edge cases:
-      - file+symbol entry (no second ":" segment) triggers no warning
+      - file:path:symbol entry gets a non-fatal whole-file hint (the form locks
+        the whole file; symbol:path::name is the symbol-scoped form)
       - symbol: prefix triggers no warning
       - inferred: prefix triggers no warning
       - bare file: with a symbol name in title generates a hint with example
@@ -48,13 +49,17 @@ def test_helper_file_only_with_symbol_candidate_in_title():
     assert "file:path.py:symbol_name" in hint or "add_sprint_item" in hint
 
 
-def test_helper_file_plus_symbol_no_warning():
-    """A file: entry that already includes :symbol triggers no warning."""
+def test_helper_file_plus_symbol_gets_whole_file_hint():
+    """A file: entry with :symbol locks the WHOLE file, so it gets a non-fatal
+    hint pointing at the symbol:path::name form for symbol scope."""
     hint = mh._check_file_only_resources_warning(
         ["file:meridian/db/sprint_items.py:add_sprint_item"],
         "fix add_sprint_item to handle duplicate titles",
     )
-    assert hint is None
+    assert hint is not None
+    assert "SYMBOL_SCOPE_HINT" in hint
+    assert "whole file" in hint
+    assert "symbol:meridian/db/sprint_items.py::add_sprint_item" in hint
 
 
 def test_helper_symbol_prefix_no_warning():
@@ -166,8 +171,9 @@ def test_add_sprint_item_symbol_scoped_resource_no_hint():
         _run(db.close())
 
 
-def test_add_sprint_item_file_plus_symbol_no_hint():
-    """file:path.py:symbol_name (the preferred form) → no hint."""
+def test_add_sprint_item_file_plus_symbol_gets_whole_file_hint():
+    """file:path.py:symbol_name locks the whole file → non-fatal hint pointing at
+    symbol:path::name; the item is still filed."""
     db = _make_db()
     try:
         proj = _run(db_module.create_project(db, "hint-proj-c"))
@@ -177,7 +183,10 @@ def test_add_sprint_item_file_plus_symbol_no_hint():
             "title": "update add_sprint_item to accept wave parameter",
             "touches_resources": ["file:meridian/mcp/handler.py:add_sprint_item"],
         }, db, "/tmp"))
-        assert out.get("symbol_scope_hint") is None
+        assert out.get("symbol_scope_hint") is not None
+        assert "SYMBOL_SCOPE_HINT" in out["symbol_scope_hint"]
+        assert "whole file" in out["symbol_scope_hint"]
+        assert "symbol:meridian/mcp/handler.py::add_sprint_item" in out["symbol_scope_hint"]
         items = _run(db_module.get_sprint_items(db, proj["id"]))
         assert any("wave" in (it.get("title") or "") for it in items)
     finally:
@@ -247,11 +256,35 @@ def test_fan_out_sprint_items_all_symbol_scoped_no_hints():
                 {
                     "title": "update get_project function",
                     "version": "v1",
-                    "touches_resources": ["file:meridian/db/__init__.py:get_project"],
+                    "touches_resources": ["symbol:meridian/db/__init__.py::get_project"],
                 },
             ],
         }, db, "/tmp"))
         assert out.get("count") == 2
         assert not out.get("symbol_scope_hints")
+    finally:
+        _run(db.close())
+
+
+def test_fan_out_sprint_items_file_plus_symbol_gets_whole_file_hint():
+    """fan_out_sprint_items with a file:path:symbol item → a whole-file hint for
+    that item; the batch is still filed."""
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "hint-proj-fan3"))
+        out = _run(mh._dispatch_mcp_tool("fan_out_sprint_items", {
+            "project_id": proj["id"],
+            "items": [
+                {
+                    "title": "update get_project function",
+                    "version": "v1",
+                    "touches_resources": ["file:meridian/db/__init__.py:get_project"],
+                },
+            ],
+        }, db, "/tmp"))
+        assert out.get("count") == 1
+        hints = out.get("symbol_scope_hints", [])
+        assert len(hints) == 1
+        assert "whole file" in hints[0]
     finally:
         _run(db.close())

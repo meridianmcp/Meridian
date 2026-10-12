@@ -45,6 +45,26 @@ def _symbol_name_of(row: Any) -> str:
     return str(row.get("symbol_name") or row.get("symbol") or "").strip()
 
 
+# Cap on the advisory symbol list a read-mode verdict carries (Change B).
+ADVISORY_SYMBOL_CLAIM_CAP = 20
+
+
+def _advisory_symbol_claims(claims: Any, session_id: str) -> dict[str, list[dict[str, str]]]:
+    """Advisory only (read mode): other sessions' live symbol claims as
+    ``{symbol_name, session_id}`` with no line ranges, capped. Never changes ``allow``."""
+    rows = claims.get("symbol_claims") if isinstance(claims, dict) else None
+    out: list[dict[str, str]] = []
+    for sc in rows if isinstance(rows, list) else []:
+        name = _symbol_name_of(sc)
+        owner = _session_of(sc)
+        if not name or not owner or owner == session_id:
+            continue
+        out.append({"symbol_name": name, "session_id": owner})
+        if len(out) >= ADVISORY_SYMBOL_CLAIM_CAP:
+            break
+    return {"symbol_claims": out}
+
+
 def evaluate_claim_guard(
     claims: dict[str, Any] | None,
     session_id: str,
@@ -82,13 +102,17 @@ def evaluate_claim_guard(
         _symbol = None
 
     def _verdict(allow: bool, reason: str, holder: str | None) -> dict[str, Any]:
-        return {
+        verdict: dict[str, Any] = {
             "allow": allow,
             "reason": reason,
             "holder": holder,
             "mode": _mode,
             "symbol": _symbol,
         }
+        if _mode == "read":
+            # Advisory only -- the allow/deny decision is unchanged by this key.
+            verdict["advisory"] = _advisory_symbol_claims(claims, session_id)
+        return verdict
 
     if not isinstance(claims, dict):
         return _verdict(True, "no-claim-data", None)

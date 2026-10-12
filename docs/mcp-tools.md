@@ -225,6 +225,8 @@ Claim exclusive edit rights on a file path for this session. Locks auto-expire a
 | `content` | string | optional | Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range. |
 | `item_id` | string | optional | Optional sprint item id this claim is being made for (c027922d). When your session holds 2+ sprint items in_progress concurrently, pass this so the touches_resources amendment side-effect is attributed to the right item instead of guessed. |
 
+A successful read claim (`mode="read"`) also returns `symbol_claims`: an advisory list (at most 20 entries) of other live sessions' symbol claims on the file, each with the symbol name and the holder's `session_id` only. It is information for the reader and never blocks a read claim; only another session's whole-file write lock does.
+
 **Example:**
 ```
 claim_file(session_id="session-uuid", file_path="meridian/server.py")

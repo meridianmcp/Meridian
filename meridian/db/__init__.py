@@ -8653,7 +8653,8 @@ def _resource_file_of(rid: str) -> "str | None":
     2a176d6d — a ``file:<path>:<symbol>`` declaration (a single extra colon,
     NOT the ``::`` double-colon ``symbol:`` convention) is a widely-used,
     accepted shorthand elsewhere in this codebase (see the SYMBOL_SCOPE_HINT
-    helper, which treats it as the *preferred* form and is why it is never
+    helper, which accepts it (it locks the WHOLE file; symbol:<path>::<name> is the
+    form that gives symbol scope) and is why it is never
     rewritten/rejected at declaration time by ``normalize_resource_id``). But
     left as an opaque ``file:`` value, the trailing ``:<symbol>`` suffix became
     part of the "file identity" this function returns — so two items each

@@ -7898,7 +7898,7 @@ def pack_groups_into_macro_waves(
 def _is_legacy_file_symbol_shorthand(resource: str) -> bool:
     """6b3b2c0e — True when a ``file:`` resource id uses the legacy
     single-colon ``file:<path>:<symbol>`` shorthand (2a176d6d's accepted
-    "preferred form" per the SYMBOL_SCOPE_HINT hint in meridian.mcp.handler)
+    whole-file form; the SYMBOL_SCOPE_HINT hint in meridian.mcp.handler points to symbol:<path>::<name> for symbol scope)
     rather than a plain ``file:<path>``.
 
     Delegates entirely to :func:`_resource_file_of` — the ONE place that
@@ -8249,8 +8249,8 @@ async def _live_resource_holder(
     the SAME canonical real-file identity the scheduler's conflict coloring
     (63b030a6/2a176d6d) already uses, instead of the raw
     ``resource[len("file:"):]`` suffix. Without this, a legacy single-colon
-    ``file:<path>:<symbol>`` declaration (2a176d6d's accepted "preferred
-    form") checked liveness against a fabricated, per-declaration-unique key
+    ``file:<path>:<symbol>`` declaration (2a176d6d's accepted whole-file
+    form, which locks the whole file) checked liveness against a fabricated, per-declaration-unique key
     ("<path>:<symbol>") that no other claim ever writes to — so this function
     silently reported the resource as FREE even when the real file <path> was
     genuinely held by another live session (the confirmed 6b3b2c0e planning
@@ -8893,7 +8893,7 @@ async def _claim_batch_resource(
     the scheduler's conflict coloring already uses, instead of the raw
     ``resource[len("file:"):]`` suffix. Before this fix, a legacy
     single-colon ``file:<path>:<symbol>`` declaration (2a176d6d's accepted
-    "preferred form") was claimed under a fabricated, per-declaration-unique
+    whole-file form, which locks the whole file) was claimed under a fabricated, per-declaration-unique
     key ("<path>:<symbol>") instead of the real file "<path>" — so two items
     declaring ``file:x.py:funcA`` and ``file:x.py:funcB`` could BOTH acquire
     a "lock" concurrently even though get_parallelizable_groups already
@@ -9608,6 +9608,22 @@ async def claim_parallel_batch(
             # resources landed a real symbol-range claim vs. a coarse
             # whole-file fallback, rather than inferring it from
             # fallback_reason presence/absence downstream.
+            # Change C -- best-effort audit row for a coarse whole-file fallback (one
+            # per item and file). The lock is already held here; a failed write is
+            # logged and the batch result is unchanged.
+            if outcome.get("claim_granularity") == "coarse" and outcome.get("file_path"):
+                try:
+                    from .. import lock_granularity_receipt as _lgr  # noqa: PLC0415
+                    await _lgr.record_coarse_fallback_receipt(
+                        db, tenant_id=None, project_id=project_id, session_id=claim_session,
+                        item_id=iid, resource=resource, file_path=outcome["file_path"],
+                        reason=outcome.get("fallback_reason"),
+                    )
+                except Exception:  # noqa: BLE001 -- a receipt must never change the batch
+                    _log.warning(
+                        "coarse-fallback receipt for item %s (%s) failed; batch unaffected",
+                        iid, resource, exc_info=True,
+                    )
             _resource_claim_record = {
                 "item_id": iid,
                 "resource": resource,

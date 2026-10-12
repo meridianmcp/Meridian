@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -26,6 +27,8 @@ from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
 from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
 from . import scope_guard
+
+_log = logging.getLogger(__name__)
 
 # CI-PERF-3B — named, overridable timeout constants (extracted from inline
 # literals scattered across the dispatch functions below) so tests can
@@ -1956,6 +1959,24 @@ async def _sprint_item_resource_claim_gate(
         except Exception:  # noqa: BLE001 — a receipt failure must never break the claim
             pass
 
+    async def _record_coarse_fallback(
+        resource_key: str, file_path: str, reason: "str | None",
+    ) -> None:
+        # Change C -- best-effort audit row per (item, file) coarse fallback. The
+        # whole-file lock is already held here: a failed write is logged and the
+        # claim result is unchanged.
+        try:
+            from .. import lock_granularity_receipt as _lgr  # noqa: PLC0415
+            await _lgr.record_coarse_fallback_receipt(
+                db, tenant_id=tenant_id, project_id=project_id, session_id=session_id,
+                item_id=item_id, resource=resource_key, file_path=file_path, reason=reason,
+            )
+        except Exception:  # noqa: BLE001 -- a receipt must never change the claim
+            _log.warning(
+                "coarse-fallback receipt for item %s (%s) failed; claim unaffected",
+                item_id, resource_key, exc_info=True,
+            )
+
     if not session_id:
         if strict_resource_locking:
             _identity_item = await db_module.get_sprint_item(db, item_id)
@@ -2120,6 +2141,8 @@ async def _sprint_item_resource_claim_gate(
                                 "reason": symbol_result.get("reason"),
                                 "holder_session_id": _holder,
                                 "details": symbol_result,
+                                # Change D -- advisory note only; refusal unchanged.
+                                **({"owner_idle": True} if symbol_result.get("owner_idle") else {}),
                             },
                         },
                         f"Cannot claim sprint item: symbol {resource!r} is locked "
@@ -2187,6 +2210,7 @@ async def _sprint_item_resource_claim_gate(
                 await _record_receipt(
                     resource, "coarse", fallback_reason, approved=_fallback_approved
                 )
+                await _record_coarse_fallback(resource, file_path, fallback_reason)
                 continue
             return await _blocked(
                 {
@@ -2366,13 +2390,15 @@ def _check_file_only_resources_warning(
        extracted from the text, include the top candidates as concrete examples.
 
     Non-fatal by construction — callers add this to a ``symbol_scope_hint`` field
-    only; filing never blocks. Returns ``None`` when everything is already
-    symbol-scoped or no file: entries are present.
+    only; filing never blocks. Returns ``None`` when there are no file: entries
+    (or only symbol: / inferred: ones). A ``file:<path>:<symbol>`` entry locks the
+    whole file, so it gets its own whole-file hint pointing at symbol:<path>::<name>.
     """
     import re as _re  # noqa: PLC0415 — lazy import keeps module-level clean
 
     entries = _parse_touches_files(touches_resources)
     file_only: list[str] = []
+    file_symbol: list[tuple[str, str]] = []  # (path, symbol) for file:<path>:<symbol>
     for entry in entries:
         raw = entry
         # Skip inferred: entries entirely — they are auto-generated server-side,
@@ -2388,9 +2414,23 @@ def _check_file_only_resources_warning(
         if len(segments) == 1 or not segments[1]:
             # Bare file:path.py — no symbol declared
             file_only.append(raw)
+        elif not _re.match(r"^[A-Za-z]:[/\\]", path_part):
+            # file:<path>:<symbol> — the shorthand locks the WHOLE file (4e2bce48), so
+            # it gets its own non-fatal hint. A Windows drive letter is not a suffix.
+            file_symbol.append((segments[0], segments[1]))
+
+    if not file_only and not file_symbol:
+        return None  # No file: entries, or only symbol:/inferred: entries
 
     if not file_only:
-        return None  # All resources are already symbol-scoped (or no file: entries)
+        # Only file:<path>:<symbol> entries. The shorthand locks the WHOLE file, so
+        # say so and point at the symbol:<path>::<name> form for symbol scope.
+        _path, _sym = file_symbol[0]
+        return (
+            "SYMBOL_SCOPE_HINT: a file:<path>:<symbol> resource locks the whole "
+            "file, not only the named symbol. For symbol scope declare "
+            f"symbol:{_path}::{_sym} instead (non-fatal: item filed as-is)."
+        )
 
     # Extract plausible symbol names from title + description
     combined = f"{title} {description}".strip()
@@ -2440,6 +2480,12 @@ def _check_file_only_resources_warning(
             f"when two items touch different functions in the same file — "
             f"this allows them to co-batch in the same parallel wave. "
             f"(Non-fatal: item filed as-is.)"
+        )
+    if file_symbol:
+        _path, _sym = file_symbol[0]
+        hint += (
+            " Also, a file:<path>:<symbol> resource locks the whole file; "
+            f"symbol:{_path}::{_sym} gives symbol scope."
         )
     return hint
 

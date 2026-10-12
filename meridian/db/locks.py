@@ -622,6 +622,38 @@ async def _all_read_claims(
         return [_row_to_dict(r) for r in await cur.fetchall()]
 
 
+# Cap on the advisory symbol list a read claim reports (Change B).
+ADVISORY_SYMBOL_CLAIM_CAP = 20
+
+
+async def _advisory_symbol_claims(
+    db: aiosqlite.Connection, file_path: str, session_id: str
+) -> list[dict[str, Any]]:
+    """Advisory only: OTHER live sessions' symbol claims on ``file_path`` as
+    ``{symbol_name, session_id}`` (no line ranges), capped. Never used to allow or
+    refuse a read claim; that decision stays with the write-lock check."""
+    rows = await _live_symbol_claims_for_file(db, file_path, session_id)
+    ordered = sorted(
+        rows, key=lambda r: (r.get("symbol_name") or "", r.get("session_id") or "")
+    )
+    return [
+        {"symbol_name": r.get("symbol_name"), "session_id": r.get("session_id")}
+        for r in ordered[:ADVISORY_SYMBOL_CLAIM_CAP]
+    ]
+
+
+async def _holder_is_idle(db: aiosqlite.Connection, session_id: str | None) -> bool:
+    """Advisory only (Change D): True when ``session_id``'s session row is ``idle``.
+    Used to add an ``owner_idle`` note to a refusal; it never decides one."""
+    if not session_id:
+        return False
+    async with db.execute(
+        "SELECT status FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = _row_to_dict(await cur.fetchone())
+    return bool(row) and row.get("status") == "idle"
+
+
 async def _claim_file_read(
     db: aiosqlite.Connection,
     normalized: str,
@@ -699,6 +731,8 @@ async def _claim_file_read(
         "code_notes": await _code_notes_for_session_file(
             db, session_id, normalized, symbol
         ),
+        # Change B -- advisory only: other sessions' live symbol claims on the file.
+        "symbol_claims": await _advisory_symbol_claims(db, normalized, session_id),
     }
 
 
@@ -1276,7 +1310,7 @@ async def claim_symbol(
         _fl_row = await cur.fetchone()
     _fl = _row_to_dict(_fl_row)
     if _fl and _fl.get("session_id") and _fl.get("session_id") != session_id:
-        return {
+        _file_locked: dict[str, Any] = {
             "claimed": False,
             "reason": "file_locked",
             "file_path": normalized,
@@ -1294,6 +1328,10 @@ async def claim_symbol(
                 "whole-file lock on it. Wait for it to release, or coordinate."
             ),
         }
+        if await _holder_is_idle(db, _fl.get("session_id")):
+            # Change D -- advisory note only; the refusal above is unchanged.
+            _file_locked["owner_idle"] = True
+        return _file_locked
 
     symbols = extract_symbols(normalized, content or "")
     if not symbols:
@@ -1399,7 +1437,7 @@ async def claim_symbol(
         holder = conflicts[0]
         holder_name = holder.get("session_name") or (holder.get("session_id") or "unknown")[:8]
         safe_hint = f" — you can safely claim {', '.join(safe)}" if safe else " — no other symbols are free"
-        return {
+        _symbol_conflict: dict[str, Any] = {
             "claimed": False,
             "reason": "symbol_conflict",
             "file_path": normalized,
@@ -1429,6 +1467,10 @@ async def claim_symbol(
                 f"claimed by session {holder_name}{safe_hint}"
             ),
         }
+        if await _holder_is_idle(db, holder.get("session_id")):
+            # Change D -- advisory note only; the refusal above is unchanged.
+            _symbol_conflict["owner_idle"] = True
+        return _symbol_conflict
 
     # 2593a5fe — amend the active sprint item's touches_resources if this symbol
     # was not in the original declaration (mid-execution pivot detection).

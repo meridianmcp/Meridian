@@ -1817,7 +1817,7 @@ async def test_claim_symbol_unambiguous_name_still_claims_normally(db):
 # ---------------------------------------------------------------------------
 # 2a176d6d — bonus root-cause fix (audit's literal example): a
 # "file:<path>:<symbol>" declaration (single extra colon, the widely-used
-# "preferred form" per the SYMBOL_SCOPE_HINT helper — NOT the "::" symbol:
+# accepted whole-file form per the SYMBOL_SCOPE_HINT helper — NOT the "::" symbol:
 # convention) must still be recognised as touching the SAME real file as
 # another "file:<path>:<other_symbol>" declaration for CONFLICT purposes,
 # even though the stored/serialized resource string is left untouched.
@@ -1844,7 +1844,7 @@ def test_two_resources_conflict_file_colon_symbol_suffix_same_file():
     # Different real files still don't conflict even with the suffix present.
     assert c("file:x.py:funcA", "file:y.py:funcB") is False
     # The stored string is untouched by normalize_resource_id (still the
-    # "preferred form" per the SYMBOL_SCOPE_HINT helper).
+    # accepted whole-file form per the SYMBOL_SCOPE_HINT helper).
     assert db_module.normalize_resource_id("file:x.py:funcA") == "file:x.py:funcA"
 
 
