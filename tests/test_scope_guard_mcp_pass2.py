@@ -1054,6 +1054,10 @@ _exempt(
     ("search_ai_log", "correlation_id"), ("search_ai_log", "parent_event_id"), ("search_ai_log", "actor_id"),
 )
 _exempt(
+    "bound", "a fan-out run id is an ai_log correlation id: the ledger's duplicate check and build_run_timeline both AND 'project_id = ?' with it (meridian/fanout_ledger.py)",
+    ("record_fanout_results", "run_id"), ("get_fanout_run", "run_id"),
+)
+_exempt(
     "bound", "doc_documents.project_id = ? joins the document id (doc store); a foreign document id matches nothing",
     ("get_citation_edges", "document_id"),
 )
@@ -1230,6 +1234,13 @@ async def _foreign(db: Any, tmp_path: Any, w: W, *, marker: str = SECRET) -> Sim
         db, w.theirs, "tool.invoked", "session", actor_id=b.actor, session_id=w.s_theirs, tenant_id=b.tenant,
         correlation_id=b.corr, parent_event_id=b.parent, payload={"detail": marker},
     )
+    # A fan-out run (5c78017e): one recorded digest. The run id embeds a prefix of the project id, so the
+    # foreign run and the caller's own run never share an id (and the project id itself is never echoed).
+    b.fanout_run = f"fanout-{w.theirs[:8]}"
+    await mk(
+        "record_fanout_results", project_id=w.theirs, run_id=b.fanout_run,
+        entries=[{"agent_key": "agent-a", "verdict": "supports", "url": "https://example.com/source", "quote": marker}],
+    )
     return b
 
 
@@ -1333,6 +1344,10 @@ _BOUND_PROBES: "dict[tuple[str, str], Callable[[W, SimpleNamespace], tuple[str, 
         "resolve_proposal_gate", {"project_id": w.mine, "gate_id": b.gate, "state": "allowed", "decision": "ok", "actor": "a"}),
     ("reopen_proposal_gate", "gate_id"): lambda w, b: (
         "reopen_proposal_gate", {"project_id": w.mine, "gate_id": b.gate, "actor": "a", "reason": "r"}),
+    ("record_fanout_results", "run_id"): lambda w, b: (
+        "record_fanout_results", {"project_id": w.mine, "run_id": b.fanout_run, "entries": [
+            {"agent_key": "agent-a", "verdict": "refutes", "url": "https://example.com/probe", "quote": "probe quote"}]}),
+    ("get_fanout_run", "run_id"): lambda w, b: ("get_fanout_run", {"project_id": w.mine, "run_id": b.fanout_run}),
 }
 
 #: Pairs whose proof is a dedicated test below (an extra setup, or a unit-level
@@ -1352,6 +1367,10 @@ _ALLOWED_WRITES: "dict[tuple[str, str], str]" = {
     ("link_manual_github_issue", "item_id"): (
         "the raw-content log and audit rows of the CALLER's own project (the handler reports 'linked' even when "
         "the UPDATE bound to the project matched nothing); needs the screening toggle, which only the shape test enables"
+    ),
+    ("record_fanout_results", "run_id"): (
+        "a digest is written under the CALLER's own project: the duplicate check and the row are both keyed on "
+        "(project_id, idempotency_key), so a foreign run's rows are never read, counted or touched"
     ),
 }
 

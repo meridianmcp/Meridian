@@ -373,6 +373,10 @@ def build_mcp_server():
             # above).
             _shared_tool("list_active_worktrees"),
             _shared_tool("list_worktrees_pending_cleanup"),
+            # 5c78017e slice 1 — fan-out ledger (same schema as HTTP/MCP).
+            _shared_tool("record_fanout_results"),
+            _shared_tool("get_fanout_run"),
+            _shared_tool("build_agent_packet"),
             Tool(
                 name="idle_until_session_done",
                 description=(
@@ -2967,6 +2971,11 @@ def build_mcp_server():
                         "task_count": run["task_count"],
                         "transcript": run["transcript"],
                     }
+            elif name in ("record_fanout_results", "get_fanout_run", "build_agent_packet"):
+                # 5c78017e slice 1 — same dispatch path as HTTP/MCP.
+                result = await _dispatch_mcp_tool(
+                    name, arguments, db, state["data_dir"]
+                )
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client
