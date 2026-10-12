@@ -1033,6 +1033,26 @@ def _node_text(node: Any) -> str:
     return "".join(node.itertext())
 
 
+def _omml_append_ctrl_pr(parent: Any) -> None:
+    """Append Word's standard ``<m:ctrlPr>`` (Cambria Math run formatting) to ``parent``.
+
+    Word writes this inside ``m:eqArrPr`` to format the equation array's control
+    characters; generated equation arrays carry the same shape so they match
+    Word-authored equations. Mirrors ``docs_intel._omml_append_ctrl_pr``.
+    """
+    rpr = _LET.SubElement(
+        _LET.SubElement(parent, _om("ctrlPr")),
+        f"{{{_DOCX_W_NS}}}rPr",
+        nsmap={"w": _DOCX_W_NS},
+    )
+    _LET.SubElement(
+        rpr,
+        f"{{{_DOCX_W_NS}}}rFonts",
+        {f"{{{_DOCX_W_NS}}}ascii": "Cambria Math", f"{{{_DOCX_W_NS}}}hAnsi": "Cambria Math"},
+    )
+    _LET.SubElement(rpr, f"{{{_DOCX_W_NS}}}i")
+
+
 def _append_run(parent: Any, text: str) -> None:
     if not text:
         return
@@ -1142,15 +1162,22 @@ def _append_mathml(node: Any, parent: Any) -> None:
             _append_mathml(child, expr)
         return
     if tag == "mtable":
+        # MathML cases/aligned systems become a real OMML equation array. Each mtr
+        # is one m:e row; its cells sit directly in that row, separated by "&"
+        # alignment points. A cell m:e nested inside the row m:e is not a math
+        # element, so Word rejects it. Same shape as docs_intel's eqArr.
         arr = _LET.SubElement(parent, _om("eqArr"))
+        _omml_append_ctrl_pr(_LET.SubElement(arr, _om("eqArrPr")))
         for row in node:
             if _local_tag(row) != "mtr":
                 continue
             row_expr = _LET.SubElement(arr, _om("e"))
-            for cell in row:
-                cell_expr = _LET.SubElement(row_expr, _om("e"))
+            for index, cell in enumerate(row):
+                if index:
+                    align = _LET.SubElement(row_expr, _om("r"))
+                    _LET.SubElement(align, _om("t")).text = "&"
                 for child in cell:
-                    _append_mathml(child, cell_expr)
+                    _append_mathml(child, row_expr)
         return
     if tag in {"munder", "mover", "munderover"}:
         kids = list(node)
