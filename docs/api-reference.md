@@ -1083,6 +1083,8 @@ No auth required.
 | `GET` | `/projects/{project_id}/agent-instructions` | Return the current agent_instructions for a project |
 | `PATCH` | `/projects/{project_id}/agent-instructions` | Set or clear agent_instructions. Pass null to reset to server defaults |
 | `GET` | `/projects/{project_id}/agent-instructions/default` | Return the server DEFAULT_AGENT_INSTRUCTIONS (for the Reset button) |
+| `GET` | `/projects/{project_id}/capability-manifest` | Return a project's declared capability manifest (read-only) |
+| `PUT` | `/projects/{project_id}/capability-manifest` | Replace a project's capability manifest wholesale |
 | `POST` | `/projects/{project_id}/codebase-map` | 5813affe — render a package-level codebase map (graphviz) from the graph |
 | `GET` | `/projects/{project_id}/context` | Return a onboarding context payload for new chat sessions (v1.9.x) |
 | `GET` | `/projects/{project_id}/context-block` | v2.3 — plain-text context block suitable for direct clipboard paste |
