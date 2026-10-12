@@ -448,6 +448,17 @@ async function loadTunnelPluginsSection(projectId: string, hostname: any) {
     // Browse section — live registry browser or curated fallback (sprint item 9b288b91).
     const browseSection = await _renderPluginBrowseSection(projectId);
 
+    // Custom-command guidance (sprint item 678abfa6, pieces 1-2). The command runs on
+    // the machine running `meridian --tunnel`, so the example is OS-shaped. Only this
+    // browser's OS is known here: the tunnel handshake sends the hostname but not the
+    // connected client's OS, hence the caption under the example.
+    const _cmdExamples: Record<string, { label: string; example: string; placeholder: string }> = {
+      windows: { label: 'Windows', example: 'C:\\Users\\you\\tools\\my-server.exe --port 9000', placeholder: 'C:\\tools\\my-server.exe' },
+      macos: { label: 'macOS', example: '/Users/you/tools/my-server --port 9000', placeholder: '/Users/you/tools/my-server' },
+      linux: { label: 'Linux', example: '/home/you/tools/my-server --port 9000', placeholder: '/home/you/tools/my-server' },
+    };
+    const _cmdEx = _cmdExamples[detectedOs] || _cmdExamples.linux;
+
     // Custom plugins subsection. Renders the user-defined plugins list (each with
     // a Remove button) + an add form (name / command / port). LOCAL-ONLY: each
     // runs as a local mcp-proxy and is written into the local .mcp.json — they
@@ -486,11 +497,17 @@ async function loadTunnelPluginsSection(projectId: string, hostname: any) {
             into this machine's <code>.mcp.json</code> for a co-located Cursor / Claude Code session.
             Local-only — it does not appear in the claude.ai connector. Use a port outside 8808–8813.
           </div>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            <b style="color:var(--text)">Where the command runs:</b> on the machine running <code>meridian --tunnel</code>, not on Meridian's servers.
+            Use a program or path that exists on that machine; a path from Meridian's own server (for example <code>/app/...</code>) will not be there.
+            Example for ${escapeHtml(_cmdEx.label)}: <code>${escapeHtml(_cmdEx.example)}</code>
+            <span style="opacity:.8">(based on this browser's OS; the tunnel machine may run another.)</span>
+          </div>
           <div id="tp-custom-list-${projectId}" style="margin-bottom:8px"></div>
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
             <input type="text" id="tp-custom-name-${projectId}" placeholder="name (e.g. fetch)"
               style="width:120px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
-            <input type="text" id="tp-custom-command-${projectId}" placeholder="command (e.g. uvx mcp-server-fetch)"
+            <input type="text" id="tp-custom-command-${projectId}" placeholder="command (e.g. uvx mcp-server-fetch or ${escapeHtml(_cmdEx.placeholder)})"
               style="flex:1;min-width:160px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
             <input type="number" id="tp-custom-port-${projectId}" placeholder="port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
