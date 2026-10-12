@@ -2,27 +2,30 @@
 
 B -- a read claim reports live symbol claims on the file as ADVISORY data
      (symbol name + holder session id only, capped at 20). Allow/deny unchanged.
-C -- a coarse fallback (symbol: resource widened to a whole-file lock) writes one
-     action_audit_log row per (item, file). Best-effort: a failed write is logged
-     and the claim result is identical to the success case.
+C -- a coarse fallback (symbol: resource widened to a whole-file lock) writes exactly
+     one EXISTING resource_lock_granularity_receipt row, from the sprint-item gate, the
+     parallel batch and the claim_file symbol fallback. Best-effort: a failed write never
+     changes the claim result.
 D -- a conflict whose blocking holder's session is idle carries owner_idle: true.
      The refusal itself is unchanged.
 """
 from __future__ import annotations
 
 import json
-import logging
 
 import pytest
 
 import meridian.server  # noqa: F401 -- import before the handler to avoid the cycle
 from meridian import db as db_module
+from meridian import lock_granularity_receipt
 from meridian.claim_guard import evaluate_claim_guard
 from meridian.db import locks as locks_module
+from meridian.mcp import handler as mh
 from meridian.mcp.handler import _sprint_item_resource_claim_gate
 
 PY_TWO = "def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n"
-RECEIPT_EVENT = "resource_coarse_fallback_receipt"
+RECEIPT_EVENT = lock_granularity_receipt.RECEIPT_EVENT_TYPE
+RETIRED_COARSE_EVENT = "resource_coarse_fallback_receipt"
 
 
 async def _project(db, name: str):
@@ -34,11 +37,27 @@ async def _set_status(db, session_id: str, status: str) -> None:
     await db.commit()
 
 
-async def _coarse_rows(db, project_id: str) -> list[dict]:
-    rows = await db_module.get_action_audit_log(
-        db, project_id=project_id, event_type=RECEIPT_EVENT, limit=500,
+async def _receipts(db, project_id: str) -> list[dict]:
+    return await lock_granularity_receipt.get_lock_granularity_receipts(
+        db, project_id=project_id, limit=500,
     )
-    return [{**r, **json.loads(r.get("detail") or "{}")} for r in rows]
+
+
+async def _coarse_rows(db, project_id: str) -> list[dict]:
+    return [r for r in await _receipts(db, project_id) if r.get("achieved_granularity") == "coarse"]
+
+
+async def _all_receipts_for_item(db, project_id: str, item_id: str) -> list[dict]:
+    """Every receipt row for one item, under the existing AND the retired event type."""
+    out: list[dict] = []
+    for event_type in (RECEIPT_EVENT, RETIRED_COARSE_EVENT):
+        rows = await db_module.get_action_audit_log(
+            db, project_id=project_id, event_type=event_type, limit=500,
+        )
+        out += [
+            {**r, **json.loads(r.get("detail") or "{}"), "event_type": event_type} for r in rows
+        ]
+    return [r for r in out if r.get("item_id") == item_id]
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +148,29 @@ def test_write_mode_result_has_no_advisory_key():
 # C -- coarse-fallback receipts (best-effort, one row per item and file)
 # ---------------------------------------------------------------------------
 
-async def test_gate_coarse_fallback_writes_one_receipt_per_item_and_file(db):
+async def test_gate_coarse_fallback_writes_exactly_one_receipt(db):
     pid = await _project(db, "c-gate-receipt")
     item = await db_module.add_sprint_item(
-        db, pid, "v1", "c-gate", touches_resources=["symbol:pkg/c1.py::alpha", "symbol:pkg/c1.py::beta"],
-        prospect_bypass=True,
+        db, pid, "v1", "c-gate", touches_resources=["symbol:pkg/c1.py::alpha"], prospect_bypass=True,
+    )
+    sess = await db_module.register_session(db, pid, "w")
+
+    gate = await _sprint_item_resource_claim_gate(db, pid, item["id"], sess["id"])
+
+    assert gate["ok"] is True
+    assert gate["lock_scope"][0]["claim_granularity"] == "coarse"
+    rows = await _all_receipts_for_item(db, pid, item["id"])
+    assert len(rows) == 1  # one fallback -> one row, under the existing event type only
+    assert rows[0]["event_type"] == RECEIPT_EVENT
+    assert rows[0]["achieved_granularity"] == "coarse"
+    assert rows[0]["reason"] == "no_source_supplied"
+
+
+async def test_gate_writes_one_receipt_per_coarse_fallback_not_two(db):
+    pid = await _project(db, "c-gate-two")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "c-gate2",
+        touches_resources=["symbol:pkg/c2.py::alpha", "symbol:pkg/c2.py::beta"], prospect_bypass=True,
     )
     sess = await db_module.register_session(db, pid, "w")
 
@@ -141,15 +178,10 @@ async def test_gate_coarse_fallback_writes_one_receipt_per_item_and_file(db):
 
     assert gate["ok"] is True
     assert all(e["claim_granularity"] == "coarse" for e in gate["lock_scope"])
-    rows = await _coarse_rows(db, pid)
-    assert len(rows) == 1  # two coarse symbols in one file -> one receipt
-    assert rows[0]["item_id"] == item["id"]
-    assert rows[0]["file_path"] == "pkg/c1.py"
-    assert rows[0]["reason"] == "no_source_supplied"
-
-    # Re-running the gate for the same item and file does not add a second row.
-    await _sprint_item_resource_claim_gate(db, pid, item["id"], sess["id"])
-    assert len(await _coarse_rows(db, pid)) == 1
+    rows = await _all_receipts_for_item(db, pid, item["id"])
+    # Two fallbacks (one per symbol resource) -> two rows in total, never two rows per fallback.
+    assert len(rows) == 2
+    assert sorted(r["resource"] for r in rows) == ["symbol:pkg/c2.py::alpha", "symbol:pkg/c2.py::beta"]
 
 
 async def test_gate_real_symbol_lock_writes_no_coarse_receipt(db):
@@ -168,11 +200,11 @@ async def test_gate_real_symbol_lock_writes_no_coarse_receipt(db):
     assert await _coarse_rows(db, pid) == []
 
 
-async def test_gate_claim_identical_when_coarse_receipt_write_fails(db, monkeypatch, caplog):
+async def test_gate_claim_identical_when_receipt_write_fails(db, monkeypatch):
     real_record = db_module.record_action_audit_event
 
-    async def failing_for_coarse(conn, event_type, **kwargs):
-        if event_type == RECEIPT_EVENT:
+    async def failing_for_receipts(conn, event_type, **kwargs):
+        if event_type in (RECEIPT_EVENT, RETIRED_COARSE_EVENT):
             raise RuntimeError("audit store unavailable")
         return await real_record(conn, event_type, **kwargs)
 
@@ -189,13 +221,11 @@ async def test_gate_claim_identical_when_coarse_receipt_write_fails(db, monkeypa
         ]
 
     ok_case = await gate_projection("pkg/c3ok.py", "c3-ok")
-    monkeypatch.setattr(db_module, "record_action_audit_event", failing_for_coarse)
-    with caplog.at_level(logging.WARNING):
-        failed_case = await gate_projection("pkg/c3fail.py", "c3-fail")
+    monkeypatch.setattr(db_module, "record_action_audit_event", failing_for_receipts)
+    failed_case = await gate_projection("pkg/c3fail.py", "c3-fail")
 
     assert failed_case == ok_case
     assert failed_case[0] is True
-    assert any("coarse" in r.getMessage().lower() and r.levelno >= logging.WARNING for r in caplog.records)
 
 
 async def test_parallel_batch_coarse_fallback_writes_receipt(db):
@@ -212,14 +242,16 @@ async def test_parallel_batch_coarse_fallback_writes_receipt(db):
     rows = await _coarse_rows(db, pid)
     assert len(rows) == 1
     assert rows[0]["item_id"] == a["id"]
-    assert rows[0]["file_path"] == "pkg/c4.py"
+    assert rows[0]["requested_granularity"] == "symbol"
+    assert rows[0]["resource"] == "symbol:pkg/c4.py::alpha"
+    assert len(await _all_receipts_for_item(db, pid, a["id"])) == 1
 
 
-async def test_parallel_batch_claim_identical_when_coarse_receipt_write_fails(db, monkeypatch, caplog):
+async def test_parallel_batch_claim_identical_when_receipt_write_fails(db, monkeypatch):
     real_record = db_module.record_action_audit_event
 
-    async def failing_for_coarse(conn, event_type, **kwargs):
-        if event_type == RECEIPT_EVENT:
+    async def failing_for_receipts(conn, event_type, **kwargs):
+        if event_type in (RECEIPT_EVENT, RETIRED_COARSE_EVENT):
             raise RuntimeError("audit store unavailable")
         return await real_record(conn, event_type, **kwargs)
 
@@ -236,13 +268,82 @@ async def test_parallel_batch_claim_identical_when_coarse_receipt_write_fails(db
         ]
 
     ok_case = await batch_projection("pkg/c5ok.py", "c5-ok")
-    monkeypatch.setattr(db_module, "record_action_audit_event", failing_for_coarse)
-    with caplog.at_level(logging.WARNING):
-        failed_case = await batch_projection("pkg/c5fail.py", "c5-fail")
+    monkeypatch.setattr(db_module, "record_action_audit_event", failing_for_receipts)
+    failed_case = await batch_projection("pkg/c5fail.py", "c5-fail")
 
     assert failed_case == ok_case
     assert failed_case[0] is True
-    assert any("coarse" in r.getMessage().lower() and r.levelno >= logging.WARNING for r in caplog.records)
+
+
+# claim_file with a symbol that cannot be resolved widens to a whole-file lock: a marked
+# coarse fallback that must write the same existing receipt, best-effort, exactly once.
+
+async def _claim_file_symbol(db, session_id: str, file_path: str, symbol: str, content=None):
+    args = {"session_id": session_id, "file_path": file_path, "symbol": symbol}
+    if content is not None:
+        args["content"] = content
+    return await mh._dispatch_mcp_tool("claim_file", args, db, "/tmp")
+
+
+async def test_claim_file_symbol_unparseable_fallback_writes_one_receipt(db):
+    pid = await _project(db, "c-cf-unparse")
+    sess = await db_module.register_session(db, pid, "w")
+
+    # A .txt file has no symbol grammar, so the symbol cannot be extracted: unparseable.
+    result = await _claim_file_symbol(db, sess["id"], "pkg/c7.txt", "alpha", content=PY_TWO)
+
+    assert result["claimed"] is True
+    assert result["fallback_reason"] == "unparseable"
+    rows = await _coarse_rows(db, pid)
+    assert len(rows) == 1
+    assert rows[0]["resource"] == "symbol:pkg/c7.txt::alpha"
+    assert rows[0]["requested_granularity"] == "symbol"
+    assert rows[0]["reason"] == "unparseable"
+    assert rows[0]["item_id"] is None
+
+
+async def test_claim_file_symbol_no_source_fallback_writes_one_receipt(db):
+    pid = await _project(db, "c-cf-nosrc")
+    sess = await db_module.register_session(db, pid, "w")
+
+    result = await _claim_file_symbol(db, sess["id"], "pkg/c8.py", "alpha")
+
+    assert result["claimed"] is True
+    assert result["fallback_reason"] == "no_source_supplied"
+    rows = await _coarse_rows(db, pid)
+    assert len(rows) == 1
+    assert rows[0]["resource"] == "symbol:pkg/c8.py::alpha"
+    assert rows[0]["reason"] == "no_source_supplied"
+
+
+async def test_claim_file_refused_symbol_fallback_writes_no_receipt(db):
+    pid = await _project(db, "c-cf-refused")
+    holder = await db_module.register_session(db, pid, "holder")
+    sess = await db_module.register_session(db, pid, "w")
+    assert (await db_module.claim_file(db, "pkg/c9.py", holder["id"], mode="write"))["claimed"]
+
+    result = await _claim_file_symbol(db, sess["id"], "pkg/c9.py", "alpha")
+
+    assert result["claimed"] is False
+    assert await _coarse_rows(db, pid) == []
+
+
+async def test_claim_file_symbol_fallback_result_identical_when_receipt_write_fails(db, monkeypatch):
+    async def failing_receipt(*args, **kwargs):
+        raise RuntimeError("audit store unavailable")
+
+    async def fallback_projection(path: str, name: str):
+        pid = await _project(db, name)
+        sess = await db_module.register_session(db, pid, "w")
+        result = await _claim_file_symbol(db, sess["id"], path, "alpha")
+        return result["claimed"], result.get("fallback_reason"), result.get("claim_granularity")
+
+    ok_case = await fallback_projection("pkg/c10ok.py", "c10-ok")
+    monkeypatch.setattr(lock_granularity_receipt, "record_lock_granularity_receipt", failing_receipt)
+    failed_case = await fallback_projection("pkg/c10fail.py", "c10-fail")
+
+    assert failed_case == ok_case
+    assert failed_case[0] is True
 
 
 # ---------------------------------------------------------------------------
@@ -321,3 +422,89 @@ async def test_gate_conflict_carries_owner_idle_and_stays_refused(db):
     assert gate["ok"] is False
     assert gate["error"] == "RESOURCE_LOCKED"
     assert gate["conflicts"][0]["conflict"]["owner_idle"] is True
+
+
+# ---------------------------------------------------------------------------
+# D -- released_idle_claims: symbol claims an idle holder held, which the claim-time
+# sweep released, are reported (advisory, capped at 20) on the successful claim.
+# ---------------------------------------------------------------------------
+
+BOX_SRC = (
+    "class Box:\n"
+    "    def fill(self):\n"
+    "        return 1\n"
+    "\n"
+    "    def empty(self):\n"
+    "        return 2\n"
+)
+
+
+async def test_released_idle_claim_is_reported_on_the_claim_that_released_it(db):
+    pid = await _project(db, "d-released-report")
+    holder = await db_module.register_session(db, pid, "holder")
+    other = await db_module.register_session(db, pid, "other")
+    assert (await db_module.claim_symbol(db, holder["id"], "pkg/d5.py", "alpha", PY_TWO))["claimed"]
+    await _set_status(db, holder["id"], "idle")
+
+    result = await db_module.claim_symbol(db, other["id"], "pkg/d5.py", "alpha", PY_TWO)
+
+    assert result["claimed"] is True
+    assert result["released_idle_claims"] == [{"symbol_name": "alpha", "session_id": holder["id"]}]
+
+
+async def test_released_idle_claim_on_an_enclosing_symbol_is_reported(db):
+    pid = await _project(db, "d-released-enclosing")
+    holder = await db_module.register_session(db, pid, "holder")
+    other = await db_module.register_session(db, pid, "other")
+    assert (await db_module.claim_symbol(db, holder["id"], "pkg/d8.py", "Box", BOX_SRC))["claimed"]
+    await _set_status(db, holder["id"], "idle")
+
+    result = await db_module.claim_symbol(db, other["id"], "pkg/d8.py", "Box.fill", BOX_SRC)
+
+    assert result["claimed"] is True
+    assert result["released_idle_claims"] == [{"symbol_name": "Box", "session_id": holder["id"]}]
+
+
+async def test_active_holder_produces_no_released_idle_claims_entry(db):
+    pid = await _project(db, "d-released-active")
+    holder = await db_module.register_session(db, pid, "holder")
+    other = await db_module.register_session(db, pid, "other")
+    assert (await db_module.claim_symbol(db, holder["id"], "pkg/d9.py", "alpha", PY_TWO))["claimed"]
+
+    result = await db_module.claim_symbol(db, other["id"], "pkg/d9.py", "beta", PY_TWO)
+
+    assert result["claimed"] is True
+    assert "released_idle_claims" not in result
+
+
+async def test_idle_claim_on_a_non_overlapping_symbol_is_not_reported(db):
+    pid = await _project(db, "d-released-disjoint")
+    holder = await db_module.register_session(db, pid, "holder")
+    other = await db_module.register_session(db, pid, "other")
+    assert (await db_module.claim_symbol(db, holder["id"], "pkg/d10.py", "beta", PY_TWO))["claimed"]
+    await _set_status(db, holder["id"], "idle")
+
+    result = await db_module.claim_symbol(db, other["id"], "pkg/d10.py", "alpha", PY_TWO)
+
+    assert result["claimed"] is True
+    assert "released_idle_claims" not in result
+
+
+async def test_released_idle_claims_list_is_capped_at_20(db):
+    pid = await _project(db, "d-released-cap")
+    other = await db_module.register_session(db, pid, "other")
+    for i in range(25):
+        holder = await db_module.register_session(db, pid, f"h{i}")
+        await db.execute(
+            "INSERT INTO file_symbol_claims "
+            "(id, session_id, file_path, symbol_name, symbol_type, line_start, line_end) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (f"d-cap-{i}", holder["id"], "pkg/d7.py", "alpha", "function", 1, 2),
+        )
+        await _set_status(db, holder["id"], "idle")
+
+    result = await db_module.claim_symbol(db, other["id"], "pkg/d7.py", "alpha", PY_TWO)
+
+    assert result["claimed"] is True
+    assert len(result["released_idle_claims"]) == 20
+    assert all(set(e) == {"symbol_name", "session_id"} for e in result["released_idle_claims"])

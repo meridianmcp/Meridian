@@ -654,6 +654,27 @@ async def _holder_is_idle(db: aiosqlite.Connection, session_id: str | None) -> b
     return bool(row) and row.get("status") == "idle"
 
 
+async def _idle_symbol_claims_for_file(
+    db: aiosqlite.Connection, file_path: str, session_id: str
+) -> list[dict[str, Any]]:
+    """Change D -- advisory only. Symbol claims on ``file_path`` held by OTHER sessions
+    whose status is ``idle``: exactly the rows :func:`expire_stale_symbol_claims`
+    releases, since ``idle`` is outside its live set. Captured BEFORE the sweep runs,
+    because the sweep is what removes an idle holder's claim before the conflict check.
+    Never used to allow or refuse a claim."""
+    async with db.execute(
+        "SELECT fsc.symbol_name, fsc.session_id, fsc.line_start, fsc.line_end "
+        "FROM file_symbol_claims fsc "
+        "JOIN sessions s ON s.id = fsc.session_id "
+        "WHERE fsc.file_path = ? AND fsc.released_at IS NULL "
+        "AND fsc.session_id != ? AND s.status = 'idle' "
+        "ORDER BY fsc.symbol_name, fsc.session_id",
+        (file_path, session_id),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
 async def _claim_file_read(
     db: aiosqlite.Connection,
     normalized: str,
@@ -1300,6 +1321,9 @@ async def claim_symbol(
     # WHOLE-FILE lock on this file, no symbol-level claim is allowed (the file
     # owner may touch any symbol). Mirror the inverse block in claim_file.
     await expire_file_locks(db)
+    # Change D -- advisory: capture the idle holders' claims on this file before the
+    # sweep below releases them, so a successful claim can report what it displaced.
+    _idle_claims = await _idle_symbol_claims_for_file(db, normalized, session_id)
     # Soft-release symbol claims whose holder is dead (idle, closed, or stale), so
     # the conflict check below never has to consider them.
     await expire_stale_symbol_claims(db)
@@ -1498,6 +1522,17 @@ async def claim_symbol(
         # never treat it as a hard TTL the way file_locks.expires_at is one.
         "lease_expiry": _cutoff_dt(-_CLAIM_LIVE_HOURS),
     }
+    # Change D -- advisory only: idle holders' claims that the sweep released and that
+    # overlap this symbol (same name, or an overlapping line range). Entries carry the
+    # symbol name and holder session id only, capped. The claim decision is unchanged.
+    _released_idle = [
+        {"symbol_name": c["symbol_name"], "session_id": c["session_id"]}
+        for c in _idle_claims
+        if c["symbol_name"] == symbol
+        or _ranges_overlap(target["line_start"], target["line_end"], c["line_start"], c["line_end"])
+    ][:ADVISORY_SYMBOL_CLAIM_CAP]
+    if _released_idle:
+        sym_result["released_idle_claims"] = _released_idle
     if _sym_resource_hint and _sym_resource_hint.get("wave_assignment_hint"):
         sym_result["wave_assignment_hint"] = _sym_resource_hint["wave_assignment_hint"]
     return sym_result

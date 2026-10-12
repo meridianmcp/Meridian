@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import re
 import time
@@ -27,8 +26,6 @@ from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
 from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
 from . import scope_guard
-
-_log = logging.getLogger(__name__)
 
 # CI-PERF-3B — named, overridable timeout constants (extracted from inline
 # literals scattered across the dispatch functions below) so tests can
@@ -1959,24 +1956,6 @@ async def _sprint_item_resource_claim_gate(
         except Exception:  # noqa: BLE001 — a receipt failure must never break the claim
             pass
 
-    async def _record_coarse_fallback(
-        resource_key: str, file_path: str, reason: "str | None",
-    ) -> None:
-        # Change C -- best-effort audit row per (item, file) coarse fallback. The
-        # whole-file lock is already held here: a failed write is logged and the
-        # claim result is unchanged.
-        try:
-            from .. import lock_granularity_receipt as _lgr  # noqa: PLC0415
-            await _lgr.record_coarse_fallback_receipt(
-                db, tenant_id=tenant_id, project_id=project_id, session_id=session_id,
-                item_id=item_id, resource=resource_key, file_path=file_path, reason=reason,
-            )
-        except Exception:  # noqa: BLE001 -- a receipt must never change the claim
-            _log.warning(
-                "coarse-fallback receipt for item %s (%s) failed; claim unaffected",
-                item_id, resource_key, exc_info=True,
-            )
-
     if not session_id:
         if strict_resource_locking:
             _identity_item = await db_module.get_sprint_item(db, item_id)
@@ -2210,7 +2189,6 @@ async def _sprint_item_resource_claim_gate(
                 await _record_receipt(
                     resource, "coarse", fallback_reason, approved=_fallback_approved
                 )
-                await _record_coarse_fallback(resource, file_path, fallback_reason)
                 continue
             return await _blocked(
                 {
@@ -5128,6 +5106,39 @@ async def _handle_sprint_tools(
     return _MISS
 
 
+async def _record_claim_file_symbol_fallback(
+    db: Any,
+    *,
+    tenant: dict[str, Any] | None,
+    session_id: str,
+    file_path: str,
+    symbol: str,
+    item_id: str | None,
+    reason: str,
+    claim_result: dict[str, Any],
+) -> None:
+    """Change C -- write the existing lock-granularity receipt when a write-mode
+    ``claim_file`` symbol request widened to a whole-file lock (unparseable source, or
+    no source supplied). Only a granted lock is receipted, matching the sprint-item
+    gate. Best-effort: a failed write never changes the claim result."""
+    if not claim_result.get("claimed"):
+        return
+    try:
+        from .. import lock_granularity_receipt as _lgr  # noqa: PLC0415
+        async with db.execute(
+            "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+        ) as cur:
+            _sess = db_module._row_to_dict(await cur.fetchone())
+        await _lgr.record_lock_granularity_receipt(
+            db, tenant_id=(tenant or {}).get("id") if tenant else None,
+            project_id=(_sess or {}).get("project_id"), session_id=session_id,
+            item_id=item_id, resource=f"symbol:{file_path}::{symbol}",
+            requested_granularity="symbol", achieved_granularity="coarse", reason=reason,
+        )
+    except Exception:  # noqa: BLE001 -- a receipt must never change the claim
+        pass
+
+
 async def _handle_file_claims(
     name: str,
     args: dict[str, Any],
@@ -5154,10 +5165,16 @@ async def _handle_file_claims(
                 # the whole-file fallback so the executor never misses a warning.
                 # The fallback is marked (claim_granularity="file" + fallback_reason)
                 # so a whole-file lock is never mistaken for a symbol claim.
-                return await db_module.claim_file(
+                _fallback = await db_module.claim_file(
                     db, args["file_path"], args["session_id"], symbol=_symbol,
                     item_id=_item_id, fallback_reason="unparseable",
                 )
+                await _record_claim_file_symbol_fallback(
+                    db, tenant=tenant, session_id=args["session_id"],
+                    file_path=args["file_path"], symbol=_symbol, item_id=_item_id,
+                    reason="unparseable", claim_result=_fallback,
+                )
+                return _fallback
             # 771c00d7 — attach symbol-scoped code notes to the symbol claim too,
             # resolving the project from the session (same as claim_file does).
             result["code_notes"] = await db_module._code_notes_for_session_file(
@@ -5167,11 +5184,18 @@ async def _handle_file_claims(
         # ffa03655 — read|write claim grain (default write/exclusive).
         # A symbol requested without content cannot be resolved, so this
         # whole-file lock is a marked fallback (no_source_supplied).
-        return await db_module.claim_file(
+        _claimed = await db_module.claim_file(
             db, args["file_path"], args["session_id"], symbol=_symbol,
             mode=args.get("mode", "write"), item_id=_item_id,
             fallback_reason="no_source_supplied" if _symbol else None,
         )
+        if _symbol and args.get("mode", "write") == "write":
+            await _record_claim_file_symbol_fallback(
+                db, tenant=tenant, session_id=args["session_id"],
+                file_path=args["file_path"], symbol=_symbol, item_id=_item_id,
+                reason="no_source_supplied", claim_result=_claimed,
+            )
+        return _claimed
     if name == "get_file_claims":
         return await db_module.get_file_claims(
             db, args["file_path"], args.get("project_id"), args.get("symbol")

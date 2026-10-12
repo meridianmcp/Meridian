@@ -9608,20 +9608,25 @@ async def claim_parallel_batch(
             # resources landed a real symbol-range claim vs. a coarse
             # whole-file fallback, rather than inferring it from
             # fallback_reason presence/absence downstream.
-            # Change C -- best-effort audit row for a coarse whole-file fallback (one
-            # per item and file). The lock is already held here; a failed write is
-            # logged and the batch result is unchanged.
-            if outcome.get("claim_granularity") == "coarse" and outcome.get("file_path"):
+            # Change C -- best-effort audit row for a granted coarse whole-file fallback,
+            # written with the SAME existing lock-granularity receipt the sprint-item gate
+            # uses (one row per fallback). The lock is already held here; a failed write
+            # is logged and the batch result is unchanged.
+            if (
+                outcome.get("claim_granularity") == "coarse"
+                and outcome.get("acquired")
+                and outcome.get("file_path")
+            ):
                 try:
                     from .. import lock_granularity_receipt as _lgr  # noqa: PLC0415
-                    await _lgr.record_coarse_fallback_receipt(
+                    await _lgr.record_lock_granularity_receipt(
                         db, tenant_id=None, project_id=project_id, session_id=claim_session,
-                        item_id=iid, resource=resource, file_path=outcome["file_path"],
-                        reason=outcome.get("fallback_reason"),
+                        item_id=iid, resource=resource, requested_granularity="symbol",
+                        achieved_granularity="coarse", reason=outcome.get("fallback_reason"),
                     )
                 except Exception:  # noqa: BLE001 -- a receipt must never change the batch
                     _log.warning(
-                        "coarse-fallback receipt for item %s (%s) failed; batch unaffected",
+                        "lock-granularity receipt for item %s (%s) failed; batch unaffected",
                         iid, resource, exc_info=True,
                     )
             _resource_claim_record = {
