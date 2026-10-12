@@ -469,13 +469,21 @@ def _parse_transcript_file(
     diag = ParseDiagnostics(file_path=str(path))
     records: list[UsageRecord] = []
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # newline="" keeps any "\r" so it is stripped per line below, instead of
+        # being folded into "\n" by universal-newline translation.
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            text = fh.read()
     except OSError as exc:
         raise UsageAuditError(f"could not read transcript file {path}: {exc}") from exc
-    lines = text.splitlines()
+    # JSONL is delimited by "\n" only. str.splitlines() also breaks on U+2028,
+    # U+2029, U+0085 and similar separators, which may appear unescaped inside a
+    # valid JSON string and would split one record into two malformed fragments.
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()  # the text after the final newline is not a line
     diag.lines_total = len(lines)
     for line_no, raw in enumerate(lines, start=1):
-        line = raw.strip()
+        line = raw.strip()  # also drops the trailing "\r" of CRLF endings
         if not line:
             diag.lines_blank += 1
             continue

@@ -302,6 +302,54 @@ def test_malformed_and_blank_lines_are_counted_not_fatal(tmp_path):
     assert diag.priced_records == 1
 
 
+def _raw_assistant_line(msg_id, *, text, usage):
+    """Like _line, but leaves non-ASCII characters unescaped in the JSON text."""
+    obj = {
+        "type": "assistant",
+        "timestamp": T0,
+        "message": {
+            "id": msg_id,
+            "model": SONNET,
+            "content": [{"type": "text", "text": text}],
+            "usage": usage,
+        },
+    }
+    return json.dumps(obj, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "separator", [" ", " ", "\u0085"], ids=["U+2028", "U+2029", "U+0085"]
+)
+def test_raw_unicode_separator_inside_a_json_string_keeps_the_record_whole(tmp_path, separator):
+    line = _raw_assistant_line(
+        "m1", text=f"before{separator}after", usage=_usage(input_tokens=7, output_tokens=42)
+    )
+    assert separator in line  # the character must reach the parser unescaped
+    report = ua.build_report(_session(tmp_path, [line]))
+    diag = report.parse_diagnostics[0]
+    assert diag.lines_total == 1
+    assert diag.lines_malformed_json == 0
+    assert diag.priced_records == 1
+    assert report.request_count["main"] == 1
+    assert report.totals.input_tokens == 7
+    assert report.totals.output_tokens == 42
+
+
+def test_crlf_transcript_splits_on_newline_and_adds_no_phantom_line(tmp_path):
+    session = tmp_path / "session"
+    session.mkdir()
+    first = _line("m1", ts=T0, usage=_usage(output_tokens=3))
+    second = _line("m2", ts=T0, usage=_usage(output_tokens=4))
+    (session / "main-session.jsonl").write_bytes(f"{first}\r\n{second}\r\n".encode("utf-8"))
+    report = ua.build_report(session)
+    diag = report.parse_diagnostics[0]
+    assert diag.lines_total == 2
+    assert diag.lines_blank == 0
+    assert diag.lines_malformed_json == 0
+    assert report.request_count["main"] == 2
+    assert report.totals.output_tokens == 7
+
+
 def test_reconciliation_flags_a_truncated_transcript(tmp_path):
     session = _session(tmp_path, [_line("m1", ts=T0, usage=_usage(output_tokens=500))])
     report = ua.build_report(session, reconcile_against=[{"message_id": "m1", "output_tokens": 10_000}])
