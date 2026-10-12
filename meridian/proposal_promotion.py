@@ -901,9 +901,15 @@ async def commit_proposal_promotion(
                     mat_skipped += 1
                     continue
                 try:
+                    # a8c33e9d — these pointers were validated at commit above.
+                    # Commit normalizes an omitted target_kind to an explicit
+                    # "existing", so re-running the on-disk check here would
+                    # drop a pointer commit already accepted. verify_on_disk=False
+                    # skips only that disk check; structural validation still runs.
                     row = await db_module.add_sprint_item_pointer(
                         db, project_id, sprint_item_id, vp["source_type"],
                         vp["targets"], label=vp.get("label"),
+                        verify_on_disk=False,
                     )
                 except Exception as exc:  # noqa: BLE001 -- best-effort, reported below
                     mat_errors.append({

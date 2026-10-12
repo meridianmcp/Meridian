@@ -11,7 +11,12 @@ Regression coverage for ``meridian.proposal_promotion.commit_proposal_promotion`
   dropped, and the promoted item is still created;
 * a malformed pointer fails closed before any write;
 * the executable_handoff step asks ``generate_handoff`` for ``mode="goal"``
-  scoped to exactly the promoted item (never the 'full' archival dump).
+  scoped to exactly the promoted item (never the 'full' archival dump);
+* a pointer that commit accepted without an explicit ``target_kind`` is kept
+  by materialization even when its local uri is not on disk (commit normalizes
+  the omitted kind to ``"existing"``, which must not re-trigger the on-disk
+  check at materialization), while a genuinely missing explicit ``existing``
+  target is still rejected for any pointer written as a new row.
 
 Every test passes ``infer_touches_resources=False`` so nothing depends on the
 live git history of the worktree.
@@ -256,3 +261,93 @@ async def test_executable_handoff_requests_goal_mode_scoped_to_promoted_item(db,
     assert captured["kwargs"]["selected_item_ids"] == [sprint_item_id]
     assert captured["kwargs"]["skip_ai_summary"] is True
     assert result["committed"]["handoff"]["path"] == handoff_path
+
+
+# ---------------------------------------------------------------------------
+# Materialization must not re-run the on-disk existence check for pointers
+# that commit already accepted; genuinely new pointers keep that check.
+# ---------------------------------------------------------------------------
+
+_MISSING_LOCAL_URI = "meridian/a8c33e9d_no_such_target.py"
+
+
+def _implicit_missing_local_pointer() -> dict:
+    """Pre-300a063d shape: a local-path target with NO ``target_kind`` key.
+
+    Commit never disk-checks an implicit target, so it accepts this even though
+    the file is absent. Materialization must keep it too.
+    """
+    return {
+        "source_type": "code",
+        "targets": [{
+            "uri": _MISSING_LOCAL_URI,
+            "selector": {
+                "type": "symbol",
+                "qualified_name": "meridian.a8c33e9d_no_such_target.run",
+            },
+        }],
+        "label": "Implicit local target",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pointer_accepted_without_target_kind_is_kept_by_materialization(db):
+    pid = await _project(db, "implicit-kind-materialized")
+    proposal = await _proposal(db, "Implicit kind", "body")
+
+    result = await _preview_and_commit(
+        db, proposal["id"], pid, "sprint_items",
+        pointers=[_implicit_missing_local_pointer()],
+    )
+
+    sprint_item_id = result["committed"]["sprint_item"]["id"]
+    materialized = result["committed"]["sprint_item_pointers"]
+    assert materialized["errors"] == []
+    assert len(materialized["pointer_ids"]) == 1
+    rows = await db_module.get_sprint_item_pointers(db, sprint_item_id)
+    assert len(rows) == 1
+    assert rows[0]["source_type"] == "code"
+    assert rows[0]["targets"][0]["uri"] == _MISSING_LOCAL_URI
+
+
+@pytest.mark.asyncio
+async def test_explicit_existing_missing_target_still_rejected_for_new_pointer(db):
+    pid = await _project(db, "explicit-missing-direct")
+    item = await db_module.add_sprint_item(db, pid, "v1", "Direct add")
+
+    with pytest.raises(ValueError, match="no file exists"):
+        await db_module.add_sprint_item_pointer(
+            db, pid, item["id"], "code",
+            [{
+                "uri": _MISSING_LOCAL_URI,
+                "target_kind": "existing",
+                "selector": {"type": "symbol", "qualified_name": "x.run"},
+            }],
+        )
+
+    assert await db_module.get_sprint_item_pointers(db, item["id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_commit_rejects_explicit_missing_existing_target_before_any_write(db):
+    pid = await _project(db, "explicit-missing-commit")
+    proposal = await _proposal(db, "Explicit missing", "body")
+    bad = [{
+        "source_type": "code",
+        "targets": [{
+            "uri": _MISSING_LOCAL_URI,
+            "target_kind": "existing",
+            "selector": {"type": "symbol", "qualified_name": "x.run"},
+        }],
+    }]
+
+    preview = await proposal_promotion.preview_proposal_promotion(
+        db, proposal["id"], pid, "sprint_items", infer_touches_resources=False,
+    )
+    with pytest.raises(ValueError, match="no file exists"):
+        await proposal_promotion.commit_proposal_promotion(
+            db, proposal["id"], pid, "sprint_items", preview["preview_hash"],
+            infer_touches_resources=False, pointers=bad,
+        )
+
+    assert await _count_sprint_items(db) == 0
