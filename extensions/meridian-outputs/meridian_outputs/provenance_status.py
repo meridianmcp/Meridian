@@ -1072,6 +1072,61 @@ def _resolver_state_for_provenance_status(
     )
 
 
+def _receipt_state_for_status(status: "dict[str, Any]") -> "tuple[str, bool]":
+    """W31-D (89d940d0): explicit promotion-receipt state for one
+    :func:`get_provenance_status`-shaped dict.
+
+    Returns ``(receipt_state, clean_provenance)``. ``receipt_state`` is one of:
+
+      - ``"exact"``        -- an exact per-file record answers this path. Its
+                              evidence does not depend on the walk, so an
+                              unconverged index never changes this state.
+      - ``"fallback"``     -- a weaker inference: a content-hash relocation, or
+                              a directory-level MERIDIAN_NOTES.md note.
+      - ``"ambiguous"``    -- several candidates match; no single answer.
+      - ``"partial"``      -- an index-dependent absence or basename relocation
+                              reached while the outputs index is still
+                              converging. Not confirmed.
+      - ``"unregistered"`` -- indexed, with no record, under a converged index.
+      - ``"unknown"``      -- never discovered, under a converged index.
+      - ``"unavailable"``  -- the outputs index could not be read at all (no
+                              convergence snapshot).
+
+    ``clean_provenance`` is True only for an exact, non-stale record whose
+    answer is backed by a converged index and whose recorded and current
+    content hashes are both confirmed (non-None). It is the one boolean a
+    promotion gate should read before claiming clean provenance; an incomplete
+    index, or an unconfirmed hash, must never make that claim.
+    """
+    ptype = status.get("provenance_type")
+    convergence = status.get("convergence")
+    staleness = status.get("staleness") or {}
+    converged = bool(convergence and convergence.get("converged"))
+
+    if ptype in (EXACT, STALE_BY_SCRIPT):
+        stale = bool(staleness.get("stale")) or ptype == STALE_BY_SCRIPT
+        # A None recorded or current hash leaves staleness unconfirmed; the
+        # resolver reports that as AMBIGUOUS, so it must not be clean either.
+        hashes_confirmed = (
+            staleness.get("recorded_content_hash") is not None
+            and staleness.get("current_content_hash") is not None
+        )
+        return "exact", converged and not stale and hashes_confirmed
+    if ptype == DIRECTORY_FALLBACK:
+        return "fallback", False
+    if ptype == RELOCATED and status.get("relocation_evidence") != "basename":
+        return "fallback", False
+    if ptype == AMBIGUOUS:
+        return "ambiguous", False
+    if convergence is None:
+        return "unavailable", False
+    if not converged:
+        return "partial", False
+    if ptype == RELOCATED:
+        return "fallback", False
+    return ("unregistered" if ptype == UNREGISTERED else "unknown"), False
+
+
 def evidence_record_from_provenance_status(
     status: "dict[str, Any]", *, record_id: "str | None" = None,
 ) -> "research_evidence.EvidenceRecord":
@@ -1174,6 +1229,20 @@ def evidence_record_from_provenance_status(
                 "originated from"
             )
 
+    # W31-D (89d940d0): explicit promotion-receipt state. An index-dependent
+    # answer reached while the outputs index is still converging (or cannot be
+    # read at all) must not be presented as settled, so it is flagged partial
+    # here. Exact records keep their existing non-partial shape.
+    receipt_state, clean_provenance = _receipt_state_for_status(status)
+    if receipt_state in ("partial", "unavailable") and not partial:
+        partial = True
+        partial_reason = (
+            "outputs index has not converged; this answer depends on the "
+            "index and is not yet confirmed"
+            if receipt_state == "partial"
+            else "outputs index is unavailable; no convergence snapshot could be read"
+        )
+
     external_ids: "dict[str, str]" = {}
     canonical_path = (archival or {}).get("canonical_path")
     if canonical_path:
@@ -1189,6 +1258,16 @@ def evidence_record_from_provenance_status(
         observed_at=observed_at, updated_at=updated_at,
     )
     resolver = _resolver_state_for_provenance_status(status)
+    if (
+        receipt_state in ("partial", "unavailable")
+        and resolver.status is research_evidence.ResolverStatus.VERIFIED
+    ):
+        # Never present an unconfirmed, index-dependent answer as VERIFIED.
+        resolver = research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=min(resolver.confidence, 0.5),
+            reason=partial_reason or "outputs index has not converged",
+        )
 
     return research_evidence.EvidenceRecord(
         identity=identity,
@@ -1217,6 +1296,10 @@ def evidence_record_from_provenance_status(
             # None for every other provenance_type, same convention as
             # every other optional key above.
             "relocation_evidence": status.get("relocation_evidence"),
+            # W31-D (89d940d0) -- explicit receipt state, and the single boolean
+            # a promotion gate should read before claiming clean provenance.
+            "receipt_state": receipt_state,
+            "clean_provenance": clean_provenance,
         },
     )
 
