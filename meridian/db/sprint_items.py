@@ -7469,6 +7469,8 @@ async def add_sprint_item_pointer(
     source_type: str,
     targets: list[dict[str, Any]],
     label: str | None = None,
+    *,
+    verify_on_disk: bool = True,
 ) -> dict[str, Any]:
     """2976e168 — persist a GENERIC POINTER on a sprint item; return the stored row.
 
@@ -7508,6 +7510,16 @@ async def add_sprint_item_pointer(
     for rollback on an ``all_or_nothing`` batch failure). The "routing" the
     86e4ae44 acceptance criteria ask for happens with the engine consuming
     this function, not the other way around — no wrapper needed here.
+
+    a8c33e9d — ``verify_on_disk=False`` skips ONLY the on-disk
+    ``target_kind='existing'`` check. Structural validation still runs. It is
+    for callers that already validated these exact targets earlier in the same
+    operation: proposal promotion's materialization step, which ran
+    ``validate_pointer`` at commit time. Commit normalizes an omitted
+    ``target_kind`` to an explicit ``"existing"``, so re-checking the disk here
+    would reject a pointer that commit accepted. Every other caller keeps the
+    default ``True``, so a genuinely new pointer with a missing explicit
+    ``existing`` target is still rejected.
     """
     from ..pointers import (  # noqa: PLC0415 — avoid an import cycle at module load
         validate_pointer,
@@ -7516,7 +7528,8 @@ async def add_sprint_item_pointer(
     )
 
     normalized = validate_pointer(
-        {"source_type": source_type, "targets": targets, "label": label}
+        {"source_type": source_type, "targets": targets, "label": label},
+        path_exists=None if verify_on_disk else (lambda _uri: True),
     )
     pid = _new_id()
     targets_json = serialize_targets(normalized["targets"])
