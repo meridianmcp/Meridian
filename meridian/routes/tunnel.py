@@ -4919,6 +4919,21 @@ _DOCS_WRITE_TOOLS: "dict[str, tuple[str, str | None]]" = {
     "highlight_document": ("docx_path", None),
     "merge_docx_draft": ("canonical_path", None),
     "apply_reviewable_edit_transaction": ("canonical_path", None),
+    # a9794fb9 -- mutating meridian-docs tools the 273df573 map missed. Each one
+    # re-saves or merges the .docx, so each must pass the same region-claim gate.
+    # flag_for_review takes a locate query in `anchor`, not a paraId, so it uses
+    # the whole-document fallback. apply_and_merge_batch_transform promotes into
+    # canonical_path via merge_draft_into_canonical, so it mirrors merge_docx_draft.
+    "insert_media_part": ("docx_path", "anchor_para_id"),
+    "remove_package_part": ("docx_path", None),
+    "remove_cross_reference": ("docx_path", "anchor_para_id"),
+    "flag_for_review": ("docx_path", None),
+    "insert_table": ("docx_path", "anchor_para_id"),
+    "remove_table": ("docx_path", None),
+    "insert_column": ("docx_path", None),
+    "split_cell": ("docx_path", None),
+    "transpose_table": ("docx_path", None),
+    "apply_and_merge_batch_transform": ("canonical_path", None),
 }
 
 
