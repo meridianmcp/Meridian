@@ -4919,6 +4919,22 @@ _DOCS_WRITE_TOOLS: "dict[str, tuple[str, str | None]]" = {
     "highlight_document": ("docx_path", None),
     "merge_docx_draft": ("canonical_path", None),
     "apply_reviewable_edit_transaction": ("canonical_path", None),
+    # a9794fb9 -- mutating meridian-docs tools the 273df573 map missed. Each one
+    # re-saves or merges the .docx, so each must pass the same region-claim gate.
+    # flag_for_review takes a locate query in `anchor`, not a paraId, so it uses
+    # the whole-document fallback. apply_and_merge_batch_transform promotes into
+    # canonical_path via merge_draft_into_canonical, so it mirrors merge_docx_draft.
+    # Its draft_output_path is claim-checked too (see _DOCS_DRAFT_OUTPUT_ARGS).
+    "insert_media_part": ("docx_path", "anchor_para_id"),
+    "remove_package_part": ("docx_path", None),
+    "remove_cross_reference": ("docx_path", "anchor_para_id"),
+    "flag_for_review": ("docx_path", None),
+    "insert_table": ("docx_path", "anchor_para_id"),
+    "remove_table": ("docx_path", None),
+    "insert_column": ("docx_path", None),
+    "split_cell": ("docx_path", None),
+    "transpose_table": ("docx_path", None),
+    "apply_and_merge_batch_transform": ("canonical_path", None),
 }
 
 
@@ -4948,6 +4964,35 @@ def _docs_write_target(
         if isinstance(anchor_val, str) and anchor_val.strip():
             element_id = anchor_val.strip()
     return path_val.strip(), element_id
+
+
+# a9794fb9 (review) -- mutating docs tools that write a SECOND .docx beside their
+# canonical path: bare tool name -> the argument naming that extra write target.
+# apply_and_merge_batch_transform stages its transformed bytes at
+# draft_output_path (apply_batch_transform) before promoting them into
+# canonical_path, so a draft another session holds a claim on must be refused
+# exactly as the canonical path is. The draft is rewritten whole, so it is
+# checked with the same whole-document fallback (no element id).
+_DOCS_DRAFT_OUTPUT_ARGS: "dict[str, str]" = {
+    "apply_and_merge_batch_transform": "draft_output_path",
+}
+
+
+def _docs_extra_write_targets(name: str, arguments: "dict | None") -> "list[str]":
+    """Return the extra ``.docx`` paths a MUTATING docs-slot tool writes beside
+    its canonical path (see :data:`_DOCS_DRAFT_OUTPUT_ARGS`), else ``[]``.
+
+    Fail-open like :func:`_docs_write_target`: a non-dict argument set, or a
+    missing / blank draft argument, contributes no target.
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    arg_key = _DOCS_DRAFT_OUTPUT_ARGS.get(bare)
+    if arg_key is None or not isinstance(arguments, dict):
+        return []
+    draft_val = arguments.get(arg_key)
+    if not isinstance(draft_val, str) or not draft_val.strip():
+        return []
+    return [draft_val.strip()]
 
 
 async def check_docs_write_conflict(
@@ -4997,20 +5042,31 @@ async def check_docs_write_conflict(
     acquires no claim of its own — claim_docx_region is the real coordination
     primitive.
     """
+    if db is None:
+        return None
+    # a9794fb9 (review) -- the canonical target first, then any extra .docx the
+    # same call writes (see _DOCS_DRAFT_OUTPUT_ARGS). Each target is checked on
+    # its own and fails open on its own lookup error, so a draft path a
+    # different session has claimed is refused even when canonical_path is clear.
+    targets: "list[tuple[str, str | None]]" = []
     target = _docs_write_target(name, arguments)
-    if not target or db is None:
-        return None
-    docx_path, element_id = target
-    try:
-        return await db_module.check_docx_region_write_conflict(
-            db, session_id, docx_path, element_id,
-        )
-    except Exception as exc:  # noqa: BLE001 — never wedge a write on a lookup error
-        _log.debug(
-            "docs write-guard: check_docx_region_write_conflict(%s) failed: %s",
-            docx_path, exc,
-        )
-        return None
+    if target:
+        targets.append(target)
+    targets.extend((path, None) for path in _docs_extra_write_targets(name, arguments))
+    for docx_path, element_id in targets:
+        try:
+            verdict = await db_module.check_docx_region_write_conflict(
+                db, session_id, docx_path, element_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — never wedge a write on a lookup error
+            _log.debug(
+                "docs write-guard: check_docx_region_write_conflict(%s) failed: %s",
+                docx_path, exc,
+            )
+            continue
+        if verdict is not None:
+            return verdict
+    return None
 
 
 # ---------------------------------------------------------------------------

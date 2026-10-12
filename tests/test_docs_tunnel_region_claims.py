@@ -547,7 +547,8 @@ def test_all_docs_write_tools_declare_session_id_in_their_mcp_schema():
     already declared session_id (a2449ffa), so only the registration was
     missing, not the schema field this test checks.
     """
-    assert len(tun._DOCS_WRITE_TOOLS) == 28
+    # 28 + 10 mutators added by a9794fb9 (see test_sprint_a9794fb9_docx_mutator_claims.py).
+    assert len(tun._DOCS_WRITE_TOOLS) == 38
     for tool_name in sorted(tun._DOCS_WRITE_TOOLS):
         schema = _docs_mcp_tool_schema(tool_name)
         props = schema.get("properties", {})

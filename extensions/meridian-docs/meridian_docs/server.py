@@ -3699,6 +3699,7 @@ def apply_and_merge_batch_transform(
     index_db_path: str | None = None,
     allow_degraded_render: bool = False,
     degraded_render_reason: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """982f8564 -- end-to-end declarative batch transform: plan -> apply to
     an isolated draft -> promote via merge_docx_draft's own
