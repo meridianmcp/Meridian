@@ -9547,6 +9547,16 @@ def _summarize_capability_availability(
     }
 
 
+# de7e3c2a review — budget for the tenant live-inventory probe that the trusted
+# capability-contract call sites await: start_session, generate_handoff, both
+# REST handoff routes and the claim-time contract (all via
+# build_effective_capability_contract). A cold tunnel slot can stall that probe
+# for ~60s, and its verdict is only a warn-only availability field. A probe that
+# overruns this budget is therefore treated as unverified: the contract keeps its
+# "unknown" availability and the call moves on instead of being held.
+_LIVE_INVENTORY_PROBE_BUDGET_SECONDS = 5.0
+
+
 def _availability_checker_from_live_inventory(
     live_inventory: "dict[str, Any]",
 ) -> "Callable[[list[dict[str, Any]]], dict[str, Any]]":
@@ -9641,6 +9651,19 @@ async def build_effective_capability_contract(
     additive, so every existing caller that passes neither argument is
     completely unaffected.
 
+    The tenant probe is bounded by ``_LIVE_INVENTORY_PROBE_BUDGET_SECONDS``
+    (de7e3c2a review): a probe that overruns it degrades to the same unverified
+    ``"unknown"`` availability as an absent probe, so no trusted call site is
+    ever held waiting on a cold tunnel slot.
+
+    de7e3c2a — every trusted call site now passes ``tenant`` or
+    ``live_inventory`` via :func:`contract_availability_kwargs`, so the
+    real-availability wiring above is the production path, not test-only.
+    Honesty caveat, following handoff_receipt's precedent: availability here
+    is agent-cooperative, not transport-level. It reflects this server's
+    in-process view at the moment of the call and is delivered only to a
+    caller that asks for it.
+
     Guarded the SAME way as the rest of this wrapper: any failure deriving
     the live inventory or building the checker degrades to no checker
     (the contract falls back to its pre-existing ``"unknown"`` availability
@@ -9658,7 +9681,15 @@ async def build_effective_capability_contract(
         if _live_inventory is None and tenant is not None:
             try:
                 from meridian.mcp.handlers import project_tools as _project_tools_module  # noqa: PLC0415
-                _live_inventory = await _project_tools_module._build_live_inventory(tenant)
+                _live_inventory = await asyncio.wait_for(
+                    _project_tools_module._build_live_inventory(tenant),
+                    timeout=_LIVE_INVENTORY_PROBE_BUDGET_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # de7e3c2a review — a probe that overruns its budget is
+                # unverified, not a failure: fall through to the "unknown"
+                # availability path so the call keeps moving.
+                _live_inventory = None
             except Exception:  # noqa: BLE001 — live-inventory probing is best-effort
                 _live_inventory = None
         if _live_inventory is not None:
@@ -9670,6 +9701,79 @@ async def build_effective_capability_contract(
             **kwargs,
         )
     except Exception:  # noqa: BLE001 — capability contract is best-effort
+        return None
+
+
+async def contract_availability_kwargs(
+    db: Any, project_id: str, tenant: "dict[str, Any] | None",
+) -> "dict[str, Any]":
+    """de7e3c2a — the single decision every trusted call site makes about how
+    a capability contract's availability is probed, so the call sites cannot
+    drift apart.
+
+    A project that declares NO capability in its manifest gets ``{}``: nothing
+    to verify, so no tunnel probe runs (no ``tools/list`` RPC is sent to a live
+    slot) and the contract keeps its exact prior ``"unknown"`` output. This is
+    what keeps such a project completely unaffected.
+
+    Otherwise a request with a tenant passes it through, so the wrapper derives
+    the real tunnel/plugin inventory the same way ``check_capability_availability``
+    does. A self-hosted or tenant-less request gets the explicit local-first
+    floor (:func:`capability_availability.local_first_live_inventory`): native
+    tool capabilities resolve ``available``, and tunnel-dependent ones resolve
+    honestly ``missing``/``degraded`` instead of the blanket ``"unknown"``.
+
+    Best-effort: a failed manifest read degrades to ``{}`` (the prior output).
+    Agent-cooperative, not transport-level (see
+    :func:`build_effective_capability_contract`).
+    """
+    try:
+        manifest = await db_module.get_project_capability_manifest(db, project_id)
+    except Exception:  # noqa: BLE001 — best-effort: prior unknown degrade
+        return {}
+    if not (manifest.get("capabilities") or []):
+        return {}
+    if tenant is not None:
+        return {"tenant": tenant}
+    return {"live_inventory": capability_availability_module.local_first_live_inventory()}
+
+
+async def build_claim_capability_contract(
+    db: Any, project_id: str, item: "dict[str, Any]", *,
+    tenant: "dict[str, Any] | None" = None,
+) -> "dict[str, Any] | None":
+    """de7e3c2a — claim-time capability contract for ONE claimed sprint item.
+
+    ``claim_sprint_item`` was the per-session channel that lacked the contract
+    ``start_session`` and ``generate_handoff`` already emit. This attaches the
+    same contract, scoped to the claimed item: ``items=[item]`` narrows the
+    item-level sections to that one item, and the capability verdicts come
+    from the probe :func:`contract_availability_kwargs` selects.
+
+    Returns ``None`` (the caller omits the field, so the claim response stays
+    byte-identical) unless BOTH hold: the claimed item declares at least one
+    tool requirement (the "declared capability, if any" gate), and the project
+    declares at least one capability in its manifest. A project with no
+    manifest is completely unaffected. Never raises.
+
+    WARN-ONLY, like handoff_receipt's claim-time check: this never blocks a
+    claim. ``executable=false`` informs the executor, it does not gate.
+    Agent-cooperative, not transport-level (see
+    :func:`build_effective_capability_contract`).
+    """
+    try:
+        if not tool_requirements_module.effective_tool_requirements(item):
+            return None
+        manifest = await db_module.get_project_capability_manifest(db, project_id)
+        if not (manifest.get("capabilities") or []):
+            return None
+        return await build_effective_capability_contract(
+            db, project_id, items=[item],
+            max_executor_contracts=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+            max_contract_list_items=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+            **(await contract_availability_kwargs(db, project_id, tenant)),
+        )
+    except Exception:  # noqa: BLE001 — claim-time contract is best-effort
         return None
 
 

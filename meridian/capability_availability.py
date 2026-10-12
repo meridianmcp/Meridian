@@ -32,6 +32,12 @@ Tool-reference conventions (a ``required_tools``/``fallback_chain`` entry):
   entry's declared command + content hash, never executed.
 
 Status values: ``available`` | ``degraded`` | ``missing`` | ``unknown``.
+
+Honesty caveat (de7e3c2a, following handoff_receipt's precedent): every
+verdict here is agent-cooperative, not transport-level. It describes what the
+server could confirm from its own in-process view when a caller asked, and it
+constrains nothing on the wire. A verdict is only as current as the call that
+produced it.
 """
 from __future__ import annotations
 
@@ -383,6 +389,9 @@ def local_first_live_inventory() -> dict[str, Any]:
     meridian-outputs, ...) still correctly resolves ``missing``/``degraded``
     here, since no tunnel is reachable from this snapshot -- this is an
     HONEST local floor, never a blanket "everything is available."
+
+    Used by every trusted call site that has no tenant (de7e3c2a, see
+    :func:`meridian.handoff.contract_availability_kwargs`).
 
     Best-effort: any failure importing the static tool manifest degrades to
     an empty builtin-tools set (every plugin-backed capability then reports

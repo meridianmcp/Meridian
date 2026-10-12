@@ -100,6 +100,7 @@ capability-manifest contract, 649e095f).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -248,7 +249,10 @@ async def verify_handoff_provenance(
       ``degraded`` / ``warning`` -- set when the capability is declared but
         no matching receipt was found.
       ``capability`` -- the ``evaluate_capability_availability`` verdict, for
-        callers that want to surface it.
+        callers that want to surface it. If the live-inventory probe overruns
+        ``handoff._LIVE_INVENTORY_PROBE_BUDGET_SECONDS`` (de7e3c2a review) this is
+        the unverified ``"unknown"`` shape instead, and the receipt lookup still
+        runs.
       ``receipt`` -- the matched receipt row, when found.
     """
     base: "dict[str, Any]" = {
@@ -273,12 +277,34 @@ async def verify_handoff_provenance(
             return base
 
         from .mcp.handlers.project_tools import check_capability_availability  # noqa: PLC0415
+        from . import handoff as handoff_module  # noqa: PLC0415 -- shared probe budget
 
-        availability = await check_capability_availability(
-            db, project_id, tenant,
-            capability_id=HANDOFF_PROVENANCE_CAPABILITY_ID,
-            live_inventory=live_inventory,
-        )
+        # de7e3c2a review — bound the live-inventory probe on this claim path the
+        # same way build_effective_capability_contract bounds it. A cold tunnel
+        # slot can stall the probe for ~60s, and this verdict is warn-only, so a
+        # probe that overruns the shared budget is reported as UNVERIFIED instead
+        # of being awaited. The receipt lookup below is DB-only and does not depend
+        # on the probe, so it still runs and a genuine receipt is still honoured.
+        try:
+            availability = await asyncio.wait_for(
+                check_capability_availability(
+                    db, project_id, tenant,
+                    capability_id=HANDOFF_PROVENANCE_CAPABILITY_ID,
+                    live_inventory=live_inventory,
+                ),
+                timeout=handoff_module._LIVE_INVENTORY_PROBE_BUDGET_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # Unverified, not faked: the same "unknown" shape that
+            # evaluate_capability_availability returns for a capability it cannot
+            # classify. The declared policy is still known from the manifest.
+            availability = [{
+                "capability_id": HANDOFF_PROVENANCE_CAPABILITY_ID,
+                "availability_policy": declared[0].get("availability_policy") or "required",
+                "status": "unknown",
+                "required_tools": [],
+                "fallback_used": None,
+            }]
     except Exception:  # noqa: BLE001 -- infra trouble must never block a claim
         return base
     if not availability:
