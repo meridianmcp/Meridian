@@ -7322,6 +7322,166 @@ async def auto_capture_session(
 
 
 # ---------------------------------------------------------------------------
+# 7b6b1edf — suggested_scopes: derive ad-hoc work clusters for checkpoint().
+# Pure read/derive layer: nothing is written. Uses the same file/symbol conflict
+# predicate (_resource_sets_conflict) that get_parallelizable_groups colors
+# with, but clusters by connected components of that conflict graph: a scope is
+# work that touched overlapping things, not a conflict-free batch.
+# ---------------------------------------------------------------------------
+
+_SUGGESTED_SCOPE_MAX_TASKS = 300
+_SUGGESTED_SCOPE_MAX_SCOPES = 20
+_ACTIVITY_FILE_RE = re.compile(r"(?:^|,\s*)(?:file_path|path)=([^,]+)")
+
+
+def _activity_file_resources(summary: str | None) -> list[str]:
+    """Extract de-duplicated ``file:`` resource ids from a session_activity
+    one-liner (``key=value`` pairs written by the MCP dispatcher). Values that
+    fail resource normalization are skipped, never raised."""
+    out: list[str] = []
+    for match in _ACTIVITY_FILE_RE.finditer(summary or ""):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+        try:
+            rid = normalize_resource_id(f"file:{raw}")
+        except ValueError:
+            continue
+        if rid not in out:
+            out.append(rid)
+    return out
+
+
+async def suggest_session_scopes(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session_id: str,
+    *,
+    scope_task_ids: "list[str] | None" = None,
+) -> list[dict[str, Any]]:
+    """Cluster a session's task_log rows into suggested work scopes.
+
+    Rows considered: the caller's ``scope_task_ids`` when non-empty (an explicit
+    override that may name already-bucketed rows); otherwise every row of this
+    session with no ``parent_task_id`` yet (unbucketed).
+
+    Resources per row, in precedence order:
+      1. the linked sprint item's ``touches_resources`` (``sprint_item_id``),
+         when that item exists and declares any;
+      2. otherwise the ``file_path``/``path`` values of the session_activity
+         heartbeats recorded between the previous task_log row and this one
+         (best effort: the ring buffer keeps only recent entries, and the
+         heartbeat carries file keys only for tool calls without ``project_id``).
+
+    Rows whose resources conflict (same predicate as get_parallelizable_groups)
+    are joined; each scope is a connected component of that graph. Rows with no
+    resources are left out. Auto-suggest only: never blocks, never writes.
+
+    Returns ``[{"task_ids": [...], "resources": [...], "basis": [...]}, ...]``
+    ordered by first task time, at most ``_SUGGESTED_SCOPE_MAX_SCOPES`` entries.
+    ``basis`` names the sources used (``"sprint_item"``, ``"session_activity"``).
+    At most the ``_SUGGESTED_SCOPE_MAX_TASKS`` most recent candidate rows count.
+    """
+    async with db.execute(
+        "SELECT * FROM task_log WHERE session_id = ? AND project_id = ? "
+        "ORDER BY created_at ASC",
+        (session_id, project_id),
+    ) as cur:
+        all_rows = [_row_to_dict(r) for r in await cur.fetchall()]
+    if not all_rows:
+        return []
+
+    if scope_task_ids:
+        wanted = {str(t) for t in scope_task_ids if t}
+        candidates = [r for r in all_rows if r["id"] in wanted]
+    else:
+        candidates = [r for r in all_rows if r.get("parent_task_id") is None]
+    candidates = candidates[-_SUGGESTED_SCOPE_MAX_TASKS:]
+    if not candidates:
+        return []
+
+    # Each row owns the activity window (previous row's created_at, its own].
+    bounds: dict[str, tuple[str | None, str]] = {}
+    prev_ts: str | None = None
+    for r in all_rows:
+        ts = str(r.get("created_at") or "")
+        bounds[r["id"]] = (prev_ts, ts)
+        prev_ts = ts
+
+    sprint_ids = {r["sprint_item_id"] for r in candidates if r.get("sprint_item_id")}
+    item_resources: dict[str, list[str]] = {}
+    if sprint_ids:
+        placeholders = ", ".join("?" for _ in sprint_ids)
+        async with db.execute(
+            f"SELECT id, touches_resources FROM sprint_items WHERE id IN ({placeholders})",
+            tuple(sprint_ids),
+        ) as cur:
+            for row in await cur.fetchall():
+                d = _row_to_dict(row)
+                item_resources[d["id"]] = parse_touches_resources(d.get("touches_resources"))
+
+    cand_resources: dict[str, list[str]] = {}
+    cand_basis: dict[str, str] = {}
+    for r in candidates:
+        sid = r.get("sprint_item_id")
+        if sid and item_resources.get(sid):
+            cand_resources[r["id"]] = list(item_resources[sid])
+            cand_basis[r["id"]] = "sprint_item"
+    unlinked = {r["id"] for r in candidates if r["id"] not in cand_basis}
+    if unlinked:
+        async with db.execute(
+            "SELECT recorded_at, summary FROM session_activity WHERE session_id = ?",
+            (session_id,),
+        ) as cur:
+            activity = [_row_to_dict(row) for row in await cur.fetchall()]
+        found: dict[str, list[str]] = {}
+        for entry in activity:
+            ts = str(entry.get("recorded_at") or "")
+            owner = None
+            for r in all_rows:
+                lower, upper = bounds[r["id"]]
+                if ts <= upper and (lower is None or ts > lower):
+                    owner = r["id"]
+                    break
+            if owner in unlinked:
+                found.setdefault(owner, []).extend(
+                    _activity_file_resources(entry.get("summary"))
+                )
+        for tid, rids in found.items():
+            uniq = list(dict.fromkeys(rids))
+            if uniq:
+                cand_resources[tid] = uniq
+                cand_basis[tid] = "session_activity"
+
+    ids = [r["id"] for r in candidates if r["id"] in cand_resources]
+    res_sets = {tid: set(cand_resources[tid]) for tid in ids}
+    parent = {tid: tid for tid in ids}
+
+    def _find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            if _find(a) != _find(b) and _resource_sets_conflict(res_sets[a], res_sets[b]):
+                parent[_find(b)] = _find(a)
+
+    components: dict[str, list[str]] = {}
+    for tid in ids:
+        components.setdefault(_find(tid), []).append(tid)
+    scopes: list[dict[str, Any]] = []
+    for members in components.values():
+        scopes.append({
+            "task_ids": members,
+            "resources": sorted({rid for tid in members for rid in cand_resources[tid]}),
+            "basis": sorted({cand_basis[tid] for tid in members}),
+        })
+    return scopes[:_SUGGESTED_SCOPE_MAX_SCOPES]
+
+
+# ---------------------------------------------------------------------------
 # Rewind (v1.3.0) — "Last X days" shareable project summary.
 # Aggregates versions shipped, goal changes, decisions logged, session
 # summaries, sprint items completed, and task counts in one async call.

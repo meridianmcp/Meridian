@@ -289,6 +289,20 @@ async def handle_checkpoint(
             "omitted_count": len(_proposal_scope.get("omitted_items") or []),
             "hitl_gate_count": len(_proposal_scope.get("hitl_gates") or []),
         }
+    # 7b6b1edf — suggested work scopes (auto-suggest only, never blocking). An
+    # explicit scope_task_ids list overrides the default unbucketed rows; any
+    # other shape is ignored. A failure here leaves the checkpoint intact.
+    _scope_override = args.get("scope_task_ids")
+    if isinstance(_scope_override, list):
+        _scope_override = [t for t in _scope_override if isinstance(t, str) and t][:500]
+    else:
+        _scope_override = None
+    try:
+        _ckpt_resp["suggested_scopes"] = await db_module.suggest_session_scopes(
+            db, project_id, session_id, scope_task_ids=_scope_override,
+        )
+    except Exception:  # noqa: BLE001 — advisory only; never fail the checkpoint
+        _ckpt_resp["suggested_scopes"] = []
     if _in_progress:
         _ckpt_resp["in_progress_items"] = [
             {"id": it["id"], "title": (it.get("title") or "")[:80]}
