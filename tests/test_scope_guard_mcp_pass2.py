@@ -1039,6 +1039,10 @@ _exempt(
     ("generate_handoff", "selected_item_ids"), ("generate_handoff", "force_include_ids"),
 )
 _exempt(
+    "bound", "suggest_session_scopes reads task_log WHERE session_id = ? AND project_id = ? and intersects scope_task_ids with those rows, so a foreign task id matches nothing (proof: test_checkpoint_scope_task_ids_never_names_a_foreign_task)",
+    ("checkpoint", "scope_task_ids"),
+)
+_exempt(
     "bound", "an override approval is spent through gate_override.consume_gate_override_approval(project_id, ...), which answers 'not found in this project' for another project's HITL",
     ("complete_sprint_item", "override_hitl_id"), ("complete_sprint_item", "completion_override_hitl_id"),
     ("complete_sprint_item", "foreign_claim_override_hitl_id"), ("update_sprint_item", "override_hitl_id"),
@@ -1356,7 +1360,7 @@ _CUSTOM_PROOFS = {
     ("complete_sprint_item", "override_hitl_id"), ("complete_sprint_item", "completion_override_hitl_id"),
     ("complete_sprint_item", "foreign_claim_override_hitl_id"), ("update_sprint_item", "override_hitl_id"),
     ("complete_wave_gate", "override_hitl_id"), ("complete_wave_gate", "verification_run_id"),
-    ("get_citation_edges", "document_id"),
+    ("get_citation_edges", "document_id"), ("checkpoint", "scope_task_ids"),
 }
 
 #: Probes whose call is allowed to write ONE kind of row, and why. None of them may touch the FOREIGN
@@ -1421,6 +1425,51 @@ async def test_the_bound_probes_are_not_vacuous(db, tmp_path):
     before = await _changes(db)
     await _call(db, tmp_path, "store_finding", {"project_id": w.mine, "content": "a real write"}, [w.mine])
     assert before is None or await _changes(db) > before
+
+
+async def test_checkpoint_scope_task_ids_never_names_a_foreign_task(db, tmp_path, monkeypatch):
+    """Proof for the 'bound' exemption of checkpoint.scope_task_ids. suggest_session_scopes reads
+    task_log WHERE session_id = ? AND project_id = ? (the CALLER's session and project) and only
+    then intersects scope_task_ids with those rows, so a foreign task id matches nothing. The
+    foreign task is linked to a sprint item whose resource carries the marker: a binding that
+    failed would put the marker into suggested_scopes. The own-task control shows the same
+    argument does select the caller's own row."""
+    w = await _world(db)
+    own_item = (await db_module.add_sprint_item(
+        db, w.mine, "v1", "own parser cleanup", touches_resources=["file:own/parser.py"]))["id"]
+    own_task = (await db_module.log_task(
+        db, w.s_mine, w.mine, "own parser cleanup", "done", sprint_item_id=own_item))["id"]
+    foreign_item = (await db_module.add_sprint_item(
+        db, w.theirs, "v1", "foreign billing", touches_resources=[f"file:{SECRET}/billing.py"]))["id"]
+    foreign_task = (await db_module.log_task(
+        db, w.s_theirs, w.theirs, "foreign billing", "done", sprint_item_id=foreign_item))["id"]
+
+    async def _noop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def _handoff(*args: Any, **kwargs: Any) -> "tuple[None, str, None]":
+        return (None, "scope proof", None)
+
+    # checkpoint's side effects (session markdown, auto-capture, handoff text) are not under test.
+    monkeypatch.setattr("meridian.server._finalize_session_md", _noop)
+    monkeypatch.setattr("meridian.db.auto_capture_session", _noop)
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _handoff)
+
+    scoped = [w.mine]
+    base = {"project_id": w.mine, "session_id": w.s_mine}
+    own = await _call(db, tmp_path, "checkpoint", {**base, "scope_task_ids": [own_task]}, scoped)
+    assert own["suggested_scopes"] == [
+        {"task_ids": [own_task], "resources": ["file:own/parser.py"], "basis": ["sprint_item"]},
+    ]
+
+    mixed = await _call(db, tmp_path, "checkpoint", {**base, "scope_task_ids": [foreign_task, own_task]}, scoped)
+    assert [scope["task_ids"] for scope in mixed["suggested_scopes"]] == [[own_task]]
+
+    foreign_only = await _call(db, tmp_path, "checkpoint", {**base, "scope_task_ids": [foreign_task]}, scoped)
+    assert foreign_only["suggested_scopes"] == []
+    for result in (mixed, foreign_only):
+        assert foreign_task not in _blob(result)
+        assert SECRET not in _blob(result)
 
 
 async def test_generate_handoff_rejects_a_foreign_item_in_both_id_lists(db, tmp_path):

@@ -154,26 +154,27 @@ _GATED_DOCX_WRITES: tuple[tuple[str, str, str | None], ...] = (
     ("highlight_document", "docx_path", None),
     ("merge_docx_draft", "canonical_path", None),
     ("apply_reviewable_edit_transaction", "canonical_path", None),
-)
-
-# DOCX writers in meridian-docs/server.py whose docstrings name the tunnel-layer
-# guard but that are absent from _DOCS_WRITE_TOOLS. Reported, not gated here.
-# flag_for_review takes anchor as str | dict, so no element id is declared.
-# remove_package_part mutates only when dry_run is False (default True).
-# The table writers (insert_table, insert_column, remove_table, split_cell,
-# transpose_table) address their target by table_index / row_index / col_index
-# or, for insert_table, by anchor_para_id; none of them is gated today.
-_UNGATED_DOCX_WRITES: tuple[tuple[str, str, str | None], ...] = (
-    ("remove_cross_reference", "docx_path", "anchor_para_id"),
+    # Added to _DOCS_WRITE_TOOLS by fix a9794fb9. Before that merge these nine
+    # writers name the guard but were ungated; the tunnel gate is authoritative.
     ("insert_media_part", "docx_path", "anchor_para_id"),
-    ("remove_package_part", "docx_path", None),
-    ("flag_for_review", "docx_path", None),
+    ("remove_package_part", "docx_path", None),  # mutates only when dry_run is False
+    ("remove_cross_reference", "docx_path", "anchor_para_id"),
+    ("flag_for_review", "docx_path", None),  # anchor is a locate query, so whole-document
     ("insert_table", "docx_path", "anchor_para_id"),
-    ("insert_column", "docx_path", None),
     ("remove_table", "docx_path", None),
+    ("insert_column", "docx_path", None),
     ("split_cell", "docx_path", None),
     ("transpose_table", "docx_path", None),
+    # Its draft_output_path is a second write target that the tunnel checks
+    # (tunnel.py _DOCS_DRAFT_OUTPUT_ARGS); this manifest models the canonical one only.
+    ("apply_and_merge_batch_transform", "canonical_path", None),
 )
+
+# DOCX writers whose docstrings name the tunnel-layer guard but that the gate does
+# not list. Empty today: every such writer is in _GATED_DOCX_WRITES above. Record a
+# new gap here, not in the gate, and the parity tests in
+# tests/test_sprint_c8eabc3d_docx_capabilities.py will require it to be listed.
+_UNGATED_DOCX_WRITES: tuple[tuple[str, str, str | None], ...] = ()
 
 # Sidecar-only writers: they read the .docx and write a local SQLite index cache,
 # never the .docx itself (see the tunnel.py comment beside _DOCS_WRITE_TOOLS).

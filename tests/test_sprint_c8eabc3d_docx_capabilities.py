@@ -4,8 +4,8 @@ Pins three things:
   * the manifest is deterministic and its hash detects any contract change;
   * the manifest agrees exactly with the tunnel-layer region-claim guard
     (meridian/routes/tunnel.py _DOCS_WRITE_TOOLS / _docs_write_target);
-  * the known ungated writers are reported as ungated, so closing that gap
-    forces a manifest update in the same change.
+  * the ungated writers are exactly the guard-mentioning writers the gate does
+    not list, so any new such writer forces a manifest update in the same change.
 """
 
 from __future__ import annotations
@@ -34,9 +34,10 @@ DOCS_SERVER_SOURCE = (
 )
 GUARD_PHRASE = "region-claim guard"
 
-# DOCX writers whose docstrings name the guard but that the manifest previously
-# omitted, so they were reported as nonexistent rather than as ungated.
-TABLE_WRITERS_PREVIOUSLY_MISSING = (
+# Table writers whose docstrings name the guard. They are in the tunnel gate
+# (tunnel.py _DOCS_WRITE_TOOLS, added by fix a9794fb9), so the manifest must
+# report them as gated, not as ungated and not as missing.
+TABLE_WRITERS = (
     "insert_table",
     "insert_column",
     "remove_table",
@@ -142,26 +143,27 @@ def test_source_scan_finds_the_guard_writers_it_is_meant_to_check():
     names = _guard_writer_names()
     assert names, "no guard-mentioning MCP tools found in meridian-docs server.py"
     assert DOCS_SERVER_SOURCE.is_file()
-    assert set(TABLE_WRITERS_PREVIOUSLY_MISSING) <= names
+    assert set(TABLE_WRITERS) <= names
 
 
-@pytest.mark.parametrize("name", TABLE_WRITERS_PREVIOUSLY_MISSING)
-def test_table_writers_are_declared_as_ungated_docx_writers(name):
+@pytest.mark.parametrize("name", TABLE_WRITERS)
+def test_table_writers_are_declared_as_gated_docx_writers(name):
     entries = _entries(dc.build_docx_capability_manifest())
     assert name in entries, f"{name} names the tunnel guard but is missing from the manifest"
     entry = entries[name]
     assert entry["rw_class"] == dc.RW_DOCX_WRITE
-    assert entry["gated_by_tunnel_guard"] is False
-    assert name in dc.UNGATED_DOCX_WRITERS
-    assert name not in tun._DOCS_WRITE_TOOLS
+    assert entry["gated_by_tunnel_guard"] is True
+    assert name not in dc.UNGATED_DOCX_WRITERS
+    assert name in tun._DOCS_WRITE_TOOLS
     target = dc.extract_docx_write_target(name, {"docx_path": "C:/d/x.docx"})
     assert target is not None
-    assert target.gated_by_tunnel_guard is False
+    assert target.gated_by_tunnel_guard is True
 
 
 def test_ungated_writers_are_exactly_the_guard_writers_missing_from_the_gate():
+    # May be empty: every guard-mentioning writer is in the gate today. The
+    # tripwire is the equality below, not a non-empty requirement.
     expected_ungated = {name for name in _guard_writer_names() if name not in tun._DOCS_WRITE_TOOLS}
-    assert expected_ungated, "expected at least one guard-mentioning writer outside the gate"
     manifest = dc.build_docx_capability_manifest()
     ungated = {
         entry["operation"]
@@ -367,16 +369,25 @@ def test_adapter_whole_document_writes_never_report_fallback():
     assert target.fallback_applied is False
 
 
-def test_adapter_reports_known_ungated_writers_as_ungated():
-    target = dc.extract_docx_write_target(
-        "remove_cross_reference", {"docx_path": "C:/d/x.docx", "anchor_para_id": "p3"}
-    )
+def test_adapter_reports_previously_ungated_writers_as_gated():
+    # remove_cross_reference was the reported gap in c8eabc3d. The tunnel gate
+    # (fix a9794fb9) now enforces it, and the adapter must agree with that.
+    args = {"docx_path": "C:/d/x.docx", "anchor_para_id": "p3"}
+    target = dc.extract_docx_write_target("remove_cross_reference", args)
     assert target is not None
-    assert target.gated_by_tunnel_guard is False
-    # The live tunnel gate still does not see it: this is the reported gap.
-    assert tun._docs_write_target(
-        "remove_cross_reference", {"docx_path": "C:/d/x.docx", "anchor_para_id": "p3"}
-    ) is None
+    assert target.gated_by_tunnel_guard is True
+    assert tun._docs_write_target("remove_cross_reference", args) == ("C:/d/x.docx", "p3")
+
+
+def test_batch_transform_is_declared_as_a_gated_canonical_path_writer():
+    # apply_and_merge_batch_transform is gated on canonical_path (fix a9794fb9).
+    # Its draft_output_path is a second write target that the tunnel checks
+    # separately (_DOCS_DRAFT_OUTPUT_ARGS); the manifest models only the canonical one.
+    entry = _entries(dc.build_docx_capability_manifest())["apply_and_merge_batch_transform"]
+    assert entry["gated_by_tunnel_guard"] is True
+    assert entry["path_arg"] == "canonical_path"
+    assert entry["anchor_arg"] is None
+    assert entry["lock_scope"] == dc.LOCK_WHOLE_DOCUMENT
 
 
 @pytest.mark.parametrize(
