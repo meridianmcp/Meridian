@@ -308,6 +308,55 @@ def test_unmatched_entry_sharing_a_title_does_not_block_a_matched_entry(tmp_path
     assert result["attachments"]["duplicate_in_bib"] == []
 
 
+def test_same_title_with_conflicting_dois_matches_neither_item(tmp_path, pdf_dir):
+    """Two items share a title but carry different DOIs. An entry with a third DOI matches neither."""
+    bib = _write_bib(tmp_path, """
+@article{clash2022,
+  title = {Shared Title For Two Papers},
+  year = {2022},
+  doi = {10.1000/ccc333},
+}
+""")
+    items = [
+        {"key": "EXIST001", "data": {
+            "key": "EXIST001", "itemType": "journalArticle", "DOI": "10.1000/aaa111",
+            "title": "Shared Title For Two Papers",
+        }},
+        {"key": "EXIST002", "data": {
+            "key": "EXIST002", "itemType": "journalArticle", "DOI": "10.1000/bbb222",
+            "title": "Shared Title For Two Papers",
+        }},
+    ]
+    _write_pdf(pdf_dir, "clash2022")
+    library, header = _library(items=items), _header()
+    result = _run(bib, library, header, pdf_dir)
+    attachments = result["attachments"]
+    assert attachments["unmatched"] == ["clash2022"]
+    assert attachments["planned"] == []
+    assert attachments["attached"] == []
+    assert header.calls == []
+    assert library.posts() == []
+
+
+@pytest.mark.parametrize("doi_line, item_doi", [
+    ("  doi = {10.1000/ccc333},\n", ""),
+    ("", "10.1000/aaa111"),
+])
+def test_same_title_matches_when_one_side_has_no_doi(tmp_path, pdf_dir, doi_line, item_doi):
+    bib = _write_bib(
+        tmp_path,
+        "@article{nodoi2023,\n  title = {Shared Title For Two Papers},\n  year = {2023},\n" + doi_line + "}\n",
+    )
+    items = [{"key": "EXIST001", "data": {
+        "key": "EXIST001", "itemType": "journalArticle", "DOI": item_doi,
+        "title": "Shared Title For Two Papers",
+    }}]
+    _write_pdf(pdf_dir, "nodoi2023")
+    result = _run(bib, _library(items=items), _header(), pdf_dir, dry_run=True)
+    assert result["attachments"]["unmatched"] == []
+    assert result["attachments"]["planned"] == ["nodoi2023"]
+
+
 def test_dry_run_never_authorizes_or_posts(bib_file, pdf_dir):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
@@ -345,6 +394,31 @@ def test_missing_or_non_pdf_file_is_skipped_and_nothing_is_authorized(bib_file, 
     assert attachments["planned"] == []
     assert attachments["attached"] == []
     assert header.calls == []
+
+
+def test_entry_without_a_pdf_does_not_block_a_later_entry_with_the_same_doi(tmp_path, pdf_dir):
+    bib = _write_bib(tmp_path, """
+@article{nopdf2020,
+  title = {Deep Learning for GPT-style Models},
+  year = {2020},
+  doi = {10.1000/xyz123},
+}
+
+@article{haspdf2020,
+  title = {Deep Learning for GPT-style Models},
+  year = {2020},
+  doi = {10.1000/xyz123},
+}
+""")
+    _write_pdf(pdf_dir, "haspdf2020")
+    header = _header()
+    result = _run(bib, _library(), header, pdf_dir)
+    attachments = result["attachments"]
+    assert attachments["no_pdf"] == ["nopdf2020"]
+    assert attachments["duplicate_in_bib"] == []
+    assert attachments["attached"] == ["haspdf2020"]
+    body = json.loads(header.requests_to("POST", WRITE_ITEMS)[0]["body"])
+    assert [entry["parentItem"] for entry in body] == ["EXIST001"]
 
 
 def test_an_entry_not_in_the_collection_is_never_touched(bib_file, pdf_dir):

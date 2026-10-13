@@ -797,13 +797,13 @@ def _get_all_pages(transport, base_url):
     raise ZoteroError("item listing did not end within the page limit")
 
 
-def _collection_item_index(collection_key, transport):
-    """Map each dedupe key (DOI or lowercase title) to the item key that carries it.
+def _collection_item_records(collection_key, transport):
+    """Return (item key, normalised DOI, normalised title) for each top-level item in the collection.
 
     Attachments, notes and annotations are skipped, as in existing_keys.
     """
     _check_collection_key(collection_key)
-    index: dict[str, str] = {}
+    records: list[tuple[str, str, str]] = []
     for obj in _get_all_pages(transport, f"{LOCAL_API}/collections/{collection_key}/items?format=json"):
         data = obj.get("data") if isinstance(obj, dict) else None
         if not isinstance(data, dict) or data.get("itemType") in _NON_TOP_LEVEL_TYPES:
@@ -811,9 +811,33 @@ def _collection_item_index(collection_key, transport):
         ident = str((obj.get("key") or data.get("key") or ""))
         if not _ITEM_KEY_RE.fullmatch(ident):
             continue
-        for key in _keys_for(data.get("DOI"), data.get("title")):
+        records.append((ident, _norm_doi(data.get("DOI")), _norm_title(data.get("title"))))
+    return records
+
+
+def _collection_item_index(collection_key, transport):
+    """Map each dedupe key (DOI or lowercase title) to the item key that carries it."""
+    index: dict[str, str] = {}
+    for ident, norm_doi, norm_title in _collection_item_records(collection_key, transport):
+        for key in _keys_for(norm_doi, norm_title):
             index.setdefault(key, ident)
     return index
+
+
+def _match_existing_item(norm_doi, norm_title, records):
+    """Return the item key an entry matches among records, or None.
+
+    A shared DOI always matches. A shared title matches only when the two DOIs do
+    not conflict, that is when at least one side has no DOI. Two different papers
+    that share a title are therefore never confused.
+    """
+    for ident, item_doi, _item_title in records:
+        if norm_doi and item_doi == norm_doi:
+            return ident
+    for ident, item_doi, item_title in records:
+        if norm_title and item_title == norm_title and (not norm_doi or not item_doi):
+            return ident
+    return None
 
 
 def _has_pdf_child(item_key, transport):
@@ -1020,7 +1044,8 @@ def attach_existing_files(
     """Attach PDFs to entries that are already in the target collection (--attach-existing).
 
     Nothing is filed. Each .bib entry is matched to an item already in the
-    collection by DOI or normalised title. An entry with no match is not touched.
+    collection by DOI, or by normalised title when the DOIs do not conflict. An
+    entry with no match is not touched.
     A matched entry gets DIR/<citekey>.pdf as a linked file when the file starts
     with %PDF- and the item has no application/pdf child yet.
 
@@ -1063,19 +1088,18 @@ def attach_existing_files(
             log(f"Could not read the BibTeX input: {exc}")
             return finish("input_error")
 
-        index = _collection_item_index(key, transport)
+        records = _collection_item_records(key, transport)
         claimed: set[str] = set()  # one PDF per existing item per run
         for entry in entries:
             citekey = entry.get("citekey") or ""
-            keys = _item_keys(bib_to_connector_item(entry))
-            parent = next((index[item_key] for item_key in sorted(keys) if item_key in index), None)
+            item = bib_to_connector_item(entry)
+            parent = _match_existing_item(_norm_doi(item.get("DOI")), _norm_title(item.get("title")), records)
             if parent is None:
                 summary["unmatched"].append(citekey)
                 continue
             if parent in claimed:
                 summary["duplicate_in_bib"].append(citekey)
                 continue
-            claimed.add(parent)
             path = _pdf_for_entry(entry, pdf_dir)
             if path is None:
                 summary["no_pdf"].append(citekey)
@@ -1084,6 +1108,7 @@ def attach_existing_files(
                 summary["already_has_pdf"].append(citekey)
                 log(f"Skipped PDF for '{citekey}': the item already has a PDF.")
             else:
+                claimed.add(parent)  # claimed only once the entry is planned, never before its PDF check
                 candidates.append((citekey, path, parent))
                 summary["planned"].append(citekey)
         if summary["unmatched"]:
