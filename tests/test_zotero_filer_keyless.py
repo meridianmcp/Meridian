@@ -1,8 +1,11 @@
 """Keyless default for the Zotero filer CLI (--backend auto).
 
-Auto must use the desktop connector whenever Zotero answers, start Zotero when
-it does not, and fall back to the Web API only when credentials are usable. The
-credential lookup is never needed on the desktop path.
+Auto uses the desktop connector whenever Zotero answers, and starts Zotero when
+it does not. A real run never falls back to the Web API: when Zotero cannot be
+brought up it reports zotero_unavailable and writes nothing. A dry run never
+starts Zotero. It uses the desktop when Zotero already answers, and the Web API
+only when Zotero is down and credentials are usable. Credentials are never read
+on the desktop path.
 
 Every test replaces the launcher probe and start, both backends and the
 credential lookup, so nothing touches the real Zotero app, the network or any
@@ -107,23 +110,31 @@ def test_auto_starts_zotero_when_api_is_down_then_uses_desktop(bib_path, monkeyp
     assert world.web.calls == []
 
 
-def test_auto_falls_back_to_web_when_start_does_not_bring_zotero_up(bib_path, monkeypatch, capsys):
+def test_auto_does_not_fall_back_to_web_when_start_does_not_bring_zotero_up(bib_path, monkeypatch, capsys):
     world = _world(monkeypatch, alive=False, start=NOT_READY, creds=CREDS)
-    assert _file(bib_path) == 0
+    code = _file(bib_path)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert json.loads(captured.out)["status"] == "zotero_unavailable"
     assert len(world.starts.calls) == 1
     assert world.desktop.calls == []
-    assert len(world.web.calls) == 1
-    assert world.web.calls[0][0][2:4] == CREDS
-    captured = capsys.readouterr()
+    assert world.web.calls == []
+    assert world.reads.calls == []
+    assert "--backend web" in captured.err
     assert SECRET not in captured.out + captured.err
 
 
-def test_auto_falls_back_to_web_when_zotero_cannot_be_launched(bib_path, monkeypatch):
+def test_auto_does_not_fall_back_to_web_when_zotero_cannot_be_launched(bib_path, monkeypatch, capsys):
     world = _world(monkeypatch, alive=False, start_error=OSError("launch refused"), creds=CREDS)
-    assert _file(bib_path) == 0
+    code = _file(bib_path)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert json.loads(captured.out)["status"] == "zotero_unavailable"
     assert len(world.starts.calls) == 1
     assert world.desktop.calls == []
-    assert len(world.web.calls) == 1
+    assert world.web.calls == []
+    assert world.reads.calls == []
+    assert SECRET not in captured.out + captured.err
 
 
 def test_auto_reports_zotero_unavailable_without_credentials(bib_path, monkeypatch, capsys):
@@ -157,3 +168,50 @@ def test_explicit_desktop_backend_skips_probe_start_and_keys(bib_path, monkeypat
     assert world.probes.calls == []
     assert world.starts.calls == []
     assert world.reads.calls == []
+
+
+def test_auto_reports_unavailable_when_zotero_is_not_installed_and_never_uses_web(bib_path, monkeypatch, capsys):
+    world = _world(monkeypatch, alive=False, start=NOT_INSTALLED, creds=CREDS)
+    code = _file(bib_path)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert json.loads(captured.out)["status"] == "zotero_unavailable"
+    assert world.desktop.calls == []
+    assert world.web.calls == []
+    assert world.reads.calls == []
+    assert SECRET not in captured.out + captured.err
+
+
+def test_dry_run_auto_with_desktop_down_and_no_credentials_exits_two_without_starting_zotero(
+    bib_path, monkeypatch, capsys
+):
+    world = _world(monkeypatch, alive=False, start=READY, creds=None)
+    code = _file(bib_path, "--dry-run")
+    captured = capsys.readouterr()
+    assert code == 2
+    assert json.loads(captured.out)["status"] == "zotero_unavailable"
+    assert world.starts.calls == []
+    assert world.desktop.calls == []
+    assert world.web.calls == []
+    assert "Nothing was filed" in captured.err
+
+
+def test_dry_run_auto_with_desktop_down_uses_web_and_never_starts_zotero(bib_path, monkeypatch, capsys):
+    world = _world(monkeypatch, alive=False, start=READY, creds=CREDS)
+    assert _file(bib_path, "--dry-run") == 0
+    assert world.starts.calls == []
+    assert world.desktop.calls == []
+    assert len(world.web.calls) == 1
+    assert world.web.calls[0][0][2:4] == CREDS
+    assert world.web.calls[0][1]["dry_run"] is True
+    captured = capsys.readouterr()
+    assert SECRET not in captured.out + captured.err
+
+
+def test_dry_run_auto_with_desktop_answering_uses_desktop_without_starting_zotero(bib_path, monkeypatch):
+    world = _world(monkeypatch, alive=True, start=READY, creds=CREDS)
+    assert _file(bib_path, "--dry-run") == 0
+    assert world.starts.calls == []
+    assert world.web.calls == []
+    assert len(world.desktop.calls) == 1
+    assert world.desktop.calls[0][1]["dry_run"] is True

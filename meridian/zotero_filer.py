@@ -942,7 +942,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="auto",
         help=(
             "auto (default): desktop when Zotero answers, starting Zotero if needed; "
-            "web only when desktop is unreachable and ZOTERO_USER_ID and ZOTERO_API_KEY are set; "
+            "a real run never falls back to web; a dry run uses web only when desktop is unreachable "
+            "and ZOTERO_USER_ID and ZOTERO_API_KEY are set; "
             "desktop: local connector only; web: Zotero Web API only"
         ),
     )
@@ -966,25 +967,31 @@ def _desktop_ready() -> bool:
     return bool(started.get("api_ready"))
 
 
-def _pick_auto_backend() -> str | None:
-    """Choose the backend for --backend auto: desktop first, web only as a fallback.
+def _pick_auto_backend(dry_run: bool) -> str | None:
+    """Choose the backend for --backend auto. Returns "desktop", "web" or None.
 
-    Returns "desktop" when Zotero answers, or comes up after a start. Returns
-    "web" when the desktop app is unreachable and usable credentials are set.
-    Returns None when neither works. Credentials are read only on the fallback.
+    A dry run never starts Zotero. It uses desktop when the API already answers,
+    and web when it does not and usable credentials are set. Credentials are read
+    only on that dry-run fallback.
+
+    A real run uses desktop when the API answers or comes up after a start. It
+    never falls back to web, so a failed start returns None and nothing is written
+    through a backend the user did not choose.
     """
-    if _desktop_ready():
-        return "desktop"
-    if web_credentials() is not None:
-        return "web"
-    return None
+    if dry_run:
+        if zotero_launcher.zotero_api_alive():
+            return "desktop"
+        return "web" if web_credentials() is not None else None
+    return "desktop" if _desktop_ready() else None
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Prints the result as JSON. Exit 0 for ok or dry_run, else 2.
 
-    With --backend auto, a Zotero that cannot be reached and has no usable Web
-    API fallback exits 2 with status zotero_unavailable and writes nothing.
+    With --backend auto, a Zotero that cannot be reached exits 2 with status
+    zotero_unavailable and writes nothing. A real run never falls back to the Web
+    API. A dry run uses the Web API only when Zotero is down and credentials are set,
+    and it never starts Zotero.
     """
     args = _build_parser().parse_args(argv)
     if args.command == "collections":
@@ -996,12 +1003,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     backend = args.backend
     if backend == "auto":
-        backend = _pick_auto_backend()
+        backend = _pick_auto_backend(args.dry_run)
         if backend is None:
-            _stderr(
-                "Zotero desktop is not running and could not be started. "
-                "Start Zotero desktop, then run this again. Nothing was filed."
-            )
+            if args.dry_run:
+                _stderr("Zotero desktop is not running. Start Zotero desktop, then run this again. Nothing was filed.")
+            else:
+                _stderr(
+                    "Zotero desktop did not come up within the wait. Start Zotero and retry, "
+                    "or pass --backend web to file through the Web API. Nothing was filed."
+                )
             print(json.dumps(_result("zotero_unavailable", args.collection), indent=2))
             return 2
     if backend == "web":
