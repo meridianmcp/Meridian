@@ -443,6 +443,31 @@ def _run_tray() -> int:
     def _show_logs(icon: "pystray.Icon", item: Any) -> None:
         threading.Thread(target=_show_logs_window, args=(runner,), daemon=True).start()
 
+    def _start_zotero(icon: "pystray.Icon", item: Any) -> None:
+        # Imported here rather than at module top so the tray still starts
+        # when the launcher module is missing from this build.
+        try:
+            from . import zotero_launcher
+        except ImportError:
+            _logger.warning(
+                "tray_main: Start Zotero unavailable, zotero_launcher is not importable",
+                exc_info=True,
+            )
+            return
+
+        def _do_start_zotero() -> None:
+            # start_zotero polls the Zotero API for up to a minute, so it runs
+            # off the tray thread to keep the menu responsive.
+            try:
+                result = zotero_launcher.start_zotero()
+            except Exception:  # noqa: BLE001 -- a failed Zotero start must never crash the tray
+                _logger.warning("tray_main: Start Zotero failed", exc_info=True)
+                return
+            action = result.get("action") if isinstance(result, dict) else result
+            _logger.info("tray_main: Start Zotero finished, action=%s", action)
+
+        threading.Thread(target=_do_start_zotero, daemon=True).start()
+
     def _restart(icon: "pystray.Icon", item: Any) -> None:
         def _do_restart() -> None:
             try:
@@ -462,6 +487,7 @@ def _run_tray() -> int:
     menu = pystray.Menu(
         pystray.MenuItem("Open Dashboard", _open_dashboard, default=True),
         pystray.MenuItem("Status", _show_status),
+        pystray.MenuItem("Start Zotero", _start_zotero),
         pystray.MenuItem("View Logs", _show_logs),
         pystray.MenuItem("Restart", _restart),
         pystray.Menu.SEPARATOR,

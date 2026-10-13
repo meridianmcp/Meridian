@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import ast
 import io
+import logging
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from unittest import mock
 
@@ -727,6 +729,141 @@ def test_run_tray_opens_dashboard_when_local_mcp_not_configured(monkeypatch):
     assert opened == [tray_main._dashboard_url()]
 
 
+# Start Zotero tray entry: menu wiring and the background launch handler.
+# zotero_launcher.start_zotero is always monkeypatched here, so no Zotero
+# process is started or stopped and no network call is made.
+
+
+def _record_started_threads(monkeypatch):
+    """Record every thread tray_main starts so a test can join it."""
+    started = []
+    real_thread = threading.Thread
+
+    class _RecordingThread(real_thread):
+        def start(self):
+            started.append(self)
+            super().start()
+
+    monkeypatch.setattr(tray_main.threading, "Thread", _RecordingThread)
+    return started
+
+
+def _build_tray_menu(monkeypatch):
+    """Run _run_tray against faked pystray/PIL and return the fake pystray
+    module, so a test can inspect the menu items _run_tray declared."""
+    fake_pystray, _ = _fake_pystray_and_pil(monkeypatch)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.NOT_CONFIGURED)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda url: None)
+    assert tray_main._run_tray() == 0
+    return fake_pystray
+
+
+def _menu_item_labels(fake_pystray):
+    return [call.args[0] for call in fake_pystray.MenuItem.call_args_list]
+
+
+def _menu_item_action(fake_pystray, label):
+    for call in fake_pystray.MenuItem.call_args_list:
+        if call.args and call.args[0] == label:
+            return call.args[1]
+    raise AssertionError(f"no tray menu item labelled {label!r}")
+
+
+def test_tray_menu_source_contains_start_zotero_label():
+    source = _TRAY_MAIN_PATH.read_text(encoding="utf-8")
+    assert '"Start Zotero"' in source
+
+
+def test_start_zotero_menu_item_sits_after_status_and_leaves_others_unchanged(monkeypatch):
+    fake_pystray = _build_tray_menu(monkeypatch)
+    assert _menu_item_labels(fake_pystray) == [
+        "Open Dashboard",
+        "Status",
+        "Start Zotero",
+        "View Logs",
+        "Restart",
+        "Quit",
+    ]
+
+
+def test_zotero_launcher_is_not_imported_at_module_top_level():
+    """The launcher must stay a lazy import inside the handler, so a missing
+    module can never stop the tray from starting."""
+    tree = ast.parse(_TRAY_MAIN_PATH.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            names = {alias.name for alias in node.names}
+            assert node.module != "zotero_launcher"
+            assert "zotero_launcher" not in names
+
+
+def test_start_zotero_handler_calls_launcher_in_a_background_daemon_thread(monkeypatch, caplog):
+    fake_pystray = _build_tray_menu(monkeypatch)
+    started = _record_started_threads(monkeypatch)
+    calls = []
+
+    def _fake_start_zotero(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"action": "started", "exe": "C:/fake/zotero.exe", "api_ready": True}
+
+    monkeypatch.setattr("meridian.zotero_launcher.start_zotero", _fake_start_zotero)
+    caplog.set_level(logging.INFO, logger="meridian.tray_main")
+    action = _menu_item_action(fake_pystray, "Start Zotero")
+
+    action(None, None)
+
+    # The handler hands the blocking call to exactly one daemon thread, so
+    # the tray is never held up waiting on Zotero.
+    assert len(started) == 1
+    assert started[0].daemon is True
+    started[0].join(timeout=5)
+    assert not started[0].is_alive()
+    assert calls == [((), {})]
+    assert any(
+        "Start Zotero finished" in r.getMessage() and "action=started" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_start_zotero_failure_is_logged_not_raised(monkeypatch, caplog):
+    fake_pystray = _build_tray_menu(monkeypatch)
+    started = _record_started_threads(monkeypatch)
+
+    def _failing_start_zotero(*args, **kwargs):
+        raise RuntimeError("zotero launch exploded")
+
+    monkeypatch.setattr("meridian.zotero_launcher.start_zotero", _failing_start_zotero)
+    caplog.set_level(logging.INFO, logger="meridian.tray_main")
+    action = _menu_item_action(fake_pystray, "Start Zotero")
+
+    action(None, None)  # must not raise
+    for thread in started:
+        thread.join(timeout=5)
+
+    failures = [r for r in caplog.records if "Start Zotero failed" in r.getMessage()]
+    assert failures
+    assert failures[0].levelno == logging.WARNING
+    assert failures[0].exc_info is not None
+
+
+def test_start_zotero_handler_survives_missing_launcher_module(monkeypatch, caplog):
+    fake_pystray = _build_tray_menu(monkeypatch)
+    started = _record_started_threads(monkeypatch)
+    # `from . import zotero_launcher` reads the package attribute before it
+    # consults sys.modules, so both must be cleared for the import to fail.
+    monkeypatch.delattr(meridian, "zotero_launcher", raising=False)
+    monkeypatch.setitem(sys.modules, "meridian.zotero_launcher", None)
+    caplog.set_level(logging.INFO, logger="meridian.tray_main")
+    action = _menu_item_action(fake_pystray, "Start Zotero")
+
+    action(None, None)  # must not raise
+
+    assert started == []
+    assert any("Start Zotero unavailable" in r.getMessage() for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Pre-ship validation checklist (507e55de) -- real-artifact consistency
 # checks between meridian-tray.spec, meridian/static/meridian-tray.ico, and
@@ -904,6 +1041,7 @@ class TestTraySpecPreShipConsistency:
             "meridian.__main__",  # main()'s `from . import __main__` (--run-server dispatch)
             "meridian.server",  # the real HTTP server --run-server ultimately serves
             "meridian.local_runner",  # module-level `from .local_runner import (...)`
+            "meridian.zotero_launcher",  # _start_zotero()'s lazy `from . import zotero_launcher`
             "pystray._win32",  # _run_tray()'s lazily-imported `import pystray`
             "PIL",  # _run_tray()'s lazily-imported `from PIL import Image`
             "PIL.Image",
