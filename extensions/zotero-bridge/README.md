@@ -51,7 +51,7 @@ before anything is written.
 | --- | --- |
 | DOI matches an existing item's DOI (case-insensitive, `doi.org` prefix ignored) | **Exact**: skipped |
 | Neither side has a DOI, and the normalised title matches | **Exact**: skipped |
-| Titles match and one side has no DOI | **Exact**: skipped |
+| Titles match and only one side has a DOI | **Conflict**: not imported, listed in the report for review |
 | Titles match and both DOIs are present and differ | **Conflict**: not imported, listed in the report for review |
 | Anything else | **New**: imported |
 

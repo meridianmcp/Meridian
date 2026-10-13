@@ -5,12 +5,12 @@
 // Rules, applied in this order for one entry against the existing items:
 //   1. A normalised DOI equal to an existing item's normalised DOI -> exact.
 //   2. Otherwise, if the normalised title is empty -> new (no title matching).
-//   3. A title match is exact when the DOIs are compatible: neither side has
-//      a DOI, or only one side has one, or both DOIs are equal.
-//      Any compatible title match returns exact, even if another title match
+//   3. A title match is exact only when neither side has a DOI.
+//      Any such title match returns exact, even if another title match
 //      conflicts.
-//   4. A title match where both sides have different DOIs is a conflict,
-//      reported for review and not imported.
+//   4. Any other title match is a conflict, reported for review and not
+//      imported: one side has a DOI and the other does not, or both DOIs are
+//      present and differ.
 //   5. Anything else -> new.
 
 const { normalizeTitle, normalizeDoi } = require('./normalize.js');
@@ -31,8 +31,7 @@ function classify(entry, existing) {
   let sawConflict = false;
   for (const item of items) {
     if (!item || normalizeTitle(item.title) !== entryTitle) continue;
-    const existingDoi = normalizeDoi(item.doi);
-    if (!entryDoi || !existingDoi || entryDoi === existingDoi) return 'exact';
+    if (!entryDoi && !normalizeDoi(item.doi)) return 'exact';
     sawConflict = true;
   }
   return sawConflict ? 'conflict' : 'new';

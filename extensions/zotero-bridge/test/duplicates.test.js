@@ -22,16 +22,16 @@ test('same title with different DOIs is a conflict', () => {
   assert.equal(classify(entry, existing), 'conflict');
 });
 
-test('same title where only the entry has a DOI is exact', () => {
+test('same title where only the entry has a DOI is a conflict', () => {
   const entry = { title: 'Shared Title', doi: '10.1000/one' };
   const existing = [{ title: 'Shared Title', doi: '' }];
-  assert.equal(classify(entry, existing), 'exact');
+  assert.equal(classify(entry, existing), 'conflict');
 });
 
-test('same title where only the existing item has a DOI is exact', () => {
+test('same title where only the existing item has a DOI is a conflict', () => {
   const entry = { title: 'Shared Title', doi: '' };
   const existing = [{ title: 'Shared Title', doi: '10.1000/one' }];
-  assert.equal(classify(entry, existing), 'exact');
+  assert.equal(classify(entry, existing), 'conflict');
 });
 
 test('different title is new, even with no DOI on either side', () => {
@@ -57,7 +57,7 @@ test('entries without a title never match on title', () => {
 });
 
 test('an exact match takes precedence over a conflicting title match', () => {
-  const entry = { title: 'Shared Title', doi: '10.1000/a' };
+  const entry = { title: 'Shared Title', doi: '' };
   const existing = [
     { title: 'Shared Title', doi: '10.1000/b' },
     { title: 'Shared Title', doi: '' },
