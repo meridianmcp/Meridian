@@ -22,6 +22,8 @@ Safety rules enforced here:
   and only to items this run filed and verified. Zotero must approve the app
   once in its own dialog. The approval key stays in memory and travels only in
   request headers.
+* --attach-existing attaches PDFs only to items already in the collection. It
+  files nothing, needs --pdf-dir, and uses the same single approval.
 """
 
 from __future__ import annotations
@@ -1006,6 +1008,105 @@ def attach_pdfs(filed, collection_key, pdf_dir, transport=None, header_transport
     return summary
 
 
+def attach_existing_files(
+    paths,
+    collection_name: str,
+    pdf_dir: str | os.PathLike,
+    transport: Transport | None = None,
+    header_transport: HeaderTransport | None = None,
+    dry_run: bool = False,
+    log: Callable[[str], Any] = print,
+) -> dict[str, Any]:
+    """Attach PDFs to entries that are already in the target collection (--attach-existing).
+
+    Nothing is filed. Each .bib entry is matched to an item already in the
+    collection by DOI or normalised title. An entry with no match is not touched.
+    A matched entry gets DIR/<citekey>.pdf as a linked file when the file starts
+    with %PDF- and the item has no application/pdf child yet.
+
+    A dry run stops after planning, so it never authorizes or writes. A live run
+    makes one authorize request when anything is planned, then writes the planned
+    attachments through _write_attachments. A refusal is reported and never retried.
+
+    Returns {"status", "collection", "mode", "attachments"}. The attachments dict
+    holds lists of citekeys: planned, attached, already_has_pdf, no_pdf, failed,
+    unmatched and duplicate_in_bib. status is dry_run, ok, no_collection,
+    input_error, zotero_error, not_approved, rate_limited, auth_error,
+    no_server_id or attach_failed.
+    """
+    transport = _resolve(transport)
+    header_transport = _resolve_header(header_transport)
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    summary: dict[str, Any] = {
+        "status": "dry_run" if dry_run else "ok",
+        "planned": [], "attached": [], "already_has_pdf": [], "no_pdf": [],
+        "failed": [], "unmatched": [], "duplicate_in_bib": [],
+    }
+    candidates: list[tuple[str, str, str]] = []  # (citekey, pdf path, parent item key)
+
+    def finish(status: str) -> dict[str, Any]:
+        summary["status"] = status
+        return {"status": status, "collection": collection_name, "mode": "attach_existing", "attachments": summary}
+
+    try:
+        key = find_collection_key(collection_name, transport)
+        if key is None:
+            log(
+                f"Create the collection '{collection_name}' in Zotero first "
+                "(right-click My Library > New Collection)."
+            )
+            return finish("no_collection")
+        try:
+            entries = _load_bib_entries(paths)
+        except (OSError, ValueError) as exc:
+            log(f"Could not read the BibTeX input: {exc}")
+            return finish("input_error")
+
+        index = _collection_item_index(key, transport)
+        claimed: set[str] = set()  # one PDF per existing item per run
+        for entry in entries:
+            citekey = entry.get("citekey") or ""
+            keys = _item_keys(bib_to_connector_item(entry))
+            parent = next((index[item_key] for item_key in sorted(keys) if item_key in index), None)
+            if parent is None:
+                summary["unmatched"].append(citekey)
+                continue
+            if parent in claimed:
+                summary["duplicate_in_bib"].append(citekey)
+                continue
+            claimed.add(parent)
+            path = _pdf_for_entry(entry, pdf_dir)
+            if path is None:
+                summary["no_pdf"].append(citekey)
+                log(f"Skipped PDF for '{citekey}': no usable {citekey}.pdf in the PDF folder.")
+            elif _has_pdf_child(parent, transport):
+                summary["already_has_pdf"].append(citekey)
+                log(f"Skipped PDF for '{citekey}': the item already has a PDF.")
+            else:
+                candidates.append((citekey, path, parent))
+                summary["planned"].append(citekey)
+        if summary["unmatched"]:
+            log(f"Not in '{collection_name}', so not touched: {', '.join(summary['unmatched'])}")
+
+        if dry_run:
+            for citekey in summary["planned"]:
+                log(f"Would attach PDF for '{citekey}' to its existing item.")
+            return finish("dry_run")
+        if candidates:
+            _write_attachments(candidates, header_transport, summary, log)
+    except _ERRORS as exc:
+        log(f"Zotero error during the PDF attach: {exc}")
+        summary["status"] = "zotero_error"
+
+    # Anything planned that was not attached counts as failed, as in attach_pdfs.
+    attached = set(summary["attached"])
+    summary["failed"] += [citekey for citekey, _path, _parent in candidates if citekey not in attached]
+    if summary["status"] == "ok" and summary["failed"]:
+        summary["status"] = "attach_failed"
+    return finish(summary["status"])
+
+
 # ---------------------------------------------------------------------------
 # Web API backend (api.zotero.org). It can create collections and write items.
 # It needs a numeric user id and a key with write access, both read from the
@@ -1281,6 +1382,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "The first real attach asks Zotero to approve Meridian once, in a dialog you must answer."
         ),
     )
+    file_parser.add_argument(
+        "--attach-existing",
+        action="store_true",
+        help=(
+            "attach DIR/<citekey>.pdf to items ALREADY in the collection (matched by DOI or title) "
+            "instead of filing new items. Needs --pdf-dir and the desktop backend. Zotero asks "
+            "for approval once per run, and only when something is left to attach."
+        ),
+    )
 
     subparsers.add_parser("collections", help="list Zotero collections (read-only)")
     return parser
@@ -1327,7 +1437,8 @@ def main(argv: list[str] | None = None) -> int:
     API. A dry run uses the Web API only when Zotero is down and credentials are set,
     and it never starts Zotero.
     """
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     if args.command == "collections":
         try:
             print(json.dumps(list_collections(), indent=2))
@@ -1335,6 +1446,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": "zotero_error", "message": str(exc)}, indent=2))
             return 2
         return 0
+    if args.attach_existing and args.pdf_dir is None:
+        parser.error("--attach-existing requires --pdf-dir")
     backend = args.backend
     if backend == "auto":
         backend = _pick_auto_backend(args.dry_run)
@@ -1348,7 +1461,19 @@ def main(argv: list[str] | None = None) -> int:
                 )
             print(json.dumps(_result("zotero_unavailable", args.collection), indent=2))
             return 2
-    if backend == "web":
+    if args.attach_existing:
+        if backend != "desktop":
+            print(json.dumps({
+                "status": "attach_existing_needs_desktop",
+                "collection": args.collection,
+                "message": (
+                    "--attach-existing attaches PDFs through the Zotero desktop app. "
+                    "Start Zotero desktop and retry. Nothing was attached."
+                ),
+            }, indent=2))
+            return 2
+        result = attach_existing_files(args.bib, args.collection, args.pdf_dir, dry_run=args.dry_run, log=_stderr)
+    elif backend == "web":
         creds = web_credentials()
         if creds is None:
             print(json.dumps({
