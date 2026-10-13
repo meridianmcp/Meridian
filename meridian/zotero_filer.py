@@ -89,8 +89,26 @@ class ZoteroError(RuntimeError):
 
 _ERRORS = (ZoteroError, OSError, http.client.HTTPException)
 
-# Loopback only: never route the Zotero connector through a system proxy.
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+class _StripKeyOnRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows redirects without sending the Zotero API key to the redirect target.
+
+    Zotero answers a file download with a redirect to the storage host. urllib
+    copies request headers onto the redirected request, so without this the key
+    would reach that host.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            for name in [name for name in redirected.headers if name.lower() == "zotero-api-key"]:
+                del redirected.headers[name]
+        return redirected
+
+
+# Loopback only: never route the Zotero connector through a system proxy. Redirects
+# are followed, but the Zotero API key is never sent to a redirect target.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _StripKeyOnRedirect())
 
 
 def _urllib_transport(method, url, body, headers):
@@ -1387,6 +1405,7 @@ _WEB_RETRY_STATUSES = frozenset({429, 503})
 _WEB_RETRY_CAP_S = 120.0  # a longer Retry-After stops the run rather than blocking it
 _WEB_UPLOAD_TIMEOUT_S = 120.0
 _WEB_FORM_TYPE = "application/x-www-form-urlencoded"
+_STORED_LINK_MODES = frozenset({"imported_file", "imported_url"})  # link modes whose file Zotero stores
 
 
 class _WebStop(ZoteroError):
@@ -1572,19 +1591,54 @@ def _web_top_item_records(run, collection_key):
     return records
 
 
-def _web_has_pdf_child(run, item_key):
-    """True when the item already has a child whose contentType is application/pdf."""
+def _web_child_file_stored(run, child_key):
+    """True when Zotero stores the file of this attachment. HTTP 404 means it is not stored.
+
+    The download redirects to the storage host, and the key is not sent there. Any
+    other status stops the run, so an unclear answer never leads to a second child.
+    """
+    status, _text, _headers = run.call(
+        "GET", f"{WEB_API}/users/{run.user_id}/items/{child_key}/file", timeout=_WEB_UPLOAD_TIMEOUT_S,
+    )
+    if status == 404:
+        return False
+    if not _ok(status):
+        _web_raise(status, "checking a PDF attachment's file")
+    return True
+
+
+def _web_pdf_child_state(run, item_key):
+    """(attached, orphan_key) for the PDF children of an item.
+
+    attached is True when a PDF child has its file stored on Zotero. A PDF child
+    with no stored file is an orphan: an earlier run created the empty attachment
+    and its upload then failed. orphan_key is the key of the first orphan, or None.
+    A linked file or linked URL has no file on Zotero, so it is never checked and
+    counts as attached. A PDF child whose key cannot be checked also counts as
+    attached, so nothing is uploaded beside it.
+    """
     url = f"{WEB_API}/users/{run.user_id}/items/{item_key}/children"
+    orphan = None
     for obj in run.objects(url, "listing item children"):
         data = obj.get("data") if isinstance(obj, dict) else None
-        if isinstance(data, dict) and str(data.get("contentType") or "").lower() == _PDF_CONTENT_TYPE:
-            return True
-    return False
+        if not isinstance(data, dict) or str(data.get("contentType") or "").lower() != _PDF_CONTENT_TYPE:
+            continue
+        link_mode = data.get("linkMode")
+        child_key = str(obj.get("key") or data.get("key") or "")
+        if (link_mode and link_mode not in _STORED_LINK_MODES) or not _ITEM_KEY_RE.fullmatch(child_key):
+            return True, None
+        if _web_child_file_stored(run, child_key):
+            return True, None
+        if orphan is None:
+            orphan = child_key
+    return False, orphan
 
 
-def _web_attach_entry(run, citekey, path, parent_key):
+def _web_attach_entry(run, citekey, path, parent_key, orphan_key=None):
     """Steps 5a to 5d for one PDF. Returns (attached, failed_step, stop_run).
 
+    orphan_key is an empty PDF child that an earlier run left behind. When it is
+    given, the upload goes into that child and no new attachment item is created.
     failed_step names the step that failed. stop_run is True after a connection
     error, so the caller stops the run. A rate limit raises _WebStop, with its
     step set to the step that was running.
@@ -1600,17 +1654,20 @@ def _web_attach_entry(run, citekey, path, parent_key):
     base = f"{WEB_API}/users/{run.user_id}"
     step = "create_item"
     try:
-        item = {
-            "itemType": "attachment", "parentItem": parent_key, "linkMode": "imported_file",
-            "title": filename, "filename": filename, "contentType": _PDF_CONTENT_TYPE,
-            "md5": md5, "mtime": mtime_ms, "tags": [], "relations": {},
-        }
-        status, text, _headers = run.call(
-            "POST", f"{base}/items", json.dumps([item]).encode("utf-8"), {"Content-Type": "application/json"},
-        )
-        att_key = _created_key(_json_or_none(text)) if _ok(status) else None
-        if att_key is None:
-            return False, step, False
+        if orphan_key is None:
+            item = {
+                "itemType": "attachment", "parentItem": parent_key, "linkMode": "imported_file",
+                "title": filename, "filename": filename, "contentType": _PDF_CONTENT_TYPE,
+                "md5": md5, "mtime": mtime_ms, "tags": [], "relations": {},
+            }
+            status, text, _headers = run.call(
+                "POST", f"{base}/items", json.dumps([item]).encode("utf-8"), {"Content-Type": "application/json"},
+            )
+            att_key = _created_key(_json_or_none(text)) if _ok(status) else None
+            if att_key is None:
+                return False, step, False
+        else:
+            att_key = orphan_key
 
         step = "authorize"
         file_url = f"{base}/items/{att_key}/file"
@@ -1674,9 +1731,10 @@ def attach_existing_web(
     Matching, the skip rules and the dry-run plan match attach_existing_files. The
     local API and the desktop approval step are never used. The steps are: check
     the key, find the collection by exact name, list its top-level items, match each
-    entry, skip entries that already have a PDF child, then for each planned PDF
-    create the attachment item, authorize the upload, upload the bytes, and register.
-    A dry run stops after planning.
+    entry, skip entries whose PDF child already has its file stored, then for each
+    planned PDF create the attachment item, authorize the upload, upload the bytes,
+    and register. An empty PDF child left by an earlier run is reused, so the upload
+    goes into it and no second child is created. A dry run stops after planning.
 
     Returns {"status", "collection", "mode", "attachments"}. The attachments dict
     holds citekey lists: planned, attached, already_has_pdf, no_pdf, failed, unmatched
@@ -1692,7 +1750,7 @@ def attach_existing_web(
         "planned": [], "attached": [], "already_has_pdf": [], "no_pdf": [],
         "failed": [], "failed_steps": {}, "unmatched": [], "duplicate_in_bib": [],
     }
-    candidates: list[tuple[str, str, str]] = []  # (citekey, pdf path, parent item key)
+    candidates: list[tuple[str, str, str, str | None]] = []  # (citekey, pdf path, parent item key, orphan child key)
     run = _WebRun(user_id, api_key, transport, sleep)
 
     def finish(status: str) -> dict[str, Any]:
@@ -1726,13 +1784,15 @@ def attach_existing_web(
             if path is None:
                 summary["no_pdf"].append(citekey)
                 log(f"Skipped PDF for '{citekey}': no usable {citekey}.pdf in the PDF folder.")
-            elif _web_has_pdf_child(run, parent):
+                continue
+            has_pdf, orphan = _web_pdf_child_state(run, parent)
+            if has_pdf:
                 summary["already_has_pdf"].append(citekey)
                 log(f"Skipped PDF for '{citekey}': the item already has a PDF.")
-            else:
-                claimed.add(parent)  # claimed only once the entry is planned
-                candidates.append((citekey, path, parent))
-                summary["planned"].append(citekey)
+                continue
+            claimed.add(parent)  # claimed only once the entry is planned
+            candidates.append((citekey, path, parent, orphan))
+            summary["planned"].append(citekey)
         if summary["unmatched"]:
             log(f"Not in '{collection_name}', so not touched: {', '.join(summary['unmatched'])}")
 
@@ -1740,9 +1800,11 @@ def attach_existing_web(
             for citekey in summary["planned"]:
                 log(f"Would attach PDF for '{citekey}' to its existing item.")
             return finish("dry_run")
-        for citekey, path, parent in candidates:
+        for citekey, path, parent, orphan in candidates:
+            if orphan is not None:
+                log(f"Reusing the empty PDF attachment left by an earlier run for '{citekey}'.")
             try:
-                attached, failed_step, stop_run = _web_attach_entry(run, citekey, path, parent)
+                attached, failed_step, stop_run = _web_attach_entry(run, citekey, path, parent, orphan)
             except _WebStop as exc:
                 summary["failed"].append(citekey)
                 summary["failed_steps"][citekey] = exc.step
@@ -1769,7 +1831,7 @@ def attach_existing_web(
 
     # Any planned entry that was not attached counts as failed. Entries the run never reached are not_run.
     attached_set = set(summary["attached"])
-    for citekey, _path, _parent in candidates:
+    for citekey, _path, _parent, _orphan in candidates:
         if citekey not in attached_set and citekey not in summary["failed"]:
             summary["failed"].append(citekey)
             summary["failed_steps"][citekey] = "not_run"

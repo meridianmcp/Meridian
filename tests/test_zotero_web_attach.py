@@ -323,10 +323,8 @@ def test_doi_and_title_matching_with_the_conflicting_doi_rule(tmp_path):
 def test_entry_with_a_pdf_child_is_skipped_and_nothing_is_written(tmp_path):
     bib, pdfs = write_inputs(tmp_path)
     routes = standard_routes()
-    routes[("GET", children_url("EXIST001"))] = ok([
-        {"key": "CHILDPDF", "data": {"key": "CHILDPDF", "itemType": "attachment",
-                                     "contentType": "application/pdf", "linkMode": "imported_file"}},
-    ])
+    routes[("GET", children_url("EXIST001"))] = ok([pdf_child("CHILDPDF")])
+    routes[("GET", file_url("CHILDPDF"))] = ok("", status=200)  # the child's file is stored
     routes.update(upload_routes(att_keys=("ATTKEY02", "ATTKEY03")))
     fake = FakeWeb(routes)
     messages = []
@@ -336,6 +334,110 @@ def test_entry_with_a_pdf_child_is_skipped_and_nothing_is_written(tmp_path):
     assert summary["attached"] == ["lee2021attention"]
     assert result["status"] == "ok"
     assert len(fake.posts(WRITE_URL)) == 1  # only lee gets an attachment item
+
+
+# ---------------------------------------------------------------------------
+# A PDF child counts only when its file is stored (orphan children)
+# ---------------------------------------------------------------------------
+
+def pdf_child(child_key, link_mode="imported_file"):
+    """A PDF attachment child of an existing item, as the children endpoint lists it."""
+    return {"key": child_key, "data": {
+        "key": child_key, "itemType": "attachment", "contentType": "application/pdf", "linkMode": link_mode,
+    }}
+
+
+def test_pdf_child_whose_file_is_not_stored_does_not_count_and_the_entry_is_planned(tmp_path):
+    bib, pdfs = write_inputs(tmp_path)
+    routes = standard_routes()
+    routes[("GET", children_url("EXIST001"))] = ok([pdf_child("ORPHAN01")])
+    routes[("GET", file_url("ORPHAN01"))] = ok("", status=404)  # an empty child: no file is stored
+    fake = FakeWeb(routes)
+    result = attach(bib, pdfs, fake, dry_run=True)
+    summary = result["attachments"]
+    assert result["status"] == "dry_run"
+    assert summary["already_has_pdf"] == []
+    assert summary["planned"] == ["smith2020deep", "lee2021attention"]
+    assert any(c["url"] == file_url("ORPHAN01") for c in fake.calls)
+    assert all(c["method"] == "GET" for c in fake.calls)  # the dry run never writes
+
+
+def test_orphaned_empty_child_is_reused_and_no_second_child_is_created(tmp_path):
+    bib, pdfs = write_inputs(tmp_path)
+    routes = standard_routes()
+    routes[("GET", children_url("EXIST001"))] = ok([pdf_child("ORPHAN01")])
+    routes[("GET", file_url("ORPHAN01"))] = ok("", status=404)
+    routes[("POST", WRITE_URL)] = created("ATTKEY02", shape="successful")  # only lee needs a new child
+    routes[("POST", file_url("ORPHAN01"))] = [authorize("UPKEY001"), ok("", status=204)]
+    routes[("POST", file_url("ATTKEY02"))] = [authorize("UPKEY002"), ok("", status=204)]
+    routes[("POST", UPLOAD_URL)] = ok("", status=201)
+    fake = FakeWeb(routes)
+    result = attach(bib, pdfs, fake)
+    summary = result["attachments"]
+    assert result["status"] == "ok"
+    assert summary["attached"] == ["smith2020deep", "lee2021attention"]
+    # Only lee gets a new attachment item. smith's upload goes into the orphan.
+    creates = [json.loads(c["body"].decode("utf-8")) for c in fake.posts(WRITE_URL)]
+    assert len(creates) == 1
+    assert creates[0][0]["parentItem"] == "EXIST002"
+    assert fake.posts(file_url("ATTKEY01")) == []
+    smith_authorize = urllib.parse.parse_qs(fake.posts(file_url("ORPHAN01"))[0]["body"].decode("ascii"))
+    assert smith_authorize["md5"] == [PDF_MD5]
+    register = fake.posts(file_url("ORPHAN01"))[1]
+    assert urllib.parse.parse_qs(register["body"].decode("ascii")) == {"upload": ["UPKEY001"]}
+    assert fake.posts(UPLOAD_URL)[0]["body"] == PREFIX.encode("utf-8") + PDF_BYTES + SUFFIX.encode("utf-8")
+
+
+def test_pdf_child_whose_file_is_stored_is_skipped_after_its_file_is_checked(tmp_path):
+    bib, pdfs = write_inputs(tmp_path)
+    routes = merged(standard_routes(), upload_routes(att_keys=("ATTKEY02", "ATTKEY03")))
+    routes[("GET", children_url("EXIST001"))] = ok([pdf_child("STORED01")])
+    routes[("GET", file_url("STORED01"))] = ok("", status=200)
+    fake = FakeWeb(routes)
+    result = attach(bib, pdfs, fake)
+    summary = result["attachments"]
+    assert summary["already_has_pdf"] == ["smith2020deep"]
+    assert summary["attached"] == ["lee2021attention"]
+    assert any(c["method"] == "GET" and c["url"] == file_url("STORED01") for c in fake.calls)
+    assert fake.posts(file_url("STORED01")) == []  # nothing is written to a child that has its file
+
+
+def test_linked_pdf_child_counts_as_attached_and_its_file_is_never_checked(tmp_path):
+    bib, pdfs = write_inputs(tmp_path)
+    routes = standard_routes()
+    routes[("GET", children_url("EXIST001"))] = ok([pdf_child("LINKED01", link_mode="linked_file")])
+    fake = FakeWeb(routes)  # no route for the child's file: a check would fail the test
+    result = attach(bib, pdfs, fake, dry_run=True)
+    assert result["attachments"]["already_has_pdf"] == ["smith2020deep"]
+    assert all(file_url("LINKED01") != c["url"] for c in fake.calls)
+
+
+def test_a_failed_file_check_stops_the_run_before_any_write(tmp_path):
+    bib, pdfs = write_inputs(tmp_path)
+    routes = merged(standard_routes(), upload_routes())
+    routes[("GET", children_url("EXIST001"))] = ok([pdf_child("CHILDX01")])
+    routes[("GET", file_url("CHILDX01"))] = ok("server error", status=500)
+    fake = FakeWeb(routes)
+    result = attach(bib, pdfs, fake)
+    assert result["status"] == "zotero_error"
+    assert fake.posts() == []
+
+
+def test_file_redirect_never_carries_the_zotero_key_to_the_storage_host():
+    import urllib.request
+
+    request = urllib.request.Request(
+        file_url("ORPHAN01"), headers={"Zotero-API-Version": "3", "Zotero-API-Key": KEY, "Accept": "*/*"},
+    )
+    redirected = zf._StripKeyOnRedirect().redirect_request(
+        request, None, 302, "Found", {}, "https://storage.example.test/files/abc",
+    )
+    assert redirected is not None
+    assert redirected.full_url == "https://storage.example.test/files/abc"
+    assert all(name.lower() != "zotero-api-key" for name in redirected.headers)
+    assert KEY not in repr(redirected.headers)
+    assert redirected.headers.get("Accept") == "*/*"
+    assert any(isinstance(handler, zf._StripKeyOnRedirect) for handler in zf._OPENER.handlers)
 
 
 # ---------------------------------------------------------------------------
