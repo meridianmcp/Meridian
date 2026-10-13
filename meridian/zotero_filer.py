@@ -18,6 +18,10 @@ Safety rules enforced here:
   not a dry run.
 * Items already in the collection (matched by DOI or lowercase title) are
   skipped.
+* PDFs are attached only on the desktop backend, only when --pdf-dir is given,
+  and only to items this run filed and verified. Zotero must approve the app
+  once in its own dialog. The approval key stays in memory and travels only in
+  request headers.
 """
 
 from __future__ import annotations
@@ -48,10 +52,22 @@ _COLLECTION_KEY_RE = re.compile(r"[A-Za-z0-9]{8}")
 _DOI_PREFIX_RE = re.compile(r"^(?:https?://)?(?:dx\.)?doi\.org/", re.IGNORECASE)
 _ARXIV_ID_RE = re.compile(r"[A-Za-z0-9./_-]{1,64}")
 _NON_TOP_LEVEL_TYPES = frozenset({"attachment", "note", "annotation"})
+_ATTACH_APP_NAME = "Meridian Zotero filer"
+_AUTHORIZE_URL = "http://127.0.0.1:23119/api/local/authorize"
+_AUTHORIZE_TIMEOUT_S = 120.0  # a person must answer Zotero's approval dialog, so this waits longer
+_ATTACH_BATCH_SIZE = 25
+_ITEM_KEY_RE = re.compile(r"[A-Za-z0-9]{8}")
+_PDF_MAGIC = b"%PDF-"
+_PDF_CONTENT_TYPE = "application/pdf"
+_MAX_PAGES = 500
 
 # A transport performs one HTTP request and returns (status, body_text).
 # Signature: transport(method, url, body_bytes_or_None, headers_dict).
 Transport = Callable[[str, str, bytes | None, dict[str, str]], tuple[int, str]]
+
+# A header-aware transport also returns the response headers as a dict.
+# Signature: transport(method, url, body, headers, timeout=...) -> (status, text, headers).
+HeaderTransport = Callable[..., tuple[int, str, dict[str, str]]]
 
 _ENTRY_START_RE = re.compile(r"@([A-Za-z]+)\s*([{(])")
 _FIELD_START_RE = re.compile(r"[\s,]*([A-Za-z][A-Za-z0-9_.:\-]*)\s*=\s*")
@@ -85,9 +101,28 @@ def _urllib_transport(method, url, body, headers):
         return exc.code, exc.read().decode("utf-8", "replace")
 
 
+def _urllib_transport_with_headers(method, url, body, headers, timeout=_TIMEOUT_S):
+    """Like _urllib_transport, but also returns the response headers as a dict.
+
+    HTTP error statuses are returned, not raised. Connection errors propagate as OSError.
+    """
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8", "replace"), dict(response.headers.items())
+    except urllib.error.HTTPError as exc:
+        response_headers = dict(exc.headers.items()) if exc.headers is not None else {}
+        return exc.code, exc.read().decode("utf-8", "replace"), response_headers
+
+
 def _resolve(transport):
     """Return the injected transport, or the real one when none was given."""
     return _urllib_transport if transport is None else transport
+
+
+def _resolve_header(transport):
+    """Return the injected header-aware transport, or the real one when none was given."""
+    return _urllib_transport_with_headers if transport is None else transport
 
 
 def _send(transport, method, url, payload=None):
@@ -570,6 +605,8 @@ def file_bib_files(
     transport: Transport | None = None,
     dry_run: bool = False,
     log: Callable[[str], Any] = print,
+    pdf_dir: str | os.PathLike | None = None,
+    header_transport: HeaderTransport | None = None,
 ) -> dict[str, Any]:
     """File every entry in the given .bib files into one named Zotero collection.
 
@@ -583,17 +620,22 @@ def file_bib_files(
     e. Re-check the selection right before saving.
     f. Save in batches of 25. Re-check the selection after each batch.
     g. Count how many of the sent items now appear in the collection.
+    h. When pdf_dir is set and every sent item verified, attach <citekey>.pdf
+       from pdf_dir to each item (see attach_pdfs). A dry run only plans this.
 
     Returns {"status", "collection", "sent", "added", "skipped_duplicates"}.
     status is one of: ok, dry_run, no_collection, input_error, zotero_error,
     selection_failed, selection_changed, save_failed, verify_mismatch.
     On a dry run, "sent" is the number of items that would be filed.
+    When pdf_dir is set and the attach step or the dry-run plan ran, the result
+    also has an "attachments" dict. With pdf_dir unset the result has no such key.
     """
     transport = _resolve(transport)
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
     existing: set[str] = set()
     sent_items: list[dict[str, Any]] = []
+    filed: list[tuple[dict[str, str], dict[str, Any]]] = []  # (bib entry, item), aligned with items
     skipped = 0
     try:
         # a. The collection must exist, matched by exact name.
@@ -626,13 +668,17 @@ def file_bib_files(
                 continue
             seen |= keys
             items.append(item)
+            filed.append((entry, item))
         log(f"{len(items)} new item(s) for '{collection_name}'; {skipped} already present.")
 
         # c. Dry run stops here, before anything is written.
         if dry_run:
             for item in items:
                 log(f"  would file: {item['title'] or item.get('DOI', '')}")
-            return _result("dry_run", collection_name, sent=len(items), skipped=skipped)
+            dry = _result("dry_run", collection_name, sent=len(items), skipped=skipped)
+            if pdf_dir is not None:
+                dry["attachments"] = plan_pdf_attachments(filed, pdf_dir)
+            return dry
         if not items:
             log("Nothing new to file.")
             return _result("ok", collection_name, skipped=skipped)
@@ -674,10 +720,290 @@ def file_bib_files(
         added = sum(1 for item in sent_items if _item_keys(item) & new_keys)
         status = "ok" if added == len(sent_items) else "verify_mismatch"
         log(f"Filed {added} of {len(sent_items)} sent item(s) into '{collection_name}'.")
-        return _result(status, collection_name, sent=len(sent_items), added=added, skipped=skipped)
+        result = _result(status, collection_name, sent=len(sent_items), added=added, skipped=skipped)
+
+        # h. Attach PDFs only after a clean, fully verified run. Items are aligned with filed.
+        if pdf_dir is not None and status == "ok" and added > 0:
+            result["attachments"] = attach_pdfs(
+                filed[:len(sent_items)], key, pdf_dir,
+                transport=transport, header_transport=header_transport, log=log,
+            )
+        return result
     except _ERRORS as exc:
         log(f"Zotero error: {exc}")
         return _result("zotero_error", collection_name, sent=len(sent_items), skipped=skipped)
+
+
+# ---------------------------------------------------------------------------
+# PDF attachments (desktop backend only). A filed entry gets DIR/<citekey>.pdf
+# as a linked file under its item. Zotero 10 shows the person an approval
+# dialog the first time, through /api/local/authorize. That is one request per
+# run and it is never retried. The returned key lives only in memory, travels
+# only in request headers, and is never logged, printed or written to a file.
+# ---------------------------------------------------------------------------
+
+_AUTH_MESSAGES = {
+    "not_approved": "Zotero did not approve the PDF attach request. No PDFs were attached.",
+    "rate_limited": "Zotero rate-limited the PDF attach request. Nothing was retried; try again later.",
+    "auth_error": "The PDF attach request to Zotero failed before it was answered. No PDFs were attached.",
+}
+
+
+def _pdf_for_entry(entry, pdf_dir):
+    """Return DIR/<citekey>.pdf when that file exists and starts with %PDF-, else None.
+
+    A citekey that is not a plain file name (empty, a dot segment, or containing a
+    path separator or a colon) never resolves, so it cannot point outside DIR.
+    """
+    citekey = entry.get("citekey") or ""
+    if not citekey or citekey in (".", "..") or ":" in citekey or os.path.basename(citekey) != citekey:
+        return None
+    path = os.path.join(os.fspath(pdf_dir), citekey + ".pdf")
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(len(_PDF_MAGIC))
+    except OSError:
+        return None
+    return path if head == _PDF_MAGIC else None
+
+
+def plan_pdf_attachments(filed, pdf_dir) -> dict[str, Any]:
+    """Dry-run plan: which filed entries would get a PDF. Reads local files only."""
+    planned: list[str] = []
+    no_pdf: list[str] = []
+    for entry, _item in filed:
+        citekey = entry.get("citekey") or ""
+        (planned if _pdf_for_entry(entry, pdf_dir) else no_pdf).append(citekey)
+    return {"status": "dry_run", "planned": planned, "no_pdf": no_pdf}
+
+
+def _get_all_pages(transport, base_url):
+    """GET every page of a Local API list endpoint. base_url carries no limit or start."""
+    rows: list[Any] = []
+    start = 0
+    for _ in range(_MAX_PAGES):
+        url = f"{base_url}{'&' if '?' in base_url else '?'}limit={_PAGE_SIZE}"
+        if start:
+            url += f"&start={start}"
+        page = _get_json(transport, url)
+        if not isinstance(page, list):
+            raise ZoteroError("unexpected response while listing items")
+        rows.extend(page)
+        if len(page) < _PAGE_SIZE:
+            return rows
+        start += len(page)
+    raise ZoteroError("item listing did not end within the page limit")
+
+
+def _collection_item_index(collection_key, transport):
+    """Map each dedupe key (DOI or lowercase title) to the item key that carries it.
+
+    Attachments, notes and annotations are skipped, as in existing_keys.
+    """
+    _check_collection_key(collection_key)
+    index: dict[str, str] = {}
+    for obj in _get_all_pages(transport, f"{LOCAL_API}/collections/{collection_key}/items?format=json"):
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if not isinstance(data, dict) or data.get("itemType") in _NON_TOP_LEVEL_TYPES:
+            continue
+        ident = str((obj.get("key") or data.get("key") or ""))
+        if not _ITEM_KEY_RE.fullmatch(ident):
+            continue
+        for key in _keys_for(data.get("DOI"), data.get("title")):
+            index.setdefault(key, ident)
+    return index
+
+
+def _has_pdf_child(item_key, transport):
+    """True when the item already has a child whose contentType is application/pdf."""
+    for obj in _get_all_pages(transport, f"{LOCAL_API}/items/{item_key}/children?format=json"):
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if isinstance(data, dict) and str(data.get("contentType") or "").lower() == _PDF_CONTENT_TYPE:
+            return True
+    return False
+
+
+def _header_value(headers, name):
+    """Case-insensitive lookup in a response-header dict. None when absent."""
+    wanted = name.lower()
+    for key, value in (headers or {}).items():
+        if str(key).lower() == wanted:
+            return str(value)
+    return None
+
+
+def _probe_server_id(header_transport):
+    """One full GET to the local API. Returns its Zotero-Server-ID response header, or None."""
+    _status, _text, response_headers = header_transport(
+        "GET", f"{LOCAL_API}/collections?limit=1", None, {_ALLOWED_HEADER: "1"}, timeout=_TIMEOUT_S,
+    )
+    return _header_value(response_headers, "Zotero-Server-ID") or None
+
+
+def _request_authorization(header_transport, server_id):
+    """Make the single authorize request, which opens Zotero's approval dialog.
+
+    Returns (outcome, key, retry_after). outcome is approved, not_approved,
+    rate_limited or auth_error. key is set only when approved. A 429 is never retried.
+    """
+    body = json.dumps({"appName": _ATTACH_APP_NAME}).encode("utf-8")
+    headers = {_ALLOWED_HEADER: "1", "Zotero-Server-ID": server_id, "Content-Type": "application/json"}
+    try:
+        status, text, response_headers = header_transport(
+            "POST", _AUTHORIZE_URL, body, headers, timeout=_AUTHORIZE_TIMEOUT_S,
+        )
+    except _ERRORS:
+        return "auth_error", None, None
+    if status == 429:
+        return "rate_limited", None, _header_value(response_headers, "Retry-After")
+    if not 200 <= status < 300:
+        return "not_approved", None, None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return "not_approved", None, None
+    key = data.get("key") if isinstance(data, dict) else None
+    if isinstance(key, str) and key:
+        return "approved", key, None
+    return "not_approved", None, None
+
+
+def _attachment_body(parent_key, citekey, pdf_path):
+    """One Local API attachment object: a linked file under parent_key, with forward-slash paths."""
+    return {
+        "itemType": "attachment",
+        "linkMode": "linked_file",
+        "parentItem": parent_key,
+        "path": os.path.abspath(pdf_path).replace("\\", "/"),
+        "title": f"{citekey}.pdf",
+        "contentType": _PDF_CONTENT_TYPE,
+    }
+
+
+def _batch_outcomes(count, text):
+    """Return one bool per batch position: True only when Zotero lists it under success or successful.
+
+    A position listed under failed, a position not listed at all, or a body that
+    is not a JSON object all count as not attached.
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return [False] * count
+    ok: set[str] = set()
+    for bucket in ("success", "successful"):
+        part = data.get(bucket)
+        if isinstance(part, dict):
+            ok |= {str(position) for position in part}
+    bad: set[str] = set()
+    failed = data.get("failed")
+    if isinstance(failed, dict):
+        bad = {str(position) for position in failed}
+    return [str(position) in ok and str(position) not in bad for position in range(count)]
+
+
+def _write_attachments(pending, header_transport, summary, log):
+    """Authorize once, then write the linked-file attachments in batches. Updates summary in place."""
+    server_id = _probe_server_id(header_transport)
+    if server_id is None:
+        summary["status"] = "no_server_id"
+        log("Zotero did not report a server id, so it cannot approve the PDF attach. No PDFs were attached.")
+        return
+    outcome, key, retry_after = _request_authorization(header_transport, server_id)
+    if outcome != "approved":
+        summary["status"] = outcome
+        if retry_after is not None:
+            summary["retry_after"] = retry_after
+        log(_AUTH_MESSAGES[outcome])
+        return
+    for start in range(0, len(pending), _ATTACH_BATCH_SIZE):
+        batch = pending[start:start + _ATTACH_BATCH_SIZE]
+        body = json.dumps(
+            [_attachment_body(parent, citekey, path) for citekey, path, parent in batch]
+        ).encode("utf-8")
+        headers = {
+            _ALLOWED_HEADER: "1",
+            "Zotero-Server-ID": server_id,
+            "Zotero-API-Key": key,
+            "Content-Type": "application/json",
+        }
+        status, text, response_headers = header_transport(
+            "POST", f"{LOCAL_API}/items", body, headers, timeout=_TIMEOUT_S,
+        )
+        if status == 429:
+            summary["status"] = "rate_limited"
+            summary["retry_after"] = _header_value(response_headers, "Retry-After")
+            log("Zotero rate-limited the PDF attach write. Stopped; nothing was retried.")
+            return
+        if not 200 <= status < 300:
+            summary["status"] = "attach_failed"
+            log(f"Zotero refused a PDF attach batch with HTTP {status}. Stopped.")
+            return
+        for (citekey, _path, _parent), attached in zip(batch, _batch_outcomes(len(batch), text)):
+            if attached:
+                summary["attached"].append(citekey)
+                log(f"Attached PDF for '{citekey}'.")
+            else:
+                summary["failed"].append(citekey)
+                log(f"Zotero did not attach the PDF for '{citekey}'.")
+
+
+def attach_pdfs(filed, collection_key, pdf_dir, transport=None, header_transport=None, log=print) -> dict[str, Any]:
+    """Attach each filed entry's local PDF to its item and return a per-item summary.
+
+    filed is a list of (bib entry, connector item) pairs for items this run filed
+    and verified. For each entry the step finds its PDF, finds the item key,
+    skips items that already have a PDF child, makes one authorize request if
+    anything is left, and writes the attachments in batches.
+
+    Returns {"status", "attached", "already_has_pdf", "no_pdf", "failed"} with
+    lists of citekeys. status is ok, not_approved, rate_limited, auth_error,
+    no_server_id, zotero_error or attach_failed. Any refusal stops the step
+    at once. Every filed entry that was not attached is listed under failed.
+    """
+    transport = _resolve(transport)
+    header_transport = _resolve_header(header_transport)
+    summary: dict[str, Any] = {
+        "status": "ok", "attached": [], "already_has_pdf": [], "no_pdf": [], "failed": [],
+    }
+    candidates: list[tuple[str, str, dict[str, Any]]] = []
+    for entry, item in filed:
+        citekey = entry.get("citekey") or ""
+        path = _pdf_for_entry(entry, pdf_dir)
+        if path is None:
+            summary["no_pdf"].append(citekey)
+            log(f"Skipped PDF for '{citekey}': no usable {citekey}.pdf in the PDF folder.")
+        else:
+            candidates.append((citekey, path, item))
+
+    pending: list[tuple[str, str, str]] = []
+    try:
+        if candidates:
+            index = _collection_item_index(collection_key, transport)
+            for citekey, path, item in candidates:
+                parent = next((index[key] for key in sorted(_item_keys(item)) if key in index), None)
+                if parent is None:
+                    summary["failed"].append(citekey)
+                    log(f"Could not find '{citekey}' in the collection, so its PDF was not attached.")
+                elif _has_pdf_child(parent, transport):
+                    summary["already_has_pdf"].append(citekey)
+                    log(f"Skipped PDF for '{citekey}': the item already has a PDF.")
+                else:
+                    pending.append((citekey, path, parent))
+            if pending:
+                _write_attachments(pending, header_transport, summary, log)
+    except _ERRORS as exc:
+        log(f"Zotero error during the PDF attach: {exc}")
+        summary["status"] = "zotero_error"
+
+    # Anything that was not classified above, or was not attached, counts as failed.
+    settled = set(summary["attached"]) | set(summary["already_has_pdf"]) | set(summary["no_pdf"]) | set(summary["failed"])
+    summary["failed"] += [citekey for citekey, _path, _item in candidates if citekey not in settled]
+    if summary["status"] == "ok" and summary["failed"]:
+        summary["status"] = "attach_failed"
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +1273,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "desktop: local connector only; web: Zotero Web API only"
         ),
     )
+    file_parser.add_argument(
+        "--pdf-dir",
+        default=None,
+        help=(
+            "folder holding <citekey>.pdf files to attach to newly filed items (desktop backend only). "
+            "The first real attach asks Zotero to approve Meridian once, in a dialog you must answer."
+        ),
+    )
 
     subparsers.add_parser("collections", help="list Zotero collections (read-only)")
     return parser
@@ -1025,8 +1359,14 @@ def main(argv: list[str] | None = None) -> int:
         result = file_bib_files_web(
             args.bib, args.collection, creds[0], creds[1], dry_run=args.dry_run, log=_stderr
         )
+        if args.pdf_dir is not None:
+            result["attachments"] = {"status": "not_run", "reason": "PDF attach needs the desktop backend"}
     else:
-        result = file_bib_files(args.bib, args.collection, dry_run=args.dry_run, log=_stderr)
+        result = file_bib_files(
+            args.bib, args.collection, dry_run=args.dry_run, log=_stderr, pdf_dir=args.pdf_dir
+        )
+        if args.pdf_dir is not None and "attachments" not in result:
+            result["attachments"] = {"status": "not_run", "reason": f"filing status is {result['status']}"}
     print(json.dumps(result, indent=2))
     return 0 if result["status"] in ("ok", "dry_run") else 2
 
