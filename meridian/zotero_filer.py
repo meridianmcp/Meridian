@@ -24,11 +24,14 @@ Safety rules enforced here:
   request headers.
 * --attach-existing attaches PDFs only to items already in the collection. It
   files nothing, needs --pdf-dir, and uses the same single approval.
+* --attach-existing with --backend web attaches through the Zotero Web API with
+  the key from the environment. It never calls the local API or the approval step.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -36,6 +39,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Callable
@@ -1371,6 +1375,430 @@ def file_bib_files_web(
         return _result("zotero_error", collection_name, skipped=skipped)
 
 
+# ---------------------------------------------------------------------------
+# Web API attach path (--attach-existing --backend web). PDFs are uploaded with
+# the user's own API key from the environment. This path never calls the local
+# API and never calls the desktop approval step. The key is sent only in the
+# Zotero-API-Key header, and the storage upload gets no Zotero headers at all.
+# ---------------------------------------------------------------------------
+
+_WEB_KEY_ENV_NAMES = ("ZOTERO_SECOND_API_KEY", "ZOTERO_API_KEY")
+_WEB_RETRY_STATUSES = frozenset({429, 503})
+_WEB_RETRY_CAP_S = 120.0  # a longer Retry-After stops the run rather than blocking it
+_WEB_UPLOAD_TIMEOUT_S = 120.0
+_WEB_FORM_TYPE = "application/x-www-form-urlencoded"
+
+
+class _WebStop(ZoteroError):
+    """Ends a Web attach run early. status says why. The message never includes the key."""
+
+    def __init__(self, status, message, retry_after=None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+        self.step = "not_run"
+
+
+def web_attach_credentials(env=None) -> tuple[str, str, str] | None:
+    """Return (user_id, api_key, variable name) for the Web attach path, or None.
+
+    The key comes from ZOTERO_SECOND_API_KEY when that is set, otherwise from
+    ZOTERO_API_KEY. Only the variable name is returned, never the value.
+    """
+    source = os.environ if env is None else env
+    user_id = (source.get("ZOTERO_USER_ID") or "").strip()
+    if not user_id.isdigit():
+        return None
+    for name in _WEB_KEY_ENV_NAMES:
+        value = (source.get(name) or "").strip()
+        if value:
+            return user_id, value, name
+    return None
+
+
+def _retry_seconds(value):
+    """Seconds to wait for a Retry-After value. None when it is missing, not a number, or over the cap."""
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= seconds <= _WEB_RETRY_CAP_S:
+        return None
+    return seconds
+
+
+def _json_or_none(text):
+    """Decode a JSON body, or None when it is not JSON."""
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ok(status):
+    """True for a 2xx status."""
+    return 200 <= status < 300
+
+
+def _created_key(data):
+    """The key of the object a Web API write created at position "0", or None.
+
+    Accepts both response shapes. success maps the position to the key. successful
+    maps the position to the object.
+    """
+    if not isinstance(data, dict):
+        return None
+    key = None
+    success = data.get("success")
+    if isinstance(success, dict):
+        key = success.get("0")
+    if key is None and isinstance(data.get("successful"), dict):
+        entry = data["successful"].get("0")
+        if isinstance(entry, dict):
+            inner = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+            key = entry.get("key") or inner.get("key")
+    return key if isinstance(key, str) and _ITEM_KEY_RE.fullmatch(key) else None
+
+
+class _WebRun:
+    """Web API calls for one attach run.
+
+    The key is held in memory and sent only in the Zotero-API-Key header. Calls to
+    Zotero also send Zotero-API-Version: 3. The storage upload goes to a storage
+    host, so it gets no Zotero headers at all.
+    """
+
+    def __init__(self, user_id, api_key, transport, sleep):
+        self.user_id = user_id
+        self._api_key = api_key
+        self._transport = _resolve_header(transport)
+        self._sleep = sleep
+
+    def call(self, method, url, body=None, headers=None, zotero=True, timeout=_TIMEOUT_S):
+        """One request. A 429 or 503 is retried once, after its Retry-After wait. Returns (status, text, headers)."""
+        sent = dict(headers or {})
+        if zotero:
+            sent["Zotero-API-Version"] = "3"
+            sent["Zotero-API-Key"] = self._api_key
+        status, text, response_headers = self._transport(method, url, body, sent, timeout=timeout)
+        if status not in _WEB_RETRY_STATUSES:
+            return status, text, response_headers
+        retry_after = _header_value(response_headers, "Retry-After")
+        wait = _retry_seconds(retry_after)
+        if wait is None:
+            raise _WebStop(
+                "rate_limited",
+                f"Zotero answered HTTP {status} and asked for a wait this run will not make. Stopped.",
+                retry_after,
+            )
+        self._sleep(wait)
+        status, text, response_headers = self._transport(method, url, body, sent, timeout=timeout)
+        if status in _WEB_RETRY_STATUSES:
+            retry_after = _header_value(response_headers, "Retry-After")
+            raise _WebStop(
+                "rate_limited",
+                f"Zotero answered HTTP {status} again after one retry. Stopped.",
+                retry_after,
+            )
+        return status, text, response_headers
+
+    def get_json(self, url, what):
+        """GET a Web API URL and return its decoded JSON body."""
+        status, text, _headers = self.call("GET", url)
+        if not _ok(status):
+            _web_raise(status, what)
+        return _decode_json(status, text, what)
+
+    def objects(self, base_url, what):
+        """Yield every object from every page of a list endpoint. base_url carries no query string."""
+        start = 0
+        for _ in range(_MAX_PAGES):
+            page = self.get_json(f"{base_url}?format=json&limit={_PAGE_SIZE}&start={start}", what)
+            if not isinstance(page, list):
+                raise ZoteroError(f"unexpected response while {what}")
+            yield from page
+            if len(page) < _PAGE_SIZE:
+                return
+            start += len(page)
+        raise ZoteroError(f"{what} did not end within the page limit")
+
+    def verify_key(self):
+        """Check that the key belongs to ZOTERO_USER_ID and may write to the library and its files."""
+        status, text, _headers = self.call("GET", f"{WEB_API}/keys/current")
+        if not _ok(status):
+            raise _WebStop("key_refused", f"Zotero refused the API key (HTTP {status}). Nothing was attached.")
+        data = _json_or_none(text)
+        if not isinstance(data, dict) or str(data.get("userID")) != self.user_id:
+            raise _WebStop(
+                "key_user_mismatch",
+                "The API key belongs to a different Zotero user than ZOTERO_USER_ID. Nothing was attached.",
+            )
+        access = data.get("access") if isinstance(data.get("access"), dict) else {}
+        user = access.get("user") if isinstance(access.get("user"), dict) else {}
+        if user.get("write") is not True or user.get("files") is not True:
+            raise _WebStop(
+                "key_insufficient",
+                "The API key needs library write and file access. Nothing was attached.",
+            )
+
+
+def _web_collection_key(run, name):
+    """Key of the one collection named exactly name, or None. Two collections with that name stop the run."""
+    keys = []
+    for obj in run.objects(f"{WEB_API}/users/{run.user_id}/collections", "listing collections"):
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if isinstance(data, dict) and data.get("name") == name and isinstance(data.get("key"), str):
+            keys.append(_check_collection_key(data["key"]))
+    if len(keys) > 1:
+        raise _WebStop(
+            "ambiguous_collection",
+            f"More than one Zotero collection is named '{name}'. Nothing was attached.",
+        )
+    return keys[0] if keys else None
+
+
+def _web_top_item_records(run, collection_key):
+    """(item key, normalised DOI, normalised title) for each top-level item in the collection."""
+    base = f"{WEB_API}/users/{run.user_id}/collections/{_check_collection_key(collection_key)}/items/top"
+    records = []
+    for obj in run.objects(base, "listing collection items"):
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if not isinstance(data, dict) or data.get("itemType") in _NON_TOP_LEVEL_TYPES:
+            continue
+        ident = str(obj.get("key") or data.get("key") or "")
+        if not _ITEM_KEY_RE.fullmatch(ident):
+            continue
+        records.append((ident, _norm_doi(data.get("DOI")), _norm_title(data.get("title"))))
+    return records
+
+
+def _web_has_pdf_child(run, item_key):
+    """True when the item already has a child whose contentType is application/pdf."""
+    url = f"{WEB_API}/users/{run.user_id}/items/{item_key}/children"
+    for obj in run.objects(url, "listing item children"):
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if isinstance(data, dict) and str(data.get("contentType") or "").lower() == _PDF_CONTENT_TYPE:
+            return True
+    return False
+
+
+def _web_attach_entry(run, citekey, path, parent_key):
+    """Steps 5a to 5d for one PDF. Returns (attached, failed_step, stop_run).
+
+    failed_step names the step that failed. stop_run is True after a connection
+    error, so the caller stops the run. A rate limit raises _WebStop, with its
+    step set to the step that was running.
+    """
+    try:
+        mtime_ms = int(os.stat(path).st_mtime * 1000)
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return False, "read_pdf", False
+    filename = f"{citekey}.pdf"
+    md5 = hashlib.md5(data).hexdigest()
+    base = f"{WEB_API}/users/{run.user_id}"
+    step = "create_item"
+    try:
+        item = {
+            "itemType": "attachment", "parentItem": parent_key, "linkMode": "imported_file",
+            "title": filename, "filename": filename, "contentType": _PDF_CONTENT_TYPE,
+            "md5": md5, "mtime": mtime_ms, "tags": [], "relations": {},
+        }
+        status, text, _headers = run.call(
+            "POST", f"{base}/items", json.dumps([item]).encode("utf-8"), {"Content-Type": "application/json"},
+        )
+        att_key = _created_key(_json_or_none(text)) if _ok(status) else None
+        if att_key is None:
+            return False, step, False
+
+        step = "authorize"
+        file_url = f"{base}/items/{att_key}/file"
+        form = urllib.parse.urlencode({"md5": md5, "filename": filename, "filesize": len(data), "mtime": mtime_ms})
+        status, text, _headers = run.call(
+            "POST", file_url, form.encode("ascii"), {"If-None-Match": "*", "Content-Type": _WEB_FORM_TYPE},
+        )
+        auth = _json_or_none(text) if _ok(status) else None
+        if not isinstance(auth, dict):
+            return False, step, False
+        if auth.get("exists") == 1:
+            return True, None, False  # Zotero already stores these bytes, so there is nothing to upload
+        upload_url = auth.get("url")
+        prefix, suffix = auth.get("prefix"), auth.get("suffix")
+        upload_key, content_type = auth.get("uploadKey"), auth.get("contentType")
+        if not (
+            isinstance(upload_url, str) and upload_url.startswith("https://")
+            and isinstance(prefix, str) and isinstance(suffix, str)
+            and isinstance(upload_key, str) and upload_key
+            and isinstance(content_type, str) and content_type
+        ):
+            return False, step, False
+
+        step = "upload"
+        payload = prefix.encode("utf-8") + data + suffix.encode("utf-8")
+        status, _text, _headers = run.call(
+            "POST", upload_url, payload, {"Content-Type": content_type},
+            zotero=False, timeout=_WEB_UPLOAD_TIMEOUT_S,
+        )
+        if not _ok(status):
+            return False, step, False
+
+        step = "register"
+        status, _text, _headers = run.call(
+            "POST", file_url, urllib.parse.urlencode({"upload": upload_key}).encode("ascii"),
+            {"If-None-Match": "*", "Content-Type": _WEB_FORM_TYPE},
+        )
+        if status != 204:
+            return False, step, False
+        return True, None, False
+    except _WebStop as exc:
+        exc.step = step
+        raise
+    except (OSError, http.client.HTTPException):
+        return False, step, True
+
+
+def attach_existing_web(
+    paths,
+    collection_name: str,
+    pdf_dir: str | os.PathLike,
+    user_id: str,
+    api_key: str,
+    transport: HeaderTransport | None = None,
+    dry_run: bool = False,
+    log: Callable[[str], Any] = print,
+    sleep: Callable[[float], Any] = time.sleep,
+) -> dict[str, Any]:
+    """Attach PDFs through the Zotero Web API to entries already in the collection.
+
+    Matching, the skip rules and the dry-run plan match attach_existing_files. The
+    local API and the desktop approval step are never used. The steps are: check
+    the key, find the collection by exact name, list its top-level items, match each
+    entry, skip entries that already have a PDF child, then for each planned PDF
+    create the attachment item, authorize the upload, upload the bytes, and register.
+    A dry run stops after planning.
+
+    Returns {"status", "collection", "mode", "attachments"}. The attachments dict
+    holds citekey lists: planned, attached, already_has_pdf, no_pdf, failed, unmatched
+    and duplicate_in_bib. failed_steps maps each failed citekey to the step that
+    failed. status is dry_run, ok, no_collection, ambiguous_collection, input_error,
+    key_refused, key_user_mismatch, key_insufficient, rate_limited, zotero_error or
+    attach_failed.
+    """
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    summary: dict[str, Any] = {
+        "status": "dry_run" if dry_run else "ok",
+        "planned": [], "attached": [], "already_has_pdf": [], "no_pdf": [],
+        "failed": [], "failed_steps": {}, "unmatched": [], "duplicate_in_bib": [],
+    }
+    candidates: list[tuple[str, str, str]] = []  # (citekey, pdf path, parent item key)
+    run = _WebRun(user_id, api_key, transport, sleep)
+
+    def finish(status: str) -> dict[str, Any]:
+        summary["status"] = status
+        return {"status": status, "collection": collection_name, "mode": "attach_existing_web", "attachments": summary}
+
+    try:
+        try:
+            entries = _load_bib_entries(paths)
+        except (OSError, ValueError) as exc:
+            log(f"Could not read the BibTeX input: {exc}")
+            return finish("input_error")
+        run.verify_key()
+        key = _web_collection_key(run, collection_name)
+        if key is None:
+            log(f"Create the collection '{collection_name}' in Zotero first.")
+            return finish("no_collection")
+        records = _web_top_item_records(run, key)
+        claimed: set[str] = set()  # one PDF per existing item per run
+        for entry in entries:
+            citekey = entry.get("citekey") or ""
+            item = bib_to_connector_item(entry)
+            parent = _match_existing_item(_norm_doi(item.get("DOI")), _norm_title(item.get("title")), records)
+            if parent is None:
+                summary["unmatched"].append(citekey)
+                continue
+            if parent in claimed:
+                summary["duplicate_in_bib"].append(citekey)
+                continue
+            path = _pdf_for_entry(entry, pdf_dir)
+            if path is None:
+                summary["no_pdf"].append(citekey)
+                log(f"Skipped PDF for '{citekey}': no usable {citekey}.pdf in the PDF folder.")
+            elif _web_has_pdf_child(run, parent):
+                summary["already_has_pdf"].append(citekey)
+                log(f"Skipped PDF for '{citekey}': the item already has a PDF.")
+            else:
+                claimed.add(parent)  # claimed only once the entry is planned
+                candidates.append((citekey, path, parent))
+                summary["planned"].append(citekey)
+        if summary["unmatched"]:
+            log(f"Not in '{collection_name}', so not touched: {', '.join(summary['unmatched'])}")
+
+        if dry_run:
+            for citekey in summary["planned"]:
+                log(f"Would attach PDF for '{citekey}' to its existing item.")
+            return finish("dry_run")
+        for citekey, path, parent in candidates:
+            try:
+                attached, failed_step, stop_run = _web_attach_entry(run, citekey, path, parent)
+            except _WebStop as exc:
+                summary["failed"].append(citekey)
+                summary["failed_steps"][citekey] = exc.step
+                raise
+            if attached:
+                summary["attached"].append(citekey)
+                log(f"Attached PDF for '{citekey}'.")
+            else:
+                summary["failed"].append(citekey)
+                summary["failed_steps"][citekey] = failed_step
+                log(f"Could not attach the PDF for '{citekey}': the {failed_step} step failed.")
+            if stop_run:
+                summary["status"] = "zotero_error"
+                log("A connection error ended the run. The remaining PDFs were not attempted.")
+                break
+    except _WebStop as exc:
+        log(str(exc))
+        summary["status"] = exc.status
+        if exc.retry_after is not None:
+            summary["retry_after"] = exc.retry_after
+    except _ERRORS as exc:
+        log(f"Zotero error during the PDF attach: {exc}")
+        summary["status"] = "zotero_error"
+
+    # Any planned entry that was not attached counts as failed. Entries the run never reached are not_run.
+    attached_set = set(summary["attached"])
+    for citekey, _path, _parent in candidates:
+        if citekey not in attached_set and citekey not in summary["failed"]:
+            summary["failed"].append(citekey)
+            summary["failed_steps"][citekey] = "not_run"
+    if summary["status"] == "ok" and summary["failed"]:
+        summary["status"] = "attach_failed"
+    return finish(summary["status"])
+
+
+def _run_attach_existing_web(args) -> int:
+    """CLI: --attach-existing with --backend web. Prints the JSON result. Exit 0 for ok or dry_run, else 2."""
+    creds = web_attach_credentials()
+    if creds is None:
+        print(json.dumps({
+            "status": "no_credentials",
+            "message": (
+                "Set ZOTERO_USER_ID (numeric) and an API key with library write and file access "
+                "(ZOTERO_SECOND_API_KEY, or ZOTERO_API_KEY) in the environment. Nothing was attached."
+            ),
+        }, indent=2))
+        return 2
+    user_id, api_key, key_name = creds
+    _stderr(f"Using the API key from {key_name}.")
+    result = attach_existing_web(
+        args.bib, args.collection, args.pdf_dir, user_id, api_key, dry_run=args.dry_run, log=_stderr,
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result["status"] in ("ok", "dry_run") else 2
+
+
 def _stderr(message: str) -> None:
     """Log to stderr so stdout carries only the JSON result."""
     print(message, file=sys.stderr)
@@ -1412,8 +1840,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "attach DIR/<citekey>.pdf to items ALREADY in the collection (matched by DOI or title) "
-            "instead of filing new items. Needs --pdf-dir and the desktop backend. Zotero asks "
-            "for approval once per run, and only when something is left to attach."
+            "instead of filing new items. Needs --pdf-dir. With --backend web it uses the Zotero "
+            "Web API and the key from the environment. Otherwise it needs the desktop backend, and "
+            "Zotero asks for approval once per run, only when something is left to attach."
         ),
     )
 
@@ -1473,6 +1902,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.attach_existing and args.pdf_dir is None:
         parser.error("--attach-existing requires --pdf-dir")
+    if args.attach_existing and args.backend == "web":
+        return _run_attach_existing_web(args)
     backend = args.backend
     if backend == "auto":
         backend = _pick_auto_backend(args.dry_run)

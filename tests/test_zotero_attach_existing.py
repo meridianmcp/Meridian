@@ -243,18 +243,24 @@ def test_attach_existing_without_pdf_dir_is_refused_before_any_call(bib_file, mo
     assert header.calls == []
 
 
-def test_attach_existing_on_the_web_backend_is_refused_before_any_web_call(bib_file, pdf_dir, monkeypatch, capsys):
+def test_attach_existing_on_the_web_backend_without_credentials_is_refused_before_any_call(
+    bib_file, pdf_dir, monkeypatch, capsys,
+):
+    for name in ("ZOTERO_USER_ID", "ZOTERO_API_KEY", "ZOTERO_SECOND_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
     def refuse(*args, **kwargs):
-        raise AssertionError("the Web API must not be used for attach-existing")
+        raise AssertionError("the Web API must not be used without credentials")
 
     monkeypatch.setattr(zf, "file_bib_files_web", refuse)
+    monkeypatch.setattr(zf, "attach_existing_web", refuse)
     code = zf.main([
         "file", "--collection", "Research", "--bib", bib_file, "--backend", "web",
         "--attach-existing", "--pdf-dir", str(pdf_dir),
     ])
     out = json.loads(capsys.readouterr().out)
     assert code == 2
-    assert out["status"] == "attach_existing_needs_desktop"
+    assert out["status"] == "no_credentials"
 
 
 # ---------------------------------------------------------------------------
