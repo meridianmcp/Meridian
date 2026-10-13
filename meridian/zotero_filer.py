@@ -1655,10 +1655,12 @@ def _web_attach_entry(run, citekey, path, parent_key, orphan_key=None):
     step = "create_item"
     try:
         if orphan_key is None:
+            # md5 and mtime belong only in the upload authorization form below. Sending
+            # them on create makes Zotero answer 412 "If-None-Match: * set but file exists".
             item = {
                 "itemType": "attachment", "parentItem": parent_key, "linkMode": "imported_file",
                 "title": filename, "filename": filename, "contentType": _PDF_CONTENT_TYPE,
-                "md5": md5, "mtime": mtime_ms, "tags": [], "relations": {},
+                "tags": [], "relations": {},
             }
             status, text, _headers = run.call(
                 "POST", f"{base}/items", json.dumps([item]).encode("utf-8"), {"Content-Type": "application/json"},

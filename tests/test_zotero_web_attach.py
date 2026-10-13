@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import urllib.parse
 
 import pytest
@@ -166,6 +167,11 @@ def write_inputs(tmp_path, bib_text=THREE_ENTRY_BIB, pdf_keys=("smith2020deep", 
     for citekey in pdf_keys:
         (pdfs / f"{citekey}.pdf").write_bytes(PDF_BYTES)
     return bib, pdfs
+
+
+def pdf_mtime_ms(pdfs, citekey):
+    """The mtime of a staged PDF in milliseconds, as the upload authorization form carries it."""
+    return int(os.stat(pdfs / f"{citekey}.pdf").st_mtime * 1000)
 
 
 def attach(bib, pdfs, transport, dry_run=False, messages=None, sleep=None):
@@ -462,14 +468,14 @@ def test_full_upload_flow_runs_in_order_with_prefix_and_suffix(tmp_path):
     assert create_body == [{
         "itemType": "attachment", "parentItem": "EXIST001", "linkMode": "imported_file",
         "title": "smith2020deep.pdf", "filename": "smith2020deep.pdf", "contentType": "application/pdf",
-        "md5": PDF_MD5, "mtime": create_body[0]["mtime"], "tags": [], "relations": {},
+        "tags": [], "relations": {},
     }]
-    assert isinstance(create_body[0]["mtime"], int)
+    assert "md5" not in create_body[0] and "mtime" not in create_body[0]
 
     authorize_form = urllib.parse.parse_qs(fake.posts(file_url("ATTKEY01"))[0]["body"].decode("ascii"))
     assert authorize_form == {
         "md5": [PDF_MD5], "filename": ["smith2020deep.pdf"],
-        "filesize": [str(len(PDF_BYTES))], "mtime": [str(create_body[0]["mtime"])],
+        "filesize": [str(len(PDF_BYTES))], "mtime": [str(pdf_mtime_ms(pdfs, "smith2020deep"))],
     }
 
     upload = fake.posts(UPLOAD_URL)[0]
@@ -513,8 +519,31 @@ def test_exists_response_skips_the_upload_for_that_entry(tmp_path):
     assert [c["body"] for c in fake.posts(file_url("ATTKEY01"))] == [
         urllib.parse.urlencode({"md5": PDF_MD5, "filename": "smith2020deep.pdf",
                                 "filesize": len(PDF_BYTES),
-                                "mtime": json.loads(fake.posts(WRITE_URL)[0]["body"])[0]["mtime"]}).encode("ascii"),
+                                "mtime": pdf_mtime_ms(pdfs, "smith2020deep")}).encode("ascii"),
     ]
+
+
+def test_create_body_has_no_md5_or_mtime_and_the_authorize_form_keeps_them(tmp_path):
+    bib, pdfs = write_inputs(tmp_path, pdf_keys=("smith2020deep",))
+    routes = standard_routes()
+    routes[("POST", WRITE_URL)] = created("ATTKEY01")
+    routes[("POST", file_url("ATTKEY01"))] = [authorize("UPKEY001"), ok("", status=204)]
+    routes[("POST", UPLOAD_URL)] = ok("", status=201)
+    fake = FakeWeb(routes)
+    result = attach(bib, pdfs, fake)
+    assert result["attachments"]["attached"] == ["smith2020deep"]
+
+    creates = json.loads(fake.posts(WRITE_URL)[0]["body"].decode("utf-8"))
+    assert len(creates) == 1
+    assert "md5" not in creates[0]
+    assert "mtime" not in creates[0]
+
+    authorize_form = urllib.parse.parse_qs(fake.posts(file_url("ATTKEY01"))[0]["body"].decode("ascii"))
+    assert set(authorize_form) == {"md5", "filename", "filesize", "mtime"}
+    assert authorize_form["md5"] == [PDF_MD5]
+    assert authorize_form["filename"] == ["smith2020deep.pdf"]
+    assert authorize_form["filesize"] == [str(len(PDF_BYTES))]
+    assert authorize_form["mtime"] == [str(pdf_mtime_ms(pdfs, "smith2020deep"))]
 
 
 def test_upload_url_that_is_not_https_is_never_sent_to(tmp_path):
