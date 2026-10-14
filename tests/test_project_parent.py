@@ -339,10 +339,12 @@ async def test_postgres_hierarchy_writes_wait_for_other_connection_lock():
             self.inner = inner
             self.lock_attempted = asyncio.Event()
 
-        async def execute(self, sql, params=()):
+        def execute(self, sql, params=()):
+            # Deliberately not ``async def``: callers write ``async with db.execute(...)``,
+            # which needs the awaitable proxy that PostgresConnection.execute returns.
             if sql.strip().upper() == "LOCK TABLE PROJECTS IN SHARE ROW EXCLUSIVE MODE":
                 self.lock_attempted.set()
-            return await self.inner.execute(sql, params)
+            return self.inner.execute(sql, params)
 
         def __getattr__(self, name):
             return getattr(self.inner, name)
