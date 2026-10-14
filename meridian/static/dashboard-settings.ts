@@ -184,6 +184,8 @@ function _applySettingsRoleVisibility(projectId: any, guest: any) {
   // Keep the team-members list visible (read-only), but drop the invite form.
   const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
   if (inviteForm) inviteForm.style.display = 'none';
+  const projectInviteForm = document.getElementById(`settings-project-invite-form-${projectId}`);
+  if (projectInviteForm) projectInviteForm.style.display = 'none';
   // Hide every Save button so nothing in the tab is editable.
   body.querySelectorAll('button').forEach(b => {
     if (/^save\b/i.test((b.textContent || '').trim())) b.style.display = 'none';
@@ -3873,6 +3875,53 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     </div>`;
   }
 
+  // Project-scoped member add (hosted mode). Lives in the Project tab so adding
+  // someone to this project does not depend on the Account tab's workspace invite.
+  // Posts the same /workspace/invite call with project_id pinned to this project.
+  if (isHostedMode()) {
+    const _projectRow: any = (window.state.projects || []).find((p: any) => p.id === projectId);
+    const _projectName = _projectRow?.name || projectId;
+    html += `<div style="margin-bottom:16px" id="project-invite-section-${projectId}">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Add member to this project</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Access is limited to <strong>${escapeHtml(String(_projectName))}</strong>. Whole-workspace invites are under Account.</div>
+      <div id="settings-project-invite-form-${projectId}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <input id="project-invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
+        <select id="project-invite-role-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
+          <option value="admin">admin</option>
+          <option value="member" selected>member</option>
+          <option value="viewer">viewer</option>
+        </select>
+        <button id="project-invite-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Add to project</button>
+      </div>
+      <div id="project-invite-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:5px;min-height:14px"></div>
+    </div>`;
+    setTimeout(() => {
+      const btn = document.getElementById(`project-invite-btn-${projectId}`) as HTMLButtonElement | null;
+      const emailEl = document.getElementById(`project-invite-email-${projectId}`) as HTMLInputElement | null;
+      const roleEl = document.getElementById(`project-invite-role-${projectId}`) as HTMLSelectElement | null;
+      const statusEl = document.getElementById(`project-invite-status-${projectId}`);
+      if (!btn) return;
+      btn.onclick = async () => {
+        const email = (emailEl?.value || '').trim();
+        const role = roleEl?.value || 'member';
+        if (!email) { if (statusEl) statusEl.textContent = 'Enter an email address.'; return; }
+        btn.disabled = true;
+        btn.textContent = 'Adding…';
+        try {
+          await api('/workspace/invite', { method: 'POST', body: JSON.stringify({ email, role, project_id: projectId }) });
+          if (emailEl) emailEl.value = '';
+          if (statusEl) { statusEl.textContent = `Invite sent to ${email} for this project.`; setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000); }
+          (window as any)._membersRefresh?.[projectId]?.();
+        } catch (e: any) {
+          if (statusEl) statusEl.textContent = `Error: ${escapeHtml(String(e))}`;
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Add to project';
+        }
+      };
+    });
+  }
+
   // Team members section (hosted mode only) — always visible for all plan tiers (ecdae392)
 
   if (isHostedMode()) {
@@ -3901,9 +3950,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         <select id="invite-scope-${projectId}" title="Scope to project (blank = full workspace access)" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
 
-          <option value="">all projects</option>
+          <option value="">whole workspace (all projects)</option>
 
-          ${(window.state.projects || []).map((p: any) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')}
+          ${(window.state.projects || []).map((p: any) => `<option value="${escapeHtml(p.id)}"${p.id === projectId ? ' selected' : ''}>${escapeHtml(p.name || p.id)}</option>`).join('')}
 
         </select>
 
@@ -4192,6 +4241,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
+      // Exposed so the Project-tab add form can refresh this list after an invite.
+      (window as any)._membersRefresh = (window as any)._membersRefresh || {};
+      (window as any)._membersRefresh[projectId] = () => renderMembers();
       async function renderMembers(): Promise<boolean> {
 
         if (!listEl) return false;
