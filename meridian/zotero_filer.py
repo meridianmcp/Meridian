@@ -34,7 +34,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable
 
-from meridian import zotero_launcher
+from meridian import zotero_connect, zotero_launcher
 
 CONNECTOR = "http://127.0.0.1:23119/connector"
 LOCAL_API = "http://127.0.0.1:23119/api/users/0"
@@ -264,19 +264,25 @@ def wait_for_selection(
         sleep(poll_s)
 
 
-def save_items(items: list[dict[str, Any]], transport: Transport | None = None) -> int | None:
-    """Save connector-format items into Zotero's current selection.
+def save_items(
+    items: list[dict[str, Any]],
+    transport: Transport | None = None,
+    store: Any = None,
+) -> dict[str, Any]:
+    """Save connector-format items into Zotero's current selection, with the stored approval.
 
-    Returns the HTTP status when Zotero accepts the batch (2xx). Returns None on
-    any HTTP error status or connection failure.
+    The write goes through :func:`zotero_connect.write_with_stored_approval`, which
+    uses the stored approval only and never opens Zotero's approval dialog. Returns
+    that result: ``{"status": "written", "http_status": N}`` on success,
+    ``{"status": "needs_connection", ...}`` when no approval is stored or Zotero
+    rejects it, and another status for any other failure.
     """
-    transport = _resolve(transport)
     payload = {"sessionID": uuid.uuid4().hex, "uri": SAVE_URI, "items": items}
-    try:
-        status, _ = _send(transport, "POST", CONNECTOR + "/saveItems", payload)
-    except _ERRORS:
-        return None
-    return status if 200 <= status < 300 else None
+    return zotero_connect.write_with_stored_approval(
+        {"method": "POST", "url": CONNECTOR + "/saveItems", "payload": payload},
+        transport=_resolve(transport),
+        store=store,
+    )
 
 
 def _clean(value: str, keep_braces: bool = False) -> str:
@@ -570,6 +576,7 @@ def file_bib_files(
     transport: Transport | None = None,
     dry_run: bool = False,
     log: Callable[[str], Any] = print,
+    store: Any = None,
 ) -> dict[str, Any]:
     """File every entry in the given .bib files into one named Zotero collection.
 
@@ -584,9 +591,13 @@ def file_bib_files(
     f. Save in batches of 25. Re-check the selection after each batch.
     g. Count how many of the sent items now appear in the collection.
 
+    A live run (not a dry run) needs a stored Zotero approval. It never asks for a
+    new one. With no approval stored, or when Zotero rejects the stored one, the run
+    logs one connect line and stops with needs_connection before any write.
+
     Returns {"status", "collection", "sent", "added", "skipped_duplicates"}.
     status is one of: ok, dry_run, no_collection, input_error, zotero_error,
-    selection_failed, selection_changed, save_failed, verify_mismatch.
+    needs_connection, selection_failed, selection_changed, save_failed, verify_mismatch.
     On a dry run, "sent" is the number of items that would be filed.
     """
     transport = _resolve(transport)
@@ -637,6 +648,11 @@ def file_bib_files(
             log("Nothing new to file.")
             return _result("ok", collection_name, skipped=skipped)
 
+        # c2. A live run needs a stored approval. It never opens Zotero's dialog.
+        if not zotero_connect.has_stored_approval(store):
+            log(zotero_connect.CONNECT_FIRST_LINE)
+            return _result("needs_connection", collection_name, skipped=skipped)
+
         # d. Select the collection in Zotero and wait until it shows as selected.
         if not open_collection_in_zotero(key):
             log(f"Could not open '{collection_name}' in Zotero automatically. Select it in the Zotero window.")
@@ -658,7 +674,11 @@ def file_bib_files(
                 return _result(
                     "selection_changed", collection_name, sent=len(sent_items), skipped=skipped
                 )
-            if save_items(batch, transport) is None:
+            saved = save_items(batch, transport, store)
+            if saved["status"] == "needs_connection":
+                log(zotero_connect.CONNECT_FIRST_LINE)
+                return _result("needs_connection", collection_name, sent=len(sent_items), skipped=skipped)
+            if saved["status"] != "written":
                 log(f"Zotero did not accept a batch after {len(sent_items)} item(s) were saved.")
                 return _result("save_failed", collection_name, sent=len(sent_items), skipped=skipped)
             sent_items.extend(batch)

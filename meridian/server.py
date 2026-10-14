@@ -985,6 +985,10 @@ app.include_router(_tunnel_router)
 app.include_router(_a2a_router)
 app.include_router(_settings_router)
 
+from .routes.zotero import router as _zotero_router  # noqa: E402 — Zotero connect (POST /zotero/connect)
+
+app.include_router(_zotero_router)
+
 # ---------------------------------------------------------------------------
 # Password gate middleware
 # ---------------------------------------------------------------------------

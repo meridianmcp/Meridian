@@ -11,6 +11,7 @@ import os
 
 import pytest
 
+from meridian import zotero_connect as zc
 from meridian import zotero_filer as zf
 
 COLLECTIONS = zf.LOCAL_API + "/collections"
@@ -93,6 +94,32 @@ def bib_file(tmp_path):
     path = tmp_path / "refs.bib"
     path.write_text(SAMPLE_BIB, encoding="utf-8")
     return str(path)
+
+
+class _MemoryApprovalStore:
+    """In-memory stand-in for the OS keyring, so live runs see a stored approval."""
+
+    def __init__(self, key):
+        self.key = key
+
+    def get(self):
+        return self.key
+
+    def set(self, key):
+        self.key = key
+
+    def delete(self):
+        had = self.key is not None
+        self.key = None
+        return had
+
+
+@pytest.fixture(autouse=True)
+def _stored_zotero_approval(monkeypatch):
+    """Every live run in this file starts with a stored approval. The key is a fake test value."""
+    store = _MemoryApprovalStore("fake-filer-test-approval")
+    monkeypatch.setattr(zc, "KeyringApprovalStore", lambda: store)
+    return store
 
 
 def _research_routes(items_payload=None, selected="Research"):
@@ -185,24 +212,24 @@ def test_open_collection_only_runs_on_windows_and_checks_the_key(monkeypatch):
 # Saving
 # ---------------------------------------------------------------------------
 
-def test_save_items_sends_fresh_session_and_returns_status():
+def test_save_items_sends_fresh_session_and_returns_written_status():
     fake = FakeTransport({("POST", SAVE): (201, {})})
     items = [{"itemType": "document", "title": "T"}]
-    assert zf.save_items(items, fake) == 201
+    assert zf.save_items(items, fake) == {"status": "written", "http_status": 201}
     payload = json.loads(fake.calls[0]["body"])
     assert payload["uri"] == "https://meridian.local/research"
     assert payload["items"] == items
     assert len(payload["sessionID"]) == 32
 
 
-def test_save_items_returns_none_on_http_error_and_connection_error():
+def test_save_items_reports_http_and_connection_errors_without_writing():
     fake = FakeTransport({("POST", SAVE): (500, {"error": "boom"})})
-    assert zf.save_items([{"title": "T"}], fake) is None
+    assert zf.save_items([{"title": "T"}], fake)["status"] == "error"
 
     def refuse(method, url, body, headers):
         raise ConnectionRefusedError("refused")
 
-    assert zf.save_items([{"title": "T"}], refuse) is None
+    assert zf.save_items([{"title": "T"}], refuse)["status"] == "unreachable"
 
 
 # ---------------------------------------------------------------------------
