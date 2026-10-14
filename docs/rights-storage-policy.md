@@ -19,8 +19,9 @@ every use mode.
 
 ## Use modes
 
-Each project has a use mode. The policy takes it as the `use_mode` argument of
-`decide_image_storage`.
+Each project has a use mode, stored on the project and defaulting to
+`standard_publication`. The policy takes it as the `use_mode` argument of
+`decide_image_storage`. The image gate reads the stored mode for the project.
 
 | Use mode | Default | Restricted items (LINK_ONLY, unknown, and derivatives of cc-by-nd) | Gate |
 |----------|---------|-----------------------------------------------------------------------|------|
@@ -142,15 +143,17 @@ project is declared commercialized.
 
 ## Future hook (not built)
 
-A commercialized project would route image-byte writes through
-`authorize_image_storage` before the write. Two gaps stand in the way today:
+A commercialized project routes image-byte writes through
+`authorize_image_storage` before the write. The gate reads the project's stored
+use mode itself, so a caller does not supply it. The stored mode is set through
+the project settings endpoint or the `set_project_use_mode` MCP tool, and every
+change is audited.
 
-1. `authorize_image_storage` has no `use_mode` argument. It always decides as
-   `standard_publication`, so it never refuses. Adding a `use_mode` argument,
-   passed to both `decide_image_storage` calls, is required. That is a change to
-   `meridian/rights_override.py`, which is out of scope for this change.
-2. The per-project use mode is not stored yet. The policy takes `use_mode` as an
-   argument. A caller must supply the project's mode.
+- The stored mode is strict. Only `standard_publication` counts as standard. A
+  blank or unknown stored value is treated as commercialized.
+- Over MCP, a commercialized project cannot be moved back to standard. The owner
+  makes that change in the dashboard.
+- A missing project is refused with `PROJECT_NOT_FOUND` before any write.
 
 The meridian-docs image-embed path runs in a separate extension process with no
 access to the Meridian database that holds the approvals. Wiring it means adding
