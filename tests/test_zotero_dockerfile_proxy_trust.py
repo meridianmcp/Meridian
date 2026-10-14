@@ -8,6 +8,8 @@ that list with a shell condition on ``FLY_APP_NAME``:
   behaviour is unchanged.
 * unset (self-hosted): loopback plus the private ranges where a same-host reverse
   proxy and the Docker gateway sit. A public peer is not trusted.
+* set and non-empty (self-hosted only): ``MERIDIAN_FORWARDED_ALLOW_IPS`` replaces
+  that default list. The Fly branch ignores it.
 
 These tests read the Dockerfile text, run the CMD's shell script under ``sh`` with
 a stub in place of uvicorn (no server starts), and hand the captured list to
@@ -58,7 +60,11 @@ def _run_cmd(env_extra: dict[str, str], tmp_path: Path) -> subprocess.CompletedP
     script = stub + _cmd_script().replace("exec uvicorn ", "uvicorn ", 1)
     script_path = tmp_path / "cmd.sh"
     script_path.write_text(script, encoding="utf-8", newline="\n")
-    env = {k: v for k, v in os.environ.items() if k not in ("FLY_APP_NAME", "MERIDIAN_DB_URL")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("FLY_APP_NAME", "MERIDIAN_DB_URL", "MERIDIAN_FORWARDED_ALLOW_IPS")
+    }
     env.update(env_extra)
     return subprocess.run(
         [sh, str(script_path)], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30,
@@ -166,3 +172,48 @@ def test_the_cmd_script_is_valid_posix_sh(tmp_path):
     script_path.write_text(_cmd_script(), encoding="utf-8", newline="\n")
     proc = subprocess.run([sh, "-n", str(script_path)], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
+
+
+# Operator override: MERIDIAN_FORWARDED_ALLOW_IPS replaces the self-hosted default list.
+
+_OVERRIDE_KEY = "MERIDIAN_FORWARDED_ALLOW_IPS"
+_PUBLIC_PROXY = "203.0.113.9"          # stands in for a reverse proxy on another public host
+_PUBLIC_PROXY_RANGE = "203.0.113.0/24"
+
+
+@pytest.mark.parametrize("value", [_PUBLIC_PROXY_RANGE, "203.0.113.9, 2001:db8::/32", "cmd.*"])
+def test_self_hosted_override_is_passed_through_verbatim(tmp_path, value):
+    # The script file is cmd.sh in tmp_path. An unquoted cmd.* would glob-expand to cmd.sh,
+    # and an unquoted value with a space would split into two words, so both prove the quoting.
+    argv = _argv({_OVERRIDE_KEY: value}, tmp_path)
+    assert _forwarded_allow_ips(argv) == value
+
+
+@pytest.mark.parametrize("env", [{}, {_OVERRIDE_KEY: ""}], ids=["unset", "empty"])
+def test_self_hosted_unset_or_empty_override_falls_back_to_the_default(tmp_path, env):
+    assert _forwarded_allow_ips(_argv(env, tmp_path)).split(",") == _SELF_HOSTED_TRUST
+
+
+def test_hosted_branch_ignores_the_override(tmp_path):
+    argv = _argv({**_HOSTED_ENV, _OVERRIDE_KEY: _PUBLIC_PROXY_RANGE}, tmp_path)
+    assert _forwarded_allow_ips(argv) == "*"
+
+
+@pytest.mark.parametrize("peer", ["127.0.0.1", "172.17.0.1"])
+def test_override_replaces_the_default_so_loopback_and_docker_gateway_are_no_longer_trusted(tmp_path, peer):
+    trusted = _forwarded_allow_ips(_argv({_OVERRIDE_KEY: _PUBLIC_PROXY}, tmp_path))
+    seen = _client_after_proxy(trusted, peer, _XFF + _PROTO)
+    assert seen["client"] == (peer, 5555)
+    assert seen["scheme"] == "http"
+
+
+@pytest.mark.parametrize(
+    ("override", "peer"),
+    [(_PUBLIC_PROXY, _PUBLIC_PROXY), (_PUBLIC_PROXY_RANGE, "203.0.113.200")],
+    ids=["address", "range"],
+)
+def test_override_honours_forwarding_from_the_named_proxy_address_or_range(tmp_path, override, peer):
+    trusted = _forwarded_allow_ips(_argv({_OVERRIDE_KEY: override}, tmp_path))
+    seen = _client_after_proxy(trusted, peer, _XFF + _PROTO)
+    assert seen["client"][0] == "198.51.100.7"
+    assert seen["scheme"] == "https"

@@ -217,6 +217,40 @@ meridian.yourdomain.com {
 
 Caddy handles TLS automatically.
 
+### Proxy on another host
+
+Meridian believes `X-Forwarded-For` and `X-Forwarded-Proto` only when they come
+from loopback (`127.0.0.1`, `::1`) or a private range (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`). The nginx and Caddy examples
+above reach Meridian from the same host or the Docker gateway, so they are
+covered.
+
+If your reverse proxy or load balancer runs on another host with a public
+address, its forwarded headers are ignored. Set `MERIDIAN_FORWARDED_ALLOW_IPS`
+to that proxy's address or range:
+
+```yaml
+services:
+  meridian:
+    environment:
+      - MERIDIAN_FORWARDED_ALLOW_IPS=203.0.113.10
+```
+
+The value replaces the default list rather than adding to it. If anything on
+loopback or the Docker gateway still needs forwarded headers, list those too.
+Leave the variable unset or empty to keep the default. Hosted deployments ignore
+it, and it does not change the Zotero connect route, which refuses forwarded
+requests either way.
+
+!!! warning "Residual risk"
+    Docker's default userland proxy can make traffic on a published port look
+    as if it came from a private gateway address such as `172.17.0.1`. That
+    address is in the default list, so a client that reaches the port directly
+    can send its own `X-Forwarded-For` and `X-Forwarded-Proto` and have them
+    believed. The `docker-compose.yml` in this repo publishes port 7878 on all
+    interfaces. Bind it to `127.0.0.1` in `ports`, or firewall it, so only your
+    proxy can reach it.
+
 ---
 
 ## Zotero connect
