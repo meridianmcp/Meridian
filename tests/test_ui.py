@@ -85,6 +85,47 @@ def test_invite_scope_dropdown_and_co_admin_badge(js):
     assert "95499c3e" in js
 
 
+def test_owner_member_policy_controls_show_defaults_overrides_and_effective_access(js):
+    """Owners can inspect and edit workspace defaults and scoped-member overrides."""
+    assert "Project-scoped member access" in js
+    assert "Workspace defaults" in js
+    assert "Member overrides" in js
+    assert "Inherit" in js
+    assert "Allow" in js
+    assert "Deny" in js
+    assert "Effective:" in js
+    assert "role clamps" in js
+    assert "Corrupt" in js
+    assert "default_policy_status" in js
+    assert "policy_status" in js
+    assert "reset: true" in js
+    assert "Reset workspace policy to built-in defaults" in js
+    assert "'/workspace/member-policy'" in js
+    assert "method: 'PATCH'" in js
+    assert "method: 'DELETE'" in js
+
+
+def test_member_policy_controls_are_present_in_the_served_dashboard_bundle():
+    """The production image serves the checked-in bundle, not this TS source."""
+    import hashlib
+    import json
+    from pathlib import Path
+
+    static = Path(__file__).resolve().parent.parent / "meridian" / "static"
+    raw = (static / "dashboard.bundle.js").read_bytes()
+    bundle = raw.decode("utf-8")
+    stale = "dashboard.bundle.js is stale: rebuild with node build.mjs"
+    for marker in (
+        "Project-scoped member access",
+        "Workspace defaults",
+        "Member overrides",
+        "Reload settings to confirm effective access.",
+    ):
+        assert marker in bundle, f"{stale} ({marker!r} missing)"
+    manifest = json.loads((static / "asset-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["bundle_hash"] == hashlib.sha256(raw).hexdigest()[:12], stale
+
+
 def test_tunnel_per_machine_picker_rendered(js):
     """8660d701 — the Tunnel Plugins section renders a per-machine picker and
     scopes the fetch/save to the selected hostname (?hostname=)."""
@@ -97,6 +138,33 @@ def test_tunnel_per_machine_picker_rendered(js):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_control_plane_proposals_and_artifacts_are_paginated_in_the_dashboard():
+    """243608f6 — the control-plane panels consume API offsets and expose page controls."""
+    settings_src = _static_text("dashboard-settings.ts")
+    assert "nextOffset," in settings_src and "prevOffset," in settings_src
+    assert "&limit=${proposalPageSize}&offset=${proposalOffset}" in settings_src
+    assert "/control-plane/artifacts?limit=${artifactPageSize}&offset=${artifactOffset}" in settings_src
+    assert "data.has_more === true" in settings_src
+    assert "paginationMarkup(page, items.length, 'proposals', total)" in settings_src
+    assert "paginationMarkup(page, items.length, 'artifacts', data.total)" in settings_src
+    assert 'data-cp-page="previous"' in settings_src
+    assert 'data-cp-page="next"' in settings_src
+    assert "proposalOffset = offset; void loadProposals();" in settings_src
+    assert "artifactOffset = offset; void loadArtifacts();" in settings_src
+
+
+def test_copy_preview_modal_keeps_long_content_inside_the_viewport():
+    """243608f6 — the copy preview dialog and textarea shrink and scroll within the viewport."""
+    dashboard_src = _static_text("dashboard.ts")
+    start = dashboard_src.index("function showCopyPreview(")
+    end = dashboard_src.index("function wireClaudeLaunchPanel(", start)
+    preview = dashboard_src[start:end]
+    assert "height:80vh" in preview and "max-height:calc(100vh - 24px)" in preview
+    assert "box-sizing:border-box" in preview
+    assert "flex:1 1 300px" in preview and "min-height:0" in preview
+    assert "max-height:calc(80vh - 120px)" in preview and "overflow:auto" in preview
 
 
 def test_dashboard_loads_200(client):

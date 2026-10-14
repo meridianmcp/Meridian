@@ -181,11 +181,18 @@ def test_add_sprint_item_persists_durable_symbol_pointer():
     assert sel["type"] == "symbol"
     assert sel["qualified_name"] == "create_project"
     assert stored[0]["targets"][0]["uri"] == "file:meridian/db/__init__.py"
+    # The same durable pointer that makes the response say "prospected" also
+    # satisfies the executable handoff gate.
+    pointer_ids = _run(db_module.get_pointer_evidence_item_ids(db, [out["id"]]))
+    goal = ho._build_quick_start_goal([out], pointer_evidence_ids=pointer_ids)
+    assert '<excluded_unprospected' not in goal
+    assert out["id"] in goal.split("<sprint_items>", 1)[1].split(
+        "</sprint_items>", 1
+    )[0]
 
 
 def test_add_sprint_item_file_only_persists_no_pointer_but_keeps_hint():
-    """BOUNDARY: a file-only item still gets the inline code_context hint, but no
-    durable pointer is fabricated (no exact symbol location tunnel-free)."""
+    """A file-only hint is not durable prospecting evidence."""
     db = _make_db()
     import meridian.db as db_module
     proj = _run(db_module.create_project(db, "prospect-file-only"))
@@ -195,7 +202,7 @@ def test_add_sprint_item_file_only_persists_no_pointer_but_keeps_hint():
         "touches_resources": ["file:meridian/server.py"],
         "force": True,
     }, db, "/tmp"))
-    assert out.get("prospecting_status") == "prospected"
+    assert out.get("prospecting_status") == "unprospected"
     assert "meridian/server.py" in out.get("code_context", {}).get("files", [])
     assert "prospected_pointer" not in out
     assert _run(db_module.get_sprint_item_pointers(db, out["id"])) == []

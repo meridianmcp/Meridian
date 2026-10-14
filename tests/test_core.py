@@ -11056,11 +11056,29 @@ def test_landing_page_charset_and_emoji_survival(client):
 
 def test_g519_roles_map_grants_expected_permissions():
     """G5.19 — ROLE_PERMS map: owner has everything; admin has invite/
-    settings/HITL but NOT billing/delete; member has read+write only;
-    viewer has read only."""
+    settings/HITL but NOT billing/delete/member-policy; member has read+write
+    only; viewer has read only."""
     from meridian import roles
     assert roles.has_perm("owner",  roles.PERM_DELETE_TENANT)
     assert roles.has_perm("owner",  roles.PERM_BILLING)
+    assert roles.has_perm("owner",  roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("admin",  roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("member", roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("viewer", roles.PERM_MANAGE_POLICY)
+    # Exact sets: a permission added to a role must be a deliberate edit here too.
+    assert roles.ROLE_PERMS == {
+        "owner": frozenset({
+            roles.PERM_READ, roles.PERM_WRITE, roles.PERM_HITL_ANSWER,
+            roles.PERM_INVITE, roles.PERM_SETTINGS, roles.PERM_BILLING,
+            roles.PERM_DELETE_TENANT, roles.PERM_MANAGE_POLICY,
+        }),
+        "admin": frozenset({
+            roles.PERM_READ, roles.PERM_WRITE, roles.PERM_HITL_ANSWER,
+            roles.PERM_INVITE, roles.PERM_SETTINGS,
+        }),
+        "member": frozenset({roles.PERM_READ, roles.PERM_WRITE}),
+        "viewer": frozenset({roles.PERM_READ}),
+    }
     assert roles.has_perm("admin",  roles.PERM_INVITE)
     assert roles.has_perm("admin",  roles.PERM_HITL_ANSWER)
     assert not roles.has_perm("admin",  roles.PERM_BILLING)

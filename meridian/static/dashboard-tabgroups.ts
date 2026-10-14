@@ -4,7 +4,7 @@
 //
 // The dashboard historically rendered ~18 FLAT top-level vtab buttons in one
 // vertical rail — too chaotic to scan. This module GROUPS those tabs into a few
-// logical groups (Overview / Planning / Work / Content / History), reusing the
+// logical groups (Overview / Planning / Work / Content / History / Settings), reusing the
 // SAME nested-subtab idea the Goal tab already uses for its data-gtab subtabs: a
 // small header per group, with the group's member tabs nested under it. It is
 // PURE IA — every original tab still renders (nothing dropped), every data-vtab
@@ -61,7 +61,8 @@ export interface VtabGroup {
 }
 
 /**
- * The canonical grouping. Every original flat tab appears in exactly one group.
+ * The canonical grouping. Every original flat tab appears in exactly one group
+ * (Settings is its own last group, not nested under History).
  * The FIRST group's FIRST tab (status) stays the default-active tab, matching
  * the previous rail order (status was the first flat button, marked active).
  *
@@ -77,7 +78,8 @@ export const VTAB_GROUPS: readonly VtabGroup[] = [
   // leave an active Experiments tab invisible in the rail (90952bad).
   { id: "work", label: "Work", tabs: ["queue", "experiments", "hitl", "team", "sessions"] },
   { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
-  { id: "history", label: "History", tabs: ["timeline", "rewind", "settings"] },
+  { id: "history", label: "History", tabs: ["timeline", "rewind"] },
+  { id: "settings", label: "Settings", tabs: ["settings"] },
 ] as const;
 
 /** The full, ordered list of grouped tab ids (union across all groups). */

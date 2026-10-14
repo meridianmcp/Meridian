@@ -793,6 +793,7 @@ def test_sse_project_scoped_member_is_limited_to_their_project(hosted, own_db_te
         r = c.post(f"/mcp/sse?session_id={sid}", json=_rpc_call(
             "add_note", {"project_id": victim_proj["id"], "title": "in-scope", "body": "x"}))
         assert "error" not in r.json(), r.text[:300]
+        assert "in-scope" in _note_titles(victim_conn, victim_proj["id"])
     assert "scope-escape" not in _note_titles(victim_conn, other["id"])
 
 

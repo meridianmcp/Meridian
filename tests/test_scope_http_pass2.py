@@ -36,6 +36,15 @@ def _make_project(client, prefix: str = "p2") -> str:
 
 
 def _scope_to(monkeypatch, project_ids):
+    if project_ids is not None:
+        from meridian.member_policy import CAPABILITY_IDS, EffectivePolicy, ScopedProjectIds
+        from meridian.roles import ROLE_MEMBER
+
+        project_ids = ScopedProjectIds(
+            project_ids,
+            policy=EffectivePolicy(caps=frozenset(CAPABILITY_IDS), role=ROLE_MEMBER),
+        )
+
     async def _fake(request):
         return project_ids
 

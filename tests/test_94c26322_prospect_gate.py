@@ -526,6 +526,9 @@ def test_e2e_transient_enrichment_pointer_without_durable_row_agrees_with_claim(
         # sprint_item_pointers row (that function never does).
         fetched = await db_module.get_sprint_item(db, iid)
         fetched["prospect_status"] = "prospected"
+        # 19aa84a7 — even a transient add_sprint_item response field cannot
+        # replace durable pointer evidence at the executable gate.
+        fetched["prospecting_status"] = "prospected"
         fetched["code_pointers"] = [{"file": "x.py"}]
 
         pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(db, [iid])
