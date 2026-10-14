@@ -7,11 +7,13 @@ that access, and it does so in its own dialog. This module owns that approval:
   starts it on purpose, with ``python -m meridian.zotero_connect connect`` or the
   ``POST /zotero/connect`` route. Nothing else calls it: not a background job, a
   filer run, a startup hook or a timer. It makes one request per call and keeps
-  at least :data:`CONNECT_MIN_INTERVAL_S` seconds between calls.
-* :func:`write_with_stored_approval` sends a write with the stored approval only.
-  It never calls :func:`connect`, so it never opens Zotero's dialog. When Zotero
-  rejects the key (401 or 403), the stored key is deleted and the caller gets
-  ``needs_connection``.
+  at least :data:`CONNECT_MIN_INTERVAL_S` seconds between calls, across threads
+  and processes.
+* :func:`write_with_stored_approval` is the only sender of the stored approval.
+  It never calls :func:`connect`, so it never opens Zotero's dialog. A 401 deletes
+  the stored key. A 403 is probed with one approval-free GET first: the key is
+  deleted only when that GET succeeds, because a 403 can also mean the local API
+  is switched off, and then the key is kept.
 * :func:`status` is read-only: one GET, never a POST.
 * :func:`disconnect` deletes the stored key. Only Zotero can revoke the approval
   itself, so the result says where to clear it.
@@ -19,7 +21,8 @@ that access, and it does so in its own dialog. This module owns that approval:
 The approval key lives in the OS keyring, under the same service name that
 :mod:`meridian.tunnel_config` uses for the Zotero API key, with its own account
 name. The key is sent only in the ``Authorization`` header, and only to loopback
-hosts. It never appears in a result, a log line or an error string.
+hosts. Every request that carries it refuses a redirect off loopback, checked
+on every hop. It never appears in a result, a log line or an error string.
 
 Standard library only. The keyring is loaded lazily through ``tunnel_config``.
 """
@@ -31,12 +34,14 @@ import logging
 import math
 import os
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from meridian import zotero_client
 from meridian.tunnel_config import (
@@ -67,8 +72,38 @@ _WRITE_TIMEOUT_S = 10.0
 # The authorize request is held open while the user answers Zotero's dialog.
 _CONNECT_TIMEOUT_S = 120.0
 
-_TRANSPORT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-_PROBE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_REDIRECT_HOSTS = frozenset({"127.0.0.1", "localhost"})
+
+
+class _RedirectRefused(Exception):
+    """A reply tried to redirect a request off this machine. The request stops there, with the approval unsent."""
+
+
+class _LoopbackRedirectGuard(urllib.request.HTTPRedirectHandler):
+    """Refuses any redirect whose target is not 127.0.0.1 or localhost.
+
+    urllib calls :meth:`redirect_request` once for every redirect hop, so every hop is
+    checked, not only the first. A refused hop raises before urllib builds the next
+    request, so no ``Authorization`` header is ever sent to the target.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
+        if host not in _REDIRECT_HOSTS:
+            try:
+                fp.close()
+            except Exception:  # noqa: BLE001 — closing the refused reply is best effort
+                pass
+            raise _RedirectRefused("Zotero tried to redirect the request off this machine; it was stopped.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_TRANSPORT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LoopbackRedirectGuard())
+_PROBE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LoopbackRedirectGuard())
+
+# Serializes the cooldown check and record inside this process. The file lock below covers other processes.
+_COOLDOWN_LOCK = threading.Lock()
+_LOCK_TIMEOUT_S = 5.0
 
 # The last connect() attempt in this process. The state file covers other processes.
 _IN_PROCESS_LAST_ATTEMPT: float | None = None
@@ -174,7 +209,7 @@ def _default_transport(timeout: float) -> Callable[[str, str, bytes | None, dict
     return send
 
 
-def _transport_failure(exc: BaseException) -> str:
+def transport_failure(exc: BaseException) -> str:
     """Name a transport failure. The exception text is dropped, so it can never carry a key into a result."""
     if isinstance(exc, TimeoutError) or (
         isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)
@@ -232,6 +267,99 @@ def _cooldown_left(now: float, path: Path) -> float:
     return max(0.0, min(CONNECT_MIN_INTERVAL_S, max(recorded) + CONNECT_MIN_INTERVAL_S - now))
 
 
+def _lock_path(record: Path) -> Path:
+    """The sidecar lock file for the record. The record is never locked itself: it is replaced with
+    os.replace, which Windows refuses while another handle has it open."""
+    return record.with_name(record.name + ".lock")
+
+
+def _lock_handle(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_handle(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _file_lock(path: Path, timeout: float) -> Iterator[bool]:
+    """Hold a cross-process lock on ``path``, creating the file if needed. Yields True once held.
+
+    Yields False when the lock is still busy after ``timeout`` seconds. Raises OSError when the
+    lock file cannot be opened at all.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    acquired = False
+    try:
+        if os.name == "nt":
+            # msvcrt locks a byte range, so the file must have a byte for the lock to cover.
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+        started = time.monotonic()
+        while True:
+            try:
+                handle.seek(0)
+                _lock_handle(handle)
+                acquired = True
+                break
+            except OSError:
+                if time.monotonic() - started >= timeout:
+                    break
+                time.sleep(0.05)
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                handle.seek(0)
+                _unlock_handle(handle)
+            except OSError:
+                pass  # closing the handle releases the lock regardless
+        handle.close()
+
+
+def _claim_attempt(now: float, path: Path) -> float:
+    """Check the cooldown and, when it is clear, record this attempt, as one atomic step.
+
+    Returns 0.0 when the attempt is recorded and may send, or the seconds left to wait. One
+    threading lock and one file lock cover the read, the check and the write, so two concurrent
+    calls cannot both pass. When the lock file cannot be opened at all, the in-process record
+    still applies, which is the same best-effort rule the state file follows.
+    """
+    global _IN_PROCESS_LAST_ATTEMPT
+    with _COOLDOWN_LOCK:
+        with ExitStack() as stack:
+            try:
+                held = stack.enter_context(_file_lock(_lock_path(path), _LOCK_TIMEOUT_S))
+            except OSError:
+                held = None
+            if held is False:
+                # Another process holds the check right now. Wait a full interval instead of racing it.
+                return CONNECT_MIN_INTERVAL_S
+            wait = _cooldown_left(now, path)
+            if wait > 0:
+                return wait
+            _IN_PROCESS_LAST_ATTEMPT = now
+            _write_last_attempt(path, now)
+            return 0.0
+
+
 # ---------------------------------------------------------------------------
 # connect(): the only POST to the authorize endpoint
 # ---------------------------------------------------------------------------
@@ -283,13 +411,12 @@ def connect(
     ``cooldown`` with ``retry_after_s`` and sends nothing. Every call that does send
     counts, including one that times out.
     """
-    global _IN_PROCESS_LAST_ATTEMPT
     url = _api_base(base_url) + _AUTHORIZE_PATH
     if not _require_loopback(url):
         return _result("error")
     now = (clock or time.time)()
     path = state_path if state_path is not None else _state_path()
-    wait = _cooldown_left(now, path)
+    wait = _claim_attempt(now, path)
     if wait > 0:
         retry_after = math.ceil(wait)
         return {
@@ -297,15 +424,13 @@ def connect(
             "retry_after_s": retry_after,
             "message": f"Wait {retry_after} seconds before asking Zotero again.",
         }
-    _IN_PROCESS_LAST_ATTEMPT = now
-    _write_last_attempt(path, now)
     send = transport if transport is not None else _default_transport(_CONNECT_TIMEOUT_S)
     body = json.dumps({"appName": APP_NAME}).encode("utf-8")
     headers = {"Content-Type": "application/json", "Zotero-Allowed-Request": "1"}
     try:
         code, text = send("POST", url, body, headers)
     except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
-        return _result(_transport_failure(exc))
+        return _result(transport_failure(exc))
     return _authorize_result(code, text, store)
 
 
@@ -363,6 +488,26 @@ def status(*, base_url: str | None = None, opener: Any = None, store: Any = None
 # write_with_stored_approval(): stored key only, never connect()
 # ---------------------------------------------------------------------------
 
+def _forget_approval(approval_store: Any) -> None:
+    try:
+        approval_store.delete()
+    except ZoteroCredentialStoreUnavailable:
+        _LOG.warning("Zotero rejected the stored approval, but it could not be removed from the OS credential store.")
+
+
+def _probe_local_api(send: Callable[[str, str, bytes | None, dict[str, str]], tuple[int, str]]) -> str:
+    """One GET to the local API with no approval. Returns ``reachable``, ``local_api_disabled``, or a failure status."""
+    try:
+        code, text = send("GET", _api_base(None) + _PROBE_PATH, None, {"Zotero-Allowed-Request": "1"})
+    except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
+        return transport_failure(exc)
+    if 200 <= code < 300:
+        return "reachable"
+    if code == 403 or "not enabled" in (text or "").lower():
+        return "local_api_disabled"
+    return "error"
+
+
 def write_with_stored_approval(
     request: Mapping[str, Any],
     *,
@@ -373,8 +518,12 @@ def write_with_stored_approval(
 
     ``request`` takes ``method``, ``url`` and an optional JSON-able ``payload``.
     With no stored approval nothing is sent and the result is ``needs_connection``.
-    When Zotero rejects the key (401 or 403), the stored key is deleted and the result
-    is ``needs_connection``. Any other failure keeps the stored key.
+    A 401 means Zotero rejected the key, so the stored key is deleted and the result is
+    ``needs_connection``. A 403 also means the local API may be switched off, so one
+    approval-free GET probes it first. The key is deleted only when that GET succeeds.
+    When the GET reports the local API off or cannot reach it, the result is
+    ``local_api_disabled`` (or the failure status) and the key is kept. Any other failure
+    also keeps the stored key.
     """
     approval_store = store if store is not None else KeyringApprovalStore()
     key = approval_store.get()
@@ -393,13 +542,18 @@ def write_with_stored_approval(
     try:
         code, _text = send(method, url, body, headers)
     except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
-        return _result(_transport_failure(exc))
-    if code in (401, 403):
-        try:
-            approval_store.delete()
-        except ZoteroCredentialStoreUnavailable:
-            _LOG.warning("Zotero rejected the stored approval, but it could not be removed from the OS credential store.")
+        return _result(transport_failure(exc))
+    if code == 401:
+        _forget_approval(approval_store)
         return _result("needs_connection")
+    if code == 403:
+        probe = _probe_local_api(send)
+        if probe == "reachable":
+            _forget_approval(approval_store)
+            return _result("needs_connection")
+        if probe == "local_api_disabled":
+            return _result("local_api_disabled", http_status=403)
+        return _result(probe, http_status=403)
     if 200 <= code < 300:
         return {"status": "written", "http_status": code}
     return _result("error", http_status=code)

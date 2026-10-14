@@ -267,22 +267,24 @@ def wait_for_selection(
 def save_items(
     items: list[dict[str, Any]],
     transport: Transport | None = None,
-    store: Any = None,
 ) -> dict[str, Any]:
-    """Save connector-format items into Zotero's current selection, with the stored approval.
+    """Save connector-format items into Zotero's current selection.
 
-    The write goes through :func:`zotero_connect.write_with_stored_approval`, which
-    uses the stored approval only and never opens Zotero's approval dialog. Returns
-    that result: ``{"status": "written", "http_status": N}`` on success,
-    ``{"status": "needs_connection", ...}`` when no approval is stored or Zotero
-    rejects it, and another status for any other failure.
+    The connector takes no approval. This request carries no approval header, and
+    it never reads or deletes the stored approval, whatever Zotero answers. Only the
+    local write path, :func:`zotero_connect.write_with_stored_approval`, uses the
+    stored approval. Returns ``{"status": "written", "http_status": N}`` on success,
+    ``{"status": "error", "http_status": N}`` for an HTTP error, and ``unreachable``,
+    ``timeout`` or ``error`` for a transport failure.
     """
     payload = {"sessionID": uuid.uuid4().hex, "uri": SAVE_URI, "items": items}
-    return zotero_connect.write_with_stored_approval(
-        {"method": "POST", "url": CONNECTOR + "/saveItems", "payload": payload},
-        transport=_resolve(transport),
-        store=store,
-    )
+    try:
+        status, _text = _send(_resolve(transport), "POST", CONNECTOR + "/saveItems", payload)
+    except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
+        return {"status": zotero_connect.transport_failure(exc)}
+    if 200 <= status < 300:
+        return {"status": "written", "http_status": status}
+    return {"status": "error", "http_status": status}
 
 
 def _clean(value: str, keep_braces: bool = False) -> str:
@@ -674,10 +676,7 @@ def file_bib_files(
                 return _result(
                     "selection_changed", collection_name, sent=len(sent_items), skipped=skipped
                 )
-            saved = save_items(batch, transport, store)
-            if saved["status"] == "needs_connection":
-                log(zotero_connect.CONNECT_FIRST_LINE)
-                return _result("needs_connection", collection_name, sent=len(sent_items), skipped=skipped)
+            saved = save_items(batch, transport)
             if saved["status"] != "written":
                 log(f"Zotero did not accept a batch after {len(sent_items)} item(s) were saved.")
                 return _result("save_failed", collection_name, sent=len(sent_items), skipped=skipped)

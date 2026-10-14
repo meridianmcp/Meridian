@@ -9,9 +9,10 @@ processes.
 
 Auth follows the rest of the dashboard. A hosted deployment requires a logged-in
 tenant, and the default-deny gate in ``hosted_route_gate`` also applies to this
-path. A self-hosted server has no tenant concept and is local-only by design.
-On the hosted tier ``connect`` runs on the server, which cannot reach a
-workstation's Zotero, so it reports ``unreachable``.
+path. A self-hosted server has no tenant concept, so it accepts only a loopback
+client (127.0.0.1 or ::1) and answers any other caller with 403 before
+``connect`` runs. On the hosted tier ``connect`` runs on the server, which cannot
+reach a workstation's Zotero, so it reports ``unreachable``.
 """
 from __future__ import annotations
 
@@ -23,6 +24,8 @@ from .. import zotero_connect
 from .._deps import _get_tenant_from_request, _hosted_mode
 
 router = APIRouter()
+
+_LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1"})
 
 _HTTP_STATUS_BY_RESULT = {
     "connected": 200,
@@ -40,8 +43,11 @@ _HTTP_STATUS_BY_RESULT = {
 @router.post("/zotero/connect")
 async def zotero_connect_route(request: Request) -> JSONResponse:
     """Run one Zotero approval attempt for a logged-in user who explicitly confirmed it."""
-    if _hosted_mode() and await _get_tenant_from_request(request) is None:
-        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    if _hosted_mode():
+        if await _get_tenant_from_request(request) is None:
+            return JSONResponse({"error": "not authenticated"}, status_code=401)
+    elif request.client is None or request.client.host not in _LOOPBACK_CLIENTS:
+        return JSONResponse({"error": "connect runs only from this machine"}, status_code=403)
     if not request.headers.get("content-type", "").lower().startswith("application/json"):
         return JSONResponse({"error": "send a JSON body with confirm set to true"}, status_code=400)
     try:

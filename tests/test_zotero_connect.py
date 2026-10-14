@@ -8,9 +8,13 @@ No test touches Zotero, the network or a credential store.
 
 from __future__ import annotations
 
+import http.client
+import http.server
 import io
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -54,6 +58,7 @@ class MemoryStore:
     def __init__(self, key=None):
         self.key = key
         self.set_calls = 0
+        self.delete_calls = 0
         self.raise_on_set = None
 
     def get(self):
@@ -66,6 +71,7 @@ class MemoryStore:
         self.set_calls += 1
 
     def delete(self):
+        self.delete_calls += 1
         had = self.key is not None
         self.key = None
         return had
@@ -354,8 +360,9 @@ def test_write_sends_the_key_only_in_the_authorization_header(env):
     assert ISSUED_KEY not in json.dumps(result)
 
 
-@pytest.mark.parametrize("code", [401, 403])
+@pytest.mark.parametrize("code", [401])
 def test_a_rejected_key_is_deleted_and_never_triggers_a_new_approval(env, monkeypatch, code):
+    # A 403 is handled separately: it may also mean the local API is switched off (see the F2 tests below).
     env.store.key = ISSUED_KEY
 
     def boom(*args, **kwargs):
@@ -497,7 +504,7 @@ def test_cli_live_run_without_an_approval_exits_two_with_one_connect_line(env, b
     assert transport.posts() == []
 
 
-def test_live_run_with_a_stored_approval_sends_the_key_only_in_the_save_header(env, bib_file, live_filer):
+def test_live_run_with_a_stored_approval_never_sends_the_key_to_the_connector(env, bib_file, live_filer):
     env.store.key = ISSUED_KEY
     transport = Routed(_filer_routes())
     messages = []
@@ -505,19 +512,21 @@ def test_live_run_with_a_stored_approval_sends_the_key_only_in_the_save_header(e
     assert result["status"] == "ok"
     save_calls = [call for call in transport.calls if call["url"] == SAVE]
     assert len(save_calls) == 1
-    assert save_calls[0]["headers"]["Authorization"] == f"Bearer {ISSUED_KEY}"
+    assert "Authorization" not in save_calls[0]["headers"]
+    assert "Zotero-API-Key" not in save_calls[0]["headers"]
+    assert ISSUED_KEY not in (save_calls[0]["body"] or b"").decode("utf-8")
     assert ISSUED_KEY not in json.dumps(result)
     assert ISSUED_KEY not in "\n".join(messages)
 
 
-def test_a_key_rejected_mid_run_reports_needs_connection_and_clears_the_key(env, bib_file, live_filer):
+def test_a_connector_rejection_mid_run_keeps_the_stored_approval(env, bib_file, live_filer):
     env.store.key = ISSUED_KEY
     transport = Routed(_filer_routes(on_save=lambda url, body: (401, {})))
     messages = []
     result = zf.file_bib_files([bib_file], "Research", transport=transport, log=messages.append)
-    assert result["status"] == "needs_connection"
-    assert env.store.key is None
-    assert sum("Connect Meridian to Zotero first" in line for line in messages) == 1
+    assert result["status"] == "save_failed"
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
 
 
 def test_a_dry_run_never_asks_for_an_approval(env, bib_file, live_filer):
@@ -531,7 +540,7 @@ def test_a_dry_run_never_asks_for_an_approval(env, bib_file, live_filer):
 # The connect route: logged-in caller, explicit confirm, one connect() per call
 # ---------------------------------------------------------------------------
 
-def _route_client(monkeypatch, *, hosted=False, tenant=None):
+def _route_client(monkeypatch, *, hosted=False, tenant=None, client_host="127.0.0.1"):
     monkeypatch.setattr(zotero_route, "_hosted_mode", lambda: hosted)
 
     async def _tenant(request):
@@ -540,7 +549,7 @@ def _route_client(monkeypatch, *, hosted=False, tenant=None):
     monkeypatch.setattr(zotero_route, "_get_tenant_from_request", _tenant)
     app = FastAPI()
     app.include_router(zotero_route.router)
-    return TestClient(app)
+    return TestClient(app, client=(client_host, 50000))
 
 
 def _recording_connect(monkeypatch, result):
@@ -757,3 +766,261 @@ def test_a_write_without_a_payload_sends_no_body(env):
     assert result == {"status": "written", "http_status": 200}
     assert transport.calls[0]["body"] is None
     assert "Content-Type" not in transport.calls[0]["headers"]
+
+
+# ---------------------------------------------------------------------------
+# Review fixes F1-F5
+# ---------------------------------------------------------------------------
+
+class Constant:
+    """Thread-safe fake transport that answers every call with one outcome."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = []
+        self._lock = threading.Lock()
+
+    def __call__(self, method, url, body, headers):
+        with self._lock:
+            self.calls.append({"method": method, "url": url, "body": body, "headers": dict(headers)})
+        return self.outcome
+
+
+# F1: the cooldown read-check-write is atomic across threads and processes.
+
+def test_two_concurrent_connect_calls_one_passes_and_one_gets_the_cooldown(env, monkeypatch):
+    real_read = zc._read_last_attempt
+
+    def slow_read(path):
+        time.sleep(0.2)  # widen the read-check-write window: an unlocked check lets both calls through
+        return real_read(path)
+
+    monkeypatch.setattr(zc, "_read_last_attempt", slow_read)
+    transport = Constant((200, json.dumps({"key": ISSUED_KEY})))
+    clock = FakeClock(1000.0)
+    barrier = threading.Barrier(2)
+    statuses = []
+
+    def worker():
+        barrier.wait()
+        statuses.append(zc.connect(transport=transport, clock=clock)["status"])
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert sorted(statuses) == ["connected", "cooldown"]
+    assert len(transport.calls) == 1
+    assert env.store.set_calls == 1
+
+
+def test_a_cooldown_lock_held_by_another_process_blocks_connect(env, monkeypatch):
+    monkeypatch.setattr(zc, "_LOCK_TIMEOUT_S", 0.2)
+    transport = Scripted()
+    with zc._file_lock(zc._lock_path(env.state_path), 1.0) as held:
+        assert held is True
+        result = zc.connect(transport=transport, clock=FakeClock(0.0))
+    assert result["status"] == "cooldown"
+    assert transport.calls == []
+    assert env.store.key is None
+
+
+# F2: a 403 from the local write path is probed before anything is forgotten.
+
+def test_403_with_a_failing_probe_keeps_the_key_and_reports_local_api_disabled(env):
+    env.store.key = ISSUED_KEY
+    transport = Scripted((403, "Forbidden"), (403, "Forbidden"))
+    result = zc.write_with_stored_approval(_write_request(), transport=transport)
+    assert result["status"] == "local_api_disabled"
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+    assert [call["method"] for call in transport.calls] == ["POST", "GET"]
+    assert transport.calls[1]["url"] == PROBE
+    assert "Authorization" not in transport.calls[1]["headers"]
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+def test_403_whose_probe_reports_the_local_api_not_enabled_keeps_the_key(env):
+    env.store.key = ISSUED_KEY
+    transport = Scripted((403, "denied"), (403, "Local API is not enabled"))
+    assert zc.write_with_stored_approval(_write_request(), transport=transport)["status"] == "local_api_disabled"
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+
+
+def test_403_with_a_successful_probe_deletes_the_key(env):
+    env.store.key = ISSUED_KEY
+    transport = Scripted((403, "denied"), (200, "[]"))
+    result = zc.write_with_stored_approval(_write_request(), transport=transport)
+    assert result["status"] == "needs_connection"
+    assert env.store.key is None
+    assert env.store.delete_calls == 1
+    assert [call["method"] for call in transport.calls] == ["POST", "GET"]
+
+
+def test_403_whose_probe_cannot_reach_zotero_keeps_the_key(env):
+    env.store.key = ISSUED_KEY
+    transport = Scripted((403, "denied"), ConnectionRefusedError("refused"))
+    result = zc.write_with_stored_approval(_write_request(), transport=transport)
+    assert result["status"] == "unreachable"
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+
+
+def test_401_deletes_the_key_without_probing(env):
+    env.store.key = ISSUED_KEY
+    transport = Scripted((401, "no"))
+    assert zc.write_with_stored_approval(_write_request(), transport=transport)["status"] == "needs_connection"
+    assert env.store.key is None
+    assert [call["method"] for call in transport.calls] == ["POST"]
+
+
+# F3: the connector save path never sends the approval and never touches the store.
+
+@pytest.mark.parametrize("outcome", [(401, "no"), (403, "denied"), (500, "boom")])
+def test_connector_rejection_leaves_the_stored_approval_intact(env, monkeypatch, outcome):
+    env.store.key = ISSUED_KEY
+
+    def no_store(*args, **kwargs):
+        raise AssertionError("the connector save path must never open the approval store")
+
+    monkeypatch.setattr(zc, "KeyringApprovalStore", no_store)
+    result = zf.save_items([{"title": "T"}], Scripted(outcome))
+    assert result["status"] == "error"
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+
+
+def test_connector_requests_carry_no_approval_or_api_key_header(env):
+    env.store.key = ISSUED_KEY
+    transport = Scripted((201, "{}"))
+    assert zf.save_items([{"title": "T"}], transport) == {"status": "written", "http_status": 201}
+    headers = transport.calls[0]["headers"]
+    assert "Authorization" not in headers
+    assert "Zotero-API-Key" not in headers
+    assert headers["Zotero-Allowed-Request"] == "1"
+    assert ISSUED_KEY not in (transport.calls[0]["body"] or b"").decode("utf-8")
+
+
+# F4: a request that carries the approval never follows a redirect off loopback.
+
+class _ServerState:
+    """A real loopback HTTP server. Paths listed in routes answer with a 302 to the mapped location."""
+
+    def __init__(self):
+        self.seen = []
+        self.routes = {}
+        self.base = ""
+
+
+@pytest.fixture
+def loopback_server():
+    state = _ServerState()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _answer(self):
+            state.seen.append((self.path, self.headers.get("Authorization")))
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            target = state.routes.get(self.path)
+            if target is None:
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        do_GET = _answer
+        do_POST = _answer
+
+        def log_message(self, format, *args):  # noqa: A002 - matches the base class signature
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    state.base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def no_offloopback_connections(monkeypatch):
+    """Record, and refuse, any connection the real HTTP client opens to a non-loopback host."""
+    attempts = []
+    real_connect = http.client.HTTPConnection.connect
+
+    def guarded_connect(self):
+        if self.host not in ("127.0.0.1", "localhost", "::1"):
+            attempts.append(self.host)
+            raise ConnectionRefusedError("test: no connection off loopback")
+        return real_connect(self)
+
+    monkeypatch.setattr(http.client.HTTPConnection, "connect", guarded_connect)
+    return attempts
+
+
+def test_a_redirect_off_loopback_raises_and_sends_no_approval_to_the_target(loopback_server, no_offloopback_connections):
+    loopback_server.routes["/start"] = "http://203.0.113.10:9/collect"
+    send = zc._default_transport(2.0)
+    with pytest.raises(Exception) as excinfo:
+        send("POST", loopback_server.base + "/start", b"{}", {"Authorization": f"Bearer {ISSUED_KEY}"})
+    assert no_offloopback_connections == []
+    assert loopback_server.seen == [("/start", f"Bearer {ISSUED_KEY}")]
+    assert type(excinfo.value).__name__ == "_RedirectRefused"
+    assert ISSUED_KEY not in str(excinfo.value)
+
+
+def test_every_redirect_hop_is_checked_not_only_the_first(loopback_server, no_offloopback_connections):
+    loopback_server.routes["/start"] = loopback_server.base + "/hop"
+    loopback_server.routes["/hop"] = "http://203.0.113.10:9/collect"
+    send = zc._default_transport(2.0)
+    with pytest.raises(Exception) as excinfo:
+        send("POST", loopback_server.base + "/start", b"{}", {"Authorization": f"Bearer {ISSUED_KEY}"})
+    assert [path for path, _auth in loopback_server.seen] == ["/start", "/hop"]
+    assert no_offloopback_connections == []
+    assert type(excinfo.value).__name__ == "_RedirectRefused"
+
+
+def test_a_write_redirected_off_loopback_keeps_the_key_and_reports_error(loopback_server, no_offloopback_connections):
+    loopback_server.routes["/start"] = "http://203.0.113.10:9/collect"
+    store = MemoryStore(ISSUED_KEY)
+    result = zc.write_with_stored_approval(
+        {"method": "POST", "url": loopback_server.base + "/start", "payload": {}}, store=store,
+    )
+    assert result["status"] == "error"
+    assert store.key == ISSUED_KEY
+    assert store.delete_calls == 0
+    assert no_offloopback_connections == []
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+# F5: the self-hosted connect route accepts only loopback clients.
+
+@pytest.mark.parametrize("client_host", ["203.0.113.9", "192.168.1.20", "10.0.0.5"])
+def test_self_hosted_connect_route_rejects_a_non_loopback_client(env, monkeypatch, client_host):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, client_host=client_host)
+    response = client.post("/zotero/connect", json={"confirm": True})
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.parametrize("client_host", ["127.0.0.1", "::1"])
+def test_self_hosted_connect_route_accepts_loopback_clients(env, monkeypatch, client_host):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, client_host=client_host)
+    assert client.post("/zotero/connect", json={"confirm": True}).status_code == 200
+    assert len(calls) == 1
