@@ -11,8 +11,13 @@ Auth follows the rest of the dashboard. A hosted deployment requires a logged-in
 tenant, and the default-deny gate in ``hosted_route_gate`` also applies to this
 path. A self-hosted server has no tenant concept, so it accepts only a loopback
 client (127.0.0.1 or ::1) and answers any other caller with 403 before
-``connect`` runs. On the hosted tier ``connect`` runs on the server, which cannot
-reach a workstation's Zotero, so it reports ``unreachable``.
+``connect`` runs. It also answers 403 to any request that carries a forwarding
+header (X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto, Forwarded or
+X-Real-IP): a request relayed by a proxy is not a local use of this route, and
+those headers are how a remote caller could pose as loopback. On the hosted tier
+``connect`` runs on the server, which cannot reach a workstation's Zotero, so it
+reports ``unreachable``. Hosted requests always arrive through the platform proxy,
+so the forwarding-header refusal does not apply there.
 """
 from __future__ import annotations
 
@@ -26,6 +31,15 @@ from .._deps import _get_tenant_from_request, _hosted_mode
 router = APIRouter()
 
 _LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1"})
+
+# Lower-case; Starlette's Headers lookup is case-insensitive.
+_FORWARDING_HEADERS = (
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "forwarded",
+    "x-real-ip",
+)
 
 _HTTP_STATUS_BY_RESULT = {
     "connected": 200,
@@ -48,6 +62,8 @@ async def zotero_connect_route(request: Request) -> JSONResponse:
             return JSONResponse({"error": "not authenticated"}, status_code=401)
     elif request.client is None or request.client.host not in _LOOPBACK_CLIENTS:
         return JSONResponse({"error": "connect runs only from this machine"}, status_code=403)
+    elif any(name in request.headers for name in _FORWARDING_HEADERS):
+        return JSONResponse({"error": "connect refuses requests relayed by a proxy"}, status_code=403)
     if not request.headers.get("content-type", "").lower().startswith("application/json"):
         return JSONResponse({"error": "send a JSON body with confirm set to true"}, status_code=400)
     try:

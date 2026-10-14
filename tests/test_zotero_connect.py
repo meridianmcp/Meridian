@@ -1024,3 +1024,90 @@ def test_self_hosted_connect_route_accepts_loopback_clients(env, monkeypatch, cl
     client = _route_client(monkeypatch, client_host=client_host)
     assert client.post("/zotero/connect", json={"confirm": True}).status_code == 200
     assert len(calls) == 1
+
+
+# Forwarded-header refusal: a request relayed by a proxy is not a local use of the
+# self-hosted route. uvicorn (--proxy-headers --forwarded-allow-ips=*) rewrites the
+# client address from X-Forwarded-For, so the loopback check alone can be spoofed.
+
+@pytest.mark.parametrize("client_host", ["127.0.0.1", "::1"])
+def test_self_hosted_connect_route_refuses_a_loopback_request_with_x_forwarded_for(env, monkeypatch, client_host):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, client_host=client_host)
+    response = client.post(
+        "/zotero/connect", json={"confirm": True}, headers={"X-Forwarded-For": "127.0.0.1"},
+    )
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.parametrize("client_host", ["127.0.0.1", "::1"])
+def test_self_hosted_connect_route_refuses_a_loopback_request_with_x_real_ip(env, monkeypatch, client_host):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, client_host=client_host)
+    response = client.post("/zotero/connect", json={"confirm": True}, headers={"X-Real-IP": "127.0.0.1"})
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-Forwarded-Host": "meridian.example"},
+        {"X-Forwarded-Proto": "https"},
+        {"Forwarded": "for=127.0.0.1;proto=https"},
+        {"x-forwarded-for": "127.0.0.1"},
+    ],
+)
+def test_self_hosted_connect_route_refuses_any_other_forwarding_header(env, monkeypatch, headers):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, client_host="127.0.0.1")
+    response = client.post("/zotero/connect", json={"confirm": True}, headers=headers)
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.parametrize("client_host", ["127.0.0.1", "::1"])
+def test_self_hosted_plain_loopback_request_still_reaches_connect(env, monkeypatch, client_host):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, client_host=client_host)
+    response = client.post("/zotero/connect", json={"confirm": True})
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("client_host", ["203.0.113.9", "192.168.1.20", "10.0.0.5"])
+def test_self_hosted_connect_route_refuses_a_non_loopback_request_even_when_it_claims_loopback(
+    env, monkeypatch, client_host,
+):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, client_host=client_host)
+    response = client.post(
+        "/zotero/connect", json={"confirm": True}, headers={"X-Forwarded-For": "127.0.0.1"},
+    )
+    assert response.status_code == 403
+    assert calls == []
+
+
+def test_hosted_connect_route_accepts_a_logged_in_request_that_carries_forwarding_headers(env, monkeypatch):
+    # Hosted traffic always arrives through the platform proxy, so forwarding headers
+    # are normal there and must not be refused.
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, hosted=True, tenant={"id": "tenant-1"}, client_host="10.0.0.5")
+    response = client.post(
+        "/zotero/connect",
+        json={"confirm": True},
+        headers={"X-Forwarded-For": "203.0.113.7", "X-Forwarded-Proto": "https", "X-Real-IP": "203.0.113.7"},
+    )
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
+def test_hosted_connect_route_still_requires_a_logged_in_user_with_forwarding_headers(env, monkeypatch):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, hosted=True, tenant=None, client_host="10.0.0.5")
+    response = client.post(
+        "/zotero/connect", json={"confirm": True}, headers={"X-Forwarded-For": "203.0.113.7"},
+    )
+    assert response.status_code == 401
+    assert calls == []
