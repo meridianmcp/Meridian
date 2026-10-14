@@ -146,7 +146,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 ### Cursor
 
-Add to `.cursor/mcp.json` in your project root:
+Add to Cursor's user-global config, `~/.cursor/mcp.json`:
 
 ```json
 {
