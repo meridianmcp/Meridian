@@ -84,15 +84,17 @@ async def authorize_image_storage(
     subject_id: str,
     derived: bool = False,
     redrawn: bool = False,
+    use_mode: str | None = None,
     hitl_id: str | None = None,
     reason: str | None = None,
     consumed_by: str | None = None,
 ) -> ImageStorageDecision:
     """Decide whether a byte write may proceed, and audit any human override.
 
-    Call this before writing image bytes. With no tier refusal, or with no
-    ``hitl_id``, it returns the decision and writes nothing. With a
-    ``hitl_id`` and a refusal, it:
+    Call this before writing image bytes. ``use_mode`` is the project's use
+    mode; a commercialized project must pass ``COMMERCIALIZED``, or the gate
+    will not apply. With no tier refusal, or with no ``hitl_id``, it returns
+    the decision and writes nothing. With a ``hitl_id`` and a refusal, it:
 
     1. requires a non-empty ``reason`` (checked before the approval is spent),
     2. verifies and spends the approval through ``consume_gate_override_approval``,
@@ -101,7 +103,10 @@ async def authorize_image_storage(
     4. re-decides, refusing agent approvers, and
     5. writes the audit row. A failed audit write raises, so no override proceeds.
     """
-    decision = decide_image_storage(raw_license, derived=derived, redrawn=redrawn)
+    # With no use_mode given, the policy's own default applies, so this module
+    # never keeps a second copy of it.
+    mode_kwargs = {} if use_mode is None else {"use_mode": use_mode}
+    decision = decide_image_storage(raw_license, derived=derived, redrawn=redrawn, **mode_kwargs)
     hid = hitl_id.strip() if isinstance(hitl_id, str) else ""
     if decision.allowed or not hid:
         return decision
@@ -128,7 +133,7 @@ async def authorize_image_storage(
         reason=approved_reason,
     )
     approved = decide_image_storage(
-        raw_license, derived=derived, redrawn=redrawn, override=override,
+        raw_license, derived=derived, redrawn=redrawn, override=override, **mode_kwargs,
     )
     await gate_override.record_override_audit(
         db,

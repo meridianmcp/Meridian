@@ -7,6 +7,7 @@ real ``db`` fixture: request, answer, authorize, audit, replay and refusals.
 from __future__ import annotations
 
 import ast
+import functools
 import json
 from pathlib import Path
 
@@ -14,12 +15,15 @@ import pytest
 
 from meridian import db as db_module
 from meridian import gate_override
+from meridian import rights_override
 from meridian import rights_policy as rp
 from meridian.rights_override import authorize_image_storage, request_rights_override
 from meridian.rights_policy import (
+    COMMERCIALIZED,
     LINK_ONLY,
     RIGHTS_OVERRIDE_EVENT_TYPE,
     RIGHTS_OVERRIDE_GATE,
+    STANDARD_PUBLICATION,
     STORE_IMAGE,
     STORE_UNMODIFIED,
     RightsOverride,
@@ -94,13 +98,14 @@ def test_license_strings_normalize_in_any_case_and_spacing(raw, expected):
     "CC BY-NC-ND-SA 4.0",
     "CC BY 4.0 (author-only)",
     "CC NC 4.0",
-    "CC BY 3.0 IGO",
+    "CC BY 3.0 ZZ",
     "arXiv",
     "copyright 2024 Acme",
 ])
 def test_unrecognised_input_is_unknown(raw):
-    # "CC BY 3.0 IGO" is a deliberate fail-closed case: the IGO clause is not
-    # in the known set, so it is unknown (link-only) rather than guessed.
+    # "CC BY 3.0 ZZ" is a deliberate fail-closed case: ZZ is not a known port
+    # code, so the clause is unrecognised and the license is unknown (link-only
+    # in commercialized use). Add a port code only once it is confirmed.
     assert normalize_license(raw) == "unknown"
 
 
@@ -110,6 +115,41 @@ def test_unrecognised_input_is_unknown(raw):
 ])
 def test_canonical_ids_are_idempotent(canonical):
     assert normalize_license(canonical) == canonical
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("CC BY 3.0 IGO", "cc-by"),
+    ("CC BY 4.0 US", "cc-by"),
+    ("CC BY-NC 3.0 IGO", "cc-by-nc"),
+    ("CC BY-SA 3.0 DE", "cc-by-sa"),
+    ("CC BY-ND 2.0 UK: England & Wales", "cc-by-nd"),
+    ("CC BY-NC-SA 2.5 AU", "cc-by-nc-sa"),
+    ("Attribution-NonCommercial 3.0 IGO", "cc-by-nc"),
+    ("https://creativecommons.org/licenses/by/3.0/igo/", "cc-by"),
+    ("https://creativecommons.org/licenses/by-nc/3.0/igo/", "cc-by-nc"),
+    ("https://creativecommons.org/licenses/by-sa/4.0/us/", "cc-by-sa"),
+])
+def test_jurisdiction_and_igo_ports_normalize_to_their_base_license(raw, expected):
+    assert normalize_license(raw) == expected
+
+
+@pytest.mark.parametrize("raw, jurisdiction", [
+    ("CC BY 3.0 IGO", "igo"),
+    ("CC BY 4.0 US", "us"),
+    ("CC BY-NC 3.0 IGO", "igo"),
+    ("https://creativecommons.org/licenses/by/3.0/igo/", "igo"),
+])
+def test_a_jurisdiction_port_is_a_note_and_never_a_tier_change(raw, jurisdiction):
+    d = decide_image_storage(raw)
+    assert d.jurisdiction == jurisdiction
+    assert "jurisdiction" in d.flags
+    assert d.tier == tier_for(d.license)
+
+
+def test_a_license_without_a_port_has_no_jurisdiction_note():
+    d = decide_image_storage("CC BY 4.0")
+    assert d.jurisdiction is None
+    assert "jurisdiction" not in d.flags
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +221,21 @@ def test_cc_by_nd_original_is_stored_as_an_unmodified_copy():
     {"redrawn": True},
     {"derived": True, "redrawn": True},
 ])
-def test_cc_by_nd_refuses_redrawn_or_cropped_derivatives(kwargs):
+def test_standard_publication_allows_nd_derivatives_with_a_review_flag(kwargs):
     d = decide_image_storage("cc-by-nd", **kwargs)
+    assert d.allowed is True
+    assert d.tier == STORE_UNMODIFIED
+    assert d.override_used is False
+    assert "no_derivatives_review" in d.flags
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"derived": True},
+    {"redrawn": True},
+    {"derived": True, "redrawn": True},
+])
+def test_commercialized_cc_by_nd_refuses_redrawn_or_cropped_derivatives(kwargs):
+    d = decide_image_storage("cc-by-nd", use_mode=COMMERCIALIZED, **kwargs)
     assert d.allowed is False
     assert d.tier == STORE_UNMODIFIED
     assert "unmodified" in d.reason
@@ -190,7 +243,13 @@ def test_cc_by_nd_refuses_redrawn_or_cropped_derivatives(kwargs):
     assert d.override_used is False
 
 
-@pytest.mark.parametrize("raw", [
+def test_commercialized_cc_by_nd_unmodified_copy_is_allowed():
+    d = decide_image_storage("cc-by-nd", use_mode=COMMERCIALIZED)
+    assert d.allowed is True
+    assert d.override_used is False
+
+
+_LINK_ONLY_RAWS = [
     "CC BY-NC 4.0",
     "CC BY-NC-SA 4.0",
     "CC BY-NC-ND 4.0",
@@ -199,25 +258,55 @@ def test_cc_by_nd_refuses_redrawn_or_cropped_derivatives(kwargs):
     "unknown",
     "",
     "mystery license",
-])
-def test_link_only_refuses_image_bytes(raw):
+]
+
+
+@pytest.mark.parametrize("raw", _LINK_ONLY_RAWS)
+def test_link_only_is_stored_with_credit_and_review_in_standard_publication(raw):
     d = decide_image_storage(raw)
-    assert d.allowed is False
+    assert d.allowed is True
+    assert d.use_mode == STANDARD_PUBLICATION
     assert d.tier == LINK_ONLY
-    assert "link-only" in d.reason
+    assert "requires_credit" in d.flags
+    assert "needs_review" in d.flags
     assert d.override_used is False
     assert d.audit is None
 
 
-def test_link_only_refuses_derivatives_too():
-    assert decide_image_storage("CC BY-NC 4.0", derived=True).allowed is False
+@pytest.mark.parametrize("raw", _LINK_ONLY_RAWS)
+def test_link_only_refuses_image_bytes_in_commercialized_use(raw):
+    d = decide_image_storage(raw, use_mode=COMMERCIALIZED)
+    assert d.allowed is False
+    assert d.tier == LINK_ONLY
+    assert "LINK_ONLY" in d.reason
+    assert "human-approved override is required" in d.reason
+    assert d.override_used is False
+    assert d.audit is None
 
 
-def test_unknown_license_is_never_storable():
-    d = decide_image_storage(None)
+def test_commercialized_link_only_refuses_derivatives_too():
+    assert decide_image_storage("CC BY-NC 4.0", derived=True, use_mode=COMMERCIALIZED).allowed is False
+
+
+def test_standard_publication_stores_link_only_derivatives_with_review():
+    d = decide_image_storage("CC BY-NC 4.0", derived=True)
+    assert d.allowed is True
+    assert "needs_review" in d.flags
+
+
+def test_unknown_license_is_never_storable_in_commercialized_use():
+    d = decide_image_storage(None, use_mode=COMMERCIALIZED)
     assert d.allowed is False
     assert d.license == "unknown"
     assert "unknown license" in d.reason
+
+
+def test_unknown_license_is_stored_with_review_in_standard_publication():
+    d = decide_image_storage(None)
+    assert d.allowed is True
+    assert d.license == "unknown"
+    assert d.tier == LINK_ONLY
+    assert "needs_review" in d.flags
 
 
 def test_rights_policy_is_a_pure_leaf_with_no_database_imports():
@@ -229,6 +318,91 @@ def test_rights_policy_is_a_pure_leaf_with_no_database_imports():
         elif isinstance(node, ast.ImportFrom):
             names.add(node.module or "")
     assert names <= {"__future__", "re", "dataclasses", "typing"}
+
+
+# ---------------------------------------------------------------------------
+# Use modes: standard publication is the default and never gates
+# ---------------------------------------------------------------------------
+
+def test_use_mode_constants_and_default():
+    assert rp.STANDARD_PUBLICATION == "standard_publication"
+    assert rp.COMMERCIALIZED == "commercialized"
+    assert decide_image_storage("CC BY-NC 4.0").use_mode == STANDARD_PUBLICATION
+    assert rp.normalize_use_mode(None) == STANDARD_PUBLICATION
+    assert rp.normalize_use_mode("") == STANDARD_PUBLICATION
+    assert rp.normalize_use_mode("   ") == STANDARD_PUBLICATION
+    assert rp.normalize_use_mode(" commercialized ") == COMMERCIALIZED
+
+
+@pytest.mark.parametrize("bad", [
+    "commercial", "Commercialized", "academic", "standard", 1, True, ["commercialized"],
+])
+def test_an_unknown_use_mode_raises_so_the_policy_fails_closed(bad):
+    with pytest.raises(RightsPolicyError) as exc:
+        rp.normalize_use_mode(bad)
+    assert exc.value.code == "USE_MODE_INVALID"
+    with pytest.raises(RightsPolicyError) as exc:
+        decide_image_storage("CC0", use_mode=bad)
+    assert exc.value.code == "USE_MODE_INVALID"
+
+
+@pytest.mark.parametrize("raw", [
+    "CC0", "public domain", "CC BY 4.0", "CC BY-SA 4.0", "CC BY-ND 4.0", "CC BY-NC 4.0",
+    "arXiv non-exclusive", "All Rights Reserved", None, "CC BY 3.0 IGO",
+])
+@pytest.mark.parametrize("kwargs", [{}, {"derived": True}, {"redrawn": True}])
+def test_standard_publication_never_gates(raw, kwargs):
+    d = decide_image_storage(raw, **kwargs)
+    assert d.allowed is True
+    assert d.override_used is False
+    assert d.audit is None
+
+
+@pytest.mark.parametrize("raw", ["CC0", "public domain", "CC BY 4.0", "CC BY-SA 4.0", "CC BY-ND 4.0"])
+def test_commercialized_stores_open_licenses_and_unmodified_copies(raw):
+    d = decide_image_storage(raw, use_mode=COMMERCIALIZED)
+    assert d.allowed is True
+    assert d.override_used is False
+
+
+@pytest.mark.parametrize("raw", ["CC0", "public domain"])
+def test_cc0_and_public_domain_need_no_credit(raw):
+    d = decide_image_storage(raw)
+    assert "requires_credit" not in d.flags
+    assert "needs_review" not in d.flags
+
+
+@pytest.mark.parametrize("raw", ["CC BY 4.0", "CC BY-SA 4.0", "CC BY-ND 4.0"])
+def test_cc_by_family_requires_credit(raw):
+    assert "requires_credit" in decide_image_storage(raw).flags
+
+
+def test_cc_by_sa_share_alike_flag_on_derivatives_in_commercialized_use():
+    d = decide_image_storage("cc-by-sa", derived=True, use_mode=COMMERCIALIZED)
+    assert d.allowed is True
+    assert d.override_used is False
+    assert "share_alike" in d.flags
+    assert d.share_alike_required is True
+    original = decide_image_storage("cc-by-sa", use_mode=COMMERCIALIZED)
+    assert "share_alike" not in original.flags
+
+
+def test_an_override_in_standard_publication_is_validated_but_not_used():
+    d = decide_image_storage("CC BY-NC 4.0", override=_override())
+    assert d.allowed is True
+    assert d.override_used is False
+    assert d.audit is None
+
+
+def test_commercialized_override_is_validated_and_still_needs_a_human():
+    with pytest.raises(RightsPolicyError) as exc:
+        decide_image_storage(
+            "CC BY-NC 4.0", use_mode=COMMERCIALIZED, override=_override(approved_by="claude-1"),
+        )
+    assert exc.value.code == "AGENT_APPROVAL_REFUSED"
+    d = decide_image_storage("CC BY-NC 4.0", use_mode=COMMERCIALIZED, override=_override())
+    assert d.allowed is True
+    assert d.override_used is True
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +421,7 @@ def _override(**overrides):
 
 
 def test_a_human_override_lets_a_refused_tier_through_and_builds_the_audit():
-    d = decide_image_storage("CC BY-NC 4.0", override=_override())
+    d = decide_image_storage("CC BY-NC 4.0", use_mode=COMMERCIALIZED, override=_override())
     assert d.allowed is True
     assert d.override_used is True
     assert d.tier == LINK_ONLY
@@ -263,7 +437,7 @@ def test_a_human_override_lets_a_refused_tier_through_and_builds_the_audit():
 
 
 def test_override_for_a_redrawn_nd_image_is_audited_with_its_tier():
-    d = decide_image_storage("cc-by-nd", redrawn=True, override=_override())
+    d = decide_image_storage("cc-by-nd", redrawn=True, use_mode=COMMERCIALIZED, override=_override())
     assert d.allowed is True
     assert d.override_used is True
     assert d.audit["tier"] == STORE_UNMODIFIED
@@ -355,6 +529,22 @@ async def _approve(db, hitl_id: str, *, answer=_YES, answered_by="adam"):
     await db_module.answer_hitl_request(db, hitl_id, answer, answered_by=answered_by)
 
 
+@pytest.fixture
+def commercialized(monkeypatch):
+    """Run authorize_image_storage under the commercialized policy.
+
+    authorize_image_storage passes use_mode only when a caller gives one, so this
+    patch sets the mode for tests that do not pass it. Patching the name it looks
+    up runs the real approval, audit and replay path under commercialized use.
+    Tests that need an explicit mode pass use_mode=COMMERCIALIZED themselves.
+    """
+    monkeypatch.setattr(
+        rights_override,
+        "decide_image_storage",
+        functools.partial(rp.decide_image_storage, use_mode=COMMERCIALIZED),
+    )
+
+
 @pytest.mark.asyncio
 async def test_request_files_a_require_human_gate_override_and_reuses_it(db):
     pid = await _project(db)
@@ -398,7 +588,18 @@ async def test_a_public_license_stores_bytes_without_any_hitl_or_audit(db):
 
 
 @pytest.mark.asyncio
-async def test_link_only_refuses_bytes_and_files_nothing_without_a_hitl(db):
+async def test_standard_publication_stores_link_only_bytes_without_a_hitl_or_audit(db):
+    pid = await _project(db)
+    d = await authorize_image_storage(db, pid, "CC BY-NC 4.0", subject_id="fig-1")
+    assert d.allowed is True
+    assert d.override_used is False
+    assert "needs_review" in d.flags
+    assert await _hitl_count(db, pid) == 0
+    assert await _audit(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_link_only_refuses_bytes_and_files_nothing_without_a_hitl(db, commercialized):
     pid = await _project(db)
     d = await authorize_image_storage(db, pid, "CC BY-NC 4.0", subject_id="fig-1")
     assert d.allowed is False
@@ -408,7 +609,20 @@ async def test_link_only_refuses_bytes_and_files_nothing_without_a_hitl(db):
 
 
 @pytest.mark.asyncio
-async def test_a_pending_approval_does_not_unlock_bytes(db):
+async def test_commercialized_use_mode_passed_explicitly_refuses_link_only_bytes(db):
+    # No fixture: the caller passes the project's use mode, which is the path
+    # real callers take. Before this was wired through, it silently stored.
+    pid = await _project(db)
+    d = await authorize_image_storage(
+        db, pid, "CC BY-NC 4.0", subject_id="fig-1", use_mode=COMMERCIALIZED,
+    )
+    assert d.allowed is False
+    assert d.tier == LINK_ONLY
+    assert await _hitl_count(db, pid) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_pending_approval_does_not_unlock_bytes(db, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid)
     with pytest.raises(RightsPolicyError) as exc:
@@ -420,7 +634,7 @@ async def test_a_pending_approval_does_not_unlock_bytes(db):
 
 
 @pytest.mark.asyncio
-async def test_a_no_answer_does_not_unlock_bytes(db):
+async def test_a_no_answer_does_not_unlock_bytes(db, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"], answer=_NO)
@@ -433,7 +647,7 @@ async def test_a_no_answer_does_not_unlock_bytes(db):
 
 
 @pytest.mark.asyncio
-async def test_an_auto_answered_approval_is_refused(db):
+async def test_an_auto_answered_approval_is_refused(db, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"], answered_by="auto")
@@ -445,7 +659,7 @@ async def test_an_auto_answered_approval_is_refused(db):
 
 
 @pytest.mark.asyncio
-async def test_an_agent_answering_the_approval_is_refused_and_not_audited(db):
+async def test_an_agent_answering_the_approval_is_refused_and_not_audited(db, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"], answered_by="claude-executor")
@@ -458,7 +672,7 @@ async def test_an_agent_answering_the_approval_is_refused_and_not_audited(db):
 
 
 @pytest.mark.asyncio
-async def test_a_human_approval_unlocks_bytes_once_and_is_audited(db):
+async def test_a_human_approval_unlocks_bytes_once_and_is_audited(db, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"])
@@ -497,7 +711,7 @@ async def test_a_human_approval_unlocks_bytes_once_and_is_audited(db):
 
 
 @pytest.mark.asyncio
-async def test_an_approval_cannot_be_spent_on_a_different_subject(db):
+async def test_an_approval_cannot_be_spent_on_a_different_subject(db, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid, subject="fig-3")
     await _approve(db, hitl["id"])
@@ -514,7 +728,7 @@ async def test_an_approval_cannot_be_spent_on_a_different_subject(db):
 
 
 @pytest.mark.asyncio
-async def test_a_missing_reason_is_refused_before_the_approval_is_spent(db):
+async def test_a_missing_reason_is_refused_before_the_approval_is_spent(db, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"])
@@ -530,7 +744,7 @@ async def test_a_missing_reason_is_refused_before_the_approval_is_spent(db):
 
 
 @pytest.mark.asyncio
-async def test_a_blank_subject_is_refused_when_an_approval_is_presented(db):
+async def test_a_blank_subject_is_refused_when_an_approval_is_presented(db, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"])
@@ -542,7 +756,7 @@ async def test_a_blank_subject_is_refused_when_an_approval_is_presented(db):
 
 
 @pytest.mark.asyncio
-async def test_a_redrawn_nd_image_needs_its_own_human_approval(db):
+async def test_a_redrawn_nd_image_needs_its_own_human_approval(db, commercialized):
     pid = await _project(db)
     refused = await authorize_image_storage(
         db, pid, "cc-by-nd", subject_id="fig-7", redrawn=True,
@@ -572,7 +786,7 @@ async def test_a_redrawn_nd_image_needs_its_own_human_approval(db):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_audit_write_blocks_the_override(db, monkeypatch):
+async def test_a_failed_audit_write_blocks_the_override(db, monkeypatch, commercialized):
     pid = await _project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"])

@@ -1,26 +1,41 @@
 """Default image-storage rights policy -- a pure leaf module.
 
 Question answered here: may Meridian store the image BYTES of a figure, table
-or source, given its license? Links and metadata (paths, captions, source ids)
-are always kept. Only image bytes are gated.
+or source, given its license and the use mode of the project? Links and
+metadata (paths, captions, source ids) are always kept. Only image bytes are
+gated, and only in commercialized use.
+
+Use modes
+---------
+STANDARD_PUBLICATION (default)  academic or standard publication. Nothing is
+                                gated. Restricted items are stored with credit
+                                and a review flag.
+COMMERCIALIZED                  opt-in per project. Restricted items are refused
+                                unless a human approves an override.
 
 Tiers
 -----
 STORE_IMAGE       cc0, public-domain, cc-by, cc-by-sa: bytes may be stored. A
                   derived figure keeps the license, and a cc-by-sa derivative
                   must carry the share-alike flag.
-STORE_UNMODIFIED  cc-by-nd: an unmodified copy only. Redrawn or cropped
-                  derivatives are refused.
+STORE_UNMODIFIED  cc-by-nd: an unmodified copy is stored. A redrawn or cropped
+                  derivative is flagged in standard publication and gated in
+                  commercialized use.
 LINK_ONLY         cc-by-nc, cc-by-nc-sa, cc-by-nc-nd, arxiv-nonexclusive,
-                  all-rights-reserved and unknown: metadata and links only.
-                  Unknown counts as link-only, never as storable.
+                  all-rights-reserved and unknown. Standard publication stores
+                  the bytes with credit and a review flag. Commercialized use
+                  refuses them unless a human approves an override.
+
+Jurisdiction and IGO ports of a CC license (``CC BY 3.0 IGO``, ``CC BY 4.0 US``)
+map to their base license. The port is recorded as a note on the decision and
+as a flag. It never changes the tier.
 
 Override
 --------
-The only way past a refusal is a human approval, passed in as a
-:class:`RightsOverride`. This module cannot verify that a human approved
-anything: it validates the shape of the override and refuses agent approvers.
-The approval itself is verified by
+In commercialized use, the only way past a refusal is a human approval, passed
+in as a :class:`RightsOverride`. This module cannot verify that a human
+approved anything: it validates the shape of the override and refuses agent
+approvers. The approval itself is verified by
 ``meridian.rights_override.authorize_image_storage`` through the existing
 gate-override mechanism (``meridian.gate_override``). Never build a
 ``RightsOverride`` from agent-supplied input.
@@ -30,8 +45,12 @@ This module imports nothing from the database layer.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+STANDARD_PUBLICATION = "standard_publication"
+COMMERCIALIZED = "commercialized"
+_USE_MODES = frozenset({STANDARD_PUBLICATION, COMMERCIALIZED})
 
 STORE_IMAGE = "STORE_IMAGE"
 STORE_UNMODIFIED = "STORE_UNMODIFIED"
@@ -41,6 +60,12 @@ LINK_ONLY = "LINK_ONLY"
 RIGHTS_OVERRIDE_GATE = "rights_storage_override"
 #: ``action_audit_log.event_type`` written for every override that is used.
 RIGHTS_OVERRIDE_EVENT_TYPE = "rights_storage_override"
+
+FLAG_REQUIRES_CREDIT = "requires_credit"
+FLAG_NEEDS_REVIEW = "needs_review"
+FLAG_SHARE_ALIKE = "share_alike"
+FLAG_NO_DERIVATIVES_REVIEW = "no_derivatives_review"
+FLAG_JURISDICTION = "jurisdiction"
 
 UNKNOWN = "unknown"
 
@@ -68,6 +93,21 @@ _CC_FAMILY: dict[frozenset[str], str] = {
     frozenset({"nc", "nd"}): "cc-by-nc-nd",
 }
 
+# Licenses that carry no attribution requirement.
+_NO_CREDIT = frozenset({"cc0", "public-domain"})
+
+# Port codes that may follow a CC version number: the IGO port and the country
+# and region ports used by creativecommons.org. A port that is not listed stays
+# an unrecognised token, so the license is unknown (link-only) until it is added.
+_JURISDICTION_CODES = frozenset({
+    "igo", "england", "scotland", "wales",
+    "ar", "at", "au", "be", "bg", "br", "ca", "ch", "cl", "cn", "co", "cr", "cy",
+    "cz", "de", "dk", "ec", "ee", "eg", "es", "fi", "fr", "gr", "gt", "hk", "hr",
+    "hu", "id", "ie", "il", "in", "is", "it", "jp", "kr", "lt", "lu", "lv", "mk",
+    "mt", "mx", "my", "nl", "no", "nz", "pe", "ph", "pl", "pr", "pt", "ro", "rs",
+    "ru", "se", "sg", "si", "sk", "th", "tr", "tw", "ua", "ug", "uk", "us", "za",
+})
+
 _FULLNAME_SUBS = (
     (re.compile(r"non[\s\-_]?commercial"), " nc "),
     (re.compile(r"no[\s\-_]?deriv(?:ative)?s?"), " nd "),
@@ -85,6 +125,9 @@ _ARXIV = re.compile(r"arxiv")
 _NON_EXCLUSIVE = re.compile(r"non[\s\-_]?exclusive")
 _ALL_RIGHTS = re.compile(r"all[\s\-_]?rights[\s\-_]?reserved")
 _CC_LICENSE_PATH = re.compile(r"creativecommons\.org/licenses/([a-z\-]+)")
+_CC_PORT_PATH = re.compile(
+    r"creativecommons\.org/licenses/[a-z\-]+/\d+(?:\.\d+)*/([a-z]{2,3})(?=[/?#\s]|$)"
+)
 _CC0_PATH = re.compile(
     r"creativecommons\.org/(?:publicdomain/zero|share-your-work/public-domain/cc0)(?=[/?#\s]|$)"
 )
@@ -125,56 +168,141 @@ class RightsOverride:
 
 @dataclass(frozen=True)
 class ImageStorageDecision:
-    """The outcome of :func:`decide_image_storage`."""
+    """The outcome of :func:`decide_image_storage`.
+
+    ``flags`` lists obligations and review hints for the item, such as
+    ``requires_credit`` or ``needs_review``. ``jurisdiction`` is the CC port
+    recorded as a note (``None`` when there is no port).
+    """
 
     license: str
     tier: str
     allowed: bool
     reason: str
+    use_mode: str = STANDARD_PUBLICATION
     override_used: bool = False
     derived: bool = False
     redrawn: bool = False
-    share_alike_required: bool = False
+    jurisdiction: str | None = None
+    flags: list[str] = field(default_factory=list)
     audit: dict[str, Any] | None = None
+
+    @property
+    def share_alike_required(self) -> bool:
+        return FLAG_SHARE_ALIKE in self.flags
 
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _parse_cc_family(text: str) -> str | None:
-    """Canonical CC BY-family id for ``text``, or None if it is not one.
+def normalize_use_mode(raw: Any) -> str:
+    """Return the canonical use mode.
 
-    Requires a CC marker (a ``cc`` token or the word "attribution") and a BY
-    clause. Any token outside the known set makes the result None, so an
-    unrecognised clause fails closed to unknown.
+    ``None``, or an empty or blank string, means :data:`STANDARD_PUBLICATION`.
+    Any other value that is not one of the two known modes raises
+    :class:`RightsPolicyError`, so a bad value fails closed.
+    """
+    if raw is None:
+        return STANDARD_PUBLICATION
+    if not isinstance(raw, str):
+        raise RightsPolicyError(
+            "USE_MODE_INVALID",
+            f"use_mode must be {STANDARD_PUBLICATION!r} or {COMMERCIALIZED!r}, not {raw!r}",
+        )
+    text = raw.strip()
+    if not text:
+        return STANDARD_PUBLICATION
+    if text in _USE_MODES:
+        return text
+    raise RightsPolicyError(
+        "USE_MODE_INVALID",
+        f"use_mode must be {STANDARD_PUBLICATION!r} or {COMMERCIALIZED!r}, not {raw!r}",
+    )
+
+
+def _strip_jurisdiction(tokens: list[str]) -> tuple[list[str], str | None]:
+    """Remove a jurisdiction or IGO port that directly follows the version.
+
+    Only the run of known port codes right after the first version token is
+    removed. Any other token is left in place, so it still fails closed.
+    """
+    for index, token in enumerate(tokens):
+        if not _VERSION.fullmatch(token):
+            continue
+        end = index + 1
+        while end < len(tokens) and tokens[end] in _JURISDICTION_CODES:
+            end += 1
+        if end == index + 1:
+            return tokens, None
+        port = " ".join(tokens[index + 1:end])
+        return tokens[:index + 1] + tokens[end:], port
+    return tokens, None
+
+
+def _parse_cc(text: str) -> tuple[str | None, str | None]:
+    """Canonical CC BY-family id and jurisdiction port for ``text``.
+
+    Either part is None when it is not recognised. Requires a CC marker (a
+    ``cc`` token or the word "attribution") and a BY clause. Any token outside
+    the known set makes the canonical id None, so an unrecognised clause fails
+    closed to unknown.
     """
     if not _CC_MARKER.search(text):
-        return None
+        return None, None
     for pattern, repl in _FULLNAME_SUBS:
         text = pattern.sub(repl, text)
+    tokens = [token for token in _TOKEN_SPLIT.split(text) if token]
+    tokens, jurisdiction = _strip_jurisdiction(tokens)
     kept: set[str] = set()
-    for token in _TOKEN_SPLIT.split(text):
-        if not token or token == "cc" or _VERSION.fullmatch(token) or token in _IGNORED_TOKENS:
+    for token in tokens:
+        if token == "cc" or _VERSION.fullmatch(token) or token in _IGNORED_TOKENS:
             continue
         if token == "attribution":
             kept.add("by")
             continue
         kept.add(token)
     if "by" not in kept:
-        return None
-    return _CC_FAMILY.get(frozenset(kept - {"by"}))
+        return None, None
+    return _CC_FAMILY.get(frozenset(kept - {"by"})), jurisdiction
 
 
-def _from_cc_url(text: str) -> str:
+def _from_cc_url(text: str) -> tuple[str, str | None]:
     match = _CC_LICENSE_PATH.search(text)
     if match:
-        return _parse_cc_family("cc " + match.group(1)) or UNKNOWN
+        canonical, _ = _parse_cc("cc " + match.group(1))
+        port_match = _CC_PORT_PATH.search(text)
+        port = port_match.group(1) if port_match else None
+        jurisdiction = port if port in _JURISDICTION_CODES else None
+        return canonical or UNKNOWN, jurisdiction
     if _CC0_PATH.search(text):
-        return "cc0"
+        return "cc0", None
     if _PDM_PATH.search(text):
-        return "public-domain"
-    return UNKNOWN
+        return "public-domain", None
+    return UNKNOWN, None
+
+
+def _classify(raw: Any) -> tuple[str, str | None]:
+    """Canonical license id and jurisdiction port (or None) for a raw value."""
+    if not isinstance(raw, str):
+        return UNKNOWN, None
+    text = " ".join(raw.split()).lower()
+    if not text:
+        return UNKNOWN, None
+    if text in _TIER_BY_LICENSE:
+        return text, None
+    if "creativecommons.org" in text:
+        return _from_cc_url(text)
+    if _CC0.match(text):
+        return "cc0", None
+    if _PUBLIC_DOMAIN.search(text) and not _CC_MARKER.search(text):
+        return "public-domain", None
+    if _ARXIV.search(text) and _NON_EXCLUSIVE.search(text):
+        return "arxiv-nonexclusive", None
+    if _ALL_RIGHTS.search(text):
+        return "all-rights-reserved", None
+    canonical, jurisdiction = _parse_cc(text)
+    return canonical or UNKNOWN, jurisdiction
 
 
 def normalize_license(raw: Any) -> str:
@@ -183,27 +311,12 @@ def normalize_license(raw: Any) -> str:
     Accepts creativecommons.org license and public-domain URLs, strings such as
     ``"CC BY-NC-ND 4.0"``, ``"cc-by"``, ``"CC0"``, ``"public domain"``,
     ``"arXiv non-exclusive"`` and ``"All Rights Reserved"``, in any case and
-    spacing. Canonical ids map to themselves. Non-strings, blanks and anything
-    unrecognised map to ``"unknown"``.
+    spacing. A jurisdiction or IGO port of a CC license maps to its base
+    license (``"CC BY 3.0 IGO"`` is ``"cc-by"``). Canonical ids map to
+    themselves. Non-strings, blanks and anything unrecognised map to
+    ``"unknown"``.
     """
-    if not isinstance(raw, str):
-        return UNKNOWN
-    text = " ".join(raw.split()).lower()
-    if not text:
-        return UNKNOWN
-    if text in _TIER_BY_LICENSE:
-        return text
-    if "creativecommons.org" in text:
-        return _from_cc_url(text)
-    if _CC0.match(text):
-        return "cc0"
-    if _PUBLIC_DOMAIN.search(text) and not _CC_MARKER.search(text):
-        return "public-domain"
-    if _ARXIV.search(text) and _NON_EXCLUSIVE.search(text):
-        return "arxiv-nonexclusive"
-    if _ALL_RIGHTS.search(text):
-        return "all-rights-reserved"
-    return _parse_cc_family(text) or UNKNOWN
+    return _classify(raw)[0]
 
 
 def tier_for(canonical: str) -> str:
@@ -254,22 +367,50 @@ def validate_override(override: Any) -> RightsOverride:
     return override
 
 
-def _base_rule(canonical: str, tier: str, *, is_derivative: bool) -> tuple[bool, str]:
+def _rule(canonical: str, tier: str, *, is_derivative: bool, mode: str) -> tuple[bool, str]:
+    """Return ``(refused, reason)`` for the bytes under this tier and use mode.
+
+    ``refused`` is True only in commercialized use, where it means a human
+    override is needed. Standard publication never refuses.
+    """
+    commercial = mode == COMMERCIALIZED
     if tier == STORE_IMAGE:
-        return True, f"{canonical} permits storing image bytes"
+        return False, f"{canonical} permits storing image bytes"
     if tier == STORE_UNMODIFIED:
-        if is_derivative:
+        if not is_derivative:
+            return False, f"{canonical} permits storing an unmodified copy"
+        if not commercial:
             return False, (
-                f"{canonical} allows only an unmodified copy; a redrawn or cropped "
-                "derivative is refused"
+                f"{canonical} permits an unmodified copy; this redrawn or cropped "
+                f"derivative is allowed in {STANDARD_PUBLICATION} and flagged for "
+                "no-derivatives review"
             )
-        return True, f"{canonical} allows storing an unmodified copy only"
-    if canonical == UNKNOWN:
-        return False, (
-            "unknown license is treated as link-only: metadata and links are kept, "
-            "image bytes are refused"
+        return True, (
+            f"tier {STORE_UNMODIFIED}: {canonical} permits only an unmodified copy; "
+            f"a redrawn or cropped derivative is refused in {COMMERCIALIZED} use"
         )
-    return False, f"{canonical} is link-only: metadata and links are kept, image bytes are refused"
+    label = "unknown license" if canonical == UNKNOWN else canonical
+    if not commercial:
+        return False, (
+            f"tier {LINK_ONLY}: {label} is allowed in {STANDARD_PUBLICATION} with "
+            "credit and a review flag; commercialized use would refuse the bytes"
+        )
+    return True, f"tier {LINK_ONLY}: {label} image bytes are refused in {COMMERCIALIZED} use"
+
+
+def _flags(canonical: str, tier: str, *, is_derivative: bool, jurisdiction: str | None) -> list[str]:
+    flags: list[str] = []
+    if canonical not in _NO_CREDIT:
+        flags.append(FLAG_REQUIRES_CREDIT)
+    if tier == LINK_ONLY:
+        flags.append(FLAG_NEEDS_REVIEW)
+    if canonical == "cc-by-sa" and is_derivative:
+        flags.append(FLAG_SHARE_ALIKE)
+    if canonical == "cc-by-nd" and is_derivative:
+        flags.append(FLAG_NO_DERIVATIVES_REVIEW)
+    if jurisdiction:
+        flags.append(FLAG_JURISDICTION)
+    return flags
 
 
 def decide_image_storage(
@@ -277,36 +418,45 @@ def decide_image_storage(
     *,
     derived: bool = False,
     redrawn: bool = False,
+    use_mode: Any = STANDARD_PUBLICATION,
     override: RightsOverride | None = None,
 ) -> ImageStorageDecision:
     """Decide whether image BYTES may be stored for a source with this license.
 
-    ``derived`` and ``redrawn`` mark a derivative of the source image. A
-    derivative of a cc-by-nd image is refused. ``override`` is a verified human
-    approval (see :class:`RightsOverride`). It is only consulted when the tier
-    refuses the bytes. A malformed override raises :class:`RightsPolicyError`
-    even when it is not needed.
+    ``use_mode`` is :data:`STANDARD_PUBLICATION` by default. Standard
+    publication never refuses. Commercialized use refuses LINK_ONLY items, and
+    redrawn or cropped derivatives of a cc-by-nd image, unless ``override`` is a
+    verified human approval (see :class:`RightsOverride`). ``override`` is only
+    consulted when the bytes would be refused. A malformed override or an
+    unknown use mode raises :class:`RightsPolicyError` even when it is not
+    needed.
 
+    ``derived`` and ``redrawn`` both mark a derivative of the source image.
     This function returns the decision. The caller must persist
     ``decision.audit`` when ``override_used`` is true.
     """
-    canonical = normalize_license(raw_license)
-    tier = tier_for(canonical)
+    mode = normalize_use_mode(use_mode)
+    canonical, jurisdiction = _classify(raw_license)
+    tier = _TIER_BY_LICENSE.get(canonical, LINK_ONLY)
     is_derivative = bool(derived) or bool(redrawn)
-    share_alike = is_derivative and canonical == "cc-by-sa"
     if override is not None:
         override = validate_override(override)
-    allowed, reason = _base_rule(canonical, tier, is_derivative=is_derivative)
-    if share_alike and allowed:
+    refused, reason = _rule(canonical, tier, is_derivative=is_derivative, mode=mode)
+    share_alike = canonical == "cc-by-sa" and is_derivative
+    if share_alike and not refused:
         reason += "; the derivative must carry the share-alike flag"
-    common = {
+    common: dict[str, Any] = {
         "license": canonical,
         "tier": tier,
+        "use_mode": mode,
         "derived": bool(derived),
         "redrawn": bool(redrawn),
-        "share_alike_required": share_alike,
+        "jurisdiction": jurisdiction,
+        "flags": _flags(
+            canonical, tier, is_derivative=is_derivative, jurisdiction=jurisdiction,
+        ),
     }
-    if allowed:
+    if not refused:
         return ImageStorageDecision(allowed=True, reason=reason, **common)
     if override is None:
         return ImageStorageDecision(
@@ -323,6 +473,7 @@ def decide_image_storage(
         "reason": override.reason.strip(),
         "tier": tier,
         "license": canonical,
+        "use_mode": mode,
         "derived": bool(derived),
         "redrawn": bool(redrawn),
     }
