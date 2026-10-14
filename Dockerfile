@@ -59,11 +59,20 @@ ENV MERIDIAN_GIT_SHA=$MERIDIAN_GIT_SHA
 
 ENV MERIDIAN_DB=/app/data/meridian.db
 
-# Startup: enforce Postgres when running on Fly
+# Startup: enforce Postgres when running on Fly.
+# Trusted proxies (uvicorn --forwarded-allow-ips): on Fly the proxy is the only
+# path in, so any peer is trusted ("*"). Self-hosted, trust loopback and the
+# private ranges where a same-host reverse proxy and the Docker gateway sit. A
+# public peer is not trusted, so its X-Forwarded-* headers are ignored.
 CMD ["sh", "-c", "\
   if [ -n \"$FLY_APP_NAME\" ] && [ -z \"$MERIDIAN_DB_URL\" ]; then \
     echo 'ERROR: Hosted mode requires MERIDIAN_DB_URL (Postgres). For local use: docker compose up OR pixi run start'; \
     exit 1; \
   fi; \
-  exec uvicorn meridian.server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=* \
+  if [ -n \"$FLY_APP_NAME\" ]; then \
+    FORWARDED_ALLOW_IPS='*'; \
+  else \
+    FORWARDED_ALLOW_IPS='127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7'; \
+  fi; \
+  exec uvicorn meridian.server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=\"$FORWARDED_ALLOW_IPS\" \
 "]

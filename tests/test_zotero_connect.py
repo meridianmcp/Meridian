@@ -1036,8 +1036,10 @@ def test_self_hosted_connect_route_accepts_loopback_clients(env, monkeypatch, cl
 
 
 # Forwarded-header refusal: a request relayed by a proxy is not a local use of the
-# self-hosted route. uvicorn (--proxy-headers --forwarded-allow-ips=*) rewrites the
-# client address from X-Forwarded-For, so the loopback check alone can be spoofed.
+# self-hosted route. uvicorn (--proxy-headers) rewrites the client address from
+# X-Forwarded-For when the peer is trusted, and a trusted Docker gateway peer can carry
+# a spoofed header, so the loopback check alone can be spoofed. The Dockerfile trust
+# list is tested in test_zotero_dockerfile_proxy_trust.py.
 
 @pytest.mark.parametrize("client_host", ["127.0.0.1", "::1"])
 def test_self_hosted_connect_route_refuses_a_loopback_request_with_x_forwarded_for(env, monkeypatch, client_host):
