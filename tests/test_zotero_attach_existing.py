@@ -9,6 +9,7 @@ and must only ever travel in request headers.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -21,10 +22,6 @@ WRITE_ITEMS = zf.LOCAL_API + "/items"
 SERVER_ID = "SRV-TEST-1"
 KEY = "DUMMYKEY0123456789ABCDEF"  # fake key, never a real credential
 EXIST_KEYS = ("EXIST001", "EXIST002")
-PDF_CHILD = {
-    "key": "CHILDPDF",
-    "data": {"key": "CHILDPDF", "itemType": "attachment", "contentType": "application/pdf", "linkMode": "linked_file"},
-}
 APPROVED_WRITE = (200, {"success": {"0": "ATT00001", "1": "ATT00002"}, "successful": {}, "failed": {}}, {})
 PDF_HEAD = b"%PDF-1.7\n%test\n"
 
@@ -162,6 +159,19 @@ def _write_pdf(directory, citekey, body=PDF_HEAD):
     path = directory / f"{citekey}.pdf"
     path.write_bytes(body)
     return path
+
+
+def _posix_path(path):
+    """Absolute path with forward slashes, the form the desktop API uses for linked files."""
+    return os.path.abspath(path).replace("\\", "/")
+
+
+def _pdf_child(key="CHILDPDF", *, path=None, link_mode="linked_file"):
+    """A PDF child as the desktop children endpoint lists it. path is set only when given."""
+    data = {"key": key, "itemType": "attachment", "contentType": "application/pdf", "linkMode": link_mode}
+    if path is not None:
+        data["path"] = path
+    return {"key": key, "data": data}
 
 
 def _write_bib(directory, text, name="refs.bib"):
@@ -380,14 +390,25 @@ def test_dry_run_never_authorizes_or_posts(bib_file, pdf_dir):
 def test_matched_item_that_already_has_a_pdf_child_is_skipped(bib_file, pdf_dir):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
+    linked = _write_pdf(pdf_dir.parent, "linked-copy")  # the file the existing child links to
     header = _header(post=(200, {"success": {"0": "ATT00002"}, "successful": {}, "failed": {}}, {}))
-    library = _library(children={"EXIST001": [PDF_CHILD]})
+    library = _library(children={"EXIST001": [_pdf_child(path=_posix_path(linked))]})
     result = _run(bib_file, library, header, pdf_dir)
     attachments = result["attachments"]
     assert attachments["already_has_pdf"] == ["smith2020deep"]
     assert attachments["attached"] == ["lee2021attention"]
     body = json.loads(header.requests_to("POST", WRITE_ITEMS)[0]["body"])
     assert [entry["parentItem"] for entry in body] == ["EXIST002"]
+
+
+def test_matched_item_whose_linked_pdf_is_missing_is_attached(bib_file, pdf_dir):
+    _write_pdf(pdf_dir, "smith2020deep")
+    _write_pdf(pdf_dir, "lee2021attention")
+    library = _library(children={"EXIST001": [_pdf_child(path=_posix_path(pdf_dir / "moved-away.pdf"))]})
+    result = _run(bib_file, library, _header(), pdf_dir)
+    attachments = result["attachments"]
+    assert attachments["already_has_pdf"] == []
+    assert attachments["attached"] == ["smith2020deep", "lee2021attention"]
 
 
 def test_missing_or_non_pdf_file_is_skipped_and_nothing_is_authorized(bib_file, pdf_dir):

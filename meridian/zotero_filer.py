@@ -862,11 +862,38 @@ def _match_existing_item(norm_doi, norm_title, records):
     return None
 
 
+def _desktop_child_has_file(data):
+    """True when a PDF child's file is present on this machine.
+
+    The desktop API reports a stored file as "storage:<name>". A stored file is
+    trusted from that report, because this client does not know the Zotero data
+    directory, so the file itself is not checked on disk. A linked file counts only
+    when its path exists on disk. A child with no path, a linked URL or an unknown
+    link mode has no file here.
+    """
+    path = data.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return False
+    path = path.strip()
+    link_mode = data.get("linkMode")
+    if path.lower().startswith("storage:"):
+        return link_mode in _STORED_LINK_MODES and bool(path[len("storage:"):].strip())
+    if link_mode == "linked_file" or link_mode in _STORED_LINK_MODES:
+        return os.path.isfile(path)
+    return False
+
+
 def _has_pdf_child(item_key, transport):
-    """True when the item already has a child whose contentType is application/pdf."""
+    """True when the item has a PDF child whose file is present (see _desktop_child_has_file).
+
+    A PDF child with no file, or with a linked file missing from disk, does not count,
+    so the item gets a new attachment.
+    """
     for obj in _get_all_pages(transport, f"{LOCAL_API}/items/{item_key}/children?format=json"):
         data = obj.get("data") if isinstance(obj, dict) else None
-        if isinstance(data, dict) and str(data.get("contentType") or "").lower() == _PDF_CONTENT_TYPE:
+        if not isinstance(data, dict) or str(data.get("contentType") or "").lower() != _PDF_CONTENT_TYPE:
+            continue
+        if _desktop_child_has_file(data):
             return True
     return False
 

@@ -24,10 +24,6 @@ SERVER_ID = "SRV-TEST-1"
 KEY = "DUMMYKEY0123456789ABCDEF"  # fake key, never a real credential
 APP_NAME = "Meridian Zotero filer"
 FILED_KEYS = ("NEW00001", "NEW00002")
-PDF_CHILD = {
-    "key": "CHILDPDF1",
-    "data": {"key": "CHILDPDF1", "itemType": "attachment", "contentType": "application/pdf", "linkMode": "linked_file"},
-}
 SAMPLE_BIB = """
 @article{smith2020deep,
   author = {Smith, Jane and {Google DeepMind}},
@@ -159,6 +155,19 @@ def _write_pdf(directory, citekey, body=PDF_HEAD):
     return path
 
 
+def _posix_path(path):
+    """Absolute path with forward slashes, the form the desktop API uses for linked files."""
+    return os.path.abspath(path).replace("\\", "/")
+
+
+def _pdf_child(key="CHILDPDF1", *, path=None, link_mode="linked_file"):
+    """A PDF child as the desktop children endpoint lists it. path is set only when given."""
+    data = {"key": key, "itemType": "attachment", "contentType": "application/pdf", "linkMode": link_mode}
+    if path is not None:
+        data["path"] = path
+    return {"key": key, "data": data}
+
+
 @pytest.fixture
 def bib_file(tmp_path):
     path = tmp_path / "refs.bib"
@@ -286,8 +295,10 @@ def test_missing_and_non_pdf_files_are_skipped_without_authorizing(bib_file, pdf
 def test_item_that_already_has_a_pdf_child_is_skipped(bib_file, pdf_dir):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
+    linked = _write_pdf(pdf_dir.parent, "linked-copy")  # the file the existing child links to
     header = _attach(post=(200, {"success": {"0": "ATT00002"}, "successful": {}, "failed": {}}, {}))
-    result = _run(bib_file, _library(children={"NEW00001": [PDF_CHILD]}), header, pdf=pdf_dir)
+    children = {"NEW00001": [_pdf_child(path=_posix_path(linked))]}
+    result = _run(bib_file, _library(children=children), header, pdf=pdf_dir)
     assert result["attachments"]["already_has_pdf"] == ["smith2020deep"]
     assert result["attachments"]["attached"] == ["lee2021attention"]
     assert len(header.requests_to("POST", AUTHORIZE)) == 1
@@ -300,6 +311,48 @@ def test_non_pdf_child_does_not_count_as_a_pdf(bib_file, pdf_dir):
     _write_pdf(pdf_dir, "lee2021attention")
     snapshot = {"key": "CHILDSNAP1", "data": {"itemType": "attachment", "contentType": "text/html"}}
     result = _run(bib_file, _library(children={"NEW00001": [snapshot]}), _attach(), pdf=pdf_dir)
+    assert result["attachments"]["already_has_pdf"] == []
+    assert result["attachments"]["attached"] == ["smith2020deep", "lee2021attention"]
+
+
+# ---------------------------------------------------------------------------
+# A PDF child counts only when its file is present on this machine
+# ---------------------------------------------------------------------------
+
+def _children_transport(item_key, children):
+    return FakeTransport({("GET", zf.LOCAL_API + f"/items/{item_key}/children"): (200, children)})
+
+
+@pytest.mark.parametrize("child", [
+    _pdf_child(),
+    _pdf_child(link_mode="linked_url"),
+    _pdf_child(link_mode="imported_file"),
+], ids=["linked_file_without_path", "linked_url", "stored_without_storage_path"])
+def test_pdf_child_with_no_file_does_not_count(child):
+    assert zf._has_pdf_child("NEW00001", _children_transport("NEW00001", [child])) is False
+
+
+def test_linked_pdf_child_whose_file_is_missing_does_not_count(pdf_dir):
+    child = _pdf_child(path=_posix_path(pdf_dir / "moved-away.pdf"))
+    assert zf._has_pdf_child("NEW00001", _children_transport("NEW00001", [child])) is False
+
+
+def test_linked_pdf_child_whose_file_exists_counts(pdf_dir):
+    present = _write_pdf(pdf_dir, "linked-copy")
+    child = _pdf_child(path=_posix_path(present))
+    assert zf._has_pdf_child("NEW00001", _children_transport("NEW00001", [child])) is True
+
+
+def test_stored_pdf_child_counts_when_zotero_reports_its_storage_path():
+    child = _pdf_child(link_mode="imported_file", path="storage:smith2020deep.pdf")
+    assert zf._has_pdf_child("NEW00001", _children_transport("NEW00001", [child])) is True
+
+
+def test_item_whose_linked_pdf_is_missing_gets_a_new_attachment(bib_file, pdf_dir):
+    _write_pdf(pdf_dir, "smith2020deep")
+    _write_pdf(pdf_dir, "lee2021attention")
+    children = {"NEW00001": [_pdf_child(path=_posix_path(pdf_dir / "moved-away.pdf"))]}
+    result = _run(bib_file, _library(children=children), _attach(), pdf=pdf_dir)
     assert result["attachments"]["already_has_pdf"] == []
     assert result["attachments"]["attached"] == ["smith2020deep", "lee2021attention"]
 
