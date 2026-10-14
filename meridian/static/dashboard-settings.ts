@@ -2513,6 +2513,45 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
+  // Use Mode section: per-project publication posture, a sibling of Execution Mode.
+  // standard_publication (default) stores restricted images with a credit line and a review flag;
+  // commercialized requires owner approval before restricted images are stored.
+
+  const useMode = (projectSettings && projectSettings.use_mode === 'commercialized') ? 'commercialized' : 'standard_publication';
+
+  html += `<div style="margin-bottom:16px">
+
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Use Mode</div>
+
+    <select id="use-mode-${projectId}" aria-label="Use mode" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
+      <option value="standard_publication" ${useMode === 'standard_publication' ? 'selected' : ''}>Standard publication (default)</option>
+      <option value="commercialized" ${useMode === 'commercialized' ? 'selected' : ''}>Commercialized (restricted images need owner approval)</option>
+    </select>
+    <div style="font-size:10px;color:var(--muted);margin-top:6px">Commercialized projects must have owner approval before restricted images are stored. Standard publication stores them with a credit line and a review flag.</div>
+    <div id="use-mode-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px;min-height:13px"></div>
+
+  </div>`;
+
+  setTimeout(() => {
+
+    const umSel = document.getElementById(`use-mode-${projectId}`);
+    const umStatus = document.getElementById(`use-mode-status-${projectId}`);
+
+    if (umSel) umSel.onchange = async () => {
+      if (umStatus) umStatus.textContent = 'Saving…';
+      try {
+        await saveProjectSettings(projectId, { use_mode: umSel.value });
+        if (umStatus) umStatus.textContent = 'Saved.';
+        setTimeout(() => { if (umStatus) umStatus.textContent = ''; }, 1500);
+      } catch (e: any) {
+        if (umStatus) umStatus.textContent = `Save failed: ${String(e)}`;
+      }
+    };
+
+  }, 0);
+
+
+
   // 0716c9e0 — Parallel Safety section
 
   const autoWorktrees = parseInt((projectSettings && projectSettings.auto_worktrees) != null ? projectSettings.auto_worktrees : 1, 10);

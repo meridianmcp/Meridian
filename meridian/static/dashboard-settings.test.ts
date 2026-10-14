@@ -558,6 +558,29 @@ describe("owner member-policy controls", () => {
     expect(calls.some((call) => call.url === "/workspace/member-policy")).toBe(false);
     expect((document.getElementById(`member-policy-${MEMBER_POLICY_PID}`) as HTMLElement).style.display).toBe("none");
   });
+
+  it("renders the use-mode control at the standard default and sends use_mode on change", async () => {
+    setupRuntime();
+    const g = globalThis as any;
+    const w = window as any;
+    const saves: Array<{ projectId: unknown; patch: unknown }> = [];
+    g.saveProjectSettings = async (projectId: unknown, patch: unknown) => {
+      saves.push({ projectId, patch });
+      return {};
+    };
+    w.saveProjectSettings = g.saveProjectSettings;
+    await openSettings();
+
+    const select = document.getElementById(`use-mode-${MEMBER_POLICY_PID}`) as HTMLSelectElement;
+    expect(select.value).toBe("standard_publication");
+    expect(document.getElementById(`use-mode-status-${MEMBER_POLICY_PID}`)).not.toBeNull();
+
+    select.value = "commercialized";
+    await (select.onchange as any)();
+
+    expect(saves).toEqual([{ projectId: MEMBER_POLICY_PID, patch: { use_mode: "commercialized" } }]);
+    expect(document.getElementById(`use-mode-status-${MEMBER_POLICY_PID}`)?.textContent).toBe("Saved.");
+  });
 });
 
 // ff9d2963 — SECURITY-LAUNCH: the generated Claude/Codex hook snippets used
