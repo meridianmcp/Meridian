@@ -9,10 +9,12 @@ processes.
 
 Auth follows the rest of the dashboard. A hosted deployment requires a logged-in
 tenant, and the default-deny gate in ``hosted_route_gate`` also applies to this
-path. A self-hosted server has no tenant concept, so it accepts only a loopback
-client (127.0.0.1 or ::1) and answers any other caller with 403 before
-``connect`` runs. It also answers 403 to any request that carries a forwarding
-header (X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto, Forwarded or
+path. A self-hosted server has no tenant concept. It answers 403 unless
+``MERIDIAN_ZOTERO_CONNECT_ENABLED`` is 1, true or yes (the route is off by
+default). With the switch on, it accepts only a loopback client (127.0.0.1 or
+::1) and answers any other caller with 403 before ``connect`` runs. It also
+answers 403 to any request that carries a forwarding header
+(X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto, Forwarded or
 X-Real-IP): a request relayed by a proxy is not a local use of this route, and
 those headers are how a remote caller could pose as loopback. On the hosted tier
 ``connect`` runs on the server, which cannot reach a workstation's Zotero, so it
@@ -20,6 +22,8 @@ reports ``unreachable``. Hosted requests always arrive through the platform prox
 so the forwarding-header refusal does not apply there.
 """
 from __future__ import annotations
+
+import os
 
 from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
@@ -31,6 +35,10 @@ from .._deps import _get_tenant_from_request, _hosted_mode
 router = APIRouter()
 
 _LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1"})
+
+# D2: the self-hosted route is opt-in. Hosted mode does not read this switch.
+_ENABLE_ENV = "MERIDIAN_ZOTERO_CONNECT_ENABLED"
+_ENABLE_VALUES = ("1", "true", "yes")
 
 # Lower-case; Starlette's Headers lookup is case-insensitive.
 _FORWARDING_HEADERS = (
@@ -54,12 +62,22 @@ _HTTP_STATUS_BY_RESULT = {
 }
 
 
+def _self_hosted_connect_enabled() -> bool:
+    """True only when the self-hosted switch is 1, true or yes (case and surrounding space ignored)."""
+    return os.environ.get(_ENABLE_ENV, "").strip().lower() in _ENABLE_VALUES
+
+
 @router.post("/zotero/connect")
 async def zotero_connect_route(request: Request) -> JSONResponse:
     """Run one Zotero approval attempt for a logged-in user who explicitly confirmed it."""
     if _hosted_mode():
         if await _get_tenant_from_request(request) is None:
             return JSONResponse({"error": "not authenticated"}, status_code=401)
+    elif not _self_hosted_connect_enabled():
+        return JSONResponse(
+            {"error": f"connect is off on this server: set {_ENABLE_ENV}=1 to turn it on"},
+            status_code=403,
+        )
     elif request.client is None or request.client.host not in _LOOPBACK_CLIENTS:
         return JSONResponse({"error": "connect runs only from this machine"}, status_code=403)
     elif any(name in request.headers for name in _FORWARDING_HEADERS):

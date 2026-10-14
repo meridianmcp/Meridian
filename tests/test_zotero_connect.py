@@ -540,8 +540,17 @@ def test_a_dry_run_never_asks_for_an_approval(env, bib_file, live_filer):
 # The connect route: logged-in caller, explicit confirm, one connect() per call
 # ---------------------------------------------------------------------------
 
-def _route_client(monkeypatch, *, hosted=False, tenant=None, client_host="127.0.0.1"):
+# The self-hosted route is off unless this variable is 1, true or yes (D2).
+ROUTE_ENV = "MERIDIAN_ZOTERO_CONNECT_ENABLED"
+
+
+def _route_client(monkeypatch, *, hosted=False, tenant=None, client_host="127.0.0.1", connect_env="1"):
+    """Build a test client for the route. ``connect_env=None`` leaves the switch unset."""
     monkeypatch.setattr(zotero_route, "_hosted_mode", lambda: hosted)
+    if connect_env is None:
+        monkeypatch.delenv(ROUTE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(ROUTE_ENV, connect_env)
 
     async def _tenant(request):
         return tenant
@@ -1110,4 +1119,75 @@ def test_hosted_connect_route_still_requires_a_logged_in_user_with_forwarding_he
         "/zotero/connect", json={"confirm": True}, headers={"X-Forwarded-For": "203.0.113.7"},
     )
     assert response.status_code == 401
+    assert calls == []
+
+
+# D2: the self-hosted route is off by default. Only MERIDIAN_ZOTERO_CONNECT_ENABLED
+# set to 1, true or yes turns it on, and hosted mode ignores the switch.
+
+@pytest.mark.parametrize("client_host", ["127.0.0.1", "::1"])
+def test_self_hosted_connect_route_is_off_when_the_switch_is_unset(env, monkeypatch, client_host):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, client_host=client_host, connect_env=None)
+    response = client.post("/zotero/connect", json={"confirm": True})
+    assert response.status_code == 403
+    assert ROUTE_ENV in response.json()["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "on", "enabled"])
+def test_self_hosted_connect_route_stays_off_for_any_other_value(env, monkeypatch, value):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, connect_env=value)
+    response = client.post("/zotero/connect", json={"confirm": True})
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "TRUE", " Yes "])
+def test_self_hosted_connect_route_proceeds_when_the_switch_is_set(env, monkeypatch, value):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, connect_env=value)
+    response = client.post("/zotero/connect", json={"confirm": True})
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
+def test_enabled_route_still_refuses_a_non_loopback_client(env, monkeypatch):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, connect_env="1", client_host="203.0.113.9")
+    response = client.post("/zotero/connect", json={"confirm": True})
+    assert response.status_code == 403
+    assert response.json()["error"] == "connect runs only from this machine"
+    assert calls == []
+
+
+def test_enabled_route_still_requires_an_explicit_confirm(env, monkeypatch):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, connect_env="1")
+    assert client.post("/zotero/connect", json={}).status_code == 400
+    assert calls == []
+
+
+def test_hosted_connect_route_ignores_the_switch_when_it_is_unset(env, monkeypatch):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, hosted=True, tenant={"id": "tenant-1"}, connect_env=None)
+    response = client.post("/zotero/connect", json={"confirm": True})
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("value", ["0", "no"])
+def test_hosted_connect_route_is_not_switched_off_by_a_false_value(env, monkeypatch, value):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, hosted=True, tenant={"id": "tenant-1"}, connect_env=value)
+    response = client.post("/zotero/connect", json={"confirm": True})
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
+def test_hosted_unauthenticated_request_is_still_401_when_the_switch_is_unset(env, monkeypatch):
+    calls = _recording_connect(monkeypatch, {"status": "connected", "message": "ok"})
+    client = _route_client(monkeypatch, hosted=True, tenant=None, connect_env=None)
+    assert client.post("/zotero/connect", json={"confirm": True}).status_code == 401
     assert calls == []
