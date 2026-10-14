@@ -329,6 +329,8 @@ async def patch_project_settings(
         require_merge_approval=body.require_merge_approval,
         code_intel_enabled=body.code_intel_enabled,
         execution_mode=body.execution_mode,
+        use_mode=body.use_mode,
+        use_mode_actor="http:patch_project_settings",
     )
     if settings is None:
         raise HTTPException(status_code=404, detail="project not found")

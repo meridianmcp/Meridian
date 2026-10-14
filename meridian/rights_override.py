@@ -23,12 +23,15 @@ from typing import Any
 
 from meridian import gate_override
 from meridian.rights_policy import (
+    COMMERCIALIZED,
     RIGHTS_OVERRIDE_EVENT_TYPE,
     RIGHTS_OVERRIDE_GATE,
+    STANDARD_PUBLICATION,
     ImageStorageDecision,
     RightsOverride,
     RightsPolicyError,
     decide_image_storage,
+    normalize_use_mode,
 )
 
 
@@ -43,6 +46,33 @@ def _subject(subject_id: Any) -> str:
 
 def _wrap(exc: gate_override.GateOverrideError) -> RightsPolicyError:
     return RightsPolicyError(exc.code, str(exc))
+
+
+async def _effective_use_mode(db: Any, project_id: str, requested: str | None) -> str:
+    """The use mode the gate applies to this project.
+
+    COMMERCIALIZED if EITHER the project's stored mode OR the explicit ``requested``
+    argument is commercialized, otherwise STANDARD_PUBLICATION. The stored mode is
+    read from the project row, so a caller cannot unlock a commercialized project
+    by passing standard. A missing project is refused with PROJECT_NOT_FOUND. An
+    unknown explicit value raises USE_MODE_INVALID. A stored value that is not
+    exactly standard_publication (blank, unknown, or written by raw SQL) is treated
+    as commercialized, so bad data can only tighten the gate, never loosen it.
+    """
+    from meridian import db as db_module  # noqa: PLC0415 — avoid import cycle
+
+    try:
+        stored = await db_module.get_project_use_mode(db, project_id)
+    except ValueError as exc:
+        raise RightsPolicyError(
+            "PROJECT_NOT_FOUND",
+            f"project {project_id!r} does not exist; no image bytes can be stored against it",
+        ) from exc
+    explicit_mode = normalize_use_mode(requested)
+    stored_is_standard = stored == STANDARD_PUBLICATION
+    if not stored_is_standard or explicit_mode == COMMERCIALIZED:
+        return COMMERCIALIZED
+    return STANDARD_PUBLICATION
 
 
 async def request_rights_override(
@@ -91,9 +121,11 @@ async def authorize_image_storage(
 ) -> ImageStorageDecision:
     """Decide whether a byte write may proceed, and audit any human override.
 
-    Call this before writing image bytes. ``use_mode`` is the project's use
-    mode; a commercialized project must pass ``COMMERCIALIZED``, or the gate
-    will not apply. With no tier refusal, or with no ``hitl_id``, it returns
+    Call this before writing image bytes. The gate applies COMMERCIALIZED when
+    EITHER the project's stored use mode (see ``db.set_project_use_mode``) OR the
+    explicit ``use_mode`` argument is commercialized, and STANDARD_PUBLICATION
+    otherwise. A missing project raises PROJECT_NOT_FOUND before anything is
+    decided or written. With no tier refusal, or with no ``hitl_id``, it returns
     the decision and writes nothing. With a ``hitl_id`` and a refusal, it:
 
     1. requires a non-empty ``reason`` (checked before the approval is spent),
@@ -103,10 +135,10 @@ async def authorize_image_storage(
     4. re-decides, refusing agent approvers, and
     5. writes the audit row. A failed audit write raises, so no override proceeds.
     """
-    # With no use_mode given, the policy's own default applies, so this module
-    # never keeps a second copy of it.
-    mode_kwargs = {} if use_mode is None else {"use_mode": use_mode}
-    decision = decide_image_storage(raw_license, derived=derived, redrawn=redrawn, **mode_kwargs)
+    effective_mode = await _effective_use_mode(db, project_id, use_mode)
+    decision = decide_image_storage(
+        raw_license, derived=derived, redrawn=redrawn, use_mode=effective_mode,
+    )
     hid = hitl_id.strip() if isinstance(hitl_id, str) else ""
     if decision.allowed or not hid:
         return decision
@@ -133,7 +165,8 @@ async def authorize_image_storage(
         reason=approved_reason,
     )
     approved = decide_image_storage(
-        raw_license, derived=derived, redrawn=redrawn, override=override, **mode_kwargs,
+        raw_license, derived=derived, redrawn=redrawn, override=override,
+        use_mode=effective_mode,
     )
     await gate_override.record_override_audit(
         db,

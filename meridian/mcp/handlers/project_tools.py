@@ -22,6 +22,7 @@ from meridian import db as db_module
 from meridian import profile_contract as _profile_contract
 from meridian._deps import _hosted_mode
 from meridian.mcp_tools import _select_active_tool_set
+from meridian.rights_policy import COMMERCIALIZED, STANDARD_PUBLICATION
 
 if TYPE_CHECKING:
     pass
@@ -145,6 +146,52 @@ async def handle_set_project_execution_mode(
     if updated is None:
         return {"error": f"project '{_pid}' not found"}
     return updated
+
+
+async def handle_set_project_use_mode(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: set_project_use_mode.
+
+    MCP wrapper over the strict db.set_project_use_mode, the rights gate's
+    per-project input. A value other than standard_publication or commercialized
+    returns {error} and changes nothing. An unknown project returns {error}. The
+    change is audited with the actor ``mcp:set_project_use_mode``.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid and args.get("project_name"):
+        _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+        _pid = (_p or {}).get("id", "") if _p else ""
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    if args.get("use_mode") is None:
+        return {"error": "use_mode is required"}
+    try:
+        current = await db_module.get_project_use_mode(db, _pid)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    # Downgrading a commercialized project would unlock restricted images with
+    # no human in the loop, so it is refused over MCP. The owner makes that change
+    # in the dashboard, where it is audited the same way.
+    if current == COMMERCIALIZED and args["use_mode"] == STANDARD_PUBLICATION:
+        return {
+            "error": (
+                "a commercialized project cannot be moved back to standard_publication "
+                "over MCP; the owner must make that change in the dashboard"
+            ),
+        }
+    try:
+        return await db_module.set_project_use_mode(
+            db, _pid, args["use_mode"],
+            actor="mcp:set_project_use_mode",
+            reason=args.get("reason"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
 
 
 async def handle_register_session(

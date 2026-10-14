@@ -7,7 +7,6 @@ real ``db`` fixture: request, answer, authorize, audit, replay and refusals.
 from __future__ import annotations
 
 import ast
-import functools
 import json
 from pathlib import Path
 
@@ -15,7 +14,6 @@ import pytest
 
 from meridian import db as db_module
 from meridian import gate_override
-from meridian import rights_override
 from meridian import rights_policy as rp
 from meridian.rights_override import authorize_image_storage, request_rights_override
 from meridian.rights_policy import (
@@ -529,20 +527,16 @@ async def _approve(db, hitl_id: str, *, answer=_YES, answered_by="adam"):
     await db_module.answer_hitl_request(db, hitl_id, answer, answered_by=answered_by)
 
 
-@pytest.fixture
-def commercialized(monkeypatch):
-    """Run authorize_image_storage under the commercialized policy.
+async def _commercial_project(db) -> str:
+    """A project whose STORED use mode is commercialized.
 
-    authorize_image_storage passes use_mode only when a caller gives one, so this
-    patch sets the mode for tests that do not pass it. Patching the name it looks
-    up runs the real approval, audit and replay path under commercialized use.
-    Tests that need an explicit mode pass use_mode=COMMERCIALIZED themselves.
+    Real state, not a patch: the project is created and its mode is set through
+    the strict setter, so the gate reads the same value a dashboard or MCP
+    change would leave behind.
     """
-    monkeypatch.setattr(
-        rights_override,
-        "decide_image_storage",
-        functools.partial(rp.decide_image_storage, use_mode=COMMERCIALIZED),
-    )
+    pid = await _project(db)
+    await db_module.set_project_use_mode(db, pid, COMMERCIALIZED, actor="test-human")
+    return pid
 
 
 @pytest.mark.asyncio
@@ -599,8 +593,8 @@ async def test_standard_publication_stores_link_only_bytes_without_a_hitl_or_aud
 
 
 @pytest.mark.asyncio
-async def test_link_only_refuses_bytes_and_files_nothing_without_a_hitl(db, commercialized):
-    pid = await _project(db)
+async def test_link_only_refuses_bytes_and_files_nothing_without_a_hitl(db):
+    pid = await _commercial_project(db)
     d = await authorize_image_storage(db, pid, "CC BY-NC 4.0", subject_id="fig-1")
     assert d.allowed is False
     assert d.tier == LINK_ONLY
@@ -610,8 +604,8 @@ async def test_link_only_refuses_bytes_and_files_nothing_without_a_hitl(db, comm
 
 @pytest.mark.asyncio
 async def test_commercialized_use_mode_passed_explicitly_refuses_link_only_bytes(db):
-    # No fixture: the caller passes the project's use mode, which is the path
-    # real callers take. Before this was wired through, it silently stored.
+    # The project is stored as standard here. An explicit commercialized argument
+    # alone is enough to refuse: the gate takes the stronger of the two modes.
     pid = await _project(db)
     d = await authorize_image_storage(
         db, pid, "CC BY-NC 4.0", subject_id="fig-1", use_mode=COMMERCIALIZED,
@@ -622,8 +616,8 @@ async def test_commercialized_use_mode_passed_explicitly_refuses_link_only_bytes
 
 
 @pytest.mark.asyncio
-async def test_a_pending_approval_does_not_unlock_bytes(db, commercialized):
-    pid = await _project(db)
+async def test_a_pending_approval_does_not_unlock_bytes(db):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid)
     with pytest.raises(RightsPolicyError) as exc:
         await authorize_image_storage(
@@ -634,8 +628,8 @@ async def test_a_pending_approval_does_not_unlock_bytes(db, commercialized):
 
 
 @pytest.mark.asyncio
-async def test_a_no_answer_does_not_unlock_bytes(db, commercialized):
-    pid = await _project(db)
+async def test_a_no_answer_does_not_unlock_bytes(db):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"], answer=_NO)
     with pytest.raises(RightsPolicyError) as exc:
@@ -647,8 +641,8 @@ async def test_a_no_answer_does_not_unlock_bytes(db, commercialized):
 
 
 @pytest.mark.asyncio
-async def test_an_auto_answered_approval_is_refused(db, commercialized):
-    pid = await _project(db)
+async def test_an_auto_answered_approval_is_refused(db):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"], answered_by="auto")
     with pytest.raises(RightsPolicyError) as exc:
@@ -659,8 +653,8 @@ async def test_an_auto_answered_approval_is_refused(db, commercialized):
 
 
 @pytest.mark.asyncio
-async def test_an_agent_answering_the_approval_is_refused_and_not_audited(db, commercialized):
-    pid = await _project(db)
+async def test_an_agent_answering_the_approval_is_refused_and_not_audited(db):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"], answered_by="claude-executor")
     with pytest.raises(RightsPolicyError) as exc:
@@ -672,8 +666,8 @@ async def test_an_agent_answering_the_approval_is_refused_and_not_audited(db, co
 
 
 @pytest.mark.asyncio
-async def test_a_human_approval_unlocks_bytes_once_and_is_audited(db, commercialized):
-    pid = await _project(db)
+async def test_a_human_approval_unlocks_bytes_once_and_is_audited(db):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"])
     d = await authorize_image_storage(
@@ -711,8 +705,8 @@ async def test_a_human_approval_unlocks_bytes_once_and_is_audited(db, commercial
 
 
 @pytest.mark.asyncio
-async def test_an_approval_cannot_be_spent_on_a_different_subject(db, commercialized):
-    pid = await _project(db)
+async def test_an_approval_cannot_be_spent_on_a_different_subject(db):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid, subject="fig-3")
     await _approve(db, hitl["id"])
     with pytest.raises(RightsPolicyError) as exc:
@@ -728,8 +722,8 @@ async def test_an_approval_cannot_be_spent_on_a_different_subject(db, commercial
 
 
 @pytest.mark.asyncio
-async def test_a_missing_reason_is_refused_before_the_approval_is_spent(db, commercialized):
-    pid = await _project(db)
+async def test_a_missing_reason_is_refused_before_the_approval_is_spent(db):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"])
     with pytest.raises(RightsPolicyError) as exc:
@@ -744,8 +738,8 @@ async def test_a_missing_reason_is_refused_before_the_approval_is_spent(db, comm
 
 
 @pytest.mark.asyncio
-async def test_a_blank_subject_is_refused_when_an_approval_is_presented(db, commercialized):
-    pid = await _project(db)
+async def test_a_blank_subject_is_refused_when_an_approval_is_presented(db):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"])
     with pytest.raises(RightsPolicyError) as exc:
@@ -756,8 +750,8 @@ async def test_a_blank_subject_is_refused_when_an_approval_is_presented(db, comm
 
 
 @pytest.mark.asyncio
-async def test_a_redrawn_nd_image_needs_its_own_human_approval(db, commercialized):
-    pid = await _project(db)
+async def test_a_redrawn_nd_image_needs_its_own_human_approval(db):
+    pid = await _commercial_project(db)
     refused = await authorize_image_storage(
         db, pid, "cc-by-nd", subject_id="fig-7", redrawn=True,
     )
@@ -786,8 +780,8 @@ async def test_a_redrawn_nd_image_needs_its_own_human_approval(db, commercialize
 
 
 @pytest.mark.asyncio
-async def test_a_failed_audit_write_blocks_the_override(db, monkeypatch, commercialized):
-    pid = await _project(db)
+async def test_a_failed_audit_write_blocks_the_override(db, monkeypatch):
+    pid = await _commercial_project(db)
     hitl = await _file_request(db, pid)
     await _approve(db, hitl["id"])
 
