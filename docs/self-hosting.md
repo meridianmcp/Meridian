@@ -226,14 +226,19 @@ it on, set `MERIDIAN_ZOTERO_CONNECT_ENABLED=1` (`true` and `yes` also work) in
 the environment that starts Meridian, then restart Meridian. With the switch
 unset, the route answers 403.
 
-- The Zotero desktop app must run on the same machine as Meridian, with its
-  local API turned on in Zotero's Advanced settings.
+- Run Meridian directly on the same machine as Zotero (for example with
+  `pixi run start`), not in the Docker container. The approval is stored in the
+  OS keyring of the machine that runs Meridian. A container has no such keyring,
+  and requests reaching it usually arrive from the Docker gateway rather than
+  `127.0.0.1`, so the route refuses them.
+- The Zotero desktop app must run on that same machine, with its local API turned
+  on in Zotero's Advanced settings.
 - The route accepts a request only from `127.0.0.1` or `::1`, and only when the
   request carries no forwarding headers.
 - A reverse proxy in front of Meridian on the same machine will not work with
   this route, because forwarded requests are refused. The nginx and Caddy
   examples above send `X-Forwarded-For` and similar headers, and the route
-  answers 403 to any request that carries them. Open Meridian directly at
+  answers 403 to any request that carries them. Open Meridian at
   `http://localhost:7878` when you connect to Zotero.
 
 ---
