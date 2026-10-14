@@ -28,6 +28,7 @@ from meridian import db as db_module
 from meridian.db import workspace as workspace_db
 
 _OUT_OF_SCOPE = "Project is outside your access scope."
+_WORKSPACE_DENIED = "Workspace-level data is not available to project-scoped members."
 
 
 def _make_project(client, prefix: str = "w2") -> str:
@@ -418,23 +419,25 @@ def test_profile_layers_of_other_projects_are_refused_for_a_scoped_caller(client
 # H4. POST /workspace/notes/{id}/move
 # ---------------------------------------------------------------------------
 
-def test_moving_a_workspace_note_needs_an_in_scope_destination_project(client, monkeypatch):
+def test_moving_a_workspace_note_is_refused_for_project_scoped_callers(client, monkeypatch):
     mine, theirs = _make_project(client), _make_project(client)
     note = client.post("/workspace/notes", json={"title": "t", "body": "keep me"}).json()
 
+    # A workspace note belongs to no project, so a scoped caller may not move it, whichever
+    # project is named: a move would hand the owner's workspace content to that project.
     _scope_to(monkeypatch, [mine])
     refused = client.post(f"/workspace/notes/{note['id']}/move", json={"project_id": theirs})
-    assert refused.status_code == 403 and refused.json()["detail"] == _OUT_OF_SCOPE
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"] == _WORKSPACE_DENIED
+    refused_in_scope = client.post(f"/workspace/notes/{note['id']}/move", json={"project_id": mine})
+    assert refused_in_scope.status_code == 403, refused_in_scope.text
+    assert refused_in_scope.json()["detail"] == _WORKSPACE_DENIED
 
-    # Nothing moved: still a workspace note, and the foreign project has no note.
+    # Nothing moved: still a workspace note, and neither project has it.
     _scope_to(monkeypatch, None)
     assert [n["id"] for n in client.get("/workspace/notes").json()] == [note["id"]]
     assert client.get(f"/projects/{theirs}/notes").json() == []
-
-    _scope_to(monkeypatch, [mine])
-    moved = client.post(f"/workspace/notes/{note['id']}/move", json={"project_id": mine})
-    assert moved.status_code == 201, moved.text
-    assert moved.json()["project_id"] == mine
+    assert client.get(f"/projects/{mine}/notes").json() == []
 
     # Unscoped callers may still move a note into any project.
     _scope_to(monkeypatch, None)

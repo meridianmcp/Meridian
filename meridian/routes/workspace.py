@@ -8,7 +8,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db, _get_tenant_from_request, _require_project_in_scope
+from .. import _deps
+from .._deps import (
+    WORKSPACE_SCOPE_DENIED,
+    _db,
+    _get_tenant_from_request,
+    _require_project_in_scope,
+)
 from .. import db as db_module
 from ..db import workspace as workspace_db
 
@@ -20,6 +26,21 @@ async def _tenant_id(request: Request) -> str | None:
     (self-host / demo / unauthenticated)."""
     tenant = await _get_tenant_from_request(request)
     return tenant["id"] if tenant else None
+
+
+async def _deny_project_scoped_workspace(request: Request) -> None:
+    """403 when the caller is a project-scoped member of the workspace they are viewing.
+
+    Used by every workspace-level route, reads and writes alike. Workspace notes, decisions,
+    settings, blog posts and the workspace sprint board belong to no project, so a project
+    grant (and its subprojects) does not cover them, and a ``write_workspace_level`` grant
+    does not either: that capability is not consulted here. Owners, workspace-wide members,
+    self-hosted and demo callers resolve to ``None`` and are unchanged. A failure resolving
+    the scope propagates (callers map it to 503). The ``/workspace`` mutation gate in server.py
+    refuses the same routes with the same body before they reach a handler.
+    """
+    if await _deps._scoped_project_ids_for_request(request) is not None:
+        raise HTTPException(status_code=403, detail=WORKSPACE_SCOPE_DENIED)
 
 
 async def _member_policy_owner_context(request: Request) -> tuple[str, str, Any]:
@@ -355,6 +376,7 @@ async def list_workspace_notes_endpoint(
     request: Request, tag: str | None = None
 ) -> list[dict[str, Any]]:
     """Workspace notes (newest first). ``?tag=X`` filters by substring match."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_workspace_notes(
         await _db(request), tag=tag, tenant_id=await _tenant_id(request)
     )
@@ -365,6 +387,7 @@ async def create_workspace_note_endpoint(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Create a workspace note. Body: {title, body, tags?}."""
+    await _deny_project_scoped_workspace(request)
     title = (body.get("title") or "").strip()
     text = (body.get("body") or "").strip()
     if not title or not text:
@@ -380,6 +403,7 @@ async def update_workspace_note_endpoint(
     note_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Patch title/body/tags on a workspace note."""
+    await _deny_project_scoped_workspace(request)
     result = await db_module.update_workspace_note(
         await _db(request), note_id,
         title=body.get("title"),
@@ -397,6 +421,7 @@ async def delete_workspace_note_endpoint(
     note_id: str, request: Request
 ) -> Response:
     """Hard-delete a workspace note. Returns 204 or 404."""
+    await _deny_project_scoped_workspace(request)
     ok = await db_module.delete_workspace_note(
         await _db(request), note_id, tenant_id=await _tenant_id(request)
     )
@@ -411,6 +436,10 @@ async def move_workspace_note_endpoint(
 ) -> dict[str, Any]:
     """Move a workspace note to a project (converts it to a project note and
     removes it from the workspace). Body: {project_id}. Returns the new note."""
+    # Moving a workspace note hands its content to the destination project, which a
+    # project-scoped caller can then read. Refused for them whatever the
+    # write_workspace_level grant (the MCP twin is in scope_guard.WORKSPACE_DENY).
+    await _deny_project_scoped_workspace(request)
     project_id = (body.get("project_id") or "").strip()
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id required")
@@ -436,6 +465,7 @@ async def list_workspace_decisions_endpoint(
 ) -> list[dict[str, Any]]:
     """Active workspace decisions (newest first). ``?include_superseded=true``
     returns full history."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_workspace_decisions(
         await _db(request), include_superseded=include_superseded,
         tenant_id=await _tenant_id(request),
@@ -447,6 +477,7 @@ async def create_workspace_decision_endpoint(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Pin a workspace decision. Body: {title, body, category?}."""
+    await _deny_project_scoped_workspace(request)
     title = (body.get("title") or "").strip()
     text = (body.get("body") or "").strip()
     category = body.get("category", "TECHNICAL")
@@ -463,6 +494,7 @@ async def delete_workspace_decision_endpoint(
     decision_id: str, request: Request
 ) -> Response:
     """Hard-delete a workspace decision. Returns 204 or 404."""
+    await _deny_project_scoped_workspace(request)
     ok = await db_module.delete_workspace_decision(
         await _db(request), decision_id, tenant_id=await _tenant_id(request)
     )
@@ -476,6 +508,7 @@ async def delete_workspace_decision_endpoint(
 @router.get("/workspace/settings")
 async def get_workspace_settings_endpoint(request: Request) -> dict[str, Any]:
     """Read the workspace-global default settings (singleton)."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_workspace_settings(
         await _db(request), tenant_id=await _tenant_id(request)
     )
@@ -497,6 +530,7 @@ async def update_workspace_settings_endpoint(
     available through the MCP update_workspace_settings tool, which calls
     db.update_workspace_settings directly and does not go through this route.
     """
+    await _deny_project_scoped_workspace(request)
     nudge_thresh = body.get("log_task_sprint_nudge_threshold")
     interval = body.get("refresh_interval_turns")
     trigger_min_interval = body.get("refresh_trigger_min_interval")
@@ -538,6 +572,7 @@ async def list_workspace_blog_endpoint(
 ) -> list[dict[str, Any]]:
     """Workspace-scoped blog posts (newest first). ``?status=`` filters to
     draft|published|archived. Each post carries a ``/blog/<slug>`` url (8843250f)."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_blog_posts(
         await _db(request), tenant_id=await _tenant_id(request), status=status
     )
@@ -549,6 +584,7 @@ async def create_workspace_blog_endpoint(
 ) -> dict[str, Any]:
     """Create or update a workspace blog post. Body: {title, body?, status?,
     slug?, id?}. Pass ``id`` to update an existing post."""
+    await _deny_project_scoped_workspace(request)
     title = (body.get("title") or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="title required")
@@ -569,6 +605,7 @@ async def list_workspace_sprint_items_endpoint(
 ) -> list[dict[str, Any]]:
     """Workspace sprint items, grouped by item_group. ``?status=`` and
     ``?group=`` filter. Not tied to any project."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_workspace_sprint_items(
         await _db(request), status=status, item_group=group,
         tenant_id=await _tenant_id(request),
@@ -580,6 +617,7 @@ async def create_workspace_sprint_item_endpoint(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Add a workspace sprint item. Body: {title, group?, human_id?}."""
+    await _deny_project_scoped_workspace(request)
     title = (body.get("title") or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="title required")
@@ -596,6 +634,7 @@ async def patch_workspace_sprint_item_endpoint(
     item_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Patch title/status/group/human_id on a workspace sprint item."""
+    await _deny_project_scoped_workspace(request)
     item = await db_module.update_workspace_sprint_item(
         await _db(request), item_id,
         title=body.get("title"),
@@ -614,6 +653,7 @@ async def complete_workspace_sprint_item_endpoint(
     item_id: str, request: Request
 ) -> dict[str, Any]:
     """Mark a workspace sprint item done (stamps completed_at)."""
+    await _deny_project_scoped_workspace(request)
     item = await db_module.complete_workspace_sprint_item(
         await _db(request), item_id, tenant_id=await _tenant_id(request)
     )

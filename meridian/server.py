@@ -66,6 +66,7 @@ from ._deps import (
     _required_perm_for_request,
     _render_workspace_block,
     _build_workspace_context_block,
+    _workspace_visible_for_request,
     _render_context_block,
 )
 from .pid_probe import pid_is_alive
@@ -1809,7 +1810,9 @@ async def _member_policy_nonproject_write_response(request: Request) -> Response
 
     from . import member_policy  # noqa: PLC0415
     from ._deps import (  # noqa: PLC0415
+        WORKSPACE_SCOPE_DENIED,
         _deny_unless_in_scope,
+        _is_workspace_data_path,
         _scoped_project_ids_for_request,
         _session_project_id,
     )
@@ -1860,6 +1863,12 @@ async def _member_policy_nonproject_write_response(request: Request) -> Response
             capability = member_policy.WRITE_PROJECT
             target = project_id or session_id
         elif workspace_mutation or github_connection_mutation:
+            if _is_workspace_data_path(path):
+                # Workspace notes, decisions, settings, blog posts and the sprint board
+                # belong to no project. A project-scoped caller is refused whatever the
+                # write_workspace_level grant, with the same body the routes return
+                # (routes/workspace.py::_deny_project_scoped_workspace).
+                return JSONResponse({"detail": WORKSPACE_SCOPE_DENIED}, status_code=403)
             capability = member_policy.WRITE_WORKSPACE_LEVEL
             target = path
         elif profile_layer_mutation:
@@ -4339,11 +4348,29 @@ async def workspace_update_member(request: Request, member_id: str) -> dict[str,
         )
     if role is not None and github_access is None:
         github_access = default_github_access_for_role(role)
-    if role is None and github_access is None:
-        raise HTTPException(status_code=422, detail="role or github_access required")
+    # project_id present in the body (even as null) changes the member's scope.
+    # null elevates a project-scoped member to the whole workspace; an id scopes
+    # the member to that one project. Absent leaves the scope alone.
+    scope_given = "project_id" in body
+    scope_project_id = None
+    if scope_given:
+        raw_scope = body.get("project_id")
+        if raw_scope is None:
+            scope_project_id = None
+        elif isinstance(raw_scope, str) and raw_scope.strip():
+            scope_project_id = raw_scope.strip()
+        else:
+            # A blank string must not silently widen a member to the whole workspace.
+            raise HTTPException(
+                status_code=422,
+                detail="project_id must be a project id, or null for the whole workspace",
+            )
+    if role is None and github_access is None and not scope_given:
+        raise HTTPException(status_code=422, detail="role, github_access or project_id required")
+    scope_kwargs = {"project_id": scope_project_id} if scope_given else {}
     updated = await db_module.update_workspace_member(
         request.app.state.db, member_id, tenant["id"],
-        role=role, github_access=github_access,
+        role=role, github_access=github_access, **scope_kwargs,
     )
     if updated is None:
         raise HTTPException(status_code=404, detail="member not found")
@@ -4352,6 +4379,7 @@ async def workspace_update_member(request: Request, member_id: str) -> dict[str,
         "email": updated["email"],
         "role": updated["role"],
         "github_access": updated.get("github_access"),
+        "project_id": updated.get("project_id"),
         "pending": updated.get("joined_at") is None,
     }
 
@@ -6429,6 +6457,7 @@ async def _start_session_composite(
     version: str | None = None,
     mode: str | None = None,
     expand_stale: bool = False,
+    include_workspace: bool = True,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -6877,7 +6906,10 @@ async def _start_session_composite(
     # count, policy-note titles, the fetch calls); the full text only when
     # include_workspace_context is on. See _build_workspace_context_block.
     try:
-        workspace_context = await _build_workspace_context_block(db)
+        # include_workspace=False: a project-scoped caller gets no owner workspace rows.
+        workspace_context = await _build_workspace_context_block(
+            db, include_workspace=include_workspace,
+        )
     except Exception:
         workspace_context = ""
 
@@ -7040,6 +7072,7 @@ async def start_session_endpoint(
             client_type=body.client,
             role=body.role,
             source=body.source,
+            include_workspace=await _workspace_visible_for_request(request),
         )
     except ValueError as _ve:
         raise HTTPException(status_code=400, detail=str(_ve)) from _ve
@@ -7363,8 +7396,10 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     # v2.8 — Codex/Claude hook sessions rarely pass a human_id, so they land on
     # the timeline as "(unknown)". Fall back to the workspace display name the
     # user set in Settings so their automated sessions are attributed to them.
+    include_workspace = await _workspace_visible_for_request(request)
     human_id = body.get("human_id")
-    if not human_id:
+    # The workspace display name is the owner's; a project-scoped caller never reads it.
+    if not human_id and include_workspace:
         try:
             ws = await db_module.get_workspace_settings(db)
             human_id = (ws.get("display_name") or "").strip() or None
@@ -7376,6 +7411,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         client_type="hook",
         source=source or None,
         mode="continue" if body.get("mode") == "continue" else None,
+        include_workspace=include_workspace,
     )
     goal = result.get("goal") or {}
     sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")

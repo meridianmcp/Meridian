@@ -12177,6 +12177,7 @@ async def generate_handoff(
     goal_string_out: "dict[str, Any] | None" = None,
     pending_goal_receiver: "dict[str, Any] | None" = None,
     refresh_retrospective: bool = False,
+    include_workspace: bool = True,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -12909,7 +12910,9 @@ async def generate_handoff(
     # No allowlisted "workspace-policy" channel exists yet for delta/goal/
     # starter/planner to opt into a narrow slice of this — see the aec043cb
     # item notes point 4; until one exists, the answer is "none survives".
-    if mode == "full":
+    # include_workspace=False (a project-scoped caller) keeps the owner's workspace
+    # records out of the document, exactly as the non-full modes do.
+    if mode == "full" and include_workspace:
         workspace_decisions = await db_module.get_workspace_decisions(db)
         workspace_notes = await db_module.get_workspace_notes(db)
     else:

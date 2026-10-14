@@ -1160,8 +1160,40 @@ def _render_workspace_index_block(
     return "\n".join(lines)
 
 
+#: 403 body for a project-scoped caller on a workspace-level route, read or write. One text
+#: shared by every workspace route and by the ``/workspace`` mutation gate in server.py, so the
+#: refusal is identical wherever it is raised.
+WORKSPACE_SCOPE_DENIED = "Workspace-level data is not available to project-scoped members."
+
+#: Path prefixes of the workspace-level HTTP routes whose data belongs to no project: notes,
+#: decisions, settings, blog posts and the sprint board, and their children (e.g. note move).
+_WORKSPACE_DATA_PREFIXES = (
+    "/workspace/notes",
+    "/workspace/decisions",
+    "/workspace/settings",
+    "/workspace/blog",
+    "/workspace/sprint-items",
+)
+
+
+def _is_workspace_data_path(path: str) -> bool:
+    """True for a workspace-level data route (read or write) under ``/workspace``."""
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in _WORKSPACE_DATA_PREFIXES)
+
+
+async def _workspace_visible_for_request(request: Request) -> bool:
+    """False for a project-scoped member of the workspace being viewed, True otherwise.
+
+    The workspace-level notes, decisions and settings belong to no project, so a
+    project-scoped caller never gets them in a rendered document (handoff, context block,
+    session start). Owners, workspace-wide members and self-hosted callers resolve to
+    ``None`` from the scope resolver and keep the workspace section.
+    """
+    return await _scoped_project_ids_for_request(request) is None
+
+
 async def _build_workspace_context_block(
-    db: Any, *, tenant_id: "str | None" = None
+    db: Any, *, tenant_id: "str | None" = None, include_workspace: bool = True,
 ) -> str:
     """0b0b24d8 — the workspace block for a cold session start and
     ``get_context_block``: the bounded index by default, the full text of every
@@ -1169,10 +1201,15 @@ async def _build_workspace_context_block(
     before this change) only when ``include_workspace_context`` is on (see
     ``toml_config.get_include_workspace_context`` for the sources and for why
     it is not a ``workspace_settings`` column).
+
+    ``include_workspace=False`` (a project-scoped caller) returns an empty block: no
+    workspace row is read at all.
     """
     from . import db as _db_module
     from . import toml_config as _toml_config
 
+    if not include_workspace:
+        return ""
     ws_decisions = await _db_module.get_workspace_decisions(db, tenant_id=tenant_id)
     ws_notes = await _db_module.get_workspace_notes(db, tenant_id=tenant_id)
     if _toml_config.get_include_workspace_context():

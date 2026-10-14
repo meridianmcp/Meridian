@@ -21,6 +21,7 @@ from meridian import capability_manifest as _capability_manifest
 from meridian import db as db_module
 from meridian import profile_contract as _profile_contract
 from meridian._deps import _hosted_mode
+from meridian.mcp.scope_guard import WORKSPACE_SCOPED_ARG
 from meridian.mcp_tools import _select_active_tool_set
 
 if TYPE_CHECKING:
@@ -254,6 +255,7 @@ async def handle_start_session(
         compact=args.get("compact", True),
         version=args.get("version"),
         mode=args.get("mode"),
+        include_workspace=not args.get(WORKSPACE_SCOPED_ARG),
     )
     # bf51b12e — register executor sessions in-memory so the planner
     # context-refresh hook skips them (the nudge is planner-only). Best-effort:

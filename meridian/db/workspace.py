@@ -3361,6 +3361,11 @@ async def delete_workspace_member(
     return True
 
 
+# Sentinel: project_id was not passed, so the member's scope is left alone.
+# A passed None means "whole workspace" (clears the project scope).
+SCOPE_UNCHANGED: Any = object()
+
+
 async def update_workspace_member(
     db: aiosqlite.Connection,
     member_id: str,
@@ -3368,12 +3373,14 @@ async def update_workspace_member(
     *,
     role: str | None = None,
     github_access: str | None = None,
+    project_id: Any = SCOPE_UNCHANGED,
 ) -> dict[str, Any] | None:
-    """v2.8 — update a member's role and/or github_access (admin-only edit).
+    """v2.8 — update a member's role, github_access, and/or project scope.
 
-    Only the fields passed (non-None) are changed. Scoped by tenant_id so a
-    caller can never touch another workspace's rows. Returns the updated row,
-    or None when no member matched.
+    Only the fields passed are changed. ``project_id=None`` elevates a
+    project-scoped member to the whole workspace; a project id scopes the member
+    to that one project. Scoped by tenant_id so a caller can never touch another
+    workspace's rows. Returns the updated row, or None when no member matched.
     """
     updates: list[str] = []
     params: list[Any] = []
@@ -3383,6 +3390,9 @@ async def update_workspace_member(
     if github_access is not None:
         updates.append("github_access = ?")
         params.append(github_access)
+    if project_id is not SCOPE_UNCHANGED:
+        updates.append("project_id = ?")
+        params.append(project_id)
     if updates:
         params.extend([member_id, tenant_id])
         await db.execute(

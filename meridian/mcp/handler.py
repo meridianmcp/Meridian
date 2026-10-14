@@ -3811,6 +3811,8 @@ async def _handle_task_tools(
                     continuation_status=_continuation_status,
                     emit_manifest=_emit_manifest,
                     pending_goal_receiver=_pending_goal_receiver,
+                    # A scoped caller never gets the owner's workspace notes/decisions.
+                    include_workspace=not args.get(scope_guard.WORKSPACE_SCOPED_ARG),
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -7822,6 +7824,13 @@ async def _dispatch_mcp_tool(
         args = {k: v for k, v in args.items() if k != "_scoped_project_ids"}
         if scoped_project_ids is not None:
             args = {**args, "_scoped_project_ids": list(scoped_project_ids)}
+    # Handoff, context block and session start carry the owner's workspace notes and
+    # decisions. The flag that leaves them out is never taken from the caller: it is
+    # stripped here and set only for a project-scoped caller.
+    if name in scope_guard.WORKSPACE_CONTEXT_TOOLS:
+        args = {k: v for k, v in args.items() if k != scope_guard.WORKSPACE_SCOPED_ARG}
+        if scoped_project_ids is not None:
+            args = {**args, scope_guard.WORKSPACE_SCOPED_ARG: True}
     # a9c041d7 — re-check tenant scope against the FINAL resolved project_id,
     # after the resolver above may have set it via project_name (or a
     # non-UUID project_id-as-name lookup). The pre-dispatch gate in

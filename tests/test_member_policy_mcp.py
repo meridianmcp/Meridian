@@ -161,30 +161,18 @@ async def test_bulk_project_ids_are_checked_against_member_scope(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-async def test_move_workspace_note_to_project_requires_only_project_write(monkeypatch, tmp_path):
+async def test_move_workspace_note_to_project_is_refused_for_every_scoped_caller(monkeypatch, tmp_path):
+    """A workspace note belongs to no project, so its move is refused by the scope guard for any
+    project-scoped caller, whatever their capabilities. The earlier rule let a project writer move
+    an owner's note into their own project."""
     monkeypatch.setattr(mcp_handler, "_resolve_project_reference", _identity_resolver)
-    monkeypatch.setattr(mcp_handler.scope_guard, "enforce_scoped_call", _allow_scope)
     args = {"note_id": "workspace-note", "project_id": PROJECT}
 
-    with pytest.raises(member_policy.MemberPolicyDenied):
-        await mcp_handler._authorize_scoped_mcp_call(
-            "move_workspace_note_to_project",
-            args,
-            object(),
-            str(tmp_path),
-            None,
-            _scoped((PROJECT,), member_policy.WRITE_WORKSPACE_LEVEL),
-        )
-
-    result = await mcp_handler._authorize_scoped_mcp_call(
-        "move_workspace_note_to_project",
-        args,
-        object(),
-        str(tmp_path),
-        None,
-        _scoped((PROJECT,), member_policy.WRITE_PROJECT),
-    )
-    assert result == args
+    for caps in (member_policy.WRITE_PROJECT, member_policy.WRITE_WORKSPACE_LEVEL):
+        with pytest.raises(ValueError, match="outside your access scope"):
+            await mcp_handler.scope_guard.enforce_scoped_call(
+                "move_workspace_note_to_project", args, object(), _scoped((PROJECT,), caps),
+            )
 
 
 @pytest.mark.asyncio
