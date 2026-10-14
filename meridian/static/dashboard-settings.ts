@@ -3891,32 +3891,84 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
           <option value="member" selected>member</option>
           <option value="viewer">viewer</option>
         </select>
-        <button id="project-invite-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Add to project</button>
+        <button id="project-invite-check-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px">Check</button>
       </div>
+      <div id="project-invite-actions-${projectId}" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap"></div>
       <div id="project-invite-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:5px;min-height:14px"></div>
     </div>`;
     setTimeout(() => {
-      const btn = document.getElementById(`project-invite-btn-${projectId}`) as HTMLButtonElement | null;
+      const checkBtn = document.getElementById(`project-invite-check-${projectId}`) as HTMLButtonElement | null;
       const emailEl = document.getElementById(`project-invite-email-${projectId}`) as HTMLInputElement | null;
       const roleEl = document.getElementById(`project-invite-role-${projectId}`) as HTMLSelectElement | null;
+      const actionsEl = document.getElementById(`project-invite-actions-${projectId}`);
       const statusEl = document.getElementById(`project-invite-status-${projectId}`);
-      if (!btn) return;
-      btn.onclick = async () => {
-        const email = (emailEl?.value || '').trim();
-        const role = roleEl?.value || 'member';
-        if (!email) { if (statusEl) statusEl.textContent = 'Enter an email address.'; return; }
+      if (!checkBtn || !emailEl || !roleEl || !actionsEl) return;
+      const setStatus = (msg: string) => { if (statusEl) statusEl.textContent = msg; };
+      const projectNameOf = (id: string) => ((window.state.projects || []).find((p: any) => p.id === id) as any)?.name || id;
+      const roleText = (row: any) => `${row.role}${row.pending ? ', invite pending' : ''}`;
+      const actionButton = (act: string, label: string, primary: boolean, mid = '') =>
+        `<button type="button" data-act="${act}" data-mid="${escapeHtml(mid)}" class="${primary ? 'primary' : 'secondary'}" style="font-size:10px;padding:4px 10px">${label}</button>`;
+
+      // Workspace membership rows for this email (a member can have one row per scope).
+      async function membershipFor(email: string): Promise<any[]> {
+        const members: any = await api('/workspace/members');
+        return (Array.isArray(members) ? members : []).filter((m: any) => String(m.email || '').toLowerCase() === email);
+      }
+
+      async function runCheck(): Promise<void> {
+        const email = (emailEl!.value || '').trim().toLowerCase();
+        actionsEl!.innerHTML = '';
+        if (!email || !email.includes('@')) { setStatus('Enter an email address.'); return; }
+        setStatus('Checking…');
+        let rows: any[];
+        try { rows = await membershipFor(email); } catch (e: any) { setStatus(`Error: ${String(e)}`); return; }
+        const workspaceRow = rows.find((r: any) => !r.project_id);
+        const thisRow = rows.find((r: any) => r.project_id === projectId);
+        const otherRows = rows.filter((r: any) => r.project_id && r.project_id !== projectId);
+        if (workspaceRow) {
+          setStatus(`${email} is already a workspace member (${roleText(workspaceRow)}), so they can open this project. Nothing to add.`);
+          return;
+        }
+        if (thisRow) {
+          setStatus(`${email} is already a member of this project (${roleText(thisRow)}).`);
+          actionsEl!.innerHTML = actionButton('elevate', 'Make workspace member', false, thisRow.id);
+          return;
+        }
+        if (otherRows.length) {
+          const names = otherRows.map((r: any) => projectNameOf(r.project_id)).join(', ');
+          setStatus(`${email} is a member of ${names} only. Add them to this project, or make them a workspace member.`);
+          actionsEl!.innerHTML = actionButton('add', 'Add to this project', true)
+            + actionButton('elevate', 'Make workspace member', false, otherRows[0].id);
+          return;
+        }
+        setStatus(`${email} is not in this workspace yet.`);
+        actionsEl!.innerHTML = actionButton('add', 'Invite to this project', true);
+      }
+
+      async function doInvite(email: string): Promise<void> {
+        await api('/workspace/invite', { method: 'POST', body: JSON.stringify({ email, role: roleEl!.value || 'member', project_id: projectId }) });
+        setStatus(`Invite sent to ${email} for this project.`);
+      }
+
+      async function doElevate(memberId: string, email: string): Promise<void> {
+        await api(`/workspace/members/${memberId}`, { method: 'PATCH', body: JSON.stringify({ project_id: null }) });
+        setStatus(`${email} is now a workspace member.`);
+      }
+
+      checkBtn.onclick = () => { void runCheck(); };
+      actionsEl.onclick = async (ev: Event) => {
+        const btn = (ev.target as HTMLElement).closest('button[data-act]') as HTMLButtonElement | null;
+        if (!btn) return;
+        const email = (emailEl.value || '').trim().toLowerCase();
         btn.disabled = true;
-        btn.textContent = 'Adding…';
         try {
-          await api('/workspace/invite', { method: 'POST', body: JSON.stringify({ email, role, project_id: projectId }) });
-          if (emailEl) emailEl.value = '';
-          if (statusEl) { statusEl.textContent = `Invite sent to ${email} for this project.`; setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000); }
+          if (btn.dataset.act === 'add') await doInvite(email);
+          else if (btn.dataset.act === 'elevate') await doElevate(btn.dataset.mid || '', email);
           (window as any)._membersRefresh?.[projectId]?.();
+          await runCheck();
         } catch (e: any) {
-          if (statusEl) statusEl.textContent = `Error: ${escapeHtml(String(e))}`;
-        } finally {
+          setStatus(`Error: ${String(e)}`);
           btn.disabled = false;
-          btn.textContent = 'Add to project';
         }
       };
     });

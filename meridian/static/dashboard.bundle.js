@@ -2590,6 +2590,12 @@
     if (["ambiguous", "quarantined", "retired"].includes(status)) return "quarantined";
     return "unknown";
   }
+  function nextOffset(page) {
+    return page.hasMore ? page.offset + page.limit : null;
+  }
+  function prevOffset(page) {
+    return page.offset > 0 ? Math.max(0, page.offset - page.limit) : null;
+  }
   function isArtifactsUnavailable(envelope) {
     return !envelope || envelope.available !== true;
   }
@@ -2692,6 +2698,8 @@
     });
     const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
     if (inviteForm) inviteForm.style.display = "none";
+    const projectInviteForm = document.getElementById(`settings-project-invite-form-${projectId}`);
+    if (projectInviteForm) projectInviteForm.style.display = "none";
     body.querySelectorAll("button").forEach((b2) => {
       if (/^save\b/i.test((b2.textContent || "").trim())) b2.style.display = "none";
     });
@@ -4388,6 +4396,35 @@ project_id = "${displayPid}"`;
           }
         };
       }, 0);
+      const useMode = projectSettings && projectSettings.use_mode === "commercialized" ? "commercialized" : "standard_publication";
+      html += `<div style="margin-bottom:16px">
+
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Use Mode</div>
+
+    <select id="use-mode-${projectId}" aria-label="Use mode" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
+      <option value="standard_publication" ${useMode === "standard_publication" ? "selected" : ""}>Standard publication (default)</option>
+      <option value="commercialized" ${useMode === "commercialized" ? "selected" : ""}>Commercialized (restricted images need owner approval)</option>
+    </select>
+    <div style="font-size:10px;color:var(--muted);margin-top:6px">Commercialized projects must have owner approval before restricted images are stored. Standard publication stores them with a credit line and a review flag.</div>
+    <div id="use-mode-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px;min-height:13px"></div>
+
+  </div>`;
+      setTimeout(() => {
+        const umSel = document.getElementById(`use-mode-${projectId}`);
+        const umStatus = document.getElementById(`use-mode-status-${projectId}`);
+        if (umSel) umSel.onchange = async () => {
+          if (umStatus) umStatus.textContent = "Saving\u2026";
+          try {
+            await saveProjectSettings(projectId, { use_mode: umSel.value });
+            if (umStatus) umStatus.textContent = "Saved.";
+            setTimeout(() => {
+              if (umStatus) umStatus.textContent = "";
+            }, 1500);
+          } catch (e3) {
+            if (umStatus) umStatus.textContent = `Save failed: ${String(e3)}`;
+          }
+        };
+      }, 0);
       const autoWorktrees = parseInt((projectSettings && projectSettings.auto_worktrees) != null ? projectSettings.auto_worktrees : 1, 10);
       const requireMergeApproval = parseInt((projectSettings && projectSettings.require_merge_approval) != null ? projectSettings.require_merge_approval : 1, 10);
       html += `<div style="margin-bottom:16px">
@@ -5187,6 +5224,30 @@ project_id = "${displayPid}"`;
             artifacts: document.getElementById("cp-panel-artifacts")
           };
           const loaded = { relationships: false, proposals: false, artifacts: false };
+          const proposalPageSize = 20;
+          const artifactPageSize = 50;
+          let proposalOffset = 0;
+          let artifactOffset = 0;
+          function paginationMarkup(page, itemCount, label, total) {
+            const first = itemCount ? page.offset + 1 : 0;
+            const last = page.offset + itemCount;
+            const summary = itemCount === 0 ? total === 0 ? "No records" : "No records on this page" : `Showing ${first}\u2013${last}${total == null ? "" : ` of ${total}`}`;
+            const previousPage = prevOffset(page);
+            const followingPage = nextOffset(page);
+            return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0 2px;font-size:10px;color:var(--muted)" aria-label="${escapeHtml(label)} pagination"><span>${escapeHtml(summary)}</span><div style="display:flex;gap:6px"><button type="button" class="secondary" data-cp-page="previous" aria-label="Previous ${escapeHtml(label)} page" ${previousPage === null ? "disabled" : ""} style="font-size:9px;padding:3px 8px">Previous</button><button type="button" class="secondary" data-cp-page="next" aria-label="Next ${escapeHtml(label)} page" ${followingPage === null ? "disabled" : ""} style="font-size:9px;padding:3px 8px">Next</button></div></div>`;
+          }
+          function bindPagination(el3, page, onPage) {
+            const previous = el3.querySelector('[data-cp-page="previous"]');
+            const following = el3.querySelector('[data-cp-page="next"]');
+            if (previous) previous.onclick = () => {
+              const offset = prevOffset(page);
+              if (offset !== null) onPage(offset);
+            };
+            if (following) following.onclick = () => {
+              const offset = nextOffset(page);
+              if (offset !== null) onPage(offset);
+            };
+          }
           async function loadRelationships() {
             const el3 = panels.relationships;
             if (!el3) return;
@@ -5202,9 +5263,21 @@ project_id = "${displayPid}"`;
             const el3 = panels.proposals;
             if (!el3) return;
             try {
-              const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=20`);
-              const items = data.items || [];
-              el3.innerHTML = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
+              const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=${proposalPageSize}&offset=${proposalOffset}`);
+              const items = Array.isArray(data.items) ? data.items : [];
+              const page = {
+                limit: Number(data.limit) || proposalPageSize,
+                offset: Number.isFinite(Number(data.offset)) ? Number(data.offset) : proposalOffset,
+                hasMore: data.has_more === true
+              };
+              const total = Number.isFinite(Number(data.total)) ? Number(data.total) : void 0;
+              proposalOffset = page.offset;
+              const rows = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
+              el3.innerHTML = rows + paginationMarkup(page, items.length, "proposals", total);
+              bindPagination(el3, page, (offset) => {
+                proposalOffset = offset;
+                void loadProposals();
+              });
             } catch (e3) {
               el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
@@ -5213,17 +5286,28 @@ project_id = "${displayPid}"`;
             const el3 = panels.artifacts;
             if (!el3) return;
             try {
-              const data = await api("/control-plane/artifacts?limit=50");
+              const data = await api(`/control-plane/artifacts?limit=${artifactPageSize}&offset=${artifactOffset}`);
               if (isArtifactsUnavailable(data)) {
                 el3.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : "Not available.")}</div>`;
                 return;
               }
-              const items = data.items || [];
-              el3.innerHTML = items.length ? items.map((rec) => {
+              const items = Array.isArray(data.items) ? data.items : [];
+              const page = {
+                limit: Number(data.limit) || artifactPageSize,
+                offset: Number.isFinite(Number(data.offset)) ? Number(data.offset) : artifactOffset,
+                hasMore: data.has_more === true
+              };
+              artifactOffset = page.offset;
+              const rows = items.length ? items.map((rec) => {
                 const health = classifyArtifactHealth(rec);
                 const ident = displaySafe(rec.path || rec.run_id || rec.artifact_id || "(unknown)");
                 return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)"><span>[${escapeHtml(rec.record_kind)}] ${escapeHtml(ident)}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(health)}</span></div>`;
               }).join("") : '<div style="color:var(--muted)">No run manifests, provenance records, or registered artifacts found.</div>';
+              el3.innerHTML = rows + paginationMarkup(page, items.length, "artifacts", data.total);
+              bindPagination(el3, page, (offset) => {
+                artifactOffset = offset;
+                void loadArtifacts();
+              });
             } catch (e3) {
               el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
@@ -5428,6 +5512,105 @@ project_id = "${displayPid}"`;
     </div>`;
       }
       if (isHostedMode()) {
+        const _projectRow = (window.state.projects || []).find((p3) => p3.id === projectId);
+        const _projectName = _projectRow?.name || projectId;
+        html += `<div style="margin-bottom:16px" id="project-invite-section-${projectId}">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Add member to this project</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Access is limited to <strong>${escapeHtml(String(_projectName))}</strong>. Whole-workspace invites are under Account.</div>
+      <div id="settings-project-invite-form-${projectId}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <input id="project-invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
+        <select id="project-invite-role-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
+          <option value="admin">admin</option>
+          <option value="member" selected>member</option>
+          <option value="viewer">viewer</option>
+        </select>
+        <button id="project-invite-check-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px">Check</button>
+      </div>
+      <div id="project-invite-actions-${projectId}" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap"></div>
+      <div id="project-invite-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:5px;min-height:14px"></div>
+    </div>`;
+        setTimeout(() => {
+          const checkBtn = document.getElementById(`project-invite-check-${projectId}`);
+          const emailEl = document.getElementById(`project-invite-email-${projectId}`);
+          const roleEl = document.getElementById(`project-invite-role-${projectId}`);
+          const actionsEl = document.getElementById(`project-invite-actions-${projectId}`);
+          const statusEl = document.getElementById(`project-invite-status-${projectId}`);
+          if (!checkBtn || !emailEl || !roleEl || !actionsEl) return;
+          const setStatus = (msg) => {
+            if (statusEl) statusEl.textContent = msg;
+          };
+          const projectNameOf = (id) => (window.state.projects || []).find((p3) => p3.id === id)?.name || id;
+          const roleText = (row) => `${row.role}${row.pending ? ", invite pending" : ""}`;
+          const actionButton = (act, label, primary, mid = "") => `<button type="button" data-act="${act}" data-mid="${escapeHtml(mid)}" class="${primary ? "primary" : "secondary"}" style="font-size:10px;padding:4px 10px">${label}</button>`;
+          async function membershipFor(email) {
+            const members = await api("/workspace/members");
+            return (Array.isArray(members) ? members : []).filter((m3) => String(m3.email || "").toLowerCase() === email);
+          }
+          async function runCheck() {
+            const email = (emailEl.value || "").trim().toLowerCase();
+            actionsEl.innerHTML = "";
+            if (!email || !email.includes("@")) {
+              setStatus("Enter an email address.");
+              return;
+            }
+            setStatus("Checking\u2026");
+            let rows;
+            try {
+              rows = await membershipFor(email);
+            } catch (e3) {
+              setStatus(`Error: ${String(e3)}`);
+              return;
+            }
+            const workspaceRow = rows.find((r3) => !r3.project_id);
+            const thisRow = rows.find((r3) => r3.project_id === projectId);
+            const otherRows = rows.filter((r3) => r3.project_id && r3.project_id !== projectId);
+            if (workspaceRow) {
+              setStatus(`${email} is already a workspace member (${roleText(workspaceRow)}), so they can open this project. Nothing to add.`);
+              return;
+            }
+            if (thisRow) {
+              setStatus(`${email} is already a member of this project (${roleText(thisRow)}).`);
+              actionsEl.innerHTML = actionButton("elevate", "Make workspace member", false, thisRow.id);
+              return;
+            }
+            if (otherRows.length) {
+              const names = otherRows.map((r3) => projectNameOf(r3.project_id)).join(", ");
+              setStatus(`${email} is a member of ${names} only. Add them to this project, or make them a workspace member.`);
+              actionsEl.innerHTML = actionButton("add", "Add to this project", true) + actionButton("elevate", "Make workspace member", false, otherRows[0].id);
+              return;
+            }
+            setStatus(`${email} is not in this workspace yet.`);
+            actionsEl.innerHTML = actionButton("add", "Invite to this project", true);
+          }
+          async function doInvite(email) {
+            await api("/workspace/invite", { method: "POST", body: JSON.stringify({ email, role: roleEl.value || "member", project_id: projectId }) });
+            setStatus(`Invite sent to ${email} for this project.`);
+          }
+          async function doElevate(memberId, email) {
+            await api(`/workspace/members/${memberId}`, { method: "PATCH", body: JSON.stringify({ project_id: null }) });
+            setStatus(`${email} is now a workspace member.`);
+          }
+          checkBtn.onclick = () => {
+            void runCheck();
+          };
+          actionsEl.onclick = async (ev) => {
+            const btn = ev.target.closest("button[data-act]");
+            if (!btn) return;
+            const email = (emailEl.value || "").trim().toLowerCase();
+            btn.disabled = true;
+            try {
+              if (btn.dataset.act === "add") await doInvite(email);
+              else if (btn.dataset.act === "elevate") await doElevate(btn.dataset.mid || "", email);
+              window._membersRefresh?.[projectId]?.();
+              await runCheck();
+            } catch (e3) {
+              setStatus(`Error: ${String(e3)}`);
+              btn.disabled = false;
+            }
+          };
+        });
+      }
+      if (isHostedMode()) {
         html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Team members</div>
@@ -5452,9 +5635,9 @@ project_id = "${displayPid}"`;
 
         <select id="invite-scope-${projectId}" title="Scope to project (blank = full workspace access)" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
 
-          <option value="">all projects</option>
+          <option value="">whole workspace (all projects)</option>
 
-          ${(window.state.projects || []).map((p3) => `<option value="${escapeHtml(p3.id)}">${escapeHtml(p3.name || p3.id)}</option>`).join("")}
+          ${(window.state.projects || []).map((p3) => `<option value="${escapeHtml(p3.id)}"${p3.id === projectId ? " selected" : ""}>${escapeHtml(p3.name || p3.id)}</option>`).join("")}
 
         </select>
 
@@ -5610,6 +5793,8 @@ project_id = "${displayPid}"`;
               };
             });
           }
+          window._membersRefresh = window._membersRefresh || {};
+          window._membersRefresh[projectId] = () => renderMembers();
           async function renderMembers() {
             if (!listEl) return false;
             let policyLoaded = true;
@@ -8766,7 +8951,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // ../wt-ui-sprint/node_modules/preact/dist/preact.module.js
+  // node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -9025,7 +9210,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // ../wt-ui-sprint/node_modules/preact/hooks/dist/hooks.module.js
+  // node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -9166,7 +9351,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // ../wt-ui-sprint/node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -10019,7 +10204,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // ../wt-ui-sprint/node_modules/zustand/esm/vanilla.mjs
+  // node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
@@ -10056,7 +10241,8 @@ ${n2.tags || ""}`.toLowerCase();
     // leave an active Experiments tab invisible in the rail (90952bad).
     { id: "work", label: "Work", tabs: ["queue", "experiments", "hitl", "team", "sessions"] },
     { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
-    { id: "history", label: "History", tabs: ["timeline", "rewind", "settings"] }
+    { id: "history", label: "History", tabs: ["timeline", "rewind"] },
+    { id: "settings", label: "Settings", tabs: ["settings"] }
   ];
   var ALL_GROUPED_TABS = VTAB_GROUPS.flatMap((g2) => g2.tabs);
   function groupForTab(tab) {
@@ -13862,7 +14048,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="overview" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="overview" title="Overview" aria-label="Overview group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4CA}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="overview" title="Overview" aria-label="Overview group" aria-expanded="true">\u{1F4CA}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13876,7 +14062,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="planning" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="planning" title="Planning" aria-label="Planning group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F3AF}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="planning" title="Planning" aria-label="Planning group" aria-expanded="true">\u{1F3AF}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13892,7 +14078,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="work" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="work" title="Work" aria-label="Work group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F477}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="work" title="Work" aria-label="Work group" aria-expanded="true">\u{1F477}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13912,7 +14098,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="content" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="content" title="Content" aria-label="Content group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4C1}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="content" title="Content" aria-label="Content group" aria-expanded="true">\u{1F4C1}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13934,7 +14120,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="history" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="history" title="History" aria-label="History group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4C5}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="history" title="History" aria-label="History group" aria-expanded="true">\u{1F4C5}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13942,7 +14128,17 @@ Current: ${current2 || "(none)"}`,
 
           <button class="vtab-btn" data-vtab="rewind" title="Rewind \u2014 Last X days">\u21BB</button>
 
-          <button class="vtab-btn" data-vtab="settings" title="Notification Settings">\u2699</button>
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="settings" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="settings" title="Settings" aria-label="Settings group" aria-expanded="true">\u2699</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="settings" title="Settings \u2014 notifications, team and project settings">\u2699</button>
 
         </div>
 
@@ -16186,11 +16382,11 @@ Current: ${current2 || "(none)"}`,
   function showCopyPreview(title, content) {
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9998;display:flex;align-items:center;justify-content:center";
-    overlay.innerHTML = `<div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
+    overlay.innerHTML = `<div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;height:80vh;max-height:calc(100vh - 24px);box-sizing:border-box;overflow:hidden;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
 
     <div style="font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--accent)">${escapeHtml(title)}</div>
 
-    <textarea style="width:100%;height:300px;font-family:var(--font-mono);font-size:11px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:10px;border-radius:4px;resize:vertical;outline:none">${escapeHtml(content)}</textarea>
+    <textarea style="width:100%;max-width:100%;min-width:0;flex:1 1 300px;min-height:0;max-height:calc(80vh - 120px);box-sizing:border-box;overflow:auto;font-family:var(--font-mono);font-size:11px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:10px;border-radius:4px;resize:vertical;outline:none">${escapeHtml(content)}</textarea>
 
     <div style="display:flex;gap:8px;justify-content:flex-end">
 
