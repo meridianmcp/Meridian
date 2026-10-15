@@ -199,6 +199,37 @@ def test_required_perm_for_request_mapping():
     assert _required_perm_for_request("POST", "/projects/p1/decisions") == PERM_WRITE
 
 
+def test_member_policy_paths_need_the_owner_only_permission():
+    """Member-policy administration maps to PERM_MANAGE_POLICY, held by the owner
+    alone, BEFORE the generic team-management branch an invited admin satisfies.
+    The existing mappings above are unchanged."""
+    from meridian._deps import _required_perm_for_request
+    from meridian.roles import (
+        PERM_INVITE, PERM_MANAGE_POLICY, PERM_SETTINGS, ROLE_ADMIN, ROLE_MEMBER,
+        ROLE_OWNER, ROLE_VIEWER, has_perm,
+    )
+
+    policy_paths = [
+        ("PUT", "/workspace/member-policy/default"),
+        ("PUT", "/workspace/member-policy"),
+        ("PUT", "/workspace/members/m1/policy"),
+        ("DELETE", "/workspace/members/m1/policy"),
+    ]
+    for method, path in policy_paths:
+        perm = _required_perm_for_request(method, path)
+        assert perm == PERM_MANAGE_POLICY, (method, path)
+        assert has_perm(ROLE_OWNER, perm)
+        for role in (ROLE_ADMIN, ROLE_MEMBER, ROLE_VIEWER):
+            assert not has_perm(role, perm), (role, method, path)
+    # reading the policy is not a mutation, so it is not role-gated here
+    assert _required_perm_for_request("GET", "/workspace/member-policy") is None
+    # team management and settings keep their old floors
+    assert _required_perm_for_request("PATCH", "/workspace/members/m1") == PERM_INVITE
+    assert _required_perm_for_request("POST", "/workspace/invite") == PERM_INVITE
+    assert _required_perm_for_request("PATCH", "/workspace/settings") == PERM_SETTINGS
+    assert has_perm(ROLE_ADMIN, PERM_INVITE) and has_perm(ROLE_ADMIN, PERM_SETTINGS)
+
+
 def _boot_hosted_role_client(monkeypatch, tmp_path):
     """Boot a hosted TestClient (fresh server import) for role-enforcement tests."""
     import importlib

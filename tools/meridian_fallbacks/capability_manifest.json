@@ -79,8 +79,8 @@
   "modules": {
     "__init__": {
       "file": "__init__.py",
-      "sha256": "76f710e5001f9abe9fa4a30cb01705937eeaf6e94216c8d9879e6fa0e549d89a",
-      "byte_size": 3869,
+      "sha256": "38482b40cb2ad49e36e503a4415a76c76395cf29b26f9bb001ae07a480a1fa73",
+      "byte_size": 3980,
       "supported_operations": [
         "re-exports the public API of every module below",
         "PACKAGE_VERSION / SCHEMA_VERSION constants"
@@ -91,8 +91,8 @@
     },
     "safe_ooxml_writer": {
       "file": "safe_ooxml_writer.py",
-      "sha256": "067973d3d52aae5a5eb0ef84424740ef4dc0c82109be68bc03ea90da1f3570cc",
-      "byte_size": 13655,
+      "sha256": "26f096046928d6b1ff84dc53be9c9f62282493e3259afe804bcb42bc6d9ac88a",
+      "byte_size": 14008,
       "supported_operations": [
         "read_parts_from_bytes(data) -> {part_name: bytes}",
         "build_zip_bytes(parts) -> bytes (deterministic, sorted-name order)",
@@ -108,8 +108,8 @@
     },
     "safe_image_insert": {
       "file": "safe_image_insert.py",
-      "sha256": "3e6d97323171d1f53d308adaf351b3453aa2ec3436fcd2f03e65c3097b38b503",
-      "byte_size": 14663,
+      "sha256": "8295c125e19d783270689cceadf7c3d475aaa35ff084cef70d8827a827503133",
+      "byte_size": 15062,
       "supported_operations": [
         "compute_image_insert_parts(parts, image_bytes, image_ext=..., anchor_text=..., paragraph_index=..., width_emu=..., height_emu=...) -> ImageInsertResult (pure, in-memory)",
         "insert_image(docx_path, image_path=... | image_bytes=..., ...) -> ImageInsertWriteResult (disk-touching, uses SafeOoxmlWriter)",
@@ -125,8 +125,8 @@
     },
     "patch_manifest": {
       "file": "patch_manifest.py",
-      "sha256": "cc251a6e40e3f5dcd64ceb56724a159bc1e7d77d4588886bc330f10ec72dfd03",
-      "byte_size": 11157,
+      "sha256": "236f062c5883a568e9ab8741f12450b4b99187968a5a7e23d71f5ab5d466ebff",
+      "byte_size": 11437,
       "supported_operations": [
         "PatchManifest.create(...) / create_from_file(...) -- new draft manifest, optionally hashing the current on-disk target as base_sha256",
         "PatchManifest.add_operation(kind, target_part, description, payload=..., metadata=...) -- kind in {replace_part, insert_image, custom}",
@@ -142,8 +142,8 @@
     },
     "transactional_merge": {
       "file": "transactional_merge.py",
-      "sha256": "8def8f413ecb8e665fe81d795a483dd823485e28bdaaa10fae144cac6414ab60",
-      "byte_size": 15814,
+      "sha256": "9c3b6f6c08e6c13f3009b1c59b9bc1dff0daa46dd72f80fa7156fd6c56c7a852",
+      "byte_size": 16205,
       "supported_operations": [
         "apply_patch_manifest(manifest, payloads=..., allow_stale_base=False, dry_run=False, appliers=...) -> MergeResult -- all-or-nothing apply of every operation in a manifest",
         "promote(manifest, reconciliation, payloads=..., writer=..., appliers=..., allow_stale_base=False, dry_run=False, required_parts=...) -> MergeResult -- the literal 'no asset promotion without a complete slot manifest' enforcement point (sprint item 5cc3d745, W31-C): refuses to call apply_patch_manifest at all unless reconciliation['verdict'] == figure_slot_manifest.MANIFEST_COMPLETE (raising TypeError only when reconciliation is not a mapping at all), forwarding every other keyword argument verbatim to apply_patch_manifest once that check passes",
@@ -159,8 +159,8 @@
     },
     "output_provenance_gate": {
       "file": "output_provenance_gate.py",
-      "sha256": "864af948c874e93e18a47292bab56d90eae38c26c53b96b86d782ea20a717604",
-      "byte_size": 31305,
+      "sha256": "111ff3bd577e159e5c67ec3741cc2eddc55f10673945d0a1516a3d4615536b0a",
+      "byte_size": 32034,
       "supported_operations": [
         "check_output_provenance(outputs_dir, path, max_scan_files=200_000) -> dict -- the local fallback answer to 'what do we know about this output's provenance', ranked EXACT > STALE_BY_SCRIPT > DIRECTORY_FALLBACK > UNREGISTERED > UNKNOWN",
         "Explicit provenance_type statuses (string-identical to extensions/meridian-outputs/meridian_outputs/provenance_status.py's own constants): EXACT='exact', DIRECTORY_FALLBACK='directory_fallback', UNREGISTERED='unregistered', UNKNOWN='unknown', STALE_BY_SCRIPT='stale_by_script'",
@@ -176,8 +176,8 @@
     },
     "docx_completion_gate": {
       "file": "docx_completion_gate.py",
-      "sha256": "caac931f8a7d4032649de9094f76e21c63d5312c2c2fb11d5b2dedda39abd6c9",
-      "byte_size": 39959,
+      "sha256": "ac4e8fa0004a1a66274029f2e302863901a3677c062e166f019ae3f80b4a7680",
+      "byte_size": 40891,
       "supported_operations": [
         "run_completion_gate(docx_path, requirements=None, render_checker=None, skip_render_check=False) -> dict -- one fail-closed completion verdict: ready=True only when every hard structural check passes AND every set CompletionRequirements is satisfied",
         "check_zip_integrity(raw) -- ZIP CRC-32, XML well-formedness, and required-part presence, all computed even after the first failure",
@@ -199,8 +199,8 @@
     },
     "figure_invariant_gate": {
       "file": "figure_invariant_gate.py",
-      "sha256": "fdd44ffed92f793975d597e73d6238cb031b8cb8e92622c88cd348d8eeec139e",
-      "byte_size": 26598,
+      "sha256": "000b1484ac64399ccce61b2cc782ffa1ba2565a32eee5f92a34868e7ccf2a923",
+      "byte_size": 27129,
       "supported_operations": [
         "compare_figure_invariants(canonical, candidate) -> dict -- fail-closed comparison of two already-extracted FigureSlotPayload payloads (a FigureSlotPayload instance or a plain mapping with the same fields), returning one of five explicit verdicts",
         "Explicit verdicts (never a bare bool): INVARIANT_HOLDS='invariant_holds' (bound source identical, numeric/text content unchanged -- only typography may differ), INVARIANT_VIOLATION='invariant_violation' (bound source identical but numeric and/or text content changed), SOURCE_MISMATCH='source_mismatch' (bound source differs, or was resolved only via content-hash relocation), AMBIGUOUS='ambiguous' (either slot's identity cannot be pinned to a single origin -- fails closed), NO_GENERATOR='no_generator' (neither a bound-source value nor any usable provenance signal exists for a slot -- distinct from AMBIGUOUS, never a crash)",
@@ -217,8 +217,8 @@
     },
     "figure_slot_manifest": {
       "file": "figure_slot_manifest.py",
-      "sha256": "7ad25f22ebbd8f44096d159c32d325acc95d6a6d220cb96e43f537461b1e9d23",
-      "byte_size": 19281,
+      "sha256": "0ef9b3d0b2a21957ed9a5364984114698b95f12c95bc910c3898c095ae555999",
+      "byte_size": 19711,
       "supported_operations": [
         "reconcile_slot_manifest(expected_slot_ids, promoted=(), held=(), skipped=(), ambiguous=()) -> dict -- fail-closed manifest-level verdict reconciling an expected set of figure-slot ids against four caller-supplied disposition buckets",
         "SlotClassification -- dataclass (slot_id, bucket, reason, owner); to_dict()/from_dict() for lossless JSON round-tripping. A blank/missing reason or owner is reported as a structural_errors entry, never silently accepted as a valid classification.",
@@ -234,8 +234,8 @@
     },
     "generate_capability_manifest": {
       "file": "generate_capability_manifest.py",
-      "sha256": "9a0612383f17ffc49ae6d4cf223b247d223162459e7b2a5665b230d162a9f907",
-      "byte_size": 8529,
+      "sha256": "41caa27457a94e65d1ab7904b75a26b4e76eb65cd76caf41066f8edcccc90cea",
+      "byte_size": 8731,
       "supported_operations": [
         "compute_module_drift(manifest, pkg_dir=...) -> list[dict] -- pure comparison of every modules[*].sha256/byte_size against the real file on disk right now; empty list means fully converged",
         "regenerate_manifest_text(manifest_text, manifest, pkg_dir=...) -> (new_text, drift) -- surgically rewrites ONLY the drifted sha256/byte_size value spans in the manifest's raw source text, leaving every other byte (key order, formatting, prose) untouched",

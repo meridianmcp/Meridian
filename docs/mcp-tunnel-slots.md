@@ -1,15 +1,29 @@
 # MCP Tool Surface (Tunnel Slots)
 
-`meridian --tunnel` runs a fixed **3-slot model**: three local proxy ports,
-each fronting one code-intelligence backend, relayed to the hosted server so
-Claude Desktop, Claude Code, Cursor, and Codex all reach the same tools no
-matter which client connects.
+`meridian --tunnel` runs **eleven built-in slots**. Each slot is one local proxy
+port that fronts one MCP backend and is relayed to the hosted server, so Claude
+Desktop, Claude Code, Cursor, and Codex all reach the same tools no matter which
+client connects. Four pre-allocated custom slots (`p0`-`p3`, ports 8814-8817)
+carry user-defined plugins and are not built-in.
 
-| Slot | Local connector name | Default backend | Server route |
-|------|----------------------|------------------|---------------|
-| `fs` | `filesystem` | built-in filesystem server | `/fs` |
-| `code` | `codebase-memory` | `codebase-memory-mcp` | `/code` |
-| `extract` | `serena` | **Serena** (`serena-agent` via `uvx`) | `/extract` |
+| Slot | Built-in plugin | Tool prefix | Local port | Server route | Default state | Default backend |
+|------|-----------------|-------------|------------|--------------|---------------|-----------------|
+| `fs` | `filesystem` | `filesystem` | 8808 | `/fs` | on (core) | built-in filesystem server (`@modelcontextprotocol/server-filesystem`) |
+| `code` | `code-intel` | `codebase` | 8809 | `/code` | on (core) | `codebase-memory-mcp` (auto-installed) |
+| `extract` | `code-extractor` | `extractor` | 8810 | `/extract` | on (core) | **Serena** (`serena-agent` via `uvx`) |
+| `ppt` | `powerpoint` | `powerpoint` | 8811 | `/ppt` | off (opt-in) | `powerpoint-mcp` via `uvx` |
+| `word` | `word` | `word` | 8812 | `/word` | off, retired | `docx-mcp` via `uvx` |
+| `dc` | `desktop-commander` | `desktop-commander` | 8813 | `/dc` | off (opt-in) | Desktop Commander |
+| `docs` | `meridian-docs` | `meridian-docs` | 8818 | `/docs` | off (opt-in) | `meridian-docs-mcp` via `uvx` |
+| `zotero` | `zotero-mcp` | `zotero-mcp` | 8819 | `/zotero` | off (opt-in) | `zotero-mcp` via `uvx` |
+| `outputs` | `meridian-outputs` | `meridian-outputs` | 8820 | `/outputs` | off (opt-in) | `meridian-outputs-mcp` via `uvx` |
+| `debug` | `mcp-debugger` | `mcp-debugger` | 8821 | `/debug` | off (opt-in) | `@debugmcp/mcp-debugger` via `npx` |
+| `latex` | `meridian-latex` | `meridian-latex` | 8822 | `/latex` | off (opt-in) | `meridian-latex` (`@meridianmcp/mcp`) via `npx` |
+
+"Tool prefix" is the `SLOT_DISPLAY_NAMES` value in `meridian/routes/tunnel.py`
+that namespaces each slot's tools (for example, `filesystem__read_file`). The
+built-in list is `BUILTIN_PLUGINS` in `meridian/tunnel_plugins.py`; `fs`, `code`,
+and `extract` are core and on by default, and `word` is retired and forced off.
 
 Each slot's command is a plain data value (`meridian/tunnel_plugins.py`'s
 `BUILTIN_PLUGINS`), overridable per tenant from the dashboard — swapping a
@@ -80,10 +94,18 @@ correct by construction rather than needing its own separate code path.
 
 ## Codex / Cursor
 
-Cursor's `.cursor/mcp.json` is updated by the same `_install_mcp_json` writer
-as Claude Code's `.mcp.json`, with the identical connector-key/URL shape (see
-`_tunnel_mcp_entries`) — the extract-slot fix above applies uniformly, since
-it lives in `run_tunnel`'s command resolution, upstream of any per-client
+Cursor's user-global MCP config is `~/.cursor/mcp.json`. The `meridian` entry
+that `scripts/meridian_connect.py` merges (`_configure_cursor`) goes there, and
+the dashboard's MCP client list (`meridian/static/dashboard-settings.ts`) names
+the same path.
+
+The tunnel client's `_install_mcp_json` writer (`_mcp_json_paths` in
+`meridian/tunnel_client.py`) injects the same connector entries as Claude Code's
+`.mcp.json`, with the identical connector-key/URL shape (see
+`_tunnel_mcp_entries`). It writes `<cwd>/.mcp.json` (created if absent) and
+touches `<cwd>/.cursor/mcp.json` only when that project-root file already
+exists; it never creates one. The extract-slot fix above applies uniformly,
+since it lives in `run_tunnel`'s command resolution, upstream of any per-client
 config file. Codex connects to the same tunnel proxy ports via its own
 `mcpServers`-style config (see `AGENTS.md`'s "Connect to Meridian" section);
 no client-specific code path exists for the extract slot's command

@@ -190,6 +190,11 @@ def test_delete_project_route_tells_the_deleted_stream_and_the_survivors(client)
         keep_events = sub_keep.events()
         gone_events = sub_gone.events()
         account_events = acct.events()
+    if callable(getattr(client.app.state.db, "add_after_commit_callback", None)):
+        # The Postgres TestClient owns an ambient transaction that is rolled
+        # back at teardown, so publishing any delete event here would be early.
+        assert keep_events == [] and gone_events == [] and account_events == []
+        return
     # Its own tab learns the project is gone (the account stream cannot say WHICH project:
     # the event names none, so the tab showing it closes on this one)...
     assert _of_type(gone_events, "project_deleted") == [{"type": "project_deleted", "project_id": gone["id"]}]
@@ -197,6 +202,32 @@ def test_delete_project_route_tells_the_deleted_stream_and_the_survivors(client)
     assert account_events == [{"type": "projects_changed", "change": "deleted"}]
     assert _of_type(keep_events, "project_deleted") == []
     assert _of_type(keep_events, "projects_changed") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("anydb", ["sqlite"], indirect=True)
+@pytest.mark.parametrize("expect", ["top", None])
+async def test_project_delete_publishes_only_after_outer_sqlite_commit(anydb, expect):
+    db = anydb
+    project = await db_module.create_project(db, "deferred-delete-event")
+    pid = project["id"]
+    with _Subscription(pid) as sub, _AccountSubscription(db) as acct:
+        await db.execute("BEGIN")
+        await db_module.delete_project(db, pid, expect=expect)
+        assert sub.events() == []
+        assert acct.events() == []
+        await db.rollback()
+        assert sub.events() == []
+        assert acct.events() == []
+        assert await db_module.get_project(db, pid) is not None
+
+        await db.execute("BEGIN")
+        await db_module.delete_project(db, pid, expect=expect)
+        assert sub.events() == []
+        assert acct.events() == []
+        await db.commit()
+        assert sub.events() == [{"type": "project_deleted", "project_id": pid}]
+        assert acct.events() == [{"type": "projects_changed", "change": "deleted"}]
 
 
 def test_batch_delete_route_announces_every_deleted_project(client):
@@ -211,9 +242,15 @@ def test_batch_delete_route_announces_every_deleted_project(client):
     ):
         r = client.delete(f"/projects?project_id={a['id']}&project_id={b['id']}")
         assert r.status_code == 200
-        assert [e["project_id"] for e in _of_type(sub_a.events(), "project_deleted")] == [a["id"]]
-        assert [e["project_id"] for e in _of_type(sub_b.events(), "project_deleted")] == [b["id"]]
-        assert len(_of_type(acct.events(), "projects_changed")) == 1
+        deleted_a = _of_type(sub_a.events(), "project_deleted")
+        deleted_b = _of_type(sub_b.events(), "project_deleted")
+        changed = _of_type(acct.events(), "projects_changed")
+        if callable(getattr(client.app.state.db, "add_after_commit_callback", None)):
+            assert deleted_a == [] and deleted_b == [] and changed == []
+        else:
+            assert [e["project_id"] for e in deleted_a] == [a["id"]]
+            assert [e["project_id"] for e in deleted_b] == [b["id"]]
+            assert len(changed) == 1
 
 
 @pytest.mark.asyncio

@@ -237,6 +237,12 @@ class ProjectSettings(BaseModel):
         "and runs sprint items immediately; 'interactive' asks for direction "
         "before executing.",
     )
+    use_mode: Literal["standard_publication", "commercialized"] = Field(
+        default="standard_publication",
+        description="Rights-gate use mode. 'standard_publication' (default) stores "
+        "link-only images with credit and a review flag. 'commercialized' refuses "
+        "their image bytes unless a human approves an override.",
+    )
 
 
 class ProjectSettingsPatch(BaseModel):
@@ -249,6 +255,7 @@ class ProjectSettingsPatch(BaseModel):
     require_merge_approval: int | None = Field(default=None, ge=0, le=2)
     code_intel_enabled: int | None = Field(default=None, ge=0, le=1)
     execution_mode: Literal["autonomous", "interactive"] | None = None
+    use_mode: Literal["standard_publication", "commercialized"] | None = None
 
 
 class GoalState(BaseModel):

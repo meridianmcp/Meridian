@@ -25,8 +25,10 @@ import pytest
 import meridian.server  # noqa: F401 -- load the server first (import-cycle ordering, as in wave 1)
 from meridian import _deps
 from meridian import db as db_module
+from meridian.db import workspace as workspace_db
 
 _OUT_OF_SCOPE = "Project is outside your access scope."
+_WORKSPACE_DENIED = "Workspace-level data is not available to project-scoped members."
 
 
 def _make_project(client, prefix: str = "w2") -> str:
@@ -36,12 +38,20 @@ def _make_project(client, prefix: str = "w2") -> str:
 
 
 def _scope_to(monkeypatch, project_ids):
-    """Make ``_scoped_project_ids_for_request`` answer ``project_ids`` (None = unscoped).
+    """Return a scope-only fixture with all member capabilities enabled.
 
-    One patch point is enough: the routes under test call the resolver through the
-    ``_deps`` module (or via ``_require_project_in_scope``), and the middleware imports
-    it at call time.
+    These tests exercise project/resource boundaries, not capability policy;
+    capability-specific denial cases use the hosted-policy fixtures instead.
     """
+    if project_ids is not None:
+        from meridian.member_policy import CAPABILITY_IDS, EffectivePolicy, ScopedProjectIds
+        from meridian.roles import ROLE_MEMBER
+
+        project_ids = ScopedProjectIds(
+            project_ids,
+            policy=EffectivePolicy(caps=frozenset(CAPABILITY_IDS), role=ROLE_MEMBER),
+        )
+
     async def _fake(request):
         return project_ids
 
@@ -409,23 +419,25 @@ def test_profile_layers_of_other_projects_are_refused_for_a_scoped_caller(client
 # H4. POST /workspace/notes/{id}/move
 # ---------------------------------------------------------------------------
 
-def test_moving_a_workspace_note_needs_an_in_scope_destination_project(client, monkeypatch):
+def test_moving_a_workspace_note_is_refused_for_project_scoped_callers(client, monkeypatch):
     mine, theirs = _make_project(client), _make_project(client)
     note = client.post("/workspace/notes", json={"title": "t", "body": "keep me"}).json()
 
+    # A workspace note belongs to no project, so a scoped caller may not move it, whichever
+    # project is named: a move would hand the owner's workspace content to that project.
     _scope_to(monkeypatch, [mine])
     refused = client.post(f"/workspace/notes/{note['id']}/move", json={"project_id": theirs})
-    assert refused.status_code == 403 and refused.json()["detail"] == _OUT_OF_SCOPE
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"] == _WORKSPACE_DENIED
+    refused_in_scope = client.post(f"/workspace/notes/{note['id']}/move", json={"project_id": mine})
+    assert refused_in_scope.status_code == 403, refused_in_scope.text
+    assert refused_in_scope.json()["detail"] == _WORKSPACE_DENIED
 
-    # Nothing moved: still a workspace note, and the foreign project has no note.
+    # Nothing moved: still a workspace note, and neither project has it.
     _scope_to(monkeypatch, None)
     assert [n["id"] for n in client.get("/workspace/notes").json()] == [note["id"]]
     assert client.get(f"/projects/{theirs}/notes").json() == []
-
-    _scope_to(monkeypatch, [mine])
-    moved = client.post(f"/workspace/notes/{note['id']}/move", json={"project_id": mine})
-    assert moved.status_code == 201, moved.text
-    assert moved.json()["project_id"] == mine
+    assert client.get(f"/projects/{mine}/notes").json() == []
 
     # Unscoped callers may still move a note into any project.
     _scope_to(monkeypatch, None)
@@ -454,10 +466,10 @@ def test_create_task_refuses_a_session_of_another_project(client, monkeypatch):
     _scope_to(monkeypatch, [mine])
     body = {"session_id": foreign_session, "project_id": mine, "description": "hijack", "status": "done"}
     refused = client.post("/tasks", json=body)
-    assert refused.status_code == 404
+    assert refused.status_code == 403
     # Same answer as a session that does not exist (no oracle for foreign session ids).
     ghost = client.post("/tasks", json={**body, "session_id": "no-such-session"})
-    assert ghost.status_code == 404 and ghost.text == refused.text
+    assert ghost.status_code == 403 and ghost.text == refused.text
 
     # The binding is an integrity rule, not a scope rule: unscoped callers get it too.
     _scope_to(monkeypatch, None)
@@ -506,7 +518,7 @@ def test_session_routes_look_the_session_up_only_for_scoped_callers(client, monk
     assert client.patch("/sessions/no-such-session", json={"status": "idle"}).status_code == 404
     assert lookups == []
 
-    # Scoped: the lookup happens, a foreign session is a 403, an unknown id the SAME 403.
+    # Scoped: the lookup happens for heartbeat/notes; foreign and unknown ids return the same 403.
     _scope_to(monkeypatch, [mine])
     # The caller's own session is idle (patched above) but not closed: a deterministic 200.
     assert client.post(f"/sessions/{own}/heartbeat").status_code == 200
@@ -516,10 +528,9 @@ def test_session_routes_look_the_session_up_only_for_scoped_callers(client, monk
         assert client.get(f"/sessions/{sid}/notes").status_code == 403
         assert client.patch(f"/sessions/{sid}", json={"status": "closed"}).status_code == 403
         assert client.post(f"/sessions/{sid}/close").status_code == 403
-    # Exactly one lookup per gated call: own heartbeat + own notes (2), then
-    # heartbeat / notes / patch for each of the two ids (6). /close does its own inline
-    # SELECT, so it is not counted here.
-    assert len(lookups) == 8
+    # These four routes use _session_project_id: own heartbeat/notes, then the
+    # foreign and unknown heartbeat requests. Other routes use their atomic or inline binding checks.
+    assert lookups == [own, own, foreign, "no-such-session"]
 
     # The refused calls did not touch the foreign session: still active, and the
     # refused heartbeats left last_seen exactly where it was.
@@ -700,9 +711,11 @@ def test_hosted_scoped_member_is_refused_on_every_wave2_route(monkeypatch, tmp_p
         # H4 -- workspace note move
         assert c.post(f"/workspace/notes/{w['note']}/move", headers=s, json={"project_id": b}).status_code == 403
 
-        # H5 -- POST /tasks with a foreign session, and the wave-1 session routes
+        # H5 -- POST /tasks with a foreign session, and the wave-1 session routes.
+        # Capability authorization fails before foreign-session lookup, so 403
+        # intentionally reveals nothing about the foreign session id.
         body = {"session_id": w["sess_b"], "project_id": a, "description": "x"}
-        assert c.post("/tasks", headers=s, json=body).status_code == 404
+        assert c.post("/tasks", headers=s, json=body).status_code == 403
         assert c.post(f"/sessions/{w['sess_b']}/heartbeat", headers=s).status_code == 403
         assert c.post(f"/sessions/{w['sess_a']}/heartbeat", headers=s).status_code == 200
         assert c.post("/sessions/no-such-session/heartbeat", headers=s).status_code == 403
@@ -743,7 +756,7 @@ def test_hosted_scope_resolution_errors_fail_closed_for_http_and_mcp(monkeypatch
         async def _boom(*args, **kwargs):
             raise RuntimeError("auth db unavailable")
 
-        monkeypatch.setattr(db_module, "get_scoped_project_ids_for_member", _boom)
+        monkeypatch.setattr(workspace_db, "get_member_authorization_context", _boom)
 
         # HTTP middleware: 503, never "treated as unscoped" (which would serve project B).
         for pid in (a, b):

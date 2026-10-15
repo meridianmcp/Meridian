@@ -61,6 +61,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import fingerprint, outputs_local
+from .path_security import (
+    relative_output_path,
+    relative_reference,
+    _require_within,
+    resolve_reference,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -166,6 +172,30 @@ def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> N
     path = _ledger_path(outputs_dir)
     with _write_lock:
         ledger = _read_ledger(outputs_dir)
+        # An update also scrubs legacy absolute-path rows that were written
+        # before this module started storing relative references.
+        portable: dict[str, dict[str, Any]] = {}
+        for old_key, old_record in ledger.items():
+            if not isinstance(old_record, dict):
+                continue
+            entry = dict(old_record)
+            old_path = entry.get("path") or old_key
+            safe_path = (
+                relative_reference(outputs_dir, old_path)
+                if isinstance(old_path, str) and os.path.isabs(old_path)
+                else str(old_path).replace("\\", "/")
+            )
+            if not safe_path:
+                continue
+            entry["path"] = safe_path
+            script = entry.get("generating_script")
+            if isinstance(script, str) and os.path.isabs(script):
+                entry["generating_script"] = (
+                    relative_reference(outputs_dir, script) or os.path.basename(script)
+                )
+            safe_key = os.path.normcase(os.path.normpath(safe_path)).replace("\\", "/")
+            portable[safe_key] = entry
+        ledger = portable
         ledger[key] = record
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -193,6 +223,9 @@ class ProvenanceRecord:
     # returns the raw dict as-is rather than reconstructing this dataclass,
     # so there is no forward-compat parsing step that could choke on it.
     experiment_run_id: str | None = None
+    # 93a8b26b -- optional opaque Zotero item keys cited by this output.
+    # Resolution stays with consumers that already have Zotero access.
+    cited_zotero_keys: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -208,6 +241,7 @@ def record_provenance(
     decision_id: str | None = None,
     note: str | None = None,
     experiment_run_id: str | None = None,
+    cited_zotero_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """Attach lightweight reproducibility metadata to one output file.
 
@@ -215,7 +249,9 @@ def record_provenance(
     normalized path) into ``<outputs_dir>/.meridian-outputs-cache/
     provenance_ledger.json``; calling this again for the same path (e.g.
     after re-running the generating script with different params) simply
-    overwrites the previous record -- no separate update step needed.
+    overwrites the previous record -- no separate update step needed. Paths
+    in the persistent ledger are relative to ``outputs_dir``; the read APIs
+    resolve them for callers and continue reading legacy absolute-path rows.
 
     Args:
       outputs_dir:        Absolute path to the outputs directory (the shared
@@ -252,11 +288,15 @@ def record_provenance(
                            no DB engine access at all), it is stored as an
                            opaque string exactly like sprint_item_id/
                            decision_id already are.
+      cited_zotero_keys:   Optional (93a8b26b) Zotero item keys cited by this
+                           output. Stored as an opaque list; this standalone
+                           package does not resolve keys or make hosted calls.
 
     Returns:
       The stored record as a dict (path, generating_script, params,
       sprint_item_id, decision_id, note, recorded_at, recorded_at_iso,
-      content_hash, experiment_run_id), or ``{"error": ...}`` on failure.
+      content_hash, experiment_run_id, cited_zotero_keys), or
+      ``{"error": ...}`` on failure.
 
     bd5b8d79 -- ``content_hash`` is a best-effort SHA-256 of ``path``'s
     on-disk bytes AT THE MOMENT this record is written, via
@@ -292,28 +332,29 @@ def record_provenance(
     if not path or not str(path).strip():
         return {"error": "path is required"}
 
+    try:
+        resolved_path = _require_within(outputs_dir, path)
+        stored_path = relative_output_path(outputs_dir, resolved_path)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     if generating_script is None:
         try:
-            generating_script = outputs_local.file_fingerprint(path).generating_script
+            generating_script = outputs_local.file_fingerprint(resolved_path).generating_script
         except Exception:  # noqa: BLE001 -- best-effort fallback only
             generating_script = None
 
-    # W1-A: a relative `path` must be resolved against `outputs_dir` before
-    # hashing -- `script_content_hash` does a plain `open(path, "rb")`, which
-    # a relative path resolves against the CALLING PROCESS's cwd (often not
-    # outputs_dir), so a perfectly valid output recorded with a relative path
-    # silently hashed nothing and content_hash came back None. An already-
-    # absolute path is passed through unchanged.
-    _hash_path = path if os.path.isabs(path) else os.path.join(outputs_dir, path)
+    # Hash the canonical output path that passed the realpath containment
+    # check above. Relative inputs have already been resolved against the root.
     try:
-        content_hash = fingerprint.script_content_hash(_hash_path)
+        content_hash = fingerprint.script_content_hash(resolved_path, outputs_dir=outputs_dir)
     except Exception:  # noqa: BLE001 -- best-effort snapshot only, never
         # blocks the (already-durable) provenance write on a hashing failure.
         content_hash = None
 
     now = time.time()
     record = ProvenanceRecord(
-        path=path,
+        path=resolved_path,
         generating_script=generating_script,
         params=dict(params) if params else {},
         sprint_item_id=sprint_item_id,
@@ -323,19 +364,28 @@ def record_provenance(
         recorded_at_iso=datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
         content_hash=content_hash,
         experiment_run_id=experiment_run_id,
+        cited_zotero_keys=cited_zotero_keys,
     )
 
-    key = _normalize_path(path)
+    key = os.path.normcase(os.path.normpath(stored_path)).replace("\\", "/")
     if not key:
-        return {"error": f"could not normalize path {path!r}"}
+        return {"error": "could not normalize path"}
+
+    stored_record = record.to_dict()
+    stored_record["path"] = stored_path
+    if isinstance(generating_script, str) and os.path.isabs(generating_script):
+        stored_record["generating_script"] = (
+            relative_reference(outputs_dir, generating_script)
+            or os.path.basename(generating_script)
+        )
 
     try:
-        _write_ledger_entry(outputs_dir, key, record.to_dict())
+        _write_ledger_entry(outputs_dir, key, stored_record)
     except (OSError, TypeError) as exc:
         return {"error": f"failed to write provenance record: {exc}"}
 
     try:
-        outputs_local.register_priority_path(outputs_dir, path)
+        outputs_local.register_priority_path(outputs_dir, resolved_path)
     except Exception:  # noqa: BLE001 -- never let the fast-path optimisation
         # break the (already-durable) provenance write it rides on top of.
         _log.debug(
@@ -362,8 +412,9 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
     Returns:
       The record dict for `path` (``path``, ``generating_script``,
       ``params``, ``sprint_item_id``, ``decision_id``, ``note``,
-      ``recorded_at``, ``recorded_at_iso``, ``content_hash``), or None if
-      nothing has ever been recorded for this path under this outputs_dir.
+      ``recorded_at``, ``recorded_at_iso``, ``content_hash``,
+      ``experiment_run_id``, ``cited_zotero_keys``), or None if nothing has
+      ever been recorded for this path under this outputs_dir.
 
     Deliberately a PURE exact-match primitive -- bd5b8d79. A bare ``None``
     here is ambiguous ("never recorded" vs. "recorded, but this path was
@@ -376,11 +427,26 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
     layers the richer status on top. Keeping this function narrow means its
     contract (exact key in, exact record out, nothing else) never drifts.
     """
-    key = _normalize_path(path) if path else ""
+    if not path:
+        return None
+    try:
+        relative_path = relative_output_path(outputs_dir, path)
+        key = os.path.normcase(os.path.normpath(relative_path)).replace("\\", "/")
+    except ValueError:
+        return None
     if not key:
         return None
     ledger = _read_ledger(outputs_dir)
     rec = ledger.get(key)
+    if rec is None:
+        # Read provenance ledgers written before relative-path storage.
+        legacy_key = _normalize_path(path)
+        rec = ledger.get(legacy_key) if legacy_key else None
+    if rec is not None and isinstance(rec.get("path"), str) and not os.path.isabs(rec["path"]):
+        # Preserve the public API's absolute-path result while keeping new
+        # on-disk records portable and free of machine-local roots.
+        rec = dict(rec)
+        rec["path"] = resolve_reference(outputs_dir, rec["path"])
     return dict(rec) if rec is not None else None
 
 
@@ -396,4 +462,9 @@ def list_provenance(outputs_dir: str) -> list[dict[str, Any]]:
       value), or ``[]`` if nothing has been recorded yet.
     """
     ledger = _read_ledger(outputs_dir)
-    return [dict(ledger[key]) for key in sorted(ledger)]
+    records = [dict(ledger[key]) for key in sorted(ledger)]
+    for record in records:
+        path = record.get("path")
+        if isinstance(path, str) and not os.path.isabs(path):
+            record["path"] = resolve_reference(outputs_dir, path)
+    return records

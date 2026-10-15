@@ -20,6 +20,9 @@ This module closes that class with ONE entry point,
   ``project_id`` is omitted; a scoped caller must name an in-scope project.
 * :data:`DENY` -- tools whose answer is cross-project by construction (keyed by
   ``file_path`` only) and cannot be narrowed to a project.
+* :data:`WORKSPACE_DENY` -- tools that read workspace-level or server-wide data
+  belonging to no project (workspace notes, decisions, settings and sprint items, the
+  server logs, LaTeX structure): refused outright for a scoped caller.
 * :data:`PROFILE_SCOPE_ARGS` -- profile-layer / capability-profile tools keyed
   by a ``(scope_type, scope_id)`` pair; for the project-owned scope types the
   ``scope_id`` is a project (or an object of one) and is checked the same way.
@@ -60,26 +63,24 @@ member should reach them at all is a product decision for the owner:
   ``reset_profile_layer``, ``clone_profile_layer``, ``set_capability_profile``,
   ``clear_capability_profile``, ``activate_profile_layer``) and the read-only
   ``get_effective_profile`` / ``get_effective_capability_profile`` scope ids;
-* ``update_workspace_settings`` and ``get_workspace_settings``, and
-  ``request_manual_issue_screening_toggle`` (an independent verifier saw it return
-  ``applied: true`` and change the workspace settings for a scoped caller);
-* ``pin_workspace_decision`` / ``get_workspace_decisions``, workspace notes
-  (``add_workspace_note``, ``get_workspace_notes``, ``move_workspace_note_to_project``
-  for a workspace note), workspace proposals (``add_workspace_proposal``), workspace
-  sprint items (``add_workspace_sprint_item`` and friends), ``save_blog_post``, and the
-  WORKSPACE section ``get_context_block`` renders from the notes and decisions above;
+* the workspace-level READ tools (``get_workspace_settings``, ``get_workspace_notes``,
+  ``get_workspace_decisions``, ``get_workspace_sprint_items``) and WRITE tools
+  (``add_workspace_note``, ``pin_workspace_decision``, ``update_workspace_settings``,
+  ``save_blog_post``, the workspace sprint-item writes, ``move_workspace_note_to_project``,
+  ``request_manual_issue_screening_toggle``) are in :data:`WORKSPACE_DENY` and refused for
+  a scoped caller, whatever their ``write_workspace_level`` grant. Workspace proposals
+  (``add_workspace_proposal``) stay behind that grant: they can be project-scoped. The
+  handoff, context block and session start drop the workspace section for a scoped
+  caller (see :data:`WORKSPACE_CONTEXT_TOOLS`);
 * ``create_project`` without a parent still creates a project that is not on the
   caller's scope list;
-* ``get_server_logs`` / ``search_server_logs`` / ``get_connection_log`` /
-  ``get_server_log_checkpoint`` read server-wide logs;
 * the tunnel-forward branch of ``_handle_mcp_request`` (it runs before this
   guard and hands the call to a tunnel plugin tool) and the ``batch_read``
   ``tunnel_research`` adapter, which reads from the tenant's own workstation;
-* ``find_orphaned_docx_staged_files``, ``check_embedded_staleness``,
-  ``audit_figure_table_provenance`` and ``get_latex_structure`` read server-side file
-  paths named by the caller (host level, not project data; the verifier read a file
-  outside the data directory through ``get_latex_structure``, which is tenant-wide
-  rather than project-scoped and worth a look on hosted servers).
+* ``find_orphaned_docx_staged_files``, ``check_embedded_staleness`` and
+  ``audit_figure_table_provenance`` read server-side file paths named by the caller
+  (host level, not project data). ``get_latex_structure`` reads such a path too and is
+  in :data:`WORKSPACE_DENY`. The server-wide log tools are in :data:`WORKSPACE_DENY`.
 
 Invariants worth keeping when you edit this file:
 
@@ -356,6 +357,58 @@ DENY: "frozenset[str]" = frozenset({
     "get_symbol_hotspots",
 })
 
+#: Tools that read WORKSPACE-level or server-wide data: rows that belong to no project
+#: (the owner's workspace notes, decisions, settings and sprint board), the server-wide
+#: logs, and a LaTeX structure read from a caller-named path. A scoped caller is refused
+#: outright, exactly as for :data:`DENY`; owners, workspace-wide members and self-hosted
+#: callers are unchanged. Kept apart from DENY, which is keyed by ``file_path`` alone and
+#: whose tests pass a ``file_path`` argument to every member.
+#:
+#: Also the WORKSPACE-level WRITES to notes, decisions, settings, blog posts and the sprint
+#: board, which change owner rows that no project covers. A ``write_workspace_level`` grant
+#: does not lift this for a project-scoped caller: the grant is not consulted here, and the
+#: HTTP ``/workspace`` routes refuse the same set with the same body. Also refused:
+#: ``request_manual_issue_screening_toggle`` (changes the owner's ``workspace_settings``, and
+#: was classified as an ordinary project write) and ``move_workspace_note_to_project`` (moves
+#: a workspace note, including a pre-isolation NULL-tenant one, into a project the caller
+#: can then read). ``add_workspace_proposal`` is not listed: proposals can be project-scoped,
+#: so it stays behind the ``write_workspace_level`` capability in ``mcp_tools``
+#: (``_WORKSPACE_MEMBER_POLICY_WRITES``).
+WORKSPACE_DENY: "frozenset[str]" = frozenset({
+    "get_workspace_notes",
+    "get_workspace_decisions",
+    "get_workspace_settings",
+    "get_workspace_sprint_items",
+    "get_server_logs",
+    "search_server_logs",
+    "get_connection_log",
+    "get_server_log_checkpoint",
+    "get_latex_structure",
+    "request_manual_issue_screening_toggle",
+    "move_workspace_note_to_project",
+    "add_workspace_note",
+    "pin_workspace_decision",
+    "update_workspace_settings",
+    "save_blog_post",
+    "add_workspace_sprint_item",
+    "update_workspace_sprint_item",
+    "complete_workspace_sprint_item",
+})
+
+#: Private argument the dispatcher sets (and strips from any caller-supplied args) for a
+#: scoped caller invoking one of :data:`WORKSPACE_CONTEXT_TOOLS`. The handler then leaves
+#: the owner's workspace notes and decisions out of the document it renders.
+WORKSPACE_SCOPED_ARG = "_workspace_scoped"
+
+#: Tools whose rendered document can carry workspace-level records: the handoff, the
+#: context block and session start. They stay callable for a scoped caller; only the
+#: workspace section is filtered out (see :data:`WORKSPACE_SCOPED_ARG`).
+WORKSPACE_CONTEXT_TOOLS: "frozenset[str]" = frozenset({
+    "generate_handoff",
+    "get_context_block",
+    "start_session",
+})
+
 #: tool -> ``(scope_type argument, scope_id argument)`` pairs. For the
 #: project-owned scope types (see :func:`_profile_scope_owner`) the id must be in
 #: scope. ``workspace`` / ``user`` / ``hosted_default`` layers are tenant-level
@@ -446,7 +499,7 @@ _PROJECT_SCOPE_TYPES = frozenset({"project"})
 def guarded_tool_names() -> "frozenset[str]":
     """Every tool name any table in this module refers to (for the rot test)."""
     return frozenset(
-        set(OBJECT_ARGS) | set(REQUIRE_PROJECT) | set(DENY)
+        set(OBJECT_ARGS) | set(REQUIRE_PROJECT) | set(DENY) | set(WORKSPACE_DENY)
         | set(PROFILE_SCOPE_ARGS) | set(FILTER_RESULT_TOOLS) | set(BATCH_ENVELOPES)
         | set(DOC_OBJECT_ARGS) | set(REDACT_HOLDER_TOOLS) | set(UNLISTED_TOOLS)
     )
@@ -938,7 +991,7 @@ async def enforce_scoped_call(
     if scoped_project_ids is None:
         return
     chk = _Checker(db, scoped_project_ids)
-    if name in DENY:
+    if name in DENY or name in WORKSPACE_DENY:
         chk.deny()
     if name in REQUIRE_PROJECT and not chk._text(args.get("project_id")):
         chk.deny()

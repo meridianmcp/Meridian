@@ -66,6 +66,7 @@ from ._deps import (
     _required_perm_for_request,
     _render_workspace_block,
     _build_workspace_context_block,
+    _workspace_visible_for_request,
     _render_context_block,
 )
 from .pid_probe import pid_is_alive
@@ -1560,6 +1561,423 @@ async def _demo_read_only_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 # 393eed0a — workspace-role enforcement (viewer read-only / member-limited)
 # ---------------------------------------------------------------------------
+async def _read_member_policy_json_object(request: Request) -> dict[str, Any]:
+    """Read an object body for the capability gate, then replay it downstream."""
+    raw = await request.body()
+    sent = False
+
+    async def _replay_body():
+        nonlocal sent
+        if sent:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent = True
+        return {"type": "http.request", "body": raw, "more_body": False}
+
+    # BaseHTTPMiddleware's call_next reads request.receive after dispatch. Restore
+    # the cached bytes so FastAPI's route body validation still sees the request.
+    request._receive = _replay_body  # type: ignore[attr-defined]
+    if not raw:
+        return {}
+    try:
+        body = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "Request body must be a JSON object.") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Request body must be a JSON object.")
+    return body
+
+
+async def _member_policy_project_write_response(request: Request) -> Response | None:
+    """Apply member capability policy to every mutating project HTTP endpoint.
+
+    Project-scoped members get the same policy checks as MCP. This gate runs
+    after the path-only scope middleware, and repeats scope checks for ids in
+    bodies/query parameters before looking those ids up. Workspace-wide callers
+    and owners receive None from the scope resolver and keep the role gate.
+    """
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    path = request.url.path.rstrip("/") or "/"
+    if path != "/projects" and not path.startswith("/projects/"):
+        return None
+
+    from . import member_policy  # noqa: PLC0415
+    from ._deps import _deny_unless_in_scope, _scoped_project_ids_for_request  # noqa: PLC0415
+
+    authorized_parent = None
+    authorized_delete_family = None
+    authorized_status_snapshot = None
+    try:
+        scoped = await _scoped_project_ids_for_request(request)
+        if scoped is None:
+            return None
+
+        match = _PROJECT_ID_PATH_RE.match(path)
+        project_id = match.group(1) if match else None
+        if project_id is not None:
+            # Preserve the scope refusal before any capability lookup or DB query.
+            _deny_unless_in_scope(scoped, project_id)
+
+        caps: set[str] = {member_policy.WRITE_PROJECT}
+        target = project_id
+        if request.method == "POST" and path == "/projects":
+            body = await _read_member_policy_json_object(request)
+            parent_id = body.get("parent_project_id")
+            if parent_id:
+                _deny_unless_in_scope(scoped, parent_id)
+            caps = set(member_policy.required_caps_for_create(parent_id))
+            target = str(parent_id) if parent_id is not None else None
+        elif request.method == "POST" and project_id and path == f"/projects/{project_id}/parent":
+            body = await _read_member_policy_json_object(request)
+            raw_parent = body.get("parent_project_id")
+            if raw_parent is not None and not isinstance(raw_parent, str):
+                raise HTTPException(400, "parent_project_id must be a string or null")
+            parent_id = str(raw_parent).strip() if raw_parent else None
+            if parent_id:
+                _deny_unless_in_scope(scoped, parent_id)
+
+            db = await _db(request)
+            ids = [project_id] + ([parent_id] if parent_id else [])
+            family = await db_module.get_project_family(db, ids)
+            project = family.get(project_id)
+            if project is None:
+                raise HTTPException(403, "Project is outside your access scope.")
+            current_parent_id = project.get("parent_project_id")
+            new_parent = family.get(parent_id) if parent_id else None
+            if parent_id and new_parent is None:
+                raise HTTPException(403, "Project is outside your access scope.")
+            project = {"id": project_id, **project}
+            if current_parent_id and current_parent_id in family:
+                current_parent = {
+                    "id": current_parent_id, **family[current_parent_id],
+                }
+            else:
+                current_parent = None
+            if new_parent is not None:
+                new_parent = {"id": parent_id, **new_parent}
+            caps = set(member_policy.required_caps_for_reparent(
+                project, current_parent, new_parent,
+            ))
+            target = project_id
+            authorized_parent = member_policy.AuthorizedParentSnapshot(
+                project_id=project_id,
+                parent_project_id=current_parent_id or None,
+                parent_exists=bool(project.get("parent_exists")),
+            )
+        elif request.method == "PATCH" and project_id and path == f"/projects/{project_id}/organization":
+            body = await _read_member_policy_json_object(request)
+            db = await _db(request)
+            project = await db_module.get_project(db, project_id)
+            if project is None:
+                raise HTTPException(403, "Project is outside your access scope.")
+            rows = await db_module.list_projects(db)
+            by_id = {str(row.get("id")): row for row in rows}
+            family = {
+                str(row.get("id")): {
+                    "parent_exists": bool(
+                        row.get("parent_project_id")
+                        and row.get("parent_project_id") in by_id
+                    ),
+                    "child_ids": [
+                        str(child.get("id")) for child in rows
+                        if child.get("parent_project_id") == row.get("id")
+                    ],
+                }
+                for row in rows
+            }
+            caps = set(member_policy.required_caps_for_status(
+                project, body.get("status"), family,
+            ))
+            target = project_id
+            if body.get("status") is not None:
+                snapshot_family = family.get(project_id)
+                if snapshot_family is None:
+                    raise HTTPException(403, "Project is outside your access scope.")
+                authorized_status_snapshot = {
+                    "project_id": project_id,
+                    "current_status": project.get("status"),
+                    "requested_status": body.get("status"),
+                    "parent_project_id": project.get("parent_project_id"),
+                    "parent_exists": bool(snapshot_family.get("parent_exists")),
+                    "child_ids": list(snapshot_family.get("child_ids") or ()),
+                }
+        elif request.method == "DELETE" and path == "/projects":
+            project_ids = list(dict.fromkeys(request.query_params.getlist("project_id")))
+            # The entire batch is scope-checked before project existence is read.
+            for pid in project_ids:
+                _deny_unless_in_scope(scoped, pid)
+            db = await _db(request)
+            family = await db_module.get_project_family(db, project_ids)
+            family = {
+                pid: {"id": pid, **row}
+                for pid, row in family.items()
+            }
+            caps = set(member_policy.required_caps_for_delete(
+                [family[pid] for pid in project_ids if pid in family],
+                family,
+            ))
+            target = ",".join(project_ids) if project_ids else None
+            authorized_delete_family = family
+        elif request.method == "DELETE" and project_id and path == f"/projects/{project_id}":
+            db = await _db(request)
+            family = await db_module.get_project_family(db, [project_id])
+            if project_id in family:
+                family = {
+                    pid: {"id": pid, **row}
+                    for pid, row in family.items()
+                }
+                caps = set(member_policy.required_caps_for_delete(
+                    family[project_id], family,
+                ))
+            target = project_id
+            authorized_delete_family = family
+
+        member_policy.require_capabilities(scoped, caps, target=target)
+        if authorized_parent is not None:
+            request.state._meridian_member_policy_authorized_parent = authorized_parent
+        if authorized_delete_family is not None:
+            request.state._meridian_member_policy_authorized_delete_family = (
+                authorized_delete_family
+            )
+        if authorized_status_snapshot is not None:
+            request.state._meridian_member_policy_authorized_status_snapshot = (
+                authorized_status_snapshot
+            )
+    except member_policy.MemberPolicyUnavailable:
+        return JSONResponse(
+            {"detail": "Member policy check unavailable"},
+            status_code=503,
+        )
+    except member_policy.MemberPolicyDenied as exc:
+        return JSONResponse(exc.body(), status_code=403)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+    except Exception:  # noqa: BLE001 — policy lookup errors must fail closed
+        import logging as _l  # noqa: PLC0415
+
+        _l.getLogger("meridian.member_policy").exception(
+            "member policy HTTP check failed"
+        )
+        if request.headers.get("x-workspace-tenant-id", "").strip():
+            return JSONResponse(
+                {"detail": "Member policy check unavailable"},
+                status_code=503,
+            )
+        return None
+    return None
+
+
+async def _member_policy_nonproject_write_response(request: Request) -> Response | None:
+    """Gate the remaining project- and workspace-level HTTP mutation routes.
+
+    The project middleware above handles ``/projects`` lifecycle writes. These
+    routes carry their target through a task/session id, a request body, or a
+    profile-layer scope, so resolve the member scope first and validate every
+    project/session target before checking its capability or allowing the
+    handler to mutate state.
+    """
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+
+    path = request.url.path.rstrip("/") or "/"
+    task_match = re.fullmatch(r"/tasks/([^/]+)", path)
+    session_match = re.fullmatch(r"/sessions/([^/]+)(?:/(close|heartbeat))?", path)
+    task_create = request.method == "POST" and path == "/tasks"
+    session_register = request.method == "POST" and path == "/sessions/register"
+    task_mutation = bool(task_match) and request.method in ("PATCH", "DELETE")
+    session_mutation = bool(session_match) and (
+        request.method == "PATCH"
+        or (request.method == "POST" and session_match.group(2) in ("close", "heartbeat"))
+    )
+
+    # Owner-only workspace administration has its own role/capability gate.
+    workspace_admin = (
+        path.startswith("/workspace/invite")
+        or path.startswith("/workspace/members")
+        or path.startswith("/workspace/member-policy")
+    )
+    workspace_mutation = path.startswith("/workspace/") and not workspace_admin
+    github_connection_mutation = (
+        path.startswith("/github/connections/") and request.method == "DELETE"
+    )
+    profile_layer_mutation = path.startswith("/profile-layers/")
+
+    if not (
+        task_create or session_register or task_mutation or session_mutation
+        or workspace_mutation or github_connection_mutation or profile_layer_mutation
+    ):
+        return None
+
+    from . import member_policy  # noqa: PLC0415
+    from ._deps import (  # noqa: PLC0415
+        WORKSPACE_SCOPE_DENIED,
+        _deny_unless_in_scope,
+        _is_workspace_data_path,
+        _scoped_project_ids_for_request,
+        _session_project_id,
+    )
+
+    try:
+        scoped = await _scoped_project_ids_for_request(request)
+        if scoped is None:
+            return None
+
+        capability: str | None = None
+        target: str | None = None
+
+        if task_create:
+            body = await _read_member_policy_json_object(request)
+            project_id = body.get("project_id")
+            session_id = body.get("session_id")
+            # Let FastAPI retain its existing request validation for malformed
+            # bodies; valid targets are scope-checked before the capability.
+            if not isinstance(project_id, str) or not project_id.strip():
+                return None
+            _deny_unless_in_scope(scoped, project_id)
+            if isinstance(session_id, str) and session_id.strip():
+                _deny_unless_in_scope(
+                    scoped, await _session_project_id(request, session_id)
+                )
+            capability = member_policy.WRITE_PROJECT
+            target = project_id
+        elif session_register:
+            body = await _read_member_policy_json_object(request)
+            project_id = body.get("project_id")
+            if not isinstance(project_id, str) or not project_id.strip():
+                return None
+            _deny_unless_in_scope(scoped, project_id)
+            capability = member_policy.WRITE_PROJECT
+            target = project_id
+        elif task_mutation:
+            task_id = task_match.group(1)
+            task = await db_module.get_task(await _db(request), task_id)
+            _deny_unless_in_scope(
+                scoped, task.get("project_id") if task is not None else None
+            )
+            capability = member_policy.WRITE_PROJECT
+            target = task.get("project_id") if task is not None else task_id
+        elif session_mutation:
+            session_id = session_match.group(1)
+            project_id = await _session_project_id(request, session_id)
+            _deny_unless_in_scope(scoped, project_id)
+            capability = member_policy.WRITE_PROJECT
+            target = project_id or session_id
+        elif workspace_mutation or github_connection_mutation:
+            if _is_workspace_data_path(path):
+                # Workspace notes, decisions, settings, blog posts and the sprint board
+                # belong to no project. A project-scoped caller is refused whatever the
+                # write_workspace_level grant, with the same body the routes return
+                # (routes/workspace.py::_deny_project_scoped_workspace).
+                return JSONResponse({"detail": WORKSPACE_SCOPE_DENIED}, status_code=403)
+            capability = member_policy.WRITE_WORKSPACE_LEVEL
+            target = path
+        elif profile_layer_mutation:
+            # Profile layers use project/session scopes for project content and
+            # workspace/user/hosted_default scopes for workspace-level state.
+            from .profile_contract import normalize_scope_type  # noqa: PLC0415
+
+            parts = [part for part in path.split("/") if part]
+            profile_prefix = parts[:1] == ["profile-layers"]
+            layer_type: str | None = None
+            layer_id: str | None = None
+            target_type: str | None = None
+            target_id: str | None = None
+
+            if profile_prefix and len(parts) >= 3 and parts[1] in {
+                "project", "session", "workspace", "user", "hosted_default",
+            }:
+                layer_type, layer_id = parts[1], parts[2]
+            elif profile_prefix and len(parts) == 3 and parts[1] == "global" and parts[2] == "activate":
+                # Compatibility endpoint for the hosted_default/global layer.
+                capability = member_policy.WRITE_WORKSPACE_LEVEL
+                target = path
+            elif profile_prefix and len(parts) == 4 and parts[1] in {
+                "workspace", "hosted_default",
+            } and parts[3] == "clone":
+                # Static source-layer aliases still take their destination from
+                # the body, just like the canonical clone endpoint.
+                layer_type, layer_id = parts[1], parts[2]
+            elif profile_prefix and len(parts) == 3 and parts[2] == "activate":
+                # Activation is hardcoded by the route to hosted_default.
+                capability = member_policy.WRITE_WORKSPACE_LEVEL
+                target = path
+
+            if layer_type is not None:
+                try:
+                    layer_type = normalize_scope_type(layer_type)
+                except (TypeError, ValueError):
+                    return None  # Keep route-level profile validation intact.
+
+            is_clone = path.endswith("/clone")
+            if is_clone:
+                body = await _read_member_policy_json_object(request)
+                raw_type = body.get("target_scope_type")
+                raw_id = body.get("target_scope_id")
+                if not isinstance(raw_type, str) or not isinstance(raw_id, str):
+                    return None  # The handler reports its existing 400 response.
+                try:
+                    target_type = normalize_scope_type(raw_type)
+                except (TypeError, ValueError):
+                    return None
+                target_id = raw_id.strip()
+                if not target_id:
+                    return None
+
+            # Scope-check both clone endpoints (source first), matching the
+            # route dependency's existing ordering.
+            for scope_type, scope_id in ((layer_type, layer_id), (target_type, target_id)):
+                if scope_type == "project" and scope_id:
+                    _deny_unless_in_scope(scoped, scope_id)
+                elif scope_type == "session" and scope_id:
+                    _deny_unless_in_scope(
+                        scoped, await _session_project_id(request, scope_id)
+                    )
+
+            effective_type = target_type if is_clone else layer_type
+            if capability is None and effective_type is not None:
+                capability = (
+                    member_policy.WRITE_PROJECT
+                    if effective_type in {"project", "session"}
+                    else member_policy.WRITE_WORKSPACE_LEVEL
+                )
+                target = (
+                    f"{effective_type}:{target_id or layer_id or ''}"
+                )
+
+        if capability is not None:
+            member_policy.require_capabilities(scoped, {capability}, target=target)
+    except member_policy.MemberPolicyUnavailable:
+        return JSONResponse(
+            {"detail": "Member policy check unavailable"},
+            status_code=503,
+        )
+    except member_policy.MemberPolicyDenied as exc:
+        return JSONResponse(exc.body(), status_code=403)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+    except Exception:  # noqa: BLE001 — policy lookup errors must fail closed
+        import logging as _l  # noqa: PLC0415
+
+        _l.getLogger("meridian.member_policy").exception(
+            "member policy HTTP check failed"
+        )
+        if request.headers.get("x-workspace-tenant-id", "").strip():
+            return JSONResponse(
+                {"detail": "Member policy check unavailable"},
+                status_code=503,
+            )
+        return None
+    return None
+
+
 @app.middleware("http")
 async def _role_enforcement_middleware(request: Request, call_next):
     """Enforce workspace roles on cross-workspace writes.
@@ -1599,6 +2017,12 @@ async def _role_enforcement_middleware(request: Request, call_next):
             status_code=403,
             media_type="application/json",
         )
+    policy_response = await _member_policy_project_write_response(request)
+    if policy_response is not None:
+        return policy_response
+    policy_response = await _member_policy_nonproject_write_response(request)
+    if policy_response is not None:
+        return policy_response
     return await call_next(request)
 
 
@@ -3928,11 +4352,29 @@ async def workspace_update_member(request: Request, member_id: str) -> dict[str,
         )
     if role is not None and github_access is None:
         github_access = default_github_access_for_role(role)
-    if role is None and github_access is None:
-        raise HTTPException(status_code=422, detail="role or github_access required")
+    # project_id present in the body (even as null) changes the member's scope.
+    # null elevates a project-scoped member to the whole workspace; an id scopes
+    # the member to that one project. Absent leaves the scope alone.
+    scope_given = "project_id" in body
+    scope_project_id = None
+    if scope_given:
+        raw_scope = body.get("project_id")
+        if raw_scope is None:
+            scope_project_id = None
+        elif isinstance(raw_scope, str) and raw_scope.strip():
+            scope_project_id = raw_scope.strip()
+        else:
+            # A blank string must not silently widen a member to the whole workspace.
+            raise HTTPException(
+                status_code=422,
+                detail="project_id must be a project id, or null for the whole workspace",
+            )
+    if role is None and github_access is None and not scope_given:
+        raise HTTPException(status_code=422, detail="role, github_access or project_id required")
+    scope_kwargs = {"project_id": scope_project_id} if scope_given else {}
     updated = await db_module.update_workspace_member(
         request.app.state.db, member_id, tenant["id"],
-        role=role, github_access=github_access,
+        role=role, github_access=github_access, **scope_kwargs,
     )
     if updated is None:
         raise HTTPException(status_code=404, detail="member not found")
@@ -3941,6 +4383,7 @@ async def workspace_update_member(request: Request, member_id: str) -> dict[str,
         "email": updated["email"],
         "role": updated["role"],
         "github_access": updated.get("github_access"),
+        "project_id": updated.get("project_id"),
         "pending": updated.get("joined_at") is None,
     }
 
@@ -6018,6 +6461,7 @@ async def _start_session_composite(
     version: str | None = None,
     mode: str | None = None,
     expand_stale: bool = False,
+    include_workspace: bool = True,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -6466,7 +6910,10 @@ async def _start_session_composite(
     # count, policy-note titles, the fetch calls); the full text only when
     # include_workspace_context is on. See _build_workspace_context_block.
     try:
-        workspace_context = await _build_workspace_context_block(db)
+        # include_workspace=False: a project-scoped caller gets no owner workspace rows.
+        workspace_context = await _build_workspace_context_block(
+            db, include_workspace=include_workspace,
+        )
     except Exception:
         workspace_context = ""
 
@@ -6629,6 +7076,7 @@ async def start_session_endpoint(
             client_type=body.client,
             role=body.role,
             source=body.source,
+            include_workspace=await _workspace_visible_for_request(request),
         )
     except ValueError as _ve:
         raise HTTPException(status_code=400, detail=str(_ve)) from _ve
@@ -6720,6 +7168,31 @@ async def _hook_scoped_project_ids(request: Request) -> "list[str] | None":
         return None
 
 
+def _require_hook_project_write(
+    scoped: "list[str] | None", project_id: str | None = None,
+) -> None:
+    """Require project-write authority for a scoped session hook caller.
+
+    Unscoped owners, workspace-wide members, and local callers retain the
+    historical behavior. Policy failures are translated to explicit HTTP
+    refusals so an unavailable policy can never fall through as a 500/pass.
+    """
+    if scoped is None:
+        return
+    from . import member_policy  # noqa: PLC0415
+
+    try:
+        member_policy.require_capability(
+            scoped, member_policy.WRITE_PROJECT, target=project_id,
+        )
+    except member_policy.MemberPolicyDenied as exc:
+        raise HTTPException(status_code=403, detail=exc.detail) from exc
+    except member_policy.MemberPolicyUnavailable as exc:
+        raise HTTPException(status_code=503, detail="member policy check unavailable") from exc
+    except Exception as exc:  # noqa: BLE001 — policy failures must refuse the hook
+        raise HTTPException(status_code=503, detail="member policy check unavailable") from exc
+
+
 def _hook_is_executor(body: dict[str, Any]) -> bool:
     """True when a SessionStart hook payload denotes an executor session.
 
@@ -6793,6 +7266,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         if hook_scope is not None and project_id:
             from ._deps import _deny_unless_in_scope  # noqa: PLC0415
             _deny_unless_in_scope(hook_scope, project_id)
+        _require_hook_project_write(hook_scope, project_id or None)
 
     def _normalize_hook_cwd(path: str) -> str:
         value = (path or "").strip().replace("\\", "/")
@@ -6926,8 +7400,10 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     # v2.8 — Codex/Claude hook sessions rarely pass a human_id, so they land on
     # the timeline as "(unknown)". Fall back to the workspace display name the
     # user set in Settings so their automated sessions are attributed to them.
+    include_workspace = await _workspace_visible_for_request(request)
     human_id = body.get("human_id")
-    if not human_id:
+    # The workspace display name is the owner's; a project-scoped caller never reads it.
+    if not human_id and include_workspace:
         try:
             ws = await db_module.get_workspace_settings(db)
             human_id = (ws.get("display_name") or "").strip() or None
@@ -6939,6 +7415,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         client_type="hook",
         source=source or None,
         mode="continue" if body.get("mode") == "continue" else None,
+        include_workspace=include_workspace,
     )
     goal = result.get("goal") or {}
     sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
@@ -7308,6 +7785,7 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     if hook_scope is not None and project_id:
         from ._deps import _deny_unless_in_scope  # noqa: PLC0415
         _deny_unless_in_scope(hook_scope, project_id)
+    _require_hook_project_write(hook_scope, project_id or None)
     # No explicit project — try to route by cwd/hostname like session-start does.
     if not project_id:
         project_id = await _resolve_hook_project_id(
@@ -8468,8 +8946,13 @@ async def _mcp_sse_session_context(
         if resolved is None:
             return None
         ctx["enforce_role"] = resolved[0]
-        ctx["scoped_project_ids"] = await db_module.get_scoped_project_ids_for_member(
-            auth_db, ws_tid, email,
+        from . import member_policy as _member_policy  # noqa: PLC0415
+        ctx["scoped_project_ids"] = await _member_policy.resolve_member_scope(
+            # This follow-up POST intentionally carries no credential. Reuse
+            # the tenant DB connection captured by the authenticated SSE GET;
+            # resolving it again from the request would reject this valid
+            # session with 401 before the scope can be re-applied.
+            auth_db, lambda: ctx["db"], ws_tid, email,
         )
     return ctx
 

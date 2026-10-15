@@ -21,6 +21,7 @@ import meridian.server as _server
 from meridian import db as db_module
 from meridian import session_brief as session_brief_module
 from meridian._deps import _build_workspace_context_block, validate_input_size
+from meridian.mcp.scope_guard import WORKSPACE_SCOPED_ARG
 
 _ITEM_RECOVERY_XML_MAX_BYTES = 1800
 
@@ -571,7 +572,13 @@ async def handle_get_context_block(
     # them at the very top so a fresh session sees org-wide truth first.
     # 0b0b24d8 — a bounded index by default, full text only when
     # include_workspace_context is on (see _build_workspace_context_block).
-    ws_block = await _build_workspace_context_block(db, tenant_id=_mcp_tenant_id)
+    # A project-scoped caller (flag set by the dispatcher) gets no workspace section: the
+    # owner's workspace rows are not project data, and the tenant filter alone would still
+    # pass the pre-isolation (NULL tenant) rows through.
+    ws_block = await _build_workspace_context_block(
+        db, tenant_id=_mcp_tenant_id,
+        include_workspace=not args.get(WORKSPACE_SCOPED_ARG),
+    )
     if ws_block:
         text = f"{ws_block}\n\n{text}"
     xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
