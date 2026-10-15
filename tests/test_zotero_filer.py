@@ -6,11 +6,15 @@ app, the network, or any file outside pytest's tmp_path.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import urllib.request
+from pathlib import Path
 
 import pytest
 
+from meridian import zotero_connect as zc
 from meridian import zotero_filer as zf
 
 COLLECTIONS = zf.LOCAL_API + "/collections"
@@ -93,6 +97,34 @@ def bib_file(tmp_path):
     path = tmp_path / "refs.bib"
     path.write_text(SAMPLE_BIB, encoding="utf-8")
     return str(path)
+
+
+class _MemoryApprovalStore:
+    """In-memory stand-in for the OS keyring, so live runs see a stored approval."""
+
+    def __init__(self, key):
+        self.key = key
+        self.delete_calls = 0
+
+    def get(self):
+        return self.key
+
+    def set(self, key):
+        self.key = key
+
+    def delete(self):
+        self.delete_calls += 1
+        had = self.key is not None
+        self.key = None
+        return had
+
+
+@pytest.fixture(autouse=True)
+def _stored_zotero_approval(monkeypatch):
+    """Every live run in this file starts with a stored approval. The key is a fake test value."""
+    store = _MemoryApprovalStore("fake-filer-test-approval")
+    monkeypatch.setattr(zc, "KeyringApprovalStore", lambda: store)
+    return store
 
 
 def _research_routes(items_payload=None, selected="Research"):
@@ -185,24 +217,24 @@ def test_open_collection_only_runs_on_windows_and_checks_the_key(monkeypatch):
 # Saving
 # ---------------------------------------------------------------------------
 
-def test_save_items_sends_fresh_session_and_returns_status():
+def test_save_items_sends_fresh_session_and_returns_written_status():
     fake = FakeTransport({("POST", SAVE): (201, {})})
     items = [{"itemType": "document", "title": "T"}]
-    assert zf.save_items(items, fake) == 201
+    assert zf.save_items(items, fake) == {"status": "written", "http_status": 201}
     payload = json.loads(fake.calls[0]["body"])
     assert payload["uri"] == "https://meridian.local/research"
     assert payload["items"] == items
     assert len(payload["sessionID"]) == 32
 
 
-def test_save_items_returns_none_on_http_error_and_connection_error():
+def test_save_items_reports_http_and_connection_errors_without_writing():
     fake = FakeTransport({("POST", SAVE): (500, {"error": "boom"})})
-    assert zf.save_items([{"title": "T"}], fake) is None
+    assert zf.save_items([{"title": "T"}], fake)["status"] == "error"
 
     def refuse(method, url, body, headers):
         raise ConnectionRefusedError("refused")
 
-    assert zf.save_items([{"title": "T"}], refuse) is None
+    assert zf.save_items([{"title": "T"}], refuse)["status"] == "unreachable"
 
 
 # ---------------------------------------------------------------------------
@@ -398,3 +430,247 @@ def test_cli_missing_collection_exits_two(bib_file, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert code == 2
     assert out["status"] == "no_collection"
+
+
+# ---------------------------------------------------------------------------
+# PDF attach on the stored approval only: a filer run never authorizes and never
+# opens Zotero's approval dialog. Every fake here fails the test on an unknown request.
+# ---------------------------------------------------------------------------
+
+AUTHORIZE = "http://127.0.0.1:23119/api/local/authorize"
+WRITE_ITEMS = zf.LOCAL_API + "/items"
+SERVER_ID = "SRV-FILER-TEST"
+PDF_HEAD = b"%PDF-1.7\n%test\n"
+APPROVED_WRITE = (200, {"success": {"0": "ATT00001", "1": "ATT00002"}, "successful": {}, "failed": {}}, {})
+FILED_ITEMS = [
+    _item("NEW00001", doi="10.1000/xyz123", title="Deep Learning for GPT-style Models"),
+    _item("NEW00002", title="Attention Is All You Need, Revisited", item_type="conferencePaper"),
+]
+
+
+class FakeHeaderTransport:
+    """Header-aware fake. Routes return (status, payload, response_headers). Unmapped requests fail the test."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+
+    def __call__(self, method, url, body, headers, timeout=None):
+        self.calls.append({
+            "method": method, "url": url, "body": body, "headers": dict(headers), "timeout": timeout,
+        })
+        handler = self.routes.get((method, url.split("?", 1)[0]))
+        if handler is None:
+            raise AssertionError(f"unexpected header request: {method} {url}")
+        status, payload, response_headers = handler
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        return status, text, dict(response_headers)
+
+    def requests_to(self, method, url):
+        return [call for call in self.calls if call["method"] == method and call["url"] == url]
+
+
+def _header_routes(post=None, items_probe=None):
+    """Server-id probe, the reachability probe that follows a 403, and the attachment write. No authorize route."""
+    return {
+        ("GET", COLLECTIONS): (200, [], {"Zotero-Server-ID": SERVER_ID}),
+        ("GET", zf.LOCAL_API + "/items"): items_probe or (200, [], {}),
+        ("POST", WRITE_ITEMS): post or APPROVED_WRITE,
+    }
+
+
+def _filing_routes():
+    """The collection starts empty, takes the save, and then lists both filed items with no PDF children."""
+    state = {"saved": False}
+
+    def items(url, body):
+        return 200, (FILED_ITEMS if state["saved"] else [])
+
+    def save(url, body):
+        state["saved"] = True
+        return 201, {}
+
+    routes = {
+        ("GET", COLLECTIONS): (200, [_collection("ABCD1234", "Research")]),
+        ("GET", ITEMS): items,
+        ("POST", SELECTED): _selection("Research"),
+        ("POST", SAVE): save,
+    }
+    for item in FILED_ITEMS:
+        routes[("GET", zf.LOCAL_API + f"/items/{item['key']}/children")] = (200, [])
+    return routes
+
+
+def _existing_routes():
+    """The collection already holds both items, so attach-existing has something to match."""
+    routes = {
+        ("GET", COLLECTIONS): (200, [_collection("ABCD1234", "Research")]),
+        ("GET", ITEMS): (200, FILED_ITEMS),
+    }
+    for item in FILED_ITEMS:
+        routes[("GET", zf.LOCAL_API + f"/items/{item['key']}/children")] = (200, [])
+    return routes
+
+
+@pytest.fixture
+def pdf_dir(tmp_path):
+    directory = tmp_path / "pdfs"
+    directory.mkdir()
+    for citekey in ("smith2020deep", "lee2021attention"):
+        (directory / f"{citekey}.pdf").write_bytes(PDF_HEAD)
+    return directory
+
+
+@pytest.fixture
+def no_zotero_ui(monkeypatch):
+    """Keep the desktop selection step out of these runs. Nothing here opens Zotero."""
+    monkeypatch.setattr(zf, "open_collection_in_zotero", lambda key: False)
+
+
+def test_no_stored_approval_skips_the_attach_step_with_no_authorize_and_one_connect_line(
+        bib_file, pdf_dir, _stored_zotero_approval, no_zotero_ui):
+    _stored_zotero_approval.key = None
+    library = FakeTransport(_existing_routes())
+    header = FakeHeaderTransport({})  # any header request at all fails the test
+    messages = []
+    result = zf.attach_existing_files(
+        [bib_file], "Research", pdf_dir, transport=library, header_transport=header, log=messages.append,
+    )
+    assert result["status"] == "needs_connection"
+    assert result["attachments"]["status"] == "needs_connection"
+    assert result["attachments"]["attached"] == []
+    assert sorted(result["attachments"]["failed"]) == ["lee2021attention", "smith2020deep"]
+    assert header.calls == []
+    assert messages.count(zc.CONNECT_FIRST_LINE) == 1
+    assert library.posts() == []
+
+
+def test_stored_approval_attach_writes_with_the_approval_header_and_never_authorizes(
+        bib_file, pdf_dir, _stored_zotero_approval, no_zotero_ui):
+    approval = _stored_zotero_approval.key
+    library = FakeTransport(_filing_routes())
+    header = FakeHeaderTransport(_header_routes())
+    result = zf.file_bib_files(
+        [bib_file], "Research", transport=library, header_transport=header,
+        pdf_dir=str(pdf_dir), log=lambda message: None,
+    )
+    attachments = result["attachments"]
+    assert result["status"] == "ok"
+    assert attachments["status"] == "ok"
+    assert attachments["attached"] == ["smith2020deep", "lee2021attention"]
+    assert all(call["url"].split("?", 1)[0] != AUTHORIZE for call in header.calls)
+    assert header.requests_to("POST", AUTHORIZE) == []
+    write = header.requests_to("POST", WRITE_ITEMS)[0]
+    assert write["headers"]["Authorization"] == f"Bearer {approval}"
+    assert write["headers"]["Zotero-Server-ID"] == SERVER_ID
+    assert "Zotero-API-Key" not in write["headers"]
+    assert approval not in json.dumps(result)
+
+
+REJECTED_MESSAGE = (
+    "Zotero rejected the stored approval. Running 'python -m meridian.zotero_connect connect' again replaces it."
+)
+
+
+def test_401_on_the_filer_path_keeps_the_stored_key_and_shows_the_rejected_message(
+        bib_file, pdf_dir, _stored_zotero_approval, no_zotero_ui):
+    approval = _stored_zotero_approval.key
+    library = FakeTransport(_filing_routes())
+    header = FakeHeaderTransport(_header_routes(post=(401, {"error": "not approved"}, {})))
+    messages = []
+    result = zf.file_bib_files(
+        [bib_file], "Research", transport=library, header_transport=header,
+        pdf_dir=str(pdf_dir), log=messages.append,
+    )
+    attachments = result["attachments"]
+    assert result["status"] == "ok"
+    assert attachments["status"] == "rejected"
+    assert attachments["attached"] == []
+    assert sorted(attachments["failed"]) == ["lee2021attention", "smith2020deep"]
+    assert _stored_zotero_approval.key == approval
+    assert _stored_zotero_approval.delete_calls == 0
+    assert header.requests_to("POST", AUTHORIZE) == []
+    assert len(header.requests_to("POST", WRITE_ITEMS)) == 1
+    assert messages.count(REJECTED_MESSAGE) == 1
+    assert zc.CONNECT_FIRST_LINE not in messages
+    assert approval not in json.dumps(result)
+
+
+def test_403_with_a_reachable_probe_on_the_filer_path_keeps_the_stored_key(
+        bib_file, pdf_dir, _stored_zotero_approval, no_zotero_ui):
+    approval = _stored_zotero_approval.key
+    library = FakeTransport(_filing_routes())
+    # The default items probe answers 200, so the local API is up and Zotero itself refused the key.
+    header = FakeHeaderTransport(_header_routes(post=(403, {"error": "denied"}, {})))
+    messages = []
+    result = zf.file_bib_files(
+        [bib_file], "Research", transport=library, header_transport=header,
+        pdf_dir=str(pdf_dir), log=messages.append,
+    )
+    attachments = result["attachments"]
+    assert result["status"] == "ok"
+    assert attachments["status"] == "rejected"
+    assert attachments["attached"] == []
+    assert _stored_zotero_approval.key == approval
+    assert _stored_zotero_approval.delete_calls == 0
+    assert header.requests_to("POST", AUTHORIZE) == []
+    assert len(header.requests_to("POST", WRITE_ITEMS)) == 1
+    assert messages.count(REJECTED_MESSAGE) == 1
+    assert zc.CONNECT_FIRST_LINE not in messages
+    assert approval not in json.dumps(result)
+
+
+def test_a_403_while_the_local_api_is_off_keeps_the_stored_key(
+        bib_file, pdf_dir, _stored_zotero_approval, no_zotero_ui):
+    approval = _stored_zotero_approval.key
+    library = FakeTransport(_filing_routes())
+    header = FakeHeaderTransport(_header_routes(
+        post=(403, {"error": "denied"}, {}),
+        items_probe=(403, "Local API is not enabled", {}),
+    ))
+    result = zf.file_bib_files(
+        [bib_file], "Research", transport=library, header_transport=header,
+        pdf_dir=str(pdf_dir), log=lambda message: None,
+    )
+    assert result["attachments"]["status"] == "zotero_error"
+    assert result["attachments"]["attached"] == []
+    assert _stored_zotero_approval.key == approval
+    assert _stored_zotero_approval.delete_calls == 0
+    assert header.requests_to("POST", AUTHORIZE) == []
+
+
+def test_only_connect_references_the_authorize_endpoint():
+    """Every reference to /local/authorize in meridian/ sits in connect(), or is its module-level path constant."""
+    package = Path(zc.__file__).resolve().parent
+    references = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+        owner_of = {}
+        for func in ast.walk(tree):
+            if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for inner in ast.walk(func):
+                    owner_of.setdefault(id(inner), func.name)
+        for node in ast.walk(tree):
+            hit = (
+                (isinstance(node, ast.Constant) and isinstance(node.value, str) and "/local/authorize" in node.value)
+                or (isinstance(node, ast.Name) and node.id == "_AUTHORIZE_PATH")
+                or (isinstance(node, ast.Attribute) and node.attr == "_AUTHORIZE_PATH")
+            )
+            if hit:
+                references.append((path.name, owner_of.get(id(node), "<module>"), node.lineno))
+    assert references, "the authorize endpoint must still be defined in zotero_connect"
+    offenders = [
+        ref for ref in references
+        if not (ref[0] == "zotero_connect.py" and ref[1] in ("connect", "<module>"))
+    ]
+    assert offenders == [], f"the authorize endpoint is referenced outside connect(): {offenders}"
+    assert {ref[1] for ref in references if ref[0] == "zotero_connect.py" and ref[1] != "<module>"} == {"connect"}
+
+
+def test_a_request_carrying_the_approval_is_never_redirected_off_this_machine():
+    request = urllib.request.Request(
+        WRITE_ITEMS, data=b"[]", headers={"Authorization": "Bearer x", "Content-Type": "application/json"},
+        method="POST",
+    )
+    handler = zf._StripKeyOnRedirect()
+    assert handler.redirect_request(request, None, 307, "Temporary Redirect", {}, "https://storage.example.test/x") is None
