@@ -1,8 +1,11 @@
 """Tests for the PDF attach step of meridian.zotero_filer (desktop backend only).
 
-Every test injects fake transports, so nothing here touches the real Zotero
-app, the network, or a real library. The authorization key used below is a
-dummy value. The tests check that it only ever travels in request headers.
+Every test injects fake transports and a fake approval store, so nothing here
+touches the real Zotero app, the network, the OS keyring or a real library. The
+approval used below is a dummy value. The attach step uses only the stored
+approval: no test here may reach the authorize endpoint, and the fake header
+transport has no route for it, so any authorize call fails the test loudly.
+The approval only ever travels in the Authorization header.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import os
 
 import pytest
 
+from meridian import zotero_connect as zc
 from meridian import zotero_filer as zf
 
 COLLECTIONS = zf.LOCAL_API + "/collections"
@@ -21,8 +25,7 @@ SAVE = zf.CONNECTOR + "/saveItems"
 AUTHORIZE = "http://127.0.0.1:23119/api/local/authorize"
 WRITE_ITEMS = zf.LOCAL_API + "/items"
 SERVER_ID = "SRV-TEST-1"
-KEY = "DUMMYKEY0123456789ABCDEF"  # fake key, never a real credential
-APP_NAME = "Meridian Zotero filer"
+KEY = "DUMMYKEY0123456789ABCDEF"  # fake approval, never a real credential
 FILED_KEYS = ("NEW00001", "NEW00002")
 SAMPLE_BIB = """
 @article{smith2020deep,
@@ -139,11 +142,45 @@ def _library(children=None):
 APPROVED_WRITE = (200, {"success": {"0": "ATT00001", "1": "ATT00002"}, "successful": {}, "failed": {}}, {})
 
 
-def _attach(auth=None, post=None, probe=None):
-    """Header-side fake: the server-id probe, the one authorize call, and the attachment write."""
+class MemoryApprovalStore:
+    """In-memory stand-in for the OS keyring approval store. Counts deletes."""
+
+    def __init__(self, key):
+        self.key = key
+        self.delete_calls = 0
+
+    def get(self):
+        return self.key
+
+    def set(self, key):
+        self.key = key
+
+    def delete(self):
+        self.delete_calls += 1
+        had = self.key is not None
+        self.key = None
+        return had
+
+
+@pytest.fixture(autouse=True)
+def approval(monkeypatch):
+    """The stored approval every test here sees. A test that needs none sets key to None.
+
+    KeyringApprovalStore is replaced for the whole file, so the OS keyring is never read.
+    """
+    store = MemoryApprovalStore(KEY)
+    monkeypatch.setattr(zc, "KeyringApprovalStore", lambda: store)
+    return store
+
+
+def _attach(post=None, probe=None, items_probe=None):
+    """Header-side fake: the server-id probe, the reachability probe used after a 403, and the attachment write.
+
+    There is deliberately no route for the authorize endpoint.
+    """
     routes = {
         ("GET", COLLECTIONS): probe or (200, [], {"Zotero-Server-ID": SERVER_ID}),
-        ("POST", AUTHORIZE): auth or (200, {"key": KEY}, {}),
+        ("GET", zf.LOCAL_API + "/items"): items_probe or (200, [], {}),
         ("POST", WRITE_ITEMS): post or APPROVED_WRITE,
     }
     return FakeHeaderTransport(routes)
@@ -301,7 +338,7 @@ def test_item_that_already_has_a_pdf_child_is_skipped(bib_file, pdf_dir):
     result = _run(bib_file, _library(children=children), header, pdf=pdf_dir)
     assert result["attachments"]["already_has_pdf"] == ["smith2020deep"]
     assert result["attachments"]["attached"] == ["lee2021attention"]
-    assert len(header.requests_to("POST", AUTHORIZE)) == 1
+    assert header.requests_to("POST", AUTHORIZE) == []
     body = json.loads(header.requests_to("POST", WRITE_ITEMS)[0]["body"])
     assert [entry["parentItem"] for entry in body] == ["NEW00002"]
 
@@ -358,43 +395,44 @@ def test_item_whose_linked_pdf_is_missing_gets_a_new_attachment(bib_file, pdf_di
 
 
 # ---------------------------------------------------------------------------
-# Authorization: one request, stop on refusal, never loop on 429
+# Stored approval only: one write, stop on refusal, never authorize
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("auth", [
+@pytest.mark.parametrize("answer", [
+    (401, {"error": "not approved"}, {}),
     (403, {"error": "denied"}, {}),
-    (200, {"message": "no key"}, {}),
-    (200, "not json", {}),
-])
-def test_unapproved_authorize_stops_the_attach_step_and_reports_it(bib_file, pdf_dir, auth):
+], ids=["401", "403-probe-reachable"])
+def test_stored_approval_rejected_by_zotero_is_deleted_and_the_step_stops(bib_file, pdf_dir, approval, answer):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
-    header = _attach(auth=auth)
+    header = _attach(post=answer)
     result = _run(bib_file, _library(), header, pdf=pdf_dir)
     attachments = result["attachments"]
-    assert attachments["status"] == "not_approved"
+    assert attachments["status"] == "needs_connection"
     assert attachments["attached"] == []
     assert sorted(attachments["failed"]) == ["lee2021attention", "smith2020deep"]
-    assert len(header.requests_to("POST", AUTHORIZE)) == 1
-    assert header.requests_to("POST", WRITE_ITEMS) == []
+    assert approval.key is None
+    assert approval.delete_calls == 1
+    assert header.requests_to("POST", AUTHORIZE) == []
+    assert len(header.requests_to("POST", WRITE_ITEMS)) == 1
     assert result["status"] == "ok"
 
 
-def test_rate_limited_authorize_stops_with_no_retry(bib_file, pdf_dir):
+def test_rate_limited_write_with_stored_approval_is_reported_and_keeps_the_approval(bib_file, pdf_dir, approval):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
-    header = _attach(auth=(429, {"error": "slow down"}, {"Retry-After": "60"}))
+    header = _attach(post=(429, {"error": "slow down"}, {"Retry-After": "60"}))
     result = _run(bib_file, _library(), header, pdf=pdf_dir)
     attachments = result["attachments"]
     assert attachments["status"] == "rate_limited"
     assert attachments["retry_after"] == "60"
     assert attachments["attached"] == []
-    assert len(header.requests_to("POST", AUTHORIZE)) == 1
-    assert header.requests_to("POST", WRITE_ITEMS) == []
-    assert len(header.calls) == 2  # the server-id probe and one authorize request, nothing more
+    assert approval.key == KEY
+    assert approval.delete_calls == 0
+    assert header.requests_to("POST", AUTHORIZE) == []
 
 
-def test_missing_server_id_means_no_authorize_request(bib_file, pdf_dir):
+def test_missing_server_id_means_no_write_and_no_authorize(bib_file, pdf_dir):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
     header = _attach(probe=(200, [], {}))
@@ -408,7 +446,7 @@ def test_missing_server_id_means_no_authorize_request(bib_file, pdf_dir):
 # Approved attach: request shape, key handling, per-item reporting
 # ---------------------------------------------------------------------------
 
-def test_approved_attach_posts_linked_file_items_with_forward_slash_paths(bib_file, pdf_dir):
+def test_stored_approval_attach_posts_linked_file_items_with_forward_slash_paths(bib_file, pdf_dir):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
     library = _library()
@@ -421,14 +459,11 @@ def test_approved_attach_posts_linked_file_items_with_forward_slash_paths(bib_fi
     assert attachments["attached"] == ["smith2020deep", "lee2021attention"]
     assert attachments["failed"] == []
 
-    auth_call = header.requests_to("POST", AUTHORIZE)[0]
-    assert json.loads(auth_call["body"]) == {"appName": APP_NAME}
-    assert auth_call["headers"]["Zotero-Server-ID"] == SERVER_ID
-    assert "Zotero-API-Key" not in auth_call["headers"]
-
+    assert header.requests_to("POST", AUTHORIZE) == []
     write_call = header.requests_to("POST", WRITE_ITEMS)[0]
     assert write_call["headers"]["Zotero-Server-ID"] == SERVER_ID
-    assert write_call["headers"]["Zotero-API-Key"] == KEY
+    assert write_call["headers"]["Authorization"] == f"Bearer {KEY}"
+    assert "Zotero-API-Key" not in write_call["headers"]
     body = json.loads(write_call["body"])
     expected_path = os.path.abspath(pdf_dir / "smith2020deep.pdf").replace("\\", "/")
     assert body[0] == {
@@ -566,6 +601,6 @@ def test_real_header_transport_returns_status_body_and_headers(monkeypatch):
             raise urllib.error.HTTPError(request.full_url, 429, "Too Many", error_headers, io.BytesIO(b"slow"))
 
     monkeypatch.setattr(zf, "_OPENER", ErrorOpener())
-    status, text, headers = zf._urllib_transport_with_headers("POST", AUTHORIZE, b"{}", {})
+    status, text, headers = zf._urllib_transport_with_headers("POST", WRITE_ITEMS, b"{}", {})
     assert (status, text) == (429, "slow")
     assert headers["Retry-After"] == "5"

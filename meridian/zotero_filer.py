@@ -19,11 +19,14 @@ Safety rules enforced here:
 * Items already in the collection (matched by DOI or lowercase title) are
   skipped.
 * PDFs are attached only on the desktop backend, only when --pdf-dir is given,
-  and only to items this run filed and verified. Zotero must approve the app
-  once in its own dialog. The approval key stays in memory and travels only in
-  request headers.
+  and only to items this run filed and verified. The attach uses the approval
+  that ``python -m meridian.zotero_connect connect`` already stored. A filer run
+  never calls the authorize endpoint and never opens Zotero's approval dialog.
+  With no stored approval, or when Zotero rejects the stored one, the attach step
+  stops with one connect line. The approval travels only in the Authorization
+  header, through zotero_connect.send_with_stored_approval.
 * --attach-existing attaches PDFs only to items already in the collection. It
-  files nothing, needs --pdf-dir, and uses the same single approval.
+  files nothing, needs --pdf-dir, and uses the same stored approval.
 * --attach-existing with --backend web attaches through the Zotero Web API with
   the key from the environment. It never calls the local API or the approval step.
 """
@@ -51,6 +54,7 @@ LOCAL_API = "http://127.0.0.1:23119/api/users/0"
 SAVE_URI = "https://meridian.local/research"
 
 _ALLOWED_HEADER = "Zotero-Allowed-Request"
+_SERVER_ID_HEADER = "Zotero-Server-ID"
 _TIMEOUT_S = 10.0
 _PAGE_SIZE = 100
 _BATCH_SIZE = 25
@@ -58,9 +62,6 @@ _COLLECTION_KEY_RE = re.compile(r"[A-Za-z0-9]{8}")
 _DOI_PREFIX_RE = re.compile(r"^(?:https?://)?(?:dx\.)?doi\.org/", re.IGNORECASE)
 _ARXIV_ID_RE = re.compile(r"[A-Za-z0-9./_-]{1,64}")
 _NON_TOP_LEVEL_TYPES = frozenset({"attachment", "note", "annotation"})
-_ATTACH_APP_NAME = "Meridian Zotero filer"
-_AUTHORIZE_URL = "http://127.0.0.1:23119/api/local/authorize"
-_AUTHORIZE_TIMEOUT_S = 120.0  # a person must answer Zotero's approval dialog, so this waits longer
 _ATTACH_BATCH_SIZE = 25
 _ITEM_KEY_RE = re.compile(r"[A-Za-z0-9]{8}")
 _PDF_MAGIC = b"%PDF-"
@@ -95,10 +96,16 @@ class _StripKeyOnRedirect(urllib.request.HTTPRedirectHandler):
 
     Zotero answers a file download with a redirect to the storage host. urllib
     copies request headers onto the redirected request, so without this the key
-    would reach that host.
+    would reach that host. A request that carries the stored approval (an
+    Authorization header) is never followed off this machine: the reply is returned
+    as it is, and the approval is not sent.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
+        carries_approval = any(name.lower() == "authorization" for name in req.headers)
+        if carries_approval and host not in zotero_connect._REDIRECT_HOSTS:
+            return None
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is not None:
             for name in [name for name in redirected.headers if name.lower() == "zotero-api-key"]:
@@ -331,10 +338,11 @@ def save_items(
 
     The connector takes no approval. This request carries no approval header, and
     it never reads or deletes the stored approval, whatever Zotero answers. Only the
-    local write path, :func:`zotero_connect.write_with_stored_approval`, uses the
-    stored approval. Returns ``{"status": "written", "http_status": N}`` on success,
-    ``{"status": "error", "http_status": N}`` for an HTTP error, and ``unreachable``,
-    ``timeout`` or ``error`` for a transport failure.
+    local write paths in zotero_connect, ``write_with_stored_approval`` and
+    ``send_with_stored_approval``, use the stored approval. Returns
+    ``{"status": "written", "http_status": N}`` on success, ``{"status": "error",
+    "http_status": N}`` for an HTTP error, and ``unreachable``, ``timeout`` or
+    ``error`` for a transport failure.
     """
     payload = {"sessionID": uuid.uuid4().hex, "uri": SAVE_URI, "items": items}
     try:
@@ -769,7 +777,7 @@ def file_bib_files(
         if pdf_dir is not None and status == "ok" and added > 0:
             result["attachments"] = attach_pdfs(
                 filed[:len(sent_items)], key, pdf_dir,
-                transport=transport, header_transport=header_transport, log=log,
+                transport=transport, header_transport=header_transport, log=log, store=store,
             )
         return result
     except _ERRORS as exc:
@@ -779,17 +787,13 @@ def file_bib_files(
 
 # ---------------------------------------------------------------------------
 # PDF attachments (desktop backend only). A filed entry gets DIR/<citekey>.pdf
-# as a linked file under its item. Zotero 10 shows the person an approval
-# dialog the first time, through /api/local/authorize. That is one request per
-# run and it is never retried. The returned key lives only in memory, travels
-# only in request headers, and is never logged, printed or written to a file.
+# as a linked file under its item. The attach uses only the approval that
+# `python -m meridian.zotero_connect connect` already stored. This module never
+# calls the authorize endpoint and never opens Zotero's approval dialog. With no
+# stored approval the step stops with one connect line. A rejected stored key is
+# deleted by zotero_connect and the step stops. The approval is sent only through
+# zotero_connect.send_with_stored_approval, in the Authorization header.
 # ---------------------------------------------------------------------------
-
-_AUTH_MESSAGES = {
-    "not_approved": "Zotero did not approve the PDF attach request. No PDFs were attached.",
-    "rate_limited": "Zotero rate-limited the PDF attach request. Nothing was retried; try again later.",
-    "auth_error": "The PDF attach request to Zotero failed before it was answered. No PDFs were attached.",
-}
 
 
 def _pdf_for_entry(entry, pdf_dir):
@@ -934,34 +938,6 @@ def _probe_server_id(header_transport):
     return _header_value(response_headers, "Zotero-Server-ID") or None
 
 
-def _request_authorization(header_transport, server_id):
-    """Make the single authorize request, which opens Zotero's approval dialog.
-
-    Returns (outcome, key, retry_after). outcome is approved, not_approved,
-    rate_limited or auth_error. key is set only when approved. A 429 is never retried.
-    """
-    body = json.dumps({"appName": _ATTACH_APP_NAME}).encode("utf-8")
-    headers = {_ALLOWED_HEADER: "1", "Zotero-Server-ID": server_id, "Content-Type": "application/json"}
-    try:
-        status, text, response_headers = header_transport(
-            "POST", _AUTHORIZE_URL, body, headers, timeout=_AUTHORIZE_TIMEOUT_S,
-        )
-    except _ERRORS:
-        return "auth_error", None, None
-    if status == 429:
-        return "rate_limited", None, _header_value(response_headers, "Retry-After")
-    if not 200 <= status < 300:
-        return "not_approved", None, None
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return "not_approved", None, None
-    key = data.get("key") if isinstance(data, dict) else None
-    if isinstance(key, str) and key:
-        return "approved", key, None
-    return "not_approved", None, None
-
-
 def _attachment_body(parent_key, citekey, pdf_path):
     """One Local API attachment object: a linked file under parent_key, with forward-slash paths."""
     return {
@@ -998,44 +974,53 @@ def _batch_outcomes(count, text):
     return [str(position) in ok and str(position) not in bad for position in range(count)]
 
 
-def _write_attachments(pending, header_transport, summary, log):
-    """Authorize once, then write the linked-file attachments in batches. Updates summary in place."""
+def _write_attachments(pending, header_transport, summary, log, store=None):
+    """Write the linked-file attachments in batches with the stored approval. Updates summary in place.
+
+    This step never authorizes and never opens Zotero's dialog. With no stored approval it stops
+    with needs_connection before any request. A reply that rejects the stored approval (a 401, or a
+    403 whose probe succeeds) makes zotero_connect delete the key, and the step stops with
+    needs_connection. A 429 stops the step and is not retried.
+    """
+    if not zotero_connect.has_stored_approval(store):
+        summary["status"] = "needs_connection"
+        log(zotero_connect.CONNECT_FIRST_LINE)
+        return
     server_id = _probe_server_id(header_transport)
     if server_id is None:
         summary["status"] = "no_server_id"
-        log("Zotero did not report a server id, so it cannot approve the PDF attach. No PDFs were attached.")
-        return
-    outcome, key, retry_after = _request_authorization(header_transport, server_id)
-    if outcome != "approved":
-        summary["status"] = outcome
-        if retry_after is not None:
-            summary["retry_after"] = retry_after
-        log(_AUTH_MESSAGES[outcome])
+        log("Zotero did not report a server id, so it cannot write the PDF attachments. No PDFs were attached.")
         return
     for start in range(0, len(pending), _ATTACH_BATCH_SIZE):
         batch = pending[start:start + _ATTACH_BATCH_SIZE]
-        body = json.dumps(
-            [_attachment_body(parent, citekey, path) for citekey, path, parent in batch]
-        ).encode("utf-8")
-        headers = {
-            _ALLOWED_HEADER: "1",
-            "Zotero-Server-ID": server_id,
-            "Zotero-API-Key": key,
-            "Content-Type": "application/json",
-        }
-        status, text, response_headers = header_transport(
-            "POST", f"{LOCAL_API}/items", body, headers, timeout=_TIMEOUT_S,
+        answer = zotero_connect.send_with_stored_approval(
+            "POST",
+            f"{LOCAL_API}/items",
+            [_attachment_body(parent, citekey, path) for citekey, path, parent in batch],
+            header_transport=header_transport,
+            headers={_SERVER_ID_HEADER: server_id},
+            store=store,
         )
-        if status == 429:
+        state = answer["status"]
+        if state == "needs_connection":
+            summary["status"] = "needs_connection"
+            log(zotero_connect.CONNECT_FIRST_LINE)
+            return
+        if state == "rate_limited":
             summary["status"] = "rate_limited"
-            summary["retry_after"] = _header_value(response_headers, "Retry-After")
+            if answer.get("retry_after") is not None:
+                summary["retry_after"] = answer["retry_after"]
             log("Zotero rate-limited the PDF attach write. Stopped; nothing was retried.")
             return
-        if not 200 <= status < 300:
+        if state != "written":
+            if state == "local_api_disabled" or "http_status" not in answer:
+                summary["status"] = "zotero_error"
+                log("Zotero's local API did not accept the PDF attach write. Stopped; nothing was retried.")
+                return
             summary["status"] = "attach_failed"
-            log(f"Zotero refused a PDF attach batch with HTTP {status}. Stopped.")
+            log(f"Zotero refused a PDF attach batch with HTTP {answer['http_status']}. Stopped.")
             return
-        for (citekey, _path, _parent), attached in zip(batch, _batch_outcomes(len(batch), text)):
+        for (citekey, _path, _parent), attached in zip(batch, _batch_outcomes(len(batch), answer["text"])):
             if attached:
                 summary["attached"].append(citekey)
                 log(f"Attached PDF for '{citekey}'.")
@@ -1044,18 +1029,20 @@ def _write_attachments(pending, header_transport, summary, log):
                 log(f"Zotero did not attach the PDF for '{citekey}'.")
 
 
-def attach_pdfs(filed, collection_key, pdf_dir, transport=None, header_transport=None, log=print) -> dict[str, Any]:
+def attach_pdfs(
+    filed, collection_key, pdf_dir, transport=None, header_transport=None, log=print, store=None,
+) -> dict[str, Any]:
     """Attach each filed entry's local PDF to its item and return a per-item summary.
 
     filed is a list of (bib entry, connector item) pairs for items this run filed
     and verified. For each entry the step finds its PDF, finds the item key,
-    skips items that already have a PDF child, makes one authorize request if
-    anything is left, and writes the attachments in batches.
+    skips items that already have a PDF child, and writes the rest in batches with
+    the stored approval. It never authorizes.
 
     Returns {"status", "attached", "already_has_pdf", "no_pdf", "failed"} with
-    lists of citekeys. status is ok, not_approved, rate_limited, auth_error,
-    no_server_id, zotero_error or attach_failed. Any refusal stops the step
-    at once. Every filed entry that was not attached is listed under failed.
+    lists of citekeys. status is ok, needs_connection, rate_limited, no_server_id,
+    zotero_error or attach_failed. Any refusal stops the step at once. Every filed
+    entry that was not attached is listed under failed.
     """
     transport = _resolve(transport)
     header_transport = _resolve_header(header_transport)
@@ -1087,7 +1074,7 @@ def attach_pdfs(filed, collection_key, pdf_dir, transport=None, header_transport
                 else:
                     pending.append((citekey, path, parent))
             if pending:
-                _write_attachments(pending, header_transport, summary, log)
+                _write_attachments(pending, header_transport, summary, log, store=store)
     except _ERRORS as exc:
         log(f"Zotero error during the PDF attach: {exc}")
         summary["status"] = "zotero_error"
@@ -1108,6 +1095,7 @@ def attach_existing_files(
     header_transport: HeaderTransport | None = None,
     dry_run: bool = False,
     log: Callable[[str], Any] = print,
+    store: Any = None,
 ) -> dict[str, Any]:
     """Attach PDFs to entries that are already in the target collection (--attach-existing).
 
@@ -1117,15 +1105,16 @@ def attach_existing_files(
     A matched entry gets DIR/<citekey>.pdf as a linked file when the file starts
     with %PDF- and the item has no application/pdf child yet.
 
-    A dry run stops after planning, so it never authorizes or writes. A live run
-    makes one authorize request when anything is planned, then writes the planned
-    attachments through _write_attachments. A refusal is reported and never retried.
+    A dry run stops after planning, so it never writes. A live run writes the
+    planned attachments through _write_attachments with the stored approval, and
+    never authorizes. With no stored approval the step stops with needs_connection.
+    A refusal is reported and never retried.
 
     Returns {"status", "collection", "mode", "attachments"}. The attachments dict
     holds lists of citekeys: planned, attached, already_has_pdf, no_pdf, failed,
     unmatched and duplicate_in_bib. status is dry_run, ok, no_collection,
-    input_error, zotero_error, not_approved, rate_limited, auth_error,
-    no_server_id or attach_failed.
+    input_error, zotero_error, needs_connection, rate_limited, no_server_id or
+    attach_failed.
     """
     transport = _resolve(transport)
     header_transport = _resolve_header(header_transport)
@@ -1187,7 +1176,7 @@ def attach_existing_files(
                 log(f"Would attach PDF for '{citekey}' to its existing item.")
             return finish("dry_run")
         if candidates:
-            _write_attachments(candidates, header_transport, summary, log)
+            _write_attachments(candidates, header_transport, summary, log, store=store)
     except _ERRORS as exc:
         log(f"Zotero error during the PDF attach: {exc}")
         summary["status"] = "zotero_error"

@@ -1,9 +1,11 @@
 """Tests for --attach-existing: PDFs go to items ALREADY in the target collection.
 
-Every test injects fake transports. An autouse guard makes the real Zotero
-transport, the collection selector and the save path fail loudly, so nothing
-here can reach the real app or library. The authorization key is a dummy value
-and must only ever travel in request headers.
+Every test injects fake transports and a fake approval store. An autouse guard
+makes the real Zotero transport, the collection selector and the save path fail
+loudly, and the OS keyring is replaced, so nothing here can reach the real app,
+the library or the keyring. The attach step uses only the stored approval, and
+the fake header transport has no route for the authorize endpoint. The approval
+is a dummy value and must only ever travel in the Authorization header.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import os
 
 import pytest
 
+from meridian import zotero_connect as zc
 from meridian import zotero_filer as zf
 
 COLLECTIONS = zf.LOCAL_API + "/collections"
@@ -20,7 +23,7 @@ ITEMS = zf.LOCAL_API + "/collections/ABCD1234/items"
 AUTHORIZE = "http://127.0.0.1:23119/api/local/authorize"
 WRITE_ITEMS = zf.LOCAL_API + "/items"
 SERVER_ID = "SRV-TEST-1"
-KEY = "DUMMYKEY0123456789ABCDEF"  # fake key, never a real credential
+KEY = "DUMMYKEY0123456789ABCDEF"  # fake approval, never a real credential
 EXIST_KEYS = ("EXIST001", "EXIST002")
 APPROVED_WRITE = (200, {"success": {"0": "ATT00001", "1": "ATT00002"}, "successful": {}, "failed": {}}, {})
 PDF_HEAD = b"%PDF-1.7\n%test\n"
@@ -145,14 +148,45 @@ def _library(children=None, items=None, collections=None):
     return FakeTransport(routes)
 
 
-def _header(auth=None, post=None, probe=None):
-    """Header-side fake: the server-id probe, the one authorize call, and the attachment write."""
+def _header(post=None, probe=None, items_probe=None):
+    """Header-side fake: the server-id probe, the reachability probe used after a 403, and the attachment write.
+
+    There is deliberately no route for the authorize endpoint.
+    """
     routes = {
         ("GET", COLLECTIONS): probe or (200, [], {"Zotero-Server-ID": SERVER_ID}),
-        ("POST", AUTHORIZE): auth or (200, {"key": KEY}, {}),
+        ("GET", zf.LOCAL_API + "/items"): items_probe or (200, [], {}),
         ("POST", WRITE_ITEMS): post or APPROVED_WRITE,
     }
     return FakeHeaderTransport(routes)
+
+
+class MemoryApprovalStore:
+    """In-memory stand-in for the OS keyring approval store. Counts deletes."""
+
+    def __init__(self, key):
+        self.key = key
+        self.delete_calls = 0
+
+    def get(self):
+        return self.key
+
+    def set(self, key):
+        self.key = key
+
+    def delete(self):
+        self.delete_calls += 1
+        had = self.key is not None
+        self.key = None
+        return had
+
+
+@pytest.fixture(autouse=True)
+def approval(monkeypatch):
+    """The stored approval every test here sees. A test that needs none sets key to None."""
+    store = MemoryApprovalStore(KEY)
+    monkeypatch.setattr(zc, "KeyringApprovalStore", lambda: store)
+    return store
 
 
 def _write_pdf(directory, citekey, body=PDF_HEAD):
@@ -465,10 +499,10 @@ def test_an_entry_not_in_the_collection_is_never_touched(bib_file, pdf_dir):
 
 
 # ---------------------------------------------------------------------------
-# Live run: one authorize, then the linked-file write
+# Live run: the stored approval, then the linked-file write. Never authorize.
 # ---------------------------------------------------------------------------
 
-def test_live_run_authorizes_once_then_writes_linked_files(bib_file, pdf_dir):
+def test_live_run_writes_linked_files_with_the_stored_approval_and_never_authorizes(bib_file, pdf_dir):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
     _write_pdf(pdf_dir, "orphan2024")
@@ -479,10 +513,11 @@ def test_live_run_authorizes_once_then_writes_linked_files(bib_file, pdf_dir):
     assert result["status"] == "ok"
     assert attachments["attached"] == ["smith2020deep", "lee2021attention"]
     assert attachments["failed"] == []
-    assert [call["url"] for call in header.calls] == [COLLECTIONS + "?limit=1", AUTHORIZE, WRITE_ITEMS]
-    assert len(header.requests_to("POST", AUTHORIZE)) == 1
+    assert [call["url"] for call in header.calls] == [COLLECTIONS + "?limit=1", WRITE_ITEMS]
+    assert header.requests_to("POST", AUTHORIZE) == []
     write = header.requests_to("POST", WRITE_ITEMS)[0]
-    assert write["headers"]["Zotero-API-Key"] == KEY
+    assert write["headers"]["Authorization"] == f"Bearer {KEY}"
+    assert "Zotero-API-Key" not in write["headers"]
     body = json.loads(write["body"])
     assert [entry["parentItem"] for entry in body] == ["EXIST001", "EXIST002"]
     assert all(entry["itemType"] == "attachment" and entry["linkMode"] == "linked_file" for entry in body)
@@ -501,28 +536,28 @@ def test_live_run_with_nothing_planned_never_authorizes(bib_file, pdf_dir):
     assert header.calls == []
 
 
-@pytest.mark.parametrize("auth", [
+@pytest.mark.parametrize("answer", [
+    (401, {"error": "not approved"}, {}),
     (403, {"error": "denied"}, {}),
-    (200, {"message": "no key"}, {}),
-    (200, "not json", {}),
-    (429, {"error": "slow down"}, {"Retry-After": "30"}),
-])
-def test_refused_or_unanswered_authorize_stops_with_no_write_and_no_retry(bib_file, pdf_dir, auth):
+], ids=["401", "403-probe-reachable"])
+def test_stored_approval_rejected_on_write_is_deleted_and_never_reauthorized(bib_file, pdf_dir, approval, answer):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
-    header = _header(auth=auth)
+    header = _header(post=answer)
     result = _run(bib_file, _library(), header, pdf_dir)
     attachments = result["attachments"]
-    assert result["status"] in ("not_approved", "rate_limited")
-    assert attachments["status"] == result["status"]
+    assert result["status"] == "needs_connection"
+    assert attachments["status"] == "needs_connection"
     assert attachments["attached"] == []
     assert sorted(attachments["failed"]) == ["lee2021attention", "smith2020deep"]
-    assert len(header.requests_to("POST", AUTHORIZE)) == 1
-    assert header.requests_to("POST", WRITE_ITEMS) == []
+    assert approval.key is None
+    assert approval.delete_calls == 1
+    assert header.requests_to("POST", AUTHORIZE) == []
+    assert len(header.requests_to("POST", WRITE_ITEMS)) == 1
     assert KEY not in json.dumps(result)
 
 
-def test_refused_write_after_approval_is_reported_and_not_retried(bib_file, pdf_dir):
+def test_refused_write_with_the_stored_approval_is_reported_and_not_retried(bib_file, pdf_dir, approval):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
     header = _header(post=(500, {"error": "boom"}, {}))
@@ -531,8 +566,25 @@ def test_refused_write_after_approval_is_reported_and_not_retried(bib_file, pdf_
     assert result["status"] == "attach_failed"
     assert attachments["attached"] == []
     assert sorted(attachments["failed"]) == ["lee2021attention", "smith2020deep"]
-    assert len(header.requests_to("POST", AUTHORIZE)) == 1
+    assert approval.key == KEY
+    assert header.requests_to("POST", AUTHORIZE) == []
     assert len(header.requests_to("POST", WRITE_ITEMS)) == 1
+
+
+def test_no_stored_approval_stops_the_attach_step_with_one_connect_line_and_no_write(bib_file, pdf_dir, approval):
+    approval.key = None
+    _write_pdf(pdf_dir, "smith2020deep")
+    _write_pdf(pdf_dir, "lee2021attention")
+    header = _header()
+    messages = []
+    result = _run(bib_file, _library(), header, pdf_dir, messages=messages)
+    attachments = result["attachments"]
+    assert result["status"] == "needs_connection"
+    assert attachments["status"] == "needs_connection"
+    assert attachments["attached"] == []
+    assert sorted(attachments["failed"]) == ["lee2021attention", "smith2020deep"]
+    assert header.calls == []
+    assert messages.count(zc.CONNECT_FIRST_LINE) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -596,5 +648,6 @@ def test_cli_live_run_attaches_existing_items(bib_file, pdf_dir, monkeypatch, ca
     assert code == 0
     assert out["status"] == "ok"
     assert out["attachments"]["attached"] == ["smith2020deep", "lee2021attention"]
-    assert len(header.requests_to("POST", AUTHORIZE)) == 1
+    assert header.requests_to("POST", AUTHORIZE) == []
+    assert header.requests_to("POST", WRITE_ITEMS)[0]["headers"]["Authorization"] == f"Bearer {KEY}"
     assert KEY not in json.dumps(out)

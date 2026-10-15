@@ -9,11 +9,13 @@ that access, and it does so in its own dialog. This module owns that approval:
   filer run, a startup hook or a timer. It makes one request per call and keeps
   at least :data:`CONNECT_MIN_INTERVAL_S` seconds between calls, across threads
   and processes.
-* :func:`write_with_stored_approval` is the only sender of the stored approval.
-  It never calls :func:`connect`, so it never opens Zotero's dialog. A 401 deletes
-  the stored key. A 403 is probed with one approval-free GET first: the key is
-  deleted only when that GET succeeds, because a 403 can also mean the local API
-  is switched off, and then the key is kept.
+* :func:`write_with_stored_approval` and :func:`send_with_stored_approval` are the
+  only senders of the stored approval. Neither calls :func:`connect`, so neither
+  opens Zotero's dialog. The filer's PDF attach step uses the second one. With no
+  stored key nothing is sent. A 401 deletes the stored key. A 403 is probed with
+  one approval-free GET first: the key is deleted only when that GET succeeds,
+  because a 403 can also mean the local API is switched off, and then the key is
+  kept.
 * :func:`status` is read-only: one GET, never a POST.
 * :func:`disconnect` deletes the stored key. Only Zotero can revoke the approval
   itself, so the result says where to clear it.
@@ -508,6 +510,35 @@ def _probe_local_api(send: Callable[[str, str, bytes | None, dict[str, str]], tu
     return "error"
 
 
+def _rejected_outcome(code: int, send: Callable[..., tuple[int, str]], approval_store: Any) -> dict[str, Any] | None:
+    """The one rule for a reply that refuses the stored approval. None when the reply is not a refusal.
+
+    401 deletes the stored key. 403 is probed with one approval-free GET: the key is deleted only when
+    that GET succeeds, and is kept when the local API is off or cannot be reached.
+    """
+    if code == 401:
+        _forget_approval(approval_store)
+        return _result("needs_connection")
+    if code == 403:
+        probe = _probe_local_api(send)
+        if probe == "reachable":
+            _forget_approval(approval_store)
+            return _result("needs_connection")
+        if probe == "local_api_disabled":
+            return _result("local_api_disabled", http_status=403)
+        return _result(probe, http_status=403)
+    return None
+
+
+def _header_value(headers: Mapping[str, str] | None, name: str) -> str | None:
+    """Case-insensitive lookup in a reply's header dict. None when absent."""
+    wanted = name.lower()
+    for key, value in (headers or {}).items():
+        if str(key).lower() == wanted:
+            return str(value)
+    return None
+
+
 def write_with_stored_approval(
     request: Mapping[str, Any],
     *,
@@ -543,19 +574,73 @@ def write_with_stored_approval(
         code, _text = send(method, url, body, headers)
     except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
         return _result(transport_failure(exc))
-    if code == 401:
-        _forget_approval(approval_store)
-        return _result("needs_connection")
-    if code == 403:
-        probe = _probe_local_api(send)
-        if probe == "reachable":
-            _forget_approval(approval_store)
-            return _result("needs_connection")
-        if probe == "local_api_disabled":
-            return _result("local_api_disabled", http_status=403)
-        return _result(probe, http_status=403)
+    rejected = _rejected_outcome(code, send, approval_store)
+    if rejected is not None:
+        return rejected
     if 200 <= code < 300:
         return {"status": "written", "http_status": code}
+    return _result("error", http_status=code)
+
+
+HeaderSend = Callable[..., tuple[int, str, dict[str, str]]]
+
+
+def _without_headers(send3: HeaderSend) -> Callable[[str, str, bytes | None, dict[str, str]], tuple[int, str]]:
+    """View a header-aware transport as a plain one for the reachability probe. The reply headers are dropped."""
+
+    def send(method: str, url: str, body: bytes | None, headers: dict[str, str]) -> tuple[int, str]:
+        status, text, _reply_headers = send3(method, url, body, headers, timeout=_PROBE_TIMEOUT_S)
+        return status, text
+
+    return send
+
+
+def send_with_stored_approval(
+    method: str,
+    url: str,
+    payload: Any = None,
+    *,
+    header_transport: HeaderSend,
+    headers: Mapping[str, str] | None = None,
+    store: Any = None,
+) -> dict[str, Any]:
+    """Send one request with the stored approval and return Zotero's answer, reply body included.
+
+    The filer's PDF attach writes carry the approval through this function, so the stored
+    approval has one sender in this module. It follows the rules of
+    :func:`write_with_stored_approval`: with no stored key nothing is sent and the result is
+    ``needs_connection``; a 401, or a 403 whose probe succeeds, deletes the key; a 403 with the
+    local API off keeps it. The key goes only in the Authorization header, and only to loopback
+    URLs. ``headers`` adds the caller's own headers, never an Authorization header. A 429 is
+    ``rate_limited`` with ``retry_after``. A 2xx is ``written`` with ``http_status`` and ``text``.
+    It never calls :func:`connect`.
+    """
+    approval_store = store if store is not None else KeyringApprovalStore()
+    key = approval_store.get()
+    if key is None:
+        return _result("needs_connection")
+    if not _require_loopback(url):
+        return _result("error")
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request_headers = {name: value for name, value in (headers or {}).items() if name.lower() != "authorization"}
+    request_headers["Zotero-Allowed-Request"] = "1"
+    request_headers["Authorization"] = f"Bearer {key}"
+    if payload is not None:
+        request_headers["Content-Type"] = "application/json"
+    try:
+        code, text, reply_headers = header_transport(
+            str(method).upper(), url, body, request_headers, timeout=_WRITE_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
+        return _result(transport_failure(exc))
+    rejected = _rejected_outcome(code, _without_headers(header_transport), approval_store)
+    if rejected is not None:
+        return rejected
+    if code == 429:
+        retry_after = _header_value(reply_headers, "Retry-After")
+        return _result("rate_limited", http_status=429, retry_after=retry_after)
+    if 200 <= code < 300:
+        return {"status": "written", "http_status": code, "text": text}
     return _result("error", http_status=code)
 
 

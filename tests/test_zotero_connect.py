@@ -1193,3 +1193,79 @@ def test_hosted_unauthenticated_request_is_still_401_when_the_switch_is_unset(en
     client = _route_client(monkeypatch, hosted=True, tenant=None, connect_env=None)
     assert client.post("/zotero/connect", json={"confirm": True}).status_code == 401
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# send_with_stored_approval(): the filer's approval-carrying write. Never connect().
+# ---------------------------------------------------------------------------
+
+ATTACH_WRITE = zf.LOCAL_API + "/items"
+
+
+class HeaderScripted:
+    """Header-aware fake: each call returns or raises the next outcome, and records the call."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def __call__(self, method, url, body, headers, timeout=None):
+        self.calls.append({"method": method, "url": url, "body": body, "headers": dict(headers), "timeout": timeout})
+        if not self.outcomes:
+            raise AssertionError(f"unexpected request: {method} {url}")
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def test_stored_write_without_an_approval_sends_nothing_and_never_connects(env, monkeypatch):
+    env.store.key = None
+    monkeypatch.setattr(zc, "connect", lambda **kwargs: pytest.fail("connect() must never run from a write"))
+    header = HeaderScripted()
+    result = zc.send_with_stored_approval("POST", ATTACH_WRITE, [{}], header_transport=header)
+    assert result == {"status": "needs_connection", "message": zc._MESSAGES["needs_connection"]}
+    assert header.calls == []
+
+
+def test_stored_write_sends_the_key_only_in_authorization_and_returns_the_reply_body(env, monkeypatch):
+    env.store.key = ISSUED_KEY
+    monkeypatch.setattr(zc, "connect", lambda **kwargs: pytest.fail("connect() must never run from a write"))
+    header = HeaderScripted((200, '{"success": {"0": "A1"}}', {}))
+    result = zc.send_with_stored_approval(
+        "POST", ATTACH_WRITE, [{"a": 1}], headers={"Zotero-Server-ID": "S1"}, header_transport=header,
+    )
+    assert result == {"status": "written", "http_status": 200, "text": '{"success": {"0": "A1"}}'}
+    call = header.calls[0]
+    assert call["headers"]["Authorization"] == f"Bearer {ISSUED_KEY}"
+    assert call["headers"]["Zotero-Server-ID"] == "S1"
+    assert "Zotero-API-Key" not in call["headers"]
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+def test_stored_write_429_is_rate_limited_with_retry_after_and_keeps_the_key(env):
+    env.store.key = ISSUED_KEY
+    header = HeaderScripted((429, "slow", {"Retry-After": "30"}))
+    result = zc.send_with_stored_approval("POST", ATTACH_WRITE, [], header_transport=header)
+    assert result["status"] == "rate_limited"
+    assert result["retry_after"] == "30"
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+
+
+def test_stored_write_refuses_a_non_loopback_url_before_sending(env):
+    env.store.key = ISSUED_KEY
+    header = HeaderScripted()
+    result = zc.send_with_stored_approval("POST", "https://example.test/items", [], header_transport=header)
+    assert result["status"] == "error"
+    assert header.calls == []
+
+
+def test_stored_write_403_with_a_failing_probe_keeps_the_key(env):
+    env.store.key = ISSUED_KEY
+    header = HeaderScripted((403, "no", {}), ConnectionRefusedError("down"))
+    result = zc.send_with_stored_approval("POST", ATTACH_WRITE, [], header_transport=header)
+    assert result["status"] == "unreachable"
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+    assert all(call["method"] == "GET" for call in header.calls[1:])
