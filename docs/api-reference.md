@@ -1362,6 +1362,7 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `POST` | `/zotero/connect` | Run one Zotero approval attempt for a self-hosted loopback caller who explicitly confirmed it |
 | `GET` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
 | `OPTIONS` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
 | `POST` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
