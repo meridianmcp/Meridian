@@ -266,6 +266,11 @@ async def _reset_pg_schema(url: str) -> None:
 _pg_schema_ready: set[str] = set()
 
 
+# Savepoint control statements a caller issues through the adapter (see
+# _SavepointCursor.execute): these must reach the connection unwrapped.
+_SAVEPOINT_CONTROL_PREFIXES = ("SAVEPOINT ", "RELEASE ", "ROLLBACK TO ")
+
+
 class _SavepointCursor:
     """Cursor wrapper: each execute() runs inside its own SAVEPOINT, serialized
     by a per-connection lock (8a52dd26).
@@ -302,8 +307,17 @@ class _SavepointCursor:
         self._cursor = cursor
 
     async def execute(self, *args, **kwargs):
-        async with self._lock, self._conn.transaction():
-            return await self._cursor.execute(*args, **kwargs)
+        sql = args[0] if args else ""
+        async with self._lock:
+            if isinstance(sql, str) and sql.lstrip().upper().startswith(_SAVEPOINT_CONTROL_PREFIXES):
+                # A caller's own SAVEPOINT must outlive this statement. Wrapping
+                # it makes psycopg's savepoint its parent, and that wrapper's
+                # RELEASE also destroys the caller's savepoint, so the caller's
+                # later RELEASE fails with InvalidSavepointSpecification. A pinned
+                # production connection runs these verbs with no such wrapper.
+                return await self._cursor.execute(*args, **kwargs)
+            async with self._conn.transaction():
+                return await self._cursor.execute(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._cursor, name)

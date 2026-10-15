@@ -8587,10 +8587,14 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_coarse_lock_files",
         "_migrate_pg_backfill_finding_note_kind",
         "_migrate_pg_project_state_milestones",
+        # use_mode (4bfc9293) was added after this order was pinned and is not on main,
+        # so no production database has run it. It is appended at the tail, not mid-list.
+        # Its ADD COLUMN IF NOT EXISTS is idempotent and nothing later depends on it.
+        "_migrate_pg_project_use_mode",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 175
+    assert len(allnames) == len(set(allnames)) == 176
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
