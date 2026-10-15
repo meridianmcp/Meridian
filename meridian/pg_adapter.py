@@ -1080,6 +1080,7 @@ CREATE TABLE IF NOT EXISTS projects (
     pending_goal TEXT,
     parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous',
+    use_mode TEXT NOT NULL DEFAULT 'standard_publication',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'parked', 'archived')),
     priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT ({_TS})
@@ -2355,6 +2356,21 @@ async def _migrate_pg_project_execution_mode(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS execution_mode "
         "TEXT NOT NULL DEFAULT 'autonomous'"
+    )
+
+
+async def _migrate_pg_project_use_mode(conn: PostgresConnection) -> None:
+    """projects.use_mode: the rights gate's per-project use mode.
+
+    'standard_publication' (default) or 'commercialized'. NOT NULL DEFAULT
+    'standard_publication' so existing rows backfill to standard. No CHECK,
+    same as execution_mode: the Python layer (db.validate_use_mode) validates.
+    ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_project_use_mode.
+    """
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS use_mode "
+        "TEXT NOT NULL DEFAULT 'standard_publication'"
     )
 
 
@@ -6080,4 +6096,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_coarse_lock_files,
     _migrate_pg_backfill_finding_note_kind,
     _migrate_pg_project_state_milestones,
+    _migrate_pg_project_use_mode,
 )

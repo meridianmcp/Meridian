@@ -30,6 +30,7 @@ import aiosqlite
 from meridian import capability_manifest as _capability_manifest
 from meridian import capability_profile as _capability_profile
 from meridian.finding_identity import finding_identity as _finding_identity
+from meridian.rights_policy import COMMERCIALIZED, STANDARD_PUBLICATION, RightsPolicyError
 
 _log = logging.getLogger(__name__)
 
@@ -162,6 +163,29 @@ def normalize_execution_mode(mode: str | None) -> str:
         if candidate in EXECUTION_MODES:
             return candidate
     return DEFAULT_EXECUTION_MODE
+
+
+# Project use mode: the rights gate's per-project input (meridian.rights_policy).
+# Unlike execution_mode this is STRICT. A bad value raises and writes nothing and
+# is never coerced to the default, so a typo cannot silently relax the gate.
+USE_MODES = (STANDARD_PUBLICATION, COMMERCIALIZED)
+DEFAULT_USE_MODE = STANDARD_PUBLICATION
+#: action_audit_log.event_type written by set_project_use_mode.
+PROJECT_USE_MODE_EVENT_TYPE = "project_use_mode_changed"
+
+
+def validate_use_mode(mode: Any) -> str:
+    """Return ``mode`` unchanged when it is exactly one of USE_MODES, else raise.
+
+    Refuses None, blanks, other case and surrounding whitespace. Raises
+    RightsPolicyError (a ValueError subclass) with code USE_MODE_INVALID.
+    """
+    if isinstance(mode, str) and mode in USE_MODES:
+        return mode
+    raise RightsPolicyError(
+        "USE_MODE_INVALID",
+        f"use_mode must be {STANDARD_PUBLICATION!r} or {COMMERCIALIZED!r}, not {mode!r}",
+    )
 
 # ---------------------------------------------------------------------------
 # Transparent field encryption (Fernet, MERIDIAN_ENCRYPTION_KEY env var).
@@ -365,6 +389,8 @@ CREATE TABLE IF NOT EXISTS projects (
     parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous'
         CHECK (execution_mode IN ('autonomous', 'interactive')),
+    use_mode TEXT NOT NULL DEFAULT 'standard_publication'
+        CHECK (use_mode IN ('standard_publication', 'commercialized')),
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'parked', 'archived')),
     priority TEXT NOT NULL DEFAULT 'P2'
@@ -1254,6 +1280,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_note_source(db)
     await _migrate_session_sprint_version(db)
     await _migrate_project_execution_mode(db)
+    await _migrate_project_use_mode(db)
     await _migrate_decision_code_anchor(db)
     await _migrate_session_graph_snapshots(db)
     await _migrate_agent_tasks_table(db)
@@ -1501,6 +1528,69 @@ async def set_project_execution_mode(
     )
     await db.commit()
     return await get_project(db, project_id)
+
+
+async def get_project_use_mode(db: aiosqlite.Connection, project_id: str) -> str:
+    """Return the stored use mode for a project.
+
+    The stored value is returned as written. Callers that gate on it normalise
+    it (rights_policy.normalize_use_mode), so an unknown stored value fails
+    closed there. Raises ValueError('project not found') for a missing project.
+    """
+    async with db.execute(
+        "SELECT use_mode FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        raise ValueError("project not found")
+    return row["use_mode"] if isinstance(row, dict) else row[0]
+
+
+async def set_project_use_mode(
+    db: aiosqlite.Connection,
+    project_id: str,
+    use_mode: str,
+    *,
+    actor: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Set a project's use mode and audit the change. Returns the updated project.
+
+    Strict: a value other than standard_publication or commercialized raises
+    ValueError (RightsPolicyError, code USE_MODE_INVALID) and nothing is written.
+    A missing project raises ValueError('project not found') before any write.
+    On success one action_audit_log row (event_type project_use_mode_changed)
+    records the old and new values and the actor. If that audit row cannot be
+    written, the mode is restored to its old value and the error is re-raised,
+    so a change and its audit row never disagree. Postgres autocommit means the
+    restore is a compensating UPDATE, not a rollback.
+    """
+    new_mode = validate_use_mode(use_mode)
+    old_mode = await get_project_use_mode(db, project_id)
+    await db.execute(
+        "UPDATE projects SET use_mode = ? WHERE id = ?", (new_mode, project_id),
+    )
+    await db.commit()
+    detail: dict[str, Any] = {"old": old_mode, "new": new_mode}
+    if reason and reason.strip():
+        detail["reason"] = reason.strip()
+    try:
+        await record_action_audit_event(
+            db,
+            PROJECT_USE_MODE_EVENT_TYPE,
+            project_id=project_id,
+            actor=actor,
+            detail=json.dumps(detail, default=str),
+        )
+    except Exception:
+        await db.execute(
+            "UPDATE projects SET use_mode = ? WHERE id = ?", (old_mode, project_id),
+        )
+        await db.commit()
+        raise
+    project = await get_project(db, project_id)
+    assert project is not None
+    return project
 
 
 async def set_project_repo_identity(
@@ -2107,7 +2197,7 @@ async def get_project_settings(
     async with db.execute(
         "SELECT id, max_pinned_decisions, executor_config, hitl_auto_answer, "
         "auto_worktrees, require_merge_approval, code_intel_enabled, "
-        "execution_mode "
+        "execution_mode, use_mode "
         "FROM projects WHERE id = ?",
         (project_id,),
     ) as cur:
@@ -2136,6 +2226,8 @@ async def get_project_settings(
         "code_intel_enabled": int(data.get("code_intel_enabled") or 0),
         # ecf69de8 — executor posture: 'autonomous' (default) | 'interactive'.
         "execution_mode": normalize_execution_mode(data.get("execution_mode")),
+        # Rights-gate use mode. The column is NOT NULL, so this is the stored value.
+        "use_mode": data.get("use_mode") or DEFAULT_USE_MODE,
     }
 
 
@@ -2150,6 +2242,8 @@ async def update_project_settings(
     require_merge_approval: int | None = None,
     code_intel_enabled: int | None = None,
     execution_mode: str | None = None,
+    use_mode: str | None = None,
+    use_mode_actor: str = "dashboard",
     github_repo: str | None = _UNSET,
     github_branch: str | None = _UNSET,
     github_account_login: str | None = _UNSET,
@@ -2158,6 +2252,9 @@ async def update_project_settings(
     project = await get_project(db, project_id)
     if project is None:
         return None
+    if use_mode is not None:
+        # Refuse a bad value before anything is written (strict, never coerced).
+        validate_use_mode(use_mode)
     updates: list[str] = []
     params: list[Any] = []
     if max_pinned_decisions is not None:
@@ -2203,6 +2300,9 @@ async def update_project_settings(
             tuple(params),
         )
         await db.commit()
+    if use_mode is not None:
+        # Routed through the setter so an HTTP change is audited like any other.
+        await set_project_use_mode(db, project_id, use_mode, actor=use_mode_actor)
     return await get_project_settings(db, project_id)
 
 

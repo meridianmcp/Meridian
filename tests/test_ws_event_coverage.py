@@ -524,6 +524,9 @@ SILENT_WRITERS: dict[tuple[str, str, str], str] = {
     ),
     ("projects", "meridian/db/__init__.py", "set_project_execution_mode"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "update_project_settings"): _SETTINGS_FORM,
+    # use_mode is rendered only in the settings form (dashboard-settings.ts), so no
+    # WebSocket-fed list needs a repaint. Allowlisted the same way as its siblings above.
+    ("projects", "meridian/db/__init__.py", "set_project_use_mode"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "set_agent_instructions"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "set_project_repo_identity"): (
         "stores a one-way repo fingerprint used for MCP scope checks; never rendered"

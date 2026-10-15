@@ -194,7 +194,10 @@ async def test_scoped_project_ids_denies_out_of_scope_destination(db):
     assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"scope-test"}
 
 
-async def test_scoped_project_ids_allows_in_scope_destination(db):
+async def test_scoped_caller_is_refused_even_for_in_scope_destination(db):
+    # Policy (scope_guard.WORKSPACE_DENY): moving a workspace note into a project
+    # the caller can read leaks the note to a project-scoped member, so the move is
+    # refused for every project-scoped caller, including one scoped to the destination.
     p = await db_module.create_project(db, "84f77597-in-scope-dest")
     note = await db_module.add_workspace_note(db, "scope-ok", "body")
 
@@ -206,12 +209,8 @@ async def test_scoped_project_ids_allows_in_scope_destination(db):
         db=db, data_dir="/tmp",
         scoped_project_ids=[p["id"]],
     )
-    assert "error" not in resp
-    # tools/call wraps the tool's return value as MCP content: a JSON string
-    # inside result.content[0].text (see handler.py's json.dumps(result) call).
-    payload = json.loads(resp["result"]["content"][0]["text"])
-    assert "error" not in payload
-    assert payload["project_id"] == p["id"]
+    assert "error" in resp
+    assert resp["error"]["message"] == "project is outside your access scope"
 
 
 # ---------------------------------------------------------------------------

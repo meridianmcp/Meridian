@@ -95,7 +95,7 @@ Add to `claude_desktop_config.json`:
 
 ## Configuring Cursor
 
-Add to `.cursor/mcp.json`:
+Add to Cursor's user-global config, `~/.cursor/mcp.json`, so the bearer token stays out of project repos:
 
 ```json
 {
