@@ -2559,16 +2559,33 @@ def test_manual_action_during_slow_probe_discards_stale_disconnected_result():
 
 _ZOTERO_PLUGIN_TOGGLE_LABEL = "Auto-install Zotero bridge plugin"
 _ZOTERO_PLUGIN_PROMPT = (
-    "Install the Zotero bridge plugin? Meridian will place it in Zotero's extensions "
-    "folder when it starts Zotero, only while Zotero is closed. Zotero's own add-on "
-    "list can remove it."
+    "Install the Zotero bridge plugin now? Meridian will place it in Zotero's extensions "
+    "folder. Close Zotero first. Zotero's own add-on list can remove it later."
 )
+_ZOTERO_PLUGIN_DOCS = _REPO_ROOT / "docs" / "zotero-plugin-install.md"
 
 
 def test_first_run_prompt_wording_and_buttons_are_the_agreed_ones():
     assert tray_main.ZOTERO_PLUGIN_PROMPT_MESSAGE == _ZOTERO_PLUGIN_PROMPT
     assert tray_main.ZOTERO_PLUGIN_INSTALL_BUTTON == "Install (recommended)"
     assert tray_main.ZOTERO_PLUGIN_NOT_NOW_BUTTON == "Not now"
+
+
+def test_docs_quote_the_prompt_the_tray_shows_word_for_word():
+    docs = _ZOTERO_PLUGIN_DOCS.read_text(encoding="utf-8")
+    assert "> " + tray_main.ZOTERO_PLUGIN_PROMPT_MESSAGE in docs
+    assert "when it starts Zotero" not in docs
+
+
+def test_docs_name_the_default_button_the_menu_items_and_the_save_failure_case():
+    # The guide's default wording and heading must agree with what the tray shows.
+    docs = _ZOTERO_PLUGIN_DOCS.read_text(encoding="utf-8")
+    assert "defaults to **" + tray_main.ZOTERO_PLUGIN_INSTALL_BUTTON + "**" in docs
+    assert "**" + tray_main.ZOTERO_PLUGIN_NOT_NOW_BUTTON + "**" in docs
+    assert "**" + tray_main.ZOTERO_PLUGIN_INSTALL_NOW_LABEL + "**" in docs
+    assert "**" + tray_main.ZOTERO_PLUGIN_MENU_LABEL + "**" in docs
+    assert "## 3. Automatic install (Windows)" in docs
+    assert "Your choice could not be saved" in docs
 
 
 @pytest.mark.parametrize(
@@ -2763,13 +2780,27 @@ def zotero_faked(monkeypatch):
             {"status": "failed", "path": None, "error": "disk full"},
             "The install failed: disk full",
         ),
+        (
+            {"status": "check_failed", "path": None, "error": "tasklist exited with code 1"},
+            "Meridian could not check whether Zotero is running, so nothing was installed. "
+            'Make sure Zotero is closed, then choose "Install Zotero plugin now" from the Meridian tray menu.',
+        ),
     ],
 )
 def test_install_result_text_names_each_outcome(result, expected):
     assert tray_main.zotero_plugin_install_text(result) == expected
 
 
-@pytest.mark.parametrize("status", ["installed", "unchanged", "refused_running", "no_profile", "failed"])
+def test_check_failed_is_a_known_install_status_and_is_not_rewritten_as_failed():
+    result = tray_main.zotero_plugin_install_now_result(
+        lambda: {"status": "check_failed", "path": None, "error": "tasklist exited with code 1"},
+    )
+    assert result["status"] == "check_failed"
+
+
+@pytest.mark.parametrize(
+    "status", ["installed", "unchanged", "refused_running", "check_failed", "no_profile", "failed"],
+)
 def test_first_run_install_text_starts_by_saying_the_choice_was_saved(status):
     text = tray_main.zotero_plugin_install_text({"status": status, "path": "P", "error": "E"}, first_run=True)
     assert text.startswith("Your choice was saved. ")
@@ -2814,6 +2845,7 @@ def test_install_message_never_raises_even_when_the_install_does():
 
 
 def test_install_answer_installs_now_and_reports_the_result(monkeypatch, tmp_path, zotero_faked):
+    monkeypatch.delenv(_ZOTERO_ENV, raising=False)  # conftest pins it to "0"; this test wants no override
     path = tmp_path / "zotero_plugin.json"
     monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: True)
     monkeypatch.setattr(
@@ -2832,6 +2864,7 @@ def test_install_answer_installs_now_and_reports_the_result(monkeypatch, tmp_pat
 def test_install_answer_while_zotero_runs_records_the_choice_and_says_what_to_do(
     monkeypatch, tmp_path, zotero_faked,
 ):
+    monkeypatch.delenv(_ZOTERO_ENV, raising=False)
     path = tmp_path / "zotero_plugin.json"
     monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: True)
     monkeypatch.setattr(
@@ -2847,6 +2880,7 @@ def test_install_answer_while_zotero_runs_records_the_choice_and_says_what_to_do
 
 
 def test_install_answer_survives_an_install_that_raises(monkeypatch, tmp_path, zotero_faked):
+    monkeypatch.delenv(_ZOTERO_ENV, raising=False)
     path = tmp_path / "zotero_plugin.json"
     monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: True)
 
@@ -2861,6 +2895,102 @@ def test_install_answer_survives_an_install_that_raises(monkeypatch, tmp_path, z
     assert zotero_faked.dialogs == [
         (_REPORT_TITLE, "Your choice was saved. The install failed: tasklist exploded"),
     ]
+
+
+_ENV_BLOCKED_TEXT = (
+    "Your choice was saved. MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL turns automatic installs off, "
+    'so nothing was installed now. Choose "Install Zotero plugin now" in the Meridian tray menu to install it.'
+)
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "NO", " off "])
+def test_install_answer_saves_the_choice_but_installs_nothing_when_the_env_var_turns_automatic_installs_off(
+    monkeypatch, tmp_path, zotero_faked, raw,
+):
+    # The Install answer is an automatic install, so the env var blocks it. The choice is still saved.
+    monkeypatch.setenv(_ZOTERO_ENV, raw)
+    path = tmp_path / "zotero_plugin.json"
+    calls = []
+    monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: True)
+    monkeypatch.setattr(
+        zpi, "install_default_profile", lambda: calls.append("install") or {"status": "installed", "path": "P"},
+    )
+
+    result = tray_main._run_zotero_plugin_first_run(path=path)
+
+    assert calls == []
+    assert result == {"autoinstall": True, "decided": True}
+    assert zpi.load_settings(path) == {"autoinstall": True, "decided": True}
+    assert zotero_faked.dialogs == [(_REPORT_TITLE, _ENV_BLOCKED_TEXT)]
+
+
+@pytest.mark.parametrize("raw", ["1", "yes"])
+def test_install_answer_still_installs_when_the_env_var_turns_automatic_installs_on(
+    monkeypatch, tmp_path, zotero_faked, raw,
+):
+    monkeypatch.setenv(_ZOTERO_ENV, raw)
+    path = tmp_path / "zotero_plugin.json"
+    monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: True)
+    monkeypatch.setattr(
+        zpi, "install_default_profile", lambda: {"status": "installed", "path": "P", "error": None},
+    )
+
+    tray_main._run_zotero_plugin_first_run(path=path)
+
+    assert zotero_faked.dialogs == [
+        (_REPORT_TITLE, "Your choice was saved. Installed the Zotero bridge plugin to P. Start Zotero to use it."),
+    ]
+
+
+def test_install_now_menu_item_runs_even_when_the_env_var_turns_automatic_installs_off(
+    monkeypatch, zotero_faked,
+):
+    # The menu item is an explicit request, so the env var does not stop it.
+    monkeypatch.setenv(_ZOTERO_ENV, "0")
+    monkeypatch.setattr(
+        zpi, "install_default_profile", lambda: {"status": "unchanged", "path": "P", "error": None},
+    )
+    queued = []
+
+    tray_main._install_zotero_plugin_now_and_report(queued.append)
+    queued[0]()
+
+    assert zotero_faked.dialogs == [(_REPORT_TITLE, "The Zotero bridge plugin is already up to date at P.")]
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        (
+            True,
+            "Meridian could not save your Zotero plugin choice: read-only settings folder. "
+            "Nothing was installed, and the prompt will ask again on the next launch. "
+            'To install now, choose "Install Zotero plugin now" from the Meridian tray menu.',
+        ),
+        (
+            False,
+            "Meridian could not save your Zotero plugin choice: read-only settings folder. "
+            "Nothing was installed, and the prompt will ask again on the next launch.",
+        ),
+    ],
+)
+def test_first_run_save_failure_is_reported_and_nothing_is_installed(
+    monkeypatch, tmp_path, zotero_faked, answer, expected,
+):
+    path = tmp_path / "zotero_plugin.json"
+    calls = []
+    monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: answer)
+    monkeypatch.setattr(zpi, "install_default_profile", lambda: calls.append("install") or {"status": "installed"})
+
+    def _cannot_save(target, settings):
+        raise OSError("read-only settings folder")
+
+    monkeypatch.setattr(zpi, "save_settings", _cannot_save)
+
+    assert tray_main._run_zotero_plugin_first_run(path=path) is None
+    assert calls == []
+    assert zotero_faked.dialogs == []
+    assert zotero_faked.errors == [(_REPORT_TITLE, expected)]
 
 
 @pytest.mark.parametrize("answer", [False, None])

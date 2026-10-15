@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -446,6 +447,37 @@ def test_default_posix_runner_asks_pgrep_for_the_exact_zotero_name(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# zotero_process_state: True, False, or None when the check itself failed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_process_state_is_unknown_when_the_check_fails(monkeypatch, platform):
+    def _broken():
+        raise OSError("process listing unavailable")
+
+    monkeypatch.setattr(zpi, "_platform", lambda: platform)
+    assert zpi.zotero_process_state(runner=_broken) is None
+
+
+def test_process_state_is_true_or_false_for_a_successful_listing(monkeypatch):
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(
+        zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 0, stdout="zotero.exe 1 Console 1 K\n"),
+    )
+    assert zpi.zotero_process_state() is True
+    monkeypatch.setattr(zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 0, stdout=""))
+    assert zpi.zotero_process_state() is False
+
+
+def test_tasklist_nonzero_exit_is_unknown_not_closed(monkeypatch):
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 1, stdout=""))
+    assert zpi.zotero_process_state() is None
+    assert zpi.zotero_is_running() is True
+
+
+# ---------------------------------------------------------------------------
 # install_into_profile
 # ---------------------------------------------------------------------------
 
@@ -456,6 +488,30 @@ def test_install_refuses_while_zotero_is_running_and_writes_nothing(profile, xpi
     assert result["status"] == "refused_running"
     assert _snapshot(profile) == before
     assert not (profile / "extensions").exists()
+
+
+def test_install_reports_check_failed_and_writes_nothing_when_the_process_check_fails(monkeypatch, profile, xpi):
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 1, stdout=""))
+    before = _snapshot(profile)
+
+    result = zpi.install_into_profile(profile, xpi)
+
+    assert result["status"] == "check_failed"
+    assert "could not check whether zotero is running" in result["error"].lower()
+    assert _snapshot(profile) == before
+    assert not (profile / "extensions").exists()
+
+
+def test_install_default_profile_reports_check_failed_not_refused_running(monkeypatch, default_profile_env):
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 1, stdout=""))
+    before = _snapshot(default_profile_env)
+
+    result = zpi.install_default_profile()
+
+    assert result["status"] == "check_failed"
+    assert _snapshot(default_profile_env) == before
 
 
 def test_install_copies_the_xpi_and_leaves_no_temp_file(profile, xpi):
@@ -629,13 +685,42 @@ def test_env_override_is_reported_only_for_recognised_values():
     assert zpi.autoinstall_env_override({}) is None
 
 
+@pytest.mark.parametrize(
+    ("raw", "forced_off"),
+    [
+        ("0", True), (" FALSE ", True), ("No", True), ("off", True),
+        ("1", False), ("true", False), ("", False), ("maybe", False),
+    ],
+)
+def test_automatic_installs_forced_off_is_true_only_for_the_off_values(raw, forced_off):
+    assert zpi.automatic_installs_forced_off({ENV_AUTOINSTALL: raw}) is forced_off
+
+
+def test_docs_list_every_env_value_the_code_accepts_and_say_what_it_scopes():
+    # The guide is read from the repo checkout. Nothing here touches Zotero or the user's profile.
+    docs = (REPO_ROOT / "docs" / "zotero-plugin-install.md").read_text(encoding="utf-8")
+    paragraphs = [paragraph for paragraph in docs.split("\n\n") if "These values force" in paragraph]
+    assert len(paragraphs) == 1, "the guide needs exactly one paragraph that lists the env values"
+    text = paragraphs[0]
+    off = re.search(r"force automatic installs \*\*off\*\*: ([^.]*)\.", text)
+    on = re.search(r"force them \*\*on\*\*, but only after you have answered the prompt: ([^.]*)\.", text)
+    assert off and on, "the off and on value lists are not in the expected sentences"
+    assert set(re.findall(r"`([^`]+)`", off.group(1))) == zpi._FALSE_VALUES
+    assert set(re.findall(r"`([^`]+)`", on.group(1))) == zpi._TRUE_VALUES
+    assert ENV_AUTOINSTALL in text
+    assert "trimmed of spaces" in text
+    assert "without regard to case" in text
+    assert "Any other value, or an empty one, is ignored" in text
+    assert "Install Zotero plugin now" in text
+
+
 # ---------------------------------------------------------------------------
 # CLI: python -m meridian zotero install-plugin [--profile DIR] [--dry-run]
 # ---------------------------------------------------------------------------
 
 
 def test_cli_dry_run_prints_the_plan_and_writes_nothing(monkeypatch, capsys, profile):
-    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: False)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
     before = _snapshot(profile)
     rc = zpi.cli_main(["--profile", str(profile), "--dry-run"])
     out = capsys.readouterr().out
@@ -648,7 +733,7 @@ def test_cli_dry_run_prints_the_plan_and_writes_nothing(monkeypatch, capsys, pro
 
 
 def test_cli_installs_into_the_given_profile(monkeypatch, capsys, profile):
-    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: False)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
     rc = zpi.cli_main(["--profile", str(profile)])
     assert rc == 0
     assert (profile / "extensions" / XPI_NAME).read_bytes() == zpi.build_xpi_bytes()
@@ -656,7 +741,7 @@ def test_cli_installs_into_the_given_profile(monkeypatch, capsys, profile):
 
 
 def test_cli_refuses_a_folder_that_is_not_a_zotero_profile(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: False)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
     bare = tmp_path / "bare"
     bare.mkdir()
     rc = zpi.cli_main(["--profile", str(bare)])
@@ -667,7 +752,7 @@ def test_cli_refuses_a_folder_that_is_not_a_zotero_profile(monkeypatch, capsys, 
 
 
 def test_cli_refuses_with_a_clear_message_while_zotero_runs(monkeypatch, capsys, profile):
-    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: True)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
     rc = zpi.cli_main(["--profile", str(profile)])
     captured = capsys.readouterr()
     assert rc == 1
@@ -676,7 +761,7 @@ def test_cli_refuses_with_a_clear_message_while_zotero_runs(monkeypatch, capsys,
 
 
 def test_cli_prints_manual_steps_when_no_profile_is_found(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: False)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
     monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path / "empty-zotero-root"))
     rc = zpi.cli_main([])
     out = capsys.readouterr().out
@@ -685,10 +770,41 @@ def test_cli_prints_manual_steps_when_no_profile_is_found(monkeypatch, capsys, t
     assert XPI_NAME in out
 
 
+def test_cli_says_the_check_failed_and_never_that_zotero_is_running(monkeypatch, capsys, profile):
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: None)
+    rc = zpi.cli_main(["--profile", str(profile)])
+    captured = capsys.readouterr()
+    text = (captured.out + captured.err).lower()
+    assert rc == 1
+    assert "could not check whether zotero is running" in text
+    assert "zotero is running. close" not in text
+    assert not (profile / "extensions").exists()
+
+
+def test_cli_dry_run_says_the_check_failed_and_writes_nothing(monkeypatch, capsys, profile):
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: None)
+    before = _snapshot(profile)
+    rc = zpi.cli_main(["--profile", str(profile), "--dry-run"])
+    out = capsys.readouterr().out.lower()
+    assert rc == 0
+    assert "could not check whether zotero is running" in out
+    assert "would refuse: zotero is running" not in out
+    assert _snapshot(profile) == before
+
+
+def test_cli_installs_even_when_the_env_var_turns_automatic_installs_off(monkeypatch, capsys, profile):
+    # The explicit command is a request from the user, so MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL=0 does not stop it.
+    monkeypatch.setenv(ENV_AUTOINSTALL, "0")
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
+    rc = zpi.cli_main(["--profile", str(profile)])
+    assert rc == 0
+    assert (profile / "extensions" / XPI_NAME).is_file()
+
+
 def test_dispatch_routes_zotero_install_plugin_to_the_installer(monkeypatch, capsys, profile):
     from meridian import __main__ as entry
 
-    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: False)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
     rc = entry._dispatch_subcommand(["zotero", "install-plugin", "--profile", str(profile), "--dry-run"])
     assert rc == 0
     assert "dry run" in capsys.readouterr().out.lower()

@@ -91,10 +91,12 @@ def _candidate_exe_paths(env):
 
 
 def is_zotero_process_running(runner=None):
-    """True when tasklist lists a zotero.exe process. Never raises.
+    """True when tasklist lists a zotero.exe process, False when it does not, None when the check failed.
 
     ``runner`` is a zero-argument callable returning tasklist stdout as text, so
     tests can avoid a real process listing. Off Windows this always returns False.
+    Never raises. A failed listing is None, never False, so status does not claim
+    that Zotero is closed when nothing was checked.
     """
     if not _is_windows():
         return False
@@ -102,7 +104,7 @@ def is_zotero_process_running(runner=None):
         output = (runner or _run_tasklist)()
         return _tasklist_lists_zotero(str(output or ""))
     except Exception:
-        return False
+        return None
 
 
 def _run_tasklist():
@@ -110,10 +112,14 @@ def _run_tasklist():
         ["tasklist", "/FI", "IMAGENAME eq zotero.exe", "/NH"],
         capture_output=True,
         text=True,
+        errors="replace",  # a byte outside the console code page must not raise
         timeout=10,
         check=False,
         creationflags=_CREATE_NO_WINDOW,
     )
+    if completed.returncode != 0:
+        # A failed listing says nothing about Zotero, so it must not read as "not running".
+        raise RuntimeError(f"tasklist exited with code {completed.returncode}")
     return completed.stdout or ""
 
 
@@ -243,7 +249,10 @@ def _launch_detached(exe):
 
 
 def status():
-    """Snapshot of install, process and API state. Never raises."""
+    """Snapshot of install, process and API state. Never raises.
+
+    ``process_running`` is None when the process check itself failed.
+    """
     exe = find_zotero_executable()
     return {
         "installed": exe is not None,

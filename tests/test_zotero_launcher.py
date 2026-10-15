@@ -160,11 +160,51 @@ def test_running_check_parses_tasklist_output(windows, output, expected):
     assert zl.is_zotero_process_running(lambda: output) is expected
 
 
-def test_running_check_swallows_runner_exception(windows):
+def test_running_check_reports_unknown_when_the_runner_fails(windows):
+    # A failed listing says nothing about Zotero, so the status must not read it as "not running".
     def boom():
         raise OSError("tasklist unavailable")
 
-    assert zl.is_zotero_process_running(boom) is False
+    assert zl.is_zotero_process_running(boom) is None
+
+
+def test_default_runner_nonzero_exit_is_unknown_not_not_running(windows, monkeypatch):
+    monkeypatch.setattr(
+        zl.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout=""),
+    )
+    assert zl.is_zotero_process_running() is None
+
+
+# 0x81, 0x8D, 0x8F, 0x90 and 0x9D have no cp1252 meaning, so a strict decode fails on them.
+_CP1252_UNDECODABLE = b"\x81\x8d\x8f\x90\x9d"
+
+
+def _text_mode_run(raw):
+    """A fake subprocess.run that decodes the captured bytes the way text mode does (cp1252 here)."""
+    seen = {}
+
+    def _fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        stdout = raw.decode("cp1252", errors=kwargs.get("errors") or "strict")
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout)
+
+    return _fake_run, seen
+
+
+def test_undecodable_tasklist_bytes_read_as_not_running_without_raising(windows, monkeypatch):
+    fake_run, seen = _text_mode_run(b"Setup" + _CP1252_UNDECODABLE + b".exe  2468 Console\r\n")
+    monkeypatch.setattr(zl.subprocess, "run", fake_run)
+
+    assert zl.is_zotero_process_running() is False
+    assert seen["errors"] == "replace"
+
+
+def test_undecodable_tasklist_bytes_still_find_a_running_zotero(windows, monkeypatch):
+    raw = b"Setup" + _CP1252_UNDECODABLE + b".exe 2468 Console\r\nzotero.exe  1234 Console  1  100,000 K\r\n"
+    fake_run, _ = _text_mode_run(raw)
+    monkeypatch.setattr(zl.subprocess, "run", fake_run)
+
+    assert zl.is_zotero_process_running() is True
 
 
 def test_running_check_treats_none_output_as_not_running(windows):
@@ -472,6 +512,18 @@ def test_status_reports_not_installed(monkeypatch):
     }
 
 
+def test_status_reports_an_unknown_process_state_when_the_listing_fails(windows, monkeypatch):
+    # A failed listing is unknown (None), never "not running", so the status does not claim Zotero is closed.
+    _fixed_find(monkeypatch, None)
+
+    def _listing_fails():
+        raise OSError("tasklist unavailable")
+
+    monkeypatch.setattr(zl, "_run_tasklist", _listing_fails)
+    monkeypatch.setattr(zl, "zotero_api_alive", lambda *a, **k: False)
+    assert zl.status()["process_running"] is None
+
+
 # autostart plan, install and remove
 
 
@@ -750,7 +802,7 @@ def _zotero_profile(tmp_path, monkeypatch, *, running=False):
         encoding="utf-8",
     )
     monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(data_root))
-    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: running)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: running)
     return profile
 
 

@@ -1142,9 +1142,8 @@ def _show_error_dialog(title: str, message: str, parent: Any | None = None) -> N
 
 ZOTERO_PLUGIN_PROMPT_TITLE = "Meridian"
 ZOTERO_PLUGIN_PROMPT_MESSAGE = (
-    "Install the Zotero bridge plugin? Meridian will place it in Zotero's extensions "
-    "folder when it starts Zotero, only while Zotero is closed. Zotero's own add-on "
-    "list can remove it."
+    "Install the Zotero bridge plugin now? Meridian will place it in Zotero's extensions "
+    "folder. Close Zotero first. Zotero's own add-on list can remove it later."
 )
 ZOTERO_PLUGIN_INSTALL_BUTTON = "Install (recommended)"
 ZOTERO_PLUGIN_NOT_NOW_BUTTON = "Not now"
@@ -1251,6 +1250,8 @@ def _run_zotero_plugin_first_run(*, parent: Any | None = None, path: "Path | Non
     """Ask once, then store the answer. Returns the saved settings, or None when nothing was saved.
 
     An Install answer also installs now, when Zotero is closed, and shows the result.
+    When MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL turns automatic installs off, the answer is
+    saved but nothing is installed. A choice that cannot be saved is reported, not skipped.
     """
     target = path if path is not None else zotero_plugin.settings_path()
     try:
@@ -1268,10 +1269,14 @@ def _run_zotero_plugin_first_run(*, parent: Any | None = None, path: "Path | Non
         _logger.warning(
             "tray_main: could not save the Zotero plugin choice; the prompt will ask again: %s", exc,
         )
+        _report_zotero_plugin_error(zotero_plugin_save_failed_text(exc, install=bool(answer)), parent=parent)
         return None
     if answer:
-        # The install refuses while Zotero runs, and the dialog then says to close it and use the menu item.
-        text = zotero_plugin_install_message(zotero_plugin.install_default_profile, first_run=True)
+        if zotero_plugin.automatic_installs_forced_off():
+            text = zotero_plugin_env_blocked_text()
+        else:
+            # The install refuses while Zotero runs, and the dialog then says to close it and use the menu item.
+            text = zotero_plugin_install_message(zotero_plugin.install_default_profile, first_run=True)
         _report_zotero_plugin_install(text, parent=parent)
     return updated
 
@@ -1301,7 +1306,7 @@ def _toggle_zotero_plugin_preference(path: "Path | None" = None) -> dict:
 ZOTERO_PLUGIN_REPORT_TITLE = "Zotero bridge plugin"
 ZOTERO_PLUGIN_INSTALL_NOW_LABEL = "Install Zotero plugin now"
 _ZOTERO_PLUGIN_INSTALL_STATUSES = frozenset({
-    "installed", "unchanged", "refused_running", "refused_not_profile", "no_profile", "failed",
+    "installed", "unchanged", "refused_running", "check_failed", "refused_not_profile", "no_profile", "failed",
 })
 _ZOTERO_PLUGIN_SAVED_PREFIX = "Your choice was saved. "
 _ZOTERO_PLUGIN_CLOSE_AND_RETRY = (
@@ -1339,6 +1344,12 @@ def zotero_plugin_install_text(result: dict, *, first_run: bool = False) -> str:
         text = f"The Zotero bridge plugin is already up to date at {path}."
     elif status == "refused_running":
         text = "Zotero is running, so nothing was installed. " + _ZOTERO_PLUGIN_CLOSE_AND_RETRY
+    elif status == "check_failed":
+        text = (
+            "Meridian could not check whether Zotero is running, so nothing was installed. "
+            'Make sure Zotero is closed, then choose "' + ZOTERO_PLUGIN_INSTALL_NOW_LABEL
+            + '" from the Meridian tray menu.'
+        )
     elif status == "no_profile":
         text = (
             "No Zotero profile was found, so nothing was installed. Open Zotero once so it creates "
@@ -1357,12 +1368,39 @@ def zotero_plugin_install_message(install: Callable[[], Any], *, first_run: bool
     return zotero_plugin_install_text(zotero_plugin_install_now_result(install), first_run=first_run)
 
 
+def zotero_plugin_env_blocked_text() -> str:
+    """First-run text when MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL turns automatic installs off. Pure."""
+    return _ZOTERO_PLUGIN_SAVED_PREFIX + (
+        "MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL turns automatic installs off, so nothing was installed now. "
+        'Choose "' + ZOTERO_PLUGIN_INSTALL_NOW_LABEL + '" in the Meridian tray menu to install it.'
+    )
+
+
+def zotero_plugin_save_failed_text(error: object, *, install: bool) -> str:
+    """Text for a first-run choice that could not be saved. Pure."""
+    text = (
+        f"Meridian could not save your Zotero plugin choice: {error}. "
+        "Nothing was installed, and the prompt will ask again on the next launch."
+    )
+    if install:
+        text += ' To install now, choose "' + ZOTERO_PLUGIN_INSTALL_NOW_LABEL + '" from the Meridian tray menu.'
+    return text
+
+
 def _report_zotero_plugin_install(text: str, parent: Any | None = None) -> None:
     """Show one install result. A dialog that cannot open is logged, never raised."""
     try:
         _show_info_dialog(ZOTERO_PLUGIN_REPORT_TITLE, text, parent=parent)
     except Exception:  # noqa: BLE001 -- a broken dialog must never take the tray down
         _logger.warning("tray_main: could not show the Zotero plugin install result", exc_info=True)
+
+
+def _report_zotero_plugin_error(text: str, parent: Any | None = None) -> None:
+    """Show one failure the user must see, such as a choice that was not saved. Never raises."""
+    try:
+        _show_error_dialog(ZOTERO_PLUGIN_REPORT_TITLE, text, parent=parent)
+    except Exception:  # noqa: BLE001 -- a broken dialog must never take the tray down
+        _logger.warning("tray_main: could not show the Zotero plugin error", exc_info=True)
 
 
 def _install_zotero_plugin_now_and_report(dispatch: Any, *, parent: Any | None = None) -> str:

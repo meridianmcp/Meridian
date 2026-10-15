@@ -6,8 +6,9 @@
   LF. In a frozen (PyInstaller) build the source is read from ``sys._MEIPASS``.
 * ``install_into_profile`` copies that .xpi into the profile's ``extensions/``
   folder. It refuses a folder that is not a Zotero profile (no ``prefs.js`` or
-  ``zotero.sqlite``) and refuses while Zotero is running, writing nothing in
-  either case. It skips the write when the bytes already match. It never touches
+  ``zotero.sqlite``), refuses while Zotero is running, and reports
+  ``check_failed`` when the process check itself fails. It writes nothing to the
+  profile in any of these cases. It skips the write when the bytes already match. It never touches
   ``extensions.json``, ``prefs.js`` or any other profile file.
   ``install_default_profile`` runs that install for the default profile named in
   ``profiles.ini``, for the packaged tray's install. It never raises.
@@ -66,6 +67,7 @@ PROFILE_MARKERS = ("prefs.js", "zotero.sqlite")
 _NOT_PROFILE_MESSAGE = (
     "{profile} is not a Zotero profile: it has neither prefs.js nor zotero.sqlite. Nothing was written."
 )
+_CHECK_FAILED_MESSAGE = "Could not check whether Zotero is running. Nothing was written."
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -302,15 +304,14 @@ def _tasklist_lists_zotero(output: str) -> bool:
     return False
 
 
-def zotero_is_running(runner: "Callable[[], str] | None" = None) -> bool:
-    """True when a Zotero process is running. Never raises.
+def zotero_process_state(runner: "Callable[[], str] | None" = None) -> "bool | None":
+    """True when Zotero runs, False when it does not, None when the check itself failed. Never raises.
 
     ``runner`` returns the raw listing text (tasklist on Windows, pgrep
-    elsewhere) so tests never call the real process list. Any error counts as
-    running, so an install is never attempted on an unknown state. The default
-    runners raise on an error exit (tasklist: any non-zero code; pgrep: any code
-    other than its no-match exit 1). Empty output from a successful listing
-    means not running.
+    elsewhere) so tests never call the real process list. The default runners
+    raise on an error exit (tasklist: any non-zero code; pgrep: any code other
+    than its no-match exit 1), and that becomes None. Empty output from a
+    successful listing means False.
     """
     try:
         if _platform() == "win32":
@@ -318,7 +319,17 @@ def zotero_is_running(runner: "Callable[[], str] | None" = None) -> bool:
         output = str((runner or _run_pgrep)() or "")
         return any(line.strip().isdigit() for line in output.splitlines())
     except Exception:
-        return True
+        return None
+
+
+def zotero_is_running(runner: "Callable[[], str] | None" = None) -> bool:
+    """True unless the process check positively reports that Zotero is closed. Never raises.
+
+    An unknown state (the check failed) counts as running, so an install is never
+    attempted on it. Callers that must tell "running" from "unknown" use
+    :func:`zotero_process_state`.
+    """
+    return zotero_process_state(runner) is not False
 
 
 # ---------------------------------------------------------------------------
@@ -367,10 +378,11 @@ def install_into_profile(
     """Copy the built .xpi into ``profile_dir/extensions/``.
 
     ``status`` is one of ``installed``, ``unchanged``, ``refused_not_profile``,
-    ``refused_running``, ``no_profile`` or ``failed``. The profile must hold a
-    marker file (``prefs.js`` or ``zotero.sqlite``), and Zotero must not be
-    running; both refusals happen before any write. ``running`` defaults to
-    :func:`zotero_is_running`, looked up at call time.
+    ``refused_running``, ``check_failed``, ``no_profile`` or ``failed``. The
+    profile must hold a marker file (``prefs.js`` or ``zotero.sqlite``), and the
+    process check must succeed and find Zotero closed. Every refusal happens
+    before any write. ``running`` returns True, False, or None for a failed
+    check. It defaults to :func:`zotero_process_state`, looked up at call time.
     """
     try:
         if profile_dir is None or not Path(profile_dir).is_dir():
@@ -379,8 +391,11 @@ def install_into_profile(
             return _result(
                 "refused_not_profile", None, error=_NOT_PROFILE_MESSAGE.format(profile=profile_dir),
             )
-        check = running if running is not None else zotero_is_running
-        if check():
+        check = running if running is not None else zotero_process_state
+        state = check()
+        if state is None:
+            return _result("check_failed", None, error=_CHECK_FAILED_MESSAGE)
+        if state:
             return _result("refused_running", None)
         target = Path(profile_dir) / "extensions" / XPI_FILENAME
         payload = Path(xpi_path).read_bytes()
@@ -396,9 +411,11 @@ def install_default_profile(*, running: "Callable[[], bool] | None" = None) -> d
     """Install the bundled plugin into Zotero's default profile. Never raises.
 
     The profile is the one ``profiles.ini`` marks as default, under
-    ``zotero_data_dir()``. Nothing is written when there is no default profile
-    or while Zotero runs. A failure anywhere else, including the bundle not
-    building, is reported as ``failed``.
+    ``zotero_data_dir()``. The Zotero profile is left alone when there is no
+    default profile, while Zotero runs, or when the process check fails. The
+    bundled .xpi is rebuilt into Meridian's own state folder first, which is not
+    part of Zotero. A failure anywhere else, including the bundle not building,
+    is reported as ``failed``.
     """
     try:
         profile = find_default_profile_dir(zotero_data_dir())
@@ -475,6 +492,15 @@ def autoinstall_env_override(env: "Mapping[str, str] | None" = None) -> "bool | 
     return None
 
 
+def automatic_installs_forced_off(env: "Mapping[str, str] | None" = None) -> bool:
+    """True when AUTOINSTALL_ENV holds a recognised off value (0, false, no, off).
+
+    Only automatic installs are blocked by it: the launch hook and the first-run
+    Install answer. The explicit tray item and the CLI still run.
+    """
+    return autoinstall_env_override(env) is False
+
+
 def effective_autoinstall(settings: "Mapping[str, Any] | None", env: "Mapping[str, str] | None" = None) -> bool:
     """Whether auto-install may run. It needs a recorded first-run decision.
 
@@ -536,6 +562,12 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     if status == "refused_running":
         print("Zotero is running. Close Zotero, then run this command again. Nothing was written.")
         return 1
+    if status == "check_failed":
+        print(
+            "Could not check whether Zotero is running. Make sure Zotero is closed, "
+            "then run this command again. Nothing was written."
+        )
+        return 1
     if status == "no_profile":
         print(f"No Zotero profile folder exists at {profile}, so nothing was installed.")
         _print_manual_steps(xpi)
@@ -562,7 +594,11 @@ def _dry_run(profile: "Path | None") -> int:
     if not is_zotero_profile(profile):
         print("Would refuse: that folder is not a Zotero profile (no prefs.js or zotero.sqlite).")
         return 0
-    if zotero_is_running():
+    state = zotero_process_state()
+    if state is None:
+        print("Would refuse: could not check whether Zotero is running. Make sure Zotero is closed first.")
+        return 0
+    if state:
         print("Would refuse: Zotero is running. Close Zotero first.")
         return 0
     target = profile / "extensions" / XPI_FILENAME
