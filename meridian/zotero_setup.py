@@ -29,7 +29,8 @@ _LOCAL_API_TIMEOUT_SECONDS = 3.0
 
 
 def _build_opener(*handlers):
-    """The local API read's opener: no proxy, and no redirect to the authorize endpoint or an ambiguous authority."""
+    """The local API read's opener: no proxy, and no redirect off loopback, to the authorize endpoint,
+    or through an ambiguous authority."""
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}), zotero_connect._NoAuthorizeRedirect(), *handlers,
     )
@@ -48,11 +49,12 @@ def list_local_zotero_collections(
     """Read collection keys/names from the running local Zotero API.
 
     No account key is sent: Zotero's local read API serves the signed-in local
-    user's library and is intentionally kept on loopback.
+    user's library and stays on loopback. The base URL must be a loopback address
+    before any request is made, and no redirect off loopback is followed.
     """
     base = (base_url or os.environ.get("MERIDIAN_ZOTERO_API_URL") or _DEFAULT_LOCAL_API_BASE)
     url = f"{base.strip().rstrip('/')}/users/0/collections?format=json"
-    if zotero_connect._ambiguous_authority(url) or zotero_connect._targets_authorize(url):
+    if not zotero_connect._require_loopback(url) or zotero_connect._targets_authorize(url):
         raise ZoteroSetupError("The Zotero local API address is not allowed. Check MERIDIAN_ZOTERO_API_URL.")
     request = urllib.request.Request(
         url,

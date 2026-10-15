@@ -45,7 +45,8 @@ _PROBE_URL = f"{_ZOTERO_LOCAL_API}/users/0/items?limit=1"
 
 def _build_probe_opener(*handlers):
     # An explicit empty ProxyHandler keeps localhost off any configured HTTP proxy. The redirect
-    # handler never follows a redirect to the authorize endpoint or to an ambiguous authority.
+    # handler never follows a redirect off loopback, to the authorize endpoint, or through an
+    # ambiguous authority.
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}), zotero_connect._NoAuthorizeRedirect(), *handlers,
     )

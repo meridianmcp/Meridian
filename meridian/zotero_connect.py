@@ -25,11 +25,15 @@ that access, and it does so in its own dialog. This module owns that approval:
 The approval key lives in the OS keyring, under the same service name that
 :mod:`meridian.tunnel_config` uses for the Zotero API key, with its own account
 name. The key is sent only in the ``Authorization`` header, and only to loopback
-hosts. Every request refuses a redirect off loopback, and a redirect to the
-authorize endpoint, checked on every hop. A URL whose authority holds an ``@`` or
-a backslash is refused everywhere a URL is checked, since urllib dials that raw
-authority and not the hostname urlsplit reports. The key never appears in a result,
-a log line or an error string.
+hosts. Each redirect hop is checked. A hop off loopback is never followed: on the
+default transports it stops the request with an error. A hop to the authorize
+endpoint, or through an ambiguous authority, is never followed on any path. The
+launcher probe and the setup read share ``_NoAuthorizeRedirect``, which leaves every
+such hop unfollowed: urllib raises the 3xx reply as an HTTPError, and the target is never
+requested. A URL whose authority holds
+an ``@`` or a backslash is refused everywhere a URL is checked, since urllib dials
+that raw authority and not the hostname urlsplit reports. The key never appears in
+a result, a log line or an error string.
 
 Standard library only. The keyring is loaded lazily through ``tunnel_config``.
 """
@@ -101,14 +105,12 @@ class _LoopbackRedirectGuard(urllib.request.HTTPRedirectHandler):
     urllib calls :meth:`redirect_request` once for every redirect hop, so every hop is
     checked, not only the first. A refused hop raises before urllib builds the next
     request, so no ``Authorization`` header is ever sent to the target. A redirect to the
-    authorize endpoint returns None instead: the 3xx reply stands, the endpoint is never
-    requested, and that holds with or without a key.
+    authorize endpoint returns None instead: urllib raises the 3xx reply as an HTTPError, the
+    endpoint is never requested, and that holds with or without a key.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-        host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
-        # An ambiguous authority is refused even when its hostname reads as loopback: urllib dials the raw authority.
-        if _ambiguous_authority(newurl) or host not in _REDIRECT_HOSTS:
+        if _leaves_loopback(newurl):
             try:
                 fp.close()
             except Exception:  # noqa: BLE001 — closing the refused reply is best effort
@@ -120,14 +122,15 @@ class _LoopbackRedirectGuard(urllib.request.HTTPRedirectHandler):
 
 
 class _NoAuthorizeRedirect(urllib.request.HTTPRedirectHandler):
-    """Follows redirects as urllib does, except to the authorize endpoint or to an ambiguous authority.
+    """Follows redirects except off loopback, to the authorize endpoint, or through an ambiguous authority.
 
     The probes and reads that carry no approval use this (the launcher probe and the setup read). A
-    refused hop returns None, so the 3xx reply stands and the refused target is never requested.
+    refused hop returns None, so urllib raises the 3xx reply as an HTTPError and the refused target
+    is never requested.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-        if _ambiguous_authority(newurl) or _targets_authorize(newurl):
+        if _leaves_loopback(newurl) or _targets_authorize(newurl):
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -241,6 +244,17 @@ def _require_loopback(url: str) -> bool:
         return False
     parts = urllib.parse.urlsplit(url)
     return parts.scheme in ("http", "https") and (parts.hostname or "").lower() in _LOCAL_HOSTS
+
+
+def _leaves_loopback(url: str) -> bool:
+    """True when a redirect target is off loopback, or its authority is ambiguous. Fails closed.
+
+    An ambiguous authority is refused even when its hostname reads as loopback: urllib dials the raw
+    authority, not the hostname urlsplit reports.
+    """
+    if _ambiguous_authority(url):
+        return True
+    return (urllib.parse.urlsplit(url).hostname or "").lower() not in _REDIRECT_HOSTS
 
 
 def _segments(text: str, *, cut_params: bool, resolve_dots: bool) -> list[str]:
@@ -603,9 +617,13 @@ def status(*, base_url: str | None = None, opener: Any = None, store: Any = None
 # ---------------------------------------------------------------------------
 
 def _probe_local_api(send: Callable[[str, str, bytes | None, dict[str, str]], tuple[int, str]]) -> str:
-    """One GET to the local API with no approval. Returns ``reachable``, ``local_api_disabled``, or a failure status."""
+    """One GET to the local API with no approval. Returns ``reachable``, ``local_api_disabled``, or a failure status.
+
+    The base URL comes from ``MERIDIAN_ZOTERO_API_URL``, so it is checked as a loopback URL before any
+    request. A spoofed base gets no request at all.
+    """
     url = _api_base(None) + _PROBE_PATH
-    if _targets_authorize(url):
+    if not _require_loopback(url) or _targets_authorize(url):
         return "error"
     try:
         code, text = send("GET", url, None, {"Zotero-Allowed-Request": "1"})

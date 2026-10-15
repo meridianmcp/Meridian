@@ -121,9 +121,11 @@ class _FakeZotero(urllib.request.BaseHandler):
         "http://127.0.0.1:23119/api/local;x/authorize",
         _SPOOF_BASE,
         "http://evil.example@127.0.0.1:23119/api",
+        "http://203.0.113.10:23119/api",
+        "http://evil.example/api",
     ],
 )
-def test_list_collections_refuses_an_authorize_or_ambiguous_base_before_any_request(monkeypatch, base):
+def test_list_collections_refuses_an_authorize_ambiguous_or_off_loopback_base_before_any_request(monkeypatch, base):
     calls = []
 
     def open_request(request, timeout):
@@ -167,6 +169,23 @@ def test_list_collections_does_not_follow_a_redirect_to_the_authorize_endpoint_o
         zotero_setup.list_local_zotero_collections(base_url="http://127.0.0.1:23119/api")
     assert [urllib.parse.urlsplit(url).path for url in zotero.seen] == [_COLLECTIONS_PATH]
     assert all("evil.example" not in url for url in zotero.seen)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://203.0.113.10:23119/api/users/0/collections",
+        "http://evil.example/api/users/0/collections",
+        "http://localhost.evil.example:23119/api/users/0/collections",
+    ],
+)
+def test_list_collections_does_not_follow_a_redirect_off_loopback(monkeypatch, target):
+    zotero = _FakeZotero({_COLLECTIONS_PATH: target})
+    monkeypatch.setattr(zotero_setup, "_OPENER", zotero_setup._build_opener(zotero))
+    with pytest.raises(zotero_setup.ZoteroSetupError):
+        zotero_setup.list_local_zotero_collections(base_url="http://127.0.0.1:23119/api")
+    assert [urllib.parse.urlsplit(url).path for url in zotero.seen] == [_COLLECTIONS_PATH]
+    assert all(urllib.parse.urlsplit(url).hostname == "127.0.0.1" for url in zotero.seen)
 
 
 def test_list_collections_still_follows_an_ordinary_loopback_redirect(monkeypatch):

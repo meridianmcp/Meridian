@@ -733,7 +733,7 @@ def test_module_entrypoint_exits_with_main_result(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# The probe's redirects: never to the authorize endpoint, never through an ambiguous authority.
+# The probe's redirects: never off loopback, never to the authorize endpoint, never through an ambiguous authority.
 # A fake local API sits at the bottom of the real probe opener. No socket is opened.
 # ---------------------------------------------------------------------------
 
@@ -799,6 +799,22 @@ def test_probe_does_not_follow_a_backslash_authority_redirect(monkeypatch):
     assert zl.zotero_api_alive() is False
     assert len(zotero.seen) == 1
     assert all("evil.example" not in url for url in zotero.seen)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://203.0.113.10:23119/api/users/0/items?limit=1",
+        "http://evil.example/api/users/0/items?limit=1",
+        "http://localhost.evil.example:23119/api/users/0/items?limit=1",
+    ],
+)
+def test_probe_does_not_follow_a_redirect_off_loopback(monkeypatch, target):
+    zotero = _FakeZotero({_PROBE_PATH: target})
+    _probe_through(monkeypatch, zotero)
+    assert zl.zotero_api_alive() is False
+    assert [urllib.parse.urlsplit(url).path for url in zotero.seen] == [_PROBE_PATH]
+    assert all(urllib.parse.urlsplit(url).hostname == "127.0.0.1" for url in zotero.seen)
 
 
 def test_probe_still_follows_an_ordinary_loopback_redirect(monkeypatch):
