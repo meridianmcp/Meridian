@@ -8,6 +8,8 @@ No test touches Zotero, the network or a credential store.
 
 from __future__ import annotations
 
+import ast
+import email.message
 import http.client
 import http.server
 import io
@@ -16,7 +18,9 @@ import logging
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import urllib.response
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -361,8 +365,9 @@ def test_write_sends_the_key_only_in_the_authorization_header(env):
 
 
 @pytest.mark.parametrize("code", [401])
-def test_a_rejected_key_is_deleted_and_never_triggers_a_new_approval(env, monkeypatch, code):
+def test_a_rejected_key_is_kept_and_never_triggers_a_new_approval(env, monkeypatch, code):
     # A 403 is handled separately: it may also mean the local API is switched off (see the F2 tests below).
+    # The write path keeps the key, as the filer does. Only connect() replaces it, and only disconnect() removes it.
     env.store.key = ISSUED_KEY
 
     def boom(*args, **kwargs):
@@ -371,8 +376,10 @@ def test_a_rejected_key_is_deleted_and_never_triggers_a_new_approval(env, monkey
     monkeypatch.setattr(zc, "connect", boom)
     transport = Scripted((code, "{}"))
     result = zc.write_with_stored_approval(_write_request(), transport=transport)
-    assert result["status"] == "needs_connection"
-    assert env.store.key is None
+    assert result["status"] == "rejected"
+    assert result["message"] == zc.REJECTED_LINE
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
     assert len(transport.calls) == 1
     assert all(call["url"] != AUTHORIZE for call in transport.calls)
 
@@ -858,13 +865,14 @@ def test_403_whose_probe_reports_the_local_api_not_enabled_keeps_the_key(env):
     assert env.store.delete_calls == 0
 
 
-def test_403_with_a_successful_probe_deletes_the_key(env):
+def test_403_with_a_successful_probe_keeps_the_key_and_reports_rejected(env):
     env.store.key = ISSUED_KEY
     transport = Scripted((403, "denied"), (200, "[]"))
     result = zc.write_with_stored_approval(_write_request(), transport=transport)
-    assert result["status"] == "needs_connection"
-    assert env.store.key is None
-    assert env.store.delete_calls == 1
+    assert result["status"] == "rejected"
+    assert result["http_status"] == 403
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
     assert [call["method"] for call in transport.calls] == ["POST", "GET"]
 
 
@@ -877,11 +885,12 @@ def test_403_whose_probe_cannot_reach_zotero_keeps_the_key(env):
     assert env.store.delete_calls == 0
 
 
-def test_401_deletes_the_key_without_probing(env):
+def test_401_keeps_the_key_and_reports_rejected_without_probing(env):
     env.store.key = ISSUED_KEY
     transport = Scripted((401, "no"))
-    assert zc.write_with_stored_approval(_write_request(), transport=transport)["status"] == "needs_connection"
-    assert env.store.key is None
+    assert zc.write_with_stored_approval(_write_request(), transport=transport)["status"] == "rejected"
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
     assert [call["method"] for call in transport.calls] == ["POST"]
 
 
@@ -1365,3 +1374,238 @@ def test_an_unparseable_url_is_refused_before_any_request_so_the_key_never_leave
     assert header.calls == []
     assert env.store.key == ISSUED_KEY
     assert env.store.delete_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Blocking review fixes. No redirect reaches the authorize endpoint, with or
+# without a key. The write path keeps a rejected key. No approval-free probe
+# targets the authorize endpoint. Only disconnect() removes the key.
+# ---------------------------------------------------------------------------
+
+# The real transport, captured before the env fixture swaps in the guarded one.
+_REAL_DEFAULT_TRANSPORT = zc._default_transport
+
+ATTACH_PATH = "/api/users/0/items"
+PROBE_PATH = "/api/users/0/items"
+COLLECTIONS_PATH = "/api/users/0/collections"
+SAVE_PATH = "/connector/saveItems"
+
+# Redirect targets that reach the authorize endpoint in a spelling a server could accept.
+REDIRECT_TARGETS = [
+    AUTHORIZE,
+    AUTHORIZE + "/",
+    "http://127.0.0.1:23119/api/local/authorize;x",
+    "http://127.0.0.1:23119/api/local;x/authorize",
+    "http://127.0.0.1:23119/api/local/authorize%3Fx",
+    "http://127.0.0.1:23119/api/local\\authorize",
+    "http://localhost:23119/api/local/AUTHORIZE?appName=Meridian",
+]
+
+
+class RedirectingZotero(urllib.request.BaseHandler):
+    """A fake Zotero installed at the bottom of a real opener. It records every request it receives.
+
+    ``redirects`` maps a request path to a Location. A request for a mapped path gets a 302 to that
+    Location. Any other request gets a 200 with an empty JSON list. The handler runs ahead of urllib's
+    own HTTP handler, so no socket is opened, and the real redirect handlers run on top of it.
+    """
+
+    handler_order = 100
+
+    def __init__(self, redirects=None):
+        self.redirects = dict(redirects or {})
+        self.seen = []
+
+    def http_open(self, req):
+        parts = urllib.parse.urlsplit(req.full_url)
+        self.seen.append({
+            "method": req.get_method(), "url": req.full_url, "path": parts.path, "headers": dict(req.header_items()),
+        })
+        location = self.redirects.get(parts.path)
+        headers = email.message.Message()
+        if location is None:
+            code, body = 200, b"[]"
+            headers["Content-Type"] = "application/json"
+        else:
+            code, body = 302, b""
+            headers["Location"] = location
+        response = urllib.response.addinfourl(io.BytesIO(body), headers, req.full_url, code)
+        response.msg = "OK" if location is None else "Found"
+        return response
+
+
+def _zotero_opener(guard, zotero):
+    """An opener built the way the real transports build theirs, with the fake Zotero at the bottom."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), guard, zotero)
+
+
+def _seen(zotero):
+    return [(call["method"], call["path"]) for call in zotero.seen]
+
+
+@pytest.mark.parametrize("target", REDIRECT_TARGETS)
+def test_a_write_redirected_to_the_authorize_endpoint_is_never_followed(env, monkeypatch, target):
+    env.store.key = ISSUED_KEY
+    zotero = RedirectingZotero({ATTACH_PATH: target})
+    monkeypatch.setattr(zc, "_TRANSPORT_OPENER", _zotero_opener(zc._LoopbackRedirectGuard(), zotero))
+    result = zc.write_with_stored_approval(
+        {"method": "POST", "url": zf.LOCAL_API + "/items", "payload": [{"a": 1}]},
+        transport=_REAL_DEFAULT_TRANSPORT(2.0),
+    )
+    assert result["status"] == "error"
+    assert _seen(zotero) == [("POST", ATTACH_PATH)]
+    assert env.store.key == ISSUED_KEY
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+@pytest.mark.parametrize("target", REDIRECT_TARGETS)
+def test_a_filer_send_redirected_to_the_authorize_endpoint_is_never_followed(env, monkeypatch, target):
+    env.store.key = ISSUED_KEY
+    zotero = RedirectingZotero({ATTACH_PATH: target})
+    monkeypatch.setattr(zf, "_OPENER", _zotero_opener(zf._StripKeyOnRedirect(), zotero))
+    result = zc.send_with_stored_approval(
+        "POST", zf.LOCAL_API + "/items", [{"a": 1}], header_transport=zf._urllib_transport_with_headers,
+    )
+    assert result["status"] == "error"
+    assert _seen(zotero) == [("POST", ATTACH_PATH)]
+    assert env.store.key == ISSUED_KEY
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+@pytest.mark.parametrize("target", REDIRECT_TARGETS)
+def test_a_connector_save_redirected_to_the_authorize_endpoint_is_never_followed(env, monkeypatch, target):
+    # The connector save carries no approval. The authorize endpoint is still never reached through it.
+    env.store.key = ISSUED_KEY
+    zotero = RedirectingZotero({SAVE_PATH: target})
+    monkeypatch.setattr(zf, "_OPENER", _zotero_opener(zf._StripKeyOnRedirect(), zotero))
+    result = zf.save_items([{"title": "T"}])
+    assert result["status"] == "error"
+    assert _seen(zotero) == [("POST", SAVE_PATH)]
+    assert env.store.key == ISSUED_KEY
+
+
+@pytest.mark.parametrize("target", REDIRECT_TARGETS)
+def test_a_status_probe_redirected_to_the_authorize_endpoint_is_never_followed(env, target):
+    zotero = RedirectingZotero({PROBE_PATH: target})
+    result = zc.status(opener=_zotero_opener(zc._LoopbackRedirectGuard(), zotero).open)
+    assert result["status"] == "unreachable"
+    assert _seen(zotero) == [("GET", PROBE_PATH)]
+
+
+@pytest.mark.parametrize("target", REDIRECT_TARGETS)
+def test_the_filer_server_id_probe_redirected_to_the_authorize_endpoint_is_never_followed(env, monkeypatch, target):
+    zotero = RedirectingZotero({COLLECTIONS_PATH: target})
+    monkeypatch.setattr(zf, "_OPENER", _zotero_opener(zf._StripKeyOnRedirect(), zotero))
+    assert zf._probe_server_id(zf._urllib_transport_with_headers) is None
+    assert _seen(zotero) == [("GET", COLLECTIONS_PATH)]
+
+
+@pytest.mark.parametrize("target", REDIRECT_TARGETS)
+def test_both_redirect_handlers_refuse_the_authorize_endpoint_with_or_without_a_key(target):
+    plain = urllib.request.Request(SAVE_URL, data=b"[]", method="POST")
+    keyed = urllib.request.Request(
+        zf.LOCAL_API + "/items", data=b"[]", headers={"Authorization": f"Bearer {ISSUED_KEY}"}, method="POST",
+    )
+    for handler in (zc._LoopbackRedirectGuard(), zf._StripKeyOnRedirect()):
+        assert handler.redirect_request(plain, None, 302, "Found", {}, target) is None
+        assert handler.redirect_request(keyed, None, 302, "Found", {}, target) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        AUTHORIZE,
+        AUTHORIZE + "/",
+        "http://127.0.0.1:23119/api/local/authorize;x",
+        "http://127.0.0.1:23119/api/local/authorize;",
+        "http://127.0.0.1:23119/api/local;x/authorize",
+        "http://127.0.0.1:23119/api/local;/authorize",
+        "http://127.0.0.1:23119/api/local%3Bx/authorize",
+        "http://127.0.0.1:23119/api/local/authorize%3Fx",
+        "http://127.0.0.1:23119/api/local/authorize%3fx",
+        "http://127.0.0.1:23119/api/local/authorize%23x",
+        "http://127.0.0.1:23119/api/local/authorize?x=1",
+        "http://127.0.0.1:23119/api/local/authorize#frag",
+        "http://127.0.0.1:23119/api/local\\authorize",
+        "http://127.0.0.1:23119/api\\local\\authorize",
+        "http://127.0.0.1:23119/api/local%5Cauthorize",
+        "http://127.0.0.1:23119/api/local%5cauthorize",
+        "http://127.0.0.1:23119/api/local/authorize%00x",
+        "http://127.0.0.1:23119/api/local/auth%0Aorize",
+        "http://127.0.0.1:23119/api/local/x/../authorize",
+        "http://127.0.0.1:23119/api/local/authorize/..",
+        "http://127.0.0.1:23119/api/local/authorize/",
+        "http://127.0.0.1:23119//api//local//authorize",
+        "http://127.0.0.1:23119/api/users/0/../../local/authorize",
+        "http://localhost:23119/api/local/authorize?appName=Meridian",
+    ],
+)
+def test_targets_authorize_refuses_every_spelling_of_the_endpoint(url):
+    assert zc._targets_authorize(url) is True
+
+
+def _encoded_rounds(text, rounds):
+    for _ in range(rounds):
+        text = urllib.parse.quote(text, safe="")
+    return text
+
+
+@pytest.mark.parametrize("rounds", [5, 6, 8])
+def test_targets_authorize_decodes_deeper_than_the_old_four_rounds(rounds):
+    assert zc._targets_authorize("http://127.0.0.1:23119/api/" + _encoded_rounds("local/authorize", rounds)) is True
+
+
+@pytest.mark.parametrize("path", ["local/authorize", "local/items"])
+def test_a_path_still_encoded_past_the_decode_depth_is_refused(path):
+    # Fail closed: a path that does not finish decoding inside the depth limit is refused, never guessed at.
+    assert zc._targets_authorize("http://127.0.0.1:23119/api/" + _encoded_rounds(path, 9)) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:23119/api/users/0/items?limit=1",
+        "http://127.0.0.1:23119/connector/saveItems",
+        "http://127.0.0.1:23119/api/local/status",
+        "http://127.0.0.1:23119/api/local/authorized",
+        "http://127.0.0.1:23119/api/local/authorize-me",
+        "http://127.0.0.1:23119/api/users/0/items/local",
+        "http://127.0.0.1:23119/",
+    ],
+)
+def test_targets_authorize_allows_the_other_local_api_paths(url):
+    assert zc._targets_authorize(url) is False
+
+
+def test_status_never_probes_a_base_url_that_targets_the_authorize_endpoint(env, monkeypatch):
+    monkeypatch.setenv("MERIDIAN_ZOTERO_API_URL", "http://127.0.0.1:23119/api/local/authorize")
+    opener = probe_opener()
+    assert zc.status(opener=opener)["status"] == "unreachable"
+    assert opener.calls == []
+
+
+def test_the_write_path_probe_never_targets_the_authorize_endpoint(env, monkeypatch):
+    env.store.key = ISSUED_KEY
+    monkeypatch.setenv("MERIDIAN_ZOTERO_API_URL", "http://127.0.0.1:23119/api/local/authorize")
+    transport = Scripted((403, "denied"))
+    result = zc.write_with_stored_approval(_write_request(), transport=transport)
+    assert result["status"] == "error"
+    assert [call["method"] for call in transport.calls] == ["POST"]
+    assert env.store.key == ISSUED_KEY
+
+
+def test_only_disconnect_removes_the_stored_approval():
+    """The store's delete() is reached from disconnect() alone. connect() replaces the key and never removes it."""
+    tree = ast.parse(Path(zc.__file__).read_text(encoding="utf-8"), filename=zc.__file__)
+    callers = set()
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("delete", "delete_password")
+            ):
+                callers.add(func.name)
+    assert callers == {"delete", "disconnect"}

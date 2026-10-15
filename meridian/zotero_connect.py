@@ -15,9 +15,9 @@ that access, and it does so in its own dialog. This module owns that approval:
   is spelled. The filer's PDF attach step uses ``send_with_stored_approval``. With
   no stored key nothing is sent. A refused key is probed with one approval-free GET
   when it is a 403, because a 403 can also mean the local API is switched off.
-  ``send_with_stored_approval`` never deletes the key: a refusal returns
-  ``rejected``, and only :func:`connect` replaces it. ``write_with_stored_approval``
-  keeps its own rule and deletes the key on a 401, or on a 403 whose probe succeeds.
+  Neither sender deletes the key: a refusal returns ``rejected`` and the key is
+  kept, on both paths. Only :func:`connect` replaces the key, and only
+  :func:`disconnect` removes it.
 * :func:`status` is read-only: one GET, never a POST.
 * :func:`disconnect` deletes the stored key. Only Zotero can revoke the approval
   itself, so the result says where to clear it.
@@ -25,8 +25,9 @@ that access, and it does so in its own dialog. This module owns that approval:
 The approval key lives in the OS keyring, under the same service name that
 :mod:`meridian.tunnel_config` uses for the Zotero API key, with its own account
 name. The key is sent only in the ``Authorization`` header, and only to loopback
-hosts. Every request that carries it refuses a redirect off loopback, checked
-on every hop. It never appears in a result, a log line or an error string.
+hosts. Every request refuses a redirect off loopback, and a redirect to the
+authorize endpoint, checked on every hop. It never appears in a result, a log
+line or an error string.
 
 Standard library only. The keyring is loaded lazily through ``tunnel_config``.
 """
@@ -37,6 +38,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 import time
@@ -65,7 +67,7 @@ CONNECT_FIRST_LINE = (
     "approve it in Zotero, then run this again. Nothing was filed."
 )
 
-# The one line a user sees when Zotero refuses the stored approval during a PDF attach. The key is kept.
+# The one line a user sees when Zotero refuses the stored approval on a write. The key is kept.
 REJECTED_LINE = (
     "Zotero rejected the stored approval. Running 'python -m meridian.zotero_connect connect' again replaces it."
 )
@@ -73,6 +75,8 @@ REJECTED_LINE = (
 _APPROVAL_ACCOUNT = "zotero-local-approval"
 _AUTHORIZE_PATH = "/local/authorize"
 _AUTHORIZE_SEGMENTS = tuple(_AUTHORIZE_PATH.strip("/").lower().split("/"))
+# Percent-decoding rounds _targets_authorize applies before it fails closed.
+_MAX_DECODE_ROUNDS = 8
 _PROBE_PATH = "/users/0/items?limit=1"
 _SERVER_ID_HEADER = "Zotero-Server-ID"
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -90,11 +94,13 @@ class _RedirectRefused(Exception):
 
 
 class _LoopbackRedirectGuard(urllib.request.HTTPRedirectHandler):
-    """Refuses any redirect whose target is not 127.0.0.1 or localhost.
+    """Refuses any redirect whose target is not 127.0.0.1 or localhost, and any redirect to the authorize endpoint.
 
     urllib calls :meth:`redirect_request` once for every redirect hop, so every hop is
     checked, not only the first. A refused hop raises before urllib builds the next
-    request, so no ``Authorization`` header is ever sent to the target.
+    request, so no ``Authorization`` header is ever sent to the target. A redirect to the
+    authorize endpoint returns None instead: the 3xx reply stands, the endpoint is never
+    requested, and that holds with or without a key.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
@@ -105,6 +111,8 @@ class _LoopbackRedirectGuard(urllib.request.HTTPRedirectHandler):
             except Exception:  # noqa: BLE001 — closing the refused reply is best effort
                 pass
             raise _RedirectRefused("Zotero tried to redirect the request off this machine; it was stopped.")
+        if _targets_authorize(newurl):
+            return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -202,34 +210,66 @@ def _require_loopback(url: str) -> bool:
     return parts.scheme in ("http", "https") and (parts.hostname or "").lower() in _LOCAL_HOSTS
 
 
-def _targets_authorize(url: str) -> bool:
-    """True when the URL's path reaches the authorize endpoint, however it is spelled.
+def _segments(text: str, *, cut_params: bool, resolve_dots: bool) -> list[str]:
+    """Lowercased path segments. Empty and ``.`` segments are dropped; ``..`` pops when dots are resolved.
 
-    The path is percent-decoded (a few rounds, so a double-encoded slash counts too), split on
-    slashes so doubled and trailing slashes are ignored, dot segments are resolved, and the
-    segments are lowercased. The URL is refused when ``local/authorize`` appears as consecutive
-    segments. A URL that cannot be parsed is refused as well.
+    With ``cut_params``, a ``;`` ends the path parameters of its own segment and the rest is cut.
+    """
+    segments: list[str] = []
+    for part in text.split("/"):
+        if cut_params:
+            part = part.split(";", 1)[0]
+        if part in ("", "."):
+            continue
+        if part == ".." and resolve_dots:
+            if segments:
+                segments.pop()
+            continue
+        segments.append(part.lower())
+    return segments
+
+
+def _has_authorize_run(segments: list[str]) -> bool:
+    width = len(_AUTHORIZE_SEGMENTS)
+    return any(tuple(segments[i:i + width]) == _AUTHORIZE_SEGMENTS for i in range(len(segments) - width + 1))
+
+
+_PATH_DROPPED_RE = re.compile(r"[\t\r\n]")
+_PATH_BREAK_RE = re.compile(r"[\\?#\x00]")
+
+
+def _targets_authorize(url: str) -> bool:
+    """True when the URL's path reaches the authorize endpoint, however it is spelled. Fails closed.
+
+    The path is percent-decoded for up to ``_MAX_DECODE_ROUNDS`` rounds. A path still encoded after
+    that is refused rather than guessed at. Tab, CR and LF are dropped, since some URL parsers drop
+    them. Backslash, ``?``, ``#`` and NUL end a segment, since some servers read them that way. The
+    path is then read four ways: a ``;`` either cuts the path parameters off its own segment or
+    ends the segment, and dot segments are either resolved or kept. The URL is refused when
+    ``local/authorize`` appears as consecutive segments in any of those readings. A URL that cannot
+    be parsed is refused as well.
     """
     try:
         path = urllib.parse.urlsplit(url).path
     except ValueError:
         return True
-    for _ in range(4):
+    for _ in range(_MAX_DECODE_ROUNDS):
         decoded = urllib.parse.unquote(path)
         if decoded == path:
             break
         path = decoded
-    segments: list[str] = []
-    for part in path.split("/"):
-        if part in ("", "."):
-            continue
-        if part == "..":
-            if segments:
-                segments.pop()
-            continue
-        segments.append(part.lower())
-    width = len(_AUTHORIZE_SEGMENTS)
-    return any(tuple(segments[i:i + width]) == _AUTHORIZE_SEGMENTS for i in range(len(segments) - width + 1))
+    if urllib.parse.unquote(path) != path:
+        return True
+    text = _PATH_BREAK_RE.sub("/", _PATH_DROPPED_RE.sub("", path))
+    separated = text.replace(";", "/")
+    for resolve_dots in (True, False):
+        for segments in (
+            _segments(text, cut_params=True, resolve_dots=resolve_dots),
+            _segments(separated, cut_params=False, resolve_dots=resolve_dots),
+        ):
+            if _has_authorize_run(segments):
+                return True
+    return False
 
 
 def _api_base(base_url: str | None) -> str:
@@ -515,7 +555,7 @@ def _probe(open_url: Callable[..., Any], url: str) -> str:
 def status(*, base_url: str | None = None, opener: Any = None, store: Any = None) -> dict[str, Any]:
     """Read-only: one GET to the local API, then whether an approval is stored. Never sends a POST."""
     url = _api_base(base_url) + _PROBE_PATH
-    if not _require_loopback(url):
+    if not _require_loopback(url) or _targets_authorize(url):
         state = "unreachable"
     else:
         open_url = opener if opener is not None else _PROBE_OPENER.open
@@ -529,17 +569,13 @@ def status(*, base_url: str | None = None, opener: Any = None, store: Any = None
 # write_with_stored_approval(): stored key only, never connect()
 # ---------------------------------------------------------------------------
 
-def _forget_approval(approval_store: Any) -> None:
-    try:
-        approval_store.delete()
-    except ZoteroCredentialStoreUnavailable:
-        _LOG.warning("Zotero rejected the stored approval, but it could not be removed from the OS credential store.")
-
-
 def _probe_local_api(send: Callable[[str, str, bytes | None, dict[str, str]], tuple[int, str]]) -> str:
     """One GET to the local API with no approval. Returns ``reachable``, ``local_api_disabled``, or a failure status."""
+    url = _api_base(None) + _PROBE_PATH
+    if _targets_authorize(url):
+        return "error"
     try:
-        code, text = send("GET", _api_base(None) + _PROBE_PATH, None, {"Zotero-Allowed-Request": "1"})
+        code, text = send("GET", url, None, {"Zotero-Allowed-Request": "1"})
     except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
         return transport_failure(exc)
     if 200 <= code < 300:
@@ -549,33 +585,19 @@ def _probe_local_api(send: Callable[[str, str, bytes | None, dict[str, str]], tu
     return "error"
 
 
-def _refused_approval(approval_store: Any, *, code: int, forget_on_refusal: bool) -> dict[str, Any]:
-    """A refused key. The write path deletes it and says needs_connection. The filer path keeps it and says rejected."""
-    if forget_on_refusal:
-        _forget_approval(approval_store)
-        return _result("needs_connection")
-    return _result("rejected", http_status=code)
-
-
-def _rejected_outcome(
-    code: int,
-    send: Callable[..., tuple[int, str]],
-    approval_store: Any,
-    *,
-    forget_on_refusal: bool,
-) -> dict[str, Any] | None:
+def _rejected_outcome(code: int, send: Callable[..., tuple[int, str]]) -> dict[str, Any] | None:
     """The one rule for a reply that refuses the stored approval. None when the reply is not a refusal.
 
-    A 401, or a 403 whose approval-free probe succeeds, refuses the key. A 403 whose probe finds the local API
-    off or unreachable is reported as that, and the key is kept on both paths. ``forget_on_refusal`` picks what
-    a refusal does to the key: True deletes it (write_with_stored_approval), False keeps it (the filer's send).
+    A 401, or a 403 whose approval-free probe succeeds, refuses the key: the result is ``rejected``. A 403
+    whose probe finds the local API off or unreachable is reported as that. Nothing here removes the key.
+    Only connect() replaces it, and only disconnect() removes it, on both the write path and the filer path.
     """
     if code == 401:
-        return _refused_approval(approval_store, code=code, forget_on_refusal=forget_on_refusal)
+        return _result("rejected", http_status=code)
     if code == 403:
         probe = _probe_local_api(send)
         if probe == "reachable":
-            return _refused_approval(approval_store, code=code, forget_on_refusal=forget_on_refusal)
+            return _result("rejected", http_status=code)
         if probe == "local_api_disabled":
             return _result("local_api_disabled", http_status=403)
         return _result(probe, http_status=403)
@@ -601,13 +623,13 @@ def write_with_stored_approval(
 
     ``request`` takes ``method``, ``url`` and an optional JSON-able ``payload``.
     With no stored approval nothing is sent and the result is ``needs_connection``.
-    A 401 means Zotero rejected the key, so the stored key is deleted and the result is
-    ``needs_connection``. A 403 also means the local API may be switched off, so one
-    approval-free GET probes it first. The key is deleted only when that GET succeeds.
-    When the GET reports the local API off or cannot reach it, the result is
-    ``local_api_disabled`` (or the failure status) and the key is kept. Any other failure
-    also keeps the stored key. A URL whose path reaches the authorize endpoint is refused
-    as ``error`` before the key is read, so nothing is sent.
+    A 401 means Zotero rejected the key: the result is ``rejected`` and the key is kept.
+    A 403 also means the local API may be switched off, so one approval-free GET probes it
+    first. A 403 whose GET succeeds is ``rejected``, and the key is kept. When the GET reports
+    the local API off or cannot reach it, the result is ``local_api_disabled`` (or the failure
+    status). Any other failure also keeps the stored key. Only :func:`connect` replaces the
+    key, and only :func:`disconnect` removes it. A URL whose path reaches the authorize
+    endpoint is refused as ``error`` before the key is read, so nothing is sent.
     """
     url = str(request.get("url") or "")
     if _targets_authorize(url):
@@ -629,7 +651,7 @@ def write_with_stored_approval(
         code, _text = send(method, url, body, headers)
     except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
         return _result(transport_failure(exc))
-    rejected = _rejected_outcome(code, send, approval_store, forget_on_refusal=True)
+    rejected = _rejected_outcome(code, send)
     if rejected is not None:
         return rejected
     if 200 <= code < 300:
@@ -664,10 +686,11 @@ def send_with_stored_approval(
     The filer's PDF attach writes carry the approval through this function, so the stored
     approval has one sender in this module. With no stored key nothing is sent and the result is
     ``needs_connection``. A 401, or a 403 whose probe succeeds, is ``rejected``, and the key is
-    kept: only :func:`connect` replaces or removes it. A 403 with the local API off keeps the key
-    too and reports that. The key goes only in the Authorization header, and only to loopback
-    URLs. ``headers`` adds the caller's own headers, never an Authorization header. A URL whose
-    path reaches the authorize endpoint is refused as ``error`` before anything is sent. A 429 is
+    kept: only :func:`connect` replaces it, and only :func:`disconnect` removes it. A 403 with the
+    local API off keeps the key too and reports that. The key goes only in the Authorization
+    header, and only to loopback URLs. ``headers`` adds the caller's own headers, never an
+    Authorization header. A URL whose path reaches the authorize endpoint is refused as ``error``
+    before anything is sent. A 429 is
     ``rate_limited`` with ``retry_after``. A 2xx is ``written`` with ``http_status`` and ``text``.
     It never calls :func:`connect`.
     """
@@ -691,9 +714,7 @@ def send_with_stored_approval(
         )
     except Exception as exc:  # noqa: BLE001 — classified; the exception text is dropped
         return _result(transport_failure(exc))
-    rejected = _rejected_outcome(
-        code, _without_headers(header_transport), approval_store, forget_on_refusal=False,
-    )
+    rejected = _rejected_outcome(code, _without_headers(header_transport))
     if rejected is not None:
         return rejected
     if code == 429:

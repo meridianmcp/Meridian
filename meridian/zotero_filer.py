@@ -100,10 +100,13 @@ class _StripKeyOnRedirect(urllib.request.HTTPRedirectHandler):
     copies request headers onto the redirected request, so without this the key
     would reach that host. A request that carries the stored approval (an
     Authorization header) is never followed off this machine: the reply is returned
-    as it is, and the approval is not sent.
+    as it is, and the approval is not sent. A redirect to the authorize endpoint is
+    never followed either, with or without a key: the reply is returned as it is.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if zotero_connect._targets_authorize(newurl):
+            return None
         host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
         carries_approval = any(name.lower() == "authorization" for name in req.headers)
         if carries_approval and host not in zotero_connect._REDIRECT_HOSTS:
