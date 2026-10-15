@@ -9,6 +9,8 @@
   ``zotero.sqlite``) and refuses while Zotero is running, writing nothing in
   either case. It skips the write when the bytes already match. It never touches
   ``extensions.json``, ``prefs.js`` or any other profile file.
+  ``install_default_profile`` runs that install for the default profile named in
+  ``profiles.ini``, for the packaged tray's install. It never raises.
 * The settings file ``zotero_plugin.json`` (in the per-user Meridian state dir,
   next to the tray's other settings) holds the user's choice. Auto-install is
   opt-in: it is off until the first-run prompt records an answer. An unreadable
@@ -265,6 +267,7 @@ def _run_tasklist() -> str:
         ["tasklist", "/FI", "IMAGENAME eq zotero.exe", "/NH"],
         capture_output=True,
         text=True,
+        errors="replace",  # a byte that is not valid in the console code page must not raise
         timeout=10,
         check=False,
         **kwargs,
@@ -369,13 +372,13 @@ def install_into_profile(
     running; both refusals happen before any write. ``running`` defaults to
     :func:`zotero_is_running`, looked up at call time.
     """
-    if profile_dir is None or not Path(profile_dir).is_dir():
-        return _result("no_profile", None)
-    if not is_zotero_profile(profile_dir):
-        return _result(
-            "refused_not_profile", None, error=_NOT_PROFILE_MESSAGE.format(profile=profile_dir),
-        )
     try:
+        if profile_dir is None or not Path(profile_dir).is_dir():
+            return _result("no_profile", None)
+        if not is_zotero_profile(profile_dir):
+            return _result(
+                "refused_not_profile", None, error=_NOT_PROFILE_MESSAGE.format(profile=profile_dir),
+            )
         check = running if running is not None else zotero_is_running
         if check():
             return _result("refused_running", None)
@@ -384,9 +387,27 @@ def install_into_profile(
         if target.is_file() and target.read_bytes() == payload:
             return _result("unchanged", target)
         _atomic_write_bytes(target, payload)
+        return _result("installed", target)
     except Exception as exc:  # noqa: BLE001 -- report every failure as data, never raise
         return _result("failed", None, error=str(exc))
-    return _result("installed", target)
+
+
+def install_default_profile(*, running: "Callable[[], bool] | None" = None) -> dict[str, Any]:
+    """Install the bundled plugin into Zotero's default profile. Never raises.
+
+    The profile is the one ``profiles.ini`` marks as default, under
+    ``zotero_data_dir()``. Nothing is written when there is no default profile
+    or while Zotero runs. A failure anywhere else, including the bundle not
+    building, is reported as ``failed``.
+    """
+    try:
+        profile = find_default_profile_dir(zotero_data_dir())
+        if profile is None:
+            return _result("no_profile", None)
+        xpi = build_xpi(default_xpi_path())
+        return install_into_profile(profile, xpi, running=running)
+    except Exception as exc:  # noqa: BLE001 -- report every failure as data, never raise
+        return _result("failed", None, error=str(exc))
 
 
 # ---------------------------------------------------------------------------

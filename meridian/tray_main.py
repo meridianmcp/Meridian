@@ -1248,7 +1248,10 @@ def _ask_zotero_plugin_first_run(parent: Any | None = None) -> "bool | None":
 
 
 def _run_zotero_plugin_first_run(*, parent: Any | None = None, path: "Path | None" = None) -> "dict | None":
-    """Ask once, then store the answer. Returns the saved settings, or None when nothing was saved."""
+    """Ask once, then store the answer. Returns the saved settings, or None when nothing was saved.
+
+    An Install answer also installs now, when Zotero is closed, and shows the result.
+    """
     target = path if path is not None else zotero_plugin.settings_path()
     try:
         answer = _ask_zotero_plugin_first_run(parent=parent)
@@ -1266,6 +1269,10 @@ def _run_zotero_plugin_first_run(*, parent: Any | None = None, path: "Path | Non
             "tray_main: could not save the Zotero plugin choice; the prompt will ask again: %s", exc,
         )
         return None
+    if answer:
+        # The install refuses while Zotero runs, and the dialog then says to close it and use the menu item.
+        text = zotero_plugin_install_message(zotero_plugin.install_default_profile, first_run=True)
+        _report_zotero_plugin_install(text, parent=parent)
     return updated
 
 
@@ -1289,6 +1296,111 @@ def _toggle_zotero_plugin_preference(path: "Path | None" = None) -> dict:
     updated = toggle_zotero_plugin_autoinstall(zotero_plugin.load_settings(target))
     zotero_plugin.save_settings(target, updated)
     return updated
+
+
+ZOTERO_PLUGIN_REPORT_TITLE = "Zotero bridge plugin"
+ZOTERO_PLUGIN_INSTALL_NOW_LABEL = "Install Zotero plugin now"
+_ZOTERO_PLUGIN_INSTALL_STATUSES = frozenset({
+    "installed", "unchanged", "refused_running", "refused_not_profile", "no_profile", "failed",
+})
+_ZOTERO_PLUGIN_SAVED_PREFIX = "Your choice was saved. "
+_ZOTERO_PLUGIN_CLOSE_AND_RETRY = (
+    'Close Zotero, then choose "' + ZOTERO_PLUGIN_INSTALL_NOW_LABEL + '" from the Meridian tray menu.'
+)
+
+
+def zotero_plugin_install_now_result(install: Callable[[], Any]) -> dict:
+    """Run one install attempt and return its result dict. Never raises.
+
+    An exception, or an answer that is not a known install status, becomes ``failed``.
+    """
+    try:
+        result = install()
+    except Exception as exc:  # noqa: BLE001 -- the tray must never see an install exception
+        return {"status": "failed", "path": None, "error": str(exc) or "unknown error"}
+    status = result.get("status") if isinstance(result, dict) else None
+    if not isinstance(status, str) or status not in _ZOTERO_PLUGIN_INSTALL_STATUSES:
+        return {"status": "failed", "path": None, "error": "the install returned an unexpected answer"}
+    return dict(result)
+
+
+def zotero_plugin_install_text(result: dict, *, first_run: bool = False) -> str:
+    """The dialog text for one install result. Pure: no disk, no Tk, no process list.
+
+    ``first_run`` marks the text shown right after the first-run Install answer,
+    which opens by saying the choice was saved.
+    """
+    status = result.get("status")
+    path = result.get("path")
+    error = result.get("error") or "unknown error"
+    if status == "installed":
+        text = f"Installed the Zotero bridge plugin to {path}. Start Zotero to use it."
+    elif status == "unchanged":
+        text = f"The Zotero bridge plugin is already up to date at {path}."
+    elif status == "refused_running":
+        text = "Zotero is running, so nothing was installed. " + _ZOTERO_PLUGIN_CLOSE_AND_RETRY
+    elif status == "no_profile":
+        text = (
+            "No Zotero profile was found, so nothing was installed. Open Zotero once so it creates "
+            'a profile, close it, then choose "' + ZOTERO_PLUGIN_INSTALL_NOW_LABEL
+            + '" from the Meridian tray menu.'
+        )
+    elif status == "refused_not_profile":
+        text = f"Nothing was installed: {error}"
+    else:
+        text = f"The install failed: {error}"
+    return _ZOTERO_PLUGIN_SAVED_PREFIX + text if first_run else text
+
+
+def zotero_plugin_install_message(install: Callable[[], Any], *, first_run: bool = False) -> str:
+    """Run one install and return its dialog text. Never raises."""
+    return zotero_plugin_install_text(zotero_plugin_install_now_result(install), first_run=first_run)
+
+
+def _report_zotero_plugin_install(text: str, parent: Any | None = None) -> None:
+    """Show one install result. A dialog that cannot open is logged, never raised."""
+    try:
+        _show_info_dialog(ZOTERO_PLUGIN_REPORT_TITLE, text, parent=parent)
+    except Exception:  # noqa: BLE001 -- a broken dialog must never take the tray down
+        _logger.warning("tray_main: could not show the Zotero plugin install result", exc_info=True)
+
+
+def _install_zotero_plugin_now_and_report(dispatch: Any, *, parent: Any | None = None) -> str:
+    """Menu action body: run the install, then show its result through ``dispatch``. Never raises."""
+    text = zotero_plugin_install_message(zotero_plugin.install_default_profile)
+    try:
+        dispatch(lambda text=text: _report_zotero_plugin_install(text, parent=parent))
+    except Exception:  # noqa: BLE001 -- a broken dispatcher must never take the tray down
+        _logger.warning("tray_main: could not queue the Zotero plugin install result", exc_info=True)
+    return text
+
+
+def _toggle_zotero_plugin_from_menu(
+    dispatch: Any, *, parent: Any | None = None, toggle: Any = None, env: Any = None,
+) -> None:
+    """Menu action: save the flipped preference, then queue the env-override notice when it applies.
+
+    ``dispatch`` queues a callback for the UI thread. Never raises.
+    """
+    change = toggle if toggle is not None else _toggle_zotero_plugin_preference
+    try:
+        change()
+    except OSError as exc:
+        dispatch(
+            lambda error=exc: _show_error_dialog(
+                "Zotero plugin preference not saved",
+                f"The setting could not be saved: {error}",
+                parent=parent,
+            )
+        )
+        return
+    notice = zotero_plugin_env_override_notice(os.environ if env is None else env)
+    if notice is not None:
+        dispatch(
+            lambda text=notice: _show_info_dialog(
+                ZOTERO_PLUGIN_REPORT_TITLE, text, parent=parent,
+            )
+        )
 
 
 class _TkUiDispatcher:
@@ -1712,24 +1824,16 @@ def _run_tray() -> int:
             ui_dispatcher.submit(ui_root.quit)
 
     def _toggle_zotero_plugin_autoinstall(icon: "pystray.Icon", item: Any) -> None:
-        try:
-            _toggle_zotero_plugin_preference()
-        except OSError as exc:
-            _dispatch_ui(
-                lambda error=exc: _show_error_dialog(
-                    "Zotero plugin preference not saved",
-                    f"The setting could not be saved: {error}",
-                    parent=ui_root,
-                )
-            )
-            return
-        notice = zotero_plugin_env_override_notice(os.environ)
-        if notice is not None:
-            _dispatch_ui(
-                lambda text=notice: _show_info_dialog(
-                    "Zotero bridge plugin", text, parent=ui_root,
-                )
-            )
+        _toggle_zotero_plugin_from_menu(_dispatch_ui, parent=ui_root)
+
+    def _install_zotero_plugin_now(icon: "pystray.Icon", item: Any) -> None:
+        # The install reads Zotero's process list and copies a file, so it runs off the menu thread.
+        threading.Thread(
+            target=_install_zotero_plugin_now_and_report,
+            args=(_dispatch_ui,),
+            kwargs={"parent": ui_root},
+            daemon=True,
+        ).start()
 
     def _zotero_plugin_autoinstall_checked(item: Any) -> bool:
         return zotero_plugin_autoinstall_checked(
@@ -1758,17 +1862,24 @@ def _run_tray() -> int:
         pystray.MenuItem("Disable tunnel", _disable_tunnel),
         pystray.MenuItem("Open tunnel diagnostics", _open_tunnel_diagnostics),
     )
+    zotero_plugin_menu_items = [
+        pystray.MenuItem(
+            _zotero_plugin_autoinstall_text,
+            _toggle_zotero_plugin_autoinstall,
+            checked=_zotero_plugin_autoinstall_checked,
+        ),
+    ]
+    if zotero_plugin.autoinstall_supported():
+        zotero_plugin_menu_items.append(
+            pystray.MenuItem(ZOTERO_PLUGIN_INSTALL_NOW_LABEL, _install_zotero_plugin_now),
+        )
     menu = pystray.Menu(
         pystray.MenuItem("Open Dashboard", _open_dashboard, default=True),
         pystray.MenuItem("Status", _show_status),
         pystray.MenuItem("Hosted tunnel", tunnel_tools),
         pystray.MenuItem("Local workstation tools", local_tools),
         pystray.MenuItem("Zotero connection…", _configure_zotero),
-        pystray.MenuItem(
-            _zotero_plugin_autoinstall_text,
-            _toggle_zotero_plugin_autoinstall,
-            checked=_zotero_plugin_autoinstall_checked,
-        ),
+        *zotero_plugin_menu_items,
         pystray.MenuItem("View Logs", _show_logs),
         pystray.MenuItem("Restart", _restart),
         pystray.Menu.SEPARATOR,

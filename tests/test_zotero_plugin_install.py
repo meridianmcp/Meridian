@@ -692,3 +692,158 @@ def test_dispatch_routes_zotero_install_plugin_to_the_installer(monkeypatch, cap
     rc = entry._dispatch_subcommand(["zotero", "install-plugin", "--profile", str(profile), "--dry-run"])
     assert rc == 0
     assert "dry run" in capsys.readouterr().out.lower()
+
+
+# ---------------------------------------------------------------------------
+# install_into_profile never raises: a PermissionError while probing maps to failed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("probe", ["is_dir", "is_zotero_profile"])
+def test_permission_error_while_probing_the_profile_maps_to_failed(monkeypatch, profile, xpi, probe):
+    if probe == "is_dir":
+        real_is_dir = zpi.Path.is_dir
+
+        def _denied_is_dir(self, *args, **kwargs):
+            if self == profile:
+                raise PermissionError("access denied")
+            return real_is_dir(self, *args, **kwargs)
+
+        monkeypatch.setattr(zpi.Path, "is_dir", _denied_is_dir)
+    else:
+
+        def _denied_probe(folder):
+            raise PermissionError("access denied")
+
+        monkeypatch.setattr(zpi, "is_zotero_profile", _denied_probe)
+
+    result = zpi.install_into_profile(profile, xpi, running=lambda: False)
+
+    assert result["status"] == "failed"
+    assert "access denied" in result["error"]
+    assert not (profile / "extensions").exists()
+
+
+# ---------------------------------------------------------------------------
+# tasklist decoding: undecodable bytes must not read as "running" or hide zotero.exe
+# ---------------------------------------------------------------------------
+
+# 0x81, 0x8D, 0x8F, 0x90 and 0x9D have no cp1252 meaning, so a strict decode fails on them.
+_CP1252_UNDECODABLE = b"\x81\x8d\x8f\x90\x9d"
+
+
+def _text_mode_run(raw):
+    """A fake subprocess.run that decodes the captured bytes the way text mode does (cp1252 here)."""
+    seen = {}
+
+    def _fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        stdout = raw.decode("cp1252", errors=kwargs.get("errors") or "strict")
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    return _fake_run, seen
+
+
+def test_tasklist_undecodable_bytes_read_as_not_running_when_zotero_is_closed(monkeypatch):
+    fake_run, seen = _text_mode_run(b"Setup" + _CP1252_UNDECODABLE + b".exe  2468 Console\r\n")
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(zpi.subprocess, "run", fake_run)
+
+    assert zpi.zotero_is_running() is False
+    assert seen["errors"] == "replace"
+
+
+def test_tasklist_undecodable_bytes_still_find_a_running_zotero(monkeypatch):
+    raw = b"Setup" + _CP1252_UNDECODABLE + b".exe 2468 Console\r\nzotero.exe  1234 Console  1  100,000 K\r\n"
+    fake_run, _ = _text_mode_run(raw)
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(zpi.subprocess, "run", fake_run)
+
+    assert zpi.zotero_is_running() is True
+
+
+def test_undecodable_byte_glued_to_zotero_exe_cannot_fake_a_match(monkeypatch):
+    # The replacement character is not ASCII, so a garbled name never equals zotero.exe.
+    fake_run, _ = _text_mode_run(b"zotero.exe\x81  77 Console\r\n")
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(zpi.subprocess, "run", fake_run)
+
+    assert zpi.zotero_is_running() is False
+
+
+# ---------------------------------------------------------------------------
+# install_default_profile: the packaged app's one-call install. It never raises.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def default_profile_env(monkeypatch, tmp_path):
+    """A Zotero data root whose profiles.ini names a default profile, with every write redirected."""
+    data = tmp_path / "ZoteroData"
+    profile = data / "Profiles" / "abc.default"
+    _write(profile / "prefs.js", 'user_pref("keep", true);\n')
+    _write(
+        data / "profiles.ini",
+        "[Profile0]\nName=default\nIsRelative=1\nPath=Profiles/abc.default\nDefault=1\n",
+    )
+    source = _fake_source(tmp_path / "src")
+    monkeypatch.setattr(zpi, "zotero_data_dir", lambda: data)
+    monkeypatch.setattr(zpi, "_bundled_source_dir", lambda: source)
+    monkeypatch.setattr(zpi, "default_xpi_path", lambda: tmp_path / "state" / XPI_NAME)
+    return profile
+
+
+def test_install_default_profile_installs_into_zoteros_default_profile(default_profile_env):
+    result = zpi.install_default_profile(running=lambda: False)
+
+    assert result["status"] == "installed"
+    assert (default_profile_env / "extensions" / XPI_NAME).is_file()
+
+
+def test_install_default_profile_reports_no_profile_and_writes_nothing_without_a_default(monkeypatch, tmp_path):
+    empty = tmp_path / "EmptyZoteroData"
+
+    def _must_not_build():
+        raise AssertionError("no plugin bundle should be built when there is no profile")
+
+    monkeypatch.setattr(zpi, "zotero_data_dir", lambda: empty)
+    monkeypatch.setattr(zpi, "default_xpi_path", _must_not_build)
+
+    result = zpi.install_default_profile(running=lambda: False)
+
+    assert result["status"] == "no_profile"
+    assert not empty.exists()
+
+
+def test_install_default_profile_refuses_while_zotero_runs_and_writes_nothing(default_profile_env):
+    before = _snapshot(default_profile_env)
+
+    result = zpi.install_default_profile(running=lambda: True)
+
+    assert result["status"] == "refused_running"
+    assert _snapshot(default_profile_env) == before
+
+
+def test_install_default_profile_turns_a_build_failure_into_failed(monkeypatch, default_profile_env):
+    def _disk_full(out_path, source_dir=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(zpi, "build_xpi", _disk_full)
+
+    result = zpi.install_default_profile(running=lambda: False)
+
+    assert result["status"] == "failed"
+    assert "disk full" in result["error"]
+    assert not (default_profile_env / "extensions").exists()
+
+
+def test_install_default_profile_turns_a_profile_lookup_failure_into_failed(monkeypatch):
+    def _denied():
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(zpi, "zotero_data_dir", _denied)
+
+    result = zpi.install_default_profile(running=lambda: False)
+
+    assert result["status"] == "failed"
+    assert "access denied" in result["error"]
