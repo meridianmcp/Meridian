@@ -29,6 +29,8 @@ from pathlib import Path
 
 # Import only the constant. zotero_client pulls in stdlib modules only.
 from meridian.zotero_client import _DEFAULT_BASE_URL as _ZOTERO_LOCAL_API
+# The probe's redirect rule lives with the connect flow, so the two cannot drift apart.
+from meridian import zotero_connect
 
 _EXE_ENV = "MERIDIAN_ZOTERO_EXE"
 
@@ -41,9 +43,12 @@ _PROGRAM_FILES_CANDIDATES = (
 # Any HTTP 200 from this one-item request means the local API is up.
 _PROBE_URL = f"{_ZOTERO_LOCAL_API}/users/0/items?limit=1"
 
-def _build_probe_opener():
-    # An explicit empty ProxyHandler keeps localhost off any configured HTTP proxy.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def _build_probe_opener(*handlers):
+    # An explicit empty ProxyHandler keeps localhost off any configured HTTP proxy. The redirect
+    # handler never follows a redirect to the authorize endpoint or to an ambiguous authority.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), zotero_connect._NoAuthorizeRedirect(), *handlers,
+    )
 
 
 _PROBE_OPENER = _build_probe_opener()

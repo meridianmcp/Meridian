@@ -7,13 +7,17 @@ APPDATA at a temp directory.
 """
 from __future__ import annotations
 
+import email.message
+import io
 import json
 import os
 import runpy
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+import urllib.response
 from pathlib import Path
 
 import pytest
@@ -726,3 +730,79 @@ def test_module_entrypoint_exits_with_main_result(monkeypatch, capsys):
         runpy.run_module("meridian.zotero_launcher", run_name="__main__")
     assert exc.value.code == 0
     assert "content" in json.loads(capsys.readouterr().out)
+
+
+# ---------------------------------------------------------------------------
+# The probe's redirects: never to the authorize endpoint, never through an ambiguous authority.
+# A fake local API sits at the bottom of the real probe opener. No socket is opened.
+# ---------------------------------------------------------------------------
+
+_AUTHORIZE_URL = "http://127.0.0.1:23119/api/local/authorize"
+_SPOOF_URL = "http://evil.example\\@127.0.0.1:23119/x"
+_PROBE_PATH = "/api/users/0/items"
+
+
+class _FakeZotero(urllib.request.BaseHandler):
+    """A fake local API installed under the probe opener. It records every request by its full URL.
+
+    ``redirects`` maps a request path to a Location: that path gets a 302 to it. Any other request
+    gets a 200 with an empty JSON list. The handler runs ahead of urllib's HTTP handler, so no socket
+    is opened, and the real redirect handler runs on top of it.
+    """
+
+    handler_order = 100
+
+    def __init__(self, redirects=None):
+        self.redirects = dict(redirects or {})
+        self.seen = []
+
+    def http_open(self, req):
+        self.seen.append(req.full_url)
+        location = self.redirects.get(urllib.parse.urlsplit(req.full_url).path)
+        headers = email.message.Message()
+        if location is None:
+            code, body = 200, b"[]"
+            headers["Content-Type"] = "application/json"
+        else:
+            code, body = 302, b""
+            headers["Location"] = location
+        response = urllib.response.addinfourl(io.BytesIO(body), headers, req.full_url, code)
+        response.msg = "OK" if location is None else "Found"
+        return response
+
+
+def _probe_through(monkeypatch, zotero):
+    """Point the real default probe path, zotero_api_alive() with no opener argument, at the fake Zotero."""
+    monkeypatch.setattr(zl, "_PROBE_OPENER", zl._build_probe_opener(zotero))
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        _AUTHORIZE_URL,
+        _AUTHORIZE_URL + "/",
+        "http://127.0.0.1:23119/api/local;x/authorize",
+        "http://127.0.0.1:23119/api/local%2Fauthorize",
+        "http://localhost:23119/api/local/AUTHORIZE?appName=Meridian",
+    ],
+)
+def test_probe_does_not_follow_a_redirect_to_the_authorize_endpoint(monkeypatch, target):
+    zotero = _FakeZotero({_PROBE_PATH: target})
+    _probe_through(monkeypatch, zotero)
+    assert zl.zotero_api_alive() is False
+    assert [urllib.parse.urlsplit(url).path for url in zotero.seen] == [_PROBE_PATH]
+
+
+def test_probe_does_not_follow_a_backslash_authority_redirect(monkeypatch):
+    zotero = _FakeZotero({_PROBE_PATH: _SPOOF_URL})
+    _probe_through(monkeypatch, zotero)
+    assert zl.zotero_api_alive() is False
+    assert len(zotero.seen) == 1
+    assert all("evil.example" not in url for url in zotero.seen)
+
+
+def test_probe_still_follows_an_ordinary_loopback_redirect(monkeypatch):
+    zotero = _FakeZotero({_PROBE_PATH: "http://127.0.0.1:23119/api/elsewhere"})
+    _probe_through(monkeypatch, zotero)
+    assert zl.zotero_api_alive() is True
+    assert len(zotero.seen) == 2

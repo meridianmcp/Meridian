@@ -101,11 +101,13 @@ class _StripKeyOnRedirect(urllib.request.HTTPRedirectHandler):
     would reach that host. A request that carries the stored approval (an
     Authorization header) is never followed off this machine: the reply is returned
     as it is, and the approval is not sent. A redirect to the authorize endpoint is
-    never followed either, with or without a key: the reply is returned as it is.
+    never followed either, with or without a key: the reply is returned as it is. Nor is
+    a redirect to an authority holding an '@' or a backslash, since its hostname can
+    read as loopback while urllib dials another host.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if zotero_connect._targets_authorize(newurl):
+        if zotero_connect._ambiguous_authority(newurl) or zotero_connect._targets_authorize(newurl):
             return None
         host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
         carries_approval = any(name.lower() == "authorization" for name in req.headers)

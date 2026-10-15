@@ -1,9 +1,16 @@
 """Tests for meridian.zotero_connect: the user-initiated Zotero connect flow.
 
-Every test uses fake transports and an in-memory approval store. The real
+Almost every test uses fake transports and an in-memory approval store. The real
 transport, the real probe opener and the real OS keyring are replaced by guards
 that record any use, and the fixture fails the test at teardown if one was reached.
-No test touches Zotero, the network or a credential store.
+No test reaches Zotero, a real credential store or any host off this machine.
+
+Three tests are the exception. test_a_redirect_off_loopback_raises_and_sends_no_approval_to_the_target,
+test_every_redirect_hop_is_checked_not_only_the_first and
+test_a_write_redirected_off_loopback_keeps_the_key_and_reports_error start a loopback-only
+ThreadingHTTPServer on 127.0.0.1 with an ephemeral port (the loopback_server fixture), so the real
+redirect handler runs against a real socket. Their redirects point off loopback, and the
+no_offloopback_connections fixture refuses any connection to such a host. No other test opens a socket.
 """
 
 from __future__ import annotations
@@ -1609,3 +1616,145 @@ def test_only_disconnect_removes_the_stored_approval():
             ):
                 callers.add(func.name)
     assert callers == {"delete", "disconnect"}
+
+
+# ---------------------------------------------------------------------------
+# Authority spoofing: a '@' or a backslash in the authority.
+#
+# urllib dials the raw authority, while urlsplit().hostname reads the text after the last '@'.
+# So "http://evil.example\@127.0.0.1:23119/x" reports the loopback host, yet the request is
+# aimed at evil.example. Every such URL is refused before the host check.
+# ---------------------------------------------------------------------------
+
+SPOOF = "http://evil.example\\@127.0.0.1:23119/x"
+SPOOF_BASE = "http://evil.example\\@127.0.0.1:23119/api"
+SPOOF_URLS = [
+    SPOOF,
+    "http://evil.example@127.0.0.1:23119/x",
+    "http://evil.example%5C@127.0.0.1:23119/x",
+]
+
+
+def test_the_spoof_url_reads_as_loopback_to_the_old_hostname_check():
+    # The bypass in one line: the hostname urlsplit reports is the loopback address.
+    assert urllib.parse.urlsplit(SPOOF).hostname == "127.0.0.1"
+
+
+@pytest.mark.parametrize("url", SPOOF_URLS)
+def test_require_loopback_refuses_an_authority_with_an_at_sign_or_backslash(url):
+    assert zc._require_loopback(url) is False
+
+
+def test_require_loopback_still_accepts_the_plain_loopback_authorize_url():
+    assert zc._require_loopback(AUTHORIZE) is True
+
+
+@pytest.mark.parametrize("url", SPOOF_URLS)
+def test_loopback_redirect_guard_refuses_an_authority_spoof_as_off_loopback(url):
+    plain = urllib.request.Request(SAVE_URL, data=b"[]", method="POST")
+    with pytest.raises(zc._RedirectRefused):
+        zc._LoopbackRedirectGuard().redirect_request(plain, None, 302, "Found", {}, url)
+
+
+@pytest.mark.parametrize("target", [AUTHORIZE, SPOOF])
+def test_no_authorize_redirect_handler_stands_the_reply_for_authorize_and_spoof_targets(target):
+    plain = urllib.request.Request(PROBE, method="GET")
+    assert zc._NoAuthorizeRedirect().redirect_request(plain, None, 302, "Found", {}, target) is None
+
+
+def test_no_authorize_redirect_handler_still_follows_an_ordinary_loopback_redirect():
+    plain = urllib.request.Request(PROBE, method="GET")
+    follow = zc._NoAuthorizeRedirect().redirect_request(
+        plain, None, 302, "Found", {}, "http://127.0.0.1:23119/api/elsewhere",
+    )
+    assert isinstance(follow, urllib.request.Request)
+
+
+def test_a_write_redirected_to_a_backslash_authority_is_refused_and_never_requested(env, monkeypatch):
+    env.store.key = ISSUED_KEY
+    zotero = RedirectingZotero({ATTACH_PATH: SPOOF})
+    monkeypatch.setattr(zc, "_TRANSPORT_OPENER", _zotero_opener(zc._LoopbackRedirectGuard(), zotero))
+    result = zc.write_with_stored_approval(
+        {"method": "POST", "url": zf.LOCAL_API + "/items", "payload": [{"a": 1}]},
+        transport=_REAL_DEFAULT_TRANSPORT(2.0),
+    )
+    assert result["status"] == "error"
+    assert _seen(zotero) == [("POST", ATTACH_PATH)]
+    assert all("evil.example" not in call["url"] for call in zotero.seen)
+    assert env.store.key == ISSUED_KEY
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+def test_a_status_probe_redirected_to_a_backslash_authority_is_not_followed(env):
+    zotero = RedirectingZotero({PROBE_PATH: SPOOF})
+    result = zc.status(opener=_zotero_opener(zc._LoopbackRedirectGuard(), zotero).open)
+    assert result["status"] == "unreachable"
+    assert _seen(zotero) == [("GET", PROBE_PATH)]
+
+
+def test_a_filer_send_redirected_to_a_backslash_authority_keeps_the_key_off_the_target(env, monkeypatch):
+    # The keyed filer guard would otherwise follow this hop: the spoof's host reads as loopback.
+    env.store.key = ISSUED_KEY
+    zotero = RedirectingZotero({ATTACH_PATH: SPOOF})
+    monkeypatch.setattr(zf, "_OPENER", _zotero_opener(zf._StripKeyOnRedirect(), zotero))
+    result = zc.send_with_stored_approval(
+        "POST", zf.LOCAL_API + "/items", [{"a": 1}], header_transport=zf._urllib_transport_with_headers,
+    )
+    assert result["status"] == "error"
+    assert _seen(zotero) == [("POST", ATTACH_PATH)]
+    keyed = [call for call in zotero.seen if ISSUED_KEY in json.dumps(call["headers"])]
+    assert [call["path"] for call in keyed] == [ATTACH_PATH]
+    assert env.store.key == ISSUED_KEY
+
+
+def test_a_connector_save_redirected_to_a_backslash_authority_is_not_followed(env, monkeypatch):
+    env.store.key = ISSUED_KEY
+    zotero = RedirectingZotero({SAVE_PATH: SPOOF})
+    monkeypatch.setattr(zf, "_OPENER", _zotero_opener(zf._StripKeyOnRedirect(), zotero))
+    result = zf.save_items([{"title": "T"}])
+    assert result["status"] == "error"
+    assert _seen(zotero) == [("POST", SAVE_PATH)]
+    assert env.store.key == ISSUED_KEY
+
+
+def test_the_filer_probe_redirected_to_a_backslash_authority_is_not_followed(env, monkeypatch):
+    zotero = RedirectingZotero({COLLECTIONS_PATH: SPOOF})
+    monkeypatch.setattr(zf, "_OPENER", _zotero_opener(zf._StripKeyOnRedirect(), zotero))
+    assert zf._probe_server_id(zf._urllib_transport_with_headers) is None
+    assert _seen(zotero) == [("GET", COLLECTIONS_PATH)]
+
+
+def test_connect_refuses_a_backslash_authority_base_before_any_request(env):
+    transport = Scripted()
+    result = zc.connect(base_url=SPOOF_BASE, transport=transport, store=env.store, state_path=env.state_path)
+    assert result["status"] == "error"
+    assert transport.calls == []
+    assert not env.state_path.exists()
+    assert env.store.key is None
+
+
+def test_status_refuses_a_backslash_authority_base_before_any_probe(env):
+    opener = probe_opener()
+    assert zc.status(base_url=SPOOF_BASE, opener=opener)["status"] == "unreachable"
+    assert opener.calls == []
+
+
+def test_write_refuses_a_backslash_authority_url_and_keeps_the_key(env):
+    env.store.key = ISSUED_KEY
+    transport = Scripted()
+    result = zc.write_with_stored_approval(
+        {"method": "POST", "url": SPOOF_BASE + "/users/0/items", "payload": {}}, transport=transport,
+    )
+    assert result["status"] == "error"
+    assert transport.calls == []
+    assert env.store.key == ISSUED_KEY
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+def test_send_refuses_a_backslash_authority_url_and_keeps_the_key(env):
+    env.store.key = ISSUED_KEY
+    header = HeaderScripted()
+    result = zc.send_with_stored_approval("POST", SPOOF_BASE + "/users/0/items", [], header_transport=header)
+    assert result["status"] == "error"
+    assert header.calls == []
+    assert env.store.key == ISSUED_KEY

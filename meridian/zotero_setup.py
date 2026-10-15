@@ -13,6 +13,7 @@ import urllib.request
 import webbrowser
 from typing import Any
 
+from . import zotero_connect
 from .tunnel_config import (
     ZoteroCredentialStoreUnavailable,
     delete_zotero_api_key,
@@ -25,6 +26,16 @@ from .tunnel_config import (
 
 _DEFAULT_LOCAL_API_BASE = "http://127.0.0.1:23119/api"
 _LOCAL_API_TIMEOUT_SECONDS = 3.0
+
+
+def _build_opener(*handlers):
+    """The local API read's opener: no proxy, and no redirect to the authorize endpoint or an ambiguous authority."""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), zotero_connect._NoAuthorizeRedirect(), *handlers,
+    )
+
+
+_OPENER = _build_opener()
 
 
 class ZoteroSetupError(RuntimeError):
@@ -41,6 +52,8 @@ def list_local_zotero_collections(
     """
     base = (base_url or os.environ.get("MERIDIAN_ZOTERO_API_URL") or _DEFAULT_LOCAL_API_BASE)
     url = f"{base.strip().rstrip('/')}/users/0/collections?format=json"
+    if zotero_connect._ambiguous_authority(url) or zotero_connect._targets_authorize(url):
+        raise ZoteroSetupError("The Zotero local API address is not allowed. Check MERIDIAN_ZOTERO_API_URL.")
     request = urllib.request.Request(
         url,
         headers={
@@ -51,7 +64,7 @@ def list_local_zotero_collections(
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             if not 200 <= response.status < 300:
                 raise ZoteroSetupError(f"Zotero local API returned HTTP {response.status}.")
             payload = json.loads(response.read().decode("utf-8"))

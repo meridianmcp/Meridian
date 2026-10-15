@@ -26,8 +26,10 @@ The approval key lives in the OS keyring, under the same service name that
 :mod:`meridian.tunnel_config` uses for the Zotero API key, with its own account
 name. The key is sent only in the ``Authorization`` header, and only to loopback
 hosts. Every request refuses a redirect off loopback, and a redirect to the
-authorize endpoint, checked on every hop. It never appears in a result, a log
-line or an error string.
+authorize endpoint, checked on every hop. A URL whose authority holds an ``@`` or
+a backslash is refused everywhere a URL is checked, since urllib dials that raw
+authority and not the hostname urlsplit reports. The key never appears in a result,
+a log line or an error string.
 
 Standard library only. The keyring is loaded lazily through ``tunnel_config``.
 """
@@ -105,13 +107,27 @@ class _LoopbackRedirectGuard(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
-        if host not in _REDIRECT_HOSTS:
+        # An ambiguous authority is refused even when its hostname reads as loopback: urllib dials the raw authority.
+        if _ambiguous_authority(newurl) or host not in _REDIRECT_HOSTS:
             try:
                 fp.close()
             except Exception:  # noqa: BLE001 — closing the refused reply is best effort
                 pass
             raise _RedirectRefused("Zotero tried to redirect the request off this machine; it was stopped.")
         if _targets_authorize(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _NoAuthorizeRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows redirects as urllib does, except to the authorize endpoint or to an ambiguous authority.
+
+    The probes and reads that carry no approval use this (the launcher probe and the setup read). A
+    refused hop returns None, so the 3xx reply stands and the refused target is never requested.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        if _ambiguous_authority(newurl) or _targets_authorize(newurl):
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -205,7 +221,24 @@ def has_stored_approval(store: Any = None) -> bool:
     return approval_store.get() is not None
 
 
+def _ambiguous_authority(url: str) -> bool:
+    """True when the URL's authority holds an '@' or a backslash. Fails closed.
+
+    urllib dials the raw authority, but urlsplit().hostname reads the text after the last '@'. A URL
+    spelled with a backslash or an extra '@' before a loopback address therefore reports a loopback
+    host while the request goes elsewhere. Every such URL is refused before any host check. A URL that
+    cannot be parsed is refused as well.
+    """
+    try:
+        netloc = urllib.parse.urlsplit(url).netloc
+    except ValueError:
+        return True
+    return "@" in netloc or "\\" in netloc
+
+
 def _require_loopback(url: str) -> bool:
+    if _ambiguous_authority(url):
+        return False
     parts = urllib.parse.urlsplit(url)
     return parts.scheme in ("http", "https") and (parts.hostname or "").lower() in _LOCAL_HOSTS
 
