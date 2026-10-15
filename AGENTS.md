@@ -601,7 +601,7 @@ canonical data source, and Codex/Cursor get parity through
   `file_warnings` field on the `start_session` response. If a file you need is claimed
   by another active session, coordinate (`request_hitl`) before editing.
 - **High-contention files — always sequential, never parallel:**
-  `meridian/static/dashboard.js`, `meridian/server.py`, `meridian/db/__init__.py`.
+  `meridian/static/dashboard.ts`, `meridian/server.py`, `meridian/db/__init__.py`.
 - **NEVER `git add -A` / `git add .` / `git commit -a`** — a repo-wide add sweeps up
   another session's uncommitted work. Stage only your files, by path.
 - Release locks when done: `release_file(file_path, session_id)`.
