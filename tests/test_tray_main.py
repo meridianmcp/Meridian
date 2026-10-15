@@ -1799,6 +1799,124 @@ def test_configure_zotero_flag_opens_setup_without_starting_tray(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Zotero bridge plugin: Windows-only first-run prompt, its startup guard, the
+# Not-now save failure, and the menu checkbox and env-override label.
+# ---------------------------------------------------------------------------
+
+_ZOTERO_ENV = "MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL"
+
+
+def _pretend_windows(monkeypatch):
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+
+
+def test_first_run_prompt_is_scheduled_on_windows_while_undecided(monkeypatch, tmp_path):
+    _pretend_windows(monkeypatch)
+    queued = []
+    assert tray_main._schedule_zotero_plugin_first_run(queued.append, path=tmp_path / "zotero_plugin.json") is True
+    assert len(queued) == 1
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_first_run_prompt_is_never_scheduled_off_windows(monkeypatch, tmp_path, platform):
+    monkeypatch.setattr(zpi, "_platform", lambda: platform)
+    queued = []
+    assert tray_main._schedule_zotero_plugin_first_run(queued.append, path=tmp_path / "zotero_plugin.json") is False
+    assert queued == []
+
+
+def test_first_run_prompt_is_not_scheduled_once_decided(monkeypatch, tmp_path):
+    _pretend_windows(monkeypatch)
+    path = tmp_path / "zotero_plugin.json"
+    zpi.save_settings(path, {"autoinstall": False, "decided": True})
+    queued = []
+    assert tray_main._schedule_zotero_plugin_first_run(queued.append, path=path) is False
+    assert queued == []
+
+
+def test_unreadable_settings_leave_the_prompt_pending(monkeypatch, tmp_path):
+    _pretend_windows(monkeypatch)
+    path = tmp_path / "zotero_plugin.json"
+    path.write_text("{broken", encoding="utf-8")
+    queued = []
+    assert tray_main._schedule_zotero_plugin_first_run(queued.append, path=path) is True
+    assert len(queued) == 1
+
+
+def test_run_tray_keeps_starting_when_the_first_run_prompt_cannot_be_scheduled(monkeypatch, caplog):
+    _, fake_icon = _fake_pystray_and_pil(monkeypatch)
+
+    def _broken(dispatch, **kwargs):
+        raise RuntimeError("prompt scheduling broke")
+
+    monkeypatch.setattr(tray_main, "_schedule_zotero_plugin_first_run", _broken)
+    fake_runner = mock.MagicMock()
+    fake_runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: fake_runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda url: None)
+
+    with caplog.at_level("WARNING"):
+        rc = tray_main._run_tray()
+
+    assert rc == 0
+    fake_icon.run.assert_called_once()
+    assert "prompt scheduling broke" in caplog.text
+
+
+@pytest.mark.parametrize("answer", [True, False])
+def test_failed_save_after_the_prompt_logs_a_warning_and_keeps_it_pending(
+    monkeypatch, tmp_path, caplog, answer,
+):
+    monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: answer)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, so the settings folder cannot be created", encoding="utf-8")
+    path = blocker / "zotero_plugin.json"
+
+    with caplog.at_level("WARNING"):
+        result = tray_main._run_zotero_plugin_first_run(path=path)
+
+    assert result is None
+    assert any(
+        record.levelname == "WARNING" and "zotero" in record.getMessage().lower()
+        for record in caplog.records
+    )
+    assert tray_main.zotero_plugin_first_run_pending(tray_main.zotero_plugin.load_settings(path)) is True
+
+
+def test_menu_checkbox_shows_the_saved_setting():
+    assert tray_main.zotero_plugin_autoinstall_checked({"autoinstall": True, "decided": True}) is True
+    assert tray_main.zotero_plugin_autoinstall_checked({"autoinstall": False, "decided": True}) is False
+
+
+def test_menu_checkbox_ignores_the_env_override_and_the_label_names_it(monkeypatch):
+    monkeypatch.setenv(_ZOTERO_ENV, "1")
+    assert tray_main.zotero_plugin_autoinstall_checked({"autoinstall": False, "decided": True}) is False
+    label = tray_main.zotero_plugin_autoinstall_label(os.environ)
+    assert "overrides" in label and _ZOTERO_ENV in label
+
+
+def test_menu_label_is_plain_when_no_recognised_override_is_set():
+    plain = tray_main.zotero_plugin_autoinstall_label({})
+    assert _ZOTERO_ENV not in plain
+    assert tray_main.zotero_plugin_autoinstall_label({_ZOTERO_ENV: "maybe"}) == plain
+    assert tray_main.zotero_plugin_env_override_notice({_ZOTERO_ENV: "maybe"}) is None
+
+
+def test_env_override_notice_says_the_variable_overrides_the_menu():
+    notice = tray_main.zotero_plugin_env_override_notice({_ZOTERO_ENV: "0"})
+    assert notice is not None
+    assert _ZOTERO_ENV in notice and "overrides" in notice
+
+
+def test_toggle_flips_the_saved_choice_and_records_a_decision(tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    zpi.save_settings(path, {"autoinstall": True, "decided": False})
+    updated = tray_main._toggle_zotero_plugin_preference(path)
+    assert updated == {"autoinstall": False, "decided": True}
+    assert zpi.load_settings(path) == updated
+
+
+# ---------------------------------------------------------------------------
 # Pre-ship validation checklist (507e55de) -- real-artifact consistency
 # checks between meridian-tray.spec, meridian/static/meridian-tray.ico, and
 # tray_main.py itself. These read the ACTUAL files on disk (never mocks),
@@ -1859,6 +1977,11 @@ def _spec_call_kwargs(spec_path: Path, call_name: str, occurrence: int = 1) -> d
                         elts: list = []
                         ok = True
                         for elt in kw.value.elts:
+                            if isinstance(elt, ast.Starred):
+                                # `*_zotero_bridge_datas()` is computed at build time and
+                                # has no literal form. test_zotero_plugin_install.py execs
+                                # the spec and checks those computed entries directly.
+                                continue
                             try:
                                 if isinstance(elt, ast.IfExp):
                                     elts.append(ast.literal_eval(elt.body))
@@ -2483,12 +2606,11 @@ def test_menu_toggle_flips_autoinstall_and_counts_as_a_decision():
     assert tray_main.toggle_zotero_plugin_autoinstall(off) == {"autoinstall": True, "decided": True}
 
 
-def test_menu_checkmark_shows_the_effective_state_including_env_override():
-    settings = {"autoinstall": True, "decided": True}
-    assert tray_main.zotero_plugin_autoinstall_checked(settings, {}) is True
-    assert tray_main.zotero_plugin_autoinstall_checked(
-        settings, {"MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL": "0"},
-    ) is False
+def test_menu_checkmark_shows_the_saved_setting_not_the_env_override(monkeypatch):
+    # The checkmark is the saved choice. An env override is named in the menu label instead.
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    assert tray_main.zotero_plugin_autoinstall_checked({"autoinstall": True, "decided": True}) is True
+    assert tray_main.zotero_plugin_autoinstall_checked({"autoinstall": False, "decided": True}) is False
 
 
 def test_undecided_first_run_is_scheduled_off_the_tray_thread(tmp_path):
@@ -2539,13 +2661,16 @@ def test_missing_gui_leaves_the_choice_undecided_and_never_raises(monkeypatch, t
 
 
 def test_menu_toggle_persists_the_new_preference(tmp_path):
+    # Auto-install defaults to off, so the first toggle from an unanswered file turns it on.
     path = tmp_path / "zotero_plugin.json"
     first = tray_main._toggle_zotero_plugin_preference(path)
-    assert first == {"autoinstall": False, "decided": True}
+    assert first == {"autoinstall": True, "decided": True}
     assert zpi.load_settings(path) == first
 
 
 def test_run_tray_schedules_the_first_run_prompt_and_exposes_the_plugin_toggle(monkeypatch):
+    # conftest pins MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL to "0"; clear it so the plain label is shown.
+    monkeypatch.delenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", raising=False)
     fake_pystray, fake_icon_instance = _fake_pystray_and_pil(monkeypatch)
     runner = mock.MagicMock()
     runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
@@ -2561,7 +2686,11 @@ def test_run_tray_schedules_the_first_run_prompt_and_exposes_the_plugin_toggle(m
     assert tray_main._run_tray() == 0
 
     assert len(scheduled) == 1
-    labels = [call.args[0] for call in fake_pystray.MenuItem.call_args_list]
+    # The plugin toggle's label is dynamic (it names the env override when set), so resolve it.
+    labels = [
+        call.args[0] if isinstance(call.args[0], str) else call.args[0](None)
+        for call in fake_pystray.MenuItem.call_args_list
+    ]
     assert _ZOTERO_PLUGIN_TOGGLE_LABEL in labels
     assert "Zotero connection…" in labels
     fake_icon_instance.run.assert_called_once()

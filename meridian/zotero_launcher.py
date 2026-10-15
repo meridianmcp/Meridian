@@ -156,11 +156,15 @@ def _http_status(response):
 def _autoinstall_zotero_plugin():
     """Before Meridian launches Zotero, install the bridge plugin when enabled.
 
-    Best effort: every failure becomes one log line and the launch goes on.
-    Nothing is installed while Zotero runs, because install_into_profile checks.
+    Windows only. It also needs a recorded first-run decision (see
+    effective_autoinstall), so an undecided or unreadable settings file installs
+    nothing. Best effort: every failure becomes one log line and the launch goes
+    on. Nothing is installed while Zotero runs, because install_into_profile checks.
     Returns the install result, or None when nothing was attempted.
     """
     try:
+        if not _is_windows():
+            return None
         settings = _zotero_plugin.load_settings(_zotero_plugin.settings_path())
         if not _zotero_plugin.effective_autoinstall(settings, os.environ):
             return None

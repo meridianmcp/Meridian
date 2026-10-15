@@ -11,10 +11,11 @@ Two menu actions for Zotero, plus a preferences pane:
 
 Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.0`.
 
-## Status: source only, not installed, untested in Zotero
+## Status: source, packaged by Meridian, untested in Zotero
 
-This folder is plugin **source**. It has not been packaged into an `.xpi`, installed
-into any Zotero profile, or run inside Zotero. The pure logic in `lib/` is covered by
+This folder is plugin **source**. Meridian's install command packs it into an `.xpi`
+(see `docs/zotero-plugin-install.md`), but the packed file has not been installed into a
+real Zotero profile or run inside Zotero. The pure logic in `lib/` is covered by
 `node --test`. The Zotero glue in `bootstrap.js` and `content/preferences.xhtml` is
 written against the APIs listed under "Verify before first real use" and has not been
 exercised. Do not point it at a library you care about until the disposable-profile
@@ -33,14 +34,20 @@ checklist below passes.
   address, a secret-shaped string, a machine-local path, or any email address other than
   the plugin ID.
 
-Zotero itself checks `update_url` for updates when automatic updates are on. That is
-Zotero's own request, not plugin code. The URL is a placeholder (see "Updates" below).
+The bridge makes no network calls of its own. Zotero itself checks the `update_url` in
+`manifest.json` for updates when automatic updates are on. That request is Zotero's, not
+plugin code. The URL is a placeholder (see "Updates" below).
 
-## Install (once it is built and tested)
+## Install
 
-1. Build an `.xpi` from this folder. The build step is not part of this source drop.
-2. In Zotero, open **Tools > Plugins**.
-3. Drag the `.xpi` onto the Plugins window, then restart Zotero if asked.
+1. From a source checkout of Meridian, run `pixi run python -m meridian zotero install-plugin`
+   with Zotero closed. It packs this folder into `meridian-zotero@usemeridian.us.xpi` and
+   copies the file into your profile when it finds one. Otherwise it prints the file's path.
+2. In Zotero, open **Tools > Add-ons**, click the gear icon, and choose **Install Add-on From File**.
+3. Select the `.xpi`, then restart Zotero if asked.
+
+Scope: the automatic install through the Meridian tray app is Windows only. See
+`docs/zotero-plugin-install.md`.
 
 ## Duplicate rules (BibTeX import)
 

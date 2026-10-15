@@ -62,7 +62,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 # This module is also PyInstaller's Analysis entry-point script
 # (meridian-tray.spec: Analysis(['meridian/tray_main.py'], ...)), which runs
@@ -1104,6 +1104,21 @@ def _show_logs_window(runner: LocalRunner, parent: Any | None = None) -> None:
         root.mainloop()
 
 
+def _show_info_dialog(title: str, message: str, parent: Any | None = None) -> None:
+    import tkinter as tk
+    from tkinter import messagebox
+
+    owns_root = parent is None
+    root = parent if parent is not None else tk.Tk()
+    if owns_root:
+        root.withdraw()
+    try:
+        messagebox.showinfo(title, message, parent=root)
+    finally:
+        if owns_root:
+            root.destroy()
+
+
 def _show_error_dialog(title: str, message: str, parent: Any | None = None) -> None:
     import tkinter as tk
     from tkinter import messagebox
@@ -1148,13 +1163,36 @@ def zotero_plugin_settings_after_answer(settings: dict, answer: "bool | None") -
 
 
 def toggle_zotero_plugin_autoinstall(settings: dict) -> dict:
-    """Flip auto-install from the tray menu. An explicit menu action counts as a decision."""
-    return {"autoinstall": not bool(settings.get("autoinstall", True)), "decided": True}
+    """Flip the saved auto-install choice from the tray menu. A menu action counts as a decision."""
+    return {"autoinstall": not bool(settings.get("autoinstall", False)), "decided": True}
 
 
-def zotero_plugin_autoinstall_checked(settings: dict, env: "dict | None" = None) -> bool:
-    """The state the tray menu shows: the effective value, including an env override."""
-    return zotero_plugin.effective_autoinstall(settings, env)
+ZOTERO_PLUGIN_MENU_LABEL = "Auto-install Zotero bridge plugin"
+ZOTERO_PLUGIN_ENV_OVERRIDE_LABEL = (
+    ZOTERO_PLUGIN_MENU_LABEL + " (MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL overrides this)"
+)
+
+
+def zotero_plugin_autoinstall_checked(settings: dict) -> bool:
+    """The tray checkbox shows the SAVED choice. An env override is named in the label instead."""
+    return bool(settings.get("autoinstall", False))
+
+
+def zotero_plugin_autoinstall_label(env: "Mapping[str, str] | None" = None) -> str:
+    """The menu label. It says the env var overrides the menu while a recognised value is set."""
+    if zotero_plugin.autoinstall_env_override(env) is None:
+        return ZOTERO_PLUGIN_MENU_LABEL
+    return ZOTERO_PLUGIN_ENV_OVERRIDE_LABEL
+
+
+def zotero_plugin_env_override_notice(env: "Mapping[str, str] | None" = None) -> "str | None":
+    """Shown after a menu toggle while the env var overrides it. None when no recognised value is set."""
+    if zotero_plugin.autoinstall_env_override(env) is None:
+        return None
+    return (
+        "MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL is set, so it overrides this menu setting. "
+        "Your choice was saved, but it takes effect only after that variable is unset."
+    )
 
 
 def _ask_zotero_plugin_first_run(parent: Any | None = None) -> "bool | None":
@@ -1215,19 +1253,29 @@ def _run_zotero_plugin_first_run(*, parent: Any | None = None, path: "Path | Non
     try:
         answer = _ask_zotero_plugin_first_run(parent=parent)
     except Exception:  # noqa: BLE001 -- a broken prompt must never take the tray down
+        _logger.warning("tray_main: the Zotero plugin first-run prompt failed", exc_info=True)
         return None
     if answer is None:
         return None
     updated = zotero_plugin_settings_after_answer(zotero_plugin.load_settings(target), answer)
     try:
         zotero_plugin.save_settings(target, updated)
-    except OSError:
+    except OSError as exc:
+        # decided stays false in the file, so the prompt asks again on the next launch.
+        _logger.warning(
+            "tray_main: could not save the Zotero plugin choice; the prompt will ask again: %s", exc,
+        )
         return None
     return updated
 
 
 def _schedule_zotero_plugin_first_run(dispatch: Any, *, parent: Any | None = None, path: "Path | None" = None) -> bool:
-    """Queue the first-run prompt through ``dispatch`` (off the tray's startup path). True if queued."""
+    """Queue the first-run prompt through ``dispatch`` (off the tray's startup path). True if queued.
+
+    Windows only: on other platforms the prompt is not shown and nothing is installed.
+    """
+    if not zotero_plugin.autoinstall_supported():
+        return False
     target = path if path is not None else zotero_plugin.settings_path()
     if not zotero_plugin_first_run_pending(zotero_plugin.load_settings(target)):
         return False
@@ -1674,11 +1722,22 @@ def _run_tray() -> int:
                     parent=ui_root,
                 )
             )
+            return
+        notice = zotero_plugin_env_override_notice(os.environ)
+        if notice is not None:
+            _dispatch_ui(
+                lambda text=notice: _show_info_dialog(
+                    "Zotero bridge plugin", text, parent=ui_root,
+                )
+            )
 
     def _zotero_plugin_autoinstall_checked(item: Any) -> bool:
         return zotero_plugin_autoinstall_checked(
-            zotero_plugin.load_settings(zotero_plugin.settings_path()), os.environ,
+            zotero_plugin.load_settings(zotero_plugin.settings_path()),
         )
+
+    def _zotero_plugin_autoinstall_text(item: Any) -> str:
+        return zotero_plugin_autoinstall_label(os.environ)
 
     local_tools = pystray.Menu(
         pystray.MenuItem("Set up a local project…", _configure_local_project),
@@ -1706,7 +1765,7 @@ def _run_tray() -> int:
         pystray.MenuItem("Local workstation tools", local_tools),
         pystray.MenuItem("Zotero connection…", _configure_zotero),
         pystray.MenuItem(
-            "Auto-install Zotero bridge plugin",
+            _zotero_plugin_autoinstall_text,
             _toggle_zotero_plugin_autoinstall,
             checked=_zotero_plugin_autoinstall_checked,
         ),
@@ -1720,7 +1779,13 @@ def _run_tray() -> int:
         icon_options["darwin_nsapplication"] = darwin_nsapplication
     icon = pystray.Icon("meridian-tray", image, "Meridian", menu, **icon_options)
     # First run only: ask once about the Zotero bridge plugin, off the startup path.
-    _schedule_zotero_plugin_first_run(_dispatch_ui, parent=ui_root)
+    # A failure here is logged and the tray carries on, so the prompt can never block startup.
+    try:
+        _schedule_zotero_plugin_first_run(_dispatch_ui, parent=ui_root)
+    except Exception as exc:  # noqa: BLE001 -- the tray must start even if the prompt cannot be queued
+        _logger.warning(
+            "tray_main: could not queue the Zotero plugin first-run prompt: %s", exc, exc_info=True,
+        )
     watchdog_thread = threading.Thread(
         target=watchdog.run,
         args=(watchdog_stop,),

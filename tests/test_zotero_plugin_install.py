@@ -9,9 +9,11 @@ is always injected.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -22,7 +24,9 @@ from meridian import zotero_plugin_install as zpi
 XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
 ENV_AUTOINSTALL = "MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL"
 ENV_DATA_DIR = "MERIDIAN_ZOTERO_DATA_DIR"
-REPO_EXTENSION = Path(zpi.__file__).resolve().parent.parent / "extensions" / "zotero-bridge"
+REPO_ROOT = Path(zpi.__file__).resolve().parent.parent
+REPO_EXTENSION = REPO_ROOT / "extensions" / "zotero-bridge"
+SPEC_PATH = REPO_ROOT / "meridian-tray.spec"
 EXPECTED_ENTRIES = [
     "bootstrap.js",
     "content/preferences.xhtml",
@@ -136,6 +140,107 @@ def test_real_extension_builds_with_manifest_bootstrap_and_prefs(tmp_path):
         assert required in names
     assert not any(name.startswith(("test/", "node_modules/")) for name in names)
     assert manifest["applications"]["zotero"]["id"] == "meridian-zotero@usemeridian.us"
+
+
+def _with_crlf(root: Path) -> None:
+    for path in root.rglob("*"):
+        if path.is_file():
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+
+
+def test_crlf_and_lf_checkouts_pack_identical_bytes(tmp_path):
+    lf = _fake_source(tmp_path / "lf")
+    crlf = _fake_source(tmp_path / "crlf")
+    for root in (lf, crlf):
+        _write(root / "manifest.json", '{\n  "manifest_version": 2\n}\n')
+        _write(root / "lib" / "pdf.js", "export {};\n// two lines\n")
+    _with_crlf(crlf)
+    # The CRLF copy really differs on disk, so the equality below is not vacuous.
+    assert (crlf / "manifest.json").read_bytes() != (lf / "manifest.json").read_bytes()
+    lf_bytes = zpi.build_xpi(tmp_path / "lf.xpi", source_dir=lf).read_bytes()
+    crlf_bytes = zpi.build_xpi(tmp_path / "crlf.xpi", source_dir=crlf).read_bytes()
+    assert lf_bytes == crlf_bytes
+    with zipfile.ZipFile(io.BytesIO(crlf_bytes)) as zf:
+        assert zf.read("manifest.json") == b'{\n  "manifest_version": 2\n}\n'
+        assert zf.read("lib/pdf.js") == b"export {};\n// two lines\n"
+
+
+def test_binary_entries_are_packed_untouched_even_when_they_contain_crlf(tmp_path):
+    src = _fake_source(tmp_path / "src")
+    blob = bytes([0x89, 0x50, 0x00, 0x0D, 0x0A, 0x1A])  # NUL and CRLF: binary, never rewritten
+    _write(src / "content" / "icon.png", blob)
+    out = zpi.build_xpi(tmp_path / "out.xpi", source_dir=src)
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read("content/icon.png") == blob
+
+
+# ---------------------------------------------------------------------------
+# Frozen desktop build: the bridge source is resolved from sys._MEIPASS
+# ---------------------------------------------------------------------------
+
+
+def test_source_resolves_to_the_repo_copy_when_not_frozen(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert zpi._bundled_source_dir() == zpi._SOURCE_DIR
+
+
+def test_frozen_build_packs_the_bridge_from_the_meipass_bundle(monkeypatch, tmp_path):
+    bundle = tmp_path / "meipass"
+    _fake_source(bundle / "extensions")  # meipass/extensions/zotero-bridge, where the spec puts it
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+    assert zpi._bundled_source_dir() == bundle / "extensions" / "zotero-bridge"
+    assert zipfile.ZipFile(io.BytesIO(zpi.build_xpi_bytes())).namelist() == EXPECTED_ENTRIES
+
+
+class _SpecAnalysis:
+    """Records the datas/hiddenimports the spec hands to PyInstaller's Analysis()."""
+
+    def __init__(self, scripts, **kwargs):
+        self.scripts = scripts
+        self.datas = kwargs.get("datas", [])
+        self.hiddenimports = kwargs.get("hiddenimports", [])
+        self.pure = []
+        self.zipped_data = []
+        self.binaries = []
+        self.zipfiles = []
+
+
+def _run_tray_spec_analysis(monkeypatch):
+    """Execute meridian-tray.spec with fake PyInstaller globals, from the repo root."""
+    monkeypatch.chdir(REPO_ROOT)  # the spec's source paths are relative, as PyInstaller runs it
+    monkeypatch.setattr(sys, "platform", "win32")
+    namespace = {
+        "__name__": "__pyinstaller_spec__",
+        "__file__": str(SPEC_PATH),
+        "Analysis": _SpecAnalysis,
+        "PYZ": lambda *args, **kwargs: None,
+        "EXE": lambda *args, **kwargs: None,
+        "COLLECT": lambda *args, **kwargs: None,
+        "BUNDLE": lambda *args, **kwargs: None,
+    }
+    source = SPEC_PATH.read_text(encoding="utf-8")
+    exec(compile(source, str(SPEC_PATH), "exec"), namespace)  # noqa: S102
+    return namespace["a"]
+
+
+def test_tray_spec_bundles_the_bridge_source_without_test_or_node_modules(monkeypatch):
+    analysis = _run_tray_spec_analysis(monkeypatch)
+    bundled = {}
+    for src, folder in analysis.datas:
+        archive = f"{folder.replace(os.sep, '/')}/{Path(src).name}"
+        if archive.startswith("extensions/zotero-bridge/"):
+            bundled[archive] = Path(src)
+    for required in (
+        "extensions/zotero-bridge/manifest.json",
+        "extensions/zotero-bridge/bootstrap.js",
+        "extensions/zotero-bridge/prefs.js",
+        "extensions/zotero-bridge/lib/bibkey.js",
+        "extensions/zotero-bridge/content/preferences.xhtml",
+    ):
+        assert required in bundled, required
+        assert bundled[required].is_file()
+    assert not any("/test/" in name or "/node_modules/" in name for name in bundled)
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +370,55 @@ def test_running_check_fails_closed_when_the_check_errors(monkeypatch):
     assert zpi.zotero_is_running(runner=_broken) is True
 
 
+def _completed(argv, returncode, stdout=""):
+    return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+
+def test_tasklist_nonzero_exit_fails_closed_even_with_empty_output(monkeypatch):
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(
+        zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 1, stdout=""),
+    )
+    assert zpi.zotero_is_running() is True
+
+
+def test_tasklist_zero_exit_with_empty_output_means_not_running(monkeypatch):
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+    monkeypatch.setattr(
+        zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 0, stdout=""),
+    )
+    assert zpi.zotero_is_running() is False
+
+
+def test_pgrep_other_nonzero_exit_fails_closed_even_with_empty_output(monkeypatch):
+    monkeypatch.setattr(zpi, "_platform", lambda: "linux")
+    monkeypatch.setattr(
+        zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 2, stdout=""),
+    )
+    assert zpi.zotero_is_running() is True
+
+
+def test_pgrep_exit_one_is_its_no_match_answer_so_not_running(monkeypatch):
+    # pgrep exits 1 when no process matches. That is a clean "not running",
+    # not a probe error, so treating it as running would refuse every install
+    # while Zotero is closed.
+    monkeypatch.setattr(zpi, "_platform", lambda: "linux")
+    monkeypatch.setattr(
+        zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 1, stdout=""),
+    )
+    assert zpi.zotero_is_running() is False
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_probe_exception_from_subprocess_fails_closed(monkeypatch, platform):
+    def _raise(argv, **kwargs):
+        raise OSError("process listing unavailable")
+
+    monkeypatch.setattr(zpi, "_platform", lambda: platform)
+    monkeypatch.setattr(zpi.subprocess, "run", _raise)
+    assert zpi.zotero_is_running() is True
+
+
 def test_default_windows_runner_filters_tasklist_on_the_zotero_image(monkeypatch):
     calls = []
 
@@ -346,6 +500,27 @@ def test_install_reports_failed_when_the_source_is_missing_and_writes_nothing(pr
     assert not (profile / "extensions").exists()
 
 
+def test_install_refuses_a_folder_without_a_profile_marker_and_writes_nothing(tmp_path, xpi):
+    bare = tmp_path / "not-a-profile"
+    bare.mkdir()
+    _write(bare / "notes.txt", "hello")
+    before = _snapshot(bare)
+    result = zpi.install_into_profile(bare, xpi, running=lambda: False)
+    assert result["status"] == "refused_not_profile"
+    assert "prefs.js" in result["error"] and "zotero.sqlite" in result["error"]
+    assert _snapshot(bare) == before
+    assert not (bare / "extensions").exists()
+
+
+@pytest.mark.parametrize("marker", ["prefs.js", "zotero.sqlite"])
+def test_install_accepts_a_folder_holding_either_profile_marker(tmp_path, xpi, marker):
+    folder = tmp_path / "profile"
+    folder.mkdir()
+    _write(folder / marker, "marker")
+    assert zpi.install_into_profile(folder, xpi, running=lambda: False)["status"] == "installed"
+    assert (folder / "extensions" / XPI_NAME).is_file()
+
+
 # ---------------------------------------------------------------------------
 # settings file
 # ---------------------------------------------------------------------------
@@ -357,13 +532,39 @@ def test_settings_live_in_the_meridian_per_user_state_dir(monkeypatch, tmp_path)
 
 
 def test_settings_defaults_when_the_file_is_missing(tmp_path):
-    assert zpi.load_settings(tmp_path / "zotero_plugin.json") == {"autoinstall": True, "decided": False}
+    assert zpi.load_settings(tmp_path / "zotero_plugin.json") == {"autoinstall": False, "decided": False}
 
 
-def test_settings_defaults_when_the_file_is_corrupt_or_wrong_shape(tmp_path):
-    for index, text in enumerate(("{not json", "[1, 2]", '{"autoinstall": "yes", "decided": 1}')):
-        path = _write(tmp_path / f"s{index}.json", text)
-        assert zpi.load_settings(path) == {"autoinstall": True, "decided": False}
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{not json",
+        "[1, 2]",
+        '"just a string"',
+        '{"autoinstall": "yes", "decided": 1}',
+        '{"autoinstall": true}',
+        '{"decided": true}',
+        b"\xff\xfe\x00 not utf-8",
+    ],
+)
+def test_unreadable_or_wrong_shape_settings_are_undecided_with_autoinstall_off(tmp_path, text):
+    path = _write(tmp_path / "zotero_plugin.json", text)
+    settings = zpi.load_settings(path)
+    assert settings == {"autoinstall": False, "decided": False}
+    assert zpi.effective_autoinstall(settings, {}) is False
+    assert zpi.effective_autoinstall(settings, {ENV_AUTOINSTALL: "1"}) is False
+
+
+def test_corrupt_file_never_turns_a_saved_opt_out_back_on(tmp_path):
+    path = _write(tmp_path / "zotero_plugin.json", '{"autoinstall": false, "decided": tru')
+    assert zpi.load_settings(path)["autoinstall"] is False
+
+
+def test_save_refuses_settings_that_are_not_two_booleans(tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    with pytest.raises(ValueError):
+        zpi.save_settings(path, {"autoinstall": "yes", "decided": True})
+    assert not path.exists()
 
 
 def test_settings_round_trip_creates_the_folder_and_leaves_no_temp_file(tmp_path):
@@ -415,6 +616,19 @@ def test_blank_or_unknown_env_falls_back_to_the_saved_setting(raw):
     assert zpi.effective_autoinstall(_OFF, {ENV_AUTOINSTALL: raw}) is False
 
 
+def test_undecided_settings_never_install_even_when_the_env_var_says_on():
+    undecided = {"autoinstall": True, "decided": False}
+    assert zpi.effective_autoinstall(undecided, {ENV_AUTOINSTALL: "1"}) is False
+    assert zpi.effective_autoinstall(undecided, {}) is False
+
+
+def test_env_override_is_reported_only_for_recognised_values():
+    assert zpi.autoinstall_env_override({ENV_AUTOINSTALL: "off"}) is False
+    assert zpi.autoinstall_env_override({ENV_AUTOINSTALL: "YES"}) is True
+    assert zpi.autoinstall_env_override({ENV_AUTOINSTALL: "maybe"}) is None
+    assert zpi.autoinstall_env_override({}) is None
+
+
 # ---------------------------------------------------------------------------
 # CLI: python -m meridian zotero install-plugin [--profile DIR] [--dry-run]
 # ---------------------------------------------------------------------------
@@ -439,6 +653,17 @@ def test_cli_installs_into_the_given_profile(monkeypatch, capsys, profile):
     assert rc == 0
     assert (profile / "extensions" / XPI_NAME).read_bytes() == zpi.build_xpi_bytes()
     assert "installed" in capsys.readouterr().out.lower()
+
+
+def test_cli_refuses_a_folder_that_is_not_a_zotero_profile(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: False)
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    rc = zpi.cli_main(["--profile", str(bare)])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "not a zotero profile" in (captured.out + captured.err).lower()
+    assert not (bare / "extensions").exists()
 
 
 def test_cli_refuses_with_a_clear_message_while_zotero_runs(monkeypatch, capsys, profile):

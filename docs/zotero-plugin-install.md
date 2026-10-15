@@ -24,15 +24,15 @@ The Meridian tray app asks once, on first launch:
 - **Not now** opts out. Closing the window also counts as Not now.
 - If the tray cannot show the prompt, no answer is saved and the prompt returns on the next launch.
 
-Meridian places the plugin only when it starts Zotero while Zotero is closed. Starting Zotero by hand does not install it. For an immediate install, use section 4.
+Meridian places the plugin only when it starts Zotero while Zotero is closed. Starting Zotero by hand does not install it. Nothing is installed until you have answered the prompt. For an immediate install, use section 4.
 
 To change the choice later, use the tray menu item **Auto-install Zotero bridge plugin**. A tick means on. Turning it off stops future automatic installs. It does not remove a plugin that is already installed; see section 6.
 
 The saved choice is in `%USERPROFILE%\.meridian\local_runner\zotero_plugin.json`, or in the folder named by `MERIDIAN_LOCAL_RUNNER_STATE_DIR` when that is set.
 
-Setting `MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL=0` forces automatic install off, whatever the tray says. `1`, `true`, `yes` and `on` force it on. Any other value is ignored and the tray setting applies. While the variable holds a recognised value, the tray checkbox shows that value.
+Setting `MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL=0` forces automatic install off, whatever the tray says. `1`, `true`, `yes` and `on` force it on, but only after you have answered the prompt. Any other value is ignored and the tray setting applies. While the variable holds a recognised value, the tray menu item says that the variable overrides it. Its checkbox still shows your saved choice.
 
-**Known gap:** the packaged tray build does not include the bridge source. `meridian-tray.spec` bundles only `meridian/static` and `meridian/templates`, so the automatic install cannot build the `.xpi` in that build. Until that is fixed, use the manual install from a source checkout.
+The packaged Windows tray app includes the bridge source, so the automatic install works from the installed app. The manual install in section 4 still needs a source checkout.
 
 ## 4. Manual install
 
@@ -45,7 +45,7 @@ Use this if you declined, or if the automatic install did not appear.
    pixi run python -m meridian zotero install-plugin
    ```
 
-   It builds `meridian-zotero@usemeridian.us.xpi` into `%USERPROFILE%\.meridian\local_runner\zotero_plugin\`. If it finds your Zotero profile, it also copies the file there. If it does not, it prints the file's path. This command installs even if you declined, because the saved setting only affects automatic installs.
+   It builds `meridian-zotero@usemeridian.us.xpi` into `%USERPROFILE%\.meridian\local_runner\zotero_plugin\`. If it finds your Zotero profile, it also copies the file there. If it does not, it prints the file's path. This command installs even if you declined, because the saved setting only affects automatic installs. It copies the file only into a folder that holds `prefs.js` or `zotero.sqlite`, so a wrong `--profile` path writes nothing.
 3. In Zotero, open **Tools > Add-ons**, click the gear icon, and choose **Install Add-on From File**.
 4. Select `meridian-zotero@usemeridian.us.xpi` from the folder in step 2.
 5. Restart Zotero if asked.
@@ -59,11 +59,14 @@ Use this if you declined, or if the automatic install did not appear.
 
 ## 6. Uninstall
 
-1. In Zotero, open **Tools > Add-ons**, select **Meridian Zotero Bridge**, and remove it. Restart Zotero.
-2. Close Zotero. Delete `meridian-zotero@usemeridian.us.xpi` from the `extensions` folder of your Zotero profile. Meridian finds that profile through `profiles.ini` in `%APPDATA%\Zotero\Zotero`.
+1. **Turn off auto-install first.** In the tray menu, clear **Auto-install Zotero bridge plugin**. If `MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL` is set, unset it too, because it overrides the menu. Otherwise Meridian puts the file back the next time it starts Zotero while Zotero is closed.
+2. In Zotero, open **Tools > Add-ons**, select **Meridian Zotero Bridge**, and remove it. Restart Zotero.
+3. Close Zotero. Delete `meridian-zotero@usemeridian.us.xpi` from the `extensions` folder of your Zotero profile. Meridian finds that profile through `profiles.ini` in `%APPDATA%\Zotero\Zotero`.
 
 ## 7. Troubleshooting
 
 - **Refused while Zotero is running.** Nothing is written while Zotero is open. The command says "Zotero is running. Close Zotero, then run this command again." Close Zotero and retry. An automatic install skipped for this reason is tried again the next time Meridian starts Zotero while it is closed.
 - **No profile found.** Meridian reads `profiles.ini` from the Zotero data folder, which defaults to `%APPDATA%\Zotero\Zotero`. If your Zotero data is somewhere else, set `MERIDIAN_ZOTERO_DATA_DIR` to that folder (the one that contains `profiles.ini`) and retry. You can also point the command at a profile folder with `--profile "<profile folder>"`.
+- **Not a Zotero profile.** The command refuses a folder that holds neither `prefs.js` nor `zotero.sqlite`, and writes nothing. Point `--profile` at the profile folder itself.
+- **Nothing happens on macOS or Linux.** The tray prompt and the automatic install are Windows only in this build. Use the manual install in section 4.
 - **Not listed after restart.** The automatic route has not been verified on a real Zotero install. If Meridian Zotero Bridge is not in **Tools > Add-ons** after a restart, use the manual install in section 4, and tell us what **Tools > Add-ons** showed.

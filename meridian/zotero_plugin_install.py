@@ -1,15 +1,18 @@
 """One-time install of the Meridian Zotero bridge plugin into Zotero's profile.
 
 * ``build_xpi`` packs ``extensions/zotero-bridge`` into a deterministic .xpi:
-  sorted entries, fixed zip timestamps, fixed file mode, so rebuilds are
-  byte-identical on every host.
+  sorted entries, fixed zip timestamps, fixed file mode, and text files with LF
+  line endings, so rebuilds are byte-identical on every host, CRLF checkout or
+  LF. In a frozen (PyInstaller) build the source is read from ``sys._MEIPASS``.
 * ``install_into_profile`` copies that .xpi into the profile's ``extensions/``
-  folder. It refuses while Zotero is running and writes nothing then. It skips
-  the write when the bytes already match. It never touches ``extensions.json``,
-  ``prefs.js`` or any other profile file.
+  folder. It refuses a folder that is not a Zotero profile (no ``prefs.js`` or
+  ``zotero.sqlite``) and refuses while Zotero is running, writing nothing in
+  either case. It skips the write when the bytes already match. It never touches
+  ``extensions.json``, ``prefs.js`` or any other profile file.
 * The settings file ``zotero_plugin.json`` (in the per-user Meridian state dir,
   next to the tray's other settings) holds the user's choice. Auto-install is
-  opt-out: it defaults on, and the first-run prompt records the answer.
+  opt-in: it is off until the first-run prompt records an answer. An unreadable
+  or wrong-shape file reads as undecided with auto-install off.
 
 UNVERIFIED on a real machine:
 
@@ -55,8 +58,12 @@ _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _ZIP_FILE_MODE = 0o644
 _ZIP_CREATE_SYSTEM_UNIX = 3
 
-_DEFAULT_SETTINGS = {"autoinstall": True, "decided": False}
+_DEFAULT_SETTINGS = {"autoinstall": False, "decided": False}
 _DEFAULT_STATE_SUBDIR = "zotero_plugin"
+PROFILE_MARKERS = ("prefs.js", "zotero.sqlite")
+_NOT_PROFILE_MESSAGE = (
+    "{profile} is not a Zotero profile: it has neither prefs.js nor zotero.sqlite. Nothing was written."
+)
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -77,8 +84,21 @@ def _platform() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _bundled_source_dir() -> Path:
+    """The bridge source folder: inside the PyInstaller bundle when frozen, else the repo copy.
+
+    meridian-tray.spec ships ``extensions/zotero-bridge`` under ``sys._MEIPASS``
+    (the same base the tray uses for its icon), without ``test/`` or
+    ``node_modules/``.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        return base / "extensions" / "zotero-bridge"
+    return _SOURCE_DIR
+
+
 def _resolve_source(source_dir: "Path | str | None") -> Path:
-    return Path(source_dir) if source_dir is not None else _SOURCE_DIR
+    return Path(source_dir) if source_dir is not None else _bundled_source_dir()
 
 
 def _runtime_files(source: Path) -> list[tuple[str, Path]]:
@@ -103,6 +123,23 @@ def _runtime_files(source: Path) -> list[tuple[str, Path]]:
     return sorted(found.items())
 
 
+def _packed_bytes(path: Path) -> bytes:
+    """The bytes written into the .xpi for one file.
+
+    Text files get LF line endings, so a CRLF checkout (Windows autocrlf) and an
+    LF checkout pack identical bytes. Binary files (anything with a NUL byte, or
+    anything that is not valid UTF-8) are packed exactly as they are.
+    """
+    data = path.read_bytes()
+    if b"\x00" in data:
+        return data
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    return text.replace("\r\n", "\n").encode("utf-8")
+
+
 def build_xpi_bytes(source_dir: "Path | str | None" = None) -> bytes:
     """The deterministic .xpi bytes for the bridge source, built in memory."""
     buffer = io.BytesIO()
@@ -112,7 +149,7 @@ def build_xpi_bytes(source_dir: "Path | str | None" = None) -> bytes:
             info.compress_type = zipfile.ZIP_DEFLATED
             info.create_system = _ZIP_CREATE_SYSTEM_UNIX
             info.external_attr = _ZIP_FILE_MODE << 16
-            archive.writestr(info, path.read_bytes(), compresslevel=9)
+            archive.writestr(info, _packed_bytes(path), compresslevel=9)
     return buffer.getvalue()
 
 
@@ -232,6 +269,9 @@ def _run_tasklist() -> str:
         check=False,
         **kwargs,
     )
+    if completed.returncode != 0:
+        # A failed listing says nothing about Zotero, so it must not read as "not running".
+        raise RuntimeError(f"tasklist exited with code {completed.returncode}")
     return completed.stdout or ""
 
 
@@ -243,6 +283,11 @@ def _run_pgrep() -> str:
         timeout=10,
         check=False,
     )
+    if completed.returncode == 1:
+        # pgrep's own answer for "no process matched": a clean "not running".
+        return ""
+    if completed.returncode != 0:
+        raise RuntimeError(f"pgrep exited with code {completed.returncode}")
     return completed.stdout or ""
 
 
@@ -259,7 +304,10 @@ def zotero_is_running(runner: "Callable[[], str] | None" = None) -> bool:
 
     ``runner`` returns the raw listing text (tasklist on Windows, pgrep
     elsewhere) so tests never call the real process list. Any error counts as
-    running, so an install is never attempted on an unknown state.
+    running, so an install is never attempted on an unknown state. The default
+    runners raise on an error exit (tasklist: any non-zero code; pgrep: any code
+    other than its no-match exit 1). Empty output from a successful listing
+    means not running.
     """
     try:
         if _platform() == "win32":
@@ -301,6 +349,12 @@ def _result(status: str, target: "Path | None", error: "str | None" = None) -> d
     return payload
 
 
+def is_zotero_profile(profile_dir: "Path | str") -> bool:
+    """True when the folder holds one of Zotero's profile marker files."""
+    folder = Path(profile_dir)
+    return any((folder / name).is_file() for name in PROFILE_MARKERS)
+
+
 def install_into_profile(
     profile_dir: "Path | str | None",
     xpi_path: "Path | str",
@@ -309,13 +363,18 @@ def install_into_profile(
 ) -> dict[str, Any]:
     """Copy the built .xpi into ``profile_dir/extensions/``.
 
-    ``status`` is one of ``installed``, ``unchanged``, ``refused_running``,
-    ``no_profile`` or ``failed``. Refusing while Zotero runs happens before any
-    write. ``running`` defaults to :func:`zotero_is_running`, looked up at call
-    time.
+    ``status`` is one of ``installed``, ``unchanged``, ``refused_not_profile``,
+    ``refused_running``, ``no_profile`` or ``failed``. The profile must hold a
+    marker file (``prefs.js`` or ``zotero.sqlite``), and Zotero must not be
+    running; both refusals happen before any write. ``running`` defaults to
+    :func:`zotero_is_running`, looked up at call time.
     """
     if profile_dir is None or not Path(profile_dir).is_dir():
         return _result("no_profile", None)
+    if not is_zotero_profile(profile_dir):
+        return _result(
+            "refused_not_profile", None, error=_NOT_PROFILE_MESSAGE.format(profile=profile_dir),
+        )
     try:
         check = running if running is not None else zotero_is_running
         if check():
@@ -342,29 +401,35 @@ def settings_path() -> Path:
     return default_state_dir() / SETTINGS_FILENAME
 
 
-def _normalize(payload: Mapping[str, Any]) -> dict[str, bool]:
+def _valid_settings(payload: Any) -> "dict[str, bool] | None":
+    """Both keys as real booleans, or None for any other shape (a partial file counts as wrong)."""
+    if not isinstance(payload, dict):
+        return None
     autoinstall = payload.get("autoinstall")
     decided = payload.get("decided")
-    return {
-        "autoinstall": autoinstall if isinstance(autoinstall, bool) else _DEFAULT_SETTINGS["autoinstall"],
-        "decided": decided if isinstance(decided, bool) else _DEFAULT_SETTINGS["decided"],
-    }
+    if not isinstance(autoinstall, bool) or not isinstance(decided, bool):
+        return None
+    return {"autoinstall": autoinstall, "decided": decided}
 
 
 def load_settings(path: "Path | str") -> dict[str, bool]:
-    """The saved settings, or the defaults when the file is missing or unreadable."""
+    """The saved settings. A missing, unreadable or wrong-shape file reads as undecided, auto-install off.
+
+    Nothing is installed from such a file, and the first-run prompt asks again.
+    """
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return dict(_DEFAULT_SETTINGS)
-    if not isinstance(payload, dict):
-        return dict(_DEFAULT_SETTINGS)
-    return _normalize(payload)
+    return _valid_settings(payload) or dict(_DEFAULT_SETTINGS)
 
 
 def save_settings(path: "Path | str", settings: Mapping[str, Any]) -> None:
-    """Atomically persist the two settings keys."""
-    text = json.dumps(_normalize(settings), sort_keys=True) + "\n"
+    """Atomically persist the two settings keys. Anything but two booleans is refused, not written."""
+    valid = _valid_settings(settings)
+    if valid is None:
+        raise ValueError("zotero plugin settings need boolean 'autoinstall' and 'decided' values")
+    text = json.dumps(valid, sort_keys=True) + "\n"
     _atomic_write_bytes(Path(path), text.encode("utf-8"))
 
 
@@ -373,15 +438,33 @@ def apply_first_run_choice(settings: Mapping[str, Any], install: bool) -> dict[s
     return {"autoinstall": bool(install), "decided": True}
 
 
-def effective_autoinstall(settings: "Mapping[str, Any] | None", env: "Mapping[str, str] | None" = None) -> bool:
-    """Whether auto-install runs. The env var wins when it holds a recognised value."""
+def autoinstall_supported() -> bool:
+    """Auto-install and its first-run prompt are Windows-only in this build."""
+    return _platform() == "win32"
+
+
+def autoinstall_env_override(env: "Mapping[str, str] | None" = None) -> "bool | None":
+    """True or False when AUTOINSTALL_ENV holds a recognised value; None when it is unset or unknown."""
     source = os.environ if env is None else env
     raw = str(source.get(AUTOINSTALL_ENV) or "").strip().casefold()
     if raw in _FALSE_VALUES:
         return False
     if raw in _TRUE_VALUES:
         return True
-    return _normalize(settings or {})["autoinstall"]
+    return None
+
+
+def effective_autoinstall(settings: "Mapping[str, Any] | None", env: "Mapping[str, str] | None" = None) -> bool:
+    """Whether auto-install may run. It needs a recorded first-run decision.
+
+    A recognised AUTOINSTALL_ENV value overrides the saved autoinstall choice in
+    both directions. An undecided install never runs, even when the env var says on.
+    """
+    current = _valid_settings(settings) or dict(_DEFAULT_SETTINGS)
+    if not current["decided"]:
+        return False
+    override = autoinstall_env_override(env)
+    return current["autoinstall"] if override is None else override
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +509,9 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     if status == "unchanged":
         print(f"The Zotero bridge plugin is already up to date at {result['path']}.")
         return 0
+    if status == "refused_not_profile":
+        print(result.get("error", "That folder is not a Zotero profile. Nothing was written."))
+        return 1
     if status == "refused_running":
         print("Zotero is running. Close Zotero, then run this command again. Nothing was written.")
         return 1
@@ -451,6 +537,9 @@ def _dry_run(profile: "Path | None") -> int:
     )
     if profile is None:
         _print_manual_steps(default_xpi_path())
+        return 0
+    if not is_zotero_profile(profile):
+        print("Would refuse: that folder is not a Zotero profile (no prefs.js or zotero.sqlite).")
         return 0
     if zotero_is_running():
         print("Would refuse: Zotero is running. Close Zotero first.")

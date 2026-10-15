@@ -737,10 +737,14 @@ _XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
 
 
 def _zotero_profile(tmp_path, monkeypatch, *, running=False):
-    """A fake Zotero data root with one default profile, reachable only through env."""
+    """A fake Zotero data root with one default profile, reachable only through env.
+
+    The profile carries prefs.js, the marker install_into_profile requires.
+    """
     data_root = tmp_path / "ZoteroRoot"
     profile = data_root / "Profiles" / "abc.default"
     profile.mkdir(parents=True)
+    (profile / "prefs.js").write_text('user_pref("keep", true);\n', encoding="utf-8")
     (data_root / "profiles.ini").write_text(
         "[Profile0]\nName=default\nIsRelative=1\nPath=Profiles/abc.default\nDefault=1\n",
         encoding="utf-8",
@@ -748,6 +752,11 @@ def _zotero_profile(tmp_path, monkeypatch, *, running=False):
     monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(data_root))
     monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: running)
     return profile
+
+
+def _decide(autoinstall: bool) -> None:
+    """Record the first-run answer in the (isolated) settings file."""
+    zpi.save_settings(zpi.settings_path(), {"autoinstall": autoinstall, "decided": True})
 
 
 def _start_recording_xpi_state(monkeypatch, tmp_path, *, api_answers=(False, True)):
@@ -770,9 +779,10 @@ def _start_recording_xpi_state(monkeypatch, tmp_path, *, api_answers=(False, Tru
     return result, exe, seen_at_launch
 
 
-def test_start_installs_the_plugin_before_launching_when_enabled(monkeypatch, tmp_path):
+def test_start_installs_the_plugin_before_launching_when_enabled(windows, monkeypatch, tmp_path):
     profile = _zotero_profile(tmp_path, monkeypatch)
     monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
     target = profile / "extensions" / _XPI_NAME
     installed_at_launch = []
     exe = tmp_path / "zotero.exe"
@@ -791,16 +801,86 @@ def test_start_installs_the_plugin_before_launching_when_enabled(monkeypatch, tm
     assert installed_at_launch == [True]
 
 
-def test_start_skips_the_plugin_when_autoinstall_is_disabled_by_env(monkeypatch, tmp_path):
+def test_start_installs_from_the_saved_choice_when_there_is_no_env_override(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.delenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", raising=False)
+    _decide(True)
+    result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [_exe]
+    assert (profile / "extensions" / _XPI_NAME).is_file()
+
+
+def test_undecided_launch_installs_nothing_even_when_the_env_var_says_on(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_env_off_overrides_a_saved_on_choice(windows, monkeypatch, tmp_path):
     profile = _zotero_profile(tmp_path, monkeypatch)
     monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    _decide(True)
     result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
     assert result["action"] == "started"
     assert len(launched) == 1
     assert not (profile / "extensions" / _XPI_NAME).exists()
 
 
-def test_start_respects_the_saved_opt_out_when_there_is_no_env_override(monkeypatch, tmp_path):
+def test_env_on_overrides_a_saved_opt_out_once_decided(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(False)
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert (profile / "extensions" / _XPI_NAME).is_file()
+
+
+def test_corrupt_settings_file_installs_nothing_and_the_launch_goes_on(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.delenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", raising=False)
+    settings = zpi.settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text('{"autoinstall": false, "decided": tru', encoding="utf-8")
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_hook_does_nothing_off_windows_even_when_decided_and_enabled(monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+    attempted = []
+
+    def _record_build(*args, **kwargs):
+        attempted.append(args)
+        raise AssertionError("the bridge must not be built off Windows")
+
+    monkeypatch.setattr(zpi, "build_xpi", _record_build)
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert attempted == []
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_start_skips_the_plugin_when_autoinstall_is_disabled_by_env(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    _decide(True)
+    result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert len(launched) == 1
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_start_respects_the_saved_opt_out_when_there_is_no_env_override(windows, monkeypatch, tmp_path):
     profile = _zotero_profile(tmp_path, monkeypatch)
     monkeypatch.delenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", raising=False)
     zpi.save_settings(zpi.settings_path(), {"autoinstall": False, "decided": True})
@@ -810,9 +890,10 @@ def test_start_respects_the_saved_opt_out_when_there_is_no_env_override(monkeypa
     assert not (profile / "extensions" / _XPI_NAME).exists()
 
 
-def test_plugin_install_exception_never_blocks_the_launch(monkeypatch, tmp_path, caplog):
+def test_plugin_install_exception_never_blocks_the_launch(windows, monkeypatch, tmp_path, caplog):
     _zotero_profile(tmp_path, monkeypatch)
     monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
 
     def _explode(*args, **kwargs):
         raise RuntimeError("disk on fire")
@@ -825,9 +906,10 @@ def test_plugin_install_exception_never_blocks_the_launch(monkeypatch, tmp_path,
     assert "disk on fire" in caplog.text
 
 
-def test_plugin_build_exception_never_blocks_the_launch(monkeypatch, tmp_path):
+def test_plugin_build_exception_never_blocks_the_launch(windows, monkeypatch, tmp_path):
     _zotero_profile(tmp_path, monkeypatch)
     monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
 
     def _missing_source(*args, **kwargs):
         raise FileNotFoundError("extensions/zotero-bridge is not bundled")
@@ -838,9 +920,10 @@ def test_plugin_build_exception_never_blocks_the_launch(monkeypatch, tmp_path):
     assert launched == [exe]
 
 
-def test_plugin_is_never_installed_while_zotero_is_running(monkeypatch, tmp_path):
+def test_plugin_is_never_installed_while_zotero_is_running(windows, monkeypatch, tmp_path):
     profile = _zotero_profile(tmp_path, monkeypatch, running=True)
     monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
     result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
     assert result["action"] == "started"
     assert launched == [exe]
