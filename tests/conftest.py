@@ -659,6 +659,23 @@ def _isolate_tunnel_log(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("MERIDIAN_TUNNEL_LOG", str(log_dir / "tunnel.log"))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_zotero_plugin(monkeypatch, tmp_path_factory):
+    """Keep the Zotero bridge plugin auto-install away from real machine state.
+
+    The launcher's pre-launch install hook and the tray's first-run prompt read
+    the per-user Meridian state dir and the Zotero data root. For EVERY test,
+    point the state dir at a temp folder, point the Zotero data root at a folder
+    with no profiles.ini (so no real Zotero profile can be found), and force
+    auto-install off. A test that wants the install path opts in with
+    monkeypatch.setenv / monkeypatch.delenv on its own.
+    """
+    state_dir = tmp_path_factory.mktemp("meridian_state")
+    monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(state_dir / "no-zotero-profile"))
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+
+
 @pytest_asyncio.fixture
 async def db(request):
     """Meridian's schema on the active backend, isolated per test.

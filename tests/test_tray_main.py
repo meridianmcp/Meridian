@@ -37,6 +37,7 @@ import pytest
 
 import meridian
 from meridian import tray_main
+from meridian import zotero_plugin_install as zpi
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _TRAY_SPEC_PATH = _REPO_ROOT / "meridian-tray.spec"
@@ -1634,6 +1635,10 @@ def _fake_pystray_and_pil(monkeypatch):
     fake_PIL.Image = fake_image_module
     monkeypatch.setitem(sys.modules, "PIL", fake_PIL)
     monkeypatch.setitem(sys.modules, "PIL.Image", fake_image_module)
+    # The Zotero plugin first-run prompt must never open a real Tk window from a test.
+    monkeypatch.setattr(
+        tray_main, "_schedule_zotero_plugin_first_run", lambda dispatch, **kwargs: False,
+    )
     return fake_pystray, fake_icon_instance
 
 
@@ -2419,3 +2424,144 @@ def test_manual_action_during_slow_probe_discards_stale_disconnected_result():
     assert tick_result == [None]
     assert watchdog._consecutive_failures == 1
     runner.restart.assert_called_once_with(reason="manual tunnel reconnect")
+
+
+# ---------------------------------------------------------------------------
+# Zotero bridge plugin: first-run prompt and autoinstall menu toggle.
+# Pure logic is tested directly. The Tk prompt is never shown: its wrapper is
+# only exercised with tkinter blocked (the "no GUI" path).
+# ---------------------------------------------------------------------------
+
+_ZOTERO_PLUGIN_TOGGLE_LABEL = "Auto-install Zotero bridge plugin"
+_ZOTERO_PLUGIN_PROMPT = (
+    "Install the Zotero bridge plugin? Meridian will place it in Zotero's extensions "
+    "folder when it starts Zotero, only while Zotero is closed. Zotero's own add-on "
+    "list can remove it."
+)
+
+
+def test_first_run_prompt_wording_and_buttons_are_the_agreed_ones():
+    assert tray_main.ZOTERO_PLUGIN_PROMPT_MESSAGE == _ZOTERO_PLUGIN_PROMPT
+    assert tray_main.ZOTERO_PLUGIN_INSTALL_BUTTON == "Install (recommended)"
+    assert tray_main.ZOTERO_PLUGIN_NOT_NOW_BUTTON == "Not now"
+
+
+@pytest.mark.parametrize(
+    ("settings", "pending"),
+    [
+        ({"autoinstall": True, "decided": False}, True),
+        ({"autoinstall": False, "decided": True}, False),
+    ],
+)
+def test_first_run_is_pending_only_until_the_user_answers(settings, pending):
+    assert tray_main.zotero_plugin_first_run_pending(settings) is pending
+
+
+def test_install_answer_enables_autoinstall_and_marks_the_choice_made():
+    updated = tray_main.zotero_plugin_settings_after_answer(
+        {"autoinstall": False, "decided": False}, True,
+    )
+    assert updated == {"autoinstall": True, "decided": True}
+
+
+def test_not_now_answer_disables_autoinstall_and_marks_the_choice_made():
+    updated = tray_main.zotero_plugin_settings_after_answer(
+        {"autoinstall": True, "decided": False}, False,
+    )
+    assert updated == {"autoinstall": False, "decided": True}
+
+
+def test_no_answer_leaves_the_settings_undecided():
+    original = {"autoinstall": True, "decided": False}
+    assert tray_main.zotero_plugin_settings_after_answer(original, None) == original
+
+
+def test_menu_toggle_flips_autoinstall_and_counts_as_a_decision():
+    on = {"autoinstall": True, "decided": False}
+    off = tray_main.toggle_zotero_plugin_autoinstall(on)
+    assert off == {"autoinstall": False, "decided": True}
+    assert tray_main.toggle_zotero_plugin_autoinstall(off) == {"autoinstall": True, "decided": True}
+
+
+def test_menu_checkmark_shows_the_effective_state_including_env_override():
+    settings = {"autoinstall": True, "decided": True}
+    assert tray_main.zotero_plugin_autoinstall_checked(settings, {}) is True
+    assert tray_main.zotero_plugin_autoinstall_checked(
+        settings, {"MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL": "0"},
+    ) is False
+
+
+def test_undecided_first_run_is_scheduled_off_the_tray_thread(tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    zpi.save_settings(path, {"autoinstall": True, "decided": False})
+    queued = []
+    assert tray_main._schedule_zotero_plugin_first_run(queued.append, path=path) is True
+    assert len(queued) == 1
+    assert callable(queued[0])
+
+
+def test_decided_settings_do_not_schedule_the_first_run_prompt(tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    zpi.save_settings(path, {"autoinstall": False, "decided": True})
+    queued = []
+    assert tray_main._schedule_zotero_plugin_first_run(queued.append, path=path) is False
+    assert queued == []
+
+
+def test_install_answer_is_saved_as_the_user_choice(monkeypatch, tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    zpi.save_settings(path, {"autoinstall": True, "decided": False})
+    monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: True)
+    queued = []
+    tray_main._schedule_zotero_plugin_first_run(queued.append, path=path)
+    queued[0]()
+    assert zpi.load_settings(path) == {"autoinstall": True, "decided": True}
+
+
+def test_not_now_answer_is_saved_as_opt_out(monkeypatch, tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    zpi.save_settings(path, {"autoinstall": True, "decided": False})
+    monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: False)
+    queued = []
+    tray_main._schedule_zotero_plugin_first_run(queued.append, path=path)
+    queued[0]()
+    assert zpi.load_settings(path) == {"autoinstall": False, "decided": True}
+
+
+def test_missing_gui_leaves_the_choice_undecided_and_never_raises(monkeypatch, tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    zpi.save_settings(path, {"autoinstall": True, "decided": False})
+    monkeypatch.setitem(sys.modules, "tkinter", None)  # any "import tkinter" now raises ImportError
+    queued = []
+    tray_main._schedule_zotero_plugin_first_run(queued.append, path=path)
+    queued[0]()  # must not raise, must not block
+    assert zpi.load_settings(path) == {"autoinstall": True, "decided": False}
+
+
+def test_menu_toggle_persists_the_new_preference(tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    first = tray_main._toggle_zotero_plugin_preference(path)
+    assert first == {"autoinstall": False, "decided": True}
+    assert zpi.load_settings(path) == first
+
+
+def test_run_tray_schedules_the_first_run_prompt_and_exposes_the_plugin_toggle(monkeypatch):
+    fake_pystray, fake_icon_instance = _fake_pystray_and_pil(monkeypatch)
+    runner = mock.MagicMock()
+    runner.start.return_value = _fake_status(tray_main.LocalMcpState.READY)
+    monkeypatch.setattr(tray_main, "_build_runner", lambda: runner)
+    monkeypatch.setattr(tray_main.webbrowser, "open", lambda _url: True)
+    scheduled = []
+    monkeypatch.setattr(
+        tray_main,
+        "_schedule_zotero_plugin_first_run",
+        lambda dispatch, **kwargs: scheduled.append(kwargs) or False,
+    )
+
+    assert tray_main._run_tray() == 0
+
+    assert len(scheduled) == 1
+    labels = [call.args[0] for call in fake_pystray.MenuItem.call_args_list]
+    assert _ZOTERO_PLUGIN_TOGGLE_LABEL in labels
+    assert "Zotero connection…" in labels
+    fake_icon_instance.run.assert_called_once()

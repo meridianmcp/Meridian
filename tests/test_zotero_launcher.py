@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from meridian import zotero_launcher as zl
+from meridian import zotero_plugin_install as zpi
 
 # Captured at import time, before the autouse fixture swaps in fakes.
 _REAL_IS_WINDOWS = zl._is_windows
@@ -726,3 +727,121 @@ def test_module_entrypoint_exits_with_main_result(monkeypatch, capsys):
         runpy.run_module("meridian.zotero_launcher", run_name="__main__")
     assert exc.value.code == 0
     assert "content" in json.loads(capsys.readouterr().out)
+
+
+# ---------------------------------------------------------------------------
+# start_zotero -- Zotero bridge plugin install before launch
+# ---------------------------------------------------------------------------
+
+_XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
+
+
+def _zotero_profile(tmp_path, monkeypatch, *, running=False):
+    """A fake Zotero data root with one default profile, reachable only through env."""
+    data_root = tmp_path / "ZoteroRoot"
+    profile = data_root / "Profiles" / "abc.default"
+    profile.mkdir(parents=True)
+    (data_root / "profiles.ini").write_text(
+        "[Profile0]\nName=default\nIsRelative=1\nPath=Profiles/abc.default\nDefault=1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(data_root))
+    monkeypatch.setattr(zpi, "zotero_is_running", lambda runner=None: running)
+    return profile
+
+
+def _start_recording_xpi_state(monkeypatch, tmp_path, *, api_answers=(False, True)):
+    """Run start_zotero and record whether the plugin file exists at the moment of launch."""
+    exe = tmp_path / "zotero.exe"
+    _scripted_alive(monkeypatch, list(api_answers))
+    _fixed_find(monkeypatch, exe)
+    seen_at_launch = []
+
+    def _launcher(path):
+        seen_at_launch.append(path)
+
+    result = zl.start_zotero(
+        timeout_s=10,
+        poll_s=1,
+        launcher=_launcher,
+        sleep=lambda seconds: None,
+        clock=lambda: 0.0,
+    )
+    return result, exe, seen_at_launch
+
+
+def test_start_installs_the_plugin_before_launching_when_enabled(monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    target = profile / "extensions" / _XPI_NAME
+    installed_at_launch = []
+    exe = tmp_path / "zotero.exe"
+    _scripted_alive(monkeypatch, [False, True])
+    _fixed_find(monkeypatch, exe)
+
+    result = zl.start_zotero(
+        timeout_s=10,
+        poll_s=1,
+        launcher=lambda path: installed_at_launch.append(target.is_file()),
+        sleep=lambda seconds: None,
+        clock=lambda: 0.0,
+    )
+
+    assert result == {"action": "started", "exe": str(exe), "api_ready": True}
+    assert installed_at_launch == [True]
+
+
+def test_start_skips_the_plugin_when_autoinstall_is_disabled_by_env(monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert len(launched) == 1
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_start_respects_the_saved_opt_out_when_there_is_no_env_override(monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.delenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", raising=False)
+    zpi.save_settings(zpi.settings_path(), {"autoinstall": False, "decided": True})
+    result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert len(launched) == 1
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_plugin_install_exception_never_blocks_the_launch(monkeypatch, tmp_path, caplog):
+    _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(zpi, "install_into_profile", _explode)
+    with caplog.at_level("WARNING"):
+        result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert "disk on fire" in caplog.text
+
+
+def test_plugin_build_exception_never_blocks_the_launch(monkeypatch, tmp_path):
+    _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+
+    def _missing_source(*args, **kwargs):
+        raise FileNotFoundError("extensions/zotero-bridge is not bundled")
+
+    monkeypatch.setattr(zpi, "build_xpi", _missing_source)
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+
+
+def test_plugin_is_never_installed_while_zotero_is_running(monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch, running=True)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
