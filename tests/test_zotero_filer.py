@@ -567,14 +567,16 @@ def test_stored_approval_attach_writes_with_the_approval_header_and_never_author
     assert approval not in json.dumps(result)
 
 
-@pytest.mark.parametrize("answer", [
-    (401, {"error": "not approved"}, {}),
-    (403, {"error": "denied"}, {}),
-], ids=["401", "403-probe-reachable"])
-def test_stored_key_rejected_with_401_or_403_is_deleted_and_never_reauthorized(
-        bib_file, pdf_dir, _stored_zotero_approval, no_zotero_ui, answer):
+REJECTED_MESSAGE = (
+    "Zotero rejected the stored approval. Running 'python -m meridian.zotero_connect connect' again replaces it."
+)
+
+
+def test_401_on_the_filer_path_keeps_the_stored_key_and_shows_the_rejected_message(
+        bib_file, pdf_dir, _stored_zotero_approval, no_zotero_ui):
+    approval = _stored_zotero_approval.key
     library = FakeTransport(_filing_routes())
-    header = FakeHeaderTransport(_header_routes(post=answer))
+    header = FakeHeaderTransport(_header_routes(post=(401, {"error": "not approved"}, {})))
     messages = []
     result = zf.file_bib_files(
         [bib_file], "Research", transport=library, header_transport=header,
@@ -582,13 +584,40 @@ def test_stored_key_rejected_with_401_or_403_is_deleted_and_never_reauthorized(
     )
     attachments = result["attachments"]
     assert result["status"] == "ok"
-    assert attachments["status"] == "needs_connection"
+    assert attachments["status"] == "rejected"
     assert attachments["attached"] == []
-    assert _stored_zotero_approval.key is None
-    assert _stored_zotero_approval.delete_calls == 1
+    assert sorted(attachments["failed"]) == ["lee2021attention", "smith2020deep"]
+    assert _stored_zotero_approval.key == approval
+    assert _stored_zotero_approval.delete_calls == 0
     assert header.requests_to("POST", AUTHORIZE) == []
     assert len(header.requests_to("POST", WRITE_ITEMS)) == 1
-    assert messages.count(zc.CONNECT_FIRST_LINE) == 1
+    assert messages.count(REJECTED_MESSAGE) == 1
+    assert zc.CONNECT_FIRST_LINE not in messages
+    assert approval not in json.dumps(result)
+
+
+def test_403_with_a_reachable_probe_on_the_filer_path_keeps_the_stored_key(
+        bib_file, pdf_dir, _stored_zotero_approval, no_zotero_ui):
+    approval = _stored_zotero_approval.key
+    library = FakeTransport(_filing_routes())
+    # The default items probe answers 200, so the local API is up and Zotero itself refused the key.
+    header = FakeHeaderTransport(_header_routes(post=(403, {"error": "denied"}, {})))
+    messages = []
+    result = zf.file_bib_files(
+        [bib_file], "Research", transport=library, header_transport=header,
+        pdf_dir=str(pdf_dir), log=messages.append,
+    )
+    attachments = result["attachments"]
+    assert result["status"] == "ok"
+    assert attachments["status"] == "rejected"
+    assert attachments["attached"] == []
+    assert _stored_zotero_approval.key == approval
+    assert _stored_zotero_approval.delete_calls == 0
+    assert header.requests_to("POST", AUTHORIZE) == []
+    assert len(header.requests_to("POST", WRITE_ITEMS)) == 1
+    assert messages.count(REJECTED_MESSAGE) == 1
+    assert zc.CONNECT_FIRST_LINE not in messages
+    assert approval not in json.dumps(result)
 
 
 def test_a_403_while_the_local_api_is_off_keeps_the_stored_key(

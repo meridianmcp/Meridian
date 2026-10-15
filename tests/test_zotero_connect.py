@@ -1269,3 +1269,99 @@ def test_stored_write_403_with_a_failing_probe_keeps_the_key(env):
     assert env.store.key == ISSUED_KEY
     assert env.store.delete_calls == 0
     assert all(call["method"] == "GET" for call in header.calls[1:])
+
+
+# ---------------------------------------------------------------------------
+# The filer path keeps a rejected key. Only connect() replaces it. The stored
+# senders refuse the authorize path before any request is sent.
+# ---------------------------------------------------------------------------
+
+def test_filer_send_401_keeps_the_key_and_says_running_connect_again_replaces_it(env, monkeypatch):
+    env.store.key = ISSUED_KEY
+    monkeypatch.setattr(zc, "connect", lambda **kwargs: pytest.fail("connect() must never run from a send"))
+    header = HeaderScripted((401, "no", {}))
+    result = zc.send_with_stored_approval("POST", ATTACH_WRITE, [{}], header_transport=header)
+    assert result["status"] == "rejected"
+    assert result["message"] == (
+        "Zotero rejected the stored approval. Running 'python -m meridian.zotero_connect connect' again replaces it."
+    )
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+    assert len(header.calls) == 1
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+def test_filer_send_403_with_a_reachable_probe_keeps_the_key(env, monkeypatch):
+    env.store.key = ISSUED_KEY
+    monkeypatch.setattr(zc, "connect", lambda **kwargs: pytest.fail("connect() must never run from a send"))
+    header = HeaderScripted((403, "denied", {}), (200, "[]", {}))
+    result = zc.send_with_stored_approval("POST", ATTACH_WRITE, [{}], header_transport=header)
+    assert result["status"] == "rejected"
+    assert "Running 'python -m meridian.zotero_connect connect' again replaces it." in result["message"]
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+    assert [call["method"] for call in header.calls] == ["POST", "GET"]
+    assert "Authorization" not in header.calls[1]["headers"]
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+AUTHORIZE_VARIANTS = [
+    AUTHORIZE,
+    AUTHORIZE + "/",
+    "http://127.0.0.1:23119/api/local/AUTHORIZE",
+    "http://127.0.0.1:23119/api/local%2Fauthorize",
+    "http://127.0.0.1:23119/api/users/0/../../local/authorize",
+    "http://127.0.0.1:23119//api//local//authorize",
+    "http://localhost:23119/api/local/authorize?appName=Meridian",
+]
+
+
+@pytest.mark.parametrize("url", AUTHORIZE_VARIANTS)
+def test_write_with_stored_approval_refuses_the_authorize_path_before_any_request(env, monkeypatch, url):
+    env.store.key = ISSUED_KEY
+    monkeypatch.setattr(zc, "connect", lambda **kwargs: pytest.fail("connect() must never run from a write"))
+    transport = Scripted()
+    result = zc.write_with_stored_approval({"method": "POST", "url": url, "payload": {}}, transport=transport)
+    assert result["status"] == "error"
+    assert transport.calls == []
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+@pytest.mark.parametrize("url", AUTHORIZE_VARIANTS)
+def test_send_with_stored_approval_refuses_the_authorize_path_before_any_request(env, monkeypatch, url):
+    env.store.key = ISSUED_KEY
+    monkeypatch.setattr(zc, "connect", lambda **kwargs: pytest.fail("connect() must never run from a send"))
+    header = HeaderScripted()
+    result = zc.send_with_stored_approval("POST", url, {"appName": "Meridian"}, header_transport=header)
+    assert result["status"] == "error"
+    assert header.calls == []
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0
+    assert ISSUED_KEY not in json.dumps(result)
+
+
+def test_authorize_path_is_refused_even_with_no_stored_approval(env, monkeypatch):
+    monkeypatch.setattr(zc, "connect", lambda **kwargs: pytest.fail("connect() must never run from a send"))
+    header = HeaderScripted()
+    transport = Scripted()
+    assert zc.send_with_stored_approval("POST", AUTHORIZE, {}, header_transport=header)["status"] == "error"
+    assert zc.write_with_stored_approval({"method": "POST", "url": AUTHORIZE}, transport=transport)["status"] == "error"
+    assert header.calls == []
+    assert transport.calls == []
+
+
+def test_an_unparseable_url_is_refused_before_any_request_so_the_key_never_leaves(env, monkeypatch):
+    env.store.key = ISSUED_KEY
+    monkeypatch.setattr(zc, "connect", lambda **kwargs: pytest.fail("connect() must never run from a sender"))
+    bad = "http://[::1/api/local/items"
+    transport = Scripted()
+    header = HeaderScripted()
+    write = zc.write_with_stored_approval({"method": "POST", "url": bad, "payload": {}}, transport=transport)
+    assert write["status"] == "error"
+    assert zc.send_with_stored_approval("POST", bad, {}, header_transport=header)["status"] == "error"
+    assert transport.calls == []
+    assert header.calls == []
+    assert env.store.key == ISSUED_KEY
+    assert env.store.delete_calls == 0

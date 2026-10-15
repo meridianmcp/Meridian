@@ -22,9 +22,11 @@ Safety rules enforced here:
   and only to items this run filed and verified. The attach uses the approval
   that ``python -m meridian.zotero_connect connect`` already stored. A filer run
   never calls the authorize endpoint and never opens Zotero's approval dialog.
-  With no stored approval, or when Zotero rejects the stored one, the attach step
-  stops with one connect line. The approval travels only in the Authorization
-  header, through zotero_connect.send_with_stored_approval.
+  With no stored approval, the attach step stops with one connect line. When Zotero
+  rejects the stored one, the attach step stops with one rejected line and keeps the
+  key; only ``python -m meridian.zotero_connect connect`` replaces it. The approval
+  travels only in the Authorization header, through
+  zotero_connect.send_with_stored_approval.
 * --attach-existing attaches PDFs only to items already in the collection. It
   files nothing, needs --pdf-dir, and uses the same stored approval.
 * --attach-existing with --backend web attaches through the Zotero Web API with
@@ -665,8 +667,9 @@ def file_bib_files(
        from pdf_dir to each item (see attach_pdfs). A dry run only plans this.
 
     A live run (not a dry run) needs a stored Zotero approval. It never asks for a
-    new one. With no approval stored, or when Zotero rejects the stored one, the run
-    logs one connect line and stops with needs_connection before any write.
+    new one. With no approval stored, the run logs one connect line and stops with
+    needs_connection before any write. A rejection of the stored approval comes later,
+    at the PDF attach step, which keeps the key (see attach_pdfs).
 
     Returns {"status", "collection", "sent", "added", "skipped_duplicates"}.
     status is one of: ok, dry_run, no_collection, input_error, zotero_error,
@@ -791,8 +794,9 @@ def file_bib_files(
 # `python -m meridian.zotero_connect connect` already stored. This module never
 # calls the authorize endpoint and never opens Zotero's approval dialog. With no
 # stored approval the step stops with one connect line. A rejected stored key is
-# deleted by zotero_connect and the step stops. The approval is sent only through
-# zotero_connect.send_with_stored_approval, in the Authorization header.
+# kept, the step stops with a rejected line, and only `connect` replaces the key.
+# The approval is sent only through zotero_connect.send_with_stored_approval, in the
+# Authorization header.
 # ---------------------------------------------------------------------------
 
 
@@ -979,8 +983,9 @@ def _write_attachments(pending, header_transport, summary, log, store=None):
 
     This step never authorizes and never opens Zotero's dialog. With no stored approval it stops
     with needs_connection before any request. A reply that rejects the stored approval (a 401, or a
-    403 whose probe succeeds) makes zotero_connect delete the key, and the step stops with
-    needs_connection. A 429 stops the step and is not retried.
+    403 whose probe succeeds) keeps the key, and the step stops with rejected. Only
+    `python -m meridian.zotero_connect connect` replaces the key. A 429 stops the step and is not
+    retried.
     """
     if not zotero_connect.has_stored_approval(store):
         summary["status"] = "needs_connection"
@@ -1002,6 +1007,10 @@ def _write_attachments(pending, header_transport, summary, log, store=None):
             store=store,
         )
         state = answer["status"]
+        if state == "rejected":
+            summary["status"] = "rejected"
+            log(zotero_connect.REJECTED_LINE)
+            return
         if state == "needs_connection":
             summary["status"] = "needs_connection"
             log(zotero_connect.CONNECT_FIRST_LINE)
@@ -1040,9 +1049,10 @@ def attach_pdfs(
     the stored approval. It never authorizes.
 
     Returns {"status", "attached", "already_has_pdf", "no_pdf", "failed"} with
-    lists of citekeys. status is ok, needs_connection, rate_limited, no_server_id,
-    zotero_error or attach_failed. Any refusal stops the step at once. Every filed
-    entry that was not attached is listed under failed.
+    lists of citekeys. status is ok, needs_connection, rejected, rate_limited,
+    no_server_id, zotero_error or attach_failed. Any refusal stops the step at once.
+    A rejected stored approval keeps the key. Every filed entry that was not attached
+    is listed under failed.
     """
     transport = _resolve(transport)
     header_transport = _resolve_header(header_transport)
@@ -1108,13 +1118,14 @@ def attach_existing_files(
     A dry run stops after planning, so it never writes. A live run writes the
     planned attachments through _write_attachments with the stored approval, and
     never authorizes. With no stored approval the step stops with needs_connection.
-    A refusal is reported and never retried.
+    A rejected stored approval stops the step with rejected and keeps the key. A refusal
+    is reported and never retried.
 
     Returns {"status", "collection", "mode", "attachments"}. The attachments dict
     holds lists of citekeys: planned, attached, already_has_pdf, no_pdf, failed,
     unmatched and duplicate_in_bib. status is dry_run, ok, no_collection,
-    input_error, zotero_error, needs_connection, rate_limited, no_server_id or
-    attach_failed.
+    input_error, zotero_error, needs_connection, rejected, rate_limited, no_server_id
+    or attach_failed.
     """
     transport = _resolve(transport)
     header_transport = _resolve_header(header_transport)

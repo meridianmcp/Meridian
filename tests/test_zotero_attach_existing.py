@@ -536,24 +536,31 @@ def test_live_run_with_nothing_planned_never_authorizes(bib_file, pdf_dir):
     assert header.calls == []
 
 
+REJECTED_MESSAGE = (
+    "Zotero rejected the stored approval. Running 'python -m meridian.zotero_connect connect' again replaces it."
+)
+
+
 @pytest.mark.parametrize("answer", [
     (401, {"error": "not approved"}, {}),
     (403, {"error": "denied"}, {}),
 ], ids=["401", "403-probe-reachable"])
-def test_stored_approval_rejected_on_write_is_deleted_and_never_reauthorized(bib_file, pdf_dir, approval, answer):
+def test_stored_approval_rejected_on_write_is_kept_and_reported_as_rejected(bib_file, pdf_dir, approval, answer):
     _write_pdf(pdf_dir, "smith2020deep")
     _write_pdf(pdf_dir, "lee2021attention")
     header = _header(post=answer)
-    result = _run(bib_file, _library(), header, pdf_dir)
+    messages = []
+    result = _run(bib_file, _library(), header, pdf_dir, messages=messages)
     attachments = result["attachments"]
-    assert result["status"] == "needs_connection"
-    assert attachments["status"] == "needs_connection"
+    assert result["status"] == "rejected"
+    assert attachments["status"] == "rejected"
     assert attachments["attached"] == []
     assert sorted(attachments["failed"]) == ["lee2021attention", "smith2020deep"]
-    assert approval.key is None
-    assert approval.delete_calls == 1
+    assert approval.key == KEY
+    assert approval.delete_calls == 0
     assert header.requests_to("POST", AUTHORIZE) == []
     assert len(header.requests_to("POST", WRITE_ITEMS)) == 1
+    assert messages.count(REJECTED_MESSAGE) == 1
     assert KEY not in json.dumps(result)
 
 
