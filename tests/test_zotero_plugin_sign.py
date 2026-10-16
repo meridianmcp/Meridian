@@ -239,6 +239,12 @@ def test_staged_manifest_gets_the_gecko_id_and_the_shipped_manifest_does_not(sou
     assert "browser_specific_settings" not in real
 
 
+def test_staged_manifest_declares_no_data_collection_as_amo_requires(source, tmp_path):
+    staged = sign.stage_for_signing(source, tmp_path / "staged")
+    gecko = json.loads((staged / "manifest.json").read_text(encoding="utf-8"))["browser_specific_settings"]["gecko"]
+    assert gecko["data_collection_permissions"] == {"required": ["none"]}
+
+
 def test_staging_packs_exactly_the_files_build_xpi_packs(source, tmp_path):
     staged = sign.stage_for_signing(source, tmp_path / "staged")
     staged_names = sorted(p.relative_to(staged).as_posix() for p in staged.rglob("*") if p.is_file())

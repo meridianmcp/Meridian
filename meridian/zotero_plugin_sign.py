@@ -237,7 +237,13 @@ def _staged_manifest(data: bytes) -> bytes:
     settings = manifest.get("browser_specific_settings")
     settings = dict(settings) if isinstance(settings, dict) else {}
     gecko = settings.get("gecko")
-    settings["gecko"] = {**(gecko if isinstance(gecko, dict) else {}), "id": PLUGIN_ADDON_ID}
+    gecko = gecko if isinstance(gecko, dict) else {}
+    # AMO requires a data-collection declaration on new add-ons. The plugin collects no data, so it declares none.
+    settings["gecko"] = {
+        **gecko,
+        "id": PLUGIN_ADDON_ID,
+        "data_collection_permissions": {"required": ["none"]},
+    }
     manifest["browser_specific_settings"] = settings
     return (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
 
