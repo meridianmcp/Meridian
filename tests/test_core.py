@@ -16416,6 +16416,16 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+    # The cleanup command must never force-remove: it gates removal on a clean
+    # `git -C <path> status --porcelain` before `git worktree remove`, and
+    # neither handed-out command may carry --force (it discards uncommitted work).
+    assert "git -C" in result["worktree_cleanup_cmd"]
+    assert "status --porcelain" in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_merge_cmd"]
+    # Merge cleanup keeps the safe branch delete (-d), never the forced -D.
+    assert "git branch -d " in result["worktree_merge_cmd"]
+    assert "git branch -D" not in result["worktree_merge_cmd"]
     # eb2e44f8 — the claim response also names the base branch the worktree
     # is expected to be created from, matching worktree_merge_cmd's target,
     # so an executor can pass it straight to POST /worktrees' base_branch
