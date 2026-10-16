@@ -847,7 +847,7 @@ def verify_fetched_signed_file(
             for name in expected:
                 if hashlib.sha256(archive.read(name)).digest() != hashlib.sha256(current_source_packed[name]).digest():
                     return FETCH_MISMATCH_MESSAGE
-    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, ValueError, KeyError, TypeError, RecursionError):
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, ValueError, KeyError, TypeError, RecursionError, RuntimeError, NotImplementedError):
         return FETCH_MISMATCH_MESSAGE
     return None
 

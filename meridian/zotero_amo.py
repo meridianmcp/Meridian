@@ -277,7 +277,9 @@ class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urlsplit(newurl).netloc.lower() != urlsplit(req.full_url).netloc.lower():
+        target, origin = urlsplit(newurl), urlsplit(req.full_url)
+        # The scheme must match too: an https request redirected to http would send the token in cleartext.
+        if target.scheme.lower() != origin.scheme.lower() or target.netloc.lower() != origin.netloc.lower():
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 

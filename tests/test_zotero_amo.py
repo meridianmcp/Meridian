@@ -352,6 +352,13 @@ def test_the_redirect_guard_refuses_a_redirect_to_another_host():
     assert handler.redirect_request(request, None, 302, "Found", {}, "https://evil.example/x") is None
 
 
+def test_the_redirect_guard_refuses_a_same_host_downgrade_to_http():
+    # The token must never leave over plain http, even when the host is unchanged.
+    handler = amo._NoCrossHostRedirect()
+    request = urllib.request.Request(VERSION_URL, headers={"Authorization": "JWT a.b.c"})
+    assert handler.redirect_request(request, None, 302, "Found", {}, "http://addons.mozilla.org/x") is None
+
+
 def test_the_redirect_guard_follows_a_redirect_that_stays_on_the_api_host():
     handler = amo._NoCrossHostRedirect()
     request = urllib.request.Request(VERSION_URL, headers={"Authorization": "JWT a.b.c"})

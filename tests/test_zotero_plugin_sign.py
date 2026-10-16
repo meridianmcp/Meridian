@@ -2127,3 +2127,25 @@ def test_docs_section_4a_has_the_fetching_an_approved_version_paragraph():
     assert "Fetching an approved version" in section
     assert "sign-plugin --fetch" in section
     assert "never uploads anything" in section
+
+
+def test_an_unreadable_zip_member_is_a_refusal_not_a_crash(monkeypatch):
+    # zipfile raises RuntimeError for an encrypted member and NotImplementedError for an unsupported method.
+    import io
+    import json
+    import zipfile
+
+    buffer = io.BytesIO()
+    manifest = {"version": "0.1.0", "applications": {"zotero": {"id": sign.PLUGIN_ADDON_ID}}}
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("META-INF/mozilla.rsa", b"sig")
+        archive.writestr("manifest.json", json.dumps(manifest))
+
+    def unreadable(self, name, *args, **kwargs):
+        raise RuntimeError("encrypted member")
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", unreadable)
+    refusal = sign.verify_fetched_signed_file(
+        buffer.getvalue(), expected_id=sign.PLUGIN_ADDON_ID, expected_version="0.1.0", current_source_packed={},
+    )
+    assert isinstance(refusal, str) and refusal
