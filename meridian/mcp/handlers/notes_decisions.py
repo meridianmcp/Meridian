@@ -29,6 +29,7 @@ from typing import Any
 import meridian.server as _server
 from meridian import db as db_module
 from meridian._deps import validate_input_size, _MANUAL_NOTE_LINT
+from meridian.finding_identity import _ARXIV_DOI_RE, finding_identity
 # 867317f6 — not re-exported through meridian.db's explicit named import
 # list (meridian/db/__init__.py is a high-contention file outside this
 # sprint item's declared scope), so import the new proposal error type
@@ -2234,29 +2235,102 @@ async def handle_save_finding(
 
 
 # fe0b0331 (doi / pmid args) — a bare DOI, ``doi:``-prefixed, or doi.org form.
-_CAPTURE_DOI_RE = re.compile(
-    r"^\s*(?:doi\s*:\s*|(?:https?://)?(?:dx\.)?doi\.org/)?(?P<doi>10\.\d{4,9}/\S+?)\s*$",
-    re.IGNORECASE,
+# re.ASCII is required: without it IGNORECASE matches U+0131 to "i" and U+017F to "s".
+_CAPTURE_DOI_PREFIX_RE = re.compile(
+    r"doi[ \t\r\n]*:[ \t\r\n]*|(?:https?://)?(?:dx\.)?doi\.org/", re.IGNORECASE | re.ASCII,
 )
+# The only characters trimmed from the edges of a doi argument. str.strip() is not
+# used because it also removes NBSP and other Unicode spaces, which must be refused.
+_CAPTURE_DOI_EDGE_WS = " \t\r\n"
+# The only characters a DOI may hold after its 10.NNNN/ prefix: ASCII letters, digits and
+# . _ ; ( ) / : -. Both letter cases are listed, so no IGNORECASE is needed; IGNORECASE
+# would also match U+212A KELVIN SIGN to k and U+017F to s. Everything else is refused:
+# % (no escape is decoded), ? # & < > and quotes (finding_identity ends a DOI at ? # &
+# and never keeps < > or quotes), [ ] { } \ ^ | backtick, whitespace and all non-ASCII.
+_CAPTURE_DOI_OUTSIDE_RE = re.compile(r"[^A-Za-z0-9._;()/:\-]")
+_CAPTURE_DOI_SHAPE_RE = re.compile(r"10\.[0-9]{4,9}/")
 _CAPTURE_PMID_RE = re.compile(r"^\s*[0-9]{1,9}\s*$")
+_DOI_ERROR = "capture_research_finding doi must be a DOI such as 10.1145/3292500.3330701"
+
+
+def _doi_char_name(ch: str) -> str:
+    """Name one character for a refusal reason: its repr if printable ASCII, else U+XXXX."""
+    return repr(ch) if "!" <= ch <= "~" else f"U+{ord(ch):04X}"
+
+
+def _normalise_capture_doi(raw: str) -> tuple[str | None, str | None]:
+    """Return ``(doi, None)`` when ``raw`` may be stored, else ``(None, reason)``.
+
+    ``raw`` is the doi argument after ``_capture_source_url`` has trimmed its ASCII
+    edge whitespace and removed any ``doi:`` / ``doi.org/`` prefix. Rules, in order:
+
+    1. A ``%`` is refused. No percent escape is decoded, because decoding stored
+       malformed URLs (``%25`` became a bare ``%``).
+    2. The value must start ``10.NNNN/``, or the reason names the shape.
+    3. Every suffix character must be on the allowlist (``_CAPTURE_DOI_OUTSIDE_RE``).
+       The reason names the first character outside it.
+    4. One trailing period is dropped as prose. A trailing ``; : ( )`` or ``..`` is
+       ambiguous and refused, and the suffix must not be empty.
+    5. No suffix segment may be ``.`` or ``..``. A URL parser resolves those, so the
+       stored URL would name a different target. The check reads the raw suffix, so the
+       trailing period that rule 4 drops is still seen and ``x/.`` is refused. Only a
+       whole segment counts, so ``...`` and ``a..b`` are accepted.
+    6. The arXiv-issued form that fully matches ``_ARXIV_DOI_RE`` is accepted and keys
+       to ``arxiv:<id>``, the same key as its arxiv.org URL. It is the only case that
+       skips rule 7.
+    7. Every other DOI must have the identity key ``doi:`` + the DOI lowercased, so the
+       stored DOI is the one whose dedupe key was checked. Only ASCII reaches this
+       point, so ``lower`` and ``casefold`` agree and ``lower`` is compared.
+
+    The caller stores ``https://doi.org/<doi>`` and nothing else.
+    """
+    if "%" in raw:
+        return None, "percent escapes are not accepted; give the plain DOI"
+    if _CAPTURE_DOI_SHAPE_RE.match(raw) is None:
+        return None, "it is not of the form 10.NNNN/suffix"
+    # The 10.NNNN/ prefix is ASCII digits by now, so a hit here is in the suffix.
+    outside = _CAPTURE_DOI_OUTSIDE_RE.search(raw)
+    if outside is not None:
+        return None, f"{_doi_char_name(outside.group())} is not an allowed DOI character"
+    if raw.endswith(".."):
+        return None, "ambiguous trailing character"
+    doi = raw[:-1] if raw.endswith(".") else raw
+    if doi.endswith((";", ":", "(", ")")):
+        return None, "ambiguous trailing character"
+    if not doi.partition("/")[2]:
+        return None, "no suffix after the DOI prefix"
+    # The raw suffix is read, because the trailing period dropped above would hide the
+    # segment in "x/.". Only a whole segment is refused, so "..." and "a..b" pass.
+    if any(segment in (".", "..") for segment in raw.partition("/")[2].split("/")):
+        return None, 'a path segment of "." or ".." would resolve to a different URL'
+    if _ARXIV_DOI_RE.fullmatch(doi):  # ASCII only by the rules above, so no Unicode digit
+        return doi, None
+    if finding_identity(f"https://doi.org/{doi}") != f"doi:{doi.lower()}":
+        return None, "its dedupe key would not be the DOI itself"
+    return doi, None
 
 
 def _capture_source_url(args: dict[str, Any]) -> tuple[str | None, str | None]:
     """Resolve the provenance URL capture_research_finding stores.
 
     Precedence: an explicit ``url`` wins; otherwise a ``doi`` is stored as its
-    https doi.org form; otherwise a ``pmid`` is stored as its PubMed URL. Returns
+    https doi.org form; otherwise a ``pmid`` is stored as its PubMed URL. A doi
+    that fails the rules in ``_normalise_capture_doi`` is refused with the doi
+    error plus the reason in parentheses. The stored DOI is the normalised
+    one, so it is the exact value whose dedupe key was checked. Returns
     ``(source_url, error)``. ``(None, None)`` means no identifier was given.
     """
     _url = (args.get("url") or "").strip()
     if _url:
         return _url, None
-    _doi = str(args.get("doi") or "").strip()
+    # Only ASCII blank means no doi. An NBSP-only value is a value, so it is refused.
+    _doi = str(args.get("doi") or "").strip(_CAPTURE_DOI_EDGE_WS)
     if _doi:
-        m = _CAPTURE_DOI_RE.match(_doi)
-        if m is None:
-            return None, "capture_research_finding doi must be a DOI such as 10.1145/3292500.3330701"
-        return f"https://doi.org/{m.group('doi')}", None
+        _prefix = _CAPTURE_DOI_PREFIX_RE.match(_doi)
+        _norm, _why = _normalise_capture_doi(_doi[_prefix.end():] if _prefix else _doi)
+        if _why is not None:
+            return None, f"{_DOI_ERROR} ({_why})"
+        return f"https://doi.org/{_norm}", None
     _pmid = str(args.get("pmid") or "").strip()
     if _pmid:
         if _CAPTURE_PMID_RE.match(_pmid) is None:

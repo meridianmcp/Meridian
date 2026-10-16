@@ -561,6 +561,52 @@ async def test_malformed_doi_arg_is_an_error_and_stores_nothing(db, project, bad
     assert await _finding_notes(db, pid) == []
 
 
+# A DOI whose dedupe key is not the DOI itself would collide with another DOI
+# (finding_identity cuts a doi.org URL at ? # & and excludes < > and quotes), so
+# the doi argument refuses it and stores nothing. The refusal keeps the existing
+# doi error as its prefix and appends the reason in parentheses.
+_DOI_KEY_ERROR = "capture_research_finding doi must be a DOI such as 10.1145/3292500.3330701"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    "10.1000/x?y",                 # ? ends the key: doi:10.1000/x
+    "10.1000/x#y",                 # # ends the key (fragment)
+    "10.1000/x&y",                 # & ends the key (query separator)
+    '10.1000/x"y',                 # quote characters are not part of the key
+    "10.1002/(SICI)1097-4636(199601)30:1<40::AID-JBM4>3.0.CO;2-K",  # legacy SICI: < and >
+    "https://doi.org/10.1000/x?y", # the doi.org-prefixed form is refused the same way
+])
+async def test_doi_arg_whose_dedupe_key_is_not_the_doi_is_refused(db, project, bad):
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi=bad)
+    assert set(out) == {"error"}
+    assert out["error"].startswith(_DOI_KEY_ERROR + " (")
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_plain_doi_arg_is_still_accepted_and_stored(db, project):
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi="10.1000/xyz")
+    assert "error" not in out
+    assert out["note"]["source"] == "https://doi.org/10.1000/xyz"
+    stored = await db_module.get_project_note(db, out["note"]["id"])
+    assert stored["source"] == "https://doi.org/10.1000/xyz"
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_arxiv_issued_doi_arg_is_accepted_and_dedupes_with_its_arxiv_url(db, project):
+    pid = project["id"]
+    first = await _capture_args(db, pid, doi="10.48550/arXiv.2301.12345")
+    assert "error" not in first
+    assert first["note"]["source"] == "https://doi.org/10.48550/arXiv.2301.12345"
+    second = await _capture(db, pid, "https://arxiv.org/abs/2301.12345v2")
+    assert second["existing_note_id"] == first["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad", ["PMID12", "1234567890", "12.5"])
 async def test_malformed_pmid_arg_is_an_error(db, project, bad):
@@ -589,3 +635,297 @@ def test_capture_tool_schema_advertises_doi_and_pmid_without_requiring_url():
     assert props["doi"]["type"] == "string"
     assert props["pmid"]["type"] == "string"
     assert schema["inputSchema"]["required"] == ["summary"]
+
+
+# ---------------------------------------------------------------------------
+# 8. fe0b0331: a doi argument stores only a DOI that keys to itself
+#
+# Rules (see _normalise_capture_doi). First the ASCII edge whitespace (space, tab,
+# CR, LF) is trimmed and one doi: or doi.org/ prefix (including its dx. and https://
+# forms) is removed. Then, in order:
+#   * a % is refused. No percent escape is decoded;
+#   * the value must start 10.NNNN/ (4 to 9 digits), or it is refused by its shape;
+#   * the suffix may hold only ASCII letters, digits and . _ ; ( ) / : -. The reason
+#     names the first character outside that set;
+#   * one trailing period is dropped as prose. A trailing ; : ( ) or .. is ambiguous;
+#   * a suffix segment that is exactly . or .. is refused, because a URL parser resolves
+#     it to a different URL. The raw suffix is read, so x/. is refused too;
+#   * the arXiv-issued form, when it fully matches _ARXIV_DOI_RE, keys to arxiv:<id>
+#     and is the only value that skips the identity check;
+#   * every other DOI must key to doi: plus the DOI lowercased.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad,reason", [
+    # Not 10.NNNN/ at the start, so the reason names the shape. A prefix lookalike is
+    # never stripped, so it reaches the shape check and fails there.
+    ("not-a-doi", "not of the form 10.NNNN/suffix"),
+    ("10.12/x", "not of the form 10.NNNN/suffix"),
+    ("10.1000", "not of the form 10.NNNN/suffix"),
+    ("https://example.com/paper", "not of the form 10.NNNN/suffix"),
+    ("do\u0131:10.1000/xyz", "not of the form 10.NNNN/suffix"),  # DOTLESS I in the prefix
+    ("http\u017f://doi.org/10.1000/xyz", "not of the form 10.NNNN/suffix"),  # LONG S
+    ("doi:\u00a010.1000/xyz", "not of the form 10.NNNN/suffix"),  # NBSP after the prefix
+    ("\u00a010.1000/xyz", "not of the form 10.NNNN/suffix"),  # NBSP before the value
+    ("\x0c10.1000/xyz", "not of the form 10.NNNN/suffix"),  # form feed before the value
+    # The shape is right, so the reason names the first character outside the suffix set.
+    ("10.1000/x\u00e9", "U+00E9 is not an allowed DOI character"),  # e with acute accent
+    ("10.1000/\u00df", "U+00DF is not an allowed DOI character"),  # sharp s
+    ("10.1000/\u212a", "U+212A is not an allowed DOI character"),  # KELVIN SIGN
+    ("10.48550/arXiv.2301.1234\u0665", "U+0665 is not an allowed DOI character"),
+    ("10.1000/x\u00a0y", "U+00A0 is not an allowed DOI character"),  # NBSP inside
+    ("10.1000/xyz\u00a0", "U+00A0 is not an allowed DOI character"),  # NBSP at the end
+    ("10.1000/x\ty", "U+0009 is not an allowed DOI character"),
+    ("10.1000/x\x7fy", "U+007F is not an allowed DOI character"),
+    ("10.1000/x y", "U+0020 is not an allowed DOI character"),
+    ("10.1000/x[1]", "'[' is not an allowed DOI character"),
+    ("10.1000/x]", "']' is not an allowed DOI character"),
+    ("10.1000/x{y", "'{' is not an allowed DOI character"),
+    ("10.1000/x}", "'}' is not an allowed DOI character"),
+    ("10.1000/x\\y", "'\\\\' is not an allowed DOI character"),
+    ("10.1000/x^y", "'^' is not an allowed DOI character"),
+    ("10.1000/x|y", "'|' is not an allowed DOI character"),
+    ("10.1000/x`y", "'`' is not an allowed DOI character"),
+    ("10.1000/x,", "',' is not an allowed DOI character"),
+    ("10.1000/x+y", "'+' is not an allowed DOI character"),
+    # A "." or ".." segment would resolve to a different URL. The trailing "/.." of x/..
+    # is caught earlier, by the trailing-character rule, and is in the test below.
+    ("10.1000/../x", 'a path segment of "." or ".." would resolve to a different URL'),
+    ("10.1000/x/./y", 'a path segment of "." or ".." would resolve to a different URL'),
+    ("10.1000/x/../y", 'a path segment of "." or ".." would resolve to a different URL'),
+    ("10.1000/x/.", 'a path segment of "." or ".." would resolve to a different URL'),  # trailing /.
+    # No suffix after the prefix, once the trailing period is dropped.
+    ("10.1000/.", "no suffix after the DOI prefix"),
+    ("10.1000/", "no suffix after the DOI prefix"),
+])
+async def test_doi_refusals_name_the_reason_and_store_nothing(db, project, bad, reason):
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi=bad)
+    assert set(out) == {"error"}
+    assert out["error"].startswith(_DOI_KEY_ERROR + " (")
+    assert reason in out["error"]
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["10.1000/x:", "10.1000/x;", "10.1000/x;.", "10.1000/x(",
+                                 "10.1000/x)", "10.1000/x..", "10.1000/x...", "10.1000/x/.."])
+async def test_trailing_punctuation_other_than_a_period_is_refused(db, project, bad):
+    """Decision: one trailing period is prose and is dropped. A trailing ; : ( ) is refused
+    as ambiguous, because it may be part of the DOI, and so is a trailing .. The value
+    10.1000/x;. is refused for its ;, once its period is dropped. Nothing is stored."""
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi=bad)
+    assert set(out) == {"error"}
+    assert out["error"].startswith(_DOI_KEY_ERROR + " (")
+    assert "ambiguous trailing character" in out["error"]
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_trailing_period_is_dropped_and_dedupes(db, project):
+    """Decision: a single trailing period is prose. It is dropped, the stored DOI is the
+    bare one, and it dedupes with the bare DOI. 10.1145/3292500.3330701. is one."""
+    pid = project["id"]
+    first = await _capture_args(db, pid, doi="10.1145/3292500.3330701.")
+    assert "error" not in first
+    assert first["note"]["source"] == "https://doi.org/10.1145/3292500.3330701"
+    second = await _capture_args(db, pid, doi="10.1145/3292500.3330701")
+    assert second["existing_note_id"] == first["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_every_allowlisted_punctuation_mark_is_accepted_inside_a_doi(db, project):
+    """The suffix allowlist is . _ ; ( ) / : - together with letters and digits. Each mark
+    is accepted between other characters, and the stored DOI is the one typed."""
+    pid = project["id"]
+    doi = "10.1000/a.b_c;d(e)f:g-h/i"
+    out = await _capture_args(db, pid, doi=doi)
+    assert "error" not in out
+    assert out["note"]["source"] == f"https://doi.org/{doi}"
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("doi", ["10.1000/x...y", "10.1000/a..b"])
+async def test_dots_inside_a_segment_are_not_dot_segments_and_are_accepted(db, project, doi):
+    """Only a whole "." or ".." segment is refused. A run of dots inside a segment is
+    ordinary, so the DOI is accepted and stored exactly as typed."""
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi=doi)
+    assert "error" not in out
+    assert out["note"]["source"] == f"https://doi.org/{doi}"
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad,reason", [
+    ("10.48550/arXiv.2301.12345?y", "'?'"),  # the arXiv exemption admits no stop character
+    ("10.48550/arXiv.2301.12345&y", "'&'"),
+    ("10.48550/arXiv.2301.12345<x", "'<'"),
+    ("10.1000/x#y", "'#'"),
+    ('10.1000/x"y', '\'"\''),
+    ("10.1000/x'y", "\"'\""),
+    # Legacy SICI DOIs contain < and >, so they are refused. This is a deliberate trade-off.
+    ("10.1002/(SICI)1097-4636(199601)30:1<40::AID-JBM4>3.0.CO;2-K", "'<'"),
+])
+async def test_stop_characters_are_refused_and_named(db, project, bad, reason):
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi=bad)
+    assert set(out) == {"error"}
+    assert out["error"].startswith(_DOI_KEY_ERROR + " (")
+    assert reason in out["error"]
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_kelvin_sign_doi_is_refused_and_does_not_merge_with_ascii_k(db, project):
+    """U+212A KELVIN SIGN lowercases to ASCII k. It is refused as a non-allowed character
+    before any case folding, so it cannot merge onto the ASCII spelling of the same DOI."""
+    pid = project["id"]
+    ascii_k = await _capture_args(db, pid, doi="10.1000/k")
+    kelvin = await _capture_args(db, pid, doi="10.1000/\u212a")
+    assert set(kelvin) == {"error"}
+    assert kelvin["error"] == f"{_DOI_KEY_ERROR} (U+212A is not an allowed DOI character)"
+    assert len(await _finding_notes(db, pid)) == 1
+    assert ascii_k["note"]["source"] == "https://doi.org/10.1000/k"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", [
+    "10.1000/xyz", "doi:10.1000/xyz", "DOI:10.1000/xyz", "doi: 10.1000/xyz",
+    "doi : 10.1000/xyz", "doi:\t10.1000/xyz", "https://doi.org/10.1000/xyz",
+    "http://dx.doi.org/10.1000/xyz", "dx.doi.org/10.1000/xyz", "doi.org/10.1000/xyz",
+    "10.1000/xyz.",
+])
+async def test_accepted_doi_spellings_store_one_normalised_doi(db, project, spelling):
+    """Plain DOIs are accepted in every prefix form, and a trailing period is dropped. Each
+    spelling stores the same https://doi.org/ form, which dedupes with a publisher URL."""
+    pid = project["id"]
+    first = await _capture_args(db, pid, doi=spelling)
+    assert "error" not in first
+    assert first["note"]["source"] == "https://doi.org/10.1000/xyz"
+    dup = await _capture(db, pid, "https://dl.acm.org/doi/10.1000/XYZ")
+    assert dup["existing_note_id"] == first["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    "10.1000/x%2Fy",   # an encoded slash
+    "10.1000%2Fxyz",   # an encoded slash in the prefix
+    "10.1000/x%25y",   # an encoded percent sign, which would decode to a bare %
+    "10.1000/x%20y",   # an encoded space
+    "10.1000/x%2525",  # a double-encoded percent sign
+    "10.1000/x%",      # a lone percent sign
+    "doi:10.1000/x%2Fy",
+    "https://doi.org/10.1000/x%2Fy",
+])
+async def test_percent_is_refused_and_no_escape_is_decoded(db, project, bad):
+    """Decision: percent escapes are not decoded at all. Decoding stored malformed URLs, so
+    any % is refused with a request for the plain DOI, and nothing is stored."""
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi=bad)
+    expected = f"{_DOI_KEY_ERROR} (percent escapes are not accepted; give the plain DOI)"
+    assert out == {"error": expected}
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_ascii_case_variants_are_accepted_and_dedupe(db, project):
+    pid = project["id"]
+    first = await _capture_args(db, pid, doi="10.1000/XYZ")
+    assert "error" not in first
+    assert first["note"]["source"] == "https://doi.org/10.1000/XYZ"
+    second = await _capture_args(db, pid, doi="10.1000/xyz")
+    assert second["existing_note_id"] == first["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_casefold_collision_is_refused_and_does_not_merge(db, project):
+    """The sharp s (U+00DF) casefolds to ss. It is refused as a non-allowed character, so it
+    cannot merge onto an existing 10.1000/ss note, while ASCII case variants of ss still
+    dedupe."""
+    pid = project["id"]
+    ss = await _capture_args(db, pid, doi="10.1000/ss")
+    refused = await _capture_args(db, pid, doi="10.1000/\u00df")
+    assert set(refused) == {"error"}
+    assert refused["error"] == f"{_DOI_KEY_ERROR} (U+00DF is not an allowed DOI character)"
+    assert len(await _finding_notes(db, pid)) == 1
+    upper = await _capture_args(db, pid, doi="10.1000/SS")
+    assert upper["existing_note_id"] == ss["note"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_arxiv_doi_forms_are_exempt_and_dedupe_with_the_arxiv_url(db, project):
+    pid = project["id"]
+    new_style = await _capture_args(db, pid, doi="10.48550/ARXIV.2301.12345v2")
+    assert "error" not in new_style
+    old_style = await _capture_args(db, pid, doi="10.48550/arXiv.hep-th/9901001.")
+    assert "error" not in old_style
+    assert old_style["note"]["source"] == "https://doi.org/10.48550/arXiv.hep-th/9901001"
+    new_dup = await _capture(db, pid, "https://arxiv.org/abs/2301.12345")
+    assert new_dup["existing_note_id"] == new_style["note"]["id"]
+    old_dup = await _capture(db, pid, "https://arxiv.org/abs/hep-th/9901001v1")
+    assert old_dup["existing_note_id"] == old_style["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("padded", ["  10.1000/xyz  ", "\t10.1000/xyz\r\n", "  doi: 10.1000/xyz  "])
+async def test_padded_doi_arg_is_accepted_and_dedupes_with_the_bare_doi(db, project, padded):
+    """Leading and trailing ASCII space, tab, CR and LF are trimmed from the argument before
+    the allowlist check, so a padded value stores and dedupes."""
+    pid = project["id"]
+    first = await _capture_args(db, pid, doi=padded)
+    assert "error" not in first
+    assert first["note"]["source"] == "https://doi.org/10.1000/xyz"
+    second = await _capture_args(db, pid, doi="10.1000/xyz")
+    assert second["existing_note_id"] == first["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_nbsp_only_doi_arg_is_refused_not_treated_as_absent(db, project):
+    """Only ASCII blank means no doi. An NBSP-only value is a value: it gets the doi error
+    with its reason, not the 'requires a url' error that a blank doi gets."""
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi="\u00a0")
+    assert set(out) == {"error"}
+    assert out["error"] == f"{_DOI_KEY_ERROR} (it is not of the form 10.NNNN/suffix)"
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    "do\u0131:10.1000/xyz",              # DOTLESS I (U+0131): Unicode IGNORECASE matches "i"
+    "http\u017f://doi.org/10.1000/xyz",  # LONG S (U+017F): Unicode IGNORECASE matches "s"
+])
+async def test_lookalike_letters_do_not_match_the_doi_prefix(db, project, bad):
+    """re.ASCII keeps the prefix regex from matching these lookalikes, so no prefix is
+    stripped. The value then fails the shape check and nothing is stored."""
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi=bad)
+    assert set(out) == {"error"}
+    assert out["error"] == f"{_DOI_KEY_ERROR} (it is not of the form 10.NNNN/suffix)"
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_identity_guard_refuses_a_key_that_differs_and_only_arxiv_skips_it(
+    db, project, monkeypatch,
+):
+    """The identity check (rule 7) is a backstop: no DOI that rules 1 to 6 admit is expected
+    to fail it. So finding_identity is patched to return a different key, which checks that
+    the guard refuses. The arXiv form is still stored, because it is the only case that
+    skips the check."""
+    monkeypatch.setattr(nd_mod, "finding_identity", lambda source: "doi:10.9999/other")
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi="10.1000/xyz")
+    assert set(out) == {"error"}
+    assert out["error"] == f"{_DOI_KEY_ERROR} (its dedupe key would not be the DOI itself)"
+    assert await _finding_notes(db, pid) == []
+    arxiv = await _capture_args(db, pid, doi="10.48550/arXiv.2301.12345")
+    assert arxiv["note"]["source"] == "https://doi.org/10.48550/arXiv.2301.12345"
