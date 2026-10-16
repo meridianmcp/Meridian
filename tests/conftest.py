@@ -667,13 +667,15 @@ def _isolate_zotero_plugin(monkeypatch, tmp_path_factory):
     the per-user Meridian state dir and the Zotero data root. For EVERY test,
     point the state dir at a temp folder, point the Zotero data root at a folder
     with no profiles.ini (so no real Zotero profile can be found), and force
-    auto-install off. A test that wants the install path opts in with
-    monkeypatch.setenv / monkeypatch.delenv on its own.
+    auto-install off. The close override is pinned unset, so the saved close
+    choice governs unless a test sets the variable itself. A test that wants the
+    install path opts in with monkeypatch.setenv / monkeypatch.delenv on its own.
     """
     state_dir = tmp_path_factory.mktemp("meridian_state")
     monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(state_dir))
     monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(state_dir / "no-zotero-profile"))
     monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    monkeypatch.delenv("MERIDIAN_ZOTERO_CLOSE_ON_INSTALL", raising=False)
 
 
 @pytest_asyncio.fixture
