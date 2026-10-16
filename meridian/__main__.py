@@ -224,9 +224,10 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
     * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]`` -- install the
       Zotero bridge plugin into Zotero's profile. A running Zotero is closed first when the
       saved setting allows it; ``--keep-zotero-open`` refuses instead.
-    * ``zotero sign-plugin [--timeout-minutes N] [--dry-run]`` -- sign the Zotero bridge plugin
-      with Mozilla as an unlisted add-on (needs WEB_EXT_API_KEY and WEB_EXT_API_SECRET). Never
-      closes Zotero, and an install never signs.
+    * ``zotero sign-plugin [--timeout-minutes N] [--dry-run] [--fetch]`` -- sign the Zotero bridge plugin
+      with Mozilla as an unlisted add-on (needs WEB_EXT_API_KEY and WEB_EXT_API_SECRET). ``--fetch``
+      downloads the file Mozilla already approved instead, and never uploads. Never closes Zotero,
+      and an install never signs.
 
     Returns the exit code, or ``None`` when ``raw_argv`` is not a subcommand.
     """

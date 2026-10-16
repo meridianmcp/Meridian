@@ -1756,3 +1756,374 @@ def test_no_user_message_in_the_install_or_the_tray_names_the_add_ons_menu():
     for text in (install_source, tray_source):
         assert "Tools > Add-ons" not in text
         assert "Install Add-on From File" not in text
+
+
+# ---------------------------------------------------------------------------
+# Fetching the approved version: read-only, verified against this source, stored as signed, never a submission
+# ---------------------------------------------------------------------------
+
+DOWNLOAD_URL = "https://addons.mozilla.org/firefox/downloads/file/99/meridian-zotero-0.1.0.xpi"
+FETCH_NOT_APPROVED_TEXT = (
+    "Mozilla has not approved and signed this version of the Zotero bridge plugin yet. Nothing was fetched or stored. "
+    "Try again later, after Mozilla approves this version."
+)
+FETCH_MISMATCH_TEXT = (
+    "The approved version does not match this source, so nothing was stored. If the source changed after Mozilla "
+    "approved this version, bump the version in manifest.json to sign a new build."
+)
+FETCH_UNSIGNED_TEXT = "The file Mozilla returned has no signature in META-INF/ (.rsa or .sf), so nothing was stored."
+FETCH_NOT_ZIP_TEXT = "The file Mozilla returned is not a zip archive, so nothing was stored."
+FETCH_SOURCE_CHANGED_TEXT = (
+    "The plugin source changed while the approved file was being fetched, so nothing was stored. Run the command again."
+)
+FETCH_STORE_FAILED_TEXT = "The fetched file could not be stored, so nothing was recorded. Nothing was uploaded."
+FETCH_STATUS_LEAD = "Fetched the approved Zotero bridge plugin 0.1.0 from Mozilla and stored it at "
+
+
+class FakeAmo:
+    """A stand-in for the AMO transport. It answers the version read and the download, and records every call."""
+
+    def __init__(self, record=None, *, version_status=200, download=b"", raise_on_call=None, on_download=None):
+        self.record = record
+        self.version_status = version_status
+        self.download = download
+        self.raise_on_call = raise_on_call
+        self.on_download = on_download
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, url, headers):
+        self.calls.append((url, dict(headers)))
+        if self.raise_on_call is not None:
+            raise self.raise_on_call
+        if url == DOWNLOAD_URL:
+            if self.on_download is not None:
+                self.on_download()
+            return 200, self.download
+        return self.version_status, json.dumps(self.record).encode("utf-8")
+
+
+def _version_record(*, version="0.1.0", status="public", signed=True, url=DOWNLOAD_URL) -> dict:
+    return {
+        "id": 7,
+        "version": version,
+        "channel": "unlisted",
+        "file": {
+            "id": 99, "status": status, "is_mozilla_signed_extension": signed, "url": url, "size": None, "hash": None,
+        },
+    }
+
+
+def _approved_entries(source: Path) -> "dict[str, bytes]":
+    """The files of a Mozilla-signed copy of ``source``: the staged copy's bytes plus a META-INF signature."""
+    files = {
+        name: (sign._staged_manifest(data) if name == "manifest.json" else data)
+        for name, data in sign._packed_snapshot(source)
+    }
+    files["META-INF/manifest.mf"] = b"Manifest-Version: 1.0\n"
+    files["META-INF/mozilla.rsa"] = b"stand-in signature"
+    files["META-INF/mozilla.sf"] = b"stand-in signature file"
+    return files
+
+
+def _approved_xpi(source: Path) -> bytes:
+    return _zip_with(_approved_entries(source))
+
+
+def _fetch(source, state, *, transport, env=CREDS, runner=None):
+    return sign.sign_plugin(
+        env=env,
+        runner=runner if runner is not None else FakeRunner(),
+        state_dir=state,
+        source_dir=source,
+        clock=lambda: FIXED_NOW,
+        fetch=True,
+        transport=transport,
+    )
+
+
+def _verify(data: bytes, source: Path, *, version: str = "0.1.0"):
+    return sign.verify_fetched_signed_file(
+        data,
+        expected_id=sign.PLUGIN_ADDON_ID,
+        expected_version=version,
+        current_source_packed=dict(sign._packed_snapshot(source)),
+    )
+
+
+def test_verify_accepts_the_approved_file_built_from_the_current_source(source):
+    assert _verify(_approved_xpi(source), source) is None
+
+
+def test_verify_refuses_bytes_that_are_not_a_zip(source):
+    assert _verify(b"not a zip at all", source) == FETCH_NOT_ZIP_TEXT
+
+
+def test_verify_refuses_a_file_with_no_meta_inf_signature(source):
+    entries = {name: data for name, data in _approved_entries(source).items() if not name.startswith("META-INF/")}
+    assert _verify(_zip_with(entries), source) == FETCH_UNSIGNED_TEXT
+    entries["mozilla.rsa"] = b"a signature outside META-INF is not one"
+    assert _verify(_zip_with(entries), source) == FETCH_UNSIGNED_TEXT
+
+
+def test_verify_refuses_a_runtime_file_whose_bytes_differ_from_the_source(source):
+    entries = _approved_entries(source)
+    entries["bootstrap.js"] = b"// a different build\n"
+    assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
+
+
+def test_verify_refuses_a_runtime_file_the_source_has_but_the_file_does_not(source):
+    entries = _approved_entries(source)
+    del entries["lib/pdf.js"]
+    assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
+
+
+def test_verify_refuses_an_extra_runtime_file_the_source_does_not_have(source):
+    entries = _approved_entries(source)
+    entries["lib/extra.js"] = b"export {};\n"
+    assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
+
+
+def test_verify_refuses_a_manifest_for_another_version(source):
+    entries = _approved_entries(source)
+    manifest = json.loads(entries["manifest.json"].decode("utf-8"))
+    manifest["version"] = "0.2.0"
+    entries["manifest.json"] = json.dumps(manifest).encode("utf-8")
+    assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
+
+
+def test_verify_refuses_a_manifest_that_differs_beyond_browser_specific_settings(source):
+    entries = _approved_entries(source)
+    manifest = json.loads(entries["manifest.json"].decode("utf-8"))
+    manifest["name"] = "A different plugin"
+    entries["manifest.json"] = json.dumps(manifest).encode("utf-8")
+    assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
+
+
+def test_verify_refuses_a_manifest_for_another_add_on_id(source):
+    entries = _approved_entries(source)
+    manifest = json.loads(entries["manifest.json"].decode("utf-8"))
+    manifest["applications"]["zotero"]["id"] = "someone-else@example.org"
+    entries["manifest.json"] = json.dumps(manifest).encode("utf-8")
+    assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
+
+
+def test_verify_refuses_a_zip_that_lists_one_name_twice(source):
+    buffer = io.BytesIO()
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, data in _approved_entries(source).items():
+                archive.writestr(name, data)
+            archive.writestr("bootstrap.js", b"second copy")
+    assert _verify(buffer.getvalue(), source) == FETCH_MISMATCH_TEXT
+
+
+def test_a_fetched_approved_version_is_verified_and_stored_as_signed_with_a_fetched_record(source, state):
+    xpi = _approved_xpi(source)
+    fake = FakeAmo(record=_version_record(), download=xpi)
+    out = _fetch(source, state, transport=fake)
+    assert out["status"] == "fetched"
+    assert out["version"] == "0.1.0"
+    assert Path(out["path"]) == state / "signed" / SIGNED_NAME
+    assert (state / "signed" / SIGNED_NAME).read_bytes() == xpi
+    (entry,) = _records(state)
+    assert entry["status"] == "signed"
+    assert entry["origin"] == "fetched"
+    assert entry["source_sha256"] == sign.source_fingerprint(source)
+    assert entry["sha256"] == hashlib.sha256(xpi).hexdigest()
+    stored_text = (state / "signed.json").read_text(encoding="utf-8")
+    assert KEY_VALUE not in stored_text and SECRET_VALUE not in stored_text
+
+
+def test_a_fetch_never_creates_a_submitted_record_and_never_runs_web_ext(source, state):
+    runner = FakeRunner()
+    fake = FakeAmo(record=_version_record(), download=_approved_xpi(source))
+    assert _fetch(source, state, transport=fake, runner=runner)["status"] == "fetched"
+    assert runner.calls == []
+    assert [record["status"] for record in _records(state)] == ["signed"]
+
+
+def test_a_fetch_with_no_credentials_makes_no_transport_call_and_names_both_variables(source, state):
+    fake = FakeAmo(record=_version_record(), download=_approved_xpi(source))
+    out = _fetch(source, state, transport=fake, env={})
+    assert out["status"] == "no_credentials"
+    assert sign.API_KEY_ENV in out["message"] and sign.API_SECRET_ENV in out["message"]
+    assert fake.calls == []
+    assert _snapshot(state) == {}
+
+
+def test_a_fetch_of_an_already_signed_version_makes_no_network_call(source, state):
+    assert _sign(source, state)["status"] == "signed"
+    fake = FakeAmo(record=_version_record(), download=_approved_xpi(source))
+    out = _fetch(source, state, transport=fake)
+    assert out["status"] == "already_signed"
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    "record_kwargs",
+    [
+        {"status": "unreviewed", "signed": False},
+        {"status": "public", "signed": False},
+        {"status": "disabled", "signed": True},
+        {"url": None},
+    ],
+    ids=["awaiting_review_unsigned", "approved_but_unsigned", "disabled", "no_download_url"],
+)
+def test_a_fetch_of_a_version_not_approved_signed_and_available_is_not_approved_yet(source, state, record_kwargs):
+    fake = FakeAmo(record=_version_record(**record_kwargs), download=b"never")
+    out = _fetch(source, state, transport=fake)
+    assert out["status"] == "not_approved_yet"
+    assert out["message"] == FETCH_NOT_APPROVED_TEXT
+    assert len(fake.calls) == 1
+    assert _snapshot(state) == {}
+
+
+def test_a_fetch_of_a_version_mozilla_does_not_list_is_not_approved_yet(source, state):
+    fake = FakeAmo(version_status=404)
+    out = _fetch(source, state, transport=fake)
+    assert out["status"] == "not_approved_yet"
+    assert _snapshot(state) == {}
+
+
+def test_a_fetched_file_whose_runtime_files_differ_from_the_source_is_refused_and_nothing_is_stored(source, state):
+    xpi = _approved_xpi(source)
+    _write(source / "bootstrap.js", "// edited after Mozilla approved this version\n")
+    fake = FakeAmo(record=_version_record(), download=xpi)
+    out = _fetch(source, state, transport=fake)
+    assert out["status"] == "failed"
+    assert out["message"] == FETCH_MISMATCH_TEXT
+    assert "approved version does not match this source" in out["message"]
+    assert _snapshot(state) == {}
+
+
+def test_a_fetched_file_with_no_meta_inf_signature_is_refused_and_nothing_is_stored(source, state):
+    entries = {name: data for name, data in _approved_entries(source).items() if not name.startswith("META-INF/")}
+    fake = FakeAmo(record=_version_record(), download=_zip_with(entries))
+    out = _fetch(source, state, transport=fake)
+    assert out["status"] == "failed"
+    assert out["message"] == FETCH_UNSIGNED_TEXT
+    assert _snapshot(state) == {}
+
+
+def test_a_source_edit_during_the_download_stores_nothing(source, state):
+    fake = FakeAmo(
+        record=_version_record(),
+        download=_approved_xpi(source),
+        on_download=lambda: _write(source / "bootstrap.js", "// edited while the file was fetched\n"),
+    )
+    out = _fetch(source, state, transport=fake)
+    assert out["status"] == "failed"
+    assert out["message"] == FETCH_SOURCE_CHANGED_TEXT
+    assert _snapshot(state) == {}
+
+
+def test_a_transport_error_during_the_fetch_is_a_failed_result_with_no_secret_and_stores_nothing(source, state):
+    fake = FakeAmo(record=_version_record(), raise_on_call=OSError(f"reset while sending {KEY_VALUE} {SECRET_VALUE}"))
+    out = _fetch(source, state, transport=fake)
+    text = json.dumps(out)
+    assert out["status"] == "failed"
+    assert KEY_VALUE not in text and SECRET_VALUE not in text
+    assert "reset" not in text
+    assert _snapshot(state) == {}
+
+
+def test_a_download_error_during_the_fetch_stores_nothing(source, state):
+    def _lost():
+        raise OSError("connection lost during download")
+
+    fake = FakeAmo(record=_version_record(), download=_approved_xpi(source), on_download=_lost)
+    out = _fetch(source, state, transport=fake)
+    assert out["status"] == "failed"
+    assert _snapshot(state) == {}
+
+
+def test_a_timed_out_version_can_be_recovered_by_fetching_the_approved_file(source, state):
+    timed = FakeRunner(result=sign.SignRunResult(returncode=None, timed_out=True))
+    assert _sign(source, state, runner=timed)["status"] == "timeout"
+    xpi = _approved_xpi(source)
+    out = _fetch(source, state, transport=FakeAmo(record=_version_record(), download=xpi))
+    assert out["status"] == "fetched"
+    (entry,) = _records(state)
+    assert entry["status"] == "signed"
+    assert entry["origin"] == "fetched"
+    assert (state / "signed" / SIGNED_NAME).read_bytes() == xpi
+
+
+def test_a_fetch_replaces_a_tampered_stored_file_with_the_verified_approved_file(source, state):
+    assert _sign(source, state)["status"] == "signed"
+    (state / "signed" / SIGNED_NAME).write_bytes(b"tampered")
+    xpi = _approved_xpi(source)
+    out = _fetch(source, state, transport=FakeAmo(record=_version_record(), download=xpi))
+    assert out["status"] == "fetched"
+    assert (state / "signed" / SIGNED_NAME).read_bytes() == xpi
+    assert sign.stored_signed_artifact(state, "0.1.0", source_sha256=sign.source_fingerprint(source)).signed
+
+
+def test_a_fetch_store_failure_is_a_failed_result_that_records_nothing(source, state, monkeypatch):
+    def _cannot_store(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sign, "record_signed_bytes", _cannot_store)
+    out = _fetch(source, state, transport=FakeAmo(record=_version_record(), download=_approved_xpi(source)))
+    assert out["status"] == "failed"
+    assert out["message"] == FETCH_STORE_FAILED_TEXT
+    assert _snapshot(state) == {}
+
+
+def test_an_install_after_a_fetch_copies_the_approved_bytes(default_zotero, source):
+    state = zpi.signing_state_dir()
+    xpi = _approved_xpi(source)
+    assert _fetch(source, state, transport=FakeAmo(record=_version_record(), download=xpi))["status"] == "fetched"
+    result = zpi.install_default_profile(running=lambda: False)
+    assert result["status"] == "installed"
+    assert (default_zotero / "extensions" / XPI_NAME).read_bytes() == xpi
+
+
+# The CLI: --fetch routes to the fetch path, the default does not, and neither uploads
+
+def test_cli_fetch_routes_to_the_fetch_path_and_says_nothing_was_uploaded(monkeypatch, capsys):
+    seen = {}
+
+    def _fake_sign(**kwargs):
+        seen.update(kwargs)
+        return {"status": "fetched", "version": "0.1.0", "path": "C:/state/signed/x.xpi"}
+
+    monkeypatch.setattr(sign, "sign_plugin", _fake_sign)
+    rc = sign.cli_main(["--fetch"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert seen["fetch"] is True
+    assert FETCH_STATUS_LEAD in out
+    assert "Nothing was uploaded." in out
+
+
+def test_cli_default_does_not_fetch(monkeypatch):
+    seen = {}
+    fake = {"status": "failed", "message": "x"}
+    monkeypatch.setattr(sign, "sign_plugin", lambda **kwargs: seen.update(kwargs) or fake)
+    sign.cli_main([])
+    assert seen["fetch"] is False
+
+
+def test_cli_fetch_without_credentials_exits_1_and_never_opens_a_connection(monkeypatch, capsys):
+    monkeypatch.setattr(sign.amo, "urllib_transport", lambda *a, **k: pytest.fail("no connection without credentials"))
+    rc = sign.cli_main(["--fetch"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert sign.API_KEY_ENV in out and sign.API_SECRET_ENV in out
+    assert KEY_VALUE not in out and SECRET_VALUE not in out
+
+
+def test_cli_fetch_not_approved_yet_exits_1_and_says_to_try_later(monkeypatch, capsys):
+    not_approved = {"status": "not_approved_yet", "version": "0.1.0", "message": FETCH_NOT_APPROVED_TEXT}
+    monkeypatch.setattr(sign, "sign_plugin", lambda **kwargs: not_approved)
+    rc = sign.cli_main(["--fetch"])
+    assert rc == 1
+    assert FETCH_NOT_APPROVED_TEXT in capsys.readouterr().out
+
+
+def test_docs_section_4a_has_the_fetching_an_approved_version_paragraph():
+    section = _section_4a(_docs())
+    assert "Fetching an approved version" in section
+    assert "sign-plugin --fetch" in section
+    assert "never uploads anything" in section

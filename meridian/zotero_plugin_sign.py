@@ -20,6 +20,9 @@ version, outside the install path:
 * ``stored_signed_artifact`` says whether the stored file is signed, missing, tampered, used up (submitted
   but not signed), or unreadable. The install path uses it, and it never calls ``sign_plugin``.
 * A record file that is unreadable or has the wrong shape is refused. It is never treated as empty.
+* ``sign_plugin(fetch=True)`` (CLI ``sign-plugin --fetch``) reads the file Mozilla has already approved and signed for
+  this version, through ``zotero_amo``. It checks that file against this source, and stores it as ``signed`` with a
+  record that says it was fetched. A fetch never writes a ``submitted`` record and never uploads anything.
 
 Signing is the CLI step ``python -m meridian zotero sign-plugin``. It never closes Zotero and it never runs
 during an install. The state folder is per user, so a build signed from a source checkout is also the one
@@ -38,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
@@ -54,14 +58,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from meridian import zotero_amo as amo
 from meridian import zotero_plugin_install as plugin
 
 PLUGIN_ADDON_ID = "meridian-zotero@usemeridian.us"
 # web-ext 8.10.0: `sign --channel unlisted` with the API key and secret read from WEB_EXT_API_KEY and
 # WEB_EXT_API_SECRET (its sign command uses yargs' WEB_EXT env prefix). Its --timeout is in milliseconds.
 WEB_EXT_PACKAGE = "web-ext@8.10.0"
-API_KEY_ENV = "WEB_EXT_API_KEY"
-API_SECRET_ENV = "WEB_EXT_API_SECRET"
+API_KEY_ENV = amo.API_KEY_ENV
+API_SECRET_ENV = amo.API_SECRET_ENV
 DEFAULT_TIMEOUT_S = 3600.0
 MAX_TIMEOUT_MINUTES = 1440.0
 SIGNED_DIRNAME = "signed"
@@ -140,6 +145,25 @@ _NPX_UNSAFE_PATH_MESSAGE = (
     "The npx program path contains characters the signing tool cannot take safely. Move Node.js to a folder path "
     "without those characters, then try again."
 )
+# The fetch path: the approved file Mozilla already holds. Its record says it was fetched, not signed here.
+FETCHED_ORIGIN = "fetched"
+FETCH_NOT_APPROVED_MESSAGE = (
+    "Mozilla has not approved and signed this version of the Zotero bridge plugin yet. Nothing was fetched or stored. "
+    "Try again later, after Mozilla approves this version."
+)
+FETCH_MISMATCH_MESSAGE = (
+    "The approved version does not match this source, so nothing was stored. If the source changed after Mozilla "
+    "approved this version, bump the version in manifest.json to sign a new build."
+)
+FETCH_UNSIGNED_MESSAGE = (
+    "The file Mozilla returned has no signature in META-INF/ (.rsa or .sf), so nothing was stored."
+)
+FETCH_NOT_ZIP_MESSAGE = "The file Mozilla returned is not a zip archive, so nothing was stored."
+FETCH_SOURCE_CHANGED_MESSAGE = (
+    "The plugin source changed while the approved file was being fetched, so nothing was stored. Run the command again."
+)
+FETCH_STORE_FAILED_MESSAGE = "The fetched file could not be stored, so nothing was recorded. Nothing was uploaded."
+FETCH_FAILED_MESSAGE = "Mozilla's approved file could not be fetched. Nothing was stored."
 # Characters that cmd.exe reads specially. The web-ext .cmd shim runs through it, so none may reach the argv.
 _UNSAFE_PATH_CHARS = frozenset('&^%!"<>|')
 
@@ -502,25 +526,41 @@ def record_signed_artifact(
     record replaces the version's ``submitted`` record. So a record never points at a file that was not written,
     and an unreadable record file is never overwritten. The key and the secret are never stored.
     """
-    state = Path(state_dir)
     if version is None:
         version = bundle_version(source_dir)
     if source_sha256 is None:
         source_sha256 = source_fingerprint(source_dir)
     payload = Path(signed_file).read_bytes()
+    return record_signed_bytes(state_dir, payload, version=version, source_sha256=source_sha256, clock=clock)
+
+
+def record_signed_bytes(
+    state_dir: "Path | str", payload: bytes, *, version: str, source_sha256: str,
+    origin: "str | None" = None, clock: "Callable[[], float] | None" = None,
+) -> Path:
+    """Store ``payload`` as the signed file for ``version``, and mark that version ``signed``. Returns the stored path.
+
+    ``origin`` says how the file was obtained: ``fetched`` for a file fetched from Mozilla, and left out for a signing
+    run. The record file is checked first, then the file is written, and then the record replaces the version's record.
+    So a record never points at a file that was not written, and an unreadable record file is never overwritten.
+    """
+    state = Path(state_dir)
     if _load_records(state) is None:
         raise ValueError(RECORD_UNREADABLE_MESSAGE)
     target = _signed_path(state, version)
     plugin._atomic_write_bytes(target, payload)
     now = (clock if clock is not None else time.time)()
-    _replace_record(state, version, {
+    entry: dict[str, Any] = {
         "addon_id": PLUGIN_ADDON_ID,
         "version": version,
         "status": RECORD_SIGNED,
         "signed_at": _timestamp(now),
         "sha256": hashlib.sha256(payload).hexdigest(),
         "source_sha256": source_sha256,
-    })
+    }
+    if origin is not None:
+        entry["origin"] = origin
+    _replace_record(state, version, entry)
     return target
 
 
@@ -545,11 +585,8 @@ def _has_signature_entries(path: Path) -> bool:
 
 
 def _credentials(env: "Mapping[str, str] | None") -> "tuple[str, str] | None":
-    """The API key and secret, stripped, or None when either is missing or empty. ``env`` None means os.environ."""
-    source = os.environ if env is None else env
-    key = str(source.get(API_KEY_ENV) or "").strip()
-    secret = str(source.get(API_SECRET_ENV) or "").strip()
-    return (key, secret) if key and secret else None
+    """The API key and secret, stripped, or None when either is missing or empty (the rule lives in ``zotero_amo``)."""
+    return amo.read_credentials(env)
 
 
 def _child_env(env: "Mapping[str, str] | None", key: str, secret: str) -> dict[str, str]:
@@ -656,6 +693,8 @@ def sign_plugin(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     clock: "Callable[[], float] | None" = None,
     source_dir: "Path | str | None" = None,
+    fetch: bool = False,
+    transport: "Callable[[str, Mapping[str, str]], tuple[int, bytes]] | None" = None,
 ) -> dict[str, Any]:
     """Sign the bundle's current version and store the result. Never raises.
 
@@ -666,6 +705,10 @@ def sign_plugin(
     ``failed``. Before web-ext runs, the version's ``submitted`` record is written, and it stays whatever the
     outcome. Only a verified signed file replaces it with a ``signed`` record. ``runner`` is called as
     ``runner(argv, env, timeout_s=..., cwd=...)`` and defaults to running ``npx``.
+
+    With ``fetch=True`` nothing is submitted and nothing is uploaded. The approved file for this version is read through
+    ``transport`` (``zotero_amo``'s default when None), checked against this source, and returned as ``fetched``, or
+    ``not_approved_yet`` when Mozilla has not approved and signed it. ``runner`` is not used.
     """
     state = Path(state_dir)
     if not _valid_timeout_seconds(timeout_s):
@@ -682,6 +725,10 @@ def sign_plugin(
         return _outcome("refused_unreadable_record", version=version, message=RECORD_UNREADABLE_MESSAGE)
     if stored.signed:
         return _outcome("already_signed", version=version, path=stored.path)
+    if fetch:
+        return _fetch_and_store(
+            state, source, snapshot, version, fingerprint, env=env, transport=transport, clock=clock,
+        )
     if stored.status != MISSING_STATUS:
         return _outcome("refused_version_reused", version=version, message=REUSED_VERSION_MESSAGE)
     creds = _credentials(env)
@@ -743,7 +790,107 @@ def sign_plugin(
 
 
 # ---------------------------------------------------------------------------
-# CLI: python -m meridian zotero sign-plugin [--timeout-minutes N] [--dry-run]
+# Fetching the approved version: read-only, checked against this source, stored as signed, never a submission
+# ---------------------------------------------------------------------------
+
+_WITHOUT_SETTINGS = "browser_specific_settings"
+
+
+def _without_settings(manifest: "dict[str, Any]") -> "dict[str, Any]":
+    return {key: value for key, value in manifest.items() if key != _WITHOUT_SETTINGS}
+
+
+def _zotero_id(manifest: "dict[str, Any]") -> object:
+    applications = manifest.get("applications")
+    zotero = applications.get("zotero") if isinstance(applications, dict) else None
+    return zotero.get("id") if isinstance(zotero, dict) else None
+
+
+def verify_fetched_signed_file(
+    data: bytes, *, expected_id: str, expected_version: str, current_source_packed: "Mapping[str, bytes]",
+) -> "str | None":
+    """Check a file that Mozilla returned against this source. None when it passes, else the refusal text. Never raises.
+
+    The file must be a zip with a signature entry directly under META-INF/. That checks the file's shape only, not
+    Mozilla's signature. Its manifest.json must name ``expected_id`` and ``expected_version``, and must equal the
+    current manifest once browser_specific_settings is removed, because signing adds that key to the staged copy only.
+    Its runtime files must be exactly the source's runtime files, each with the sha256 of the source's packed bytes.
+    ``current_source_packed`` maps each runtime file's archive name to its packed bytes: the same snapshot that the
+    fingerprint is taken from.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except (zipfile.BadZipFile, OSError, ValueError, TypeError):
+        return FETCH_NOT_ZIP_MESSAGE
+    try:
+        with archive:
+            names = archive.namelist()
+            if len(set(names)) != len(names):
+                return FETCH_MISMATCH_MESSAGE
+            if not any(_SIGNATURE_ENTRY.fullmatch(name) for name in names):
+                return FETCH_UNSIGNED_MESSAGE
+            expected = set(current_source_packed) - {"manifest.json"}
+            runtime = {name for name in names if not name.startswith("META-INF/") and not name.endswith("/")}
+            if "manifest.json" not in names or runtime - {"manifest.json"} != expected:
+                return FETCH_MISMATCH_MESSAGE
+            signed_manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            current_bytes = current_source_packed.get("manifest.json")
+            if current_bytes is None or not isinstance(signed_manifest, dict):
+                return FETCH_MISMATCH_MESSAGE
+            current_manifest = json.loads(current_bytes.decode("utf-8"))
+            if not isinstance(current_manifest, dict):
+                return FETCH_MISMATCH_MESSAGE
+            if signed_manifest.get("version") != expected_version or _zotero_id(signed_manifest) != expected_id:
+                return FETCH_MISMATCH_MESSAGE
+            if _without_settings(signed_manifest) != _without_settings(current_manifest):
+                return FETCH_MISMATCH_MESSAGE
+            for name in expected:
+                if hashlib.sha256(archive.read(name)).digest() != hashlib.sha256(current_source_packed[name]).digest():
+                    return FETCH_MISMATCH_MESSAGE
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, ValueError, KeyError, TypeError, RecursionError):
+        return FETCH_MISMATCH_MESSAGE
+    return None
+
+
+def _fetch_and_store(
+    state: Path, source: Path, snapshot: "list[tuple[str, bytes]]", version: str, fingerprint: str, *,
+    env: "Mapping[str, str] | None",
+    transport: "Callable[[str, Mapping[str, str]], tuple[int, bytes]] | None",
+    clock: "Callable[[], float] | None",
+) -> dict[str, Any]:
+    """Fetch Mozilla's approved file for ``version``, check it against ``snapshot``, and store it. Never raises.
+
+    Nothing is submitted and nothing is uploaded. The file is read and checked, and only then stored as ``signed``,
+    with a record that names this source and says the file was fetched.
+    """
+    try:
+        fetched = amo.fetch_approved_version(env=env, transport=transport, addon_id=PLUGIN_ADDON_ID, version=version)
+    except Exception:  # noqa: BLE001 -- a failed fetch is a failed result, never a crash
+        return _outcome("failed", version=version, message=FETCH_FAILED_MESSAGE)
+    if fetched.status == amo.NO_CREDENTIALS:
+        return _outcome("no_credentials", version=version, message=NO_CREDENTIALS_MESSAGE)
+    if fetched.status == amo.NOT_APPROVED:
+        return _outcome("not_approved_yet", version=version, message=FETCH_NOT_APPROVED_MESSAGE)
+    if fetched.status != amo.FETCHED or fetched.data is None:
+        return _outcome("failed", version=version, message=fetched.message or FETCH_FAILED_MESSAGE)
+    refusal = verify_fetched_signed_file(
+        fetched.data, expected_id=PLUGIN_ADDON_ID, expected_version=version, current_source_packed=dict(snapshot),
+    )
+    if refusal is not None:
+        return _outcome("failed", version=version, message=refusal)
+    if _source_changed(source, fingerprint):
+        return _outcome("failed", version=version, message=FETCH_SOURCE_CHANGED_MESSAGE)
+    try:
+        stored_path = record_signed_bytes(
+            state, fetched.data, version=version, source_sha256=fingerprint, origin=FETCHED_ORIGIN, clock=clock,
+        )
+    except (OSError, ValueError, TypeError):
+        return _outcome("failed", version=version, message=FETCH_STORE_FAILED_MESSAGE)
+    return _outcome("fetched", version=version, path=stored_path)
+
+
+# ---------------------------------------------------------------------------
+# CLI: python -m meridian zotero sign-plugin [--timeout-minutes N] [--dry-run] [--fetch]
 # ---------------------------------------------------------------------------
 
 
@@ -755,6 +902,12 @@ def _status_text(result: Mapping[str, Any]) -> str:
             f"Signed the Zotero bridge plugin {version} and stored it at {result.get('path')}. Next, run: "
             "python -m meridian zotero install-plugin (it closes Zotero only for the install, and restarts "
             "it if it closed it)."
+        )
+    if status == "fetched":
+        return (
+            f"Fetched the approved Zotero bridge plugin {version} from Mozilla and stored it at {result.get('path')}. "
+            "Nothing was uploaded. Next, run: python -m meridian zotero install-plugin (it closes Zotero only for the "
+            "install, and restarts it if it closed it)."
         )
     if status == "already_signed":
         return f"The Zotero bridge plugin {version} is already signed at {result.get('path')}. Nothing was uploaded."
@@ -807,6 +960,13 @@ def cli_main(argv: "list[str] | None" = None) -> int:
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the plan. Signs nothing and uploads nothing.")
+    parser.add_argument(
+        "--fetch", action="store_true",
+        help=(
+            "Fetch the file Mozilla has already approved and signed for this version, check it against this source, "
+            "and store it. It downloads only and never uploads anything."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         minutes = parse_timeout_minutes(args.timeout_minutes)
@@ -815,6 +975,6 @@ def cli_main(argv: "list[str] | None" = None) -> int:
         return 1
     if args.dry_run:
         return _dry_run()
-    result = sign_plugin(state_dir=plugin.signing_state_dir(), timeout_s=minutes * 60)
+    result = sign_plugin(state_dir=plugin.signing_state_dir(), timeout_s=minutes * 60, fetch=args.fetch)
     print(_status_text(result))
-    return 0 if result["status"] in ("signed", "already_signed") else 1
+    return 0 if result["status"] in ("signed", "already_signed", "fetched") else 1

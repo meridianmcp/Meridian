@@ -71,6 +71,8 @@ Firefox and Zotero load add-ons that Mozilla has signed. Meridian signs the brid
 5. Wait for Mozilla. The command returns once Mozilla has signed the file, or stops at the timeout. A timeout or a failure stores no signed file. It may still have submitted this version to Mozilla, so the version number is used up. The message says: Bump the version in manifest.json to sign a new build.
 6. Run `pixi run python -m meridian zotero install-plugin` (section 4). It copies the signed file into Zotero's profile.
 
+**Fetching an approved version.** After Mozilla approves the version, run `pixi run python -m meridian zotero sign-plugin --fetch`. It downloads the file Mozilla has already approved and signed, checks it against this source, and stores it as signed. It never uploads anything, and it never writes a `submitted` record. Use it when a timed-out run left the version submitted but no signed file was stored.
+
 What signing does, and what it does not:
 
 - **Signing does not close Zotero.** Its network use is this. web-ext is pinned to 8.10.0, but the first run fetches that package, and its npm dependencies, from the npm registry, and those dependencies are not pinned. The signing call then uploads the bundle to Mozilla's addons.mozilla.org API. Signing writes to two places: Meridian's state folder, `%USERPROFILE%\.meridian\local_runner\zotero_plugin\` (the signed file in `signed\` and the record in `signed.json`), and the system temporary folder, which holds the staged copy and web-ext's output while it runs. npm and npx write their own files to the npm cache.
