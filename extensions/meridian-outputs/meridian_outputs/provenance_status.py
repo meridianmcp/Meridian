@@ -175,9 +175,18 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
     content hash was ever captured) -- never silently reported as verified
     just because an exact record exists.
   - :data:`RELOCATED` -> ``VERIFIED`` (confidence 0.75, lower than a
-    same-path :data:`EXACT` match's 0.95) -- content identity IS confirmed
-    by hash, just at a different path than originally recorded; the reason
-    string names the matched prior path.
+    same-path :data:`EXACT` match's 0.95). For a content-hash match, content
+    identity is confirmed by hash, just at a different path than originally
+    recorded. For a basename match (``relocation_evidence`` ``"basename"``),
+    identity rests on the basename alone, and the bridge still maps it to
+    ``VERIFIED``. The reason string names the matched prior path. Known
+    follow-up, not handled here:
+    this mapping does not read ``script_staleness``. The bridge reports
+    RELOCATED as ``VERIFIED`` with ``is_authoritative`` True even when the
+    generating script has changed or become unreadable. For a content-hash
+    match, the ``staleness_record`` reads ``stale`` in that case, so
+    ``is_authoritative`` is not proof that a relocated output is current. The
+    bridge is unchanged in this batch.
   - :data:`AMBIGUOUS` (this module's ``provenance_type``, not to be confused
     with the identically-named :class:`~research_evidence.ResolverStatus`
     member several OTHER branches below also map to) -> ``AMBIGUOUS``, low
@@ -195,11 +204,13 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
     flag, never a blanket "not found."
 
 :attr:`~research_evidence.EvidenceRecord.partial` is set (with a required
-``partial_reason``) exactly for :data:`UNREGISTERED`/:data:`UNKNOWN` --
-per this codebase's "partial records ... never presented as authoritative"
-requirement, a record built from either of those two provenance_type values
-is, by construction, known-incomplete (no exact record/directory note was
-ever captured for it), regardless of how confident the resolver mapping
+``partial_reason``) for :data:`UNREGISTERED`, :data:`UNKNOWN` and
+:data:`AMBIGUOUS` -- per this codebase's "partial records ... never presented
+as authoritative" requirement, a record built from any of those three
+provenance_type values is, by construction, known-incomplete (no exact
+record or directory note was captured for UNREGISTERED/UNKNOWN, and no single
+prior record can be confirmed for AMBIGUOUS), regardless of how confident the
+resolver mapping
 above is about its VERIFIED/STALE/etc status.
 
 Basename-fallback relocation routing (sprint item 00c3c3f0)
@@ -262,6 +273,27 @@ been discovered (by a prior walk, or by an explicit
 ``register_priority_path``/``register_output_paths``/``record_provenance``
 call), matching this module's "never triggers a rebuild" contract for
 every one of its other read-only helpers.
+
+Staleness vocabulary (oz-outputs-staleness-vocabulary)
+------------------------------------------------------
+Every :func:`get_provenance_status` result, except an ``{"error": ...}``
+response, also carries an additive ``staleness_record`` key: the shared
+``fresh`` / ``stale`` / ``unknown`` / ``degraded`` state plus a ``reason``,
+built by :func:`meridian_outputs.staleness.map_staleness`. Error responses
+carry only the ``error`` key. The per-source keys
+(``staleness``, ``script_staleness``, ``provenance_type``, ``inconclusive``)
+keep their names and values. Sources mapped: :func:`_staleness` (line 300),
+the :data:`STALE_BY_SCRIPT` state (line 297), and the script-hash checks
+behind ``check_staleness`` and ``find_stale_by_script`` in server.py. A
+content-hash :data:`RELOCATED` status whose generating script changed or
+became unreadable is read through the same script source, while its
+``provenance_type`` stays :data:`RELOCATED`. A basename :data:`RELOCATED`
+status is never read through the matched hit's own tag: its
+``script_staleness`` is only this path's own tag (``None`` when untagged), and
+its ``staleness_record`` is ``unknown`` unless that tag reports a changed or
+unreadable script. The core
+producers ``outputs_indexer.check_promotion_source_freshness`` and
+``embedded_staleness`` are outside this module and are not mapped here.
 """
 from __future__ import annotations
 
@@ -271,6 +303,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import annotate, fingerprint, outputs_local, research_evidence
+from . import staleness as staleness_vocab
 
 _log = logging.getLogger(__name__)
 
@@ -403,7 +436,10 @@ def _stale_by_script_result(outputs_dir: str, path: str) -> dict[str, Any] | Non
     Returns ``None`` when ``path`` was never fingerprint-tagged (nothing to
     compare) -- this is NOT the same as "not stale"; callers must check for
     ``None`` before reading ``is_stale``. Otherwise the matching
-    :class:`fingerprint.StalenessResult`, as a dict.
+    :class:`fingerprint.StalenessResult`, as a dict. Its ``path`` is the path
+    of the record whose tag produced this result. For a content-hash
+    :data:`RELOCATED` status, that can be the matched record's path rather
+    than the queried path.
     """
     target = annotate._normalize_path(path)
     if not target:
@@ -565,7 +601,7 @@ def _basename_relocation_lookup(
     return best
 
 
-def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
+def _build_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     """The richer, authoritative answer to "what do we know about this
     file's provenance", composed from both underlying systems and ranked by
     confidence.
@@ -604,6 +640,18 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
           ``record`` is that resolved row, ``staleness`` notes the weaker,
           basename-only evidence). ``relocation_evidence`` (additive) is
           ``"content_hash"`` or ``"basename"`` so a caller can tell which.
+          A changed or unreadable generating script is detected for
+          content-hash relocations when tagged, meaning the matched record or
+          this path carries a fingerprint tag. ``script_staleness`` is checked
+          through the matched record's own tag (or this path's own tag, when
+          that one reports stale), and ``staleness_record`` reads it as
+          ``stale``. An untagged content-hash relocation reads ``fresh``. A
+          basename relocation is never read through the matched hit's own tag:
+          its ``script_staleness`` is only this path's own tag (``None`` for an
+          untagged file), and its ``staleness_record`` is ``unknown`` unless
+          that tag reports a changed or unreadable script. ``provenance_type``
+          stays :data:`RELOCATED` either way: the identity is still relocated,
+          so a caller that fails closed on that keeps doing so.
         - :data:`AMBIGUOUS` -- same as :data:`RELOCATED`, but MORE THAN ONE
           candidate matches -- either by content hash (fa600e42; ``record``
           is ``None``, the matches are listed verbatim under a new
@@ -664,6 +712,23 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     if len(relocation_matches) == 1:
         match = relocation_matches[0]
         current_hash = match.get("content_hash")
+        # Stale-tag precedence for a content-hash relocation: a stale result
+        # from either the matched record's own fingerprint tag or this path's
+        # own tag wins (matched record checked first). Otherwise the matched
+        # record's result is preferred, falling back to this path's own tag.
+        # provenance_type stays RELOCATED either way.
+        matched_script = _stale_by_script_result(
+            outputs_dir, match.get("path") or path,
+        )
+        query_script = _stale_by_script_result(outputs_dir, path)
+        if matched_script is not None and matched_script.get("is_stale"):
+            script_staleness = matched_script
+        elif query_script is not None and query_script.get("is_stale"):
+            script_staleness = query_script
+        else:
+            script_staleness = (
+                matched_script if matched_script is not None else query_script
+            )
         return {
             "path": path,
             "provenance_type": RELOCATED,
@@ -680,7 +745,7 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
                     "appears to have been relocated/renamed"
                 ),
             },
-            "script_staleness": _stale_by_script_result(outputs_dir, path),
+            "script_staleness": script_staleness,
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
             "relocation_evidence": "content_hash",
@@ -785,6 +850,65 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
         "convergence": indexed["convergence"],
         "inconclusive": inconclusive,
     }
+
+
+def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
+    """Composed provenance status for ``path``, plus the shared staleness envelope.
+
+    Returns the same dict :func:`_build_provenance_status` builds, which holds
+    the branch contract, with one additive key: ``staleness_record``, a
+    :meth:`staleness.StalenessRecord.to_dict` mapping with ``state`` (one of
+    ``fresh``, ``stale``, ``unknown``, ``degraded``), ``reason``, ``source``
+    and ``path``. Existing keys keep their names and values. For a
+    content-hash :data:`RELOCATED` status whose generating script changed or
+    became unreadable, this reads ``stale``, with the script's ``reason``, while
+    its ``provenance_type`` stays ``relocated``. A basename :data:`RELOCATED`
+    status is never read through the matched hit's own tag: it reads ``unknown``
+    unless this path's own tag reports a changed or unreadable script.
+
+    An ``{"error": ...}`` response (missing ``outputs_dir``/``path``) is
+    returned unchanged, with no ``staleness_record``: there is no provenance
+    state to map, so a record would only carry a misleading reason.
+    """
+    status = _build_provenance_status(outputs_dir, path)
+    if "error" in status:
+        return status
+    status["staleness_record"] = _staleness_record_for_status(status).to_dict()
+    return status
+
+
+def _staleness_record_for_status(status: dict[str, Any]) -> "staleness_vocab.StalenessRecord":
+    """Pick the source the status came from and map it onto the vocabulary.
+
+    A ``stale_by_script`` status is read through the ``stale_by_script``
+    source, and so is a :data:`RELOCATED` status whose generating script has
+    changed or become unreadable. A content-hash :data:`RELOCATED` status's
+    ``staleness`` block compares the content hash that matched, which equals
+    the current hash by construction, so that block alone would read fresh and
+    hide the script change. A basename :data:`RELOCATED` status's block has no
+    content hash to compare, so it reads ``unknown``, not fresh. Every other
+    status with a ``staleness`` block is read through ``_staleness``, and a
+    status without one goes through the ``stale_by_script`` source.
+    """
+    block = status.get("staleness")
+    provenance_type = status.get("provenance_type")
+    script = status.get("script_staleness")
+    relocated_script_changed = (
+        provenance_type == RELOCATED
+        and isinstance(script, dict)
+        and bool(script.get("is_stale"))
+    )
+    if (
+        provenance_type != STALE_BY_SCRIPT
+        and not relocated_script_changed
+        and isinstance(block, dict)
+    ):
+        return staleness_vocab.map_staleness(
+            staleness_vocab.SOURCE_PROVENANCE_STALENESS, block, path=status.get("path"),
+        )
+    return staleness_vocab.map_staleness(
+        staleness_vocab.SOURCE_STALE_BY_SCRIPT_STATE, status, path=status.get("path"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -991,6 +1115,13 @@ def _resolver_state_for_provenance_status(
             ),
         )
     if ptype == RELOCATED:
+        # Known follow-up, not handled here: this branch does not read
+        # script_staleness. The bridge reports RELOCATED as VERIFIED with
+        # is_authoritative True even when the generating script has changed or
+        # become unreadable. For a content-hash match, staleness_record reads
+        # stale in that case, so is_authoritative is not proof that a relocated
+        # output is current. The bridge is unchanged in this batch. See the
+        # module docstring's rule table.
         record = status.get("record") or {}
         return research_evidence.ResolverState(
             status=research_evidence.ResolverStatus.VERIFIED,

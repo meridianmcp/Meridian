@@ -84,6 +84,20 @@ function Test-Under([string]$File, [string]$Dir) {
     return ((Norm $File) + '/').StartsWith($d, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+# Scratch space any session may write outside its checkout: the OS temp dirs (the session
+# scratchpad lives under '<temp>/claude', see the 55d48d69 note above the worktree check)
+# and Claude Code's plan files (~/.claude/plans). 9486c983: shared by the worktree
+# boundary check and the executor primary-checkout check.
+function Test-Scratch([string]$File) {
+    foreach ($d in @($env:TEMP, $env:TMP, $env:TMPDIR)) { if ($d -and (Test-Under $File ((Norm $d) + '/claude'))) { return $true } }
+    if ((Norm $File).StartsWith('/tmp/claude/', [System.StringComparison]::Ordinal)) { return $true }
+    foreach ($h in @($env:USERPROFILE, $env:HOME)) {
+        if ($h -and (Test-Under $File ((Norm $h) + '/.claude/plans'))) { return $true }
+    }
+    if ($env:CLAUDE_CONFIG_DIR -and (Test-Under $File ((Norm $env:CLAUDE_CONFIG_DIR) + '/plans'))) { return $true }
+    return $false
+}
+
 try { $payload = [Console]::In.ReadToEnd() } catch { exit 0 }
 if (-not $payload) { exit 0 }
 try { $obj = $payload | ConvertFrom-Json } catch { exit 0 }
@@ -138,17 +152,19 @@ if ($isWorktreeSession -and -not $insideProjectDir) {
     # scratch file) silently bypassed the worktree boundary block entirely.
     # Scoped to '<temp>/claude' to match the session scratchpad's real shape
     # (see the harness environment block: "<TEMP>\claude\<project>\<session>\scratchpad").
-    $scratch = $false
-    foreach ($d in @($env:TEMP, $env:TMP, $env:TMPDIR)) { if ($d -and (Test-Under $normFile ((Norm $d) + '/claude'))) { $scratch = $true } }
-    if ((Norm $normFile).StartsWith('/tmp/claude/', [System.StringComparison]::Ordinal)) { $scratch = $true }
-    foreach ($h in @($env:USERPROFILE, $env:HOME)) {
-        if ($h -and (Test-Under $normFile ((Norm $h) + '/.claude/plans'))) { $scratch = $true }
-    }
-    if ($env:CLAUDE_CONFIG_DIR -and (Test-Under $normFile ((Norm $env:CLAUDE_CONFIG_DIR) + '/plans'))) { $scratch = $true }
-    if ($scratch) { exit 0 }
+    if (Test-Scratch $normFile) { exit 0 }
     # The file is outside this session's worktree. Block it.
     # exit 2 blocks the tool call; stderr is fed back to Claude as the reason.
     Stop-Call "Meridian worktree guard (a3984d96): ${tool} target '$filePath' is OUTSIDE this session's worktree ('$projectDir'). Edit only files under your own worktree (the temp dir / session scratchpad and ~/.claude/plans are fine). If you need to affect the main tree or a different worktree, coordinate via request_hitl or complete this session first."
+}
+
+# 9486c983 -- an executor (MERIDIAN_SESSION_ROLE=executor, set only by the worktree
+# launcher) must never edit repo files in the PRIMARY checkout: run each session in its
+# own worktree (AGENTS.md "Parallel sessions" rule). Scratch (temp dir / plan files)
+# stays allowed. A file outside the checkout is not a repo file and falls through.
+$sessionRole = ([string]$env:MERIDIAN_SESSION_ROLE).Trim().ToLowerInvariant()
+if ($sessionRole -eq 'executor' -and -not $isWorktreeSession -and $insideProjectDir -and -not (Test-Scratch $normFile)) {
+    Stop-Call "Meridian worktree guard (9486c983): ${tool} target '$filePath' is inside the PRIMARY checkout ('$projectDir'), and this session declares role=executor (MERIDIAN_SESSION_ROLE). Executors must not edit the primary checkout: run each session in its own worktree (AGENTS.md, 'Parallel sessions' rule), then edit only under that worktree."
 }
 
 if (-not $insideProjectDir) {

@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -100,7 +101,8 @@ _WIN_CRASH_CODES = frozenset(
 
 
 def _run_hook_once(
-    payload: str, *, claude_project_dir: str | None = None
+    payload: str, *, claude_project_dir: str | None = None,
+    session_role: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run worktree_guard.sh from cwd=worktree root.
 
@@ -118,6 +120,13 @@ def _run_hook_once(
         setup = f"export CLAUDE_PROJECT_DIR='{safe}'; "
     else:
         setup = "unset CLAUDE_PROJECT_DIR; "
+    # 9486c983: the executor role is an explicit env var; never inherit one from the
+    # parent process.
+    if session_role is not None:
+        safe_role = session_role.replace("'", "'\\''")
+        setup += f"export MERIDIAN_SESSION_ROLE='{safe_role}'; "
+    else:
+        setup += "unset MERIDIAN_SESSION_ROLE; "
 
     # The hook lives in _WORKTREE_ROOT/.claude/hooks/, use _WORKTREE_ROOT as cwd.
     cmd = setup + "exec bash .claude/hooks/worktree_guard.sh"
@@ -137,13 +146,16 @@ def _run_hook_once(
 
 
 def _run_hook(
-    payload: str, *, claude_project_dir: str | None = None
+    payload: str, *, claude_project_dir: str | None = None,
+    session_role: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Retry on Windows subprocess-teardown crashes (harness artifact, not hook)."""
     last: subprocess.CompletedProcess | None = None
     for _ in range(3):
         try:
-            last = _run_hook_once(payload, claude_project_dir=claude_project_dir)
+            last = _run_hook_once(
+                payload, claude_project_dir=claude_project_dir, session_role=session_role,
+            )
         except subprocess.TimeoutExpired:
             continue
         if last.returncode in _WIN_CRASH_CODES:
@@ -1132,3 +1144,182 @@ async def test_complete_sprint_item_proceeds_when_no_manifest_exists(db, tmp_pat
 
     assert result.get("error") is None
     assert result["status"] == "done"
+
+
+# ===========================================================================
+# 9486c983 -- executor role in the PRIMARY checkout. An executor
+# (MERIDIAN_SESSION_ROLE=executor, set only by the worktree launcher) must not
+# edit repo files in the primary checkout; owner sessions keep the fail-open
+# behaviour. The bash cases run worktree_guard.sh; the core cases also run
+# worktree_guard.ps1, the hook settings.json registers on Windows.
+# ===========================================================================
+
+_EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+_HOOK_PS1 = _WORKTREE_ROOT / ".claude" / "hooks" / "worktree_guard.ps1"
+_POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
+
+_needs_powershell = pytest.mark.skipif(
+    not _HOOK_PS1.exists() or _POWERSHELL is None,
+    reason="worktree_guard.ps1 or PowerShell unavailable",
+)
+
+# A repo file in the primary checkout (the near-miss target, tests/conftest.py).
+_PRIMARY_REPO_FILE = _MAIN_FILE
+# Scratch an executor legitimately writes outside any checkout.
+_SCRATCH_FILE = os.path.join(tempfile.gettempdir(), "claude", "9486c983-scratch", "notes.md")
+_PLAN_FILE = os.path.join(os.path.expanduser("~"), ".claude", "plans", "9486c983-plan.md")
+
+
+def _edit_payload(tool: str, path: str) -> str:
+    """Payload shaped like a real call of `tool` (NotebookEdit carries notebook_path)."""
+    if tool == "NotebookEdit":
+        return _make_notebook_payload(str(Path(path).with_suffix(".ipynb")))
+    return _make_payload(tool, path)
+
+
+def _run_hook_ps1(
+    payload: str, *, claude_project_dir: str | None = None,
+    session_role: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run worktree_guard.ps1 with CLAUDE_PROJECT_DIR and MERIDIAN_SESSION_ROLE set or
+    removed exactly as requested (the env is passed as a dict, so no MSYS path
+    conversion is involved)."""
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("CLAUDE_PROJECT_DIR", "MERIDIAN_SESSION_ROLE")
+    }
+    if claude_project_dir is not None:
+        env["CLAUDE_PROJECT_DIR"] = claude_project_dir
+    if session_role is not None:
+        env["MERIDIAN_SESSION_ROLE"] = session_role
+    r = subprocess.run(
+        [_POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(_HOOK_PS1)],
+        input=payload.encode("utf-8"),
+        cwd=str(_WORKTREE_ROOT),
+        env=env,
+        capture_output=True,
+        timeout=60,
+    )
+    return subprocess.CompletedProcess(
+        r.args,
+        r.returncode,
+        stdout=(r.stdout or b"").decode("utf-8", "replace"),
+        stderr=(r.stderr or b"").decode("utf-8", "replace"),
+    )
+
+
+@_needs_bash
+@pytest.mark.parametrize("tool", _EDIT_TOOLS)
+def test_executor_in_primary_checkout_is_denied(tool):
+    """executor + primary checkout + repo file -> exit 2, naming the AGENTS.md rule."""
+    r = _run_hook(
+        _edit_payload(tool, _PRIMARY_REPO_FILE),
+        claude_project_dir=str(_REPO), session_role="executor",
+    )
+    assert r.returncode == 2, f"{tool}: an executor must not edit the primary checkout"
+    assert "9486c983" in r.stderr
+    assert "Parallel sessions" in r.stderr
+    assert tool in r.stderr
+
+
+@_needs_bash
+@pytest.mark.parametrize("tool", _EDIT_TOOLS)
+def test_executor_in_own_worktree_is_allowed(tool):
+    r = _run_hook(
+        _edit_payload(tool, _WORKTREE_FILE),
+        claude_project_dir=_WORKTREE_DIR, session_role="executor",
+    )
+    assert r.returncode == 0, f"{tool}: an executor may edit files in its own worktree"
+
+
+@_needs_bash
+@pytest.mark.parametrize("tool", _EDIT_TOOLS)
+def test_owner_in_primary_checkout_is_allowed(tool):
+    """No executor role (owner session) keeps today's fail-open behaviour."""
+    r = _run_hook(_edit_payload(tool, _PRIMARY_REPO_FILE), claude_project_dir=str(_REPO))
+    assert r.returncode == 0, f"{tool}: an owner session in the primary checkout is not restricted"
+
+
+@_needs_bash
+@pytest.mark.parametrize("tool", _EDIT_TOOLS)
+@pytest.mark.parametrize("scratch", [_SCRATCH_FILE, _PLAN_FILE], ids=["temp", "plan"])
+def test_executor_scratch_write_in_primary_checkout_is_allowed(tool, scratch):
+    r = _run_hook(
+        _edit_payload(tool, scratch),
+        claude_project_dir=str(_REPO), session_role="executor",
+    )
+    assert r.returncode == 0, f"{tool}: executor scratch writes must stay allowed"
+
+
+@_needs_bash
+@pytest.mark.parametrize("role", ["planner", ""])
+def test_non_executor_role_in_primary_checkout_is_allowed(role):
+    r = _run_hook(
+        _edit_payload("Edit", _PRIMARY_REPO_FILE),
+        claude_project_dir=str(_REPO), session_role=role,
+    )
+    assert r.returncode == 0, f"role={role!r} must not trigger the executor rule"
+
+
+@_needs_bash
+@pytest.mark.parametrize("role", ["EXECUTOR", "  executor  "])
+def test_executor_role_match_ignores_case_and_whitespace(role):
+    r = _run_hook(
+        _edit_payload("Edit", _PRIMARY_REPO_FILE),
+        claude_project_dir=str(_REPO), session_role=role,
+    )
+    assert r.returncode == 2, f"role={role!r} must still be recognised as executor"
+
+
+@_needs_bash
+def test_executor_outside_checkout_is_not_a_repo_file():
+    """The rule covers repo files in the primary checkout. A non-scratch path outside
+    the checkout is not a repo file and falls through (fail open, as before)."""
+    outside = str(_REPO.parent / "9486c983-outside-the-checkout.md")
+    r = _run_hook(
+        _edit_payload("Write", outside),
+        claude_project_dir=str(_REPO), session_role="executor",
+    )
+    assert r.returncode == 0
+
+
+@_needs_powershell
+@pytest.mark.parametrize("tool", _EDIT_TOOLS)
+def test_ps1_executor_in_primary_checkout_is_denied(tool):
+    r = _run_hook_ps1(
+        _edit_payload(tool, _PRIMARY_REPO_FILE),
+        claude_project_dir=str(_REPO), session_role="executor",
+    )
+    assert r.returncode == 2, f"{tool}: an executor must not edit the primary checkout (ps1)"
+    assert "9486c983" in r.stderr
+    assert "Parallel sessions" in r.stderr
+    assert tool in r.stderr
+
+
+@_needs_powershell
+@pytest.mark.parametrize("tool", _EDIT_TOOLS)
+def test_ps1_executor_in_own_worktree_is_allowed(tool):
+    r = _run_hook_ps1(
+        _edit_payload(tool, _WORKTREE_FILE),
+        claude_project_dir=_WORKTREE_DIR, session_role="executor",
+    )
+    assert r.returncode == 0, f"{tool}: an executor may edit files in its own worktree (ps1)"
+
+
+@_needs_powershell
+@pytest.mark.parametrize("tool", _EDIT_TOOLS)
+def test_ps1_owner_in_primary_checkout_is_allowed(tool):
+    r = _run_hook_ps1(_edit_payload(tool, _PRIMARY_REPO_FILE), claude_project_dir=str(_REPO))
+    assert r.returncode == 0, f"{tool}: an owner session in the primary checkout is not restricted (ps1)"
+
+
+@_needs_powershell
+@pytest.mark.parametrize("tool", _EDIT_TOOLS)
+@pytest.mark.parametrize("scratch", [_SCRATCH_FILE, _PLAN_FILE], ids=["temp", "plan"])
+def test_ps1_executor_scratch_write_in_primary_checkout_is_allowed(tool, scratch):
+    r = _run_hook_ps1(
+        _edit_payload(tool, scratch),
+        claude_project_dir=str(_REPO), session_role="executor",
+    )
+    assert r.returncode == 0, f"{tool}: executor scratch writes must stay allowed (ps1)"
