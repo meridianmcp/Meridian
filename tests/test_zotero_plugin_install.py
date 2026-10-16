@@ -58,7 +58,7 @@ def _write(path: Path, data) -> Path:
 def _fake_source(root: Path) -> Path:
     """A miniature extensions/zotero-bridge tree, including files that must be excluded."""
     src = root / "zotero-bridge"
-    _write(src / "manifest.json", '{"manifest_version": 2}')
+    _write(src / "manifest.json", '{"manifest_version": 2, "version": "0.1.0"}')
     _write(src / "bootstrap.js", "// boot")
     _write(src / "prefs.js", 'pref("x", true);')
     _write(src / "content" / "preferences.xhtml", "<xul/>")
@@ -80,12 +80,38 @@ def _snapshot(root: Path) -> dict[str, str]:
     return out
 
 
+@pytest.fixture(autouse=True)
+def _isolated_meridian_state(monkeypatch, tmp_path):
+    """Every default Meridian path (the bundle, the signed artifacts, the settings) lives in tmp_path."""
+    monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(tmp_path / "meridian-state"))
+
+
+def _seed_signed(state_dir: Path, source: Path, payload: bytes) -> Path:
+    """Store ``payload`` as the signed artifact for ``source``, through the real record path. No Mozilla involved."""
+    from meridian import zotero_plugin_sign as sign
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    produced = state_dir / "stand-in-produced.xpi"
+    produced.write_bytes(payload)
+    try:
+        return sign.record_signed_artifact(state_dir, produced, source_dir=source, clock=lambda: 0.0)
+    finally:
+        produced.unlink()
+
+
+def _forget_signed(state_dir: Path) -> None:
+    """Remove the signed record, so the bundle looks unsigned."""
+    (state_dir / "signed.json").unlink(missing_ok=True)
+
+
 @pytest.fixture
 def profile(tmp_path):
     folder = tmp_path / "Zotero" / "Profiles" / "abc.default"
     folder.mkdir(parents=True)
     _write(folder / "prefs.js", 'user_pref("keep", true);\n')
     _write(folder / "extensions.json", '{"addons": []}')
+    # The repo bundle counts as signed (a stand-in with the bundle's own bytes), so CLI installs can run.
+    _seed_signed(zpi.signing_state_dir(), zpi._bundled_source_dir(), zpi.build_xpi_bytes())
     return folder
 
 
@@ -911,6 +937,7 @@ def default_profile_env(monkeypatch, tmp_path):
     monkeypatch.setattr(zpi, "zotero_data_dir", lambda: data)
     monkeypatch.setattr(zpi, "_bundled_source_dir", lambda: source)
     monkeypatch.setattr(zpi, "default_xpi_path", lambda: tmp_path / "state" / XPI_NAME)
+    _seed_signed(tmp_path / "state", source, zpi.build_xpi_bytes(source))
     return profile
 
 
@@ -1805,3 +1832,63 @@ def test_docs_say_an_install_that_finds_the_plugin_already_current_does_not_clos
 def test_the_bridge_readme_says_an_install_that_finds_the_plugin_already_current_does_not_close_zotero():
     readme = (REPO_EXTENSION / "README.md").read_text(encoding="utf-8")
     assert _ALREADY_CURRENT_SENTENCE in readme
+
+
+# ---------------------------------------------------------------------------
+# The signing gate: an unsigned plugin version is never installed (see test_zotero_plugin_sign.py)
+# ---------------------------------------------------------------------------
+
+
+def test_install_default_profile_reports_needs_signature_when_nothing_is_stored(default_profile_env):
+    _forget_signed(zpi.signing_state_dir())
+    before = _snapshot(default_profile_env)
+    result = zpi.install_default_profile(running=lambda: False)
+    assert result["status"] == "needs_signature"
+    assert result["unsigned_path"] == str(zpi.default_xpi_path())
+    assert "This plugin version is not signed yet." in result["message"]
+    assert _snapshot(default_profile_env) == before
+
+
+def test_default_install_with_close_refuses_an_unsigned_plugin_before_closing(default_profile_env):
+    _forget_signed(zpi.signing_state_dir())
+    before = _snapshot(default_profile_env)
+    result = zpi.install_default_with_close(
+        _CLOSE_ON, close_zotero=True, running=lambda: True,
+        close=lambda running=None: pytest.fail("Zotero must not be closed for an unsigned plugin"),
+        restart=lambda: pytest.fail("nothing is restarted when Meridian closed nothing"),
+    )
+    assert result["status"] == "needs_signature"
+    assert result["closed_zotero"] is False
+    assert result["restart"] is None
+    assert _snapshot(default_profile_env) == before
+
+
+def test_cli_install_without_a_signature_closes_nothing_and_points_at_sign_plugin(monkeypatch, capsys, profile):
+    _forget_signed(zpi.signing_state_dir())
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("no close without a signature"))
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "python -m meridian zotero sign-plugin" in out
+    assert "Install Plugin From File" in out
+    assert "Meridian closed" not in out
+    assert not (profile / "extensions").exists()
+
+
+def test_cli_dry_run_says_the_plugin_needs_a_signature_and_would_install_nothing(capsys, profile):
+    _forget_signed(zpi.signing_state_dir())
+    rc = zpi.cli_main(["--profile", str(profile), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "not signed yet" in out
+    assert "Would install" not in out
+    assert not (profile / "extensions").exists()
+
+
+def test_cli_installs_the_signed_bytes_and_not_the_unsigned_build(monkeypatch, capsys, profile):
+    signed_payload = b"PK-stand-in-for-mozilla-signed-bytes"
+    _seed_signed(zpi.signing_state_dir(), zpi._bundled_source_dir(), signed_payload)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
+    assert zpi.cli_main(["--profile", str(profile)]) == 0
+    assert (profile / "extensions" / XPI_NAME).read_bytes() == signed_payload
+    assert signed_payload != zpi.build_xpi_bytes()

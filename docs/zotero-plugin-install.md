@@ -54,6 +54,33 @@ Use this if you declined, or if the automatic install did not appear.
 4. Select `meridian-zotero@usemeridian.us.xpi` from the folder in step 2.
 5. Restart Zotero if asked.
 
+## 4a. Signing the plugin (Mozilla, unlisted)
+
+Firefox and Zotero load add-ons that Mozilla has signed. Meridian signs the bridge once per plugin version, as a separate step. Installing never signs, and an install never waits on Mozilla.
+
+1. Create a Mozilla developer account on addons.mozilla.org (the developer hub).
+2. In the developer hub, open the **API Keys** page and create a key pair. Mozilla shows the key (the JWT issuer) and the secret (the JWT secret). Copy both now.
+3. Set both as **user** environment variables, never in a file or in chat: `WEB_EXT_API_KEY` for the key and `WEB_EXT_API_SECRET` for the secret. On Windows, open **Edit environment variables for your account**, add both under **User variables**, then open a new terminal.
+4. From a source checkout, with Node.js and `npx` on your PATH, run this in the repository root:
+
+   ```
+   pixi run python -m meridian zotero sign-plugin
+   ```
+
+   `--dry-run` prints the plugin version, whether the two variables are set (yes or no, never the values), and whether a signed file is already stored. It signs nothing and uploads nothing. `--timeout-minutes N` changes the default wait of 60 minutes.
+5. Wait for Mozilla. The command returns once Mozilla has signed the file, or stops at the timeout. A timeout or a failure stores nothing, and the message says so.
+6. Run `pixi run python -m meridian zotero install-plugin` (section 4). It copies the signed file into Zotero's profile.
+
+What signing does, and what it does not:
+
+- **Signing does not close Zotero.** It talks only to Mozilla and writes into Meridian's own state folder, `%USERPROFILE%\.meridian\local_runner\zotero_plugin\signed\` with `signed.json` beside it. The unsigned bundle stays in that folder too.
+- **Installing does close Zotero**, under the rules in section 3. It copies only the signed file, and only when that file was signed for this plugin version and this exact source. With no matching signed file, the install writes nothing, closes nothing, and prints the signing command.
+- **A version is signed once.** If you edit the bridge without changing its version, the old signature no longer matches, and the next `sign-plugin` run signs the new source.
+- **The key and the secret are never written to a file, printed, or put on a command line.** The signing call receives them in its environment only. Other `WEB_EXT_*` variables are not passed to that call, so none of them can redirect the credentials to another server.
+- **Fallback: install the unsigned file yourself.** The install prints the path of the unsigned file. In Zotero, open **Tools > Plugins**, click the gear icon, choose **Install Plugin From File**, and select that file. The message calls the menu **Plugins**; section 4 calls it **Add-ons**, and which name Zotero 8 shows is not verified. Zotero may refuse an unsigned add-on in a normal build; that is not verified either.
+
+**Not yet verified:** Mozilla's unlisted signing of this bridge has not been run against Mozilla. Zotero accepting a signed `.xpi` copied into a profile's `extensions` folder is not yet verified on a real Zotero install.
+
 ## 5. Verify
 
 1. **Tools > Add-ons** lists **Meridian Zotero Bridge**, and it is enabled.

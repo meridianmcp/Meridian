@@ -3563,3 +3563,38 @@ def test_the_tray_finds_the_profile_and_builds_the_bundle_before_it_closes_zoter
         "Meridian closed Zotero, installed the Zotero bridge plugin to P, and restarted Zotero."
         + _CLOSED_AND_RESTARTED_TAIL
     )
+
+
+@pytest.fixture(autouse=True)
+def zotero_plugin_signed_stand_in(monkeypatch, tmp_path):
+    """The install paths copy only a signed artifact. This stands one in with the bundle's own bytes."""
+    signed = tmp_path / "stand-in-signed.xpi"
+    signed.write_bytes(zpi.build_xpi_bytes())
+    monkeypatch.setattr(zpi, "signed_install_source", lambda source_dir=None: signed)
+    return signed
+
+
+def test_the_tray_says_an_unsigned_plugin_needs_a_signature_and_closes_nothing(monkeypatch, tmp_path):
+    profile = tmp_path / "Zotero" / "Profiles" / "unsigned.default"
+    profile.mkdir(parents=True)
+    (profile / "prefs.js").write_text('user_pref("keep", true);\n', encoding="utf-8")
+    monkeypatch.setattr(zpi, "find_default_profile_dir", lambda data_dir: profile)
+    monkeypatch.setattr(zpi, "signed_install_source", lambda source_dir=None: None)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(
+        zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("no close for an unsigned plugin"),
+    )
+    text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
+    assert text.startswith("This plugin version is not signed yet.")
+    assert "python -m meridian zotero sign-plugin" in text
+    assert "Install Plugin From File" in text
+    assert not (profile / "extensions").exists()
+
+
+def test_the_tray_text_for_a_needs_signature_result_is_the_installer_message():
+    message = zpi.needs_signature_message("U:/unsigned/meridian-zotero@usemeridian.us.xpi")
+    result = {"status": "needs_signature", "path": None, "message": message, "closed_zotero": False, "restart": None}
+    assert tray_main.zotero_plugin_install_text(result) == message
+    assert tray_main.zotero_plugin_install_text(result, first_run=True) == (
+        "Your choice was saved. " + message
+    )

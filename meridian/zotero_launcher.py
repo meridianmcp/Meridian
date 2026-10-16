@@ -184,8 +184,12 @@ def _autoinstall_zotero_plugin():
         if profile is None:
             _log.info("zotero plugin autoinstall: no default Zotero profile found; skipped")
             return None
-        xpi = _zotero_plugin.build_xpi(_zotero_plugin.default_xpi_path())
-        result = _zotero_plugin.install_into_profile(profile, xpi)
+        signed = _zotero_plugin.signed_install_source()
+        if signed is None:
+            # Nothing is signed for this plugin version yet. Launching Zotero goes on; signing is a separate CLI step.
+            _log.info("zotero plugin autoinstall: this plugin version is not signed yet; skipped")
+            return None
+        result = _zotero_plugin.install_into_profile(profile, signed)
         _log.info("zotero plugin autoinstall: %s", result["status"])
         return result
     except Exception as exc:  # noqa: BLE001 -- the plugin must never block Zotero's launch
