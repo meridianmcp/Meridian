@@ -9,7 +9,9 @@ Two menu actions for Zotero, plus a preferences pane:
   a folder. For each item whose Extra field has a `BibTeX key: <key>` line, the plugin
   looks for `<key>.pdf` in that folder and attaches it.
 
-Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.0`.
+Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.2`. Earlier builds: `0.1.0` (Mozilla-approved,
+no `strict_max_version`). `0.1.1` (on Mozilla, uploaded by the owner, with the old placeholder
+`update_url`, so it does not auto-update from GitHub).
 
 ## Status: source, packaged by Meridian, untested in Zotero
 
@@ -36,7 +38,7 @@ checklist below passes.
 
 The bridge makes no network calls of its own. Zotero itself checks the `update_url` in
 `manifest.json` for updates when automatic updates are on. That request is Zotero's, not
-plugin code. The URL is a placeholder (see "Updates" below).
+plugin code. The URL is not live yet (see "Updates" below).
 
 ## Install
 
@@ -111,18 +113,20 @@ pane shows the duplicate policy as text. Nothing else is configurable.
 ## Compatibility
 
 - `applications.zotero.strict_min_version` is `8.0`.
-- `strict_max_version` is **not set**, per the owner's decision for no maximum and
-  automatic updates. Zotero's developer documentation says plugin authors "should" set
-  it to the latest minor version they tested, but does not say it is required. If a
-  future Zotero release refuses to load the plugin without it, set it to `"99.*"` and
-  record the change here.
+- `strict_max_version` is **`"99.*"`**. The owner's decision is no practical maximum, and
+  `99.*` is that value. It was added in 0.1.1 because Zotero 10.0.6 rejects a `zotero`
+  add-on without the key. The parser reports "applications.zotero.strict_max_version not
+  provided", and in a fresh profile the file was deleted at startup. The 0.1.0 build
+  lacked the key. Tested 2026-10-16 with throwaway profiles.
 
 ## Updates
 
-`update_url` is a **placeholder and is not yet published**. Nothing is served at that
-address yet. Do not treat automatic updates as working until usemeridian.us serves a
-real update manifest at that URL. The manifest marks the placeholder in
-`update_url_status`.
+`update_url` points at `update.json` on the `main` branch of
+`meridianmcp/zotero-bridge-updates`, read through `raw.githubusercontent.com`. That repo is
+separate from `meridianmcp/Meridian`, so the update file never touches the Meridian deploy
+branches. The file does not exist yet. A release step will write it after each signed
+release, with the signed file's URL and SHA-256. Until then the URL returns 404, and
+automatic updates do not work. The manifest states this in `update_url_status`.
 
 ## Out of scope for this build
 

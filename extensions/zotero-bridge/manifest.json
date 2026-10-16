@@ -1,15 +1,16 @@
 {
   "manifest_version": 2,
   "name": "Meridian Zotero Bridge",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Import BibTeX into a chosen collection with duplicate checks, and attach PDFs from a folder by BibTeX key. Runs only from menus inside Zotero. No server, no network, no watchers.",
   "author": "Meridian",
   "applications": {
     "zotero": {
       "id": "meridian-zotero@usemeridian.us",
       "strict_min_version": "8.0",
-      "update_url": "https://usemeridian.us/zotero/meridian-zotero-bridge/update.json",
-      "update_url_status": "PLACEHOLDER: not yet published. Do not rely on this URL until usemeridian.us serves a real update manifest."
+      "strict_max_version": "99.*",
+      "update_url": "https://raw.githubusercontent.com/meridianmcp/zotero-bridge-updates/main/update.json",
+      "update_url_status": "Written by the release workflow after each signed release. Until the first release is published, this URL returns 404."
     }
   }
 }

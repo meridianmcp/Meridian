@@ -1211,7 +1211,7 @@ def test_dry_run_prints_yes_or_no_and_never_the_values_and_calls_no_runner(monke
     out = capsys.readouterr().out
     assert rc == 0
     assert "dry run" in out.lower()
-    assert "0.1.0" in out
+    assert f"Plugin version: {sign.bundle_version(zpi._bundled_source_dir())}" in out
     credential_lines = [line for line in out.splitlines() if line.lower().startswith("mozilla credentials")]
     assert len(credential_lines) == 1
     assert credential_lines[0].rstrip().endswith("yes" if creds_set else "no")

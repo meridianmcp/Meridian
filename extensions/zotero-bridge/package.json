@@ -1,6 +1,6 @@
 {
   "name": "meridian-zotero-bridge",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "description": "Meridian Zotero Bridge plugin source. Not installed; untested in Zotero.",
   "type": "commonjs",
