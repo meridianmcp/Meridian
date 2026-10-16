@@ -2769,6 +2769,11 @@ def zotero_faked(monkeypatch):
     monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
     monkeypatch.setattr(tray_main, "_show_info_dialog", _fake_info)
     monkeypatch.setattr(tray_main, "_show_error_dialog", _fake_error)
+    # The install's registration step starts and closes Zotero. These tests check the tray's dialogs, so it is stubbed here.
+    monkeypatch.setattr(zpi, "_register_default", lambda *args, **kwargs: {"status": "not_exercised", "message": ""})
+    # Some tests replace the file copy with a fake, and the profile here is a relative folder. The scan line must not
+    # be written into the repository from a test, so it is stubbed too.
+    monkeypatch.setattr(zpi, "ensure_scan_pref", lambda profile: "present")
     return recorded
 
 

@@ -9,7 +9,9 @@
   ``zotero.sqlite``), refuses while Zotero is running, and reports
   ``check_failed`` when the process check itself fails. It writes nothing to the
   profile in any of these cases. It skips the write when the bytes already match. It never touches
-  ``extensions.json``, ``prefs.js`` or any other profile file.
+  ``prefs.js`` or any other profile file. The registration step below is the only other writer: it
+  adds one scan line to ``user.js`` and enables this add-on's entry in ``extensions.json``, both
+  with Zotero closed.
   ``install_default_profile`` runs that install for the default profile named in
   ``profiles.ini``, with no close step. It never raises.
 * ``signed_install_state`` says what is stored for this bundle's version and source: the Mozilla-signed .xpi
@@ -45,9 +47,9 @@ UNVERIFIED on a real machine:
 * the default Zotero data-root paths in ``zotero_data_dir`` (Windows
   ``%APPDATA%\\Zotero\\Zotero``, macOS ``~/Library/Application Support/Zotero``,
   Linux ``~/.zotero/zotero``). ``MERIDIAN_ZOTERO_DATA_DIR`` overrides them.
-* whether Zotero loads an unsigned .xpi that is dropped into ``extensions/``
-  without an ``extensions.json`` entry. This module relies on that load path
-  and does not verify it.
+* Zotero 10.0.6 was tested in throwaway profiles only, not on the user's profile: a new file in
+  ``extensions/`` is registered only when ``extensions.startupScanScopes`` lets Zotero scan the folder, and
+  a newly registered sideload comes up disabled. The registration step below relies on both facts.
 * whether ``taskkill /IM zotero.exe`` (a close request, not a force kill) makes
   Zotero exit within the 20-second wait. A Zotero that is busy or shows a dialog
   will not close, and the install then reports ``close_failed``.
@@ -63,6 +65,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -107,6 +110,10 @@ CLOSE_FAILED_MESSAGE = (
 UNCONFIRMED_CLOSED_STATUSES = frozenset({"check_failed", "refused_running"})
 _CLOSE_POLL_SECONDS = 0.5
 _CLOSE_TIMEOUT_SECONDS = 20.0
+REGISTER_TIMEOUT_SECONDS = 120.0
+REGISTER_POLL_SECONDS = 1.0
+# Zotero shuts down slowly after its first start, so the registration's close waits longer than the install's close.
+REGISTER_CLOSE_TIMEOUT_SECONDS = 60.0
 _TASKKILL_ARGV = ("taskkill", "/IM", "zotero.exe")
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -627,7 +634,7 @@ def _prepare_default_install() -> "tuple[Path, Path, str] | dict[str, Any]":
         if not is_zotero_profile(profile):
             return _result("refused_not_profile", None, error=_NOT_PROFILE_MESSAGE.format(profile=profile))
         unsigned = build_xpi(default_xpi_path())
-        stored = signed_install_state()
+        stored = _stored_with_fetch()
         refusal = _signed_refusal(stored, unsigned)
         if refusal is not None:
             return refusal
@@ -751,8 +758,12 @@ def install_with_close(
     close: "Callable[..., str] | None" = None,
     restart: "Callable[[], Any] | None" = None,
     env: "Mapping[str, str] | None" = None,
+    after_install: "Callable[[], Mapping[str, Any]] | None" = None,
 ) -> dict[str, Any]:
     """Install the plugin, closing Zotero first when the choice allows it. Never raises.
+
+    ``after_install`` runs after a successful install, while Zotero is closed, and its result is kept under ``enable``.
+    It is the registration step, which starts and closes Zotero itself, so it runs before any restart.
 
     ``install`` writes the plugin and is supplied by the caller, who resolves the profile and the
     bundle before this runs. So no profile lookup or build happens after a close.
@@ -781,7 +792,7 @@ def install_with_close(
         # The state of Zotero is unknown. Refuse here, so that neither the close nor the install runs.
         return _refusal_result("check_failed", _CHECK_FAILED_MESSAGE)
     if start is False:
-        return _install_outcome(install, closed=False)
+        return _after_install(_install_outcome(install, closed=False), after_install)
     if not want_close:
         return _refusal_result("refused_running", REFUSED_RUNNING_MESSAGE)
     try:
@@ -794,9 +805,20 @@ def install_with_close(
         return _refusal_result("refused_running", REFUSED_RUNNING_MESSAGE)
     if outcome != "closed":
         # "not_running": Zotero stopped between the two checks. Meridian closed nothing, so nothing restarts.
-        return _install_outcome(install, closed=False)
-    result = _install_outcome(install, closed=True)
+        return _after_install(_install_outcome(install, closed=False), after_install)
+    result = _after_install(_install_outcome(install, closed=True), after_install)
     result["restart"] = _restart_after_close(restart)
+    return result
+
+
+def _after_install(result: dict[str, Any], after_install: "Callable[[], Mapping[str, Any]] | None") -> dict[str, Any]:
+    """Run the registration step after a successful install, and keep its result under ``enable``. Never raises."""
+    if after_install is None or result.get("status") not in ("installed", "unchanged"):
+        return result
+    try:
+        result["enable"] = dict(after_install())
+    except Exception as exc:  # noqa: BLE001 -- a failed registration is reported, never raised
+        result["enable"] = {"status": "failed", "message": str(exc)}
     return result
 
 
@@ -808,8 +830,14 @@ def install_default_with_close(
     close: "Callable[..., str] | None" = None,
     restart: "Callable[[], Any] | None" = None,
     env: "Mapping[str, str] | None" = None,
+    launch: "Callable[[], Any] | None" = None,
+    register_timeout_s: "float | None" = None,
 ) -> dict[str, Any]:
     """The tray's install: the default profile and the bundle first, then :func:`install_with_close`. Never raises.
+
+    After the file is in place, the registration step enables the plugin (see ``register_and_enable``). ``launch``
+    starts Zotero for that step and defaults to the launcher. A ``user.js`` that sets the scan pref to anything
+    else is refused before anything closes.
 
     The profile is found, checked for its marker, and the bundle is built before anything closes, as the
     CLI does it. A missing default profile, a folder that is not a profile, or a bundle that will not build
@@ -820,20 +848,294 @@ def install_default_with_close(
     if isinstance(prepared, dict):
         return {**prepared, "closed_zotero": False, "restart": None}
     profile, signed, sha256 = prepared
+    check = running if running is not None else zotero_process_state
+    if check_scan_pref(profile) == "conflict":
+        return _refusal_result(PREF_CONFLICT_STATUS, PREF_CONFLICT_MESSAGE)
     current = _already_current(profile, sha256)
     if current is not None:
-        # Nothing would be written, so there is nothing to close for, whatever Zotero's state is.
-        return {**current, "closed_zotero": False, "restart": None}
-    check = running if running is not None else zotero_process_state
+        # The file is already current, so nothing is closed. The plugin is enabled only while Zotero is not running.
+        return _unchanged_outcome(profile, current, check, close, launch, register_timeout_s)
     return install_with_close(
         settings,
-        install=lambda: install_into_profile(profile, signed, running=check, expected_sha256=sha256),
+        install=lambda: _install_files(profile, signed, check, sha256),
         close_zotero=close_zotero,
         running=check,
         close=close,
         restart=restart,
         env=env,
+        after_install=lambda: _register_default(profile, check, close, launch, register_timeout_s),
     )
+
+
+# ---------------------------------------------------------------------------
+# Registering and enabling the plugin, with no click
+# ---------------------------------------------------------------------------
+#
+# Zotero scans the profile's extensions/ folder only when extensions.startupScanScopes allows it (its default is
+# 0), so a file dropped in is ignored by an ordinary start. A newly registered sideload comes up disabled, because
+# extensions.autoDisableScopes is 15. This section makes both facts work for this one add-on:
+#
+# * user.js gets one line that sets the scan scope. Every other line in user.js is kept.
+# * Zotero registers the file on a start. Meridian then enables only this add-on's entry in extensions.json,
+#   with Zotero closed. Other entries, and the rest of the profile, are left as they are.
+# * Meridian records the profiles it enabled the plugin in. A plugin the user later disables stays disabled.
+
+ADDON_ID = "meridian-zotero@usemeridian.us"  # equal to zotero_plugin_sign.PLUGIN_ADDON_ID (a test checks it)
+SCAN_PREF = "extensions.startupScanScopes"
+SCAN_PREF_VALUE = 1
+SCAN_PREF_LINE = f'user_pref("{SCAN_PREF}", {SCAN_PREF_VALUE});'
+_SCAN_PREF_RE = re.compile(r'user_pref\(\s*"extensions\.startupScanScopes"\s*,\s*([^)]*?)\s*\)\s*;?')
+EXTENSIONS_JSON = "extensions.json"
+ENABLED_RECORD = "zotero_plugin_enabled.json"
+PREF_CONFLICT_STATUS = "pref_conflict"
+PREF_CONFLICT_MESSAGE = (
+    f"This Zotero profile's user.js sets {SCAN_PREF} to something other than {SCAN_PREF_VALUE}, so Meridian will "
+    "not change it. Remove that line, then run this command again. Nothing was written."
+)
+_REGISTER_MESSAGES = {
+    "registry_unreadable": "Zotero's extensions.json could not be read, so the plugin was not enabled. Nothing was changed.",
+    "close_failed": "Zotero did not close after it registered the plugin, so nothing was enabled. Close Zotero, then run this command again.",
+    "register_timeout": "Zotero did not register the plugin within two minutes, so it is not enabled yet. Start Zotero once, then run this command again.",
+    "left_disabled": "The plugin is disabled in Zotero. Meridian enabled it earlier, so it was left disabled. Enable it in Tools > Plugins to turn it back on.",
+    "blocked": "Zotero blocks this plugin, so it was not enabled.",
+    "not_registered": "Zotero did not list the plugin after it started, so it is not enabled yet. Start Zotero once, then run this command again.",
+    "failed": "The plugin could not be enabled.",
+}
+_ENABLE_OK_MESSAGES = {
+    "enabled": "The plugin is enabled in Zotero.",
+    "already_enabled": "The plugin is enabled in Zotero.",
+}
+_SKIPPED_RUNNING_MESSAGE = (
+    "Zotero is running, so the plugin's enable state was not changed. Close Zotero, then run this command again."
+)
+
+
+def check_scan_pref(profile: "Path | str") -> str:
+    """``added`` when user.js has no scan line, ``present`` when it has the one Meridian needs, ``conflict`` for any other value. Reads only."""
+    path = Path(profile) / "user.js"
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    values = [match.group(1).strip() for match in _SCAN_PREF_RE.finditer(text)]
+    if any(value != str(SCAN_PREF_VALUE) for value in values):
+        return "conflict"
+    return "present" if values else "added"
+
+
+def ensure_scan_pref(profile: "Path | str") -> str:
+    """Add the scan line to user.js when it is missing, keeping every other line. Returns what was found. Writes only for ``added``."""
+    state = check_scan_pref(profile)
+    if state == "added":
+        path = Path(profile) / "user.js"
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if text and not text.endswith("\n"):
+            text += "\n"
+        _atomic_write_bytes(path, (text + SCAN_PREF_LINE + "\n").encode("utf-8"))
+    return state
+
+
+def _read_registry(profile: "Path | str") -> "tuple[str, dict[str, Any] | None, dict[str, Any] | None]":
+    """``(status, data, entry)``: ``missing``, ``unreadable``, or ``ok`` with this add-on's entry (None when not registered). Reads only."""
+    path = Path(profile) / EXTENSIONS_JSON
+    if not path.is_file():
+        return "missing", None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "unreadable", None, None
+    addons = data.get("addons") if isinstance(data, dict) else None
+    if not isinstance(addons, list):
+        return "unreadable", None, None
+    entry = next((item for item in addons if isinstance(item, dict) and item.get("id") == ADDON_ID), None)
+    return "ok", data, entry
+
+
+def _enable_entry(profile: "Path | str") -> dict[str, Any]:
+    """Clear ``userDisabled`` on this add-on's entry and nothing else. Zotero must be closed. Never raises."""
+    status, data, entry = _read_registry(profile)
+    if status != "ok" or entry is None:
+        return _register_result("not_registered")
+    if entry.get("appDisabled") or (entry.get("blocklistState") or 0) != 0:
+        return _register_result("blocked")
+    entry["userDisabled"] = False
+    entry["active"] = not entry.get("softDisabled", False)
+    _atomic_write_bytes(Path(profile) / EXTENSIONS_JSON, (json.dumps(data, indent=2) + "\n").encode("utf-8"))
+    return _register_result("enabled")
+
+
+def _record_path() -> Path:
+    return signing_state_dir() / ENABLED_RECORD
+
+
+def _profile_key(profile: "Path | str") -> str:
+    return os.path.normcase(str(Path(profile).resolve()))
+
+
+def _recorded_profiles() -> list[str]:
+    try:
+        payload = json.loads(_record_path().read_text(encoding="utf-8"))
+        keys = payload.get("profiles", []) if isinstance(payload, dict) else []
+        return [key for key in keys if isinstance(key, str)]
+    except (OSError, ValueError):
+        return []
+
+
+def _enabled_by_meridian(profile: "Path | str") -> bool:
+    return _profile_key(profile) in _recorded_profiles()
+
+
+def _remember_enabled(profile: "Path | str") -> None:
+    keys = _recorded_profiles()
+    key = _profile_key(profile)
+    if key not in keys:
+        keys.append(key)
+    _atomic_write_bytes(_record_path(), (json.dumps({"profiles": keys}, indent=2) + "\n").encode("utf-8"))
+
+
+def _register_result(status: str) -> dict[str, Any]:
+    message = _REGISTER_MESSAGES.get(status) or _ENABLE_OK_MESSAGES.get(status, "")
+    return {"status": status, "message": message}
+
+
+def _wait_for_registration(
+    profile: "Path | str", *, timeout_s: float, sleep: "Callable[[float], Any]", clock: "Callable[[], float]",
+) -> bool:
+    """True once extensions.json lists this add-on, False when ``timeout_s`` passes first."""
+    deadline = clock() + timeout_s
+    while True:
+        status, _data, entry = _read_registry(profile)
+        if status == "ok" and entry is not None:
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(REGISTER_POLL_SECONDS)
+
+
+def register_and_enable(
+    profile: "Path | str",
+    *,
+    launch: "Callable[[], Any]",
+    close: "Callable[..., str]",
+    running: "Callable[[], bool | None]",
+    timeout_s: "float | None" = None,
+    sleep: "Callable[[float], Any]" = time.sleep,
+    clock: "Callable[[], float]" = time.monotonic,
+) -> dict[str, Any]:
+    """Get Zotero to register the plugin, then enable it. Zotero must be closed when this runs. Never raises.
+
+    * Already enabled: ``already_enabled``. Nothing is changed except Meridian's record.
+    * Not registered yet: ``launch`` starts Zotero, Meridian waits up to ``timeout_s`` for the entry, and
+      ``close`` closes Zotero again. No entry means ``register_timeout``. Zotero that does not close means
+      ``close_failed``. Nothing is enabled in either case.
+    * Disabled, and Meridian enabled it before: ``left_disabled``. The user turned it off on purpose.
+    * Otherwise the entry is enabled: ``enabled``.
+    """
+    try:
+        status, _data, entry = _read_registry(profile)
+        if status == "unreadable":
+            return _register_result("registry_unreadable")
+        if entry is None:
+            launch()
+            wait_s = REGISTER_TIMEOUT_SECONDS if timeout_s is None else timeout_s
+            registered = _wait_for_registration(profile, timeout_s=wait_s, sleep=sleep, clock=clock)
+            closed = close(running=running)
+            if closed not in ("closed", "not_running"):
+                return _register_result("close_failed")
+            if not registered:
+                return _register_result("register_timeout")
+            status, _data, entry = _read_registry(profile)
+            if status != "ok" or entry is None:
+                return _register_result("not_registered")
+        if not entry.get("userDisabled", False):
+            _remember_enabled(profile)
+            return _register_result("already_enabled")
+        if _enabled_by_meridian(profile):
+            return _register_result("left_disabled")
+        result = _enable_entry(profile)
+        if result["status"] == "enabled":
+            _remember_enabled(profile)
+        return result
+    except Exception:  # noqa: BLE001 -- every failure is data for the caller, never a crash
+        return _register_result("failed")
+
+
+def _install_files(
+    profile: "Path | str", signed: "Path | str", running: "Callable[[], bool | None] | None", sha256: str,
+) -> dict[str, Any]:
+    """The install's writes: the signed file, then the scan line. The scan line is written only after the file. Never raises."""
+    result = install_into_profile(profile, signed, running=running, expected_sha256=sha256)
+    if result.get("status") in ("installed", "unchanged"):
+        try:
+            result["scan_pref"] = ensure_scan_pref(profile)
+        except Exception as exc:  # noqa: BLE001 -- a failed user.js write is reported, the file is already in place
+            result = {**result, "status": "failed", "error": f"user.js could not be updated: {exc}"}
+    return result
+
+
+def _fetch_approved_if_missing() -> None:
+    """Ask Mozilla for the approved file when none is stored for this bundle. Reads only: nothing is submitted. Never raises."""
+    from meridian import zotero_plugin_sign as sign  # imported here: that module imports this one
+
+    try:
+        sign.sign_plugin(fetch=True, state_dir=signing_state_dir())
+    except Exception:  # noqa: BLE001 -- a failed fetch leaves the install to report that nothing is stored
+        return
+
+
+def _stored_with_fetch() -> Any:
+    """The stored signed state, asking Mozilla for the approved file first when none is stored. Never raises."""
+    stored = signed_install_state()
+    if not stored.signed:
+        _fetch_approved_if_missing()
+        stored = signed_install_state()
+    return stored
+
+
+def _close_after_registration(running: "Callable[[], bool | None] | None" = None) -> str:
+    """Close the Zotero the registration step started, with the longer registration wait. Never raises."""
+    return close_zotero_gracefully(running=running, timeout_s=REGISTER_CLOSE_TIMEOUT_SECONDS)
+
+
+def _register_default(
+    profile: "Path | str",
+    running: "Callable[[], bool | None] | None",
+    close: "Callable[..., str] | None",
+    launch: "Callable[[], Any] | None",
+    timeout_s: "float | None",
+) -> dict[str, Any]:
+    """The registration step for the default profile, with Zotero closed. Never raises.
+
+    The default launch is the launcher's start, which returns once Zotero's local API answers. A close sent before
+    that can be ignored while Zotero is still starting, so the default close runs only after the start.
+    """
+    check = running if running is not None else zotero_process_state
+    return register_and_enable(
+        profile,
+        launch=launch if launch is not None else _start_zotero_after_close,
+        close=close if close is not None else _close_after_registration,
+        running=check,
+        timeout_s=timeout_s,
+    )
+
+
+def _unchanged_outcome(
+    profile: "Path | str",
+    current: Mapping[str, Any],
+    running: "Callable[[], bool | None] | None",
+    close: "Callable[..., str] | None",
+    launch: "Callable[[], Any] | None",
+    timeout_s: "float | None",
+) -> dict[str, Any]:
+    """The outcome when the installed file is already the signed one. Writes nothing to user.js. Enables only while Zotero is closed. Never raises."""
+    result = {**current, "closed_zotero": False, "restart": None}
+    check = running if running is not None else zotero_process_state
+    if _safe_state(check) is False:
+        result["enable"] = _register_default(profile, check, close, launch, timeout_s)
+        return result
+    _status, _data, entry = _read_registry(profile)
+    if entry is not None and not entry.get("userDisabled", False):
+        result["enable"] = _register_result("already_enabled")
+    else:
+        result["enable"] = {"status": "skipped_zotero_running", "message": _SKIPPED_RUNNING_MESSAGE}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1082,27 +1384,72 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     if not is_zotero_profile(profile):
         print(_NOT_PROFILE_MESSAGE.format(profile=profile))
         return 1
+    # Meridian can only register and enable the plugin in Zotero's default profile, because it starts Zotero itself.
+    is_default = _is_default_profile(profile)
     # An unsigned or tampered plugin is refused before anything closes: only the verified signed file is copied.
-    stored = signed_install_state()
+    stored = _stored_with_fetch()
     refusal = _signed_refusal(stored, xpi)
     if refusal is not None:
         return _print_install_status(refusal, xpi, profile)
+    if check_scan_pref(profile) == "conflict":
+        print(PREF_CONFLICT_MESSAGE)
+        return 1
     # A plugin that is already identical needs no close, whether or not Zotero runs.
     current = _already_current(profile, stored.sha256)
     if current is not None:
-        return _print_install_status(current, xpi, profile)
+        outcome = _unchanged_outcome(profile, current, None, None, None, None) if is_default else _not_default(current)
+        return _print_install_status_and_enable(outcome, xpi, profile)
     result = install_with_close(
         load_settings(settings_path()),
         close_zotero=close_zotero,
-        install=lambda: install_into_profile(profile, stored.path, expected_sha256=stored.sha256),
+        install=lambda: _install_files(profile, stored.path, None, stored.sha256),
+        after_install=(lambda: _register_default(profile, None, None, None, None)) if is_default else None,
     )
+    if not is_default and result.get("status") in ("installed", "unchanged"):
+        result = _not_default(result)
     if result.get("closed_zotero") and result.get("status") in UNCONFIRMED_CLOSED_STATUSES:
         # Meridian closed Zotero, so the text must not tell the user to close it as if it had not.
         print(_closed_unconfirmed_cli_text(result.get("restart")))
         return 1
-    code = _print_install_status(result, xpi, profile)
+    code = _print_install_status_and_enable(result, xpi, profile)
     if result.get("closed_zotero"):
         print(_restart_sentence(result.get("restart")))
+    return code
+
+
+NOT_DEFAULT_PROFILE_MESSAGE = (
+    "The plugin file and its scan setting are in this profile. Meridian enables the plugin only in Zotero's default "
+    "profile, so start Zotero with this profile once, then enable the plugin in Tools > Plugins."
+)
+
+
+def _is_default_profile(profile: "Path | None") -> bool:
+    """True when ``profile`` is the profile Zotero marks as default. Never raises."""
+    try:
+        default = find_default_profile_dir(zotero_data_dir())
+        return profile is not None and default is not None and _profile_key(profile) == _profile_key(default)
+    except Exception:  # noqa: BLE001 -- an unknown default is not the default
+        return False
+
+
+def _not_default(result: Mapping[str, Any]) -> dict[str, Any]:
+    """The result for a profile that is not the default. Nothing is enabled and nothing is written here. Never raises."""
+    return {**result, "enable": {"status": "not_default_profile", "message": NOT_DEFAULT_PROFILE_MESSAGE}}
+
+
+def _print_install_status_and_enable(result: Mapping[str, Any], xpi: Path, profile: Path) -> int:
+    """The install's status line, then the enable line when there is one. Returns the exit code."""
+    code = _print_install_status(result, xpi, profile)
+    enable = result.get("enable")
+    if isinstance(enable, Mapping):
+        message = _ENABLE_OK_MESSAGES.get(str(enable.get("status"))) or enable.get("message")
+        if message:
+            print(message)
+        if str(enable.get("status")) in ("register_timeout", "close_failed", "not_registered", "registry_unreadable", "failed", "blocked"):
+            code = 1
+    if result.get("scan_pref_error"):
+        print(f"The scan setting could not be written to user.js: {result['scan_pref_error']}")
+        code = 1
     return code
 
 

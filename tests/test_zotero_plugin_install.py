@@ -87,6 +87,17 @@ def _isolated_meridian_state(monkeypatch, tmp_path):
     monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(tmp_path / "meridian-state"))
 
 
+@pytest.fixture(autouse=True)
+def _no_fetch_no_registration(monkeypatch):
+    """No test asks Mozilla for a file, or runs the registration step, which starts and closes Zotero.
+
+    The registration step is covered by test_zotero_plugin_enable.py. These tests check the install around it, so the
+    step is stubbed to a neutral result here. The restart tests keep the real launcher start path.
+    """
+    monkeypatch.setattr(zpi, "_fetch_approved_if_missing", lambda: None)
+    monkeypatch.setattr(zpi, "_register_default", lambda *args, **kwargs: {"status": "not_exercised", "message": ""})
+
+
 def _seed_signed(state_dir: Path, source: Path, payload: bytes) -> Path:
     """Store ``payload`` as the signed artifact for ``source``, through the real record path. No Mozilla involved."""
     from meridian import zotero_plugin_sign as sign

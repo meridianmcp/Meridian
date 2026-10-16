@@ -124,6 +124,9 @@ def _isolated(monkeypatch, tmp_path):
     monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(tmp_path / "meridian-state"))
     monkeypatch.delenv(sign.API_KEY_ENV, raising=False)
     monkeypatch.delenv(sign.API_SECRET_ENV, raising=False)
+    # The install's registration step starts and closes Zotero. These tests check signing, so it is stubbed here.
+    # test_zotero_plugin_enable.py covers the registration itself.
+    monkeypatch.setattr(zpi, "_register_default", lambda *args, **kwargs: {"status": "not_exercised", "message": ""})
 
 
 def _write(path: Path, data) -> Path:
@@ -1345,7 +1348,13 @@ def default_zotero(monkeypatch, tmp_path, source):
 def test_install_without_a_signed_artifact_writes_nothing_and_says_it_needs_a_signature(
     monkeypatch, default_zotero,
 ):
-    monkeypatch.setattr(sign, "sign_plugin", lambda **kwargs: pytest.fail("install never signs"))
+    def _no_submission(**kwargs):
+        # The install may ask Mozilla for the approved file (fetch=True: read only, nothing submitted). It never submits.
+        if not kwargs.get("fetch"):
+            pytest.fail("install never submits to Mozilla")
+        return {"status": "not_approved_yet", "message": "Mozilla has not approved this version."}
+
+    monkeypatch.setattr(sign, "sign_plugin", _no_submission)
     before = _snapshot(default_zotero)
     result = zpi.install_default_profile(running=lambda: False)
     assert result["status"] == "needs_signature"
