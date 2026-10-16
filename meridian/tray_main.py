@@ -1441,6 +1441,21 @@ def _closed_not_restarted_text(status: Any, path: Any) -> str:
     )
 
 
+def _closed_unconfirmed_text(restarted: bool) -> str:
+    """Meridian closed Zotero, but could not confirm it was closed, so nothing was installed. Names the next step."""
+    if restarted:
+        return (
+            "Meridian closed Zotero and restarted it, but could not confirm that Zotero is closed, so nothing was "
+            'installed. Close Zotero, then choose "' + ZOTERO_PLUGIN_INSTALL_NOW_LABEL
+            + '" from the Meridian tray menu.'
+        )
+    return (
+        "Meridian closed Zotero, but could not restart it, and could not confirm that Zotero is closed, so nothing "
+        'was installed. Make sure Zotero is closed, then choose "' + ZOTERO_PLUGIN_INSTALL_NOW_LABEL
+        + '" from the Meridian tray menu.'
+    )
+
+
 _ZOTERO_CLOSED_RESTARTED_PREFIX = "Meridian closed Zotero and restarted it. "
 _ZOTERO_CLOSED_NOT_RESTARTED_PREFIX = "Meridian closed Zotero, but could not restart it. Start Zotero yourself. "
 
@@ -1484,7 +1499,10 @@ def zotero_plugin_install_text(result: dict, *, first_run: bool = False) -> str:
     error = result.get("error") or "unknown error"
     closed = result.get("closed_zotero") is True
     restarted = result.get("restart") in ("started", "already_running")
-    if closed and status in ("installed", "unchanged"):
+    if closed and status in zotero_plugin.UNCONFIRMED_CLOSED_STATUSES:
+        # Meridian closed Zotero, so the text must not tell the user to close it as if it had not.
+        text = _closed_unconfirmed_text(restarted)
+    elif closed and status in ("installed", "unchanged"):
         if restarted:
             text = _closed_and_restarted_text(status, path)
         else:

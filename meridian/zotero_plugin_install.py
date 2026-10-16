@@ -17,9 +17,11 @@
   The taskkill argument list has no force flag, and a close that fails leaves
   Zotero as it was.
 * ``install_default_with_close`` is the tray's install. It finds the default
-  profile and builds the bundle first, in the same order as the CLI, and only
-  then calls ``install_with_close``. A missing profile or a bundle that will not
-  build is refused before anything closes.
+  profile, checks that it holds a profile marker, and builds the bundle first.
+  Only then does it compare the bundle with the installed plugin, and call
+  ``install_with_close``. A missing profile, a folder that is not a profile, or a
+  bundle that will not build is refused before anything closes. A plugin that is
+  already identical is ``unchanged``, and Zotero is not closed, even while it runs.
 * ``install_with_close`` is the install the tray and the CLI use. It closes
   Zotero first when the saved ``close_zotero_for_install`` choice allows it.
   ``MERIDIAN_ZOTERO_CLOSE_ON_INSTALL`` can only turn that off, never on. It then
@@ -87,12 +89,15 @@ PROFILE_MARKERS = ("prefs.js", "zotero.sqlite")
 _NOT_PROFILE_MESSAGE = (
     "{profile} is not a Zotero profile: it has neither prefs.js nor zotero.sqlite. Nothing was written."
 )
-_CHECK_FAILED_MESSAGE = "Could not check whether Zotero is running. Nothing was written."
+_CHECK_FAILED_MESSAGE = "Could not check whether Zotero is running. Nothing was written to the Zotero profile."
 REFUSED_RUNNING_MESSAGE = "Zotero is running. Close Zotero, then run this command again. Nothing was written."
 CLOSE_FAILED_MESSAGE = (
     "Zotero did not close, so nothing was installed. Close Zotero yourself, then try the install again. "
-    "Nothing was written."
+    "Nothing was written to the Zotero profile."
 )
+# An install that closed Zotero but then could not confirm it was closed (the process check failed,
+# or Zotero still ran when the install looked). Meridian did close it, so the wording must say so.
+UNCONFIRMED_CLOSED_STATUSES = frozenset({"check_failed", "refused_running"})
 _CLOSE_POLL_SECONDS = 0.5
 _CLOSE_TIMEOUT_SECONDS = 20.0
 _TASKKILL_ARGV = ("taskkill", "/IM", "zotero.exe")
@@ -506,17 +511,35 @@ def install_into_profile(
         return _result("failed", None, error=str(exc))
 
 
+def _already_current(profile: "Path | str", xpi: "Path | str") -> "dict[str, Any] | None":
+    """The ``unchanged`` result when the installed plugin matches the built bundle byte for byte, else None.
+
+    It only reads, so it can run before any close and whatever Zotero's state is. Never raises: a
+    read that fails means "not known to be current", and the install path then decides.
+    """
+    target = Path(profile) / "extensions" / XPI_FILENAME
+    try:
+        if target.is_file() and target.read_bytes() == Path(xpi).read_bytes():
+            return _result("unchanged", target)
+    except Exception:  # noqa: BLE001 -- an unreadable file is not known to be current
+        return None
+    return None
+
+
 def _prepare_default_install() -> "tuple[Path, Path] | dict[str, Any]":
     """The default profile and the built bundle, resolved before anything is closed. Never raises.
 
     Returns ``(profile, xpi)`` when both are ready. Otherwise it returns the refusal to hand back
-    unchanged: ``no_profile`` when there is no default profile, or ``failed`` when the bundle will
-    not build. The bundle is written into Meridian's own state folder, never into Zotero.
+    unchanged: ``no_profile`` when there is no default profile, ``refused_not_profile`` when the
+    profile folder holds no marker file (the same check the CLI makes), or ``failed`` when the
+    bundle will not build. The bundle is written into Meridian's own state folder, never into Zotero.
     """
     try:
         profile = find_default_profile_dir(zotero_data_dir())
         if profile is None:
             return _result("no_profile", None)
+        if not is_zotero_profile(profile):
+            return _result("refused_not_profile", None, error=_NOT_PROFILE_MESSAGE.format(profile=profile))
         return profile, build_xpi(default_xpi_path())
     except Exception as exc:  # noqa: BLE001 -- report every failure as data, never raise
         return _result("failed", None, error=str(exc))
@@ -652,13 +675,19 @@ def install_default_with_close(
 ) -> dict[str, Any]:
     """The tray's install: the default profile and the bundle first, then :func:`install_with_close`. Never raises.
 
-    The profile is found and the bundle is built before anything closes, as the CLI does it. A missing
-    default profile, or a bundle that will not build, is refused and Zotero is left alone.
+    The profile is found, checked for its marker, and the bundle is built before anything closes, as the
+    CLI does it. A missing default profile, a folder that is not a profile, or a bundle that will not build
+    is refused and Zotero is left alone. A plugin already identical to the bundle is ``unchanged`` with no
+    close and no restart, whether or not Zotero runs.
     """
     prepared = _prepare_default_install()
     if isinstance(prepared, dict):
         return {**prepared, "closed_zotero": False, "restart": None}
     profile, xpi = prepared
+    current = _already_current(profile, xpi)
+    if current is not None:
+        # Nothing would be written, so there is nothing to close for, whatever Zotero's state is.
+        return {**current, "closed_zotero": False, "restart": None}
     check = running if running is not None else zotero_process_state
     return install_with_close(
         settings,
@@ -817,6 +846,19 @@ def _restart_sentence(restart: Any) -> str:
     return "Meridian closed Zotero, but could not restart it. Start Zotero yourself."
 
 
+def _closed_unconfirmed_cli_text(restart: Any) -> str:
+    """What the CLI says when Meridian closed Zotero but could not confirm it was closed. Names the restart. Pure."""
+    if restart in ("started", "already_running"):
+        return (
+            "Meridian closed Zotero and restarted it, but could not confirm that Zotero is closed, so nothing was "
+            "installed. Close Zotero, then run this command again."
+        )
+    return (
+        "Meridian closed Zotero, but could not restart it, and could not confirm that Zotero is closed, so nothing "
+        "was installed. Make sure Zotero is closed, then run this command again."
+    )
+
+
 def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -> int:
     """Print the install's own outcome line. Returns the exit code."""
     status = result["status"]
@@ -838,7 +880,7 @@ def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -
     if status == "check_failed":
         print(
             "Could not check whether Zotero is running. Make sure Zotero is closed, "
-            "then run this command again. Nothing was written."
+            "then run this command again. Nothing was written to the Zotero profile."
         )
         return 1
     if status == "no_profile":
@@ -892,11 +934,19 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     if not is_zotero_profile(profile):
         print(_NOT_PROFILE_MESSAGE.format(profile=profile))
         return 1
+    # A plugin that is already identical needs no close, whether or not Zotero runs.
+    current = _already_current(profile, xpi)
+    if current is not None:
+        return _print_install_status(current, xpi, profile)
     result = install_with_close(
         load_settings(settings_path()),
         close_zotero=close_zotero,
         install=lambda: install_into_profile(profile, xpi),
     )
+    if result.get("closed_zotero") and result.get("status") in UNCONFIRMED_CLOSED_STATUSES:
+        # Meridian closed Zotero, so the text must not tell the user to close it as if it had not.
+        print(_closed_unconfirmed_cli_text(result.get("restart")))
+        return 1
     code = _print_install_status(result, xpi, profile)
     if result.get("closed_zotero"):
         print(_restart_sentence(result.get("restart")))

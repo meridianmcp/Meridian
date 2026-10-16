@@ -2746,6 +2746,9 @@ def _install_returns(monkeypatch, answer):
     per-test state dir), the close step and the restart. Only the write into the profile is answered.
     """
     monkeypatch.setattr(zpi, "find_default_profile_dir", lambda data_dir: _FAKE_PROFILE)
+    # The fake folder does not exist, so its profile-marker check is answered too. The marker refusal
+    # has its own test in this file, with a real folder that holds no marker.
+    monkeypatch.setattr(zpi, "is_zotero_profile", lambda profile_dir: True)
     monkeypatch.setattr(zpi, "install_into_profile", lambda profile_dir, xpi_path, **kwargs: answer())
 
 
@@ -2774,8 +2777,9 @@ def _no_real_subprocess_or_zotero_close(request, monkeypatch):
     """The Zotero install tests' guard, for this file too: no real process call and no real Zotero close.
 
     subprocess.run and Popen fail the test, so a test that reaches the real tasklist or taskkill cannot
-    touch the machine. A real close goes through close_zotero_gracefully, which is faked to fail the test,
-    because install_with_close would otherwise swallow the error and wait on the poll. A test that spawns
+    touch the machine. A real close goes through close_zotero_gracefully, which is faked to fail the test.
+    pytest.fail raises a BaseException, and install_with_close only catches Exception, so the failure
+    reaches the test instead of being reported as a failed close. A test that spawns
     a real process on purpose is marked subprocess_isolated and keeps subprocess; the close guard still applies.
     """
 
@@ -3251,7 +3255,7 @@ def test_close_failed_message_is_the_one_text_the_cli_and_the_tray_share():
     assert text == zpi.CLOSE_FAILED_MESSAGE
     assert text == (
         "Zotero did not close, so nothing was installed. Close Zotero yourself, then try the install again. "
-        "Nothing was written."
+        "Nothing was written to the Zotero profile."
     )
 
 
@@ -3266,6 +3270,44 @@ def test_refused_running_message_still_says_to_close_zotero_and_install_now():
         "Zotero is running, so nothing was installed. Close Zotero, then choose "
         '"Install Zotero plugin now" from the Meridian tray menu.'
     )
+
+
+_UNCONFIRMED_CLOSED_STATUSES = ["check_failed", "refused_running"]
+_UNCONFIRMED_RESTARTED_TEXT = (
+    "Meridian closed Zotero and restarted it, but could not confirm that Zotero is closed, so nothing was installed. "
+    'Close Zotero, then choose "Install Zotero plugin now" from the Meridian tray menu.'
+)
+_UNCONFIRMED_NOT_RESTARTED_TEXT = (
+    "Meridian closed Zotero, but could not restart it, and could not confirm that Zotero is closed, so nothing "
+    'was installed. Make sure Zotero is closed, then choose "Install Zotero plugin now" from the Meridian tray menu.'
+)
+
+
+@pytest.mark.parametrize("status", _UNCONFIRMED_CLOSED_STATUSES)
+@pytest.mark.parametrize("restart", ["started", "already_running"])
+def test_closed_unconfirmed_restarted_says_meridian_closed_it_and_asks_to_close_then_install(status, restart):
+    text = tray_main.zotero_plugin_install_text({
+        "status": status, "path": None, "error": "E", "closed_zotero": True, "restart": restart,
+    })
+    assert text == _UNCONFIRMED_RESTARTED_TEXT
+
+
+@pytest.mark.parametrize("status", _UNCONFIRMED_CLOSED_STATUSES)
+@pytest.mark.parametrize("restart", ["error", "timeout", None])
+def test_closed_unconfirmed_not_restarted_says_meridian_closed_it_and_asks_to_make_sure_it_is_closed(status, restart):
+    text = tray_main.zotero_plugin_install_text({
+        "status": status, "path": None, "error": "E", "closed_zotero": True, "restart": restart,
+    })
+    assert text == _UNCONFIRMED_NOT_RESTARTED_TEXT
+
+
+@pytest.mark.parametrize("status", _UNCONFIRMED_CLOSED_STATUSES)
+def test_closed_but_unconfirmed_first_run_text_starts_with_the_saved_prefix(status):
+    text = tray_main.zotero_plugin_install_text(
+        {"status": status, "path": None, "error": "E", "closed_zotero": True, "restart": "started"},
+        first_run=True,
+    )
+    assert text == "Your choice was saved. " + _UNCONFIRMED_RESTARTED_TEXT
 
 
 def test_close_failed_is_a_known_install_status_so_the_tray_shows_its_message():
@@ -3387,7 +3429,8 @@ def test_the_tray_suite_blocks_real_process_calls_and_real_zotero_closes():
 
 # Closing Zotero for the install: every outcome that closed Zotero says so, and the tray resolves before it closes.
 
-_NOT_INSTALLED_STATUSES = ["failed", "refused_running", "no_profile", "refused_not_profile", "check_failed"]
+# refused_running and check_failed after a close have their own wording (the unconfirmed tests above).
+_NOT_INSTALLED_STATUSES = ["failed", "no_profile", "refused_not_profile"]
 
 
 @pytest.mark.parametrize("status", _NOT_INSTALLED_STATUSES)
@@ -3447,6 +3490,42 @@ def test_the_tray_refuses_without_closing_when_the_process_check_fails(monkeypat
     )
     text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
     assert text == tray_main.zotero_plugin_install_text({"status": "check_failed", "path": None, "error": None})
+
+
+def test_the_tray_refuses_a_folder_without_a_profile_marker_before_it_closes_zotero(monkeypatch, tmp_path):
+    bare = tmp_path / "Zotero" / "Profiles" / "bare.default"
+    bare.mkdir(parents=True)
+    monkeypatch.setattr(zpi, "find_default_profile_dir", lambda data_dir: bare)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(
+        zpi, "close_zotero_gracefully",
+        lambda **kwargs: pytest.fail("Zotero must not be closed for a folder that is not a profile"),
+    )
+    text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
+    assert text.startswith("Nothing was installed: ")
+    assert "neither prefs.js nor zotero.sqlite" in text
+    assert not (bare / "extensions").exists()
+
+
+def test_the_tray_reports_a_plugin_already_current_as_unchanged_while_zotero_runs(monkeypatch, tmp_path):
+    profile = tmp_path / "Zotero" / "Profiles" / "current.default"
+    (profile / "extensions").mkdir(parents=True)
+    (profile / "prefs.js").write_text('user_pref("keep", true);\n', encoding="utf-8")
+    installed = profile / "extensions" / zpi.XPI_FILENAME
+    installed.write_bytes(zpi.build_xpi_bytes())
+    monkeypatch.setattr(zpi, "find_default_profile_dir", lambda data_dir: profile)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(
+        zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("the close must not run for a current plugin"),
+    )
+    monkeypatch.setattr(
+        zpi, "install_into_profile",
+        lambda *args, **kwargs: pytest.fail("the install must not run for a current plugin"),
+    )
+    text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
+    assert text == tray_main.zotero_plugin_install_text(
+        {"status": "unchanged", "path": str(installed), "closed_zotero": False, "restart": None},
+    )
 
 
 def test_the_tray_finds_the_profile_and_builds_the_bundle_before_it_closes_zotero(monkeypatch):

@@ -45,6 +45,7 @@ plugin code. The URL is a placeholder (see "Updates" below).
    `MERIDIAN_ZOTERO_CLOSE_ON_INSTALL` override (off values only), or `--keep-zotero-open`
    turns closing off. With closing off, close Zotero before you run it.
    A close request can still time out, and then nothing is installed.
+   An install that finds the plugin already current does not close Zotero.
    The command packs this folder into `meridian-zotero@usemeridian.us.xpi` and copies the file
    into your profile when it finds one. Otherwise it prints the file's path.
 2. In Zotero, open **Tools > Add-ons**, click the gear icon, and choose **Install Add-on From File**.

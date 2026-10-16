@@ -781,6 +781,7 @@ def test_cli_says_the_check_failed_and_never_that_zotero_is_running(monkeypatch,
     text = (captured.out + captured.err).lower()
     assert rc == 1
     assert "could not check whether zotero is running" in text
+    assert "nothing was written to the zotero profile." in text
     assert "zotero is running. close" not in text
     assert not (profile / "extensions").exists()
 
@@ -1250,7 +1251,9 @@ def test_a_failed_process_check_refuses_without_closing_or_calling_the_install()
     assert result["status"] == "check_failed"
     assert result["closed_zotero"] is False
     assert result["restart"] is None
-    assert "Nothing was written" in result["message"]
+    assert result["message"] == (
+        "Could not check whether Zotero is running. Nothing was written to the Zotero profile."
+    )
 
 
 # install_default_with_close: the tray's install resolves the profile and builds the bundle before any close ---
@@ -1340,6 +1343,131 @@ def test_a_bundle_that_will_not_build_refuses_before_any_close(monkeypatch, defa
     assert not (default_profile_env / "extensions").exists()
 
 
+def test_the_default_install_refuses_a_folder_without_a_marker_before_any_build_or_close(monkeypatch, tmp_path):
+    data = tmp_path / "ZoteroData"
+    bare = data / "Profiles" / "bare.default"
+    bare.mkdir(parents=True)
+    _write(data / "profiles.ini", "[Profile0]\nName=default\nIsRelative=1\nPath=Profiles/bare.default\nDefault=1\n")
+    built = tmp_path / "state" / XPI_NAME
+    monkeypatch.setattr(zpi, "zotero_data_dir", lambda: data)
+    monkeypatch.setattr(zpi, "_bundled_source_dir", lambda: _fake_source(tmp_path / "src"))
+    monkeypatch.setattr(zpi, "default_xpi_path", lambda: built)
+    result = zpi.install_default_with_close(
+        _CLOSE_ON, close_zotero=True, running=lambda: True,
+        close=lambda running=None: pytest.fail("Zotero must not be closed for a folder that is not a profile"),
+        restart=lambda: pytest.fail("nothing is restarted when Meridian closed nothing"),
+    )
+    assert result["status"] == "refused_not_profile"
+    assert result["closed_zotero"] is False
+    assert result["restart"] is None
+    assert "neither prefs.js nor zotero.sqlite" in result["error"]
+    assert _snapshot(bare) == {}
+    assert not built.exists()
+
+
+@pytest.mark.parametrize("zotero_state", [True, False, None])
+def test_an_identical_installed_plugin_is_unchanged_with_no_close_and_no_restart(default_profile_env, zotero_state):
+    assert zpi.install_default_profile(running=lambda: False)["status"] == "installed"
+    before = _snapshot(default_profile_env)
+    result = zpi.install_default_with_close(
+        _CLOSE_ON, close_zotero=True, running=lambda: zotero_state,
+        close=lambda running=None: pytest.fail("Zotero must not be closed when the plugin is already current"),
+        restart=lambda: pytest.fail("nothing is restarted when Meridian closed nothing"),
+    )
+    assert result["status"] == "unchanged"
+    assert result["closed_zotero"] is False
+    assert result["restart"] is None
+    assert _snapshot(default_profile_env) == before
+
+
+def test_an_identical_installed_plugin_is_unchanged_even_when_closing_is_off(default_profile_env):
+    assert zpi.install_default_profile(running=lambda: False)["status"] == "installed"
+    result = zpi.install_default_with_close(
+        _CLOSE_OFF, close_zotero=False, running=lambda: True,
+        close=lambda running=None: pytest.fail("Zotero must not be closed when the plugin is already current"),
+    )
+    assert result["status"] == "unchanged"
+    assert result["closed_zotero"] is False
+
+
+def test_a_different_installed_plugin_still_closes_zotero_for_the_install(default_profile_env):
+    assert zpi.install_default_profile(running=lambda: False)["status"] == "installed"
+    installed = default_profile_env / "extensions" / XPI_NAME
+    installed.write_bytes(b"an older plugin build")
+    events = []
+    result = zpi.install_default_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True, False),
+        close=lambda running=None: events.append("close") or "closed",
+        restart=lambda: "started",
+    )
+    assert events == ["close"]
+    assert result["status"] == "installed"
+    assert result["closed_zotero"] is True
+    assert installed.read_bytes() == zpi.build_xpi_bytes()
+
+
+@pytest.mark.parametrize("restart", ["started", "already_running"])
+@pytest.mark.parametrize(
+    "process_states",
+    [(True, None), (True, True)],
+    ids=["check_failed_after_close", "refused_running_after_close"],
+)
+def test_cli_closed_but_unconfirmed_says_meridian_closed_zotero_and_never_that_zotero_is_running(
+    monkeypatch, capsys, profile, process_states, restart,
+):
+    from meridian import zotero_launcher
+
+    monkeypatch.setattr(zpi, "zotero_process_state", _states(*process_states))
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: "closed")
+    monkeypatch.setattr(
+        zotero_launcher, "start_zotero", lambda **kwargs: {"action": restart, "exe": "Z", "api_ready": True},
+    )
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert out == (
+        "Meridian closed Zotero and restarted it, but could not confirm that Zotero is closed, so nothing was "
+        "installed. Close Zotero, then run this command again.\n"
+    )
+    assert not (profile / "extensions").exists()
+
+
+@pytest.mark.parametrize("process_states", [(True, None), (True, True)], ids=["check_failed", "refused_running"])
+def test_cli_closed_but_unconfirmed_without_a_restart_says_to_make_sure_zotero_is_closed(
+    monkeypatch, capsys, profile, process_states,
+):
+    from meridian import zotero_launcher
+
+    monkeypatch.setattr(zpi, "zotero_process_state", _states(*process_states))
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: "closed")
+
+    def _no_start(**kwargs):
+        raise OSError("no exe")
+
+    monkeypatch.setattr(zotero_launcher, "start_zotero", _no_start)
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert out == (
+        "Meridian closed Zotero, but could not restart it, and could not confirm that Zotero is closed, so nothing "
+        "was installed. Make sure Zotero is closed, then run this command again.\n"
+    )
+    assert not (profile / "extensions").exists()
+
+
+def test_cli_an_identical_plugin_is_unchanged_and_never_closes_a_running_zotero(monkeypatch, capsys, profile):
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
+    assert zpi.cli_main(["--profile", str(profile)]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("the close must not run"))
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "already up to date" in out
+    assert "Meridian closed" not in out
+
+
 def test_close_failed_never_installs_never_restarts_and_says_to_close_zotero_and_try_again():
     events = []
     close, install, restart = _steps(events, close_outcome="close_failed")
@@ -1352,7 +1480,7 @@ def test_close_failed_never_installs_never_restarts_and_says_to_close_zotero_and
     assert result["restart"] is None
     assert result["message"] == (
         "Zotero did not close, so nothing was installed. Close Zotero yourself, then try the install again. "
-        "Nothing was written."
+        "Nothing was written to the Zotero profile."
     )
     assert result["message"] == zpi.CLOSE_FAILED_MESSAGE
     assert not hasattr(zpi, "_CLI_CLOSE_FAILED_MESSAGE")
@@ -1664,3 +1792,16 @@ def test_the_bridge_readme_says_the_install_command_closes_zotero_and_can_time_o
     assert "--keep-zotero-open" in readme
     assert "MERIDIAN_ZOTERO_CLOSE_ON_INSTALL" in readme
     assert "can still time out" in readme
+
+
+_ALREADY_CURRENT_SENTENCE = "An install that finds the plugin already current does not close Zotero."
+
+
+def test_docs_say_an_install_that_finds_the_plugin_already_current_does_not_close_zotero():
+    docs = (REPO_ROOT / "docs" / "zotero-plugin-install.md").read_text(encoding="utf-8")
+    assert _ALREADY_CURRENT_SENTENCE in docs
+
+
+def test_the_bridge_readme_says_an_install_that_finds_the_plugin_already_current_does_not_close_zotero():
+    readme = (REPO_EXTENSION / "README.md").read_text(encoding="utf-8")
+    assert _ALREADY_CURRENT_SENTENCE in readme
