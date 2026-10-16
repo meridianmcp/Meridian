@@ -245,6 +245,13 @@ def test_staged_manifest_declares_no_data_collection_as_amo_requires(source, tmp
     assert gecko["data_collection_permissions"] == {"required": ["none"]}
 
 
+def test_staged_manifest_names_the_id_where_web_ext_reads_it_and_keeps_zotero(source, tmp_path):
+    staged = sign.stage_for_signing(source, tmp_path / "staged")
+    applications = json.loads((staged / "manifest.json").read_text(encoding="utf-8"))["applications"]
+    assert applications["gecko"] == {"id": sign.PLUGIN_ADDON_ID}
+    assert applications["zotero"]["id"] == sign.PLUGIN_ADDON_ID
+
+
 def test_staging_packs_exactly_the_files_build_xpi_packs(source, tmp_path):
     staged = sign.stage_for_signing(source, tmp_path / "staged")
     staged_names = sorted(p.relative_to(staged).as_posix() for p in staged.rglob("*") if p.is_file())
@@ -1903,6 +1910,38 @@ def test_verify_refuses_a_manifest_for_another_add_on_id(source):
     entries = _approved_entries(source)
     manifest = json.loads(entries["manifest.json"].decode("utf-8"))
     manifest["applications"]["zotero"]["id"] = "someone-else@example.org"
+    entries["manifest.json"] = json.dumps(manifest).encode("utf-8")
+    assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
+
+
+def test_verify_accepts_the_applications_gecko_entry_that_staging_adds(source):
+    entries = _approved_entries(source)
+    manifest = json.loads(entries["manifest.json"].decode("utf-8"))
+    manifest["applications"]["gecko"] = {"id": sign.PLUGIN_ADDON_ID}
+    entries["manifest.json"] = json.dumps(manifest).encode("utf-8")
+    assert _verify(_zip_with(entries), source) is None
+
+
+def test_verify_refuses_an_applications_gecko_entry_for_another_id_or_with_extra_keys(source):
+    for gecko in ({"id": "someone-else@example.org"}, {"id": sign.PLUGIN_ADDON_ID, "strict_min_version": "1.0"}):
+        entries = _approved_entries(source)
+        manifest = json.loads(entries["manifest.json"].decode("utf-8"))
+        manifest["applications"]["gecko"] = gecko
+        entries["manifest.json"] = json.dumps(manifest).encode("utf-8")
+        assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
+
+
+def test_verify_accepts_a_source_manifest_that_already_names_the_gecko_id(source):
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    manifest["applications"]["gecko"] = {"id": sign.PLUGIN_ADDON_ID}
+    (source / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert _verify(_approved_xpi(source), source) is None
+
+
+def test_verify_refuses_a_browser_specific_gecko_id_for_another_add_on(source):
+    entries = _approved_entries(source)
+    manifest = json.loads(entries["manifest.json"].decode("utf-8"))
+    manifest["browser_specific_settings"]["gecko"]["id"] = "someone-else@example.org"
     entries["manifest.json"] = json.dumps(manifest).encode("utf-8")
     assert _verify(_zip_with(entries), source) == FETCH_MISMATCH_TEXT
 

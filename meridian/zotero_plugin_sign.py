@@ -4,8 +4,9 @@ Firefox and Zotero load an add-on that Mozilla has signed. This module signs the
 version, outside the install path:
 
 * ``stage_for_signing`` copies the files ``build_xpi`` packs into a scratch folder, with the same excludes
-  and LF line endings, and adds ``browser_specific_settings.gecko.id`` to the STAGED manifest only. The
-  shipped ``extensions/zotero-bridge/manifest.json`` is never changed.
+  and LF line endings, and adds the gecko id to the STAGED manifest only: ``browser_specific_settings.gecko``
+  (for Mozilla) and ``applications.gecko`` (for web-ext, which reads the ID from there). The shipped
+  ``extensions/zotero-bridge/manifest.json`` is never changed.
 * ``sign_plugin`` reads the bundle once and captures its version and source fingerprint. It writes a record
   with status ``submitted`` for that version into ``<state_dir>/signed.json`` BEFORE it runs
   ``web-ext sign --channel unlisted`` (pinned to ``WEB_EXT_PACKAGE``). The API key and secret go into the
@@ -252,12 +253,18 @@ def source_fingerprint(source_dir: "Path | str") -> str:
 
 
 def _staged_manifest(data: bytes) -> bytes:
-    """The manifest for signing: the shipped one plus browser_specific_settings.gecko.id. Refuses an id mismatch."""
+    """The manifest for signing: the shipped one plus the gecko id in both places web-ext reads it. Refuses an id mismatch.
+
+    web-ext 8.10 takes the add-on ID from ``applications.gecko`` whenever an ``applications`` key is present, and refuses
+    the manifest without it (``InvalidManifest: missing "applications.gecko" property``). Zotero needs
+    ``applications.zotero``, so the gecko id sits beside it. The shipped manifest is never changed.
+    """
     manifest = json.loads(data.decode("utf-8"))
     applications = manifest.get("applications") if isinstance(manifest, dict) else None
     zotero = applications.get("zotero") if isinstance(applications, dict) else None
     if not isinstance(zotero, dict) or zotero.get("id") != PLUGIN_ADDON_ID:
         raise ValueError("the bundle manifest's applications.zotero.id is not the plugin's add-on id")
+    manifest["applications"] = {**applications, "gecko": {"id": PLUGIN_ADDON_ID}}
     settings = manifest.get("browser_specific_settings")
     settings = dict(settings) if isinstance(settings, dict) else {}
     gecko = settings.get("gecko")
@@ -806,6 +813,14 @@ def _zotero_id(manifest: "dict[str, Any]") -> object:
     return zotero.get("id") if isinstance(zotero, dict) else None
 
 
+def _without_staging_additions(manifest: "dict[str, Any]") -> "dict[str, Any]":
+    """The signed manifest without the one ``applications.gecko`` entry that staging adds. Any other gecko entry stays."""
+    applications = manifest.get("applications")
+    if isinstance(applications, dict) and applications.get("gecko") == {"id": PLUGIN_ADDON_ID}:
+        return {**manifest, "applications": {key: value for key, value in applications.items() if key != "gecko"}}
+    return manifest
+
+
 def verify_fetched_signed_file(
     data: bytes, *, expected_id: str, expected_version: str, current_source_packed: "Mapping[str, bytes]",
 ) -> "str | None":
@@ -842,7 +857,13 @@ def verify_fetched_signed_file(
                 return FETCH_MISMATCH_MESSAGE
             if signed_manifest.get("version") != expected_version or _zotero_id(signed_manifest) != expected_id:
                 return FETCH_MISMATCH_MESSAGE
-            if _without_settings(signed_manifest) != _without_settings(current_manifest):
+            settings = signed_manifest.get("browser_specific_settings")
+            gecko = settings.get("gecko") if isinstance(settings, dict) else None
+            if not isinstance(gecko, dict) or gecko.get("id") != expected_id:
+                return FETCH_MISMATCH_MESSAGE
+            if _without_staging_additions(_without_settings(signed_manifest)) != _without_staging_additions(
+                _without_settings(current_manifest)
+            ):
                 return FETCH_MISMATCH_MESSAGE
             for name in expected:
                 if hashlib.sha256(archive.read(name)).digest() != hashlib.sha256(current_source_packed[name]).digest():
