@@ -136,6 +136,10 @@ _UNSAFE_PATH_MESSAGE = (
     "The temporary folder path contains characters that the signing tool cannot take safely. Set TEMP to a folder "
     "path without those characters, then try again."
 )
+_NPX_UNSAFE_PATH_MESSAGE = (
+    "The npx program path contains characters the signing tool cannot take safely. Move Node.js to a folder path "
+    "without those characters, then try again."
+)
 # Characters that cmd.exe reads specially. The web-ext .cmd shim runs through it, so none may reach the argv.
 _UNSAFE_PATH_CHARS = frozenset('&^%!"<>|')
 
@@ -299,6 +303,46 @@ def sign_argv(
 def _unsafe_for_argv(path: "Path | str") -> bool:
     """True when a path holds a character cmd.exe reads specially (see ``_UNSAFE_PATH_CHARS``). Never raises."""
     return any(char in _UNSAFE_PATH_CHARS for char in str(path))
+
+
+def _npx_folders() -> list[str]:
+    """The PATH folders that may hold npx: absolute entries only, never an empty entry, never the current folder.
+
+    A relative entry, an empty one, or one that resolves to the current folder is skipped, so npx is never taken from
+    the folder the command runs in. Never raises.
+    """
+    try:
+        here: "str | None" = os.path.normcase(os.path.realpath(os.getcwd()))
+    except (OSError, ValueError):
+        here = None
+    folders: list[str] = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        try:
+            resolved = os.path.normcase(os.path.realpath(entry))
+        except (OSError, ValueError):
+            continue
+        if resolved != here:
+            folders.append(entry)
+    return folders
+
+
+def _find_npx() -> "str | None":
+    """The npx program in the first PATH folder that holds one, or None. Never raises.
+
+    Each folder is checked as ``<folder>/npx``, a name with a folder part. ``shutil.which("npx", path=...)`` is
+    not used: on Windows it searches the current folder first, whatever ``path`` says, unless the
+    NoDefaultCurrentDirectoryInExePath variable is set.
+    """
+    for folder in _npx_folders():
+        try:
+            found = shutil.which(os.path.join(folder, "npx"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if found:
+            return found
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -654,11 +698,11 @@ def sign_plugin(
         except (OSError, ValueError, TypeError, OverflowError, RecursionError):
             return _outcome("failed", version=version, message=_STAGING_FAILED_MESSAGE)
         # Both checks run before the submission record, so a run that cannot start never uses up the version.
-        npx = shutil.which("npx")
+        npx = _find_npx()
         if npx is None:
             return _outcome("failed", version=version, message=_NPX_MISSING_MESSAGE)
         if _unsafe_for_argv(npx):
-            return _outcome("failed", version=version, message=_UNSAFE_PATH_MESSAGE)
+            return _outcome("failed", version=version, message=_NPX_UNSAFE_PATH_MESSAGE)
         try:
             argv = sign_argv(staged, artifacts, timeout_s, npx=npx)
         except (OSError, ValueError, TypeError, OverflowError):

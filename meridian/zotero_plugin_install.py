@@ -129,7 +129,9 @@ VERSION_USED_MESSAGE = (
 RECORD_UNREADABLE_STATUS = "record_unreadable"
 # The same sentence sign-plugin shows, so both commands give one instruction.
 RECORD_UNREADABLE_MESSAGE = (
-    "The signing record is unreadable, so nothing will be submitted. Check state/signed.json, then try again."
+    "The signing record is unreadable, so nothing will be submitted. Check "
+    "%USERPROFILE%\\.meridian\\local_runner\\zotero_plugin\\signed.json (or zotero_plugin\\signed.json in the folder "
+    "named by MERIDIAN_LOCAL_RUNNER_STATE_DIR, when that is set), then try again."
 )
 
 

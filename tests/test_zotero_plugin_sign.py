@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -64,7 +66,9 @@ FAILED_NONE_TEXT = (
     "version, so bump the version in manifest.json to sign a new build."
 )
 RECORD_UNREADABLE_TEXT = (
-    "The signing record is unreadable, so nothing will be submitted. Check state/signed.json, then try again."
+    "The signing record is unreadable, so nothing will be submitted. Check "
+    "%USERPROFILE%\\.meridian\\local_runner\\zotero_plugin\\signed.json (or zotero_plugin\\signed.json in the folder "
+    "named by MERIDIAN_LOCAL_RUNNER_STATE_DIR, when that is set), then try again."
 )
 NPX_MISSING_TEXT = (
     "npx was not found on PATH, so the signing tool cannot run. Install Node.js, which includes npx, then try again. "
@@ -72,6 +76,12 @@ NPX_MISSING_TEXT = (
 )
 BUNDLE_UNREADABLE_TEXT = "The plugin bundle's manifest could not be read. Nothing was signed or uploaded."
 FAKE_NPX = "C:/node/npx.cmd"
+# The real lookup, captured before the autouse fixture replaces it, for the tests that search real folders.
+_REAL_WHICH = shutil.which
+NPX_UNSAFE_TEXT = (
+    "The npx program path contains characters the signing tool cannot take safely. Move Node.js to a folder path "
+    "without those characters, then try again."
+)
 UNSAFE_PATH_TEXT = (
     "The temporary folder path contains characters that the signing tool cannot take safely. Set TEMP to a folder "
     "path without those characters, then try again."
@@ -659,8 +669,11 @@ def test_a_malformed_record_is_not_bypassed_by_a_signed_file_on_disk(source, sta
     assert runner.calls == []
 
 
-def test_the_recovery_text_says_to_check_the_record_and_never_to_remove_it():
+def test_the_recovery_text_names_the_real_record_location_and_never_says_to_remove_it():
     assert "remove" not in RECORD_UNREADABLE_TEXT.lower()
+    assert "%USERPROFILE%\\.meridian\\local_runner\\zotero_plugin\\signed.json" in RECORD_UNREADABLE_TEXT
+    assert "MERIDIAN_LOCAL_RUNNER_STATE_DIR" in RECORD_UNREADABLE_TEXT
+    assert "state/signed.json" not in RECORD_UNREADABLE_TEXT
     assert zpi.RECORD_UNREADABLE_MESSAGE == RECORD_UNREADABLE_TEXT
     assert sign.RECORD_UNREADABLE_MESSAGE == RECORD_UNREADABLE_TEXT
 
@@ -686,6 +699,29 @@ def test_a_malformed_record_also_refuses_the_install_and_writes_nothing(default_
     assert result["message"] == RECORD_UNREADABLE_TEXT
     assert _snapshot(default_zotero) == before
     assert not (default_zotero / "extensions").exists()
+
+
+def test_install_after_the_record_is_deleted_reports_the_version_used_and_writes_nothing(source, default_zotero):
+    state = zpi.signing_state_dir()
+    assert _sign(source, state)["status"] == "signed"
+    (state / "signed.json").unlink()
+    before = _snapshot(default_zotero)
+    result = zpi.install_default_profile(running=lambda: False)
+    assert result["status"] == "version_used"
+    assert "Bump the version in manifest.json to sign a new build." in result["message"]
+    assert _snapshot(default_zotero) == before
+    assert not (default_zotero / "extensions").exists()
+
+
+def test_a_same_source_rerun_reports_already_signed_and_exits_zero_with_no_run(source, monkeypatch, capsys):
+    monkeypatch.setattr(zpi, "_bundled_source_dir", lambda: source)
+    monkeypatch.setattr(sign, "_run_web_ext", lambda *a, **k: pytest.fail("no run for an already signed source"))
+    assert _sign(source, zpi.signing_state_dir())["status"] == "signed"
+    rc = sign.cli_main([])
+    text = capsys.readouterr().out
+    assert rc == 0
+    assert "already signed" in text
+    assert "Nothing was uploaded." in text
 
 
 def test_dry_run_reports_a_version_already_submitted_to_mozilla(monkeypatch, capsys):
@@ -885,6 +921,147 @@ def test_a_missing_npx_makes_no_runner_call_and_submits_nothing(source, state):
 
 
 # ---------------------------------------------------------------------------
+# npx comes from PATH only: never from the folder the command runs in, never from an empty or a relative entry
+# ---------------------------------------------------------------------------
+
+
+def _fake_npx(folder: Path) -> Path:
+    """A stand-in npx in ``folder``: npx.cmd on Windows, an executable npx elsewhere. Nothing ever starts it."""
+    folder.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        target = folder / "npx.cmd"
+        target.write_text("@echo off\r\n", encoding="utf-8")
+    else:
+        target = folder / "npx"
+        target.write_text("#!/bin/sh\n", encoding="utf-8")
+        target.chmod(0o755)
+    return target
+
+
+def _use_real_which(monkeypatch) -> None:
+    """Put back the real shutil.which, which the autouse fixture replaces with a fake.
+
+    On Windows, which() searches the current folder first unless NoDefaultCurrentDirectoryInExePath is set. Some
+    machines set it, so the tests clear it, to match a default Windows install.
+    """
+    monkeypatch.setattr(sign.shutil, "which", _REAL_WHICH)
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+
+
+def _same_file(text: str, path: Path) -> bool:
+    return os.path.normcase(os.path.abspath(text)) == os.path.normcase(os.path.abspath(str(path)))
+
+
+def test_npx_in_the_current_folder_is_never_started(source, state, tmp_path, monkeypatch):
+    _use_real_which(monkeypatch)
+    cwd = tmp_path / "cwd"
+    _fake_npx(cwd)
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(sign.subprocess, "Popen", lambda *a, **k: pytest.fail("no process for a cwd npx"))
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == NPX_MISSING_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == {}
+
+
+def test_npx_on_a_path_folder_is_the_program_that_runs(source, state, tmp_path, monkeypatch):
+    _use_real_which(monkeypatch)
+    npx = _fake_npx(tmp_path / "node")
+    monkeypatch.setenv("PATH", str(tmp_path / "node"))
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "signed"
+    (call,) = runner.calls
+    assert _same_file(call["argv"][0], npx)
+    assert call["argv"][1:4] == ["--yes", sign.WEB_EXT_PACKAGE, "sign"]
+
+
+def test_an_npx_in_the_current_folder_does_not_beat_the_one_on_path(source, state, tmp_path, monkeypatch):
+    _use_real_which(monkeypatch)
+    cwd = tmp_path / "cwd"
+    _fake_npx(cwd)
+    npx = _fake_npx(tmp_path / "node")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("PATH", str(tmp_path / "node"))
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "signed"
+    (call,) = runner.calls
+    assert _same_file(call["argv"][0], npx)
+
+
+def test_an_empty_path_entry_is_skipped_so_the_current_folder_is_not_searched(source, state, tmp_path, monkeypatch):
+    _use_real_which(monkeypatch)
+    _fake_npx(tmp_path / "cwd")
+    monkeypatch.chdir(tmp_path / "cwd")
+    monkeypatch.setenv("PATH", os.pathsep + os.pathsep)
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == NPX_MISSING_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == {}
+
+
+def test_a_relative_path_entry_is_skipped(source, state, tmp_path, monkeypatch):
+    _use_real_which(monkeypatch)
+    _fake_npx(tmp_path / "relbin")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "relbin")
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == NPX_MISSING_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == {}
+
+
+def test_a_path_entry_that_is_the_current_folder_is_skipped(source, state, tmp_path, monkeypatch):
+    _use_real_which(monkeypatch)
+    cwd = tmp_path / "cwd"
+    _fake_npx(cwd)
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("PATH", str(cwd))
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == NPX_MISSING_TEXT
+    assert runner.calls == []
+
+
+def test_every_npx_lookup_names_one_absolute_path_folder_so_windows_adds_no_current_folder(
+    source, state, tmp_path, monkeypatch,
+):
+    seen = []
+
+    def _spy(name, *args, **kwargs):
+        seen.append(name)
+        return None
+
+    folders = [tmp_path / "a", tmp_path / "b"]
+    monkeypatch.setattr(sign.shutil, "which", _spy)
+    monkeypatch.setenv("PATH", os.pathsep.join(str(folder) for folder in folders))
+    out = _sign(source, state, runner=FakeRunner())
+    assert out["message"] == NPX_MISSING_TEXT
+    assert seen, "the PATH folders should have been searched"
+    for name in seen:
+        assert os.path.isabs(name)
+        assert os.path.basename(name) == "npx"
+        assert any(_same_file(os.path.dirname(name), folder) for folder in folders)
+
+
+def test_the_npx_path_refusal_names_the_program_path_and_never_the_temp_folder():
+    assert "TEMP" not in NPX_UNSAFE_TEXT
+    assert "The npx program path contains characters the signing tool cannot take safely." in NPX_UNSAFE_TEXT
+    assert "Move Node.js to a folder path without those characters" in NPX_UNSAFE_TEXT
+
+
+# ---------------------------------------------------------------------------
 # Never-raises: a runner, a start, or a scratch folder that fails is a failed result, with no traceback and no secret
 # ---------------------------------------------------------------------------
 
@@ -997,7 +1174,7 @@ def test_an_npx_path_with_an_unsafe_character_is_refused_before_any_submission(s
     runner = FakeRunner()
     out = _sign(source, state, runner=runner)
     assert out["status"] == "failed"
-    assert out["message"] == UNSAFE_PATH_TEXT
+    assert out["message"] == NPX_UNSAFE_TEXT
     assert runner.calls == []
     assert _snapshot(state) == {}
 
@@ -1400,6 +1577,11 @@ def _docs() -> str:
     return REPO_DOCS.read_text(encoding="utf-8")
 
 
+def _section_4a(docs: str) -> str:
+    """The signing section of the install guide: from its heading up to section 5."""
+    return docs[docs.index("## 4a."):docs.index("## 5. Verify")]
+
+
 def test_docs_state_the_network_use_plainly_and_drop_the_talks_only_to_mozilla_claim():
     docs = _docs()
     assert "talks only to Mozilla" not in docs
@@ -1464,11 +1646,41 @@ def test_docs_say_deleting_the_record_removes_the_guarantee_and_that_a_bump_sign
     assert "To sign again, bump the version in `manifest.json`." in docs
 
 
-def test_docs_say_a_version_is_matched_exactly_and_that_a_near_duplicate_is_probably_rejected():
+def test_docs_say_a_version_is_matched_exactly_and_that_a_near_duplicate_is_not_verified():
     docs = _docs()
     assert "matched exactly as written" in docs
     assert "`0.1` and `0.1.0` are different versions" in docs
-    assert "Mozilla would probably reject a near-duplicate" in docs
+    assert "Mozilla would probably reject a near-duplicate" not in docs
+    assert "Mozilla's behaviour for a near-duplicate version is not verified" in _section_4a(docs)
+
+
+def test_docs_say_a_same_source_rerun_exits_zero_and_only_a_changed_source_or_a_failure_is_refused():
+    section = _section_4a(_docs())
+    assert "reports it as already signed, exits 0, and uploads nothing" in section
+    assert "Any other later run for that version is refused with:" in section
+    assert "Any later run for that version is refused with" not in section
+
+
+def test_docs_say_install_is_blocked_after_the_record_is_deleted_while_the_signed_file_is_kept():
+    section = _section_4a(_docs())
+    assert "Install is also blocked after the record is deleted, while the signed file is kept" in section
+    assert "reports the version as used and says to bump it" in section
+
+
+def test_docs_say_the_one_submission_guarantee_lives_in_the_state_folder_and_a_new_machine_starts_empty():
+    section = _section_4a(_docs())
+    assert "The one-submission guarantee lives in the state folder" in section
+    assert "A different machine" in section
+    assert "a different Windows user" in section
+    assert "`MERIDIAN_LOCAL_RUNNER_STATE_DIR` override" in section
+    assert "starts with no record" in section
+
+
+def test_docs_name_the_check_then_write_race_as_a_plain_limit_in_section_4a():
+    section = _section_4a(_docs())
+    assert "`sign-plugin` runs for the same version at the same time" in section
+    assert "both can submit" in section
+    assert "This build does not lock against it." in section
 
 
 def test_docs_say_a_version_submitted_before_the_record_existed_is_not_protected():
@@ -1496,9 +1708,21 @@ def test_the_bridge_readme_carries_the_record_deletion_version_and_pre_record_fa
     assert "To sign again, bump the version in `manifest.json`." in readme
     assert "matched exactly as written" in readme
     assert "`0.1` and `0.1.0` are different versions" in readme
-    assert "Mozilla would probably reject a near-duplicate" in readme
+    assert "Mozilla would probably reject a near-duplicate" not in readme
+    assert "Mozilla's behaviour for a near-duplicate version is not verified" in readme
     assert "before this record existed" in readme
     assert "is not protected" in readme
+
+
+def test_the_bridge_readme_says_install_is_blocked_after_a_deletion_and_where_the_guarantee_lives():
+    readme = (REPO_EXTENSION / "README.md").read_text(encoding="utf-8")
+    assert "Install is also blocked after the record is deleted, while the signed file is kept" in readme
+    assert "reports the version as used and says to bump it" in readme
+    assert "The one-submission guarantee lives in the state folder" in readme
+    assert "A different machine" in readme
+    assert "a different Windows user" in readme
+    assert "starts with no record" in readme
+    assert "reports it as already signed, exits 0, and uploads nothing" in readme
 
 
 def test_docs_say_the_unsigned_build_writes_nothing_to_the_zotero_profile():

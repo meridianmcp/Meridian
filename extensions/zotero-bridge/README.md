@@ -55,14 +55,16 @@ plugin code. The URL is a placeholder (see "Updates" below).
 
 Signing is a separate step, described in `docs/zotero-plugin-install.md`, section 4a. A timeout or a
 failure may already have submitted this version to Mozilla, so the version number is used up. The message
-says: Bump the version in manifest.json to sign a new build.
+says: Bump the version in manifest.json to sign a new build. Running it again for a version that already has a signed file for the same source reports it as already signed, exits 0, and uploads nothing.
 
 Deleting `signed.json` removes the guarantee against resubmitting a version that was submitted without a
 signed file. Meridian cannot detect a fully deleted record, so it cannot refuse a second submission of that
-version. A stored signed file with no record is refused too. To sign again, bump the version in `manifest.json`.
+version. A stored signed file with no record is refused too. Install is also blocked after the record is deleted, while the signed file is kept: the install reports the version as used and says to bump it. To sign again, bump the version in `manifest.json`.
+
+The one-submission guarantee lives in the state folder, `%USERPROFILE%\.meridian\local_runner\zotero_plugin\`, or in the folder named by `MERIDIAN_LOCAL_RUNNER_STATE_DIR` when that is set. A different machine, a different Windows user, or a `MERIDIAN_LOCAL_RUNNER_STATE_DIR` override starts with no record.
 
 A version number is matched exactly as written, so `0.1` and `0.1.0` are different versions.
-Mozilla would probably reject a near-duplicate.
+Mozilla's behaviour for a near-duplicate version is not verified.
 A version that was submitted to Mozilla before this record existed, in an earlier build, is not protected,
 because Meridian has no record of that submission. Bump that version before you sign again.
 
