@@ -588,7 +588,9 @@ def test_settings_live_in_the_meridian_per_user_state_dir(monkeypatch, tmp_path)
 
 
 def test_settings_defaults_when_the_file_is_missing(tmp_path):
-    assert zpi.load_settings(tmp_path / "zotero_plugin.json") == {"autoinstall": False, "decided": False}
+    assert zpi.load_settings(tmp_path / "zotero_plugin.json") == {
+        "autoinstall": False, "decided": False, "close_zotero_for_install": True,
+    }
 
 
 @pytest.mark.parametrize(
@@ -606,7 +608,7 @@ def test_settings_defaults_when_the_file_is_missing(tmp_path):
 def test_unreadable_or_wrong_shape_settings_are_undecided_with_autoinstall_off(tmp_path, text):
     path = _write(tmp_path / "zotero_plugin.json", text)
     settings = zpi.load_settings(path)
-    assert settings == {"autoinstall": False, "decided": False}
+    assert settings == {"autoinstall": False, "decided": False, "close_zotero_for_install": True}
     assert zpi.effective_autoinstall(settings, {}) is False
     assert zpi.effective_autoinstall(settings, {ENV_AUTOINSTALL: "1"}) is False
 
@@ -626,21 +628,23 @@ def test_save_refuses_settings_that_are_not_two_booleans(tmp_path):
 def test_settings_round_trip_creates_the_folder_and_leaves_no_temp_file(tmp_path):
     path = tmp_path / "state" / "zotero_plugin.json"
     zpi.save_settings(path, {"autoinstall": False, "decided": True})
-    assert zpi.load_settings(path) == {"autoinstall": False, "decided": True}
-    assert json.loads(path.read_text(encoding="utf-8")) == {"autoinstall": False, "decided": True}
+    assert zpi.load_settings(path) == {"autoinstall": False, "decided": True, "close_zotero_for_install": True}
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "autoinstall": False, "decided": True, "close_zotero_for_install": True,
+    }
     assert sorted(p.name for p in path.parent.iterdir()) == ["zotero_plugin.json"]
 
 
 def test_first_run_install_choice_enables_autoinstall_and_marks_decided():
     original = {"autoinstall": False, "decided": False}
     updated = zpi.apply_first_run_choice(original, True)
-    assert updated == {"autoinstall": True, "decided": True}
+    assert updated == {"autoinstall": True, "decided": True, "close_zotero_for_install": True}
     assert original == {"autoinstall": False, "decided": False}
 
 
 def test_first_run_not_now_choice_disables_autoinstall_and_marks_decided():
     updated = zpi.apply_first_run_choice({"autoinstall": True, "decided": False}, False)
-    assert updated == {"autoinstall": False, "decided": True}
+    assert updated == {"autoinstall": False, "decided": True, "close_zotero_for_install": True}
 
 
 # ---------------------------------------------------------------------------
@@ -753,7 +757,7 @@ def test_cli_refuses_a_folder_that_is_not_a_zotero_profile(monkeypatch, capsys, 
 
 def test_cli_refuses_with_a_clear_message_while_zotero_runs(monkeypatch, capsys, profile):
     monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
-    rc = zpi.cli_main(["--profile", str(profile)])
+    rc = zpi.cli_main(["--profile", str(profile), "--keep-zotero-open"])
     captured = capsys.readouterr()
     assert rc == 1
     assert "zotero is running" in (captured.out + captured.err).lower()
@@ -963,3 +967,514 @@ def test_install_default_profile_turns_a_profile_lookup_failure_into_failed(monk
 
     assert result["status"] == "failed"
     assert "access denied" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Closing Zotero for the install: close_zotero_gracefully and install_with_close
+# ---------------------------------------------------------------------------
+
+CLOSE_ENV = "MERIDIAN_ZOTERO_CLOSE_ON_INSTALL"
+TASKKILL_ARGV = ["taskkill", "/IM", "zotero.exe"]
+_CLOSE_ON = {"autoinstall": False, "decided": True, "close_zotero_for_install": True}
+_CLOSE_OFF = {"autoinstall": False, "decided": True, "close_zotero_for_install": False}
+
+
+class _FakeSleep:
+    """Records every wait and never blocks."""
+
+    def __init__(self):
+        self.waits = []
+
+    def __call__(self, seconds):
+        self.waits.append(seconds)
+
+
+def _states(*values):
+    """A process check that answers each value in turn, then keeps answering the last one."""
+    queue = list(values)
+
+    def _check():
+        if len(queue) > 1:
+            return queue.pop(0)
+        return queue[0]
+
+    return _check
+
+
+def _runner_recording(calls):
+    def _run(argv):
+        calls.append(list(argv))
+        return None
+
+    return _run
+
+
+@pytest.fixture
+def windows(monkeypatch):
+    monkeypatch.setattr(zpi, "_platform", lambda: "win32")
+
+
+# close_zotero_gracefully -------------------------------------------------------
+
+
+def test_close_argv_is_exactly_taskkill_by_image_name_with_no_force_flag(windows):
+    calls = []
+    outcome = zpi.close_zotero_gracefully(
+        runner=_runner_recording(calls), timeout_s=1.0, sleep=_FakeSleep(), running=_states(True, False),
+    )
+    assert outcome == "closed"
+    assert calls == [TASKKILL_ARGV]
+    assert all(part.upper() not in {"/F", "/T"} for part in calls[0])
+    assert not any("kill" in part.lower() for part in calls[0][1:])
+
+
+def test_default_runner_hands_subprocess_the_same_argv_and_no_shell(monkeypatch, windows):
+    seen = []
+
+    def _fake_run(argv, **kwargs):
+        seen.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(zpi.subprocess, "run", _fake_run)
+    outcome = zpi.close_zotero_gracefully(timeout_s=1.0, sleep=_FakeSleep(), running=_states(True, False))
+    assert outcome == "closed"
+    assert [argv for argv, _ in seen] == [TASKKILL_ARGV]
+    assert not seen[0][1].get("shell", False)
+
+
+def test_close_reports_closed_once_zotero_stops(windows):
+    calls = []
+    outcome = zpi.close_zotero_gracefully(
+        runner=_runner_recording(calls), timeout_s=20.0, sleep=_FakeSleep(), running=_states(True, True, False),
+    )
+    assert outcome == "closed"
+    assert calls == [TASKKILL_ARGV]
+
+
+def test_close_polls_every_half_second_up_to_the_timeout(windows):
+    clock = _FakeSleep()
+    outcome = zpi.close_zotero_gracefully(
+        runner=_runner_recording([]), timeout_s=20.0, sleep=clock, running=_states(True, True, False),
+    )
+    assert outcome == "closed"
+    assert clock.waits == [0.5, 0.5]
+
+
+def test_close_reports_not_running_and_runs_nothing_when_zotero_was_already_closed(windows):
+    calls, clock = [], _FakeSleep()
+    outcome = zpi.close_zotero_gracefully(runner=_runner_recording(calls), sleep=clock, running=_states(False))
+    assert outcome == "not_running"
+    assert calls == []
+    assert clock.waits == []
+
+
+def test_close_reports_close_failed_when_zotero_still_runs_at_the_timeout(windows):
+    clock = _FakeSleep()
+    outcome = zpi.close_zotero_gracefully(
+        runner=_runner_recording([]), timeout_s=2.0, sleep=clock, running=_states(True),
+    )
+    assert outcome == "close_failed"
+    assert clock.waits == [0.5, 0.5, 0.5, 0.5]
+
+
+def test_close_fails_closed_when_the_check_fails_before_taskkill_runs(windows):
+    calls = []
+    outcome = zpi.close_zotero_gracefully(
+        runner=_runner_recording(calls), sleep=_FakeSleep(), running=lambda: None,
+    )
+    assert outcome == "close_failed"
+    assert calls == []
+
+
+def test_close_fails_closed_when_the_check_fails_while_waiting(windows):
+    outcome = zpi.close_zotero_gracefully(
+        runner=_runner_recording([]), timeout_s=20.0, sleep=_FakeSleep(), running=_states(True, None),
+    )
+    assert outcome == "close_failed"
+
+
+def test_close_treats_a_raising_check_as_a_failed_check(windows):
+    def _broken():
+        raise RuntimeError("tasklist exploded")
+
+    outcome = zpi.close_zotero_gracefully(runner=_runner_recording([]), sleep=_FakeSleep(), running=_broken)
+    assert outcome == "close_failed"
+
+
+def test_a_taskkill_that_raises_never_escapes_and_the_poll_decides(windows):
+    def _boom(argv):
+        raise OSError("taskkill is missing")
+
+    outcome = zpi.close_zotero_gracefully(runner=_boom, timeout_s=1.0, sleep=_FakeSleep(), running=_states(True))
+    assert outcome == "close_failed"
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_close_is_unsupported_off_windows_and_runs_nothing(monkeypatch, platform):
+    monkeypatch.setattr(zpi, "_platform", lambda: platform)
+    calls = []
+    outcome = zpi.close_zotero_gracefully(runner=_runner_recording(calls), sleep=_FakeSleep(), running=_states(True))
+    assert outcome == "unsupported"
+    assert calls == []
+
+
+def test_close_uses_the_process_state_check_when_none_is_injected(monkeypatch, windows):
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
+    assert zpi.close_zotero_gracefully(runner=_runner_recording([]), sleep=_FakeSleep()) == "not_running"
+
+
+# install_with_close: the orchestration -----------------------------------------
+
+
+def _steps(events, *, install_status="installed", close_outcome="closed", restart_action="started"):
+    """Fake close, install and restart callables that record their order in ``events``."""
+
+    def _close(running=None):
+        events.append("close")
+        return close_outcome
+
+    def _install():
+        events.append("install")
+        return {"status": install_status, "path": "P", "error": None}
+
+    def _restart():
+        events.append("restart")
+        return restart_action
+
+    return _close, _install, _restart
+
+
+def test_closes_installs_then_restarts_when_meridian_closed_zotero():
+    events = []
+    close, install, restart = _steps(events)
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True), close=close, install=install, restart=restart,
+    )
+    assert events == ["close", "install", "restart"]
+    assert result["status"] == "installed"
+    assert result["closed_zotero"] is True
+    assert result["restart"] == "started"
+
+
+def test_never_restarts_zotero_that_was_not_running_at_the_start():
+    events = []
+    close, install, restart = _steps(events)
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(False), close=close, install=install, restart=restart,
+    )
+    assert events == ["install"]
+    assert result["status"] == "installed"
+    assert result["closed_zotero"] is False
+    assert result["restart"] is None
+
+
+def test_a_close_that_finds_zotero_already_gone_installs_without_restarting():
+    events = []
+    close, install, restart = _steps(events, close_outcome="not_running")
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True), close=close, install=install, restart=restart,
+    )
+    assert events == ["close", "install"]
+    assert result["closed_zotero"] is False
+    assert result["restart"] is None
+
+
+def test_close_zotero_false_refuses_while_running_and_never_calls_close():
+    events = []
+    close, install, restart = _steps(events)
+    result = zpi.install_with_close(
+        _CLOSE_OFF, close_zotero=False, running=_states(True), close=close, install=install, restart=restart,
+    )
+    assert events == []
+    assert result["status"] == "refused_running"
+    assert result["closed_zotero"] is False
+    assert result["restart"] is None
+    assert "Zotero is running" in result["message"]
+
+
+def test_close_zotero_none_follows_the_saved_setting():
+    events = []
+    close, install, restart = _steps(events)
+    result = zpi.install_with_close(
+        _CLOSE_OFF, close_zotero=None, running=_states(True), close=close, install=install, restart=restart,
+    )
+    assert events == []
+    assert result["status"] == "refused_running"
+
+
+def test_the_close_env_override_beats_the_saved_setting_when_close_zotero_is_none():
+    events = []
+    close, install, restart = _steps(events)
+    result = zpi.install_with_close(
+        _CLOSE_OFF, close_zotero=None, env={CLOSE_ENV: "1"},
+        running=_states(True), close=close, install=install, restart=restart,
+    )
+    assert events == ["close", "install", "restart"]
+    assert result["status"] == "installed"
+
+
+def test_an_explicit_close_zotero_argument_beats_the_close_env_override():
+    events = []
+    close, install, restart = _steps(events)
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=False, env={CLOSE_ENV: "1"},
+        running=_states(True), close=close, install=install, restart=restart,
+    )
+    assert events == []
+    assert result["status"] == "refused_running"
+
+
+def test_a_failed_process_check_never_closes_and_leaves_the_install_to_report_it():
+    events = []
+    close, install, restart = _steps(events, install_status="check_failed")
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=lambda: None, close=close, install=install, restart=restart,
+    )
+    assert events == ["install"]
+    assert result["status"] == "check_failed"
+    assert result["closed_zotero"] is False
+    assert result["restart"] is None
+
+
+def test_close_failed_never_installs_never_restarts_and_says_to_close_and_install_again():
+    events = []
+    close, install, restart = _steps(events, close_outcome="close_failed")
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True), close=close, install=install, restart=restart,
+    )
+    assert events == ["close"]
+    assert result["status"] == "close_failed"
+    assert result["closed_zotero"] is False
+    assert result["restart"] is None
+    assert "did not close" in result["message"]
+    assert "run Install again" in result["message"]
+    assert "Nothing was written" in result["message"]
+
+
+def test_a_close_failure_leaves_the_profile_byte_identical(profile, xpi):
+    before = _snapshot(profile)
+    result = zpi.install_with_close(
+        _CLOSE_ON,
+        close_zotero=True,
+        running=_states(True),
+        close=lambda running=None: "close_failed",
+        install=lambda: zpi.install_into_profile(profile, xpi, running=lambda: False),
+        restart=lambda: "started",
+    )
+    assert result["status"] == "close_failed"
+    assert _snapshot(profile) == before
+    assert not (profile / "extensions").exists()
+
+
+def test_a_closed_zotero_is_restarted_even_when_the_install_then_refuses():
+    events = []
+    close, _, restart = _steps(events)
+
+    def _install():
+        events.append("install")
+        return {"status": "refused_running", "path": None}
+
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True), close=close, install=_install, restart=restart,
+    )
+    assert events == ["close", "install", "restart"]
+    assert result["status"] == "refused_running"
+    assert result["closed_zotero"] is True
+    assert result["restart"] == "started"
+
+
+def test_an_install_that_raises_becomes_failed_and_zotero_is_still_restarted():
+    events = []
+    close, _, restart = _steps(events)
+
+    def _install():
+        events.append("install")
+        raise RuntimeError("disk on fire")
+
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True), close=close, install=_install, restart=restart,
+    )
+    assert result["status"] == "failed"
+    assert "disk on fire" in result["error"]
+    assert events == ["close", "install", "restart"]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("boom"), OSError("launch failed")])
+def test_a_restart_that_raises_never_escapes_and_the_install_result_stands(error):
+    events = []
+    close, install, _ = _steps(events)
+
+    def _restart():
+        raise error
+
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True), close=close, install=install, restart=_restart,
+    )
+    assert result["status"] == "installed"
+    assert result["closed_zotero"] is True
+    assert result["restart"] == "error"
+
+
+def test_the_default_restart_uses_the_launcher_start_path_without_reinstalling(monkeypatch):
+    from meridian import zotero_launcher
+
+    seen = {}
+
+    def _fake_start(**kwargs):
+        seen.update(kwargs)
+        return {"action": "started", "exe": "zotero.exe", "api_ready": True}
+
+    def _no_install(*args, **kwargs):
+        raise AssertionError("the restart must not install again")
+
+    monkeypatch.setattr(zotero_launcher, "start_zotero", _fake_start)
+    monkeypatch.setattr(zpi, "install_into_profile", _no_install)
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True),
+        close=lambda running=None: "closed", install=lambda: {"status": "installed", "path": "P"},
+    )
+    assert result["restart"] == "started"
+    assert callable(seen["before_launch"])
+    seen["before_launch"]()  # the restart's own pre-launch hook does nothing
+
+
+def test_the_default_restart_reports_an_os_error_from_the_launcher_as_error(monkeypatch):
+    from meridian import zotero_launcher
+
+    def _fail(**kwargs):
+        raise OSError("no exe")
+
+    monkeypatch.setattr(zotero_launcher, "start_zotero", _fail)
+    result = zpi.install_with_close(
+        _CLOSE_ON, close_zotero=True, running=_states(True),
+        close=lambda running=None: "closed", install=lambda: {"status": "installed", "path": "P"},
+    )
+    assert result["status"] == "installed"
+    assert result["restart"] == "error"
+
+
+# settings: the close_zotero_for_install key -------------------------------------
+
+
+def test_close_setting_defaults_to_true_and_a_legacy_file_keeps_its_decision(tmp_path):
+    path = _write(tmp_path / "zotero_plugin.json", '{"autoinstall": true, "decided": true}')
+    assert zpi.load_settings(path) == {"autoinstall": True, "decided": True, "close_zotero_for_install": True}
+
+
+def test_close_setting_round_trips_as_false(tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    zpi.save_settings(path, {"autoinstall": True, "decided": True, "close_zotero_for_install": False})
+    assert zpi.load_settings(path) == {"autoinstall": True, "decided": True, "close_zotero_for_install": False}
+    assert json.loads(path.read_text(encoding="utf-8"))["close_zotero_for_install"] is False
+
+
+def test_a_non_boolean_close_setting_makes_the_whole_file_wrong_shape(tmp_path):
+    path = _write(
+        tmp_path / "zotero_plugin.json",
+        '{"autoinstall": true, "decided": true, "close_zotero_for_install": "no"}',
+    )
+    assert zpi.load_settings(path) == {"autoinstall": False, "decided": False, "close_zotero_for_install": True}
+
+
+def test_save_refuses_a_non_boolean_close_setting(tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    with pytest.raises(ValueError):
+        zpi.save_settings(path, {"autoinstall": False, "decided": True, "close_zotero_for_install": "no"})
+    assert not path.exists()
+
+
+def test_first_run_choice_keeps_the_saved_close_setting():
+    original = {"autoinstall": False, "decided": False, "close_zotero_for_install": False}
+    assert zpi.apply_first_run_choice(original, True) == {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("env", "saved", "expected"),
+    [
+        ({CLOSE_ENV: "0"}, True, False),
+        ({CLOSE_ENV: "on"}, False, True),
+        ({CLOSE_ENV: "maybe"}, False, False),
+        ({}, True, True),
+        ({CLOSE_ENV: ""}, False, False),
+    ],
+)
+def test_effective_close_follows_a_recognised_env_value_else_the_saved_setting(env, saved, expected):
+    settings = {"autoinstall": False, "decided": True, "close_zotero_for_install": saved}
+    assert zpi.effective_close_zotero(settings, env) is expected
+
+
+def test_close_env_override_is_reported_only_for_recognised_values():
+    assert zpi.close_zotero_env_override({CLOSE_ENV: "off"}) is False
+    assert zpi.close_zotero_env_override({CLOSE_ENV: "YES"}) is True
+    assert zpi.close_zotero_env_override({CLOSE_ENV: "maybe"}) is None
+    assert zpi.close_zotero_env_override({}) is None
+
+
+# CLI: --keep-zotero-open and the saved setting ----------------------------------
+
+
+def test_cli_keep_zotero_open_refuses_and_never_closes(monkeypatch, capsys, profile):
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("the close must not run"))
+    rc = zpi.cli_main(["--profile", str(profile), "--keep-zotero-open"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "zotero is running" in (captured.out + captured.err).lower()
+    assert not (profile / "extensions").exists()
+
+
+def test_cli_closes_installs_and_restarts_by_default(monkeypatch, capsys, profile):
+    from meridian import zotero_launcher
+
+    monkeypatch.setattr(zpi, "zotero_process_state", _states(True, False))
+    closed = []
+
+    def _close(**kwargs):
+        closed.append(kwargs)
+        return "closed"
+
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", _close)
+    monkeypatch.setattr(
+        zotero_launcher, "start_zotero", lambda **kwargs: {"action": "started", "exe": "Z", "api_ready": True},
+    )
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert len(closed) == 1
+    assert (profile / "extensions" / XPI_NAME).read_bytes() == zpi.build_xpi_bytes()
+    assert "restarted" in out.lower()
+
+
+def test_cli_follows_a_saved_close_setting_of_false(monkeypatch, capsys, profile):
+    zpi.save_settings(zpi.settings_path(), {"autoinstall": False, "decided": True, "close_zotero_for_install": False})
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("the close must not run"))
+    rc = zpi.cli_main(["--profile", str(profile)])
+    assert rc == 1
+    assert "zotero is running" in capsys.readouterr().out.lower()
+
+
+def test_cli_reports_close_failed_in_words_and_writes_nothing(monkeypatch, capsys, profile):
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: "close_failed")
+    before = _snapshot(profile)
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out.lower()
+    assert rc == 1
+    assert "did not close" in out
+    assert _snapshot(profile) == before
+
+
+# docs ---------------------------------------------------------------------------
+
+
+def test_docs_say_closing_is_part_of_the_install_and_never_forced():
+    docs = (REPO_ROOT / "docs" / "zotero-plugin-install.md").read_text(encoding="utf-8")
+    assert "close_zotero_for_install" in docs
+    assert "Close Zotero to install the plugin" in docs
+    assert "--keep-zotero-open" in docs
+    assert "never force-closes Zotero" in docs
+    assert "Windows" in docs
+    assert "update_url" in docs

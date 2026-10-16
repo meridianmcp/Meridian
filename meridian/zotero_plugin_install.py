@@ -12,10 +12,19 @@
   ``extensions.json``, ``prefs.js`` or any other profile file.
   ``install_default_profile`` runs that install for the default profile named in
   ``profiles.ini``, for the packaged tray's install. It never raises.
+* ``close_zotero_gracefully`` asks a running Zotero to close with
+  ``taskkill /IM zotero.exe`` (never ``/F`` or ``/T``) and waits for it to stop.
+  It never kills anything, and a close that fails leaves Zotero as it was.
+* ``install_with_close`` is the install the tray and the CLI use. It closes
+  Zotero first when the saved ``close_zotero_for_install`` choice (or the
+  ``MERIDIAN_ZOTERO_CLOSE_ON_INSTALL`` override) allows it, installs, and then
+  restarts Zotero, best effort, only when Meridian closed it. If Zotero does not
+  close, nothing is installed.
 * The settings file ``zotero_plugin.json`` (in the per-user Meridian state dir,
   next to the tray's other settings) holds the user's choice. Auto-install is
   opt-in: it is off until the first-run prompt records an answer. An unreadable
-  or wrong-shape file reads as undecided with auto-install off.
+  or wrong-shape file reads as undecided with auto-install off. A file written
+  before the close choice existed keeps its decisions and closes Zotero by default.
 
 UNVERIFIED on a real machine:
 
@@ -25,8 +34,11 @@ UNVERIFIED on a real machine:
 * whether Zotero loads an unsigned .xpi that is dropped into ``extensions/``
   without an ``extensions.json`` entry. This module relies on that load path
   and does not verify it.
+* whether ``taskkill /IM zotero.exe`` (a close request, not a force kill) makes
+  Zotero exit within the 20-second wait. A Zotero that is busy or shows a dialog
+  will not close, and the install then reports ``close_failed``.
 
-CLI: ``python -m meridian zotero install-plugin [--profile DIR] [--dry-run]``.
+CLI: ``python -m meridian zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]``.
 """
 
 from __future__ import annotations
@@ -40,6 +52,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -48,6 +61,8 @@ XPI_FILENAME = "meridian-zotero@usemeridian.us.xpi"
 SETTINGS_FILENAME = "zotero_plugin.json"
 ZOTERO_DATA_DIR_ENV = "MERIDIAN_ZOTERO_DATA_DIR"
 AUTOINSTALL_ENV = "MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL"
+CLOSE_ENV = "MERIDIAN_ZOTERO_CLOSE_ON_INSTALL"
+CLOSE_SETTING_KEY = "close_zotero_for_install"
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -61,13 +76,21 @@ _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _ZIP_FILE_MODE = 0o644
 _ZIP_CREATE_SYSTEM_UNIX = 3
 
-_DEFAULT_SETTINGS = {"autoinstall": False, "decided": False}
+_DEFAULT_SETTINGS = {"autoinstall": False, "decided": False, CLOSE_SETTING_KEY: True}
 _DEFAULT_STATE_SUBDIR = "zotero_plugin"
 PROFILE_MARKERS = ("prefs.js", "zotero.sqlite")
 _NOT_PROFILE_MESSAGE = (
     "{profile} is not a Zotero profile: it has neither prefs.js nor zotero.sqlite. Nothing was written."
 )
 _CHECK_FAILED_MESSAGE = "Could not check whether Zotero is running. Nothing was written."
+REFUSED_RUNNING_MESSAGE = "Zotero is running. Close Zotero, then run this command again. Nothing was written."
+CLOSE_FAILED_MESSAGE = (
+    "Zotero did not close, so nothing was installed. Close Zotero yourself, then run Install again. "
+    "Nothing was written."
+)
+_CLOSE_POLL_SECONDS = 0.5
+_CLOSE_TIMEOUT_SECONDS = 20.0
+_TASKKILL_ARGV = ("taskkill", "/IM", "zotero.exe")
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -332,6 +355,77 @@ def zotero_is_running(runner: "Callable[[], str] | None" = None) -> bool:
     return zotero_process_state(runner) is not False
 
 
+def _safe_state(check: "Callable[[], bool | None]") -> "bool | None":
+    """The check's answer as True, False or None (None when it fails or raises). Never raises."""
+    try:
+        answer = check()
+    except Exception:  # noqa: BLE001 -- a failing check is an unknown state, never a crash
+        return None
+    return None if answer is None else bool(answer)
+
+
+# ---------------------------------------------------------------------------
+# Closing Zotero (a graceful close request only, never a force kill)
+# ---------------------------------------------------------------------------
+
+
+def _run_taskkill(argv: "list[str]") -> None:
+    """Run the close request. Its exit code is not the outcome: the poll in the caller decides."""
+    kwargs: dict[str, Any] = {}
+    if _platform() == "win32":
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+    subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=10,
+        check=False,
+        **kwargs,
+    )
+
+
+def close_zotero_gracefully(
+    *,
+    runner: "Callable[[list[str]], Any] | None" = None,
+    timeout_s: float = _CLOSE_TIMEOUT_SECONDS,
+    sleep: "Callable[[float], Any]" = time.sleep,
+    running: "Callable[[], bool | None] | None" = None,
+) -> str:
+    """Ask Zotero to close and wait for it. Never raises, never kills.
+
+    The only process command is ``taskkill /IM zotero.exe``: no ``/F`` (force) and no
+    ``/T`` (tree). It sends Zotero the same close request as its window's close button.
+    The process check runs every half second until ``timeout_s``.
+
+    Returns ``"unsupported"`` off Windows (nothing runs), ``"not_running"`` when
+    Zotero was not running at the start (nothing runs), ``"closed"`` when it
+    stopped, and ``"close_failed"`` when it still runs at the timeout or the check
+    fails. A failed check counts as a failure, never as "closed" (fail closed).
+    """
+    if _platform() != "win32":
+        return "unsupported"
+    check = running if running is not None else zotero_process_state
+    start = _safe_state(check)
+    if start is False:
+        return "not_running"
+    if start is None:
+        return "close_failed"
+    send = runner if runner is not None else _run_taskkill
+    try:
+        send(list(_TASKKILL_ARGV))
+    except Exception:  # noqa: BLE001 -- the poll below decides whether Zotero closed
+        pass
+    for _ in range(int(round(timeout_s / _CLOSE_POLL_SECONDS))):
+        sleep(_CLOSE_POLL_SECONDS)
+        state = _safe_state(check)
+        if state is False:
+            return "closed"
+        if state is None:
+            return "close_failed"
+    return "close_failed"
+
+
 # ---------------------------------------------------------------------------
 # Installing into the profile
 # ---------------------------------------------------------------------------
@@ -428,6 +522,102 @@ def install_default_profile(*, running: "Callable[[], bool] | None" = None) -> d
 
 
 # ---------------------------------------------------------------------------
+# Installing with Zotero closed first (the tray and the CLI use this)
+# ---------------------------------------------------------------------------
+
+
+def _nothing_before_launch() -> None:
+    """The restart's pre-launch hook. The plugin was just installed, so there is nothing to place."""
+    return None
+
+
+def _start_zotero_after_close() -> str:
+    """Restart Zotero through the launcher's start path. Returns the launcher's action."""
+    from meridian import zotero_launcher  # imported here: zotero_launcher imports this module
+
+    result = zotero_launcher.start_zotero(before_launch=_nothing_before_launch)
+    return str(result.get("action") or "error")
+
+
+def _restart_after_close(restart: "Callable[[], Any] | None") -> str:
+    """Best-effort restart of a Zotero that Meridian closed. Never raises; returns an action or ``error``."""
+    try:
+        action = (restart if restart is not None else _start_zotero_after_close)()
+    except Exception:  # noqa: BLE001 -- a failed restart must never fail the install
+        return "error"
+    return str(action or "error")
+
+
+def _install_outcome(install: "Callable[[], Mapping[str, Any]]", *, closed: bool) -> dict[str, Any]:
+    """Run one install and tag it with whether Meridian closed Zotero. Never raises."""
+    try:
+        outcome = dict(install())
+    except Exception as exc:  # noqa: BLE001 -- report every failure as data, never raise
+        outcome = {"status": "failed", "path": None, "error": str(exc) or "unknown error"}
+    outcome["closed_zotero"] = closed
+    outcome.setdefault("restart", None)
+    return outcome
+
+
+def _refusal_result(status: str, message: str) -> dict[str, Any]:
+    """A result for an install that was not attempted: nothing was written and nothing restarts."""
+    return {"status": status, "path": None, "message": message, "closed_zotero": False, "restart": None}
+
+
+def install_with_close(
+    settings: "Mapping[str, Any] | None",
+    *,
+    close_zotero: "bool | None" = None,
+    running: "Callable[[], bool | None] | None" = None,
+    close: "Callable[..., str] | None" = None,
+    install: "Callable[[], Mapping[str, Any]] | None" = None,
+    restart: "Callable[[], Any] | None" = None,
+    env: "Mapping[str, str] | None" = None,
+) -> dict[str, Any]:
+    """Install the plugin, closing Zotero first when the choice allows it. Never raises.
+
+    ``close_zotero=None`` follows the saved choice and ``MERIDIAN_ZOTERO_CLOSE_ON_INSTALL``.
+    An explicit bool wins over both: the CLI's ``--keep-zotero-open`` passes False.
+
+    * Zotero not running (or the check failed): install as usual. Nothing is
+      closed or started.
+    * Zotero running and closing off, or closing unsupported: ``refused_running``.
+      Nothing is closed.
+    * Zotero running and closing on: :func:`close_zotero_gracefully` runs.
+      ``close_failed`` writes nothing and restarts nothing. ``closed`` installs,
+      then restarts Zotero, best effort, because Meridian closed it.
+
+    The result always carries ``status``, ``path``, ``closed_zotero`` (True only
+    when Meridian closed Zotero in this run) and ``restart`` (the launcher's action,
+    ``error``, or None when no restart was attempted). ``message`` is set for
+    ``refused_running`` and ``close_failed``.
+    """
+    want_close = close_zotero if close_zotero is not None else effective_close_zotero(settings, env)
+    check = running if running is not None else zotero_process_state
+    run_install = install if install is not None else install_default_profile
+    close_step = close if close is not None else close_zotero_gracefully
+    if _safe_state(check) is not True:
+        # Not running, or the check failed. The install itself refuses on a failed check and writes nothing.
+        return _install_outcome(run_install, closed=False)
+    if not want_close:
+        return _refusal_result("refused_running", REFUSED_RUNNING_MESSAGE)
+    try:
+        outcome = close_step(running=check)
+    except Exception:  # noqa: BLE001 -- a close that raises is a close that failed
+        outcome = "close_failed"
+    if outcome == "close_failed":
+        return _refusal_result("close_failed", CLOSE_FAILED_MESSAGE)
+    if outcome == "unsupported":
+        return _refusal_result("refused_running", REFUSED_RUNNING_MESSAGE)
+    if outcome != "closed":
+        # "not_running": Zotero stopped between the two checks. Meridian closed nothing, so nothing restarts.
+        return _install_outcome(run_install, closed=False)
+    result = _install_outcome(run_install, closed=True)
+    result["restart"] = _restart_after_close(restart)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Settings and the first-run choice
 # ---------------------------------------------------------------------------
 
@@ -439,18 +629,25 @@ def settings_path() -> Path:
     return default_state_dir() / SETTINGS_FILENAME
 
 
-def _valid_settings(payload: Any) -> "dict[str, bool] | None":
-    """Both keys as real booleans, or None for any other shape (a partial file counts as wrong)."""
+def _valid_settings(payload: Any) -> "dict[str, Any] | None":
+    """The settings as real booleans, or None for any other shape.
+
+    ``autoinstall`` and ``decided`` are required, so a partial file counts as wrong.
+    ``close_zotero_for_install`` is optional: a file written before it existed reads as
+    True, which keeps every saved decision. A present value that is not a boolean makes
+    the whole file wrong.
+    """
     if not isinstance(payload, dict):
         return None
     autoinstall = payload.get("autoinstall")
     decided = payload.get("decided")
-    if not isinstance(autoinstall, bool) or not isinstance(decided, bool):
+    close = payload.get(CLOSE_SETTING_KEY, True)
+    if not isinstance(autoinstall, bool) or not isinstance(decided, bool) or not isinstance(close, bool):
         return None
-    return {"autoinstall": autoinstall, "decided": decided}
+    return {"autoinstall": autoinstall, "decided": decided, CLOSE_SETTING_KEY: close}
 
 
-def load_settings(path: "Path | str") -> dict[str, bool]:
+def load_settings(path: "Path | str") -> dict[str, Any]:
     """The saved settings. A missing, unreadable or wrong-shape file reads as undecided, auto-install off.
 
     Nothing is installed from such a file, and the first-run prompt asks again.
@@ -463,17 +660,29 @@ def load_settings(path: "Path | str") -> dict[str, bool]:
 
 
 def save_settings(path: "Path | str", settings: Mapping[str, Any]) -> None:
-    """Atomically persist the two settings keys. Anything but two booleans is refused, not written."""
+    """Atomically persist the settings keys. Anything but booleans is refused, not written."""
     valid = _valid_settings(settings)
     if valid is None:
-        raise ValueError("zotero plugin settings need boolean 'autoinstall' and 'decided' values")
+        raise ValueError(
+            "zotero plugin settings need boolean 'autoinstall', 'decided' and 'close_zotero_for_install' values"
+        )
     text = json.dumps(valid, sort_keys=True) + "\n"
     _atomic_write_bytes(Path(path), text.encode("utf-8"))
 
 
-def apply_first_run_choice(settings: Mapping[str, Any], install: bool) -> dict[str, bool]:
-    """A new settings dict: the answer is recorded and ``decided`` becomes true."""
-    return {"autoinstall": bool(install), "decided": True}
+def apply_first_run_choice(settings: Mapping[str, Any], install: bool) -> dict[str, Any]:
+    """A new settings dict: the answer is recorded and ``decided`` becomes true. The close choice is kept."""
+    return {
+        "autoinstall": bool(install),
+        "decided": True,
+        CLOSE_SETTING_KEY: saved_close_zotero(settings),
+    }
+
+
+def saved_close_zotero(settings: "Mapping[str, Any] | None") -> bool:
+    """The saved ``close_zotero_for_install`` choice. True when absent or when the settings are unreadable."""
+    current = _valid_settings(settings) or dict(_DEFAULT_SETTINGS)
+    return bool(current[CLOSE_SETTING_KEY])
 
 
 def autoinstall_supported() -> bool:
@@ -481,15 +690,24 @@ def autoinstall_supported() -> bool:
     return _platform() == "win32"
 
 
-def autoinstall_env_override(env: "Mapping[str, str] | None" = None) -> "bool | None":
-    """True or False when AUTOINSTALL_ENV holds a recognised value; None when it is unset or unknown."""
+def _recognised_env_bool(name: str, env: "Mapping[str, str] | None") -> "bool | None":
     source = os.environ if env is None else env
-    raw = str(source.get(AUTOINSTALL_ENV) or "").strip().casefold()
+    raw = str(source.get(name) or "").strip().casefold()
     if raw in _FALSE_VALUES:
         return False
     if raw in _TRUE_VALUES:
         return True
     return None
+
+
+def autoinstall_env_override(env: "Mapping[str, str] | None" = None) -> "bool | None":
+    """True or False when AUTOINSTALL_ENV holds a recognised value; None when it is unset or unknown."""
+    return _recognised_env_bool(AUTOINSTALL_ENV, env)
+
+
+def close_zotero_env_override(env: "Mapping[str, str] | None" = None) -> "bool | None":
+    """True or False when CLOSE_ENV holds a recognised value; None when it is unset or unknown."""
+    return _recognised_env_bool(CLOSE_ENV, env)
 
 
 def automatic_installs_forced_off(env: "Mapping[str, str] | None" = None) -> bool:
@@ -514,9 +732,20 @@ def effective_autoinstall(settings: "Mapping[str, Any] | None", env: "Mapping[st
     return current["autoinstall"] if override is None else override
 
 
+def effective_close_zotero(settings: "Mapping[str, Any] | None", env: "Mapping[str, str] | None" = None) -> bool:
+    """Whether an install may close a running Zotero. A recognised CLOSE_ENV value beats the saved choice."""
+    override = close_zotero_env_override(env)
+    return saved_close_zotero(settings) if override is None else override
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+_CLI_CLOSE_FAILED_MESSAGE = (
+    "Zotero did not close, so nothing was installed. Close Zotero yourself, then run this command again. "
+    "Nothing was written."
+)
 
 
 def _print_manual_steps(xpi: Path) -> None:
@@ -524,31 +753,15 @@ def _print_manual_steps(xpi: Path) -> None:
         print(line.format(xpi=xpi))
 
 
-def cli_main(argv: "list[str] | None" = None) -> int:
-    """``python -m meridian zotero install-plugin``. Returns 0 on success, 1 otherwise.
+def _restart_sentence(restart: Any) -> str:
+    """What happened to a Zotero that Meridian closed, and what the user does next."""
+    if restart in ("started", "already_running"):
+        return "Meridian closed Zotero to install the plugin, and restarted it."
+    return "Meridian closed Zotero to install the plugin, but could not restart it. Start Zotero yourself."
 
-    The explicit command installs regardless of the saved auto-install setting.
-    """
-    parser = argparse.ArgumentParser(
-        prog="python -m meridian zotero install-plugin",
-        description="Install the Meridian Zotero bridge plugin into Zotero's profile (Zotero must be closed).",
-    )
-    parser.add_argument("--profile", type=Path, default=None, help="Zotero profile folder (default: the profile Zotero marks as default).")
-    parser.add_argument("--dry-run", action="store_true", help="Print the plan and write nothing.")
-    args = parser.parse_args(argv)
-    profile = Path(args.profile) if args.profile is not None else find_default_profile_dir(zotero_data_dir())
-    if args.dry_run:
-        return _dry_run(profile)
-    try:
-        xpi = build_xpi(default_xpi_path())
-    except OSError as exc:
-        print(f"The plugin bundle could not be built: {exc}")
-        return 1
-    if profile is None:
-        print("No Zotero profile was found, so nothing was installed.")
-        _print_manual_steps(xpi)
-        return 1
-    result = install_into_profile(profile, xpi)
+
+def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -> int:
+    """Print the install's own outcome line. Returns the exit code."""
     status = result["status"]
     if status == "installed":
         print(f"Installed the Zotero bridge plugin to {result['path']}.")
@@ -557,10 +770,13 @@ def cli_main(argv: "list[str] | None" = None) -> int:
         print(f"The Zotero bridge plugin is already up to date at {result['path']}.")
         return 0
     if status == "refused_not_profile":
-        print(result.get("error", "That folder is not a Zotero profile. Nothing was written."))
+        print(result.get("error", _NOT_PROFILE_MESSAGE.format(profile=profile)))
         return 1
     if status == "refused_running":
-        print("Zotero is running. Close Zotero, then run this command again. Nothing was written.")
+        print(result.get("message", REFUSED_RUNNING_MESSAGE))
+        return 1
+    if status == "close_failed":
+        print(_CLI_CLOSE_FAILED_MESSAGE)
         return 1
     if status == "check_failed":
         print(
@@ -576,7 +792,61 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     return 1
 
 
-def _dry_run(profile: "Path | None") -> int:
+def cli_main(argv: "list[str] | None" = None) -> int:
+    """``python -m meridian zotero install-plugin``. Returns 0 on success, 1 otherwise.
+
+    The explicit command installs regardless of the saved auto-install setting. It
+    closes a running Zotero first when the saved close choice says so; ``--keep-zotero-open``
+    turns that off for this run.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m meridian zotero install-plugin",
+        description=(
+            "Install the Meridian Zotero bridge plugin into Zotero's profile. A running Zotero is "
+            "closed first unless the saved setting or --keep-zotero-open says otherwise."
+        ),
+    )
+    parser.add_argument("--profile", type=Path, default=None, help="Zotero profile folder (default: the profile Zotero marks as default).")
+    parser.add_argument("--dry-run", action="store_true", help="Print the plan and write nothing.")
+    parser.add_argument(
+        "--keep-zotero-open",
+        action="store_true",
+        help="Do not close Zotero for this install, even when the saved setting says to. Nothing is written while Zotero runs.",
+    )
+    args = parser.parse_args(argv)
+    profile = Path(args.profile) if args.profile is not None else find_default_profile_dir(zotero_data_dir())
+    close_zotero = False if args.keep_zotero_open else None
+    if args.dry_run:
+        return _dry_run(profile, close_zotero=close_zotero)
+    try:
+        xpi = build_xpi(default_xpi_path())
+    except OSError as exc:
+        print(f"The plugin bundle could not be built: {exc}")
+        return 1
+    if profile is None:
+        print("No Zotero profile was found, so nothing was installed.")
+        _print_manual_steps(xpi)
+        return 1
+    # Check the explicit profile before anything closes, so Zotero is never closed for a refused install.
+    if not profile.is_dir():
+        print(f"No Zotero profile folder exists at {profile}, so nothing was installed.")
+        _print_manual_steps(xpi)
+        return 1
+    if not is_zotero_profile(profile):
+        print(_NOT_PROFILE_MESSAGE.format(profile=profile))
+        return 1
+    result = install_with_close(
+        load_settings(settings_path()),
+        close_zotero=close_zotero,
+        install=lambda: install_into_profile(profile, xpi),
+    )
+    code = _print_install_status(result, xpi, profile)
+    if result.get("closed_zotero"):
+        print(_restart_sentence(result.get("restart")))
+    return code
+
+
+def _dry_run(profile: "Path | None", *, close_zotero: "bool | None" = None) -> int:
     print("Dry run: nothing will be written.")
     print(f"Zotero profile: {profile if profile is not None else 'not found'}")
     try:
@@ -599,7 +869,11 @@ def _dry_run(profile: "Path | None") -> int:
         print("Would refuse: could not check whether Zotero is running. Make sure Zotero is closed first.")
         return 0
     if state:
-        print("Would refuse: Zotero is running. Close Zotero first.")
+        may_close = close_zotero if close_zotero is not None else effective_close_zotero(load_settings(settings_path()))
+        if may_close:
+            print("Would close Zotero, install the plugin, and restart Zotero if it closed it.")
+        else:
+            print("Would refuse: Zotero is running. Close Zotero first.")
         return 0
     target = profile / "extensions" / XPI_FILENAME
     current = target.read_bytes() if target.is_file() else None
