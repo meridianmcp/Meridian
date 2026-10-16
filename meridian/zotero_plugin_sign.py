@@ -14,8 +14,9 @@ version, outside the install path:
   A zero exit with exactly one zip .xpi that has a signature under META-INF/ is stored as
   ``<state_dir>/signed/<addon-id>-<version>.xpi``, and that version's record becomes ``signed``.
 * One submission per version, ever. Any record for a version, in any status and for any source, refuses a
-  new submission of that version. A failed, timed-out or source-changed run keeps its ``submitted`` record,
-  because Mozilla may already hold the version. Bump the version in ``manifest.json`` to sign new source.
+  new submission of that version. A stored signed file with no record for its version refuses the same way. A
+  failed, timed-out or source-changed run keeps its ``submitted`` record, because Mozilla may already hold the
+  version. Bump the version in ``manifest.json`` to sign new source.
 * ``stored_signed_artifact`` says whether the stored file is signed, missing, tampered, used up (submitted
   but not signed), or unreadable. The install path uses it, and it never calls ``sign_plugin``.
 * A record file that is unreadable or has the wrong shape is refused. It is never treated as empty.
@@ -127,6 +128,10 @@ _STORE_FAILED_MESSAGE = (
 )
 _SCRATCH_FAILED_MESSAGE = "The temporary folder for signing could not be created. Nothing was signed or uploaded."
 _SUBMIT_RECORD_FAILED_MESSAGE = "The signing record could not be written, so nothing was submitted to Mozilla."
+_NPX_MISSING_MESSAGE = (
+    "npx was not found on PATH, so the signing tool cannot run. Install Node.js, which includes npx, then try again. "
+    "Nothing was signed or uploaded."
+)
 _UNSAFE_PATH_MESSAGE = (
     "The temporary folder path contains characters that the signing tool cannot take safely. Set TEMP to a folder "
     "path without those characters, then try again."
@@ -148,9 +153,9 @@ class StoredSigned:
     """What is stored for one plugin version.
 
     * ``signed``: a signed record for this source matches the file's sha256.
-    * ``missing``: no record exists for this version, so it can be signed.
-    * ``used``: a record exists for this version, but no signed file matches this source. Mozilla may hold the
-      version, so it is never signed again.
+    * ``missing``: no record and no stored file exist for this version, so it can be signed.
+    * ``used``: a record exists for this version, but no signed file matches this source, or a stored file exists
+      with no record for it. Mozilla may hold the version, so it is never signed again.
     * ``tampered``: a signed record for this source matches, but its file is changed or cannot be read.
     * ``unreadable``: the record file cannot be read or has the wrong shape.
 
@@ -272,14 +277,17 @@ def _valid_timeout_seconds(timeout_s: object) -> bool:
     return math.isfinite(seconds) and 0 < seconds <= MAX_TIMEOUT_MINUTES * 60
 
 
-def sign_argv(staged_dir: "Path | str", artifacts_dir: "Path | str", timeout_s: float) -> list[str]:
+def sign_argv(
+    staged_dir: "Path | str", artifacts_dir: "Path | str", timeout_s: float, npx: str = "npx",
+) -> list[str]:
     """The web-ext argv. It carries no credential: those are passed in the call's environment.
 
+    ``npx`` is the program that starts the run: ``sign_plugin`` passes the npx path it found and checked.
     ``--no-config-discovery`` stops a config file in the home folder from changing the target or the options.
     """
     timeout_ms = max(1, int(round(float(timeout_s) * 1000)))
     return [
-        "npx", "--yes", WEB_EXT_PACKAGE, "sign",
+        npx, "--yes", WEB_EXT_PACKAGE, "sign",
         "--source-dir", str(staged_dir),
         "--artifacts-dir", str(artifacts_dir),
         "--channel", "unlisted",
@@ -360,8 +368,9 @@ def stored_signed_artifact(
 ) -> StoredSigned:
     """What is stored for ``version``, and for ``source_sha256`` when given. Never raises.
 
-    The statuses are described on :class:`StoredSigned`. A version that has any record is never ``missing``, so a
-    version Mozilla may already hold can never be treated as a fresh one.
+    The statuses are described on :class:`StoredSigned`. A version that has any record, or a stored signed file, is
+    never ``missing``, so a version Mozilla may already hold can never be treated as a fresh one. A stored file
+    whose record was deleted is therefore ``used``: deleting ``signed.json`` alone does not make a version new.
     """
     try:
         if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
@@ -369,15 +378,15 @@ def stored_signed_artifact(
         records = _load_records(state_dir)
         if records is None:
             return StoredSigned(status=UNREADABLE_STATUS)
+        target = _signed_path(state_dir, version)
         mine = [record for record in records if _is_for(record, version)]
         if not mine:
-            return StoredSigned(status=MISSING_STATUS)
+            return StoredSigned(status=USED_STATUS if target.exists() else MISSING_STATUS)
         signed = [
             record for record in mine
             if _record_status(record) == RECORD_SIGNED
             and (source_sha256 is None or record.get("source_sha256") == source_sha256)
         ]
-        target = _signed_path(state_dir, version)
         if not signed or not target.is_file():
             return StoredSigned(status=USED_STATUS)
         recorded = signed[-1].get("sha256")
@@ -528,16 +537,15 @@ def _kill_signing_tree(process: Any) -> None:
 
 
 def _run_web_ext(argv: list[str], env: Mapping[str, str], *, timeout_s: float, cwd: "Path | str") -> SignRunResult:
-    """Run the sign argv through npx, with its output in two files and never in pipes. Never raises.
+    """Run the sign argv, whose first item is the npx path ``sign_plugin`` checked, with its output in two files and
+    never in pipes. Never raises.
 
     Pipes are avoided on purpose: a grandchild that inherits a pipe keeps it open, and that blocks the read. The
     wall clock is ``timeout_s`` plus a grace period, so web-ext's own timeout normally fires first. When the wait runs
-    out, the child's process tree is killed (see :func:`_kill_signing_tree`). If npx is missing or cannot
-    start, the result has no exit code.
+    out, the child's process tree is killed (see :func:`_kill_signing_tree`). The same kill runs when the wait is
+    interrupted by anything, KeyboardInterrupt included, and then the exception is raised again. If the program
+    cannot start, the result has no exit code.
     """
-    npx = shutil.which("npx")
-    if npx is None:
-        return SignRunResult(returncode=None)
     kwargs: dict[str, Any] = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = plugin._CREATE_NO_WINDOW
@@ -550,7 +558,7 @@ def _run_web_ext(argv: list[str], env: Mapping[str, str], *, timeout_s: float, c
             with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
                 try:
                     process = subprocess.Popen(
-                        [npx, *argv[1:]],
+                        list(argv),
                         env=dict(env),
                         cwd=str(cwd),
                         stdin=subprocess.DEVNULL,
@@ -565,6 +573,9 @@ def _run_web_ext(argv: list[str], env: Mapping[str, str], *, timeout_s: float, c
                 except subprocess.TimeoutExpired:
                     _kill_signing_tree(process)
                     return SignRunResult(returncode=None, timed_out=True)
+                except BaseException:  # noqa: BLE001 -- KeyboardInterrupt too: the signing child must not outlive us
+                    _kill_signing_tree(process)
+                    raise
             output = stdout_path.read_bytes() + stderr_path.read_bytes()
     except OSError:
         return SignRunResult(returncode=None)
@@ -614,7 +625,7 @@ def sign_plugin(
         snapshot = _packed_snapshot(source)
         version = _version_from_manifest(_manifest_bytes(snapshot))
         fingerprint = _fingerprint_of(snapshot)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, RecursionError):
         return _outcome("failed", message=_BUNDLE_UNREADABLE_MESSAGE)
     stored = stored_signed_artifact(state, version, source_sha256=fingerprint)
     if stored.status == UNREADABLE_STATUS:
@@ -640,7 +651,16 @@ def sign_plugin(
         try:
             staged = _stage_snapshot(snapshot, staged_dir)
             artifacts.mkdir()
-            argv = sign_argv(staged, artifacts, timeout_s)
+        except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+            return _outcome("failed", version=version, message=_STAGING_FAILED_MESSAGE)
+        # Both checks run before the submission record, so a run that cannot start never uses up the version.
+        npx = shutil.which("npx")
+        if npx is None:
+            return _outcome("failed", version=version, message=_NPX_MISSING_MESSAGE)
+        if _unsafe_for_argv(npx):
+            return _outcome("failed", version=version, message=_UNSAFE_PATH_MESSAGE)
+        try:
+            argv = sign_argv(staged, artifacts, timeout_s, npx=npx)
         except (OSError, ValueError, TypeError, OverflowError):
             return _outcome("failed", version=version, message=_STAGING_FAILED_MESSAGE)
         try:
@@ -697,7 +717,7 @@ def _dry_run() -> int:
         source = plugin._resolve_source(None)
         version = bundle_version(source)
         fingerprint = source_fingerprint(source)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, RecursionError):
         print("Plugin version: cannot be read from the bundle manifest.")
         return 0
     print(f"Plugin version: {version}")

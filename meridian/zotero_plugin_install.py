@@ -129,7 +129,7 @@ VERSION_USED_MESSAGE = (
 RECORD_UNREADABLE_STATUS = "record_unreadable"
 # The same sentence sign-plugin shows, so both commands give one instruction.
 RECORD_UNREADABLE_MESSAGE = (
-    "The signing record is unreadable, so nothing will be submitted. Check or remove state/signed.json, then try again."
+    "The signing record is unreadable, so nothing will be submitted. Check state/signed.json, then try again."
 )
 
 

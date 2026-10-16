@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -100,8 +101,12 @@ def _seed_signed(state_dir: Path, source: Path, payload: bytes) -> Path:
 
 
 def _forget_signed(state_dir: Path) -> None:
-    """Remove the signed record, so the bundle looks unsigned."""
+    """Remove the signed record and the stored signed file, so the bundle looks never signed.
+
+    A stored file with no record is a used version, so both must go for the bundle to read as unsigned.
+    """
     (state_dir / "signed.json").unlink(missing_ok=True)
+    shutil.rmtree(state_dir / "signed", ignore_errors=True)
 
 
 def _sha_of(path: Path) -> str:

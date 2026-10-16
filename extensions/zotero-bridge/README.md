@@ -57,6 +57,15 @@ Signing is a separate step, described in `docs/zotero-plugin-install.md`, sectio
 failure may already have submitted this version to Mozilla, so the version number is used up. The message
 says: Bump the version in manifest.json to sign a new build.
 
+Deleting `signed.json` removes the guarantee against resubmitting a version that was submitted without a
+signed file. Meridian cannot detect a fully deleted record, so it cannot refuse a second submission of that
+version. A stored signed file with no record is refused too. To sign again, bump the version in `manifest.json`.
+
+A version number is matched exactly as written, so `0.1` and `0.1.0` are different versions.
+Mozilla would probably reject a near-duplicate.
+A version that was submitted to Mozilla before this record existed, in an earlier build, is not protected,
+because Meridian has no record of that submission. Bump that version before you sign again.
+
 Scope: the automatic install through the Meridian tray app is Windows only. It needs Zotero 8 or later
 (the manifest's minimum). See `docs/zotero-plugin-install.md`.
 

@@ -64,8 +64,14 @@ FAILED_NONE_TEXT = (
     "version, so bump the version in manifest.json to sign a new build."
 )
 RECORD_UNREADABLE_TEXT = (
-    "The signing record is unreadable, so nothing will be submitted. Check or remove state/signed.json, then try again."
+    "The signing record is unreadable, so nothing will be submitted. Check state/signed.json, then try again."
 )
+NPX_MISSING_TEXT = (
+    "npx was not found on PATH, so the signing tool cannot run. Install Node.js, which includes npx, then try again. "
+    "Nothing was signed or uploaded."
+)
+BUNDLE_UNREADABLE_TEXT = "The plugin bundle's manifest could not be read. Nothing was signed or uploaded."
+FAKE_NPX = "C:/node/npx.cmd"
 UNSAFE_PATH_TEXT = (
     "The temporary folder path contains characters that the signing tool cannot take safely. Set TEMP to a folder "
     "path without those characters, then try again."
@@ -97,13 +103,14 @@ SIGNED_BYTES = _signed_zip(b"signed-by-the-stand-in")
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
-    """No real process, and every default Meridian path points into tmp_path."""
+    """No real process, no real npx lookup, and every default Meridian path points into tmp_path."""
 
     def _blocked(*args, **kwargs):
         raise RuntimeError("real process calls are blocked in tests")
 
     monkeypatch.setattr(sign.subprocess, "run", _blocked)
     monkeypatch.setattr(sign.subprocess, "Popen", _blocked)
+    monkeypatch.setattr(sign.shutil, "which", lambda name: FAKE_NPX)
     monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(tmp_path / "meridian-state"))
     monkeypatch.delenv(sign.API_KEY_ENV, raising=False)
     monkeypatch.delenv(sign.API_SECRET_ENV, raising=False)
@@ -346,6 +353,18 @@ def test_a_fresh_version_with_no_record_is_signed_normally(source, state):
     out = _sign(source, state, runner=runner)
     assert out["status"] == "signed"
     assert len(runner.calls) == 1
+
+
+def test_an_orphan_signed_file_with_no_record_is_a_used_version_and_makes_no_runner_call(source, state):
+    _write(state / "signed" / SIGNED_NAME, SIGNED_BYTES)
+    before = _snapshot(state)
+    assert sign.stored_signed_artifact(state, "0.1.0").status == sign.USED_STATUS
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "refused_version_reused"
+    assert out["message"] == REUSED_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == before
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +659,12 @@ def test_a_malformed_record_is_not_bypassed_by_a_signed_file_on_disk(source, sta
     assert runner.calls == []
 
 
+def test_the_recovery_text_says_to_check_the_record_and_never_to_remove_it():
+    assert "remove" not in RECORD_UNREADABLE_TEXT.lower()
+    assert zpi.RECORD_UNREADABLE_MESSAGE == RECORD_UNREADABLE_TEXT
+    assert sign.RECORD_UNREADABLE_MESSAGE == RECORD_UNREADABLE_TEXT
+
+
 def test_a_record_written_before_the_status_field_still_counts_as_signed(source, state):
     assert _sign(source, state)["status"] == "signed"
     (entry,) = _records(state)
@@ -793,6 +818,37 @@ def test_a_hung_web_ext_is_killed_as_its_own_tree_and_nothing_is_stored(source, 
         assert taskkill == []
 
 
+def test_a_keyboard_interrupt_kills_the_signing_tree_and_still_propagates(source, state, monkeypatch):
+    launched, taskkill, killpg, interrupted = [], [], [], []
+
+    def _interrupted_once(child, timeout):
+        if not interrupted:
+            interrupted.append(child.pid)
+            raise KeyboardInterrupt()
+        return 0
+
+    def _record_taskkill(argv, **kwargs):
+        taskkill.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(sign.shutil, "which", lambda name: "C:/node/npx.cmd")
+    _fake_popen(monkeypatch, _interrupted_once, launched)
+    monkeypatch.setattr(sign.subprocess, "run", _record_taskkill)
+    monkeypatch.setattr(sign.os, "killpg", lambda pid, sig: killpg.append((pid, sig)), raising=False)
+    with pytest.raises(KeyboardInterrupt):
+        sign.sign_plugin(env=CREDS, state_dir=state, source_dir=source, timeout_s=60)
+    (child,) = launched
+    assert interrupted == [4242]
+    if sys.platform == "win32":
+        assert taskkill == [["taskkill", "/PID", "4242", "/T", "/F"]]
+        assert killpg == []
+    else:
+        assert killpg == [(4242, signal.SIGKILL)]
+        assert taskkill == []
+    assert child.args[0] == "C:/node/npx.cmd"
+    _only_a_submitted_record(state)
+
+
 def test_the_forced_kill_never_names_zotero(source, state, monkeypatch):
     taskkill = []
     monkeypatch.setattr(sign.shutil, "which", lambda name: "C:/node/npx.cmd")
@@ -808,11 +864,24 @@ def test_the_forced_kill_never_names_zotero(source, state, monkeypatch):
         assert "/IM" not in argv
 
 
-def test_a_missing_npx_is_a_failure_with_no_exit_code_invented(source, state, monkeypatch):
+def test_a_missing_npx_writes_no_record_and_starts_no_process(source, state, monkeypatch):
     monkeypatch.setattr(sign.shutil, "which", lambda name: None)
+    monkeypatch.setattr(sign.subprocess, "Popen", lambda *a, **k: pytest.fail("no process without npx"))
     out = sign.sign_plugin(env=CREDS, state_dir=state, source_dir=source)
     assert out["status"] == "failed"
-    _only_a_submitted_record(state)
+    assert out["message"] == NPX_MISSING_TEXT
+    assert _snapshot(state) == {}
+
+
+def test_a_missing_npx_makes_no_runner_call_and_submits_nothing(source, state):
+    runner = FakeRunner()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sign.shutil, "which", lambda name: None)
+        out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == NPX_MISSING_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +937,32 @@ def test_an_oserror_creating_the_scratch_folder_is_a_failed_result_that_submits_
     assert _snapshot(state) == {}
 
 
+def _deeply_nested_manifest(source: Path) -> None:
+    deep = "[" * 100_000 + "]" * 100_000
+    _write(source / "manifest.json", '{"manifest_version": 2, "version": "0.1.0", "deep": ' + deep + "}")
+
+
+def test_a_deeply_nested_manifest_is_a_failed_result_with_no_traceback(source, state):
+    _deeply_nested_manifest(source)
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == BUNDLE_UNREADABLE_TEXT
+    assert "Traceback" not in json.dumps(out)
+    assert runner.calls == []
+    assert _snapshot(state) == {}
+
+
+def test_a_deeply_nested_manifest_is_reported_by_the_dry_run_without_a_traceback(source, monkeypatch, capsys):
+    _deeply_nested_manifest(source)
+    monkeypatch.setattr(zpi, "_bundled_source_dir", lambda: source)
+    rc = sign.cli_main(["--dry-run"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "cannot be read from the bundle manifest" in captured.out
+    assert "Traceback" not in captured.out + captured.err
+
+
 # ---------------------------------------------------------------------------
 # Safe staging path: no character that cmd.exe reads specially may reach the web-ext argv
 # ---------------------------------------------------------------------------
@@ -893,6 +988,29 @@ def test_the_unsafe_character_check_covers_every_listed_character():
     for char in '&^%!"<>|':
         assert sign._unsafe_for_argv(f"C:/temp/a{char}b") is True
     assert sign._unsafe_for_argv("C:/temp/a b (c)") is False
+
+
+@pytest.mark.parametrize("char", ["&", "^", "%", "!"], ids=["ampersand", "caret", "percent", "bang"])
+def test_an_npx_path_with_an_unsafe_character_is_refused_before_any_submission(source, state, monkeypatch, char):
+    monkeypatch.setattr(sign.shutil, "which", lambda name: f"C:/node {char} tools/npx.cmd")
+    monkeypatch.setattr(sign.subprocess, "Popen", lambda *a, **k: pytest.fail("no process for an unsafe npx path"))
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == UNSAFE_PATH_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == {}
+
+
+def test_the_resolved_npx_path_is_the_program_the_argv_starts(source, state):
+    runner = FakeRunner()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sign.shutil, "which", lambda name: "C:/Program Files/nodejs/npx.cmd")
+        out = _sign(source, state, runner=runner)
+    assert out["status"] == "signed"
+    (call,) = runner.calls
+    assert call["argv"][0] == "C:/Program Files/nodejs/npx.cmd"
+    assert call["argv"][1:4] == ["--yes", sign.WEB_EXT_PACKAGE, "sign"]
 
 
 # ---------------------------------------------------------------------------
@@ -1116,6 +1234,15 @@ def test_a_deleted_signed_file_is_a_used_version_and_never_a_missing_one(default
     assert runner.calls == []
 
 
+def test_an_orphan_signed_file_with_no_record_is_a_used_version_for_the_install_too(default_zotero, source):
+    state = zpi.signing_state_dir()
+    _write(state / "signed" / SIGNED_NAME, SIGNED_BYTES)
+    result = zpi.install_default_profile(running=lambda: False)
+    assert result["status"] == "version_used"
+    assert result["message"] == VERSION_USED_TEXT
+    assert not (default_zotero / "extensions").exists()
+
+
 def test_a_tampered_file_in_the_cli_says_so_and_closes_nothing(monkeypatch, capsys, default_zotero, source):
     assert _sign(source, zpi.signing_state_dir())["status"] == "signed"
     (zpi.signing_state_dir() / "signed" / SIGNED_NAME).write_bytes(b"tampered")
@@ -1320,14 +1447,58 @@ def test_docs_name_the_zotero_minimum_and_keep_one_menu_note_for_zotero_10_0_6()
 def test_docs_state_the_negative_timeout_form_and_the_process_tree_kill():
     docs = _docs()
     assert "--timeout-minutes=-5" in docs
+    assert "may be written with an equals sign" in docs
+    assert "must be written with an equals sign" not in docs
     assert "process tree" in docs
     assert "only forced kill" in docs
+
+
+def _bullet(docs: str, lead: str) -> str:
+    return next(line for line in docs.splitlines() if line.startswith(f"- **{lead}"))
+
+
+def test_docs_say_deleting_the_record_removes_the_guarantee_and_that_a_bump_signs_again():
+    docs = _docs()
+    assert "Deleting `signed.json` removes the guarantee against resubmitting a version" in docs
+    assert "cannot detect a fully deleted record" in docs
+    assert "To sign again, bump the version in `manifest.json`." in docs
+
+
+def test_docs_say_a_version_is_matched_exactly_and_that_a_near_duplicate_is_probably_rejected():
+    docs = _docs()
+    assert "matched exactly as written" in docs
+    assert "`0.1` and `0.1.0` are different versions" in docs
+    assert "Mozilla would probably reject a near-duplicate" in docs
+
+
+def test_docs_say_a_version_submitted_before_the_record_existed_is_not_protected():
+    docs = _docs()
+    assert "before this record existed" in docs
+    assert "is not protected" in docs
+
+
+def test_docs_signing_no_longer_claims_it_writes_the_unsigned_bundle_to_the_state_folder():
+    bullet = _bullet(_docs(), "Signing does not close Zotero.")
+    assert "unsigned bundle" not in bullet
+    assert "`signed.json`" in bullet
 
 
 def test_the_bridge_readme_says_a_failed_submission_uses_up_the_version_number():
     readme = (REPO_EXTENSION / "README.md").read_text(encoding="utf-8")
     assert "the version number is used up" in readme
     assert "Bump the version in manifest.json to sign a new build." in readme
+
+
+def test_the_bridge_readme_carries_the_record_deletion_version_and_pre_record_facts():
+    readme = (REPO_EXTENSION / "README.md").read_text(encoding="utf-8")
+    assert "Deleting `signed.json` removes the guarantee against resubmitting a version" in readme
+    assert "cannot detect a fully deleted record" in readme
+    assert "To sign again, bump the version in `manifest.json`." in readme
+    assert "matched exactly as written" in readme
+    assert "`0.1` and `0.1.0` are different versions" in readme
+    assert "Mozilla would probably reject a near-duplicate" in readme
+    assert "before this record existed" in readme
+    assert "is not protected" in readme
 
 
 def test_docs_say_the_unsigned_build_writes_nothing_to_the_zotero_profile():
