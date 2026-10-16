@@ -53,8 +53,12 @@ plugin code. The URL is a placeholder (see "Updates" below).
 2. In Zotero, open **Tools > Plugins**, click the gear icon, and choose **Install Plugin From File**.
 3. Select the `.xpi`, then restart Zotero if asked.
 
-Scope: the automatic install through the Meridian tray app is Windows only. See
-`docs/zotero-plugin-install.md`.
+Signing is a separate step, described in `docs/zotero-plugin-install.md`, section 4a. A timeout or a
+failure may already have submitted this version to Mozilla, so the version number is used up. The message
+says: Bump the version in manifest.json to sign a new build.
+
+Scope: the automatic install through the Meridian tray app is Windows only. It needs Zotero 8 or later
+(the manifest's minimum). See `docs/zotero-plugin-install.md`.
 
 ## Duplicate rules (BibTeX import)
 

@@ -1394,6 +1394,7 @@ ZOTERO_PLUGIN_INSTALL_NOW_LABEL = "Install Zotero plugin now"
 _ZOTERO_PLUGIN_INSTALL_STATUSES = frozenset({
     "installed", "unchanged", "refused_running", "close_failed", "check_failed", "refused_not_profile",
     "no_profile", "failed", "needs_signature", zotero_plugin.INTEGRITY_STATUS,
+    zotero_plugin.VERSION_USED_STATUS, zotero_plugin.RECORD_UNREADABLE_STATUS,
 })
 _ZOTERO_PLUGIN_SAVED_PREFIX = "Your choice was saved. "
 _ZOTERO_PLUGIN_CLOSE_AND_RETRY = (
@@ -1486,6 +1487,10 @@ def _unclosed_install_text(status: Any, path: Any, error: Any) -> str:
         return f"Nothing was installed: {error}"
     if status == zotero_plugin.INTEGRITY_STATUS:
         return zotero_plugin.INTEGRITY_FAILED_MESSAGE
+    if status == zotero_plugin.VERSION_USED_STATUS:
+        return zotero_plugin.VERSION_USED_MESSAGE
+    if status == zotero_plugin.RECORD_UNREADABLE_STATUS:
+        return zotero_plugin.RECORD_UNREADABLE_MESSAGE
     return f"The install failed: {error}"
 
 

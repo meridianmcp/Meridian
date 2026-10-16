@@ -104,6 +104,11 @@ def _forget_signed(state_dir: Path) -> None:
     (state_dir / "signed.json").unlink(missing_ok=True)
 
 
+def _sha_of(path: Path) -> str:
+    """The sha256 of a file's bytes: the hash an install is given for it."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 @pytest.fixture
 def profile(tmp_path):
     folder = tmp_path / "Zotero" / "Profiles" / "abc.default"
@@ -510,7 +515,7 @@ def test_tasklist_nonzero_exit_is_unknown_not_closed(monkeypatch):
 
 def test_install_refuses_while_zotero_is_running_and_writes_nothing(profile, xpi):
     before = _snapshot(profile)
-    result = zpi.install_into_profile(profile, xpi, running=lambda: True)
+    result = zpi.install_into_profile(profile, xpi, running=lambda: True, expected_sha256=_sha_of(xpi))
     assert result["status"] == "refused_running"
     assert _snapshot(profile) == before
     assert not (profile / "extensions").exists()
@@ -521,7 +526,7 @@ def test_install_reports_check_failed_and_writes_nothing_when_the_process_check_
     monkeypatch.setattr(zpi.subprocess, "run", lambda argv, **kw: _completed(argv, 1, stdout=""))
     before = _snapshot(profile)
 
-    result = zpi.install_into_profile(profile, xpi)
+    result = zpi.install_into_profile(profile, xpi, expected_sha256=_sha_of(xpi))
 
     assert result["status"] == "check_failed"
     assert "could not check whether zotero is running" in result["error"].lower()
@@ -541,7 +546,7 @@ def test_install_default_profile_reports_check_failed_not_refused_running(monkey
 
 
 def test_install_copies_the_xpi_and_leaves_no_temp_file(profile, xpi):
-    result = zpi.install_into_profile(profile, xpi, running=lambda: False)
+    result = zpi.install_into_profile(profile, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))
     target = profile / "extensions" / XPI_NAME
     assert result["status"] == "installed"
     assert target.read_bytes() == xpi.read_bytes()
@@ -549,18 +554,18 @@ def test_install_copies_the_xpi_and_leaves_no_temp_file(profile, xpi):
 
 
 def test_second_install_reports_unchanged_and_does_not_rewrite(monkeypatch, profile, xpi):
-    assert zpi.install_into_profile(profile, xpi, running=lambda: False)["status"] == "installed"
+    assert zpi.install_into_profile(profile, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))["status"] == "installed"
 
     def _must_not_write(target, payload):
         raise AssertionError("an unchanged install must not rewrite the file")
 
     monkeypatch.setattr(zpi, "_atomic_write_bytes", _must_not_write)
-    assert zpi.install_into_profile(profile, xpi, running=lambda: False)["status"] == "unchanged"
+    assert zpi.install_into_profile(profile, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))["status"] == "unchanged"
 
 
 def test_install_never_touches_extensions_json_prefs_or_anything_else(profile, xpi):
     before = _snapshot(profile)
-    zpi.install_into_profile(profile, xpi, running=lambda: False)
+    zpi.install_into_profile(profile, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))
     after = _snapshot(profile)
     assert after["extensions.json"] == before["extensions.json"]
     assert after["prefs.js"] == before["prefs.js"]
@@ -570,14 +575,14 @@ def test_install_never_touches_extensions_json_prefs_or_anything_else(profile, x
 
 
 def test_install_with_no_profile_reports_no_profile_and_creates_nothing(tmp_path, xpi):
-    assert zpi.install_into_profile(None, xpi, running=lambda: False)["status"] == "no_profile"
+    assert zpi.install_into_profile(None, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))["status"] == "no_profile"
     missing = tmp_path / "missing"
-    assert zpi.install_into_profile(missing, xpi, running=lambda: False)["status"] == "no_profile"
+    assert zpi.install_into_profile(missing, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))["status"] == "no_profile"
     assert not missing.exists()
 
 
 def test_install_reports_failed_when_the_source_is_missing_and_writes_nothing(profile, tmp_path):
-    result = zpi.install_into_profile(profile, tmp_path / "nope.xpi", running=lambda: False)
+    result = zpi.install_into_profile(profile, tmp_path / "nope.xpi", running=lambda: False, expected_sha256="0" * 64)
     assert result["status"] == "failed"
     assert not (profile / "extensions").exists()
 
@@ -587,7 +592,7 @@ def test_install_refuses_a_folder_without_a_profile_marker_and_writes_nothing(tm
     bare.mkdir()
     _write(bare / "notes.txt", "hello")
     before = _snapshot(bare)
-    result = zpi.install_into_profile(bare, xpi, running=lambda: False)
+    result = zpi.install_into_profile(bare, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))
     assert result["status"] == "refused_not_profile"
     assert "prefs.js" in result["error"] and "zotero.sqlite" in result["error"]
     assert _snapshot(bare) == before
@@ -599,8 +604,16 @@ def test_install_accepts_a_folder_holding_either_profile_marker(tmp_path, xpi, m
     folder = tmp_path / "profile"
     folder.mkdir()
     _write(folder / marker, "marker")
-    assert zpi.install_into_profile(folder, xpi, running=lambda: False)["status"] == "installed"
+    assert zpi.install_into_profile(folder, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))["status"] == "installed"
     assert (folder / "extensions" / XPI_NAME).is_file()
+
+
+def test_install_with_no_hash_to_check_refuses_and_writes_nothing(profile, xpi):
+    """None is never a pass: with nothing to compare the bytes against, the copy is refused."""
+    before = _snapshot(profile)
+    result = zpi.install_into_profile(profile, xpi, running=lambda: False, expected_sha256=None)
+    assert result["status"] == "integrity_failed"
+    assert _snapshot(profile) == before
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +879,7 @@ def test_permission_error_while_probing_the_profile_maps_to_failed(monkeypatch, 
 
         monkeypatch.setattr(zpi, "is_zotero_profile", _denied_probe)
 
-    result = zpi.install_into_profile(profile, xpi, running=lambda: False)
+    result = zpi.install_into_profile(profile, xpi, running=lambda: False, expected_sha256=_sha_of(xpi))
 
     assert result["status"] == "failed"
     assert "access denied" in result["error"]
@@ -1522,7 +1535,7 @@ def test_a_close_failure_leaves_the_profile_byte_identical(profile, xpi):
         close_zotero=True,
         running=_states(True),
         close=lambda running=None: "close_failed",
-        install=lambda: zpi.install_into_profile(profile, xpi, running=lambda: False),
+        install=lambda: zpi.install_into_profile(profile, xpi, running=lambda: False, expected_sha256=_sha_of(xpi)),
         restart=lambda: "started",
     )
     assert result["status"] == "close_failed"
@@ -1895,6 +1908,23 @@ def test_cli_dry_run_says_the_unsigned_file_would_be_written_and_writes_nothing(
     assert not zpi.default_xpi_path().exists()
     assert _snapshot(profile) == before
     assert not (profile / "extensions").exists()
+
+
+def test_cli_dry_run_refuses_a_version_already_submitted_without_a_signed_file(capsys, profile):
+    from meridian import zotero_plugin_sign as sign
+
+    bundle = zpi._bundled_source_dir()
+    state = zpi.signing_state_dir()
+    _forget_signed(state)
+    sign.record_submission(state, sign.bundle_version(bundle), sign.source_fingerprint(bundle), clock=lambda: 0.0)
+    before = _snapshot(profile)
+    rc = zpi.cli_main(["--profile", str(profile), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Would refuse." in out
+    assert "Bump the version in manifest.json to sign a new build." in out
+    assert "not signed yet" not in out
+    assert _snapshot(profile) == before
 
 
 def test_cli_installs_the_signed_bytes_and_not_the_unsigned_build(monkeypatch, capsys, profile):

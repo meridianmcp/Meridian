@@ -43,19 +43,38 @@ EXPECTED_ENTRIES = [
 # The exact user-facing texts. A test that changes any of them is a change to the contract.
 TIMEOUT_TEXT = (
     "Mozilla did not return a signed file in time. Check this version's page in the developer hub. "
+    "Mozilla may still have received this version, so bump the version in manifest.json to sign a new build. "
     "Nothing was stored."
 )
-SOURCE_CHANGED_TEXT = "The plugin source changed while Mozilla was signing it. Run sign-plugin again."
-REUSED_TEXT = (
-    "This version was already submitted with different source. Bump the version in manifest.json, then sign again."
+SOURCE_CHANGED_TEXT = (
+    "The plugin source changed while Mozilla was signing it, so nothing was stored. Mozilla may have received "
+    "this version, so bump the version in manifest.json to sign a new build."
 )
-INTEGRITY_TEXT = "The stored signed file failed its integrity check. Sign the plugin again."
+REUSED_TEXT = "This version has already been submitted to Mozilla. Bump the version in manifest.json to sign a new build."
+INTEGRITY_TEXT = "The stored signed file failed its integrity check. Bump the version in manifest.json to sign a new build."
 RANGE_TEXT = (
     "--timeout-minutes must be a number of minutes greater than 0 and at most 1440. Nothing was signed or uploaded."
 )
 UNSIGNED_ZIP_TEXT = (
     "Mozilla signing finished, but the file it returned has no signature in META-INF/ (.rsa or .sf). "
-    "Nothing was stored."
+    "Nothing was stored. Mozilla may have received this version, so bump the version in manifest.json to sign a new build."
+)
+FAILED_NONE_TEXT = (
+    "Mozilla signing did not complete (web-ext exit code: none). Nothing was stored. Mozilla may have received this "
+    "version, so bump the version in manifest.json to sign a new build."
+)
+RECORD_UNREADABLE_TEXT = (
+    "The signing record is unreadable, so nothing will be submitted. Check or remove state/signed.json, then try again."
+)
+UNSAFE_PATH_TEXT = (
+    "The temporary folder path contains characters that the signing tool cannot take safely. Set TEMP to a folder "
+    "path without those characters, then try again."
+)
+SCRATCH_TEXT = "The temporary folder for signing could not be created. Nothing was signed or uploaded."
+SUBMIT_RECORD_TEXT = "The signing record could not be written, so nothing was submitted to Mozilla."
+VERSION_USED_TEXT = (
+    "This plugin version was already submitted to Mozilla, and no verified signed file is stored for it. "
+    "Bump the version in manifest.json to sign a new build. Nothing was written."
 )
 NEEDS_SIGNATURE_LEAD = "This plugin version is not signed yet."
 
@@ -166,6 +185,19 @@ def _snapshot(root: Path) -> dict[str, str]:
         p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted(root.rglob("*")) if p.is_file()
     }
+
+
+def _records(state: Path) -> list[dict]:
+    return json.loads((state / "signed.json").read_text(encoding="utf-8"))["records"]
+
+
+def _only_a_submitted_record(state: Path, version: str = "0.1.0") -> None:
+    """Nothing is stored, and the one record is the submission for ``version``: the version number is used up."""
+    assert not (state / "signed").exists()
+    (record,) = _records(state)
+    assert record["addon_id"] == sign.PLUGIN_ADDON_ID
+    assert record["version"] == version
+    assert record["status"] == "submitted"
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +349,112 @@ def test_a_fresh_version_with_no_record_is_signed_normally(source, state):
 
 
 # ---------------------------------------------------------------------------
+# One submission per version: the record is written before web-ext runs, and any record refuses a new submission
+# ---------------------------------------------------------------------------
+
+
+def test_the_submitted_record_is_on_disk_before_web_ext_runs(source, state):
+    seen = {}
+
+    class _Recording(FakeRunner):
+        def __call__(self, argv, env, *, timeout_s, cwd):
+            seen["records"] = _records(state)
+            return super().__call__(argv, env, timeout_s=timeout_s, cwd=cwd)
+
+    assert _sign(source, state, runner=_Recording())["status"] == "signed"
+    assert [record["status"] for record in seen["records"]] == ["submitted"]
+    assert seen["records"][0]["source_sha256"] == sign.source_fingerprint(source)
+
+
+def test_a_failed_run_leaves_a_submitted_record_and_the_next_run_is_refused(source, state):
+    assert _sign(source, state, runner=FakeRunner(result=sign.SignRunResult(returncode=7)))["status"] == "failed"
+    _only_a_submitted_record(state)
+    retry = FakeRunner()
+    out = _sign(source, state, runner=retry)
+    assert out["status"] == "refused_version_reused"
+    assert out["message"] == REUSED_TEXT
+    assert retry.calls == []
+    _only_a_submitted_record(state)
+
+
+def test_a_failed_run_is_refused_again_even_when_the_source_changed(source, state):
+    assert _sign(source, state, runner=FakeRunner(result=sign.SignRunResult(returncode=7)))["status"] == "failed"
+    _write(source / "bootstrap.js", "// changed after the failed run\n")
+    retry = FakeRunner()
+    out = _sign(source, state, runner=retry)
+    assert out["status"] == "refused_version_reused"
+    assert out["message"] == REUSED_TEXT
+    assert retry.calls == []
+
+
+def test_a_timed_out_run_is_refused_the_same_way_with_the_source_unchanged_or_changed(source, state):
+    timed = FakeRunner(result=sign.SignRunResult(returncode=None, timed_out=True))
+    assert _sign(source, state, runner=timed)["status"] == "timeout"
+    same = FakeRunner()
+    assert _sign(source, state, runner=same)["status"] == "refused_version_reused"
+    assert same.calls == []
+    _write(source / "bootstrap.js", "// edited after the timeout\n")
+    changed = FakeRunner()
+    assert _sign(source, state, runner=changed)["status"] == "refused_version_reused"
+    assert changed.calls == []
+
+
+def test_a_submitted_record_refuses_before_the_credentials_are_even_looked_at(source, state):
+    assert _sign(source, state, runner=FakeRunner(result=sign.SignRunResult(returncode=3)))["status"] == "failed"
+    runner = FakeRunner()
+    out = _sign(source, state, env={}, runner=runner)
+    assert out["status"] == "refused_version_reused"
+    assert runner.calls == []
+
+
+def test_a_tampered_stored_file_is_never_re_signed_for_the_same_version(source, state):
+    assert _sign(source, state)["status"] == "signed"
+    (state / "signed" / SIGNED_NAME).write_bytes(b"tampered")
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "refused_version_reused"
+    assert out["message"] == REUSED_TEXT
+    assert runner.calls == []
+
+
+def test_a_fresh_version_still_signs_after_an_earlier_version_was_used_up(source, state):
+    timed = FakeRunner(result=sign.SignRunResult(returncode=None, timed_out=True))
+    assert _sign(source, state, runner=timed)["status"] == "timeout"
+    manifest_path = source / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["version"] = "0.2.0"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    runner = FakeRunner(
+        produce=lambda artifacts: (artifacts / f"{sign.PLUGIN_ADDON_ID}-0.2.0.xpi").write_bytes(SIGNED_BYTES),
+    )
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "signed"
+    assert out["version"] == "0.2.0"
+    assert len(runner.calls) == 1
+    assert {record["version"]: record["status"] for record in _records(state)} == {"0.1.0": "submitted", "0.2.0": "signed"}
+
+
+def test_a_record_write_failure_submits_nothing(source, state, monkeypatch):
+    def _cannot_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sign, "record_submission", _cannot_write)
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == SUBMIT_RECORD_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == {}
+
+
+def test_the_submitted_record_carries_the_source_fingerprint_and_a_utc_time(source, state):
+    assert _sign(source, state, runner=FakeRunner(result=sign.SignRunResult(returncode=5)))["status"] == "failed"
+    (record,) = _records(state)
+    assert record["source_sha256"] == sign.source_fingerprint(source)
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", record["submitted_at"])
+
+
+# ---------------------------------------------------------------------------
 # Source fixed during the Mozilla wait; the captured version and fingerprint are the ones recorded
 # ---------------------------------------------------------------------------
 
@@ -332,7 +470,7 @@ def test_a_source_edit_during_the_mozilla_wait_stores_nothing(source, state):
     assert len(runner.calls) == 1
     assert out["status"] == "failed"
     assert out["message"] == SOURCE_CHANGED_TEXT
-    assert _snapshot(state) == {}
+    _only_a_submitted_record(state)
 
 
 def test_a_source_edited_and_restored_during_the_wait_is_recorded_under_the_captured_fingerprint(source, state):
@@ -402,6 +540,7 @@ def test_a_signed_result_is_stored_with_a_record_and_never_a_secret(source, stat
     (entry,) = record["records"]
     assert entry["addon_id"] == sign.PLUGIN_ADDON_ID
     assert entry["version"] == "0.1.0"
+    assert entry["status"] == "signed"
     assert entry["sha256"] == hashlib.sha256(SIGNED_BYTES).hexdigest()
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", entry["signed_at"])
     stored_text = (state / "signed.json").read_text(encoding="utf-8")
@@ -409,11 +548,11 @@ def test_a_signed_result_is_stored_with_a_record_and_never_a_secret(source, stat
     assert KEY_VALUE not in json.dumps(out) and SECRET_VALUE not in json.dumps(out)
 
 
-def test_a_timeout_result_stores_nothing(source, state):
+def test_a_timeout_result_stores_nothing_but_uses_up_the_version(source, state):
     runner = FakeRunner(result=sign.SignRunResult(returncode=None, timed_out=True))
     out = _sign(source, state, runner=runner)
     assert out["status"] == "timeout"
-    assert _snapshot(state) == {}
+    _only_a_submitted_record(state)
 
 
 def test_a_failed_exit_reports_the_exit_code_only_and_stores_nothing(source, state):
@@ -421,7 +560,7 @@ def test_a_failed_exit_reports_the_exit_code_only_and_stores_nothing(source, sta
     out = _sign(source, state, runner=runner)
     assert out["status"] == "failed"
     assert "7" in out["message"]
-    assert _snapshot(state) == {}
+    _only_a_submitted_record(state)
 
 
 @pytest.mark.parametrize(
@@ -436,7 +575,7 @@ def test_a_failed_exit_reports_the_exit_code_only_and_stores_nothing(source, sta
 def test_success_needs_exactly_one_zip_artifact(source, state, produce):
     out = _sign(source, state, runner=FakeRunner(produce=produce))
     assert out["status"] == "failed"
-    assert _snapshot(state) == {}
+    _only_a_submitted_record(state)
 
 
 def test_a_stored_file_that_is_tampered_with_is_not_returned(source, state):
@@ -462,6 +601,77 @@ def test_a_corrupt_record_file_means_nothing_is_signed(source, state):
     assert _sign(source, state)["status"] == "signed"
     (state / "signed.json").write_text("{not json", encoding="utf-8")
     assert sign.signed_artifact_for_version(state, "0.1.0") is None
+
+
+MALFORMED_RECORD_TEXTS = [
+    "{not json",
+    "[]",
+    '{"records": "x"}',
+    '{"records": [1]}',
+    '{"records": [{"addon_id": "meridian-zotero@usemeridian.us", "version": "0.1.0"}]}',
+    '{"records": [{"addon_id": "meridian-zotero@usemeridian.us", "version": "0.1.0", "status": "bogus", '
+    '"source_sha256": "' + "0" * 64 + '"}]}',
+]
+
+
+@pytest.mark.parametrize(
+    "text", MALFORMED_RECORD_TEXTS,
+    ids=["not_json", "a_list", "records_not_a_list", "entry_not_an_object", "entry_missing_fields", "unknown_status"],
+)
+def test_a_malformed_record_file_refuses_and_is_never_treated_as_empty(source, state, text):
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "signed.json").write_text(text, encoding="utf-8")
+    before = _snapshot(state)
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "refused_unreadable_record"
+    assert out["message"] == RECORD_UNREADABLE_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == before
+    assert sign.signed_artifact_for_version(state, "0.1.0") is None
+
+
+def test_a_malformed_record_is_not_bypassed_by_a_signed_file_on_disk(source, state):
+    assert _sign(source, state)["status"] == "signed"
+    (state / "signed.json").write_text("{not json", encoding="utf-8")
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "refused_unreadable_record"
+    assert runner.calls == []
+
+
+def test_a_record_written_before_the_status_field_still_counts_as_signed(source, state):
+    assert _sign(source, state)["status"] == "signed"
+    (entry,) = _records(state)
+    del entry["status"]
+    (state / "signed.json").write_text(json.dumps({"records": [entry]}), encoding="utf-8")
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "already_signed"
+    assert runner.calls == []
+
+
+def test_a_malformed_record_also_refuses_the_install_and_writes_nothing(default_zotero, source):
+    state = zpi.signing_state_dir()
+    assert _sign(source, state)["status"] == "signed"
+    (state / "signed.json").write_text("[]", encoding="utf-8")
+    before = _snapshot(default_zotero)
+    result = zpi.install_default_profile(running=lambda: False)
+    assert result["status"] == "record_unreadable"
+    assert result["message"] == RECORD_UNREADABLE_TEXT
+    assert _snapshot(default_zotero) == before
+    assert not (default_zotero / "extensions").exists()
+
+
+def test_dry_run_reports_a_version_already_submitted_to_mozilla(monkeypatch, capsys):
+    bundle = zpi._bundled_source_dir()
+    state = zpi.signing_state_dir()
+    sign.record_submission(state, sign.bundle_version(bundle), sign.source_fingerprint(bundle), clock=lambda: FIXED_NOW)
+    rc = sign.cli_main(["--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "already submitted to Mozilla" in out
+    assert "Signed artifact stored: no" in out
 
 
 def test_signed_artifact_lookup_refuses_an_unsafe_version(source, state):
@@ -542,7 +752,7 @@ def test_web_ext_timeout_text_in_the_log_file_is_classified_as_a_timeout(source,
     out = sign.sign_plugin(env=CREDS, state_dir=state, source_dir=source)
     assert out["status"] == "timeout"
     assert out["message"] == TIMEOUT_TEXT
-    assert _snapshot(state) == {}
+    _only_a_submitted_record(state)
 
 
 def test_the_child_writes_to_log_files_not_pipes_so_no_inherited_handle_can_block_the_wait(source, state, monkeypatch):
@@ -572,7 +782,7 @@ def test_a_hung_web_ext_is_killed_as_its_own_tree_and_nothing_is_stored(source, 
     out = sign.sign_plugin(env=CREDS, state_dir=state, source_dir=source, timeout_s=60)
     assert out["status"] == "timeout"
     assert out["message"] == TIMEOUT_TEXT
-    assert _snapshot(state) == {}
+    _only_a_submitted_record(state)
     (child,) = launched
     assert child.args[0] == "C:/node/npx.cmd"
     if sys.platform == "win32":
@@ -602,7 +812,87 @@ def test_a_missing_npx_is_a_failure_with_no_exit_code_invented(source, state, mo
     monkeypatch.setattr(sign.shutil, "which", lambda name: None)
     out = sign.sign_plugin(env=CREDS, state_dir=state, source_dir=source)
     assert out["status"] == "failed"
+    _only_a_submitted_record(state)
+
+
+# ---------------------------------------------------------------------------
+# Never-raises: a runner, a start, or a scratch folder that fails is a failed result, with no traceback and no secret
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("bad value"), TypeError("bad type"), OSError("no such program")],
+    ids=["value_error", "type_error", "os_error"],
+)
+def test_a_popen_that_raises_is_a_failed_run_with_no_traceback_and_no_secret(source, state, monkeypatch, error):
+    monkeypatch.setattr(sign.shutil, "which", lambda name: "C:/node/npx.cmd")
+
+    def _raises(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(sign.subprocess, "Popen", _raises)
+    out = sign.sign_plugin(env=CREDS, state_dir=state, source_dir=source, timeout_s=120)
+    text = json.dumps(out)
+    assert out["status"] == "failed"
+    assert out["message"] == FAILED_NONE_TEXT
+    assert "Traceback" not in text
+    assert str(error) not in text
+    assert KEY_VALUE not in text and SECRET_VALUE not in text
+    _only_a_submitted_record(state)
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("bad value"), TypeError("bad type")], ids=["value_error", "type_error"],
+)
+def test_run_web_ext_turns_a_popen_error_into_a_result_without_a_return_code(monkeypatch, tmp_path, error):
+    monkeypatch.setattr(sign.shutil, "which", lambda name: "C:/node/npx.cmd")
+
+    def _raises(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(sign.subprocess, "Popen", _raises)
+    result = sign._run_web_ext(["npx", "--yes", sign.WEB_EXT_PACKAGE, "sign"], dict(CREDS), timeout_s=60, cwd=tmp_path)
+    assert result == sign.SignRunResult(returncode=None)
+
+
+def test_an_oserror_creating_the_scratch_folder_is_a_failed_result_that_submits_nothing(source, state, monkeypatch):
+    def _no_folder(*args, **kwargs):
+        raise OSError("the temporary folder is not writable")
+
+    monkeypatch.setattr(sign.tempfile, "TemporaryDirectory", _no_folder)
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == SCRATCH_TEXT
+    assert runner.calls == []
     assert _snapshot(state) == {}
+
+
+# ---------------------------------------------------------------------------
+# Safe staging path: no character that cmd.exe reads specially may reach the web-ext argv
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("char", ["&", "^", "%", "!"], ids=["ampersand", "caret", "percent", "bang"])
+def test_a_temp_folder_path_with_an_unsafe_character_is_refused_before_any_argv_or_submission(
+    source, state, tmp_path, monkeypatch, char,
+):
+    temp = tmp_path / f"Temp {char} Build"
+    temp.mkdir()
+    monkeypatch.setattr(sign.tempfile, "tempdir", str(temp))
+    monkeypatch.setattr(sign, "sign_argv", lambda *a, **k: pytest.fail("no argv for an unsafe path"))
+    runner = FakeRunner()
+    out = _sign(source, state, runner=runner)
+    assert out["status"] == "failed"
+    assert out["message"] == UNSAFE_PATH_TEXT
+    assert runner.calls == []
+    assert _snapshot(state) == {}
+
+
+def test_the_unsafe_character_check_covers_every_listed_character():
+    for char in '&^%!"<>|':
+        assert sign._unsafe_for_argv(f"C:/temp/a{char}b") is True
+    assert sign._unsafe_for_argv("C:/temp/a b (c)") is False
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +1006,7 @@ def test_a_timeout_result_gives_the_developer_hub_message_and_no_promise_to_retr
     assert out["status"] == "timeout"
     assert out["message"] == TIMEOUT_TEXT
     assert "later" not in out["message"]
-    assert _snapshot(state) == {}
+    _only_a_submitted_record(state)
 
 
 def test_dispatch_routes_zotero_sign_plugin_to_the_signer(capsys):
@@ -811,14 +1101,19 @@ def test_a_tampered_signed_file_is_never_installed_and_gets_the_integrity_messag
     assert not (default_zotero / "extensions").exists()
 
 
-def test_a_missing_signed_file_gets_the_needs_signature_message_not_the_integrity_one(default_zotero, source):
-    assert _sign(source, zpi.signing_state_dir())["status"] == "signed"
-    (zpi.signing_state_dir() / "signed" / SIGNED_NAME).unlink()
+def test_a_deleted_signed_file_is_a_used_version_and_never_a_missing_one(default_zotero, source):
+    state = zpi.signing_state_dir()
+    assert _sign(source, state)["status"] == "signed"
+    (state / "signed" / SIGNED_NAME).unlink()
     result = zpi.install_default_profile(running=lambda: False)
-    assert result["status"] == "needs_signature"
-    assert NEEDS_SIGNATURE_LEAD in result["message"]
-    assert result["message"] != INTEGRITY_TEXT
+    assert result["status"] == "version_used"
+    assert result["message"] == VERSION_USED_TEXT
+    assert NEEDS_SIGNATURE_LEAD not in result["message"]
     assert not (default_zotero / "extensions").exists()
+    # The same version cannot be signed again, so the install must not send the user to sign-plugin.
+    runner = FakeRunner()
+    assert _sign(source, state, runner=runner)["status"] == "refused_version_reused"
+    assert runner.calls == []
 
 
 def test_a_tampered_file_in_the_cli_says_so_and_closes_nothing(monkeypatch, capsys, default_zotero, source):
@@ -897,6 +1192,41 @@ def test_the_copy_reads_the_signed_file_exactly_once_and_writes_those_bytes(monk
     assert (default_zotero / "extensions" / XPI_NAME).read_bytes() == SIGNED_BYTES
 
 
+def test_install_into_profile_has_no_default_for_the_expected_hash(default_zotero, tmp_path):
+    xpi = tmp_path / "stand-in.xpi"
+    xpi.write_bytes(SIGNED_BYTES)
+    with pytest.raises(TypeError):
+        zpi.install_into_profile(default_zotero, xpi, running=lambda: False)
+    with pytest.raises(TypeError):
+        zpi.install_into_profile(default_zotero, xpi, lambda: False, hashlib.sha256(SIGNED_BYTES).hexdigest())
+    assert not (default_zotero / "extensions").exists()
+
+
+def test_every_production_install_passes_the_recorded_hash(monkeypatch, default_zotero, source):
+    state = zpi.signing_state_dir()
+    assert _sign(source, state)["status"] == "signed"
+    recorded = hashlib.sha256(SIGNED_BYTES).hexdigest()
+    given = []
+    real_install = zpi.install_into_profile
+
+    def _spy(profile_dir, xpi_path, **kwargs):
+        given.append(kwargs.get("expected_sha256"))
+        return real_install(profile_dir, xpi_path, **kwargs)
+
+    target = default_zotero / "extensions" / XPI_NAME
+    monkeypatch.setattr(zpi, "install_into_profile", _spy)
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
+    assert zpi.install_default_profile(running=lambda: False)["status"] == "installed"
+    target.unlink()
+    assert zpi.install_default_with_close(
+        {"autoinstall": False, "decided": True, "close_zotero_for_install": True},
+        close_zotero=False, running=lambda: False,
+    )["status"] == "installed"
+    target.unlink()
+    assert zpi.cli_main(["--profile", str(default_zotero)]) == 0
+    assert given == [recorded, recorded, recorded]
+
+
 # ---------------------------------------------------------------------------
 # Zip shape before storing: a signature entry under META-INF/ is required
 # ---------------------------------------------------------------------------
@@ -918,7 +1248,7 @@ def test_a_returned_zip_without_a_meta_inf_signature_is_refused_and_nothing_is_s
     out = _sign(source, state, runner=runner)
     assert out["status"] == "failed"
     assert out["message"] == UNSIGNED_ZIP_TEXT
-    assert _snapshot(state) == {}
+    _only_a_submitted_record(state)
 
 
 def test_a_signed_looking_zip_with_meta_inf_signature_entries_is_stored(source, state):
@@ -960,9 +1290,44 @@ def test_docs_name_the_only_forced_kill_and_say_it_touches_the_signing_child_onl
 
 def test_docs_promise_only_the_version_refusal_and_no_later_retry():
     docs = _docs()
-    assert "Bump the version in manifest.json, then sign again." in docs
+    assert "Bump the version in manifest.json to sign a new build." in docs
     assert "the next `sign-plugin` run signs the new source" not in docs
     assert "again later" not in docs
+
+
+def test_docs_drop_the_signed_once_claim_and_the_only_state_folder_claim_and_name_the_temp_and_npm_writes():
+    docs = _docs()
+    assert "A version is signed once" not in docs
+    assert "writes only into Meridian's own state folder" not in docs
+    assert "system temporary folder" in docs
+    assert "npm cache" in docs
+
+
+def test_docs_say_a_failed_or_timed_out_submission_uses_up_the_version_number():
+    docs = _docs()
+    assert "the version number is used up" in docs
+    assert "Bump the version in manifest.json to sign a new build." in docs
+
+
+def test_docs_name_the_zotero_minimum_and_keep_one_menu_note_for_zotero_10_0_6():
+    docs = _docs()
+    assert "Zotero 8 or later (the manifest's minimum)" in docs
+    assert "Zotero 8.0 or later" not in docs
+    assert docs.count("Zotero 10") == 1
+    assert "Zotero 10.0.6" in docs
+
+
+def test_docs_state_the_negative_timeout_form_and_the_process_tree_kill():
+    docs = _docs()
+    assert "--timeout-minutes=-5" in docs
+    assert "process tree" in docs
+    assert "only forced kill" in docs
+
+
+def test_the_bridge_readme_says_a_failed_submission_uses_up_the_version_number():
+    readme = (REPO_EXTENSION / "README.md").read_text(encoding="utf-8")
+    assert "the version number is used up" in readme
+    assert "Bump the version in manifest.json to sign a new build." in readme
 
 
 def test_docs_say_the_unsigned_build_writes_nothing_to_the_zotero_profile():

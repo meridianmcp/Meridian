@@ -3616,7 +3616,42 @@ def test_the_tray_says_a_tampered_stored_file_failed_its_integrity_check_and_clo
         zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("no close for a tampered file"),
     )
     text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
-    assert text == "The stored signed file failed its integrity check. Sign the plugin again."
+    assert text == "The stored signed file failed its integrity check. Bump the version in manifest.json to sign a new build."
+    assert not (profile / "extensions").exists()
+
+
+_VERSION_USED_TRAY_TEXT = (
+    "This plugin version was already submitted to Mozilla, and no verified signed file is stored for it. "
+    "Bump the version in manifest.json to sign a new build. Nothing was written."
+)
+_RECORD_UNREADABLE_TRAY_TEXT = (
+    "The signing record is unreadable, so nothing will be submitted. Check or remove state/signed.json, then try again."
+)
+
+
+@pytest.mark.parametrize(
+    ("state_status", "expected"),
+    [("used", _VERSION_USED_TRAY_TEXT), ("unreadable", _RECORD_UNREADABLE_TRAY_TEXT)],
+    ids=["version_used", "record_unreadable"],
+)
+def test_the_tray_says_a_used_version_or_an_unreadable_record_and_closes_nothing(
+    monkeypatch, tmp_path, state_status, expected,
+):
+    from meridian import zotero_plugin_sign as sign
+
+    profile = tmp_path / "Zotero" / "Profiles" / f"{state_status}.default"
+    profile.mkdir(parents=True)
+    (profile / "prefs.js").write_text('user_pref("keep", true);\n', encoding="utf-8")
+    monkeypatch.setattr(zpi, "find_default_profile_dir", lambda data_dir: profile)
+    monkeypatch.setattr(
+        zpi, "signed_install_state", lambda source_dir=None: sign.StoredSigned(status=state_status),
+    )
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(
+        zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("no close for a refused install"),
+    )
+    text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
+    assert text == expected
     assert not (profile / "extensions").exists()
 
 

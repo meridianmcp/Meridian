@@ -190,8 +190,9 @@ def _autoinstall_zotero_plugin():
             _log.info("zotero plugin autoinstall: the stored signed file failed its integrity check; skipped")
             return None
         if not stored.signed:
-            # Nothing is signed for this plugin version yet. Launching Zotero goes on; signing is a separate CLI step.
-            _log.info("zotero plugin autoinstall: this plugin version is not signed yet; skipped")
+            # Not signed, or no signed file can be used for it (submitted without one, or an unreadable record).
+            # Launching Zotero goes on; signing is a separate CLI step.
+            _log.info("zotero plugin autoinstall: not signed, or no usable signed file; skipped")
             return None
         result = _zotero_plugin.install_into_profile(profile, stored.path, expected_sha256=stored.sha256)
         _log.info("zotero plugin autoinstall: %s", result["status"])

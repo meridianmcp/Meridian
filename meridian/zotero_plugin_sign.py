@@ -6,21 +6,24 @@ version, outside the install path:
 * ``stage_for_signing`` copies the files ``build_xpi`` packs into a scratch folder, with the same excludes
   and LF line endings, and adds ``browser_specific_settings.gecko.id`` to the STAGED manifest only. The
   shipped ``extensions/zotero-bridge/manifest.json`` is never changed.
-* ``sign_plugin`` reads the bundle once and captures its version and source fingerprint BEFORE it runs
+* ``sign_plugin`` reads the bundle once and captures its version and source fingerprint. It writes a record
+  with status ``submitted`` for that version into ``<state_dir>/signed.json`` BEFORE it runs
   ``web-ext sign --channel unlisted`` (pinned to ``WEB_EXT_PACKAGE``). The API key and secret go into the
   environment of that one call. They are never on the command line, never written to a file, and never
   returned. Afterwards it recomputes the fingerprint: a source that changed during the wait stores nothing.
   A zero exit with exactly one zip .xpi that has a signature under META-INF/ is stored as
-  ``<state_dir>/signed/<addon-id>-<version>.xpi``, with the captured version and fingerprint recorded in
-  ``<state_dir>/signed.json``.
-* A version that already has a record for a different source is refused before any upload. Bump the
-  version in ``manifest.json`` to sign new source.
-* ``stored_signed_artifact`` says whether the stored file is signed, missing, or tampered. The install path
-  uses it, and it never calls ``sign_plugin``.
+  ``<state_dir>/signed/<addon-id>-<version>.xpi``, and that version's record becomes ``signed``.
+* One submission per version, ever. Any record for a version, in any status and for any source, refuses a
+  new submission of that version. A failed, timed-out or source-changed run keeps its ``submitted`` record,
+  because Mozilla may already hold the version. Bump the version in ``manifest.json`` to sign new source.
+* ``stored_signed_artifact`` says whether the stored file is signed, missing, tampered, used up (submitted
+  but not signed), or unreadable. The install path uses it, and it never calls ``sign_plugin``.
+* A record file that is unreadable or has the wrong shape is refused. It is never treated as empty.
 
 Signing is the CLI step ``python -m meridian zotero sign-plugin``. It never closes Zotero and it never runs
 during an install. The state folder is per user, so a build signed from a source checkout is also the one
-the packaged tray app installs.
+the packaged tray app installs. The staged copy and the artifacts live in a folder under the system
+temporary folder. npm and npx write their own files to the npm cache.
 
 The only forced kill in this path is the one that ends the signing child's own process tree when web-ext
 does not finish in time. It never touches Zotero or any other process.
@@ -62,9 +65,15 @@ DEFAULT_TIMEOUT_S = 3600.0
 MAX_TIMEOUT_MINUTES = 1440.0
 SIGNED_DIRNAME = "signed"
 RECORD_FILENAME = "signed.json"
+# Record statuses. A record with no status field is an older signed record, so it reads as signed.
+RECORD_SUBMITTED = "submitted"
+RECORD_SIGNED = "signed"
+# Stored-artifact statuses (StoredSigned.status).
 SIGNED_STATUS = "signed"
 MISSING_STATUS = "missing"
 TAMPERED_STATUS = "tampered"
+USED_STATUS = "used"
+UNREADABLE_STATUS = "unreadable"
 _WALL_CLOCK_GRACE_S = 60.0
 _KILL_WAIT_S = 10.0
 _TASKKILL_TIMEOUT_S = 30.0
@@ -85,24 +94,45 @@ RANGE_MESSAGE = (
 )
 TIMEOUT_MESSAGE = (
     "Mozilla did not return a signed file in time. Check this version's page in the developer hub. "
+    "Mozilla may still have received this version, so bump the version in manifest.json to sign a new build. "
     "Nothing was stored."
 )
-SOURCE_CHANGED_MESSAGE = "The plugin source changed while Mozilla was signing it. Run sign-plugin again."
-REUSED_VERSION_MESSAGE = (
-    "This version was already submitted with different source. Bump the version in manifest.json, then sign again."
+SOURCE_CHANGED_MESSAGE = (
+    "The plugin source changed while Mozilla was signing it, so nothing was stored. Mozilla may have received "
+    "this version, so bump the version in manifest.json to sign a new build."
 )
+REUSED_VERSION_MESSAGE = (
+    "This version has already been submitted to Mozilla. Bump the version in manifest.json to sign a new build."
+)
+# The same sentence the install shows for a version that is used up, so both paths give one instruction.
+RECORD_UNREADABLE_MESSAGE = plugin.RECORD_UNREADABLE_MESSAGE
 UNSIGNED_ZIP_MESSAGE = (
     "Mozilla signing finished, but the file it returned has no signature in META-INF/ (.rsa or .sf). "
-    "Nothing was stored."
+    "Nothing was stored. Mozilla may have received this version, so bump the version in manifest.json to sign a "
+    "new build."
 )
 _FAILED_TEMPLATE = (
-    "Mozilla signing did not complete (web-ext exit code: {code}). Nothing was stored. "
-    "Check your network connection and the API key pair, then run this command again."
+    "Mozilla signing did not complete (web-ext exit code: {code}). Nothing was stored. Mozilla may have received "
+    "this version, so bump the version in manifest.json to sign a new build."
 )
-_NOT_ONE_XPI_MESSAGE = "Mozilla signing finished, but it did not produce exactly one signed .xpi. Nothing was stored."
+_NOT_ONE_XPI_MESSAGE = (
+    "Mozilla signing finished, but it did not produce exactly one signed .xpi. Nothing was stored. Mozilla may have "
+    "received this version, so bump the version in manifest.json to sign a new build."
+)
 _STAGING_FAILED_MESSAGE = "The plugin bundle could not be prepared for signing. Nothing was signed or uploaded."
 _BUNDLE_UNREADABLE_MESSAGE = "The plugin bundle's manifest could not be read. Nothing was signed or uploaded."
-_STORE_FAILED_MESSAGE = "The signed file could not be stored, so nothing was recorded."
+_STORE_FAILED_MESSAGE = (
+    "The signed file could not be stored, so nothing was recorded. Mozilla may have signed this version, so bump "
+    "the version in manifest.json to sign a new build."
+)
+_SCRATCH_FAILED_MESSAGE = "The temporary folder for signing could not be created. Nothing was signed or uploaded."
+_SUBMIT_RECORD_FAILED_MESSAGE = "The signing record could not be written, so nothing was submitted to Mozilla."
+_UNSAFE_PATH_MESSAGE = (
+    "The temporary folder path contains characters that the signing tool cannot take safely. Set TEMP to a folder "
+    "path without those characters, then try again."
+)
+# Characters that cmd.exe reads specially. The web-ext .cmd shim runs through it, so none may reach the argv.
+_UNSAFE_PATH_CHARS = frozenset('&^%!"<>|')
 
 
 @dataclass(frozen=True)
@@ -115,7 +145,14 @@ class SignRunResult:
 
 @dataclass(frozen=True)
 class StoredSigned:
-    """What is stored for one plugin version: ``signed`` (record and file match), ``missing``, or ``tampered``.
+    """What is stored for one plugin version.
+
+    * ``signed``: a signed record for this source matches the file's sha256.
+    * ``missing``: no record exists for this version, so it can be signed.
+    * ``used``: a record exists for this version, but no signed file matches this source. Mozilla may hold the
+      version, so it is never signed again.
+    * ``tampered``: a signed record for this source matches, but its file is changed or cannot be read.
+    * ``unreadable``: the record file cannot be read or has the wrong shape.
 
     ``path`` and ``sha256`` are set only when the status is ``signed``. ``sha256`` is the recorded hash, which the
     copy into a profile checks the bytes against.
@@ -251,6 +288,11 @@ def sign_argv(staged_dir: "Path | str", artifacts_dir: "Path | str", timeout_s: 
     ]
 
 
+def _unsafe_for_argv(path: "Path | str") -> bool:
+    """True when a path holds a character cmd.exe reads specially (see ``_UNSAFE_PATH_CHARS``). Never raises."""
+    return any(char in _UNSAFE_PATH_CHARS for char in str(path))
+
+
 # ---------------------------------------------------------------------------
 # The stored signed artifact and its record
 # ---------------------------------------------------------------------------
@@ -264,16 +306,53 @@ def _sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _read_records(state_dir: "Path | str") -> list[dict[str, Any]]:
-    """The records in ``signed.json``. A missing, unreadable or wrong-shape file has none. Never raises."""
+def _timestamp(now: float) -> str:
+    return datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_for(record: "dict[str, Any]", version: str) -> bool:
+    return record.get("addon_id") == PLUGIN_ADDON_ID and record.get("version") == version
+
+
+def _record_status(record: "dict[str, Any]") -> str:
+    return str(record.get("status", RECORD_SIGNED))
+
+
+def _valid_record(record: Any) -> bool:
+    """True when one record has a shape this module writes. Never raises."""
+    if not isinstance(record, dict):
+        return False
+    if not isinstance(record.get("addon_id"), str) or not isinstance(record.get("version"), str):
+        return False
+    if not isinstance(record.get("source_sha256"), str):
+        return False
+    status = record.get("status", RECORD_SIGNED)
+    if status == RECORD_SUBMITTED:
+        return isinstance(record.get("submitted_at"), str)
+    if status == RECORD_SIGNED:
+        return isinstance(record.get("sha256"), str) and isinstance(record.get("signed_at"), str)
+    return False
+
+
+def _load_records(state_dir: "Path | str") -> "list[dict[str, Any]] | None":
+    """The records in ``signed.json``: ``[]`` when there is no file, or None when it is unreadable or wrong-shaped.
+
+    None is never treated as empty: every caller refuses on it. Never raises.
+    """
     try:
-        payload = json.loads((Path(state_dir) / RECORD_FILENAME).read_text(encoding="utf-8"))
+        text = (Path(state_dir) / RECORD_FILENAME).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
     except (OSError, ValueError):
-        return []
+        return None
+    try:
+        payload = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
     records = payload.get("records") if isinstance(payload, dict) else None
-    if not isinstance(records, list):
-        return []
-    return [record for record in records if isinstance(record, dict)]
+    if not isinstance(records, list) or not all(_valid_record(record) for record in records):
+        return None
+    return records
 
 
 def stored_signed_artifact(
@@ -281,24 +360,27 @@ def stored_signed_artifact(
 ) -> StoredSigned:
     """What is stored for ``version``, and for ``source_sha256`` when given. Never raises.
 
-    ``missing``: no record matches (or the record's file is gone). ``tampered``: a record matches and the file is
-    there, but its sha256 is not the recorded one, or it cannot be read. ``signed``: the file's sha256 matches.
+    The statuses are described on :class:`StoredSigned`. A version that has any record is never ``missing``, so a
+    version Mozilla may already hold can never be treated as a fresh one.
     """
     try:
         if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
             return StoredSigned(status=MISSING_STATUS)
-        matches = [
-            record for record in _read_records(state_dir)
-            if record.get("addon_id") == PLUGIN_ADDON_ID
-            and record.get("version") == version
+        records = _load_records(state_dir)
+        if records is None:
+            return StoredSigned(status=UNREADABLE_STATUS)
+        mine = [record for record in records if _is_for(record, version)]
+        if not mine:
+            return StoredSigned(status=MISSING_STATUS)
+        signed = [
+            record for record in mine
+            if _record_status(record) == RECORD_SIGNED
             and (source_sha256 is None or record.get("source_sha256") == source_sha256)
         ]
-        if not matches:
-            return StoredSigned(status=MISSING_STATUS)
         target = _signed_path(state_dir, version)
-        if not target.is_file():
-            return StoredSigned(status=MISSING_STATUS)
-        recorded = matches[-1].get("sha256")
+        if not signed or not target.is_file():
+            return StoredSigned(status=USED_STATUS)
+        recorded = signed[-1].get("sha256")
         try:
             actual = _sha256_of(target)
         except OSError:
@@ -307,7 +389,7 @@ def stored_signed_artifact(
             return StoredSigned(status=TAMPERED_STATUS)
         return StoredSigned(status=SIGNED_STATUS, path=target, sha256=recorded)
     except (OSError, ValueError, TypeError):
-        return StoredSigned(status=MISSING_STATUS)
+        return StoredSigned(status=UNREADABLE_STATUS)
 
 
 def signed_artifact_for_version(
@@ -318,14 +400,35 @@ def signed_artifact_for_version(
     return stored.path if stored.signed else None
 
 
-def _conflicting_record(state_dir: "Path | str", version: str, source_sha256: str) -> bool:
-    """True when a record for ``version`` holds a different source fingerprint. Never raises."""
-    return any(
-        record.get("addon_id") == PLUGIN_ADDON_ID
-        and record.get("version") == version
-        and record.get("source_sha256") != source_sha256
-        for record in _read_records(state_dir)
-    )
+def _replace_record(state: Path, version: str, entry: "dict[str, Any]") -> None:
+    """Write ``entry`` in place of any record for ``version``.
+
+    Raises ValueError rather than overwrite a record file it cannot read.
+    """
+    records = _load_records(state)
+    if records is None:
+        raise ValueError(RECORD_UNREADABLE_MESSAGE)
+    kept = [record for record in records if not _is_for(record, version)]
+    kept.append(entry)
+    text = json.dumps({"records": kept}, indent=2, sort_keys=True) + "\n"
+    plugin._atomic_write_bytes(state / RECORD_FILENAME, text.encode("utf-8"))
+
+
+def record_submission(
+    state_dir: "Path | str", version: str, source_sha256: str, *, clock: "Callable[[], float] | None" = None,
+) -> None:
+    """Write the ``submitted`` record for ``version``.
+
+    ``sign_plugin`` calls it before web-ext runs, so every run leaves one.
+    """
+    now = (clock if clock is not None else time.time)()
+    _replace_record(Path(state_dir), version, {
+        "addon_id": PLUGIN_ADDON_ID,
+        "version": version,
+        "status": RECORD_SUBMITTED,
+        "source_sha256": source_sha256,
+        "submitted_at": _timestamp(now),
+    })
 
 
 def record_signed_artifact(
@@ -333,12 +436,12 @@ def record_signed_artifact(
     version: "str | None" = None, source_sha256: "str | None" = None,
     clock: "Callable[[], float] | None" = None,
 ) -> Path:
-    """Store ``signed_file`` for ``version``, and record it. Returns the stored path.
+    """Store ``signed_file`` for ``version``, and mark that version ``signed``. Returns the stored path.
 
     ``version`` and ``source_sha256`` are the values captured before signing. When they are not given, they are
-    read from ``source_dir``. The file is written first and the record second, so a record never points at a
-    file that was not written. A record replaces any earlier record for the same version. The key and the
-    secret are never stored.
+    read from ``source_dir``. The record file is checked first, then the signed file is written, and then the
+    record replaces the version's ``submitted`` record. So a record never points at a file that was not written,
+    and an unreadable record file is never overwritten. The key and the secret are never stored.
     """
     state = Path(state_dir)
     if version is None:
@@ -346,23 +449,19 @@ def record_signed_artifact(
     if source_sha256 is None:
         source_sha256 = source_fingerprint(source_dir)
     payload = Path(signed_file).read_bytes()
+    if _load_records(state) is None:
+        raise ValueError(RECORD_UNREADABLE_MESSAGE)
     target = _signed_path(state, version)
     plugin._atomic_write_bytes(target, payload)
     now = (clock if clock is not None else time.time)()
-    entry = {
+    _replace_record(state, version, {
         "addon_id": PLUGIN_ADDON_ID,
         "version": version,
-        "signed_at": datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "status": RECORD_SIGNED,
+        "signed_at": _timestamp(now),
         "sha256": hashlib.sha256(payload).hexdigest(),
         "source_sha256": source_sha256,
-    }
-    kept = [
-        record for record in _read_records(state)
-        if not (record.get("addon_id") == PLUGIN_ADDON_ID and record.get("version") == version)
-    ]
-    kept.append(entry)
-    text = json.dumps({"records": kept}, indent=2, sort_keys=True) + "\n"
-    plugin._atomic_write_bytes(state / RECORD_FILENAME, text.encode("utf-8"))
+    })
     return target
 
 
@@ -449,15 +548,18 @@ def _run_web_ext(argv: list[str], env: Mapping[str, str], *, timeout_s: float, c
             stdout_path = Path(logs) / "stdout.txt"
             stderr_path = Path(logs) / "stderr.txt"
             with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
-                process = subprocess.Popen(
-                    [npx, *argv[1:]],
-                    env=dict(env),
-                    cwd=str(cwd),
-                    stdin=subprocess.DEVNULL,
-                    stdout=out,
-                    stderr=err,
-                    **kwargs,
-                )
+                try:
+                    process = subprocess.Popen(
+                        [npx, *argv[1:]],
+                        env=dict(env),
+                        cwd=str(cwd),
+                        stdin=subprocess.DEVNULL,
+                        stdout=out,
+                        stderr=err,
+                        **kwargs,
+                    )
+                except Exception:  # noqa: BLE001 -- a start that raises is a failed run; its detail is never kept
+                    return SignRunResult(returncode=None)
                 try:
                     returncode = process.wait(timeout=float(timeout_s) + _WALL_CLOCK_GRACE_S)
                 except subprocess.TimeoutExpired:
@@ -496,10 +598,12 @@ def sign_plugin(
 ) -> dict[str, Any]:
     """Sign the bundle's current version and store the result. Never raises.
 
-    Returns ``status`` as one of ``already_signed`` (a matching stored file exists, so no runner call),
-    ``refused_version_reused`` (a record for this version has a different source, so no runner call),
+    Returns ``status`` as one of ``already_signed`` (a matching signed file is stored, so no runner call),
+    ``refused_version_reused`` (this version was already submitted to Mozilla, for any source, so no runner call),
+    ``refused_unreadable_record`` (the record file cannot be read or has the wrong shape, so no runner call),
     ``no_credentials`` (either variable is missing or empty, so no runner call), ``signed``, ``timeout`` or
-    ``failed``. A failed, timed-out, changed-source, or unusable result stores nothing. ``runner`` is called as
+    ``failed``. Before web-ext runs, the version's ``submitted`` record is written, and it stays whatever the
+    outcome. Only a verified signed file replaces it with a ``signed`` record. ``runner`` is called as
     ``runner(argv, env, timeout_s=..., cwd=...)`` and defaults to running ``npx``.
     """
     state = Path(state_dir)
@@ -512,24 +616,37 @@ def sign_plugin(
         fingerprint = _fingerprint_of(snapshot)
     except (OSError, ValueError, TypeError):
         return _outcome("failed", message=_BUNDLE_UNREADABLE_MESSAGE)
-    existing = signed_artifact_for_version(state, version, source_sha256=fingerprint)
-    if existing is not None:
-        return _outcome("already_signed", version=version, path=existing)
-    if _conflicting_record(state, version, fingerprint):
+    stored = stored_signed_artifact(state, version, source_sha256=fingerprint)
+    if stored.status == UNREADABLE_STATUS:
+        return _outcome("refused_unreadable_record", version=version, message=RECORD_UNREADABLE_MESSAGE)
+    if stored.signed:
+        return _outcome("already_signed", version=version, path=stored.path)
+    if stored.status != MISSING_STATUS:
         return _outcome("refused_version_reused", version=version, message=REUSED_VERSION_MESSAGE)
     creds = _credentials(env)
     if creds is None:
         return _outcome("no_credentials", version=version, message=NO_CREDENTIALS_MESSAGE)
     run = runner if runner is not None else _run_web_ext
-    with tempfile.TemporaryDirectory(prefix="meridian-zotero-sign-", ignore_cleanup_errors=True) as scratch:
+    try:
+        scratch_root = tempfile.TemporaryDirectory(prefix="meridian-zotero-sign-", ignore_cleanup_errors=True)
+    except OSError:
+        return _outcome("failed", version=version, message=_SCRATCH_FAILED_MESSAGE)
+    with scratch_root as scratch:
         scratch_dir = Path(scratch)
         artifacts = scratch_dir / "artifacts"
+        staged_dir = scratch_dir / "staged"
+        if any(_unsafe_for_argv(path) for path in (scratch_dir, staged_dir, artifacts)):
+            return _outcome("failed", version=version, message=_UNSAFE_PATH_MESSAGE)
         try:
-            staged = _stage_snapshot(snapshot, scratch_dir / "staged")
+            staged = _stage_snapshot(snapshot, staged_dir)
             artifacts.mkdir()
             argv = sign_argv(staged, artifacts, timeout_s)
         except (OSError, ValueError, TypeError, OverflowError):
             return _outcome("failed", version=version, message=_STAGING_FAILED_MESSAGE)
+        try:
+            record_submission(state, version, fingerprint, clock=clock)
+        except (OSError, ValueError, TypeError):
+            return _outcome("failed", version=version, message=_SUBMIT_RECORD_FAILED_MESSAGE)
         try:
             result = run(argv, _child_env(env, *creds), timeout_s=timeout_s, cwd=scratch_dir)
         except Exception:  # noqa: BLE001 -- a runner that raises is a failed signing, never a crash
@@ -547,12 +664,12 @@ def sign_plugin(
         if not _has_signature_entries(produced[0]):
             return _outcome("failed", version=version, message=UNSIGNED_ZIP_MESSAGE)
         try:
-            stored = record_signed_artifact(
+            stored_path = record_signed_artifact(
                 state, produced[0], version=version, source_sha256=fingerprint, clock=clock,
             )
         except (OSError, ValueError, TypeError):
             return _outcome("failed", version=version, message=_STORE_FAILED_MESSAGE)
-    return _outcome("signed", version=version, path=stored)
+    return _outcome("signed", version=version, path=stored_path)
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +708,10 @@ def _dry_run() -> int:
         stored_text = f"yes ({stored.path})"
     elif stored.tampered:
         stored_text = "no (the stored file failed its integrity check)"
+    elif stored.status == USED_STATUS:
+        stored_text = "no (this version was already submitted to Mozilla, so sign-plugin will refuse it)"
+    elif stored.status == UNREADABLE_STATUS:
+        stored_text = "no (the signing record is unreadable)"
     else:
         stored_text = "no"
     print(f"Signed artifact stored: {stored_text}")
