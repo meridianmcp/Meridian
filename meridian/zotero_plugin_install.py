@@ -11,15 +11,20 @@
   profile in any of these cases. It skips the write when the bytes already match. It never touches
   ``extensions.json``, ``prefs.js`` or any other profile file.
   ``install_default_profile`` runs that install for the default profile named in
-  ``profiles.ini``, for the packaged tray's install. It never raises.
+  ``profiles.ini``, with no close step. It never raises.
 * ``close_zotero_gracefully`` asks a running Zotero to close with
   ``taskkill /IM zotero.exe`` (never ``/F`` or ``/T``) and waits for it to stop.
-  It never kills anything, and a close that fails leaves Zotero as it was.
+  The taskkill argument list has no force flag, and a close that fails leaves
+  Zotero as it was.
+* ``install_default_with_close`` is the tray's install. It finds the default
+  profile and builds the bundle first, in the same order as the CLI, and only
+  then calls ``install_with_close``. A missing profile or a bundle that will not
+  build is refused before anything closes.
 * ``install_with_close`` is the install the tray and the CLI use. It closes
-  Zotero first when the saved ``close_zotero_for_install`` choice (or the
-  ``MERIDIAN_ZOTERO_CLOSE_ON_INSTALL`` override) allows it, installs, and then
-  restarts Zotero, best effort, only when Meridian closed it. If Zotero does not
-  close, nothing is installed.
+  Zotero first when the saved ``close_zotero_for_install`` choice allows it.
+  ``MERIDIAN_ZOTERO_CLOSE_ON_INSTALL`` can only turn that off, never on. It then
+  installs and restarts Zotero, best effort, only when Meridian closed it. If the
+  process check fails, or Zotero does not close, nothing is installed.
 * The settings file ``zotero_plugin.json`` (in the per-user Meridian state dir,
   next to the tray's other settings) holds the user's choice. Auto-install is
   opt-in: it is off until the first-run prompt records an answer. An unreadable
@@ -85,7 +90,7 @@ _NOT_PROFILE_MESSAGE = (
 _CHECK_FAILED_MESSAGE = "Could not check whether Zotero is running. Nothing was written."
 REFUSED_RUNNING_MESSAGE = "Zotero is running. Close Zotero, then run this command again. Nothing was written."
 CLOSE_FAILED_MESSAGE = (
-    "Zotero did not close, so nothing was installed. Close Zotero yourself, then run Install again. "
+    "Zotero did not close, so nothing was installed. Close Zotero yourself, then try the install again. "
     "Nothing was written."
 )
 _CLOSE_POLL_SECONDS = 0.5
@@ -501,24 +506,38 @@ def install_into_profile(
         return _result("failed", None, error=str(exc))
 
 
+def _prepare_default_install() -> "tuple[Path, Path] | dict[str, Any]":
+    """The default profile and the built bundle, resolved before anything is closed. Never raises.
+
+    Returns ``(profile, xpi)`` when both are ready. Otherwise it returns the refusal to hand back
+    unchanged: ``no_profile`` when there is no default profile, or ``failed`` when the bundle will
+    not build. The bundle is written into Meridian's own state folder, never into Zotero.
+    """
+    try:
+        profile = find_default_profile_dir(zotero_data_dir())
+        if profile is None:
+            return _result("no_profile", None)
+        return profile, build_xpi(default_xpi_path())
+    except Exception as exc:  # noqa: BLE001 -- report every failure as data, never raise
+        return _result("failed", None, error=str(exc))
+
+
 def install_default_profile(*, running: "Callable[[], bool] | None" = None) -> dict[str, Any]:
-    """Install the bundled plugin into Zotero's default profile. Never raises.
+    """Install the bundled plugin into Zotero's default profile, with no close step. Never raises.
 
     The profile is the one ``profiles.ini`` marks as default, under
     ``zotero_data_dir()``. The Zotero profile is left alone when there is no
     default profile, while Zotero runs, or when the process check fails. The
     bundled .xpi is rebuilt into Meridian's own state folder first, which is not
     part of Zotero. A failure anywhere else, including the bundle not building,
-    is reported as ``failed``.
+    is reported as ``failed``. The tray closes a running Zotero through
+    :func:`install_default_with_close` instead.
     """
-    try:
-        profile = find_default_profile_dir(zotero_data_dir())
-        if profile is None:
-            return _result("no_profile", None)
-        xpi = build_xpi(default_xpi_path())
-        return install_into_profile(profile, xpi, running=running)
-    except Exception as exc:  # noqa: BLE001 -- report every failure as data, never raise
-        return _result("failed", None, error=str(exc))
+    prepared = _prepare_default_install()
+    if isinstance(prepared, dict):
+        return prepared
+    profile, xpi = prepared
+    return install_into_profile(profile, xpi, running=running)
 
 
 # ---------------------------------------------------------------------------
@@ -567,20 +586,23 @@ def _refusal_result(status: str, message: str) -> dict[str, Any]:
 def install_with_close(
     settings: "Mapping[str, Any] | None",
     *,
+    install: "Callable[[], Mapping[str, Any]]",
     close_zotero: "bool | None" = None,
     running: "Callable[[], bool | None] | None" = None,
     close: "Callable[..., str] | None" = None,
-    install: "Callable[[], Mapping[str, Any]] | None" = None,
     restart: "Callable[[], Any] | None" = None,
     env: "Mapping[str, str] | None" = None,
 ) -> dict[str, Any]:
     """Install the plugin, closing Zotero first when the choice allows it. Never raises.
 
-    ``close_zotero=None`` follows the saved choice and ``MERIDIAN_ZOTERO_CLOSE_ON_INSTALL``.
-    An explicit bool wins over both: the CLI's ``--keep-zotero-open`` passes False.
+    ``install`` writes the plugin and is supplied by the caller, who resolves the profile and the
+    bundle before this runs. So no profile lookup or build happens after a close.
 
-    * Zotero not running (or the check failed): install as usual. Nothing is
-      closed or started.
+    ``close_zotero=None`` follows the saved choice, and ``MERIDIAN_ZOTERO_CLOSE_ON_INSTALL`` can
+    turn that off. An explicit bool wins over both: the CLI's ``--keep-zotero-open`` passes False.
+
+    * The process check fails: ``check_failed``. Nothing is closed, and ``install`` is not called.
+    * Zotero not running: install as usual. Nothing is closed or started.
     * Zotero running and closing off, or closing unsupported: ``refused_running``.
       Nothing is closed.
     * Zotero running and closing on: :func:`close_zotero_gracefully` runs.
@@ -590,15 +612,17 @@ def install_with_close(
     The result always carries ``status``, ``path``, ``closed_zotero`` (True only
     when Meridian closed Zotero in this run) and ``restart`` (the launcher's action,
     ``error``, or None when no restart was attempted). ``message`` is set for
-    ``refused_running`` and ``close_failed``.
+    ``check_failed``, ``refused_running`` and ``close_failed``.
     """
     want_close = close_zotero if close_zotero is not None else effective_close_zotero(settings, env)
     check = running if running is not None else zotero_process_state
-    run_install = install if install is not None else install_default_profile
     close_step = close if close is not None else close_zotero_gracefully
-    if _safe_state(check) is not True:
-        # Not running, or the check failed. The install itself refuses on a failed check and writes nothing.
-        return _install_outcome(run_install, closed=False)
+    start = _safe_state(check)
+    if start is None:
+        # The state of Zotero is unknown. Refuse here, so that neither the close nor the install runs.
+        return _refusal_result("check_failed", _CHECK_FAILED_MESSAGE)
+    if start is False:
+        return _install_outcome(install, closed=False)
     if not want_close:
         return _refusal_result("refused_running", REFUSED_RUNNING_MESSAGE)
     try:
@@ -611,10 +635,40 @@ def install_with_close(
         return _refusal_result("refused_running", REFUSED_RUNNING_MESSAGE)
     if outcome != "closed":
         # "not_running": Zotero stopped between the two checks. Meridian closed nothing, so nothing restarts.
-        return _install_outcome(run_install, closed=False)
-    result = _install_outcome(run_install, closed=True)
+        return _install_outcome(install, closed=False)
+    result = _install_outcome(install, closed=True)
     result["restart"] = _restart_after_close(restart)
     return result
+
+
+def install_default_with_close(
+    settings: "Mapping[str, Any] | None",
+    *,
+    close_zotero: "bool | None" = None,
+    running: "Callable[[], bool | None] | None" = None,
+    close: "Callable[..., str] | None" = None,
+    restart: "Callable[[], Any] | None" = None,
+    env: "Mapping[str, str] | None" = None,
+) -> dict[str, Any]:
+    """The tray's install: the default profile and the bundle first, then :func:`install_with_close`. Never raises.
+
+    The profile is found and the bundle is built before anything closes, as the CLI does it. A missing
+    default profile, or a bundle that will not build, is refused and Zotero is left alone.
+    """
+    prepared = _prepare_default_install()
+    if isinstance(prepared, dict):
+        return {**prepared, "closed_zotero": False, "restart": None}
+    profile, xpi = prepared
+    check = running if running is not None else zotero_process_state
+    return install_with_close(
+        settings,
+        install=lambda: install_into_profile(profile, xpi, running=check),
+        close_zotero=close_zotero,
+        running=check,
+        close=close,
+        restart=restart,
+        env=env,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -732,21 +786,24 @@ def effective_autoinstall(settings: "Mapping[str, Any] | None", env: "Mapping[st
     return current["autoinstall"] if override is None else override
 
 
+def close_zotero_env_disables(env: "Mapping[str, str] | None" = None) -> bool:
+    """True when CLOSE_ENV holds a recognised off value. That is the only thing CLOSE_ENV can do."""
+    return close_zotero_env_override(env) is False
+
+
 def effective_close_zotero(settings: "Mapping[str, Any] | None", env: "Mapping[str, str] | None" = None) -> bool:
-    """Whether an install may close a running Zotero. A recognised CLOSE_ENV value beats the saved choice."""
-    override = close_zotero_env_override(env)
-    return saved_close_zotero(settings) if override is None else override
+    """Whether an install may close a running Zotero: the saved choice, which CLOSE_ENV can only turn off.
+
+    A recognised on value (1, true, yes, on) changes nothing, because closing never turns on against a saved off.
+    """
+    if close_zotero_env_disables(env):
+        return False
+    return saved_close_zotero(settings)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-_CLI_CLOSE_FAILED_MESSAGE = (
-    "Zotero did not close, so nothing was installed. Close Zotero yourself, then run this command again. "
-    "Nothing was written."
-)
-
 
 def _print_manual_steps(xpi: Path) -> None:
     for line in _MANUAL_STEPS:
@@ -754,10 +811,10 @@ def _print_manual_steps(xpi: Path) -> None:
 
 
 def _restart_sentence(restart: Any) -> str:
-    """What happened to a Zotero that Meridian closed, and what the user does next."""
+    """What happened to the Zotero that Meridian closed for this run. Printed after every outcome that closed it."""
     if restart in ("started", "already_running"):
-        return "Meridian closed Zotero to install the plugin, and restarted it."
-    return "Meridian closed Zotero to install the plugin, but could not restart it. Start Zotero yourself."
+        return "Meridian closed Zotero and restarted it."
+    return "Meridian closed Zotero, but could not restart it. Start Zotero yourself."
 
 
 def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -> int:
@@ -776,7 +833,7 @@ def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -
         print(result.get("message", REFUSED_RUNNING_MESSAGE))
         return 1
     if status == "close_failed":
-        print(_CLI_CLOSE_FAILED_MESSAGE)
+        print(CLOSE_FAILED_MESSAGE)
         return 1
     if status == "check_failed":
         print(
