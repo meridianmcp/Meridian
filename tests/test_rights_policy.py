@@ -8,13 +8,26 @@ from __future__ import annotations
 
 import ast
 import json
+import uuid
 from pathlib import Path
 
 import pytest
 
+import meridian.server  # noqa: F401 — must be imported before handler to avoid cycle
 from meridian import db as db_module
 from meridian import gate_override
+from meridian import rights_override as rights_override_module
 from meridian import rights_policy as rp
+from meridian.mcp import handler as mh
+from meridian.mcp.handlers import project_tools as pt_mod
+from meridian.mcp_tools import (
+    _DESTRUCTIVE_TOOLS,
+    _MCP_TOOLS_LIST,
+    _READ_ONLY_TOOLS,
+    _TOOL_CATEGORY,
+    _TOOL_EXAMPLES,
+    _TOOL_WORKFLOW_TIER,
+)
 from meridian.rights_override import authorize_image_storage, request_rights_override
 from meridian.rights_policy import (
     COMMERCIALIZED,
@@ -793,3 +806,182 @@ async def test_a_failed_audit_write_blocks_the_override(db, monkeypatch):
         await authorize_image_storage(
             db, pid, "CC BY-NC 4.0", subject_id="fig-3", hitl_id=hitl["id"], reason=_REASON,
         )
+
+
+# ---------------------------------------------------------------------------
+# MCP tool: check_image_rights (read-only preview; never grants an override)
+# ---------------------------------------------------------------------------
+
+_CHECK_DATA_DIR = "meridian-test-data"
+_UNKNOWN_LICENSES = [
+    None,
+    "",
+    "   ",
+    "Some Unknown License 9.9",
+    "https://example.com/licenses/by/4.0/",
+]
+
+
+async def _mode_project(db, mode: str) -> str:
+    """A project with a unique name whose stored use mode is ``mode``."""
+    project = await db_module.create_project(db, f"rights-check-{uuid.uuid4().hex[:10]}")
+    if mode == COMMERCIALIZED:
+        await db_module.set_project_use_mode(db, project["id"], COMMERCIALIZED, actor="test-human")
+    return project["id"]
+
+
+async def _check(db, args: dict):
+    return await mh._handle_project_tools(
+        "check_image_rights", args, db, _CHECK_DATA_DIR, None, None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_reports_tier_flags_mode_and_no_override_in_standard_use(db):
+    pid = await _mode_project(db, STANDARD_PUBLICATION)
+    result = await _check(db, {"project_id": pid, "license": "CC BY-NC 4.0"})
+    assert "error" not in result
+    assert result["use_mode"] == STANDARD_PUBLICATION
+    assert result["license"] == "cc-by-nc"
+    assert result["tier"] == LINK_ONLY
+    assert "requires_credit" in result["flags"]
+    assert "needs_review" in result["flags"]
+    assert result["override_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_check_says_a_human_override_is_needed_for_link_only_in_commercialized_use(db):
+    pid = await _mode_project(db, COMMERCIALIZED)
+    result = await _check(db, {"project_id": pid, "license": "CC BY-NC 4.0"})
+    assert result["use_mode"] == COMMERCIALIZED
+    assert result["tier"] == LINK_ONLY
+    assert result["override_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_check_flags_a_redrawn_nd_derivative_by_mode(db):
+    standard = await _mode_project(db, STANDARD_PUBLICATION)
+    commercial = await _mode_project(db, COMMERCIALIZED)
+    args = {"license": "CC BY-ND 4.0", "derived": True, "redrawn": True}
+    s = await _check(db, {"project_id": standard, **args})
+    assert s["tier"] == STORE_UNMODIFIED
+    assert s["redrawn"] is True
+    assert "no_derivatives_review" in s["flags"]
+    assert s["override_required"] is False
+    c = await _check(db, {"project_id": commercial, **args})
+    assert c["tier"] == STORE_UNMODIFIED
+    assert c["override_required"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("license_value", _UNKNOWN_LICENSES)
+async def test_a_missing_or_unknown_license_is_link_only(db, license_value):
+    standard = await _mode_project(db, STANDARD_PUBLICATION)
+    commercial = await _mode_project(db, COMMERCIALIZED)
+    s = await _check(db, {"project_id": standard, "license": license_value})
+    assert s["license"] == "unknown"
+    assert s["tier"] == LINK_ONLY
+    assert "requires_credit" in s["flags"]
+    assert s["override_required"] is False
+    c = await _check(db, {"project_id": commercial, "license": license_value})
+    assert c["tier"] == LINK_ONLY
+    assert c["override_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_license_left_out_of_the_call_is_link_only(db):
+    pid = await _mode_project(db, COMMERCIALIZED)
+    result = await _check(db, {"project_id": pid})
+    assert result["license"] == "unknown"
+    assert result["tier"] == LINK_ONLY
+    assert result["override_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_check_never_calls_the_override_path_and_writes_no_row(db, monkeypatch):
+    calls: list[str] = []
+
+    def refuse(name):
+        async def _spy(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"check_image_rights must not call {name}")
+        return _spy
+
+    monkeypatch.setattr(
+        rights_override_module, "authorize_image_storage", refuse("authorize_image_storage"),
+    )
+    monkeypatch.setattr(
+        rights_override_module, "request_rights_override", refuse("request_rights_override"),
+    )
+
+    pid = await _mode_project(db, COMMERCIALIZED)
+    audit_before = len(await db_module.get_action_audit_log(db, project_id=pid))
+    hitl_before = await _hitl_count(db, pid)
+    for args in (
+        {"project_id": pid, "license": "CC BY-NC 4.0"},
+        {"project_id": pid, "license": "CC BY-ND 4.0", "derived": True, "redrawn": True},
+        {"project_id": pid},
+    ):
+        assert "error" not in await _check(db, args)
+    assert calls == []
+    assert len(await db_module.get_action_audit_log(db, project_id=pid)) == audit_before
+    assert await _hitl_count(db, pid) == hitl_before
+    assert await _audit(db, pid) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("license_value, derived, redrawn", [
+    ("CC BY 4.0", False, False),
+    ("CC BY-NC 4.0", False, False),
+    ("CC BY-ND 4.0", True, True),
+    (None, False, False),
+])
+async def test_check_agrees_with_the_gate_it_previews(db, license_value, derived, redrawn):
+    for mode in (STANDARD_PUBLICATION, COMMERCIALIZED):
+        pid = await _mode_project(db, mode)
+        preview = await _check(db, {
+            "project_id": pid, "license": license_value, "derived": derived, "redrawn": redrawn,
+        })
+        gate = await authorize_image_storage(
+            db, pid, license_value, subject_id="fig-1", derived=derived, redrawn=redrawn,
+        )
+        assert preview["tier"] == gate.tier
+        assert preview["override_required"] is (not gate.allowed)
+
+
+@pytest.mark.asyncio
+async def test_check_returns_error_for_an_unknown_project(db):
+    result = await _check(db, {"project_id": "does-not-exist", "license": "CC0"})
+    assert "error" in result
+    assert result.get("code") == "PROJECT_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_check_requires_a_project(db):
+    result = await _check(db, {"license": "CC0"})
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_check_resolves_the_project_by_name(db):
+    name = f"rights-check-{uuid.uuid4().hex[:10]}"
+    project = await db_module.create_project(db, name)
+    result = await _check(db, {"project_name": name, "license": "CC0"})
+    assert result["project_id"] == project["id"]
+    assert result["tier"] == STORE_IMAGE
+
+
+def test_check_image_rights_is_read_only_and_exposes_no_override_path():
+    tool = next(t for t in _MCP_TOOLS_LIST if t["name"] == "check_image_rights")
+    assert set(tool["inputSchema"]["properties"]) == {
+        "project_id", "project_name", "license", "derived", "redrawn",
+    }
+    assert "check_image_rights" in _READ_ONLY_TOOLS
+    assert "check_image_rights" not in _DESTRUCTIVE_TOOLS
+    assert _TOOL_CATEGORY["check_image_rights"] == "project"
+    assert _TOOL_WORKFLOW_TIER["check_image_rights"] == "common-support"
+    assert "check_image_rights(" in _TOOL_EXAMPLES["check_image_rights"]
+    names = {t["name"] for t in _MCP_TOOLS_LIST}
+    assert "authorize_image_storage" not in names
+    assert "request_rights_override" not in names
+    assert hasattr(pt_mod, "handle_check_image_rights")

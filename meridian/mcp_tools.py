@@ -12,6 +12,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "rename_project": 'rename_project(project_name="old-name", new_name="new-name")',
     "set_project_execution_mode": 'set_project_execution_mode(project_name="my-project", execution_mode="autonomous")',
     "set_project_use_mode": 'set_project_use_mode(project_name="my-project", use_mode="standard_publication")',
+    "check_image_rights": 'check_image_rights(project_name="my-project", license="CC BY-NC 4.0")',
     "merge_project": 'merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")',
     "start_session": 'start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
@@ -361,6 +362,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "use_mode": {"type": "string", "enum": ["standard_publication", "commercialized"], "description": "The new use mode."},
          "reason": {"type": "string", "description": "Optional reason recorded in the audit row."}},
          "required": ["use_mode"]}},
+    {"name": "check_image_rights", "description":
+        "Read-only preview of the image-storage rights policy for ONE source image in a "
+        "project. Pass the source's license (a canonical id such as 'cc-by-nc', a license "
+        "string, or a creativecommons.org URL), and whether the stored figure is a derivative "
+        "of the source (derived) or a redrawn or cropped copy (redrawn). Returns the tier "
+        "(STORE_IMAGE, STORE_UNMODIFIED or LINK_ONLY), the flags (for example requires_credit "
+        "and needs_review), the project's use mode, and override_required: true when image "
+        "bytes would be refused without a human-approved override. A missing or unknown "
+        "license is LINK_ONLY. This tool grants nothing: it writes no row, no audit entry and "
+        "no approval request. Returns {error} for an unknown project.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "license": {"type": "string", "description": "The source's license: a canonical id, a license string, or a creativecommons.org URL. Omit or leave blank when unknown; that is treated as LINK_ONLY."},
+         "derived": {"type": "boolean", "description": "True when the stored figure is a derivative of the source image."},
+         "redrawn": {"type": "boolean", "description": "True when the derivative is a redrawn or cropped copy of the source image."}}}},
     {"name": "merge_project", "description":
         "d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents EVERY "
         "child row of the source project (sprint items, tasks, decisions, insights, "
@@ -4831,6 +4848,8 @@ _READ_ONLY_TOOLS = {
     # 7c96d41b — paper_contract read-only queries.
     "get_paper_contract", "list_paper_contract_revisions",
     "get_current_paper_contract_content",
+    # Image-storage rights preview: pure decision, reads the stored use mode, grants nothing.
+    "check_image_rights",
 }
 
 # Member-policy intent for MCP dispatch.  Values describe the operation shape,
@@ -5039,6 +5058,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "rename_project":      "project",
     "set_project_execution_mode": "project",
     "set_project_use_mode": "project",
+    "check_image_rights": "project",
     "merge_project":       "project",
     "list_projects":       "project",
     "get_project_by_name": "project",
@@ -5399,6 +5419,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "rename_project":            "both",
     "set_project_execution_mode": "both",
     "set_project_use_mode": "both",
+    "check_image_rights": "both",
     "merge_project":             "both",
     "list_projects":             "both",
     "get_project_by_name":       "both",
@@ -5692,6 +5713,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "rename_project":             "maintenance-only",
     "set_project_execution_mode": "maintenance-only",
     "set_project_use_mode": "maintenance-only",
+    "check_image_rights": "common-support",
     "merge_project":              "maintenance-only",
     "set_parent_project":         "maintenance-only",
     "list_projects":              "maintenance-only",
