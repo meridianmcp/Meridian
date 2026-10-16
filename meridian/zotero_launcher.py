@@ -184,12 +184,16 @@ def _autoinstall_zotero_plugin():
         if profile is None:
             _log.info("zotero plugin autoinstall: no default Zotero profile found; skipped")
             return None
-        signed = _zotero_plugin.signed_install_source()
-        if signed is None:
+        stored = _zotero_plugin.signed_install_state()
+        if stored.tampered:
+            # The stored file no longer matches its record. Launching Zotero goes on; signing again is a CLI step.
+            _log.info("zotero plugin autoinstall: the stored signed file failed its integrity check; skipped")
+            return None
+        if not stored.signed:
             # Nothing is signed for this plugin version yet. Launching Zotero goes on; signing is a separate CLI step.
             _log.info("zotero plugin autoinstall: this plugin version is not signed yet; skipped")
             return None
-        result = _zotero_plugin.install_into_profile(profile, signed)
+        result = _zotero_plugin.install_into_profile(profile, stored.path, expected_sha256=stored.sha256)
         _log.info("zotero plugin autoinstall: %s", result["status"])
         return result
     except Exception as exc:  # noqa: BLE001 -- the plugin must never block Zotero's launch

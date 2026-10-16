@@ -796,7 +796,9 @@ def test_cli_prints_manual_steps_when_no_profile_is_found(monkeypatch, capsys, t
     rc = zpi.cli_main([])
     out = capsys.readouterr().out
     assert rc == 1
-    assert "Install Add-on From File" in out
+    assert "Tools > Plugins" in out
+    assert "Install Plugin From File" in out
+    assert "Add-on" not in out
     assert XPI_NAME in out
 
 
@@ -1866,22 +1868,32 @@ def test_default_install_with_close_refuses_an_unsigned_plugin_before_closing(de
 def test_cli_install_without_a_signature_closes_nothing_and_points_at_sign_plugin(monkeypatch, capsys, profile):
     _forget_signed(zpi.signing_state_dir())
     monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("no close without a signature"))
+    before = _snapshot(profile)
     rc = zpi.cli_main(["--profile", str(profile)])
     out = capsys.readouterr().out
     assert rc == 1
     assert "python -m meridian zotero sign-plugin" in out
+    assert "Tools > Plugins" in out
     assert "Install Plugin From File" in out
     assert "Meridian closed" not in out
+    assert _snapshot(profile) == before
     assert not (profile / "extensions").exists()
 
 
-def test_cli_dry_run_says_the_plugin_needs_a_signature_and_would_install_nothing(capsys, profile):
+def test_cli_dry_run_says_the_unsigned_file_would_be_written_and_writes_nothing(capsys, profile):
     _forget_signed(zpi.signing_state_dir())
+    before = _snapshot(profile)
     rc = zpi.cli_main(["--profile", str(profile), "--dry-run"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "not signed yet" in out
+    assert "would be written" in out
+    assert str(zpi.default_xpi_path()) in out
+    assert "shown here" not in out
+    assert "Select:" not in out
     assert "Would install" not in out
+    assert not zpi.default_xpi_path().exists()
+    assert _snapshot(profile) == before
     assert not (profile / "extensions").exists()
 
 

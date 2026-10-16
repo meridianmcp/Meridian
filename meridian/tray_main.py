@@ -1393,7 +1393,7 @@ ZOTERO_PLUGIN_REPORT_TITLE = "Zotero bridge plugin"
 ZOTERO_PLUGIN_INSTALL_NOW_LABEL = "Install Zotero plugin now"
 _ZOTERO_PLUGIN_INSTALL_STATUSES = frozenset({
     "installed", "unchanged", "refused_running", "close_failed", "check_failed", "refused_not_profile",
-    "no_profile", "failed", "needs_signature",
+    "no_profile", "failed", "needs_signature", zotero_plugin.INTEGRITY_STATUS,
 })
 _ZOTERO_PLUGIN_SAVED_PREFIX = "Your choice was saved. "
 _ZOTERO_PLUGIN_CLOSE_AND_RETRY = (
@@ -1484,6 +1484,8 @@ def _unclosed_install_text(status: Any, path: Any, error: Any) -> str:
         )
     if status == "refused_not_profile":
         return f"Nothing was installed: {error}"
+    if status == zotero_plugin.INTEGRITY_STATUS:
+        return zotero_plugin.INTEGRITY_FAILED_MESSAGE
     return f"The install failed: {error}"
 
 
@@ -1500,8 +1502,8 @@ def zotero_plugin_install_text(result: dict, *, first_run: bool = False) -> str:
     closed = result.get("closed_zotero") is True
     restarted = result.get("restart") in ("started", "already_running")
     if status == zotero_plugin.NEEDS_SIGNATURE_STATUS:
-        # Nothing was closed or written. The message names the signing command and the manual route to the file.
-        text = str(result.get("message") or zotero_plugin.needs_signature_message(result.get("unsigned_path") or ""))
+        # Nothing was closed or written. The tray names the source checkout, not the CLI command, and the manual route.
+        text = zotero_plugin.tray_needs_signature_message(result.get("unsigned_path") or "")
     elif closed and status in zotero_plugin.UNCONFIRMED_CLOSED_STATUSES:
         # Meridian closed Zotero, so the text must not tell the user to close it as if it had not.
         text = _closed_unconfirmed_text(restarted)

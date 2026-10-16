@@ -46,9 +46,11 @@ plugin code. The URL is a placeholder (see "Updates" below).
    turns closing off. With closing off, close Zotero before you run it.
    A close request can still time out, and then nothing is installed.
    An install that finds the plugin already current does not close Zotero.
-   The command packs this folder into `meridian-zotero@usemeridian.us.xpi` and copies the file
-   into your profile when it finds one. Otherwise it prints the file's path.
-2. In Zotero, open **Tools > Add-ons**, click the gear icon, and choose **Install Add-on From File**.
+   The command packs this folder into the unsigned build `meridian-zotero@usemeridian.us.xpi` in Meridian's
+   state folder. That build writes nothing to the Zotero profile. The command copies a file into your
+   profile only when the Mozilla-signed file for this version is stored. Otherwise it prints the signing
+   command and the unsigned file's path. See `docs/zotero-plugin-install.md`, section 4a.
+2. In Zotero, open **Tools > Plugins**, click the gear icon, and choose **Install Plugin From File**.
 3. Select the `.xpi`, then restart Zotero if asked.
 
 Scope: the automatic install through the Meridian tray app is Windows only. See

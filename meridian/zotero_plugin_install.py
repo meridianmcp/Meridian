@@ -12,9 +12,11 @@
   ``extensions.json``, ``prefs.js`` or any other profile file.
   ``install_default_profile`` runs that install for the default profile named in
   ``profiles.ini``, with no close step. It never raises.
-* ``signed_install_source`` is the only file an install copies: the Mozilla-signed .xpi that
-  ``zotero_plugin_sign`` stored for this bundle's version and source. With none stored, every install returns
-  ``needs_signature`` before anything closes, and nothing is written to Zotero's profile. Installs never sign.
+* ``signed_install_state`` says what is stored for this bundle's version and source: the Mozilla-signed .xpi
+  that ``zotero_plugin_sign`` stored (``signed``), nothing (``missing``, which returns ``needs_signature``), or
+  a stored file whose bytes no longer match its record (``tampered``, which returns ``integrity_failed``).
+  Both refusals happen before anything closes. The copy reads the signed file once, checks its sha256 against
+  the record, and writes those same bytes. Only that signed file is ever copied. Installs never sign.
 * ``close_zotero_gracefully`` asks a running Zotero to close with
   ``taskkill /IM zotero.exe`` (never ``/F`` or ``/T``) and waits for it to stop.
   The taskkill argument list has no force flag, and a close that fails leaves
@@ -110,9 +112,11 @@ _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 _MANUAL_STEPS = (
     "Install the plugin by hand:",
     "  1. Close Zotero.",
-    "  2. In Zotero, open Tools > Add-ons, click the gear icon, and choose Install Add-on From File.",
+    "  2. In Zotero, open Tools > Plugins, click the gear icon, and choose Install Plugin From File.",
     "  3. Select: {xpi}",
 )
+INTEGRITY_STATUS = "integrity_failed"
+INTEGRITY_FAILED_MESSAGE = "The stored signed file failed its integrity check. Sign the plugin again."
 
 
 def _platform() -> str:
@@ -476,20 +480,28 @@ def is_zotero_profile(profile_dir: "Path | str") -> bool:
     return any((folder / name).is_file() for name in PROFILE_MARKERS)
 
 
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
 def install_into_profile(
     profile_dir: "Path | str | None",
     xpi_path: "Path | str",
     *,
     running: "Callable[[], bool] | None" = None,
+    expected_sha256: "str | None" = None,
 ) -> dict[str, Any]:
-    """Copy the built .xpi into ``profile_dir/extensions/``.
+    """Copy the .xpi into ``profile_dir/extensions/``.
 
     ``status`` is one of ``installed``, ``unchanged``, ``refused_not_profile``,
-    ``refused_running``, ``check_failed``, ``no_profile`` or ``failed``. The
-    profile must hold a marker file (``prefs.js`` or ``zotero.sqlite``), and the
+    ``refused_running``, ``check_failed``, ``no_profile``, ``integrity_failed`` or ``failed``.
+    The profile must hold a marker file (``prefs.js`` or ``zotero.sqlite``), and the
     process check must succeed and find Zotero closed. Every refusal happens
     before any write. ``running`` returns True, False, or None for a failed
     check. It defaults to :func:`zotero_process_state`, looked up at call time.
+
+    The file is read once. When ``expected_sha256`` is given, those bytes must hash to it, or the result is
+    ``integrity_failed`` and nothing is written. The bytes checked are the bytes written.
     """
     try:
         if profile_dir is None or not Path(profile_dir).is_dir():
@@ -506,6 +518,8 @@ def install_into_profile(
             return _result("refused_running", None)
         target = Path(profile_dir) / "extensions" / XPI_FILENAME
         payload = Path(xpi_path).read_bytes()
+        if expected_sha256 is not None and _sha256(payload) != expected_sha256:
+            return _integrity_refusal()
         if target.is_file() and target.read_bytes() == payload:
             return _result("unchanged", target)
         _atomic_write_bytes(target, payload)
@@ -514,15 +528,15 @@ def install_into_profile(
         return _result("failed", None, error=str(exc))
 
 
-def _already_current(profile: "Path | str", xpi: "Path | str") -> "dict[str, Any] | None":
-    """The ``unchanged`` result when the installed plugin matches the built bundle byte for byte, else None.
+def _already_current(profile: "Path | str", expected_sha256: str) -> "dict[str, Any] | None":
+    """The ``unchanged`` result when the installed plugin is the verified signed file, else None.
 
-    It only reads, so it can run before any close and whatever Zotero's state is. Never raises: a
-    read that fails means "not known to be current", and the install path then decides.
+    It reads only the installed copy, never the signed file, so it can run before any close and whatever Zotero's
+    state is. Never raises: a read that fails means "not known to be current", and the install path then decides.
     """
     target = Path(profile) / "extensions" / XPI_FILENAME
     try:
-        if target.is_file() and target.read_bytes() == Path(xpi).read_bytes():
+        if target.is_file() and _sha256(target.read_bytes()) == expected_sha256:
             return _result("unchanged", target)
     except Exception:  # noqa: BLE001 -- an unreadable file is not known to be current
         return None
@@ -539,14 +553,33 @@ def _needs_signature_result(unsigned: "Path | str") -> dict[str, Any]:
     }
 
 
-def _prepare_default_install() -> "tuple[Path, Path] | dict[str, Any]":
-    """The default profile and the built bundle, resolved before anything is closed. Never raises.
+def _integrity_refusal() -> dict[str, Any]:
+    """The refusal for a stored signed file whose bytes no longer match its record. Nothing is closed or written."""
+    return {
+        "status": INTEGRITY_STATUS,
+        "path": None,
+        "error": INTEGRITY_FAILED_MESSAGE,
+        "message": INTEGRITY_FAILED_MESSAGE,
+    }
 
-    Returns ``(profile, signed_xpi)`` when both are ready. Otherwise it returns the refusal to hand back
-    unchanged: ``no_profile`` when there is no default profile, ``refused_not_profile`` when the
-    profile folder holds no marker file (the same check the CLI makes), ``needs_signature`` when no
-    signature is stored for this bundle, or ``failed`` when the bundle will not build. The unsigned bundle
-    is written into Meridian's own state folder, never into Zotero.
+
+def _signed_refusal(stored: Any, unsigned: "Path | str") -> "dict[str, Any] | None":
+    """The refusal for a stored state that is not signed, or None when the stored file may be installed."""
+    if stored.signed:
+        return None
+    if stored.tampered:
+        return _integrity_refusal()
+    return _needs_signature_result(unsigned)
+
+
+def _prepare_default_install() -> "tuple[Path, Path, str] | dict[str, Any]":
+    """The default profile, the verified signed file and its hash, resolved before anything is closed. Never raises.
+
+    Returns ``(profile, signed_xpi, sha256)`` when everything is ready. Otherwise it returns the refusal to hand back
+    unchanged: ``no_profile`` when there is no default profile, ``refused_not_profile`` when the profile folder holds
+    no marker file (the same check the CLI makes), ``needs_signature`` when no signature is stored for this bundle,
+    ``integrity_failed`` when the stored file no longer matches its record, or ``failed`` when the bundle will not
+    build. The unsigned bundle is written into Meridian's own state folder, never into Zotero.
     """
     try:
         profile = find_default_profile_dir(zotero_data_dir())
@@ -555,19 +588,26 @@ def _prepare_default_install() -> "tuple[Path, Path] | dict[str, Any]":
         if not is_zotero_profile(profile):
             return _result("refused_not_profile", None, error=_NOT_PROFILE_MESSAGE.format(profile=profile))
         unsigned = build_xpi(default_xpi_path())
-        signed = signed_install_source()
-        if signed is None:
-            return _needs_signature_result(unsigned)
-        return profile, signed
+        stored = signed_install_state()
+        refusal = _signed_refusal(stored, unsigned)
+        if refusal is not None:
+            return refusal
+        return profile, stored.path, stored.sha256
     except Exception as exc:  # noqa: BLE001 -- report every failure as data, never raise
         return _result("failed", None, error=str(exc))
 
 
 NEEDS_SIGNATURE_STATUS = "needs_signature"
+# The CLI keeps the signing command. The tray names the source checkout instead.
 _NEEDS_SIGNATURE_TEMPLATE = (
     "This plugin version is not signed yet. Run: python -m meridian zotero sign-plugin (it needs your Mozilla "
     "API key and secret in environment variables). Until then, you can install the unsigned file yourself: "
-    "Tools > Plugins > gear icon > Install Plugin From File, then select the file shown here: {path}."
+    "Tools > Plugins, click the gear icon, choose Install Plugin From File, then select the file shown here: {path}."
+)
+_TRAY_NEEDS_SIGNATURE_TEMPLATE = (
+    "This plugin version is not signed yet. Sign the plugin from a source checkout of Meridian, then install again "
+    "here. Until then, you can install the unsigned file yourself: Tools > Plugins, click the gear icon, choose "
+    "Install Plugin From File, then select the file shown here: {path}."
 )
 
 
@@ -577,21 +617,29 @@ def signing_state_dir() -> Path:
 
 
 def needs_signature_message(unsigned_path: "Path | str") -> str:
-    """The text for an unsigned bundle: the signing command, and the manual route to the unsigned file."""
+    """The CLI text for an unsigned bundle: the signing command, and the manual route to the unsigned file."""
     return _NEEDS_SIGNATURE_TEMPLATE.format(path=unsigned_path)
 
 
-def signed_install_source(source_dir: "Path | str | None" = None) -> "Path | None":
-    """The stored signed .xpi for the bundle's current version, or None. Reads only, never signs. Never raises."""
-    try:
-        from meridian import zotero_plugin_sign as sign  # imported here: that module imports this one
+def tray_needs_signature_message(unsigned_path: "Path | str") -> str:
+    """The tray text for an unsigned bundle: the source checkout, and the manual route to the unsigned file."""
+    return _TRAY_NEEDS_SIGNATURE_TEMPLATE.format(path=unsigned_path)
 
+
+def signed_install_state(source_dir: "Path | str | None" = None) -> Any:
+    """What is stored for the bundle's version and source, as a ``StoredSigned``. Reads only. Never raises.
+
+    An unreadable bundle reads as ``missing``, so the install asks for a signature rather than guessing.
+    """
+    from meridian import zotero_plugin_sign as sign  # imported here: that module imports this one
+
+    try:
         source = _resolve_source(source_dir)
-        return sign.signed_artifact_for_version(
+        return sign.stored_signed_artifact(
             signing_state_dir(), sign.bundle_version(source), source_sha256=sign.source_fingerprint(source),
         )
     except Exception:  # noqa: BLE001 -- an unreadable bundle or record is "not signed", never a crash
-        return None
+        return sign.StoredSigned(status=sign.MISSING_STATUS)
 
 
 def install_default_profile(*, running: "Callable[[], bool] | None" = None) -> dict[str, Any]:
@@ -608,8 +656,8 @@ def install_default_profile(*, running: "Callable[[], bool] | None" = None) -> d
     prepared = _prepare_default_install()
     if isinstance(prepared, dict):
         return prepared
-    profile, xpi = prepared
-    return install_into_profile(profile, xpi, running=running)
+    profile, signed, sha256 = prepared
+    return install_into_profile(profile, signed, running=running, expected_sha256=sha256)
 
 
 # ---------------------------------------------------------------------------
@@ -732,15 +780,15 @@ def install_default_with_close(
     prepared = _prepare_default_install()
     if isinstance(prepared, dict):
         return {**prepared, "closed_zotero": False, "restart": None}
-    profile, signed = prepared
-    current = _already_current(profile, signed)
+    profile, signed, sha256 = prepared
+    current = _already_current(profile, sha256)
     if current is not None:
         # Nothing would be written, so there is nothing to close for, whatever Zotero's state is.
         return {**current, "closed_zotero": False, "restart": None}
     check = running if running is not None else zotero_process_state
     return install_with_close(
         settings,
-        install=lambda: install_into_profile(profile, signed, running=check),
+        install=lambda: install_into_profile(profile, signed, running=check, expected_sha256=sha256),
         close_zotero=close_zotero,
         running=check,
         close=close,
@@ -935,6 +983,9 @@ def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -
     if status == NEEDS_SIGNATURE_STATUS:
         print(result.get("message", needs_signature_message(xpi)))
         return 1
+    if status == INTEGRITY_STATUS:
+        print(result.get("message", INTEGRITY_FAILED_MESSAGE))
+        return 1
     if status == "no_profile":
         print(f"No Zotero profile folder exists at {profile}, so nothing was installed.")
         _print_manual_steps(xpi)
@@ -986,19 +1037,19 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     if not is_zotero_profile(profile):
         print(_NOT_PROFILE_MESSAGE.format(profile=profile))
         return 1
-    # An unsigned plugin is refused before anything closes: the stored signature is the only file an install copies.
-    signed = signed_install_source()
-    if signed is None:
-        print(needs_signature_message(xpi))
-        return 1
+    # An unsigned or tampered plugin is refused before anything closes: only the verified signed file is copied.
+    stored = signed_install_state()
+    refusal = _signed_refusal(stored, xpi)
+    if refusal is not None:
+        return _print_install_status(refusal, xpi, profile)
     # A plugin that is already identical needs no close, whether or not Zotero runs.
-    current = _already_current(profile, signed)
+    current = _already_current(profile, stored.sha256)
     if current is not None:
         return _print_install_status(current, xpi, profile)
     result = install_with_close(
         load_settings(settings_path()),
         close_zotero=close_zotero,
-        install=lambda: install_into_profile(profile, signed),
+        install=lambda: install_into_profile(profile, stored.path, expected_sha256=stored.sha256),
     )
     if result.get("closed_zotero") and result.get("status") in UNCONFIRMED_CLOSED_STATUSES:
         # Meridian closed Zotero, so the text must not tell the user to close it as if it had not.
@@ -1023,16 +1074,23 @@ def _dry_run(profile: "Path | None", *, close_zotero: "bool | None" = None) -> i
         f"sha256 {hashlib.sha256(payload).hexdigest()}"
     )
     if profile is None:
-        _print_manual_steps(default_xpi_path())
+        print("No Zotero profile was found, so a real install would stop here. Nothing is written by a dry run.")
         return 0
     if not is_zotero_profile(profile):
         print("Would refuse: that folder is not a Zotero profile (no prefs.js or zotero.sqlite).")
         return 0
-    signed = signed_install_source()
-    if signed is None:
-        print(needs_signature_message(default_xpi_path()))
+    stored = signed_install_state()
+    if stored.tampered:
+        print(f"Would refuse. {INTEGRITY_FAILED_MESSAGE}")
         return 0
-    print(f"Signed artifact: {signed}")
+    if not stored.signed:
+        # The unsigned file is only described here: a dry run writes nothing, so it does not exist yet.
+        print(
+            "This plugin version is not signed yet, so a real install would refuse it. The unsigned file "
+            f"would be written to {default_xpi_path()} first. A dry run writes nothing."
+        )
+        return 0
+    print(f"Signed artifact: {stored.path}")
     state = zotero_process_state()
     if state is None:
         print("Would refuse: could not check whether Zotero is running. Make sure Zotero is closed first.")
@@ -1045,8 +1103,7 @@ def _dry_run(profile: "Path | None", *, close_zotero: "bool | None" = None) -> i
             print("Would refuse: Zotero is running. Close Zotero first.")
         return 0
     target = profile / "extensions" / XPI_FILENAME
-    current = target.read_bytes() if target.is_file() else None
-    if current == signed.read_bytes():
+    if _already_current(profile, stored.sha256) is not None:
         print(f"Would leave the installed plugin unchanged at {target}.")
     else:
         print(f"Would install to {target}.")

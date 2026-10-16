@@ -49,8 +49,8 @@ Use this if you declined, or if the automatic install did not appear.
    pixi run python -m meridian zotero install-plugin
    ```
 
-   It builds `meridian-zotero@usemeridian.us.xpi` into `%USERPROFILE%\.meridian\local_runner\zotero_plugin\`. If it finds your Zotero profile, it also copies the file there. If it does not, it prints the file's path. This command installs even if you declined, because the saved setting only affects automatic installs. It copies the file only into a folder that holds `prefs.js` or `zotero.sqlite`, so a wrong `--profile` path writes nothing. It follows the close choice in section 3. Add `--keep-zotero-open` to refuse the install while Zotero is open, for this run only.
-3. In Zotero, open **Tools > Add-ons**, click the gear icon, and choose **Install Add-on From File**.
+   It builds the unsigned bundle `meridian-zotero@usemeridian.us.xpi` into `%USERPROFILE%\.meridian\local_runner\zotero_plugin\`. The unsigned build writes nothing to the Zotero profile. The command copies a file into the profile only when the Mozilla-signed file for this plugin version is stored (section 4a). Without one, it prints the signing command and the path of the unsigned file, and you can install that file by hand in steps 3 and 4. This command installs even if you declined, because the saved setting only affects automatic installs. It copies the file only into a folder that holds `prefs.js` or `zotero.sqlite`, so a wrong `--profile` path writes nothing. It follows the close choice in section 3. Add `--keep-zotero-open` to refuse the install while Zotero is open, for this run only.
+3. In Zotero, open **Tools > Plugins**, click the gear icon, and choose **Install Plugin From File**.
 4. Select `meridian-zotero@usemeridian.us.xpi` from the folder in step 2.
 5. Restart Zotero if asked.
 
@@ -67,23 +67,24 @@ Firefox and Zotero load add-ons that Mozilla has signed. Meridian signs the brid
    pixi run python -m meridian zotero sign-plugin
    ```
 
-   `--dry-run` prints the plugin version, whether the two variables are set (yes or no, never the values), and whether a signed file is already stored. It signs nothing and uploads nothing. `--timeout-minutes N` changes the default wait of 60 minutes.
+   `--dry-run` prints the plugin version, whether the two variables are set (yes or no, never the values), and whether a signed file is already stored. It signs nothing, uploads nothing, and writes nothing. `--timeout-minutes N` changes the default wait of 60 minutes. N must be more than 0 and at most 1440. Any other value is refused before anything is staged or uploaded.
 5. Wait for Mozilla. The command returns once Mozilla has signed the file, or stops at the timeout. A timeout or a failure stores nothing, and the message says so.
 6. Run `pixi run python -m meridian zotero install-plugin` (section 4). It copies the signed file into Zotero's profile.
 
 What signing does, and what it does not:
 
-- **Signing does not close Zotero.** It talks only to Mozilla and writes into Meridian's own state folder, `%USERPROFILE%\.meridian\local_runner\zotero_plugin\signed\` with `signed.json` beside it. The unsigned bundle stays in that folder too.
-- **Installing does close Zotero**, under the rules in section 3. It copies only the signed file, and only when that file was signed for this plugin version and this exact source. With no matching signed file, the install writes nothing, closes nothing, and prints the signing command.
-- **A version is signed once.** If you edit the bridge without changing its version, the old signature no longer matches, and the next `sign-plugin` run signs the new source.
+- **Signing does not close Zotero.** Its network use is this. web-ext is pinned to 8.10.0, but its first run fetches that package, and its npm dependencies, from the npm registry, and those dependencies are not pinned. The signing call then uploads the bundle to Mozilla's addons.mozilla.org API. Signing writes only into Meridian's own state folder, `%USERPROFILE%\.meridian\local_runner\zotero_plugin\signed\` with `signed.json` beside it. The unsigned bundle stays in that folder too.
+- **Installing does close Zotero**, under the rules in section 3. It copies only the signed file, and only when that file was signed for this plugin version and this exact source. The copy reads the file once, checks its sha256 against the record, and writes those same bytes. With no matching signed file, the install writes nothing, closes nothing, and prints the signing command. A stored file that no longer matches its record gets its own message. When the check catches it before Zotero is closed, the install stops there. Each copy writes only bytes that match the record.
+- **A version is signed once, from one source.** Once a version is signed, `sign-plugin` reports it as already signed and uploads nothing. If you edit the bridge without changing its version, `sign-plugin` refuses before it uploads anything and prints: Bump the version in manifest.json, then sign again. It stores nothing in that case.
 - **The key and the secret are never written to a file, printed, or put on a command line.** The signing call receives them in its environment only. Other `WEB_EXT_*` variables are not passed to that call, so none of them can redirect the credentials to another server.
-- **Fallback: install the unsigned file yourself.** The install prints the path of the unsigned file. In Zotero, open **Tools > Plugins**, click the gear icon, choose **Install Plugin From File**, and select that file. The message calls the menu **Plugins**; section 4 calls it **Add-ons**, and which name Zotero 8 shows is not verified. Zotero may refuse an unsigned add-on in a normal build; that is not verified either.
+- **One forced kill, for the signing child only.** If Mozilla does not finish within the wait, `sign-plugin` ends the signing child's own process tree, with `taskkill /PID <child> /T /F` on Windows, so that a hung web-ext cannot block the command. This is the only forced kill in the signing path. It touches the signing child only, never Zotero or any other process. Zotero's own close step is a plain close request and never forces anything.
+- **Fallback: install the unsigned file yourself.** The install prints the path of the unsigned file. In Zotero, open **Tools > Plugins**, click the gear icon, choose **Install Plugin From File**, and select that file. Zotero may refuse an unsigned add-on in a normal build. Neither the menu names nor that refusal are verified on Zotero 10.
 
 **Not yet verified:** Mozilla's unlisted signing of this bridge has not been run against Mozilla. Zotero accepting a signed `.xpi` copied into a profile's `extensions` folder is not yet verified on a real Zotero install.
 
 ## 5. Verify
 
-1. **Tools > Add-ons** lists **Meridian Zotero Bridge**, and it is enabled.
+1. **Tools > Plugins** lists **Meridian Zotero Bridge**, and it is enabled.
 2. Right-click a collection in the left pane. The menu has **Import BibTeX here...**.
 3. Select a regular item and right-click it. The menu has **Attach PDFs from folder...**.
 4. Zotero's settings include a pane named **Meridian Zotero Bridge**.
@@ -91,7 +92,7 @@ What signing does, and what it does not:
 ## 6. Uninstall
 
 1. **Turn off auto-install first.** In the tray menu, clear **Auto-install Zotero bridge plugin**. If `MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL` is set, unset it too, because it overrides the menu. Otherwise Meridian puts the file back the next time it starts Zotero while Zotero is closed. Do not choose **Install Zotero plugin now** either, since it puts the file back too.
-2. In Zotero, open **Tools > Add-ons**, select **Meridian Zotero Bridge**, and remove it. Restart Zotero.
+2. In Zotero, open **Tools > Plugins**, select **Meridian Zotero Bridge**, and remove it. Restart Zotero.
 3. Close Zotero. Delete `meridian-zotero@usemeridian.us.xpi` from the `extensions` folder of your Zotero profile. Meridian finds that profile through `profiles.ini` in `%APPDATA%\Zotero\Zotero`.
 
 ## 7. Troubleshooting
@@ -104,4 +105,4 @@ What signing does, and what it does not:
 - **No profile found.** Meridian reads `profiles.ini` from the Zotero data folder, which defaults to `%APPDATA%\Zotero\Zotero`. If your Zotero data is somewhere else, set `MERIDIAN_ZOTERO_DATA_DIR` to that folder (the one that contains `profiles.ini`) and retry. You can also point the command at a profile folder with `--profile "<profile folder>"`.
 - **Not a Zotero profile.** The command refuses a folder that holds neither `prefs.js` nor `zotero.sqlite`, and writes nothing. Point `--profile` at the profile folder itself.
 - **Nothing happens on macOS or Linux.** The tray prompt, the immediate install, the tray menu items and the close step are Windows only in this build. Use the manual install in section 4.
-- **Not listed after restart.** The automatic route has not been verified on a real Zotero install. If Meridian Zotero Bridge is not in **Tools > Add-ons** after a restart, use the manual install in section 4, and tell us what **Tools > Add-ons** showed.
+- **Not listed after restart.** The automatic route has not been verified on a real Zotero install. If Meridian Zotero Bridge is not in **Tools > Plugins** after a restart, use the manual install in section 4, and tell us what **Tools > Plugins** showed.
