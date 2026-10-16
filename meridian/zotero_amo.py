@@ -242,7 +242,10 @@ def fetch_approved_version(
     if not isinstance(file, dict):
         return _failed(UNEXPECTED_MESSAGE)
     url = file.get("url")
-    approved = file.get("status") == PUBLIC_FILE_STATUS and file.get(SIGNED_FIELD) is True
+    # Approval is the file's public status. The is_mozilla_signed_extension flag reads False for an approved
+    # unlisted version (checked live), so it is not required here. The downloaded file is checked for Mozilla's
+    # signature entries and against this source before anything is stored.
+    approved = file.get("status") == PUBLIC_FILE_STATUS
     if not approved or not isinstance(url, str) or not url:
         return FetchResult(status=NOT_APPROVED, message=NOT_APPROVED_MESSAGE)
     if not _is_api_host(url):

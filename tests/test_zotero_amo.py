@@ -224,11 +224,10 @@ def test_an_approved_signed_file_is_returned_as_its_bytes():
     "record_kwargs",
     [
         {"status": "unreviewed", "signed": False},
-        {"status": "public", "signed": False},
         {"status": "disabled", "signed": True},
         {"url": None},
     ],
-    ids=["awaiting_review_unsigned", "approved_but_unsigned", "disabled", "no_download_url"],
+    ids=["awaiting_review_unsigned", "disabled", "no_download_url"],
 )
 def test_a_version_that_is_not_approved_signed_and_available_is_not_approved_yet(record_kwargs):
     fake = FakeAmo(record=_version_record(**record_kwargs), download=b"never")
@@ -408,3 +407,14 @@ def test_the_default_transport_returns_an_http_error_code_without_raising(monkey
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: _Opener())
     assert amo.urllib_transport(VERSION_URL, {}) == (404, b"")
+
+
+def test_a_public_version_counts_as_approved_even_when_the_signed_flag_reads_false():
+    # Checked live: the approved unlisted 0.1.0 reports status public with is_mozilla_signed_extension false.
+    fake = FakeAmo(record=_version_record(signed=False), download=b"not a zip")
+    assert _fetch(fake).status != amo.NOT_APPROVED
+
+
+def test_a_version_that_is_not_public_is_still_not_approved():
+    fake = FakeAmo(record=_version_record(status="unreviewed"), download=b"never")
+    assert _fetch(fake).status == amo.NOT_APPROVED

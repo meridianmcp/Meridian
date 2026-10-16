@@ -1963,11 +1963,10 @@ def test_a_fetch_of_an_already_signed_version_makes_no_network_call(source, stat
     "record_kwargs",
     [
         {"status": "unreviewed", "signed": False},
-        {"status": "public", "signed": False},
         {"status": "disabled", "signed": True},
         {"url": None},
     ],
-    ids=["awaiting_review_unsigned", "approved_but_unsigned", "disabled", "no_download_url"],
+    ids=["awaiting_review_unsigned", "disabled", "no_download_url"],
 )
 def test_a_fetch_of_a_version_not_approved_signed_and_available_is_not_approved_yet(source, state, record_kwargs):
     fake = FakeAmo(record=_version_record(**record_kwargs), download=b"never")
