@@ -262,6 +262,19 @@ been discovered (by a prior walk, or by an explicit
 ``register_priority_path``/``register_output_paths``/``record_provenance``
 call), matching this module's "never triggers a rebuild" contract for
 every one of its other read-only helpers.
+
+Staleness vocabulary (oz-outputs-staleness-vocabulary)
+------------------------------------------------------
+Every :func:`get_provenance_status` result also carries an additive
+``staleness_record`` key: the shared ``fresh`` / ``stale`` / ``unknown`` /
+``degraded`` state plus a ``reason``, built by
+:func:`meridian_outputs.staleness.map_staleness`. The per-source keys
+(``staleness``, ``script_staleness``, ``provenance_type``, ``inconclusive``)
+keep their names and values. Sources mapped: :func:`_staleness` (line 300),
+the :data:`STALE_BY_SCRIPT` state (line 297), and the script-hash checks
+behind ``check_staleness`` and ``find_stale_by_script`` in server.py. The core
+producers ``outputs_indexer.check_promotion_source_freshness`` and
+``embedded_staleness`` are outside this module and are not mapped here.
 """
 from __future__ import annotations
 
@@ -271,6 +284,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import annotate, fingerprint, outputs_local, research_evidence
+from . import staleness as staleness_vocab
 
 _log = logging.getLogger(__name__)
 
@@ -565,7 +579,7 @@ def _basename_relocation_lookup(
     return best
 
 
-def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
+def _build_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     """The richer, authoritative answer to "what do we know about this
     file's provenance", composed from both underlying systems and ranked by
     confidence.
@@ -785,6 +799,37 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
         "convergence": indexed["convergence"],
         "inconclusive": inconclusive,
     }
+
+
+def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
+    """Composed provenance status for ``path``, plus the shared staleness envelope.
+
+    Returns the same dict :func:`_build_provenance_status` builds, which holds
+    the branch contract, with one additive key: ``staleness_record``, a
+    :meth:`staleness.StalenessRecord.to_dict` mapping with ``state`` (one of
+    ``fresh``, ``stale``, ``unknown``, ``degraded``), ``reason``, ``source``
+    and ``path``. Existing keys keep their names and values.
+    """
+    status = _build_provenance_status(outputs_dir, path)
+    status["staleness_record"] = _staleness_record_for_status(status).to_dict()
+    return status
+
+
+def _staleness_record_for_status(status: dict[str, Any]) -> "staleness_vocab.StalenessRecord":
+    """Pick the source the status came from and map it onto the vocabulary.
+
+    A ``stale_by_script`` status, or any status without an exact or relocated
+    ``staleness`` block, is read through the ``stale_by_script`` source. Every
+    other status with a ``staleness`` block is read through ``_staleness``.
+    """
+    block = status.get("staleness")
+    if status.get("provenance_type") != STALE_BY_SCRIPT and isinstance(block, dict):
+        return staleness_vocab.map_staleness(
+            staleness_vocab.SOURCE_PROVENANCE_STALENESS, block, path=status.get("path"),
+        )
+    return staleness_vocab.map_staleness(
+        staleness_vocab.SOURCE_STALE_BY_SCRIPT_STATE, status, path=status.get("path"),
+    )
 
 
 # ---------------------------------------------------------------------------
