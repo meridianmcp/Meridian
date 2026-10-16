@@ -369,3 +369,50 @@ def test_block_status_envelope_uses_provenance_source() -> None:
     )
     assert record.source == SV.SOURCE_PROVENANCE_STALENESS
     assert record.state == "unknown"
+
+
+def test_relocated_status_with_changed_script_reads_stale() -> None:
+    """Content-hash tier only. A content-hash RELOCATED status's own staleness
+    block compares the matched hash to itself, so it reads fresh. A changed
+    generating script must still show, through the stale_by_script source,
+    while provenance_type stays relocated. A basename RELOCATED status has no
+    content hash, so its block reads unknown, not fresh. That case is covered
+    in test_provenance_status.py."""
+    status = {
+        "path": "/o/new.csv",
+        "provenance_type": "relocated",
+        "relocation_evidence": "content_hash",
+        "staleness": PROV_FRESH,
+        "script_staleness": SCRIPT_STALE,
+        "inconclusive": False,
+    }
+    record = PS._staleness_record_for_status(status)
+    assert record.source == SV.SOURCE_STALE_BY_SCRIPT_STATE
+    assert record.state == "stale"
+    assert record.path == "/o/new.csv"
+
+
+def test_relocated_status_with_fresh_script_reads_fresh() -> None:
+    status = {
+        "path": "/o/new.csv",
+        "provenance_type": "relocated",
+        "staleness": PROV_FRESH,
+        "script_staleness": SCRIPT_FRESH,
+        "inconclusive": False,
+    }
+    record = PS._staleness_record_for_status(status)
+    assert record.source == SV.SOURCE_PROVENANCE_STALENESS
+    assert record.state == "fresh"
+
+
+def test_error_envelope_keeps_error_shape_without_staleness_record(tmp_path: Path) -> None:
+    """An {"error": ...} response has no provenance state to map. It must come
+    back unchanged, with no staleness_record whose reason would describe an
+    output that was never looked up."""
+    no_dir = PS.get_provenance_status("", str(tmp_path / "x.csv"))
+    assert no_dir == {"error": "outputs_dir is required"}
+    assert "staleness_record" not in no_dir
+
+    no_path = PS.get_provenance_status(str(tmp_path), "")
+    assert no_path == {"error": "path is required"}
+    assert "staleness_record" not in no_path
