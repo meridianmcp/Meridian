@@ -2477,14 +2477,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "paper/page (case-folded DOI, arXiv id without version, PMID, or "
         "normalised URL) nothing is created and the result carries "
         "existing_note_id (a soft result, not an error); pass force_new=true to "
-        "save a separate copy.",
+        "save a separate copy. Identify the paper by url, or by doi / pmid when "
+        "no url is available (a doi is stored as its https doi.org form).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "url": {"type": "string", "description": "Source URL of the web page or paper."},
+         "url": {"type": "string", "description": "Source URL of the web page or paper. Takes precedence over doi and pmid when several are given."},
+         "doi": {"type": "string", "description": "DOI of the paper (e.g. 10.1145/3292500.3330701, or doi:/doi.org form). Used as the source, stored as https://doi.org/<doi>, when no url is given."},
+         "pmid": {"type": "string", "description": "PubMed id of the paper. Used as the source, stored as its PubMed URL, when neither url nor doi is given."},
          "summary": {"type": "string", "description": "Your summary of the finding (markdown)."},
          "related_decision_id": {"type": "string", "description": "Optional pinned-decision id to link the finding to."},
          "force_new": {"type": "boolean", "description": "Default false. true skips the in-project duplicate check and always creates a new finding note."}},
-         "required": ["url", "summary"]}},
+         "required": ["summary"]}},
     {"name": "get_notes", "description":
         "Read-only: List project notes (newest first), LIGHTWEIGHT by default — "
         "each item is id/slug/title/tags/kind/priority/timestamps with NO body, "

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from typing import Any
 
 import meridian.server as _server
@@ -2232,6 +2233,38 @@ async def handle_save_finding(
         return {"error": str(exc)}
 
 
+# fe0b0331 (doi / pmid args) — a bare DOI, ``doi:``-prefixed, or doi.org form.
+_CAPTURE_DOI_RE = re.compile(
+    r"^\s*(?:doi\s*:\s*|(?:https?://)?(?:dx\.)?doi\.org/)?(?P<doi>10\.\d{4,9}/\S+?)\s*$",
+    re.IGNORECASE,
+)
+_CAPTURE_PMID_RE = re.compile(r"^\s*[0-9]{1,9}\s*$")
+
+
+def _capture_source_url(args: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Resolve the provenance URL capture_research_finding stores.
+
+    Precedence: an explicit ``url`` wins; otherwise a ``doi`` is stored as its
+    https doi.org form; otherwise a ``pmid`` is stored as its PubMed URL. Returns
+    ``(source_url, error)``. ``(None, None)`` means no identifier was given.
+    """
+    _url = (args.get("url") or "").strip()
+    if _url:
+        return _url, None
+    _doi = str(args.get("doi") or "").strip()
+    if _doi:
+        m = _CAPTURE_DOI_RE.match(_doi)
+        if m is None:
+            return None, "capture_research_finding doi must be a DOI such as 10.1145/3292500.3330701"
+        return f"https://doi.org/{m.group('doi')}", None
+    _pmid = str(args.get("pmid") or "").strip()
+    if _pmid:
+        if _CAPTURE_PMID_RE.match(_pmid) is None:
+            return None, "capture_research_finding pmid must be a numeric PubMed id"
+        return f"https://pubmed.ncbi.nlm.nih.gov/{int(_pmid)}/", None
+    return None, None
+
+
 async def handle_capture_research_finding(
     args: dict[str, Any],
     db: Any,
@@ -2247,19 +2280,28 @@ async def handle_capture_research_finding(
     fe0b0331 — same in-project dedupe as save_finding: the same paper (matched
     by case-folded DOI / arXiv id without version / PMID / normalised URL)
     returns ``existing_note_id`` instead of a copy; ``force_new=true`` escapes.
+
+    fe0b0331 (doi / pmid args) — ``doi`` or ``pmid`` may stand in for ``url``.
+    With no url, a doi is stored as ``https://doi.org/<doi>`` and a pmid as its
+    PubMed URL, so the same paper captured by DOI and by publisher URL dedupes.
+    An explicit url always wins. With none of the three the existing error
+    text is returned.
     """
     validate_input_size(args.get("summary"), "finding summary", 1_000_000)
     validate_input_size(args.get("url"), "url", 2_000)
-    _url = (args.get("url") or "").strip()
-    if not _url:
+    validate_input_size(args.get("doi"), "doi", 2_000)
+    _source, _err = _capture_source_url(args)
+    if _err is not None:
+        return {"error": _err}
+    if _source is None:
         return {"error": "capture_research_finding requires a url"}
     if not (args.get("summary") or "").strip():
         return {"error": "capture_research_finding requires a non-empty summary"}
-    _st = "arxiv" if "arxiv.org" in _url.lower() else "web"
+    _st = "arxiv" if "arxiv.org" in _source.lower() else "web"
     try:
         return await db_module.save_finding(
             db, args["project_id"], args.get("summary") or "",
-            source_url=_url, source_type=_st,
+            source_url=_source, source_type=_st,
             decision_id=args.get("related_decision_id"),
             force_new=_flag(args.get("force_new")),
         )

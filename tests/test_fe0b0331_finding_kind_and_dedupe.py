@@ -474,3 +474,118 @@ def test_finding_identity_distinguishes_different_works():
         finding_identity("https://news.ycombinator.com/item?id=2"),
     }
     assert len(keys) == 9
+
+
+# ---------------------------------------------------------------------------
+# 7. capture_research_finding takes doi / pmid (sprint item a4e43f50)
+# ---------------------------------------------------------------------------
+
+async def _capture_args(db, pid, **kw):
+    args = {"project_id": pid, "summary": "Paper shows Y"}
+    args.update(kw)
+    return await nd_mod.handle_capture_research_finding(args, db, _DATA_DIR, None, None)
+
+
+@pytest.mark.asyncio
+async def test_doi_without_url_stores_the_doi_org_form(db, project):
+    out = await _capture_args(db, project["id"], doi="10.1145/3292500.3330701")
+    assert "error" not in out
+    assert out["note"]["source"] == "https://doi.org/10.1145/3292500.3330701"
+    assert out["source_type"] == "web"
+    stored = await db_module.get_project_note(db, out["note"]["id"])
+    assert stored["source"] == "https://doi.org/10.1145/3292500.3330701"
+
+
+@pytest.mark.asyncio
+async def test_doi_arg_dedupes_against_an_earlier_publisher_url(db, project):
+    pid = project["id"]
+    first = await _capture(db, pid, "https://dl.acm.org/doi/10.1145/3292500.3330701")
+    second = await _capture_args(db, pid, doi="10.1145/3292500.3330701")
+    assert "error" not in second
+    assert second["existing_note_id"] == first["note"]["id"]
+    assert second["duplicate"] is True
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_publisher_url_after_a_doi_arg_dedupes_too(db, project):
+    pid = project["id"]
+    first = await _capture_args(db, pid, doi="doi:10.1145/ABC.123")
+    assert first["note"]["source"] == "https://doi.org/10.1145/ABC.123"
+    second = await _capture(db, pid, "https://dl.acm.org/doi/10.1145/abc.123")
+    assert second["existing_note_id"] == first["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_doi_arg_force_new_creates_a_second_note(db, project):
+    pid = project["id"]
+    first = await _capture_args(db, pid, doi="10.1000/x8")
+    forced = await _capture_args(db, pid, doi="10.1000/x8", force_new=True)
+    assert "existing_note_id" not in forced
+    assert forced["note"]["id"] != first["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 2
+
+
+@pytest.mark.asyncio
+async def test_explicit_url_wins_over_doi_and_pmid(db, project):
+    out = await _capture_args(db, project["id"], url="https://example.com/post",
+                              doi="10.1000/x9", pmid="12345678")
+    assert out["note"]["source"] == "https://example.com/post"
+
+
+@pytest.mark.asyncio
+async def test_pmid_arg_stores_the_pubmed_url_and_dedupes(db, project):
+    pid = project["id"]
+    first = await _capture_args(db, pid, pmid="12345678")
+    assert first["note"]["source"] == "https://pubmed.ncbi.nlm.nih.gov/12345678/"
+    second = await _capture(db, pid, "https://pubmed.ncbi.nlm.nih.gov/12345678/")
+    assert second["existing_note_id"] == first["note"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_no_url_doi_or_pmid_keeps_the_existing_error_text(db, project):
+    pid = project["id"]
+    assert await _capture_args(db, pid) == {"error": "capture_research_finding requires a url"}
+    blank = await _capture_args(db, pid, doi="   ", pmid="  ")
+    assert blank == {"error": "capture_research_finding requires a url"}
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["not-a-doi", "10.12/x", "https://example.com/paper"])
+async def test_malformed_doi_arg_is_an_error_and_stores_nothing(db, project, bad):
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi=bad)
+    assert "error" in out and "doi" in out["error"]
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["PMID12", "1234567890", "12.5"])
+async def test_malformed_pmid_arg_is_an_error(db, project, bad):
+    out = await _capture_args(db, project["id"], pmid=bad)
+    assert "error" in out and "pmid" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_doi_arg_survives_the_real_mcp_dispatch(db, project):
+    from meridian.mcp import handler as mh
+
+    pid = project["id"]
+    first = await mh._dispatch_mcp_tool("capture_research_finding", {
+        "project_id": pid, "summary": "via doi dispatch", "doi": "10.1000/x10",
+    }, db, _DATA_DIR)
+    assert first["note"]["source"] == "https://doi.org/10.1000/x10"
+    dup = await mh._dispatch_mcp_tool("capture_research_finding", {
+        "project_id": pid, "summary": "again", "url": "https://dl.acm.org/doi/10.1000/X10",
+    }, db, _DATA_DIR)
+    assert dup["existing_note_id"] == first["note"]["id"]
+
+
+def test_capture_tool_schema_advertises_doi_and_pmid_without_requiring_url():
+    schema = next(t for t in mcp_tools._MCP_TOOLS_LIST if t["name"] == "capture_research_finding")
+    props = schema["inputSchema"]["properties"]
+    assert props["doi"]["type"] == "string"
+    assert props["pmid"]["type"] == "string"
+    assert schema["inputSchema"]["required"] == ["summary"]
