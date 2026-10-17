@@ -1097,11 +1097,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "32d3d5de — Launch a long-running job on a remote host (e.g. a rented GPU "
         "pod) over a short-lived SSH connection used ONLY to start it, never held "
         "open: the command runs fully detached (nohup+setsid), so it survives the "
-        "launching connection dropping for any reason. Returns quickly (a few "
-        "hundred ms) with a job_id regardless of how long the underlying job "
-        "takes — poll get_remote_task_status separately to check on it. Do not "
-        "include credentials in command; use env vars already set on the remote "
-        "host instead.",
+        "launching connection dropping for any reason. A launch that starts returns "
+        "within seconds with a job_id, regardless of how long the underlying job "
+        "takes — poll get_remote_task_status separately to check on it. A launch "
+        "that cannot confirm within about 15 seconds is recorded as status "
+        "launch_unconfirmed and may still be running on the host: confirm "
+        "it with get_remote_task_status before relaunching, because relaunching "
+        "can start a second, possibly paid, job. Do not include credentials in "
+        "command; use env vars already set on the remote host instead.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -1117,8 +1120,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "code), still running (PID alive), terminated-unexpectedly (PID gone, no "
         "exit code — often OOM-kill or a host reset), connection-lost-but-"
         "possibly-still-running (the SSH connection itself could not be "
-        "established, explicitly distinct from a failure), or unknown. Includes "
-        "a bounded log tail and elapsed time.",
+        "established, explicitly distinct from a failure), or unknown. A "
+        "successful status check (one that connects to the host) re-checks the row, "
+        "including a launch_unconfirmed one, and replaces its status with the one "
+        "observed there, except that an observed unknown never replaces an already-terminal "
+        "status. A check that connects but finds no pid file (NOPID) returns unknown and cannot "
+        "tell 'never started' from 'started, pid not yet written', so do not relaunch on unknown "
+        "alone. Includes a bounded log tail and elapsed time.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},

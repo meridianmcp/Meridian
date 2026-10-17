@@ -3,7 +3,8 @@ primitive v1 (W1-E, item 32d3d5de).
 
 Mirrors :mod:`meridian.research_run` / :mod:`meridian.experiment`'s structure
 and conventions exactly (read either first): pure validation/normalization
-and deterministic string-building, no DB, no network, no subprocess. See
+and deterministic string-building (the one exception: build_launch_script draws
+a fresh per-launch nonce), no DB, no network, no subprocess. See
 :mod:`meridian.db.remote_tasks` for persistence and :mod:`meridian.remote_ssh`
 for the actual SSH transport this module's scripts are ultimately run over.
 
@@ -27,9 +28,11 @@ rented GPU pod is the canonical case) hits three recurring failures:
 POSIX shell one-liner that backgrounds the caller's command fully detached
 (``nohup`` + ``setsid``, not just one or the other -- see that function's
 docstring) and echoes the launched PID back over the SAME short-lived
-connection used to start it, so the launch call returns in a few hundred ms
-with a real PID, and the underlying job survives that connection closing
-immediately afterward. :func:`build_status_check_script` /
+connection used to start it, and the underlying job survives that connection
+closing immediately afterward. A normal launch returns in seconds with a real
+PID. A launch that cannot confirm within about 15 seconds (the launch timeout
+in :mod:`meridian.remote_ssh`) is recorded as ``launch_unconfirmed`` and is
+confirmed later by a status check. :func:`build_status_check_script` /
 :func:`parse_status_check_output` / :func:`map_check_marker_to_status`
 answer (3): a second, always-fresh connection can cheaply ask "is this job
 done, running, or dead" without ever depending on the connection that
@@ -60,6 +63,7 @@ DEVIATIONS FROM THE SPRINT-ITEM BRIEF (documented, not silently resolved)
 from __future__ import annotations
 
 import re
+import secrets
 import shlex
 from typing import Any
 
@@ -78,13 +82,14 @@ REMOTE_TASK_STATUSES = frozenset(
         "completed-failure",
         "terminated-unexpectedly",
         "connection-lost-but-possibly-still-running",
+        "launch_unconfirmed",
         "unknown",
     }
 )
 # A job in one of these states is done for good -- no future status check can
-# ever move it back to "running". "connection-lost..." and "unknown" are
-# deliberately NOT terminal: both mean "we don't currently know", not "it's
-# over".
+# ever move it back to "running". "connection-lost...", "launch_unconfirmed"
+# and "unknown" are deliberately NOT terminal: each means "we don't currently
+# know", not "it's over".
 REMOTE_TASK_TERMINAL_STATUSES = frozenset(
     {"completed-success", "completed-failure", "terminated-unexpectedly"}
 )
@@ -108,6 +113,28 @@ _JOB_ID_RE = re.compile(
 )
 _STATUS_LINE_RE = re.compile(r"^MERIDIAN_STATUS=(\w+)\s*$", re.MULTILINE)
 _EXIT_CODE_LINE_RE = re.compile(r"^MERIDIAN_EXIT_CODE=(-?\d+)\s*$", re.MULTILINE)
+_PID_LINE_RE = re.compile(r"^MERIDIAN_PID=(\d+)\s*$", re.MULTILINE)
+# Per-file log-tail blocks emitted by build_status_check_script. Each block's
+# markers carry this job's nonce: ``MERIDIAN_STDOUT_BEGIN_<nonce>`` and so on.
+# build_launch_script writes the nonce to ``nonce.txt`` in the job directory,
+# and the status script echoes it back on a ``MERIDIAN_NONCE=`` header line.
+# parse_status_check_output accepts a block only when its markers carry the
+# nonce from that header line. Job output that contains the fixed strings
+# (``MERIDIAN_STDOUT_END`` and so on) therefore cannot move a tail boundary.
+# The unsuffixed prefixes below only locate the end of the header: the real
+# first block begins before any job output, so the first occurrence of a prefix
+# is always the real one.
+#
+# Limit: the job runs with the job directory as its working directory, so a job
+# that deliberately reads or rewrites nonce.txt can still forge markers. The
+# same holds for exit_code.txt and pid.txt, which a job can also write. The
+# nonce guards against marker text that shows up in job output by accident or
+# by copying another job's log. It is not a sandbox.
+_NONCE_LINE_RE = re.compile(r"^MERIDIAN_NONCE=([0-9a-f]{16})\s*$", re.MULTILINE)
+_STDOUT_BEGIN = "MERIDIAN_STDOUT_BEGIN"
+_STDOUT_END = "MERIDIAN_STDOUT_END"
+_STDERR_BEGIN = "MERIDIAN_STDERR_BEGIN"
+_STDERR_END = "MERIDIAN_STDERR_END"
 
 
 class RemoteExecError(ValueError):
@@ -118,7 +145,7 @@ def validate_status(value: object) -> str:
     """Normalize and validate a remote-task status against the closed
     vocabulary (running | completed-success | completed-failure |
     terminated-unexpectedly | connection-lost-but-possibly-still-running |
-    unknown)."""
+    launch_unconfirmed | unknown)."""
     status = value.strip().lower() if isinstance(value, str) else ""
     if status not in REMOTE_TASK_STATUSES:
         raise RemoteExecError(
@@ -238,6 +265,13 @@ def build_job_dir(job_id: str, base_dir: str = DEFAULT_REMOTE_BASE_DIR) -> str:
     return f"{base_dir}/{job_id}"
 
 
+def new_nonce() -> str:
+    """Return a fresh per-launch nonce: 16 lowercase hex characters from
+    :func:`secrets.token_hex`. It frames the log-tail blocks of one job's
+    status checks (see the constants above)."""
+    return secrets.token_hex(8)
+
+
 def build_launch_script(
     job_id: str, command: str, *, base_dir: str = DEFAULT_REMOTE_BASE_DIR
 ) -> str:
@@ -247,38 +281,79 @@ def build_launch_script(
     Structure:
       1. ``mkdir -p`` the job directory and ``cd`` into it (unquoted: see
          :func:`build_job_dir`'s docstring on why -- ``base_dir`` and
-         ``job_id`` are both trusted/generated, never raw caller input).
-      2. Run the caller's ``command`` inside ``nohup setsid bash -c ...``,
-         backgrounded, with stdin closed and stdout/stderr redirected to log
-         files. BOTH ``nohup`` (ignores SIGHUP delivered directly to the
+         ``job_id`` are both trusted/generated, never raw caller input). Then
+         write a fresh nonce to ``nonce.txt`` (:func:`new_nonce`). The status
+         check frames its log tails with it, so job output cannot forge the
+         block boundaries (see the constants above).
+      2. Start the inner script ``bash -c ...`` under ``nohup setsid``,
+         backgrounded. BOTH ``nohup`` (ignores SIGHUP delivered directly to the
          process) AND ``setsid`` (starts a brand-new session, fully detached
          from the SSH pty/session) are used together -- either alone covers
          most but not all of the ways a dropped SSH connection can still
          reap a naively-backgrounded child; using both is the standard
          belt-and-suspenders idiom for this exact problem.
+         The OUTER backgrounded job (the ``nohup setsid`` process) has its
+         stdin and stdout redirected to ``/dev/null`` and its stderr to
+         ``launch.err`` in the job directory, so it holds no file descriptor on
+         the SSH channel. This matters: sshd keeps the session open until every
+         process holding the channel's stdout/stderr closes it, so an inherited
+         channel would keep the launching ssh call open for the whole life of
+         the job. ``launch.err`` keeps the outer job's own errors (for example
+         ``nohup: failed to run command 'setsid'``), which ``/dev/null`` would
+         discard. The inner script itself redirects the caller's command to
+         ``stdout.log`` and ``stderr.log`` (and gives it ``/dev/null`` as stdin).
       3. ``$!`` (the PID of the just-backgrounded process) is captured
          immediately in the SAME shell invocation and both written to
          ``pid.txt`` AND echoed to stdout (via ``tee``) -- the launch call's
          own SSH stdout is exactly this PID, so the caller gets it back on
-         the first round-trip with no extra work.
-      4. On completion (success OR failure) the wrapped command's real exit
-         code is written to ``exit_code.txt``. This -- not "the PID is gone"
-         -- is the primary "is it actually done, and how" signal: a PID
-         disappearing is ambiguous (normal exit vs. OOM-killed vs. host
-         reboot all look the same from the outside), while an exit-code file
-         existing means the wrapper shell itself ran to completion.
+         the first round-trip with no extra work. The script then sleeps one
+         second and checks that the job is still there: ``kill -0`` on that PID,
+         or an existing ``exit_code.txt``, which the wrapper writes just before it
+         exits, so a command that finished inside that second also passes. Only
+         then does the launch exit 0 with the PID. Otherwise the outer job died
+         in its first second. The script prints the tail of ``launch.err`` to
+         stderr and exits 1, so the caller sees the reason in the launch result.
+         The synchronous steps fail with the shell's own error for mkdir, cd and
+         the nonce write, because ``launch.err`` does not exist yet at those
+         points. Only a failed pid write, which runs after the job has started,
+         prints the tail of ``launch.err``. A detached job that dies after
+         that second is not reported by the launch. The first status check
+         reports it (see :func:`build_status_check_script`). Until that check,
+         the row is stored as ``running`` with a PID that is no longer alive.
+      4. When the wrapped command finishes (including by calling ``exit N``),
+         the inner script writes that command's own exit status to
+         ``exit_code.txt``. The command runs in a subshell ``( command )``, so
+         the recorded value is the command's ``$?``, not the status of the
+         wrapper shell. A command killed by a signal records ``128 + signal
+         number``. This -- not "the PID is gone" -- is the primary "is it
+         actually done, and how" signal: a PID disappearing is ambiguous
+         (normal exit vs. OOM-killed vs. host reboot all look the same from
+         the outside), while an existing ``exit_code.txt`` means the command
+         finished and this is its status. A job whose wrapper dies before it
+         can write the file leaves no exit-code file and is reported as
+         terminated-unexpectedly.
 
     ``command`` is the only untrusted input here and is embedded as ONE
     ``shlex.quote``-d argument to ``bash -c`` -- never string-concatenated
     unquoted into the outer script.
     """
     job_dir = build_job_dir(job_id, base_dir)
-    inner = f"{{ {command} ; }} > stdout.log 2> stderr.log < /dev/null; echo $? > exit_code.txt"
+    nonce = new_nonce()
+    # The command runs in a SUBSHELL, not a brace group: a bare ``exit N`` inside
+    # the command must end only the subshell, so the ``echo $?`` record still
+    # runs. In a brace group that ``exit`` would end the wrapper first and the
+    # job would be reported as terminated-unexpectedly. The newline before ``)``
+    # keeps a trailing shell comment in the command from swallowing the paren.
+    inner = f"( {command}\n) > stdout.log 2> stderr.log < /dev/null; echo $? > exit_code.txt"
     quoted_inner = shlex.quote(inner)
     return (
         f"mkdir -p {job_dir} && cd {job_dir} && "
-        f"{{ nohup setsid bash -c {quoted_inner} & }} && "
-        f"echo $! | tee pid.txt"
+        f"echo {nonce} > nonce.txt && "
+        f"{{ nohup setsid bash -c {quoted_inner} < /dev/null > /dev/null 2> launch.err & }} && "
+        f"echo $! | tee pid.txt && "
+        f"sleep 1 && "
+        f'{{ kill -0 "$(cat pid.txt)" 2>/dev/null || [ -f exit_code.txt ]; }} || '
+        f"{{ tail -c {MAX_LOG_TAIL_BYTES} launch.err >&2 2>/dev/null; exit 1; }}"
     )
 
 
@@ -291,8 +366,8 @@ def build_status_check_script(
     """Build the single POSIX shell command that determines a job's status,
     in the exact priority order the sprint item specifies:
 
-      1. ``exit_code.txt`` exists -> the wrapper ran to completion; read the
-         real exit code.
+      1. ``exit_code.txt`` exists -> the wrapped command finished; read the
+         exit status it recorded (see :func:`build_launch_script` step 4).
       2. Else the recorded PID is still alive (``kill -0``) -> running.
       3. Else a PID was recorded but is gone with no exit code -> the job
          was launched but died without the wrapper ever completing
@@ -301,16 +376,51 @@ def build_status_check_script(
       4. Else (no ``pid.txt`` at all, or the job directory itself is
          missing) -> genuinely unknown, distinct from every case above.
 
-    Emits a small, line-oriented, greppable marker format
-    (``MERIDIAN_STATUS=...`` / ``MERIDIAN_EXIT_CODE=...`` /
-    ``MERIDIAN_LOG_BEGIN``..``MERIDIAN_LOG_END``) rather than JSON -- no
-    guarantee a bare POSIX ``sh`` on an arbitrary remote host has a JSON
+    The header lines come first: ``MERIDIAN_STATUS=...``, then
+    ``MERIDIAN_EXIT_CODE=...`` (only when DONE; the value is the wrapped
+    command's own exit status, see :func:`build_launch_script` step 4) and
+    ``MERIDIAN_PID=...`` (whenever ``pid.txt`` exists, so a caller can persist
+    the PID and log path even when the status itself is not RUNNING).
+
+    A ``MERIDIAN_NONCE=<nonce>`` line (the nonce from ``nonce.txt``) follows
+    the header, then two independent log-tail blocks, one per file. Each
+    block's markers carry that nonce: ``MERIDIAN_STDOUT_BEGIN_<nonce>`` ..
+    ``MERIDIAN_STDOUT_END_<nonce>`` holds the last ``log_tail_bytes`` of
+    ``stdout.log``, and ``MERIDIAN_STDERR_BEGIN_<nonce>`` ..
+    ``MERIDIAN_STDERR_END_<nonce>`` holds the last ``log_tail_bytes`` of
+    ``stderr.log``. Each file gets its own ``tail -c`` call so a large stderr
+    cannot crowd stdout out of the result. When ``stderr.log`` is absent the
+    job never started, so the stderr block holds ``launch.err`` instead, and a
+    launch that failed still reports why. With no ``nonce.txt`` (the NODIR path,
+    or a job directory from before nonces existed) no blocks are emitted at all,
+    and the parser returns empty tails.
+
+    Emits a small, line-oriented, greppable marker format rather than JSON --
+    no guarantee a bare POSIX ``sh`` on an arbitrary remote host has a JSON
     encoder on hand, but every one of these is a plain ``echo``.
     :func:`parse_status_check_output` is this format's one reader.
     """
     job_dir = build_job_dir(job_id, base_dir)
+    tail_bytes = int(log_tail_bytes)
+    # Blocks are emitted only when nonce.txt exists and is non-empty. On the
+    # NODIR path the cwd is NOT the job directory, so there is no nonce and no
+    # blocks, which also keeps a stray stdout.log in $HOME from being shown.
+    # The nonce is read into N and every marker is built from it. The echo
+    # arguments are double-quoted, so a malformed nonce file cannot split or
+    # glob them. The parser rejects any nonce that is not 16 hex characters.
+    tail_blocks = (
+        "if [ -s nonce.txt ]; then N=$(cat nonce.txt); "
+        'echo "MERIDIAN_NONCE=$N"; '
+        f'echo "{_STDOUT_BEGIN}_$N"; tail -c {tail_bytes} stdout.log 2>/dev/null; echo; '
+        f'echo "{_STDOUT_END}_$N"; '
+        f'echo "{_STDERR_BEGIN}_$N"; '
+        f"{{ tail -c {tail_bytes} stderr.log 2>/dev/null || "
+        f"tail -c {tail_bytes} launch.err 2>/dev/null; }}; echo; "
+        f'echo "{_STDERR_END}_$N"; '
+        "fi"
+    )
     return (
-        f"cd {job_dir} 2>/dev/null || {{ echo MERIDIAN_STATUS=NODIR; echo MERIDIAN_LOG_BEGIN; echo MERIDIAN_LOG_END; exit 0; }}; "
+        f"cd {job_dir} 2>/dev/null || {{ echo MERIDIAN_STATUS=NODIR; exit 0; }}; "
         "if [ -f exit_code.txt ]; then "
         "echo MERIDIAN_STATUS=DONE; echo MERIDIAN_EXIT_CODE=$(cat exit_code.txt); "
         "elif [ -f pid.txt ] && kill -0 \"$(cat pid.txt)\" 2>/dev/null; then "
@@ -318,9 +428,8 @@ def build_status_check_script(
         "elif [ -f pid.txt ]; then "
         "echo MERIDIAN_STATUS=DIED; "
         "else echo MERIDIAN_STATUS=NOPID; fi; "
-        "echo MERIDIAN_LOG_BEGIN; "
-        f"tail -c {int(log_tail_bytes)} stdout.log stderr.log 2>/dev/null; "
-        "echo MERIDIAN_LOG_END"
+        "if [ -f pid.txt ]; then echo MERIDIAN_PID=$(cat pid.txt); fi; "
+        f"{tail_blocks}"
     )
 
 
@@ -338,28 +447,70 @@ def parse_launch_pid(stdout: object) -> "int | None":
     return None
 
 
+def _extract_block(text: str, begin: str, end: str, start: int = 0) -> tuple[str, int]:
+    """Return ``(body, cursor)`` for the first ``begin``..``end`` block at or
+    after ``start``, where ``cursor`` is the offset just past the ``end``
+    marker. A missing ``begin`` yields ``("", start)``; a missing ``end``
+    (truncated transport output) takes the rest of the text."""
+    begin_at = text.find(begin, start)
+    if begin_at < 0:
+        return "", start
+    body_start = begin_at + len(begin)
+    end_at = text.find(end, body_start)
+    if end_at < 0:
+        return text[body_start:].strip("\n"), len(text)
+    return text[body_start:end_at].strip("\n"), end_at + len(end)
+
+
 def parse_status_check_output(stdout: object) -> dict[str, Any]:
     """Parse :func:`build_status_check_script`'s marker-format output into
-    ``{"marker": str, "exit_code": int | None, "log_tail": str}``.
+    ``{"marker": str, "exit_code": int | None, "pid": int | None,
+    "stdout_tail": str, "stderr_tail": str}``.
 
     ``marker`` is one of DONE/RUNNING/DIED/NOPID/NODIR, or "NOPID" as a safe
     default when the expected marker line is missing entirely (a
     should-never-happen case -- a genuinely broken remote shell -- that
     still needs to map to SOMETHING rather than raising).
+
+    ``marker``, ``exit_code`` and ``pid`` are read ONLY from the header, the
+    part before the first log block. Log content is job output, which is
+    untrusted, so a log line that happens to look like ``MERIDIAN_EXIT_CODE=``
+    must never be taken as the real exit status. Each tail is read only from a
+    block whose markers carry the nonce declared in the header (see the
+    constants above), so job output that contains the fixed marker strings
+    cannot move a tail boundary. Each tail is truncated to
+    :data:`MAX_LOG_TAIL_BYTES` on its own. Without a nonce header, both tails
+    are empty.
     """
     text = stdout if isinstance(stdout, str) else ""
-    marker_match = _STATUS_LINE_RE.search(text)
+    # Job output appears only inside blocks, and the real first block begins
+    # before any of it, so the first occurrence of the unsuffixed prefix is
+    # always the real one. Everything before it is the header.
+    first_block = text.find(_STDOUT_BEGIN)
+    header = text if first_block < 0 else text[:first_block]
+    marker_match = _STATUS_LINE_RE.search(header)
     marker = marker_match.group(1) if marker_match else "NOPID"
-    exit_match = _EXIT_CODE_LINE_RE.search(text)
+    exit_match = _EXIT_CODE_LINE_RE.search(header)
     exit_code = int(exit_match.group(1)) if exit_match else None
-    log_tail = ""
-    if "MERIDIAN_LOG_BEGIN" in text:
-        after = text.split("MERIDIAN_LOG_BEGIN", 1)[1]
-        log_tail = after.split("MERIDIAN_LOG_END", 1)[0].strip("\n")
+    pid_match = _PID_LINE_RE.search(header)
+    pid = int(pid_match.group(1)) if pid_match else None
+    # Without a valid nonce line the tails stay empty. That fails closed.
+    stdout_tail = stderr_tail = ""
+    nonce_match = _NONCE_LINE_RE.search(header)
+    if nonce_match:
+        nonce = nonce_match.group(1)
+        stdout_tail, cursor = _extract_block(
+            text, f"{_STDOUT_BEGIN}_{nonce}", f"{_STDOUT_END}_{nonce}",
+        )
+        stderr_tail, _ = _extract_block(
+            text, f"{_STDERR_BEGIN}_{nonce}", f"{_STDERR_END}_{nonce}", cursor,
+        )
     return {
         "marker": marker,
         "exit_code": exit_code,
-        "log_tail": truncate_log_tail(log_tail),
+        "pid": pid,
+        "stdout_tail": truncate_log_tail(stdout_tail),
+        "stderr_tail": truncate_log_tail(stderr_tail),
     }
 
 
