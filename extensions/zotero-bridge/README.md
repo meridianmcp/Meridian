@@ -1,44 +1,164 @@
 # Meridian Zotero Bridge
 
-Two menu actions for Zotero, plus a preferences pane:
+Menu actions and a local write API for Zotero:
 
-- **Import BibTeX here...** on a collection's context menu. Pick one `.bib` file. The
-  entries are checked for duplicates against the whole library, and the new ones are
-  imported into that collection.
-- **Attach PDFs from folder...** on an item's context menu, for the selected items. Pick
-  a folder. For each item whose Extra field has a `BibTeX key: <key>` line, the plugin
-  looks for `<key>.pdf` in that folder and attaches it.
+- **Import BibTeX here...** on a collection's context menu. Pick one `.bib` file. The entries are checked for
+  duplicates against the whole library, and the new ones are imported into that collection.
+- **Attach PDFs from folder...** on an item's context menu, for the selected items. Pick a folder. For each item
+  whose Extra field has a `BibTeX key: <key>` line, the plugin looks for `<key>.pdf` in that folder and attaches it.
+- **Local write API** on `127.0.0.1:23125`, for scripts and agents. It creates, edits, trashes and restores items,
+  notes, attachments, relations, collections and tags, and it imports BibTeX. Reads stay on Zotero's own local API.
+  See "Local write API" below.
 
-Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.2`. Earlier builds: `0.1.0` (Mozilla-approved,
-no `strict_max_version`). `0.1.1` (on Mozilla, uploaded by the owner, with the old placeholder
-`update_url`, so it does not auto-update from GitHub).
+Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.3` (source; not yet signed or released).
+Earlier builds: `0.1.2` (Mozilla-signed, menus only, no write API), `0.1.1` (on Mozilla, uploaded by the owner, with
+the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.0` (Mozilla-approved, no
+`strict_max_version`).
 
-## Status: source, packaged by Meridian, untested in Zotero
+## Status
 
-This folder is plugin **source**. Meridian's install command packs it into an `.xpi`
-(see `docs/zotero-plugin-install.md`), but the packed file has not been installed into a
-real Zotero profile or run inside Zotero. The pure logic in `lib/` is covered by
-`node --test`. The Zotero glue in `bootstrap.js` and `content/preferences.xhtml` is
-written against the APIs listed under "Verify before first real use" and has not been
-exercised. Do not point it at a library you care about until the disposable-profile
-checklist below passes.
+- **Verified in Zotero 10.0.6.** On 2026-10-17, against a throwaway profile with its own data folder, the write API
+  passed 52 live checks: admission (token, Host, Origin), item, note, attachment, relation, collection, tag, batch
+  and BibTeX routes, and error responses. A missing token file left the API off while Zotero ran normally.
+  Those checks ran before the limit, collection, restore, linked-file, batch rollback, BibTeX key and creator-role
+  changes listed below, so those changes are not live-checked yet.
+- **Verified in node.** The unit tests cover the HTTP parser, admission, validation, the write logic (against a
+  Zotero-shaped fake) and the design-line checks in `test/static-checks.test.js`.
+- **Not verified in Zotero:** the two menu commands, the preferences pane, and the file pickers. These run only
+  through the Zotero window, which the checks above did not drive. The BibTeX import they share with the API was
+  verified through the API.
+- **Not yet done:** a Mozilla-signed `0.1.3` build, and its release to the update channel. Until that happens,
+  Meridian's install step prints the signing command.
+
+Two bugs were found and fixed while verifying. The BibTeX duplicate check called `Zotero.Items.getAll` with its first
+two arguments swapped, so the import failed before it wrote anything. The menu import and the API import share that
+code, so both were affected. Restoring a collection now restores the subcollections that were trashed with it, as
+Zotero's own restore does. That restore is API-only.
 
 ## Design line
 
-- No HTTP endpoint, no server, no file watcher, no timer that picks up outside files,
-  and no code path that another program can trigger.
-- A menu command or the preferences pane is the only way in. Every write starts from a
-  user action inside Zotero.
-- No network calls. The plugin code does not call the local Zotero API, the Zotero Web
-  API, or any other endpoint.
-- `test/static-checks.test.js` enforces this in code. It fails if the runtime files gain
-  a network call, a server, a watcher, a timer, an observer, a URL literal, a local host
-  address, a secret-shaped string, a machine-local path, or any email address other than
-  the plugin ID.
+- A write comes from one of two places: a menu command you choose inside Zotero, or the local write API.
+- The write API listens on `127.0.0.1` only. It answers only a `Host` header of `127.0.0.1:<port>`. It refuses any
+  request with an `Origin` header, so a browser page cannot drive it. It needs `Authorization: Bearer <token>`,
+  compared in constant time.
+- **Local trust.** The API trusts every local process that holds the token, and it cannot tell them apart. They share
+  one connection limit of eight. A connection that sends no complete request is closed after ten seconds, so one
+  process can hold a slot for up to ten seconds that way. After an answer, the socket stays open for up to five more
+  seconds. This affects local availability only: a local process can keep other callers from connecting.
+- The plugin makes no outbound network calls. There is no file watcher and no timer that picks up outside files.
+- Only `api/listener.js` opens a socket, starts a timer, or names the loopback address. Everything else is pure
+  logic in `lib/`, which node tests cover.
+- Nothing deletes data permanently. Items and collections go to the trash, and restore brings them back.
+  `test/static-checks.test.js` fails the build if code calls `erase`, `emptyTrash`, or an SQL `DELETE`.
+- `test/static-checks.test.js` also fails the build on a URL literal, a `fetch` call, an observer, a localhost name,
+  an email address other than the plugin ID, a secret-shaped string, or a machine-local path.
 
-The bridge makes no network calls of its own. Zotero itself checks the `update_url` in
-`manifest.json` for updates when automatic updates are on. That request is Zotero's, not
-plugin code. The URL is not live yet (see "Updates" below).
+## Local write API
+
+### Start, stop, and the token
+
+- The API starts when Zotero starts, but only if the profile's `user.js` names a token file
+  (`extensions.zotero.meridianZoteroBridge.apiTokenPath`) and the file holds a usable token. It stops at shutdown.
+  Without a usable token the API stays off, the menus still work, and Zotero logs the reason.
+- The port is `extensions.zotero.meridianZoteroBridge.apiPort`, default `23125`. If another program holds the port,
+  the API stays off and Zotero logs that.
+- The Meridian install writes both prefs into the profile's `user.js`. It creates the token file once, in
+  `%USERPROFILE%\.meridian\local_runner\zotero_bridge\api_token` (or under the folder named by
+  `MERIDIAN_LOCAL_RUNNER_STATE_DIR`). A reinstall keeps an existing usable token. The token is a credential. Do not
+  print it, paste it into a chat, or commit it.
+
+### Calling it
+
+Every request needs these headers:
+
+- `Host: 127.0.0.1:23125`
+- `Authorization: Bearer <token>`
+- `Content-Type: application/json`, for any request with a body. The body is one JSON object, at most 40 MiB.
+
+Every response is JSON. Errors have the shape `{"error": {"code": "...", "message": "...", "details": {...}}}`.
+Each connection carries one request, and the server closes it after the answer.
+
+```bash
+TOKEN=$(cat "$HOME/.meridian/local_runner/zotero_bridge/api_token")
+curl -s -X POST http://127.0.0.1:23125/v1/items \
+  -H "Host: 127.0.0.1:23125" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"item_type": "book", "fields": {"title": "A title"}, "tags": ["reading"]}'
+```
+
+Reads: use Zotero's own local API (`http://127.0.0.1:23119/api/users/0/...`), which Zotero serves when
+"Allow other applications on this computer to communicate with Zotero" is on. The write API does not serve reads.
+
+### Endpoints
+
+Keys are Zotero's 8-character keys. Every item response has `key`, `version`, `date_modified`, and `library_id`.
+Collection responses have the same fields except `date_modified`, because Zotero collections do not keep one.
+
+| Method and path | Body | Notes |
+| --- | --- | --- |
+| `GET /v1/status` | none | Plugin, API and Zotero versions, and the library id. |
+| `POST /v1/items` | `item_type`, optional `fields`, `creators`, `tags`, `collection_keys`, `relations` | Answers 201. Unknown fields are refused, and the reply lists them. |
+| `PATCH /v1/items/{key}` | `fields`, `creators`, `set_tags`, `add_tags`, `remove_tags`, `set_collections`, `add_collections`, `remove_collections`, `add_relations`, `remove_relations`, and the precondition fields | Only the fields you send change. `item_type` cannot change. |
+| `POST /v1/items/{key}/trash` | precondition fields, optional | Moves the item to the trash. Works for notes and attachments too. |
+| `POST /v1/items/{key}/restore` | precondition fields, optional | Takes the item out of the trash. |
+| `POST /v1/items/{key}/notes` | `html` | Creates a child note of a regular item. Answers 201. |
+| `PATCH /v1/notes/{key}` | `html`, precondition fields | Replaces the note's HTML. |
+| `POST /v1/items/{key}/attachments` | `mode`, and either `filename` plus `data_base64` (`imported_file`) or `path` (`linked_file`), plus optional `title` and `content_type` | Answers 201. A linked file must exist, or the reply is 422 `file_not_found`. Not allowed inside a batch. |
+| `POST /v1/items/{key}/relations` | `related_key`, or `predicate` plus `object` | Adds a relation. |
+| `DELETE /v1/items/{key}/relations` | the same as the POST | Removes the relation. |
+| `POST /v1/collections` | `name`, optional `parent_key` | Answers 201. |
+| `PATCH /v1/collections/{key}` | `name`, `parent_key` (`null` moves it to the top), `expected_version` (synced libraries only) | Refuses a move that would make a collection its own ancestor. Sending `expected_modified` is refused with 422. |
+| `POST /v1/collections/{key}/trash` and `/restore` | `expected_version`, optional (synced libraries only) | Restoring also restores every trashed subcollection under it, including ones trashed earlier, as Zotero's own Restore does. A collection whose parent is still in the trash cannot be restored: restore the parent first (422). |
+| `POST /v1/collections/{key}/items` | `item_keys` | Adds items. Refuses the whole list if any key is unknown or trashed. |
+| `DELETE /v1/collections/{key}/items` | `item_keys` | Removes items from the collection. The items stay in the library. |
+| `POST /v1/tags/rename` | `from`, `to` | Renames a tag across the user library. Not allowed inside a batch. |
+| `POST /v1/import/bibtex` | `bibtex`, optional `collection_key`, optional `dry_run` | Returns the plan: what would import, the exact duplicates, and the conflicts. `dry_run: true` writes nothing. A file whose library changes during the parse is refused with 409 `library_changed`, and nothing is imported. Not allowed inside a batch. |
+| `POST /v1/batch` | `operations`: a list of `{method, path, body}` | Runs the operations in one transaction. Any failure rolls the whole batch back and reports `failed_index`. |
+
+Relation objects are the ones Zotero stores. `related_key` links two items in the library. Any other predicate
+needs the `predicate:name` form (for example `dc:replaces`) and an `object` with no spaces.
+
+### Concurrency
+
+- Send back the `date_modified` you read as `expected_modified`. If the item has changed since, the write is refused
+  with `409 changed_since_read`, and nothing is written. Zotero keeps `date_modified` to the second, so two saves in
+  the same second look the same to this check.
+- Local items stay at `version: 0` until a sync, so `expected_version` gives no protection for them. It is checked
+  when you send it, for synced libraries.
+- Collections have no `date_modified`, so their replies omit it. For a collection, send `expected_version` only for a
+  synced library. A collection write that sends `expected_modified` is refused with 422. A local library keeps version
+  at 0, so a collection in one has no version check to send.
+- Writes run one at a time. Two requests that arrive together do not interleave.
+
+### Batches
+
+- A batch runs its operations in order, inside one transaction. If any fails, the batch is rolled back and the reply
+  names the operation that failed. The Zotero objects that the batch changed in
+  memory are reloaded from the database, so the running Zotero matches what is stored. Writes inside a batch do not
+  wait on a transaction Zotero opened for the UI.
+- These can run inside a batch: item create, update, trash and restore; note create and update; relation add and
+  remove; collection create, update, trash and restore; and adding or removing items in a collection.
+- These cannot run inside a batch, and a batch that names one is refused before anything is written: attachments, tag
+  rename and BibTeX import. Each opens its own transaction, and Zotero does not nest them. Send them on their own.
+
+### Limits and rules
+
+- Request: headers 16 KiB, body 40 MiB. Attachment content 24 MiB after decoding. Note HTML 2 MB. Field value
+  100 KB. BibTeX text 8 MiB. A batch holds at most 200 operations. The body limit leaves room for a 24 MiB attachment,
+  which is 32 MiB in base64, plus the rest of the JSON.
+- Writes go to the user library only. Group libraries are not writable through this API.
+- A creator role that the item type does not allow is refused with 422. The message names the role and the item type.
+- A BibTeX duplicate check counts trashed items as existing, so a re-import does not bring back something the user
+  trashed.
+- An imported attachment is copied into Zotero storage. A linked attachment stores the path. A token holder can link
+  any absolute regular file that the Zotero process can read. The reply is 201 for a file that exists and 422
+  `file_not_found` otherwise, so a reply shows whether a path exists. UNC and device paths are refused. A check that
+  stalls for more than five seconds returns 422 `file_check_timed_out`. The API does not return file contents.
+- Errors go to Zotero's error console. Request bodies and the token are never logged.
+
+### Not in this version
+
+Permanent delete, group libraries, any reads (use Zotero's local API), PDF text extraction, and tag management beyond
+rename, add and remove.
 
 ## Install
 
@@ -48,10 +168,12 @@ plugin code. The URL is not live yet (see "Updates" below).
    turns closing off. With closing off, close Zotero before you run it.
    A close request can still time out, and then nothing is installed.
    An install that finds the plugin already current does not close Zotero.
-   The command packs this folder into the unsigned build `meridian-zotero@usemeridian.us.xpi` in Meridian's
+   The command packs this folder into the unsigned build (the plugin ID with the `.xpi` extension) in Meridian's
    state folder. That build writes nothing to the Zotero profile. The command copies a file into your
-   profile only when the Mozilla-signed file for this version is stored. Otherwise it prints the signing
-   command and the unsigned file's path. See `docs/zotero-plugin-install.md`, section 4a.
+   profile only when a Mozilla-signed file for this version is stored. With signing credentials set and no
+   signed file stored, it first fetches the approved file for this version from addons.mozilla.org. That fetch
+   only reads and submits nothing. Otherwise it prints the signing command and the unsigned file's path. See
+   `docs/zotero-plugin-install.md`, section 4a.
 2. In Zotero, open **Tools > Plugins**, click the gear icon, and choose **Install Plugin From File**.
 3. Select the `.xpi`, then restart Zotero if asked.
 
@@ -73,10 +195,20 @@ because Meridian has no record of that submission. Bump that version before you 
 Scope: the automatic install through the Meridian tray app is Windows only. It needs Zotero 8 or later
 (the manifest's minimum). See `docs/zotero-plugin-install.md`.
 
+The install also writes the local write API's two prefs into the profile's `user.js`, and creates the token file
+once, in `%USERPROFILE%\.meridian\local_runner\zotero_bridge\api_token`. A reinstall keeps an existing usable token.
+Section 5 of the install guide has a status check that uses the token without printing it.
+
+Beyond the file copy and the two API prefs, the install also writes the scan line to `user.js`
+(`extensions.startupScanScopes = 1`), enables the add-on in `extensions.json`, and, when the add-on is not yet
+registered, starts Zotero, waits for it to register the add-on, and closes Zotero again. Meridian enables the plugin
+only in Zotero's default profile. A rerun on an already-current install repairs the scan line, the token and the two
+API prefs, and writes nothing else.
+
 ## Duplicate rules (BibTeX import)
 
-Each parsed entry is checked against every item already in the library. Checks run
-before anything is written.
+Each parsed entry is checked against every item already in the library, trashed items included. Checks run before
+anything is written.
 
 | Situation | Result |
 | --- | --- |
@@ -86,111 +218,97 @@ before anything is written.
 | Titles match and both DOIs are present and differ | **Conflict**: not imported, listed in the report for review |
 | Anything else | **New**: imported |
 
-Normalised title: lowercase, BibTeX braces removed, whitespace collapsed, leading and
-trailing punctuation trimmed. Punctuation inside the title is kept.
+Normalised title: lowercase, BibTeX braces removed, whitespace collapsed, leading and trailing punctuation trimmed.
+Punctuation inside the title is kept.
 
-If a title matches both an exact item and a conflicting item, the entry counts as exact.
-An entry that appears twice in the same file counts as exact the second time.
+If a title matches both an exact item and a conflicting item, the entry counts as exact. An entry that appears twice
+in the same file counts as exact the second time.
+
+Citation keys. The citation key of an imported entry comes from the translator's `itemID` field, which the BibTeX
+import translator keeps. An explicit `citationKey` field, or a `Citation Key:` line in Extra, is used first when
+present. Each imported item gets a `BibTeX key: <key>` line in Extra, which the PDF step reads. If the library's item
+count changes while the file is parsed, the import is refused with 409 `library_changed`, and nothing is imported.
 
 ## Attach PDFs (storage)
 
 - **Default: copy.** Each PDF is copied into Zotero storage.
-- **Link instead:** turn on "Link PDFs instead of copying" in the preferences pane. The
-  file stays where it is and Zotero links to it.
+- **Link instead:** turn on "Link PDFs instead of copying" in the preferences pane. The file stays where it is and
+  Zotero links to it.
 
-**Cloud quota note.** If Zotero file sync is on, copied PDFs count toward the Zotero cloud
-storage quota. Linked files do not. The link option avoids that cost, but linked files
-break if the source folder moves. The default is copy (the link option is off).
+**Cloud quota note.** If Zotero file sync is on, copied PDFs count toward the Zotero cloud storage quota. Linked files
+do not. The link option avoids that cost, but linked files break if the source folder moves. The default is copy (the
+link option is off).
 
-A PDF is attached only when the item has no existing PDF attachment, the file exists,
-and the file starts with `%PDF-`.
+A PDF is attached only when the item has no existing PDF attachment, the file exists, and the file starts with `%PDF-`.
 
 ## Preferences
 
-One preference, `extensions.zotero.meridianZoteroBridge.linkPdfs`, default `false`. The
-pane shows the duplicate policy as text. Nothing else is configurable.
+- `extensions.zotero.meridianZoteroBridge.linkPdfs`, default `false`. Shown in the preferences pane.
+- `extensions.zotero.meridianZoteroBridge.apiPort`, default `23125`. Set by the install.
+- `extensions.zotero.meridianZoteroBridge.apiTokenPath`, default empty, which keeps the API off. Set by the install.
 
 ## Compatibility
 
 - `applications.zotero.strict_min_version` is `8.0`.
-- `strict_max_version` is **`"99.*"`**. The owner's decision is no practical maximum, and
-  `99.*` is that value. It was added in 0.1.1 because Zotero 10.0.6 rejects a `zotero`
-  add-on without the key. The parser reports "applications.zotero.strict_max_version not
-  provided", and in a fresh profile the file was deleted at startup. The 0.1.0 build
-  lacked the key. Tested 2026-10-16 with throwaway profiles.
+- `strict_max_version` is **`"99.*"`**. The owner's decision is no practical maximum, and `99.*` is that value. It was
+  added in 0.1.1 because Zotero 10.0.6 rejects a `zotero` add-on without the key. The parser reports
+  "applications.zotero.strict_max_version not provided", and in a fresh profile the file was deleted at startup. The
+  0.1.0 build lacked the key. Tested 2026-10-16 with throwaway profiles.
 
 ## Updates
 
-`update_url` points at `update.json` on the `main` branch of
-`meridianmcp/zotero-bridge-updates`, read through `raw.githubusercontent.com`. That repo is
-separate from `meridianmcp/Meridian`, so the update file never touches the Meridian deploy
-branches. The file does not exist yet. A release step will write it after each signed
-release, with the signed file's URL and SHA-256. Until then the URL returns 404, and
-automatic updates do not work. The manifest states this in `update_url_status`.
+`update_url` points at `update.json` on the `main` branch of `meridianmcp/zotero-bridge-updates`, read through
+`raw.githubusercontent.com`. That repo is separate from `meridianmcp/Meridian`, so the update file never touches the
+Meridian deploy branches. The file does not exist yet. A release step will write it after each signed release, with
+the signed file's URL and SHA-256. Until then the URL returns 404, and automatic updates do not work. The manifest
+states this in `update_url_status`.
 
 ## Out of scope for this build
 
 - AI summaries and notes. These are a later phase and will be off by default.
-- Any network call of any kind, including the Zotero Web API.
-- Installing the plugin into a profile or running it against a real library.
+- Outbound network calls of any kind, including the Zotero Web API.
+- Group library writes, permanent deletion, and reads through the write API.
 
 ## Verify before first real use
 
-These points come from the design and are not confirmed against a running Zotero build.
+Verified, in a throwaway Zotero 10.0.6 profile with its own data folder:
 
-1. **Translator does not save during parse.** `bootstrap.js` runs the BibTeX translator with
-   an `itemDone` handler that collects items, and passes `{ libraryID: false }`. The
-   translator's save behaviour with that option is not verified. The code counts library
-   entries before and after the parse, and aborts the import with a message if the count
-   changed. Confirm in a disposable profile that the count does not change.
-2. **`Zotero.MenuManager.registerMenu`** shape: `menuID`, `pluginID`, `target`
-   (`main/library/collection`, `main/library/item`), `menus[].onCommand(event, context)`,
-   and the `context` fields used (`collectionTreeRow.ref`, `items`). The Zotero developer
-   documentation fetched for this build does not cover MenuManager.
-3. **`Zotero.PreferencePanes.register`** options (`pluginID`, `src`, `label`) and the
-   XUL `<preference>` binding in `content/preferences.xhtml`.
-4. **File pickers.** `Components.classes['@mozilla.org/filepicker;1']` is used. Check
-   whether Zotero 8 still exposes it, or swap in its current picker helper.
-5. **Item APIs.** `Zotero.Items.getAll(true, libraryID)`, `Zotero.Items.getAsync`,
-   `Zotero.Collections.getByLibrary(libraryID, true)`, `Zotero.Attachments.importFromFile`
-   and `linkFromFile` with `{ file, parentItemID }`, `Zotero.File.pathToFile`.
-6. **BibTeX translator ID** `9cb70025-a888-4a29-a210-93ec52da40d4`, with a fallback that
-   finds the translator by label `BibTeX`.
-7. **Citation key on imported items.** The import writes `BibTeX key: <key>` into Extra
-   only when the translator output carries a citation key (`citationKey`, or a
-   `Citation Key:` line in Extra). If it does not, imported items have no key line and
-   the PDF attach step will skip them.
+1. **Translator does not save during parse.** The BibTeX dry run parsed three entries and wrote none. The count guard
+   in `bootstrap.js` checks this on every import and found no change.
+2. **Item, collection, tag, note, attachment and relation APIs** used by `lib/api/` behave as the 52 live checks
+   expect. The checks read the stored state back from the database.
+3. **BibTeX translator.** The import found a BibTeX translator and saved the new entries. The lookup in `bootstrap.js` tries
+   the ID first and the label `BibTeX` second. The live run does not record which one matched.
+
+Not verified yet:
+
+4. **`Zotero.MenuManager.registerMenu`** shape, and the `context` fields the menus read (`collectionTreeRow.ref`,
+   `items`). The menus were not opened in the Zotero window.
+5. **`Zotero.PreferencePanes.register`** options and the XUL bindings in `content/preferences.xhtml`.
+6. **File pickers.** `Components.classes['@mozilla.org/filepicker;1']` is used. Check whether Zotero 8 still exposes
+   it, or swap in its current picker helper.
+7. **Citation key on imported items.** The BibTeX import reads the key from the translator's itemID field and writes a BibTeX key: <key> line into Extra, which the PDF step reads. Verified live on 2026-10-17: an imported entry's Extra holds BibTeX key: <key>.
 
 ## Disposable-profile test checklist
 
-Use a fresh profile that is not your working profile, and a test library with a few
-items. Do not use your real library.
+Use a fresh profile that is not your working profile, with its own data folder, and a test library with a few items.
+Do not use your real library.
 
-1. Install the built `.xpi` into the disposable profile. Zotero starts without error, and
-   the Zotero error console is clean.
-2. Preferences pane: "Meridian Zotero Bridge" appears. The link checkbox is off. The
-   duplicate-policy text is shown.
-3. Collection menu: right-click a collection, and "Import BibTeX here..." appears.
-   Right-click a nested collection with the same name as another, and check the
-   ambiguity message.
-4. BibTeX import, with one `.bib` file containing:
-   - an entry whose DOI matches an existing item (expect: skipped as exact),
-   - an entry with the same title and no DOI on either side (expect: skipped),
-   - an entry with the same title and a different DOI (expect: listed as conflict, not
-     imported),
-   - an entry with a new title (expect: imported into the collection).
-   The item count before and after should match the expected number of imports.
-5. Item menu: select items with and without `BibTeX key: <key>` in Extra. Put matching
-   `<key>.pdf` files in a folder, including one file that is not a PDF. Run "Attach PDFs
-   from folder..." and check that the copy default attaches only the valid PDFs and the
-   summary lists the rest.
-6. Turn on "Link PDFs instead of copying", repeat step 5, and check that the attachment
-   is a linked file.
-7. Run "Attach PDFs from folder..." again on the same items. Expect "already has a PDF"
-   for each.
-8. Disable and re-enable the plugin, then restart Zotero. Menus and pane still work
-   once, with no duplicate menu entries.
-9. Remove the plugin. Menus and the pane are gone, and no plugin errors appear.
+1. Install the built `.xpi` into the disposable profile. Zotero starts without error, and the error console is clean.
+2. Preferences pane: "Meridian Zotero Bridge" appears. The link checkbox is off.
+3. Collection menu: right-click a collection, and "Import BibTeX here..." appears. Right-click a nested collection with
+   the same name as another, and check the ambiguity message.
+4. BibTeX import, with one `.bib` file containing an entry whose DOI matches an existing item, an entry with the same
+   title and no DOI, an entry with the same title and a different DOI, and an entry with a new title. Expect the first
+   two to be skipped, the third listed as a conflict, and the last imported into the collection.
+5. Item menu: select items with and without `BibTeX key: <key>` in Extra. Run "Attach PDFs from folder..." and check
+   that only the valid PDFs attach and the summary lists the rest.
+6. Turn on "Link PDFs instead of copying", repeat step 5, and check that the attachment is a linked file.
+7. Run "Attach PDFs from folder..." again on the same items. Expect "already has a PDF" for each.
+8. Write API: `GET /v1/status` answers with the token, and a request without the token gets 401.
+9. Disable and re-enable the plugin, then restart Zotero. Menus, the pane and the API still work once, with no duplicate
+   menu entries.
+10. Remove the plugin. Menus and the pane are gone, the API stops, and no plugin errors appear.
 
 ## Tests
 
@@ -198,21 +316,21 @@ items. Do not use your real library.
 node --test extensions/zotero-bridge/test/*.test.js
 ```
 
-On Node 21 and later the directory form `node --test extensions/zotero-bridge/test/` does
-not expand to the test files. On Node 24 it fails with a test-failed entry for the
-directory path. Use the glob form above, or `npm test` from this folder.
+On Node 21 and later the directory form `node --test extensions/zotero-bridge/test/` does not expand to the test
+files. Use the glob form above, or `npm test` from this folder.
 
 Files:
 
-- `lib/normalize.js`: normalised title and DOI.
-- `lib/duplicates.js`: `classify` and `planImport`.
-- `lib/bibkey.js`: reads and validates `BibTeX key: <key>` from Extra.
-- `lib/pdf.js`: checks the first five bytes are `%PDF-`.
-- `lib/collections.js`: picks a collection by exact name.
-- `bootstrap.js`: Zotero glue (install, startup, shutdown, uninstall; menus, pane,
-  translator, attachments).
-- `prefs.js`: default preference.
-- `content/preferences.xhtml`: preferences pane.
-- `manifest.json`: plugin manifest.
-- `package.json`: marks this folder as CommonJS for the tests. It is not part of the
-  plugin manifest.
+- `lib/normalize.js`, `lib/duplicates.js`, `lib/bibkey.js`, `lib/pdf.js`, `lib/collections.js`: the pure logic of the
+  menus.
+- `lib/api/http.js`: the HTTP/1.1 parser and the response builder. `test/api-http.test.js`.
+- `lib/api/auth.js`: Host, Origin, token shape and constant-time compare. `test/api-http.test.js`.
+- `lib/api/validate.js`: input checks, base64, file names, keys, preconditions. `test/api-validate.test.js`.
+- `lib/api/items.js`, `lib/api/collections.js`: the write logic. `test/api-items.test.js` and
+  `test/api-collections.test.js`, both run against `test/support/fake-zotero.js`, which is not Zotero.
+- `lib/api/app.js`: routes, JSON bodies, the write queue, and batches. `test/api-app.test.js`.
+- `api/listener.js`: the socket. Covered by the live checks, not by node.
+- `bootstrap.js`: Zotero glue (install, startup, shutdown, menus, pane, translator, attachments, the API).
+- `test/static-checks.test.js`: the design line.
+- `prefs.js`, `content/preferences.xhtml`, `manifest.json`: plugin settings and manifest.
+- `package.json`: marks this folder as CommonJS for the tests. It is not part of the plugin manifest.

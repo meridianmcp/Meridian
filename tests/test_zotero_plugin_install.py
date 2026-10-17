@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from meridian import zotero_bridge_api as bridge
 from meridian import zotero_plugin_install as zpi
 
 XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
@@ -30,6 +31,7 @@ REPO_ROOT = Path(zpi.__file__).resolve().parent.parent
 REPO_EXTENSION = REPO_ROOT / "extensions" / "zotero-bridge"
 SPEC_PATH = REPO_ROOT / "meridian-tray.spec"
 EXPECTED_ENTRIES = [
+    "api/listener.js",
     "bootstrap.js",
     "content/preferences.xhtml",
     "lib/bibkey.js",
@@ -62,6 +64,7 @@ def _fake_source(root: Path) -> Path:
     _write(src / "manifest.json", '{"manifest_version": 2, "version": "0.1.0"}')
     _write(src / "bootstrap.js", "// boot")
     _write(src / "prefs.js", 'pref("x", true);')
+    _write(src / "api" / "listener.js", "// listener")
     _write(src / "content" / "preferences.xhtml", "<xul/>")
     _write(src / "lib" / "bibkey.js", "export {};")
     _write(src / "lib" / "pdf.js", "export {};")
@@ -1425,7 +1428,8 @@ def test_the_default_install_refuses_a_folder_without_a_marker_before_any_build_
 
 @pytest.mark.parametrize("zotero_state", [True, False, None])
 def test_an_identical_installed_plugin_is_unchanged_with_no_close_and_no_restart(default_profile_env, zotero_state):
-    assert zpi.install_default_profile(running=lambda: False)["status"] == "installed"
+    # A complete install first, so the profile holds every repaired line. A rerun on it then writes nothing at all.
+    assert zpi.install_default_with_close(_CLOSE_ON, close_zotero=True, running=lambda: False)["status"] == "installed"
     before = _snapshot(default_profile_env)
     result = zpi.install_default_with_close(
         _CLOSE_ON, close_zotero=True, running=lambda: zotero_state,
@@ -1435,7 +1439,69 @@ def test_an_identical_installed_plugin_is_unchanged_with_no_close_and_no_restart
     assert result["status"] == "unchanged"
     assert result["closed_zotero"] is False
     assert result["restart"] is None
+    assert result["repaired"] == []
     assert _snapshot(default_profile_env) == before
+
+
+def _without_lines(path: Path, marker: str) -> None:
+    """Drop every line that contains ``marker`` from a text file, keeping the rest."""
+    kept = [line for line in path.read_text(encoding="utf-8").splitlines(keepends=True) if marker not in line]
+    path.write_text("".join(kept), encoding="utf-8")
+
+
+def test_an_already_current_plugin_gets_its_removed_api_port_line_back_on_a_rerun(monkeypatch, default_profile_env):
+    assert zpi.install_default_with_close(_CLOSE_ON, close_zotero=True, running=lambda: False)["status"] == "installed"
+    user_js = default_profile_env / "user.js"
+    _without_lines(user_js, "apiPort")
+    assert "apiPort" not in user_js.read_text(encoding="utf-8")
+    installed = default_profile_env / "extensions" / XPI_NAME
+    xpi_before = installed.read_bytes()
+    monkeypatch.setattr(zpi, "install_into_profile", lambda *a, **k: pytest.fail("the .xpi must not be rewritten"))
+
+    result = zpi.install_default_with_close(
+        _CLOSE_ON, close_zotero=True, running=lambda: False,
+        close=lambda running=None: pytest.fail("an already-current plugin does not close Zotero"),
+    )
+
+    assert result["status"] == "unchanged"
+    assert result["api_prefs"] == bridge.PREFS_UPDATED
+    assert result["api_token"] == bridge.TOKEN_KEPT
+    assert result["repaired"] == ["api_prefs"]
+    assert user_js.read_text(encoding="utf-8").count("apiPort") == 1
+    assert installed.read_bytes() == xpi_before
+
+
+def test_an_already_current_plugin_gets_a_removed_scan_line_and_token_back_on_a_rerun(default_profile_env):
+    assert zpi.install_default_with_close(_CLOSE_ON, close_zotero=True, running=lambda: False)["status"] == "installed"
+    user_js = default_profile_env / "user.js"
+    _without_lines(user_js, "startupScanScopes")
+    bridge.token_file_path().unlink()
+
+    result = zpi.install_default_with_close(_CLOSE_ON, close_zotero=True, running=lambda: False)
+
+    assert result["status"] == "unchanged"
+    assert result["scan_pref"] == zpi.SCAN_ADDED
+    assert result["api_token"] == bridge.TOKEN_CREATED
+    assert result["repaired"] == ["scan_pref", "api_token"]
+    assert zpi.check_scan_pref(default_profile_env) == zpi.SCAN_PRESENT
+    assert bridge.token_is_usable(bridge.token_file_path())
+
+
+def test_cli_an_already_current_plugin_repairs_a_removed_api_port_line_and_says_so(monkeypatch, capsys, profile):
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
+    assert zpi.cli_main(["--profile", str(profile)]) == 0
+    capsys.readouterr()
+    user_js = profile / "user.js"
+    _without_lines(user_js, "apiPort")
+    monkeypatch.setattr(zpi, "install_into_profile", lambda *a, **k: pytest.fail("the .xpi must not be rewritten"))
+
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "already up to date" in out
+    assert "Repaired in this profile: the local write API settings in user.js." in out
+    assert user_js.read_text(encoding="utf-8").count("apiPort") == 1
 
 
 def test_an_identical_installed_plugin_is_unchanged_even_when_closing_is_off(default_profile_env):

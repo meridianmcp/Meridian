@@ -32,4 +32,29 @@ function readBibKey(extra) {
   return isSafeBibKey(match[1]) ? match[1] : null;
 }
 
-module.exports = { readBibKey, isSafeBibKey };
+// A "Citation Key: <key>" line in Extra, as Zotero's own exports write it.
+const CITATION_KEY_LINE = /^[ \t]*Citation Key:[ \t]*(\S+)[ \t\r]*$/im;
+
+/**
+ * The citation key of an entry that the BibTeX import translator produced, or null.
+ *
+ * The translator keeps the entry's key in `itemID` and does not write it to Extra on
+ * import, so `itemID` is the source that matters. A `citationKey` field or a
+ * `Citation Key:` line in Extra is used first when present. Each candidate must pass
+ * the same safety rules as a key read from the plugin's own line.
+ */
+function citationKeyFromImport(json) {
+  if (!json || typeof json !== 'object') return null;
+  const candidates = [json.citationKey];
+  if (typeof json.extra === 'string') {
+    const match = json.extra.match(CITATION_KEY_LINE);
+    if (match) candidates.push(match[1]);
+  }
+  candidates.push(json.itemID);
+  for (const candidate of candidates) {
+    if (isSafeBibKey(candidate)) return candidate;
+  }
+  return null;
+}
+
+module.exports = { readBibKey, isSafeBibKey, citationKeyFromImport };

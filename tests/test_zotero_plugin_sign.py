@@ -35,6 +35,7 @@ SECRET_VALUE = "SECRET-VALUE-DO-NOT-PRINT-456"
 CREDS = {sign.API_KEY_ENV: KEY_VALUE, sign.API_SECRET_ENV: SECRET_VALUE}
 FIXED_NOW = 1_800_000_000.0
 EXPECTED_ENTRIES = [
+    "api/listener.js",
     "bootstrap.js",
     "content/preferences.xhtml",
     "lib/bibkey.js",
@@ -149,6 +150,7 @@ def _fake_source(root: Path) -> Path:
     _write(src / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     _write(src / "bootstrap.js", "// boot\n")
     _write(src / "prefs.js", 'pref("x", true);\n')
+    _write(src / "api" / "listener.js", "// listener\n")
     _write(src / "content" / "preferences.xhtml", "<xul/>\n")
     _write(src / "lib" / "bibkey.js", "export {};\n")
     _write(src / "lib" / "pdf.js", "export {};\n")

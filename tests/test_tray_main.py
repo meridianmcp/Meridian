@@ -2774,6 +2774,7 @@ def zotero_faked(monkeypatch):
     # Some tests replace the file copy with a fake, and the profile here is a relative folder. The scan line must not
     # be written into the repository from a test, so it is stubbed too.
     monkeypatch.setattr(zpi, "ensure_scan_pref", lambda profile: "present")
+    monkeypatch.setattr(zpi, "_ensure_api", lambda profile: "present")
     return recorded
 
 

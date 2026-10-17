@@ -118,6 +118,44 @@ def test_a_conflicting_scan_value_is_refused_and_left_alone(profile):
     assert (profile / "user.js").read_text(encoding="utf-8") == original
 
 
+def test_a_commented_out_scan_line_is_not_a_setting_so_the_active_line_is_added(profile):
+    original = '// user_pref("extensions.startupScanScopes", 1);\n'
+    (profile / "user.js").write_bytes(original.encode("ascii"))
+    assert zpi.check_scan_pref(profile) == "added"
+    assert zpi.ensure_scan_pref(profile) == "added"
+    raw = (profile / "user.js").read_text(encoding="utf-8")
+    assert raw.startswith(original)
+    active = [line for line in raw.splitlines() if not line.lstrip().startswith("//")]
+    assert active == [zpi.SCAN_PREF_LINE]
+    assert zpi.check_scan_pref(profile) == "present"
+
+
+def test_a_commented_out_conflicting_value_is_ignored_and_the_active_one_counts(profile):
+    commented = '// user_pref("extensions.startupScanScopes", 0);\n'
+    (profile / "user.js").write_bytes((commented + zpi.SCAN_PREF_LINE + "\n").encode("ascii"))
+    assert zpi.check_scan_pref(profile) == "present"
+
+
+def test_a_last_line_without_a_newline_is_terminated_before_the_scan_line_is_added(profile):
+    (profile / "user.js").write_bytes(b'user_pref("a", 1);')
+    assert zpi.ensure_scan_pref(profile) == "added"
+    assert (profile / "user.js").read_bytes() == b'user_pref("a", 1);\n' + zpi.SCAN_PREF_LINE.encode("ascii") + b"\n"
+
+
+def test_a_windows_1252_user_js_keeps_its_bytes_when_the_scan_line_is_added(profile):
+    original = 'user_pref("browser.example", "café …");\r\n'.encode("cp1252")
+    (profile / "user.js").write_bytes(original)
+    assert zpi.ensure_scan_pref(profile) == "added"
+    assert (profile / "user.js").read_bytes() == original + (zpi.SCAN_PREF_LINE + "\r\n").encode("ascii")
+
+
+def test_an_unreadable_user_js_is_a_refusal_state_and_the_check_never_raises(profile):
+    (profile / "user.js").mkdir()  # the file's name is taken by a folder: it exists, and it cannot be read as a file
+    assert zpi.check_scan_pref(profile) == "unreadable"
+    assert zpi.ensure_scan_pref(profile) == "unreadable"
+    assert (profile / "user.js").is_dir()
+
+
 # --- the registry: one entry, enabled, nothing else changed ----------------------------------
 
 def test_enabling_changes_only_our_entry_in_extensions_json(profile):
@@ -242,7 +280,9 @@ def test_the_tray_install_writes_the_file_then_registers_then_restarts(monkeypat
     assert result["restart"] == "started"
     assert calls == ["close", "launch", "close", "restart"]
     assert (profile / "extensions" / zpi.XPI_FILENAME).read_bytes() == PAYLOAD
-    assert (profile / "user.js").read_text(encoding="utf-8") == zpi.SCAN_PREF_LINE + "\n"
+    user_js = (profile / "user.js").read_text(encoding="utf-8")
+    assert user_js.startswith(zpi.SCAN_PREF_LINE + "\n")
+    assert user_js.count("apiTokenPath") == 1
     assert _entry(profile)["userDisabled"] is False
 
 
@@ -257,6 +297,23 @@ def test_a_conflicting_user_js_is_refused_before_anything_closes(monkeypatch, pr
         restart=lambda: calls.append("restart") or "started",
     )
     assert result["status"] == zpi.PREF_CONFLICT_STATUS
+    assert calls == []
+    assert not (profile / "extensions" / zpi.XPI_FILENAME).exists()
+
+
+def test_an_unreadable_user_js_is_refused_before_anything_closes(monkeypatch, profile, signed):
+    (profile / "user.js").mkdir()
+    calls: list[str] = []
+    monkeypatch.setattr(zpi, "_prepare_default_install", lambda: (profile, signed, SHA))
+    result = zpi.install_default_with_close(
+        {"close_zotero_for_install": True},
+        running=lambda: True,
+        close=lambda running=None: calls.append("close") or "closed",
+        restart=lambda: calls.append("restart") or "started",
+    )
+    assert result["status"] == zpi.PREF_CONFLICT_STATUS
+    assert "cannot be read" in result["message"]
+    assert result["closed_zotero"] is False
     assert calls == []
     assert not (profile / "extensions" / zpi.XPI_FILENAME).exists()
 

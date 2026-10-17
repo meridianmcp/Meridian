@@ -9,9 +9,11 @@
   ``zotero.sqlite``), refuses while Zotero is running, and reports
   ``check_failed`` when the process check itself fails. It writes nothing to the
   profile in any of these cases. It skips the write when the bytes already match. It never touches
-  ``prefs.js`` or any other profile file. The registration step below is the only other writer: it
-  adds one scan line to ``user.js`` and enables this add-on's entry in ``extensions.json``, both
-  with Zotero closed.
+  ``prefs.js`` or any other profile file. The profile repairs below are the other writers: they add
+  the scan line and the API token and prefs. They run after the .xpi, and also when the .xpi is
+  already current, so a removed line comes back. They never rewrite the .xpi. ``user.js`` is read as
+  bytes, and Zotero reads it only at its start, so the repairs need no close. The registration step
+  is the only writer of ``extensions.json``, and it runs with Zotero closed.
   ``install_default_profile`` runs that install for the default profile named in
   ``profiles.ini``, with no close step. It never raises.
 * ``signed_install_state`` says what is stored for this bundle's version and source: the Mozilla-signed .xpi
@@ -30,7 +32,8 @@
   Only then does it compare the bundle with the installed plugin, and call
   ``install_with_close``. A missing profile, a folder that is not a profile, or a
   bundle that will not build is refused before anything closes. A plugin that is
-  already identical is ``unchanged``, and Zotero is not closed, even while it runs.
+  already identical is ``unchanged``, and Zotero is not closed, even while it runs. Its profile
+  repairs still run, so a scan line, token or API pref that was removed is written back.
 * ``install_with_close`` is the install the tray and the CLI use. It closes
   Zotero first when the saved ``close_zotero_for_install`` choice allows it.
   ``MERIDIAN_ZOTERO_CLOSE_ON_INSTALL`` can only turn that off, never on. It then
@@ -86,7 +89,7 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 _SOURCE_DIR = Path(__file__).resolve().parent.parent / "extensions" / "zotero-bridge"
 _RUNTIME_FILES = ("manifest.json", "bootstrap.js", "prefs.js")
-_RUNTIME_DIRS = ("content", "lib")
+_RUNTIME_DIRS = ("api", "content", "lib")
 _EXCLUDED_PARTS = frozenset({"test", "node_modules", "__pycache__"})
 _EXCLUDED_NAMES = frozenset({"package.json", "package-lock.json", "README.md"})
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
@@ -844,15 +847,16 @@ def install_default_with_close(
     The profile is found, checked for its marker, and the bundle is built before anything closes, as the
     CLI does it. A missing default profile, a folder that is not a profile, or a bundle that will not build
     is refused and Zotero is left alone. A plugin already identical to the bundle is ``unchanged`` with no
-    close and no restart, whether or not Zotero runs.
+    close and no restart, whether or not Zotero runs. Its profile repairs still run, without rewriting the .xpi.
     """
     prepared = _prepare_default_install()
     if isinstance(prepared, dict):
         return {**prepared, "closed_zotero": False, "restart": None}
     profile, signed, sha256 = prepared
     check = running if running is not None else zotero_process_state
-    if check_scan_pref(profile) == "conflict":
-        return _refusal_result(PREF_CONFLICT_STATUS, PREF_CONFLICT_MESSAGE)
+    scan = check_scan_pref(profile)
+    if scan in (SCAN_CONFLICT, SCAN_UNREADABLE):
+        return _refusal_result(PREF_CONFLICT_STATUS, _pref_refusal_message(scan))
     current = _already_current(profile, sha256)
     if current is not None:
         # The file is already current, so nothing is closed. The plugin is enabled only while Zotero is not running.
@@ -886,13 +890,28 @@ ADDON_ID = "meridian-zotero@usemeridian.us"  # equal to zotero_plugin_sign.PLUGI
 SCAN_PREF = "extensions.startupScanScopes"
 SCAN_PREF_VALUE = 1
 SCAN_PREF_LINE = f'user_pref("{SCAN_PREF}", {SCAN_PREF_VALUE});'
-_SCAN_PREF_RE = re.compile(r'user_pref\(\s*"extensions\.startupScanScopes"\s*,\s*([^)]*?)\s*\)\s*;?')
+# ASCII flag: user.js is read as latin-1, so a non-ASCII byte must never count as whitespace here.
+_SCAN_PREF_RE = re.compile(r'user_pref\(\s*"extensions\.startupScanScopes"\s*,\s*([^)]*?)\s*\)\s*;?', re.ASCII)
+# What check_scan_pref and ensure_scan_pref report about user.js.
+SCAN_ADDED = "added"
+SCAN_PRESENT = "present"
+SCAN_CONFLICT = "conflict"
+SCAN_UNREADABLE = "unreadable"
 EXTENSIONS_JSON = "extensions.json"
 ENABLED_RECORD = "zotero_plugin_enabled.json"
 PREF_CONFLICT_STATUS = "pref_conflict"
 PREF_CONFLICT_MESSAGE = (
     f"This Zotero profile's user.js sets {SCAN_PREF} to something other than {SCAN_PREF_VALUE}, so Meridian will "
     "not change it. Remove that line, then run this command again. Nothing was written."
+)
+PREF_UNREADABLE_MESSAGE = (
+    "This Zotero profile's user.js exists but cannot be read, so Meridian will not change it. Check that the file "
+    "can be read, then run this command again. Nothing was written."
+)
+# A repair that fails after the .xpi is in place: nothing is refused, so the text says only what is missing.
+_REPAIR_SCAN_FAILED_MESSAGE = (
+    f"user.js could not be updated: it cannot be read, or {SCAN_PREF} is set to something other than "
+    f"{SCAN_PREF_VALUE}. Fix that, then run this command again."
 )
 _REGISTER_MESSAGES = {
     "registry_unreadable": "Zotero's extensions.json could not be read, so the plugin was not enabled. Nothing was changed.",
@@ -912,25 +931,54 @@ _SKIPPED_RUNNING_MESSAGE = (
 )
 
 
-def check_scan_pref(profile: "Path | str") -> str:
-    """``added`` when user.js has no scan line, ``present`` when it has the one Meridian needs, ``conflict`` for any other value. Reads only."""
-    path = Path(profile) / "user.js"
-    text = path.read_text(encoding="utf-8") if path.is_file() else ""
-    values = [match.group(1).strip() for match in _SCAN_PREF_RE.finditer(text)]
+def _active_text(text: str) -> str:
+    """The text without its comment lines. A line whose first non-space characters are ``//`` is a comment, not a setting."""
+    return "\n".join(line for line in text.split("\n") if not line.lstrip(" \t").startswith("//"))
+
+
+def _scan_state(text: str) -> str:
+    """The scan state of user.js text: ``added``, ``present`` or ``conflict``. Pure."""
+    values = [match.group(1).strip() for match in _SCAN_PREF_RE.finditer(_active_text(text))]
     if any(value != str(SCAN_PREF_VALUE) for value in values):
-        return "conflict"
-    return "present" if values else "added"
+        return SCAN_CONFLICT
+    return SCAN_PRESENT if values else SCAN_ADDED
+
+
+def _pref_refusal_message(state: str) -> str:
+    """The refusal text for a user.js that sets the scan pref to another value, or that cannot be read. Pure."""
+    return PREF_UNREADABLE_MESSAGE if state == SCAN_UNREADABLE else PREF_CONFLICT_MESSAGE
+
+
+def check_scan_pref(profile: "Path | str") -> str:
+    """The scan state of user.js: ``added`` (no active scan line), ``present`` (the one Meridian needs), ``conflict``
+    (any other active value), or ``unreadable`` (user.js exists but cannot be read). Reads only. Never raises.
+
+    A commented-out line such as ``// user_pref(...)`` is not a setting and does not count.
+    """
+    from meridian import zotero_bridge_api as bridge  # imported here: the bridge module imports the local-runner module
+
+    try:
+        text = bridge.read_user_js(profile)
+    except Exception:  # noqa: BLE001 -- an unreadable user.js is a refusal state, never a crash
+        return SCAN_UNREADABLE
+    return _scan_state(text)
 
 
 def ensure_scan_pref(profile: "Path | str") -> str:
-    """Add the scan line to user.js when it is missing, keeping every other line. Returns what was found. Writes only for ``added``."""
-    state = check_scan_pref(profile)
-    if state == "added":
-        path = Path(profile) / "user.js"
-        text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        if text and not text.endswith("\n"):
-            text += "\n"
-        _atomic_write_bytes(path, (text + SCAN_PREF_LINE + "\n").encode("utf-8"))
+    """Add the scan line to user.js when no active one exists, keeping every other byte. Returns what was found.
+
+    Writes only for ``added``. A failed write raises OSError; an unreadable user.js is reported as ``unreadable``.
+    """
+    from meridian import zotero_bridge_api as bridge  # imported here: see check_scan_pref
+
+    try:
+        text = bridge.read_user_js(profile)
+    except Exception:  # noqa: BLE001 -- see check_scan_pref
+        return SCAN_UNREADABLE
+    state = _scan_state(text)
+    if state == SCAN_ADDED:
+        lines, newline = bridge.user_js_lines(text)
+        bridge.write_user_js(profile, "".join(line + "\n" for line in lines) + SCAN_PREF_LINE + newline)
     return state
 
 
@@ -1059,16 +1107,79 @@ def register_and_enable(
         return _register_result("failed")
 
 
+def _ensure_api(profile: "Path | str") -> str:
+    """The local write API's token file, then the two profile prefs that point the plugin at it. Returns the prefs state.
+
+    The token value is never returned or printed. Its state is read first, by :func:`_api_token_state`.
+    """
+    from meridian import zotero_bridge_api as bridge  # imported here: the bridge module imports the local-runner module
+
+    path = bridge.token_file_path()
+    bridge.ensure_api_token(path)
+    return bridge.ensure_api_prefs(profile, path, bridge.API_PORT)
+
+
+def _api_token_state() -> str:
+    """``kept`` when the token file already holds a usable token, else ``created``: what :func:`_ensure_api` is about to do.
+
+    Reads only, and never raises. The token value is never returned.
+    """
+    from meridian import zotero_bridge_api as bridge  # imported here: see _ensure_api
+
+    try:
+        return bridge.TOKEN_KEPT if bridge.token_is_usable(bridge.token_file_path()) else bridge.TOKEN_CREATED
+    except Exception:  # noqa: BLE001 -- the state is only reported; _ensure_api decides what is written
+        return bridge.TOKEN_CREATED
+
+
+def _repaired_keys(scan: str, token: str, prefs: str) -> list[str]:
+    """The repairs one run actually made: ``scan_pref``, ``api_token`` and ``api_prefs``. Pure."""
+    from meridian import zotero_bridge_api as bridge  # imported here: see _ensure_api
+
+    keys: list[str] = []
+    if scan == SCAN_ADDED:
+        keys.append("scan_pref")
+    if token == bridge.TOKEN_CREATED:
+        keys.append("api_token")
+    if prefs != bridge.PREFS_PRESENT:
+        keys.append("api_prefs")
+    return keys
+
+
+def _repair_profile(profile: "Path | str", result: Mapping[str, Any]) -> dict[str, Any]:
+    """The profile repairs that follow the .xpi: the scan line, then the API token and prefs. Never raises.
+
+    Every step is idempotent, so the same call on a complete profile writes nothing. The result gains the states
+    ``scan_pref``, ``api_token`` and ``api_prefs``, and ``repaired``, the repairs this run made. The .xpi is never
+    touched. A failed step makes the result ``failed``, and the steps after it do not run.
+    """
+    try:
+        scan = ensure_scan_pref(profile)
+    except Exception as exc:  # noqa: BLE001 -- a failed user.js write is reported, the file is already in place
+        return {**result, "status": "failed", "error": f"user.js could not be updated: {exc}"}
+    if scan in (SCAN_CONFLICT, SCAN_UNREADABLE):
+        return {**result, "status": "failed", "error": _REPAIR_SCAN_FAILED_MESSAGE}
+    token = _api_token_state()
+    try:
+        prefs = _ensure_api(profile)
+    except Exception as exc:  # noqa: BLE001 -- the API stays off until its prefs are written; the result says so
+        return {**result, "status": "failed", "error": f"The local write API could not be set up: {exc}"}
+    return {
+        **result,
+        "scan_pref": scan,
+        "api_token": token,
+        "api_prefs": prefs,
+        "repaired": _repaired_keys(scan, token, prefs),
+    }
+
+
 def _install_files(
     profile: "Path | str", signed: "Path | str", running: "Callable[[], bool | None] | None", sha256: str,
 ) -> dict[str, Any]:
-    """The install's writes: the signed file, then the scan line. The scan line is written only after the file. Never raises."""
+    """The install's writes: the signed file, then the profile repairs. Each write follows the file. Never raises."""
     result = install_into_profile(profile, signed, running=running, expected_sha256=sha256)
     if result.get("status") in ("installed", "unchanged"):
-        try:
-            result["scan_pref"] = ensure_scan_pref(profile)
-        except Exception as exc:  # noqa: BLE001 -- a failed user.js write is reported, the file is already in place
-            result = {**result, "status": "failed", "error": f"user.js could not be updated: {exc}"}
+        return _repair_profile(profile, result)
     return result
 
 
@@ -1126,8 +1237,14 @@ def _unchanged_outcome(
     launch: "Callable[[], Any] | None",
     timeout_s: "float | None",
 ) -> dict[str, Any]:
-    """The outcome when the installed file is already the signed one. Writes nothing to user.js. Enables only while Zotero is closed. Never raises."""
-    result = {**current, "closed_zotero": False, "restart": None}
+    """The outcome when the installed file is already the signed one: the profile repairs run, then the enable step.
+
+    The .xpi is not rewritten and nothing is closed. The enable step runs only while Zotero is closed. Never raises.
+    """
+    repaired = _repair_profile(profile, current)
+    result = {**repaired, "closed_zotero": False, "restart": None}
+    if repaired.get("status") != "unchanged":
+        return result
     check = running if running is not None else zotero_process_state
     if _safe_state(check) is False:
         result["enable"] = _register_default(profile, check, close, launch, timeout_s)
@@ -1299,6 +1416,20 @@ def _closed_unconfirmed_cli_text(restart: Any) -> str:
     )
 
 
+_REPAIR_LABELS = {
+    "scan_pref": "the scan line in user.js",
+    "api_token": "the local write API token",
+    "api_prefs": "the local write API settings in user.js",
+}
+
+
+def _print_repairs(result: Mapping[str, Any]) -> None:
+    """Name the profile repairs this run made, if it made any. Printed after an unchanged plugin."""
+    labels = [_REPAIR_LABELS[key] for key in result.get("repaired") or [] if key in _REPAIR_LABELS]
+    if labels:
+        print("Repaired in this profile: " + ", ".join(labels) + ".")
+
+
 def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -> int:
     """Print the install's own outcome line. Returns the exit code."""
     status = result["status"]
@@ -1307,6 +1438,7 @@ def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -
         return 0
     if status == "unchanged":
         print(f"The Zotero bridge plugin is already up to date at {result['path']}.")
+        _print_repairs(result)
         return 0
     if status == "refused_not_profile":
         print(result.get("error", _NOT_PROFILE_MESSAGE.format(profile=profile)))
@@ -1393,13 +1525,19 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     refusal = _signed_refusal(stored, xpi)
     if refusal is not None:
         return _print_install_status(refusal, xpi, profile)
-    if check_scan_pref(profile) == "conflict":
-        print(PREF_CONFLICT_MESSAGE)
+    scan = check_scan_pref(profile)
+    if scan in (SCAN_CONFLICT, SCAN_UNREADABLE):
+        print(_pref_refusal_message(scan))
         return 1
-    # A plugin that is already identical needs no close, whether or not Zotero runs.
+    # A plugin that is already identical needs no close, whether or not Zotero runs. Its profile repairs still run.
     current = _already_current(profile, stored.sha256)
     if current is not None:
-        outcome = _unchanged_outcome(profile, current, None, None, None, None) if is_default else _not_default(current)
+        if is_default:
+            outcome = _unchanged_outcome(profile, current, None, None, None, None)
+        else:
+            outcome = _repair_profile(profile, current)
+            if outcome.get("status") == "unchanged":
+                outcome = _not_default(outcome)
         return _print_install_status_and_enable(outcome, xpi, profile)
     result = install_with_close(
         load_settings(settings_path()),
@@ -1499,7 +1637,10 @@ def _dry_run(profile: "Path | None", *, close_zotero: "bool | None" = None) -> i
         return 0
     target = profile / "extensions" / XPI_FILENAME
     if _already_current(profile, stored.sha256) is not None:
-        print(f"Would leave the installed plugin unchanged at {target}.")
+        print(
+            f"Would leave the installed plugin unchanged at {target}, and repair any missing scan line or API "
+            "settings in user.js."
+        )
     else:
         print(f"Would install to {target}.")
     return 0
