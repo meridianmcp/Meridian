@@ -771,10 +771,14 @@ async def test_test_slot_populates_shutdown_confirmed_on_success(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_test_slot_populates_shutdown_confirmed_on_early_protocol_failure(tmp_path):
+async def test_test_slot_populates_shutdown_confirmed_on_early_protocol_failure(tmp_path, monkeypatch):
     """The error-path branch (spawn/initialize/list_tools failure) must also
     report a real shutdown receipt, not leave it None once a process WAS
     spawned."""
+    # taskkill /F /T under the full gate's 8 workers can take longer than the
+    # production 5s bound, which then reports shutdown_confirmed=False even
+    # though the process is killed. Widen the bound for this test only.
+    monkeypatch.setattr(tst, "PROCESS_KILL_WAIT_TIMEOUT_S", 30.0)
     spec = tst.SlotSpec("hang", "hang-slot", 9998, [sys.executable, "-c", _HANGING_SERVER_SRC],
                          None, "stateless", False)
     result = await tst.test_slot(spec, str(tmp_path), spawn_timeout=0.5)
