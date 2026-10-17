@@ -5,11 +5,16 @@
 
 # Meridian
 
-**Claude Code has no memory between sessions. Meridian fixes that.**
+**Shared, structured project state for long-running AI coding work.**
 
-Open-source MCP server for persistent AI session memory — shared task log,
+Source-available MCP server for persistent project state — shared task log,
 pinned decisions, human-in-the-loop queue, and tiered handoffs. Works with
 Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
+
+Built-in agent memory (for example Claude Code's `CLAUDE.md` files and auto memory)
+keeps notes as files for that agent. Meridian adds a shared, queryable project
+record that several sessions and different MCP clients can read and update. It
+works alongside built-in memory rather than replacing it.
 
 [![GitHub Stars](https://img.shields.io/github/stars/meridianmcp/Meridian?style=social)](https://github.com/meridianmcp/Meridian)
 [![License: MSL-1.0](https://img.shields.io/badge/license-MSL--1.0-blue)](LICENSE)
@@ -25,11 +30,11 @@ Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 
 Every AI coding session boots blind. You re-explain the architecture, re-describe
 the constraints, re-list what's been tried. When context fills up mid-task,
-everything is lost. This is context debt — and it compounds.
+detail is lost. This is context debt — and it compounds.
 
 Meridian gives your sessions shared memory. They see the same task log, the same
 pinned decisions, the same goal state. When context fills up, a new session resumes
-from a compressed handoff in seconds. No copy-paste, no re-explaining from scratch.
+from a compressed handoff. No copy-paste, no re-explaining from scratch.
 
 [![Meridian dashboard](docs/screenshots/01_dashboard.png)](https://usemeridian.us)
 
@@ -48,7 +53,7 @@ other's task log, and resume from a compressed handoff when context fills up.
 ### Option 1 — binary release (recommended)
 
 Signed binaries for Windows, macOS (Apple Silicon), and Linux are attached to
-every [GitHub release](https://github.com/meridianmcp/Meridian/releases) (current: v0.2.6).
+every [GitHub release](https://github.com/meridianmcp/Meridian/releases).
 
 **Linux / macOS (one-liner via uv):**
 ```bash
@@ -184,7 +189,7 @@ Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) a
   dashboard highlights; Enter submits it, number keys pick others.
 - **GitHub hub** (hosted) — connect your repo once in Settings; sessions get `read_file`,
   `list_files`, `search_code`, `git_log`, `get_commit` injected automatically. No extra install.
-- **Tiered handoffs** — L0/L1/L2 compression so a fresh session can resume in seconds.
+- **Tiered handoffs** — L0/L1/L2 compression so a fresh session can pick up where the last one stopped.
 - **Webhook intake** — push events from LangGraph / Autogen / custom agents into the same dashboard.
 - **Works everywhere** — Claude Code, Claude Desktop, Cursor, Windsurf, LangGraph, custom.
 <!-- MERIDIAN:ANCHOR:END features-list -->
