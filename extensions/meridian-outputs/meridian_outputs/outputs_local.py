@@ -3135,6 +3135,10 @@ def _open_tantivy_index_cold_start_safe(
 DUCKDB_NEW_FILE_BLOCK_SIZE = 16384
 #: The block sizes DuckDB accepts for a new database file.
 _DUCKDB_BLOCK_SIZES = (16384, 32768, 65536, 131072, 262144)
+#: Serialises the first creation of an on-disk index file within this process
+#: (see OutputsFtsIndex._duckdb_connect). It is per process only: another OS
+#: process has its own copy of this lock and is not covered by it.
+_DUCKDB_FIRST_OPEN_LOCK = threading.Lock()
 
 
 class OutputsFtsIndex:
@@ -3644,20 +3648,31 @@ class OutputsFtsIndex:
         and the read and write sides can never disagree about a file either
         one created.
 
+        The existence check, the creating connection and its close, and the
+        plain open all run under one module-level lock
+        (``_DUCKDB_FIRST_OPEN_LOCK``). Without it, a thread in this process
+        could see the file appear while the creating connection was still open,
+        and its plain open would be refused. The lock is per process only and
+        does not coordinate with other OS processes.
+
         This is deliberate. DuckDB refuses a second connection to the same file
         in one process whose config differs from one already open (``Can't open
         a connection to same database file with a different configuration``),
         so passing the config on a long-lived connection broke the read path
         whenever the write connection had created the file first. Existing
-        files are opened exactly as before, and ``:memory:`` is never touched.
+        files are opened exactly as before, and ``:memory:`` is never touched
+        (it takes neither the lock nor the creating step).
         """
         import duckdb  # noqa: PLC0415
-        if self._db_path != ":memory:" and not os.path.exists(self._db_path):
-            duckdb.connect(
-                self._db_path,
-                config={"default_block_size": str(self._duckdb_block_size)},
-            ).close()
-        return duckdb.connect(self._db_path)
+        if self._db_path == ":memory:":
+            return duckdb.connect(self._db_path)
+        with _DUCKDB_FIRST_OPEN_LOCK:
+            if not os.path.exists(self._db_path):
+                duckdb.connect(
+                    self._db_path,
+                    config={"default_block_size": str(self._duckdb_block_size)},
+                ).close()
+            return duckdb.connect(self._db_path)
 
     def _connect(self) -> Any:
         if self._con is None:
@@ -7800,6 +7815,12 @@ class OutputsFtsIndex:
         must stay an explicit, out-of-band, caller-scheduled operation --
         e.g. a periodic maintenance window, not a rebuild() side effect.
 
+        The copy is written at this index's own block size
+        (``duckdb_block_size``, or DUCKDB_NEW_FILE_BLOCK_SIZE by default), not
+        DuckDB's 262144 default. If ``new_db_path`` already exists it must have
+        that block size: DuckDB refuses to ATTACH a file whose block size
+        differs, and that error is raised before anything is copied.
+
         Raises ``ValueError`` for ``:memory:`` mode (nothing to compact --
         there is no persistent file) or if ``new_db_path`` resolves to this
         index's own ``db_path``. Raises ``RuntimeError`` if this
@@ -7832,7 +7853,14 @@ class OutputsFtsIndex:
             if new_dir:
                 os.makedirs(new_dir, exist_ok=True)
             target_catalog = "_meridian_outputs_compact_target"
-            con.execute(f'ATTACH \'{new_db_path}\' AS "{target_catalog}"')
+            # Attach the target at this instance's block size. Without the
+            # option, COPY FROM DATABASE writes the copy at DuckDB's 262144
+            # default. _duckdb_block_size is always one of _DUCKDB_BLOCK_SIZES
+            # (validated in __init__), so interpolating it cannot inject SQL.
+            con.execute(
+                f'ATTACH \'{new_db_path}\' AS "{target_catalog}" '
+                f"(BLOCK_SIZE {self._duckdb_block_size})"
+            )
             try:
                 con.execute(f'COPY FROM DATABASE "{source_catalog}" TO "{target_catalog}"')
             finally:

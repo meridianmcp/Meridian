@@ -9,10 +9,15 @@ new index file at DUCKDB_NEW_FILE_BLOCK_SIZE (16384) unless the caller passes
     setting (DuckDB records the size in the file header);
   - the read connection and the write connection agree on the size of a file
     whichever of them creates it, including when both are open at once;
-  - search results for the same corpus are identical at 16384 and 262144.
+  - search results for the same corpus are identical at 16384 and 262144;
+  - eight threads opening one fresh file at the same moment all succeed and
+    the file ends at 16384 bytes of block size;
+  - compact_to writes a copy at the index's own block size and leaves the
+    source file as it was.
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +43,31 @@ def _block_size_on_disk(db_path: str) -> int:
         return _block_size_via(con)
     finally:
         con.close()
+
+
+def _index_rows_via(con: Any) -> list[tuple[Any, ...]]:
+    """Read every indexed (path, sha256) pair, in path order."""
+    return con.execute(
+        "SELECT path, sha256 FROM outputs_index ORDER BY path",
+    ).fetchall()
+
+
+def _index_rows_on_disk(db_path: str) -> list[tuple[Any, ...]]:
+    con = duckdb.connect(db_path)
+    try:
+        return _index_rows_via(con)
+    finally:
+        con.close()
+
+
+def _open_when_released(
+    index: OL.OutputsFtsIndex, barrier: threading.Barrier, errors: list[BaseException],
+) -> None:
+    try:
+        barrier.wait(timeout=30)
+        index._connect()
+    except BaseException as exc:  # noqa: BLE001
+        errors.append(exc)
 
 
 def _make_outputs_dir(tmp_path: Path) -> Path:
@@ -73,19 +103,29 @@ class TestNewFileBlockSize:
             idx.close()
         assert _block_size_on_disk(str(db_path)) == 16384
 
-    def test_new_file_created_with_262144_has_block_size_262144(
+    def test_explicit_262144_and_default_files_get_their_own_block_sizes(
         self, tmp_path: Path,
     ) -> None:
-        db_path = tmp_path / "index.duckdb"
-        idx = OL.OutputsFtsIndex(
-            str(_make_outputs_dir(tmp_path)), db_path=str(db_path),
-            duckdb_block_size=262144,
+        """One assertion over two files created side by side. If the config
+        were dropped, both would be DuckDB's 262144 and the tuple would not
+        match (262144, 16384)."""
+        outputs_dir = _make_outputs_dir(tmp_path)
+        explicit_path = tmp_path / "explicit.duckdb"
+        default_path = tmp_path / "default.duckdb"
+        explicit = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=str(explicit_path), duckdb_block_size=262144,
         )
+        default = OL.OutputsFtsIndex(str(outputs_dir), db_path=str(default_path))
         try:
-            idx._connect()
+            explicit._connect()
+            default._connect()
         finally:
-            idx.close()
-        assert _block_size_on_disk(str(db_path)) == 262144
+            explicit.close()
+            default.close()
+        assert (
+            _block_size_on_disk(str(explicit_path)),
+            _block_size_on_disk(str(default_path)),
+        ) == (262144, 16384)
 
     def test_read_connection_creating_file_agrees_with_write_connection(
         self, tmp_path: Path,
@@ -243,3 +283,83 @@ class TestSearchEquivalenceAcrossBlockSizes:
         # equality above compares two genuinely distinct on-disk layouts.
         assert _block_size_on_disk(str(small_db)) == 16384
         assert _block_size_on_disk(str(large_db)) == 262144
+
+
+class TestConcurrentFirstOpen:
+    """Eight threads open one fresh index file at the same moment.
+
+    The first open creates the file at the configured block size with a
+    short-lived creating connection, then closes it. A thread that sees the
+    file already present must not open it with the default config while that
+    creating connection is still open, or DuckDB refuses with "different
+    configuration". Every round uses a new path, so each round is a real first
+    creation, and the rounds are repeated so the race window is exercised.
+    """
+
+    THREADS = 8
+    ROUNDS = 20
+
+    def test_all_threads_succeed_and_file_is_16384(self, tmp_path: Path) -> None:
+        outputs_dir = _make_outputs_dir(tmp_path)
+        for round_no in range(self.ROUNDS):
+            db_path = tmp_path / f"round_{round_no}" / "index.duckdb"
+            db_path.parent.mkdir()
+            indexes = [
+                OL.OutputsFtsIndex(str(outputs_dir), db_path=str(db_path))
+                for _ in range(self.THREADS)
+            ]
+            barrier = threading.Barrier(self.THREADS)
+            errors: list[BaseException] = []
+            threads = [
+                threading.Thread(
+                    target=_open_when_released, args=(index, barrier, errors),
+                )
+                for index in indexes
+            ]
+            try:
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=60)
+                assert not any(thread.is_alive() for thread in threads), (
+                    f"round {round_no}: a thread did not finish"
+                )
+                assert errors == [], f"round {round_no}: {errors!r}"
+            finally:
+                for index in indexes:
+                    index.close()
+            assert _block_size_on_disk(str(db_path)) == 16384, (
+                f"round {round_no}: file block size is not 16384"
+            )
+
+
+class TestCompactToBlockSize:
+    """compact_to() ATTACHes its target at the index's own block size. Without
+    that, COPY FROM DATABASE writes the copy at DuckDB's 262144 default."""
+
+    @pytest.mark.parametrize("block_size", [16384, 262144])
+    def test_compacted_copy_takes_instance_block_size_and_source_is_unchanged(
+        self, tmp_path: Path, block_size: int,
+    ) -> None:
+        outputs_dir = _make_outputs_dir(tmp_path)
+        for name, text in CORPUS.items():
+            (outputs_dir / name).write_text(text, encoding="utf-8")
+        db_path = tmp_path / "index.duckdb"
+        compact_path = tmp_path / "compact" / "index_compacted.duckdb"
+        idx = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=str(db_path), duckdb_block_size=block_size,
+        )
+        try:
+            assert idx.rebuild() > 0
+            con = idx._connect()
+            assert _block_size_via(con) == block_size
+            source_rows = _index_rows_via(con)
+            assert source_rows, "rebuild must index the corpus"
+            idx.compact_to(str(compact_path))
+        finally:
+            idx.close()
+        assert _block_size_on_disk(str(compact_path)) == block_size
+        assert _index_rows_on_disk(str(compact_path)) == source_rows
+        # The source keeps its block size and its rows after compact_to.
+        assert _block_size_on_disk(str(db_path)) == block_size
+        assert _index_rows_on_disk(str(db_path)) == source_rows
