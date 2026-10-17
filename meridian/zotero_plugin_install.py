@@ -109,7 +109,9 @@ CLOSE_FAILED_MESSAGE = (
 # or Zotero still ran when the install looked). Meridian did close it, so the wording must say so.
 UNCONFIRMED_CLOSED_STATUSES = frozenset({"check_failed", "refused_running"})
 _CLOSE_POLL_SECONDS = 0.5
-_CLOSE_TIMEOUT_SECONDS = 20.0
+# Zotero can take longer than 20 seconds to shut down (a real install was refused at 20s with nothing written),
+# so the install's close waits up to a minute.
+_CLOSE_TIMEOUT_SECONDS = 60.0
 REGISTER_TIMEOUT_SECONDS = 120.0
 REGISTER_POLL_SECONDS = 1.0
 # Zotero shuts down slowly after its first start, so the registration's close waits longer than the install's close.
