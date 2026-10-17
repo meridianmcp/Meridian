@@ -174,19 +174,27 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
     when there simply isn't enough hash data to say either way (e.g. no
     content hash was ever captured) -- never silently reported as verified
     just because an exact record exists.
-  - :data:`RELOCATED` -> ``VERIFIED`` (confidence 0.75, lower than a
-    same-path :data:`EXACT` match's 0.95). For a content-hash match, content
-    identity is confirmed by hash, just at a different path than originally
-    recorded. For a basename match (``relocation_evidence`` ``"basename"``),
-    identity rests on the basename alone, and the bridge still maps it to
-    ``VERIFIED``. The reason string names the matched prior path. Known
-    follow-up, not handled here:
-    this mapping does not read ``script_staleness``. The bridge reports
-    RELOCATED as ``VERIFIED`` with ``is_authoritative`` True even when the
-    generating script has changed or become unreadable. For a content-hash
-    match, the ``staleness_record`` reads ``stale`` in that case, so
-    ``is_authoritative`` is not proof that a relocated output is current. The
-    bridge is unchanged in this batch.
+  - :data:`RELOCATED` -- the generating script is checked first, whatever the
+    identity tier, because a changed or unreadable script means the output's
+    current state is not proven even when its identity still resolves:
+
+      * ``script_staleness`` reports ``is_stale`` (the script changed since
+        tagging, or can no longer be read) -> ``STALE``, confidence 0.3, the
+        same state and confidence as a changed :data:`EXACT` record. Not
+        authoritative. The reason names the changed or unreadable script.
+      * ``relocation_evidence`` ``"content_hash"`` and a fresh or untagged
+        script -> ``VERIFIED``, confidence 0.75 (lower than a same-path
+        :data:`EXACT` match's 0.95), authoritative. Content identity is
+        confirmed by hash, just at a different path than originally recorded.
+      * ``relocation_evidence`` ``"basename"`` and a fresh or untagged script
+        -> ``VERIFIED``, confidence 0.6 (below a content-hash match), NOT
+        authoritative. Identity rests on the basename alone, so the record is
+        also marked ``partial`` (see below). That keeps it out of
+        ``trusted_pointers`` and the authoritative record count.
+
+    The reason names the matched prior path for a ``VERIFIED`` relocation, and
+    the script for a ``STALE`` one. ``provenance_type`` stays :data:`RELOCATED`
+    in every case.
   - :data:`AMBIGUOUS` (this module's ``provenance_type``, not to be confused
     with the identically-named :class:`~research_evidence.ResolverStatus`
     member several OTHER branches below also map to) -> ``AMBIGUOUS``, low
@@ -205,13 +213,14 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
 
 :attr:`~research_evidence.EvidenceRecord.partial` is set (with a required
 ``partial_reason``) for :data:`UNREGISTERED`, :data:`UNKNOWN` and
-:data:`AMBIGUOUS` -- per this codebase's "partial records ... never presented
-as authoritative" requirement, a record built from any of those three
-provenance_type values is, by construction, known-incomplete (no exact
-record or directory note was captured for UNREGISTERED/UNKNOWN, and no single
-prior record can be confirmed for AMBIGUOUS), regardless of how confident the
-resolver mapping
-above is about its VERIFIED/STALE/etc status.
+:data:`AMBIGUOUS`, and for a :data:`RELOCATED` whose ``relocation_evidence`` is
+``"basename"``. Per this codebase's "partial records ... never presented as
+authoritative" requirement, a record built from any of those provenance_type
+values is, by construction, known-incomplete: no exact record or directory
+note was captured for UNREGISTERED/UNKNOWN, no single prior record can be
+confirmed for AMBIGUOUS, and a basename-only match confirms identity without a
+content hash. This holds regardless of how confident the resolver mapping above
+is about its VERIFIED/STALE/etc status.
 
 Basename-fallback relocation routing (sprint item 00c3c3f0)
 --------------------------------------------------------------
@@ -246,7 +255,9 @@ rather than minting a new one, so every existing consumer of that string
 (the research-evidence bridge below, and the standalone
 ``tools/meridian_fallbacks/figure_invariant_gate.py``, which hardcodes the
 SAME literal ``"relocated"`` value and treats it conservatively as a
-possible source mismatch) keeps working unchanged. A new, purely additive
+possible source mismatch) keeps the same ``provenance_type``, and the bridge
+below maps the basename tier to a non-authoritative record. A new, purely
+additive
 ``relocation_evidence`` field (``"content_hash"`` or ``"basename"``)
 distinguishes which tier actually produced the verdict for a caller that
 cares. A basename hit with more than one candidate (``candidate_count >
@@ -282,8 +293,9 @@ response, also carries an additive ``staleness_record`` key: the shared
 built by :func:`meridian_outputs.staleness.map_staleness`. Error responses
 carry only the ``error`` key. The per-source keys
 (``staleness``, ``script_staleness``, ``provenance_type``, ``inconclusive``)
-keep their names and values. Sources mapped: :func:`_staleness` (line 300),
-the :data:`STALE_BY_SCRIPT` state (line 297), and the script-hash checks
+keep their names and values. Sources mapped: :func:`_staleness`, the
+:data:`STALE_BY_SCRIPT` state (read in :func:`_staleness_record_for_status`),
+and the script-hash checks
 behind ``check_staleness`` and ``find_stale_by_script`` in server.py. A
 content-hash :data:`RELOCATED` status whose generating script changed or
 became unreadable is read through the same script source, while its
@@ -1115,17 +1127,33 @@ def _resolver_state_for_provenance_status(
             ),
         )
     if ptype == RELOCATED:
-        # Known follow-up, not handled here: this branch does not read
-        # script_staleness. The bridge reports RELOCATED as VERIFIED with
-        # is_authoritative True even when the generating script has changed or
-        # become unreadable. For a content-hash match, staleness_record reads
-        # stale in that case, so is_authoritative is not proof that a relocated
-        # output is current. The bridge is unchanged in this batch. See the
-        # module docstring's rule table.
+        # The generating script is checked first, whatever the identity tier.
+        # A changed or unreadable script (script_staleness.is_stale, from either
+        # the matched record's tag or this path's own tag -- see
+        # _build_provenance_status) means the output's current state is not
+        # proven, so it maps to the same STALE state and confidence as a changed
+        # EXACT record. See the module docstring's rule table.
         record = status.get("record") or {}
+        if script_staleness.get("is_stale"):
+            script_reason = script_staleness.get("reason") or (
+                "generating script changed or became unreadable since it was tagged"
+            )
+            script_path = script_staleness.get("script_path")
+            if script_path:
+                script_reason = f"{script_reason} (script {script_path!r})"
+            return research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.STALE,
+                confidence=0.3,
+                reason=f"relocated output: {script_reason}",
+            )
+        # Identity confirmed by content hash keeps the full 0.75. Identity
+        # confirmed by basename alone is lower (0.6) and is not authoritative.
+        # evidence_record_from_provenance_status marks it partial for that
+        # reason.
+        basename = status.get("relocation_evidence") == "basename"
         return research_evidence.ResolverState(
             status=research_evidence.ResolverStatus.VERIFIED,
-            confidence=0.75,
+            confidence=0.6 if basename else 0.75,
             reason=(
                 staleness.get("reason")
                 or (
@@ -1276,7 +1304,15 @@ def evidence_record_from_provenance_status(
             )
         )
 
-    partial = ptype in (UNREGISTERED, UNKNOWN, AMBIGUOUS)
+    # A basename-only RELOCATED is partial: identity is confirmed by basename,
+    # not by content hash. Partial is the existing "not authoritative" field
+    # (EvidenceRecord.is_authoritative excludes it), so trusted_pointers and the
+    # authoritative count both leave it out. The generating-script state does
+    # not change this.
+    basename_relocated = (
+        ptype == RELOCATED and status.get("relocation_evidence") == "basename"
+    )
+    partial = ptype in (UNREGISTERED, UNKNOWN, AMBIGUOUS) or basename_relocated
     partial_reason: "str | None" = None
     if ptype == UNREGISTERED:
         partial_reason = (
@@ -1304,6 +1340,12 @@ def evidence_record_from_provenance_status(
                 "provenance records -- cannot confirm which one this file "
                 "originated from"
             )
+    elif basename_relocated:
+        partial_reason = (
+            "identity rests on the basename alone (resolve_figure_output's "
+            "basename-fallback tier), not a content-hash match -- not "
+            "confirmed authoritative"
+        )
 
     external_ids: "dict[str, str]" = {}
     canonical_path = (archival or {}).get("canonical_path")
