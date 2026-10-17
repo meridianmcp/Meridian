@@ -2488,7 +2488,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Inline capture for web/paper research during planning: save a finding "
         "from a URL as an addressable note with the source link, optionally linked "
         "to a decision. A research-shaped wrapper over save_finding — arXiv URLs "
-        "are tagged source_type=arxiv automatically, everything else as web. Turns "
+        "and arXiv-issued DOIs are tagged source_type=arxiv automatically; "
+        "everything else as web. Turns "
         "web-search results into durable Meridian artifacts instead of evaporating. "
         "In-project dedupe: if this project already has a finding for the same "
         "paper/page (case-folded DOI, arXiv id without version, PMID, or "
@@ -2498,7 +2499,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "no url is available (a doi is stored as its https doi.org form).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "url": {"type": "string", "description": "Source URL of the web page or paper. Takes precedence over doi and pmid when several are given."},
+         "url": {"type": "string", "description": "Source URL of the web page or paper. A doi.org or dx.doi.org url (http, https or no scheme) is read as a DOI: it is refused if the DOI is not in the allowed form (for example one with a query string, fragment, percent escape, dot path segment or non-ASCII character), and it is stored as https://doi.org/<doi>. Takes precedence over doi and pmid when several are given."},
          "doi": {"type": "string", "description": "DOI of the paper (e.g. 10.1145/3292500.3330701, or doi:/doi.org form). Used as the source, stored as https://doi.org/<doi>, when no url is given."},
          "pmid": {"type": "string", "description": "PubMed id of the paper. Used as the source, stored as its PubMed URL, when neither url nor doi is given."},
          "summary": {"type": "string", "description": "Your summary of the finding (markdown)."},
