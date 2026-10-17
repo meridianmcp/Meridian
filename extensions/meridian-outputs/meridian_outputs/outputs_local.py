@@ -3126,6 +3126,17 @@ def _open_tantivy_index_cold_start_safe(
         return fresh_index, warning
 
 
+#: Block size (bytes) DuckDB uses for a NEW index file created by
+#: OutputsFtsIndex when the caller does not pass ``duckdb_block_size``.
+#: DuckDB's own default is 262144. This governs only files created after this
+#: value takes effect: DuckDB records the block size in the file header at
+#: creation and never changes it, so an existing index file keeps the size it
+#: was created with and is never rewritten by changing this constant.
+DUCKDB_NEW_FILE_BLOCK_SIZE = 16384
+#: The block sizes DuckDB accepts for a new database file.
+_DUCKDB_BLOCK_SIZES = (16384, 32768, 65536, 131072, 262144)
+
+
 class OutputsFtsIndex:
     # Adaptive defaults are deliberately bounded: 4k is the safety floor,
     # while 32k was the fastest tested setting in the real SUT benchmark.
@@ -3211,6 +3222,29 @@ class OutputsFtsIndex:
             return cls._WRITE_CHUNK_DEFAULT
         return value
 
+    @classmethod
+    def _resolve_duckdb_block_size(cls, explicit: int | None) -> int:
+        """Validate the ``duckdb_block_size`` constructor argument.
+
+        None selects DUCKDB_NEW_FILE_BLOCK_SIZE. Any value other than one of
+        DuckDB's supported block sizes raises ValueError rather than being
+        silently replaced, so a typo cannot quietly create a file at an
+        unintended size.
+        """
+        if explicit is None:
+            return DUCKDB_NEW_FILE_BLOCK_SIZE
+        if (
+            isinstance(explicit, bool)
+            or not isinstance(explicit, int)
+            or explicit not in _DUCKDB_BLOCK_SIZES
+        ):
+            raise ValueError(
+                f"OutputsFtsIndex: duckdb_block_size={explicit!r} is not a "
+                "supported DuckDB block size; expected one of "
+                + ", ".join(str(size) for size in _DUCKDB_BLOCK_SIZES)
+            )
+        return explicit
+
     def __init__(
         self,
         outputs_dir: str,
@@ -3222,6 +3256,7 @@ class OutputsFtsIndex:
         exclude_patterns: tuple[str, ...] | None = None,
         tantivy_heap_bytes: int | None = None,
         duckdb_memory_limit_bytes: int | None = None,
+        duckdb_block_size: int | None = None,
         max_batch: int | None = None,
         write_chunk: int | None = None,
         walk_cooldown_seconds: float | None = None,
@@ -3284,6 +3319,10 @@ class OutputsFtsIndex:
         # all, so re-resolving on that path is already idempotent -- only an
         # explicit constructor arg needs this guard.
         self._duckdb_memory_limit_overridden = duckdb_memory_limit_bytes is not None
+        # Block size for a NEW db file only (see DUCKDB_NEW_FILE_BLOCK_SIZE).
+        # Validated here, before the write lock or any connection exists, so a
+        # bad value fails at construction and never reaches the file system.
+        self._duckdb_block_size = self._resolve_duckdb_block_size(duckdb_block_size)
         # 3535b9ad -- walk batch cap: explicit param > MERIDIAN_OUTPUTS_MAX_BATCH
         # env var > class default (1bce8c41: an effectively-unbounded default,
         # time-primary -- see _ResumableFileWalk._MAX_BATCH). This value feeds
@@ -3593,10 +3632,36 @@ class OutputsFtsIndex:
         self._legacy_migration_calls_since_scan = 0
         self._legacy_migration_found_last_time = True
 
+    def _duckdb_connect(self) -> Any:
+        """Open a DuckDB connection to ``self._db_path``.
+
+        A brand-new on-disk file is created at ``self._duckdb_block_size``. The
+        sizing is applied by a short-lived creating connection that is closed
+        straight away, and every connection is then a plain
+        ``duckdb.connect(path)``: the write connection, the read connection, and
+        any other connection this process opens to the same file. The block
+        size is recorded in the file header, so those plain opens all see it,
+        and the read and write sides can never disagree about a file either
+        one created.
+
+        This is deliberate. DuckDB refuses a second connection to the same file
+        in one process whose config differs from one already open (``Can't open
+        a connection to same database file with a different configuration``),
+        so passing the config on a long-lived connection broke the read path
+        whenever the write connection had created the file first. Existing
+        files are opened exactly as before, and ``:memory:`` is never touched.
+        """
+        import duckdb  # noqa: PLC0415
+        if self._db_path != ":memory:" and not os.path.exists(self._db_path):
+            duckdb.connect(
+                self._db_path,
+                config={"default_block_size": str(self._duckdb_block_size)},
+            ).close()
+        return duckdb.connect(self._db_path)
+
     def _connect(self) -> Any:
         if self._con is None:
-            import duckdb  # noqa: PLC0415
-            self._con = duckdb.connect(self._db_path)
+            self._con = self._duckdb_connect()
             # task_ecb96ac9 follow-on -- give DuckDB an explicit ceiling to
             # self-manage against (see _default_duckdb_memory_limit_bytes's
             # module comment for why: no ceiling let a real run exhaust
@@ -3846,8 +3911,7 @@ class OutputsFtsIndex:
         if self._db_path == ":memory:":
             return self._connect()
         if self._read_con is None:
-            import duckdb  # noqa: PLC0415
-            self._read_con = duckdb.connect(self._db_path)
+            self._read_con = self._duckdb_connect()
             try:
                 self._ensure_schema(self._read_con)
             except Exception:  # noqa: BLE001
