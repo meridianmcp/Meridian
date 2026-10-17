@@ -63,7 +63,7 @@ def build_mcp_server():
     # as the HTTP /mcp surface (meridian/mcp/handler.py) so both transports
     # advertise identical prompts and bodies.
     from . import handler as _handler
-    from ..mcp_tools import _MCP_TOOLS_LIST
+    from ..mcp_tools import _MCP_TOOLS_LIST, normalize_public_tool_name
 
     server: Server = Server("meridian")
 
@@ -168,42 +168,8 @@ def build_mcp_server():
     async def list_tools() -> list[Tool]:
         """Advertise every Meridian tool to the MCP client."""
         return [
-            Tool(
-                name="create_project",
-                description=(
-                    "Create a new Meridian project to coordinate sessions "
-                    "around. Returns the project id and name. Project names "
-                    "must be unique."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "execution_mode": {
-                            "type": "string",
-                            "enum": ["autonomous", "interactive"],
-                            "description": (
-                                "Executor posture for sessions on this project. "
-                                "'autonomous' (default) claims and runs sprint "
-                                "items immediately without asking; 'interactive' "
-                                "asks for direction first. Editable later in "
-                                "dashboard Settings."
-                            ),
-                        },
-                        "parent_project_id": {
-                            "type": "string",
-                            "description": (
-                                "Optional parent project id — makes this a "
-                                "subproject that inherits the parent's north_star "
-                                "when it has none of its own. Subprojects are one "
-                                "level deep: the parent must exist and must not "
-                                "itself be a subproject."
-                            ),
-                        },
-                    },
-                    "required": ["name"],
-                },
-            ),
+            _shared_tool("meridian_project_create"),
+            _shared_tool("create_project"),
             Tool(
                 name="register_session",
                 description=(
@@ -2129,15 +2095,8 @@ def build_mcp_server():
             # schema/description the HTTP/streamable-HTTP transport advertises so
             # the three transports can no longer drift apart on this tool.
             _shared_tool("start_session"),
-            Tool(
-                name="list_projects",
-                description=(
-                    "Call first when project_id is unknown. Returns the "
-                    "current tenant's projects as [{id, name, sprint, "
-                    "created_at}] newest first."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
+            _shared_tool("meridian_project_list"),
+            _shared_tool("list_projects"),
             Tool(
                 name="get_project_by_name",
                 description=(
@@ -2190,6 +2149,7 @@ def build_mcp_server():
         name: str, arguments: dict[str, Any]
     ) -> list[TextContent]:
         """Dispatch an MCP tool call to the matching db/handoff function."""
+        name = normalize_public_tool_name(name)
         db = await _ensure_db()
         result: Any
         try:
