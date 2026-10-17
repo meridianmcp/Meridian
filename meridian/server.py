@@ -4786,6 +4786,9 @@ async def mcp_tools_doc() -> str:
         "Read-only: Fetch one project note's full body by its per-project `slug` (the `slug` field "
         "from `get_notes`). The pull half of the list→read model.")
     lines += _render_tool("delete_note")
+    lines += ["## Compute\n"]
+    lines += _render_tool("runpod_check_key")
+    lines += _render_tool("runpod_list_pods")
     lines += ["## Projects\n"]
     lines += _render_tool("create_project")
     lines += _render_tool("merge_project")

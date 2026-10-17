@@ -97,8 +97,9 @@ async def runpod_check_key_route(request: Request) -> JSONResponse:
 
 @router.get("/compute/runpod/pods")
 async def runpod_list_pods_route(request: Request) -> JSONResponse:
-    """List one page (up to 1000) of the account's RunPod pods as summaries. Cluster member
-    pods are not included: RunPod's includeClusterPods defaults to false and is not sent."""
+    """List one page (up to 1000) of the account's RunPod pods as summaries.
+
+    Cluster member pods are not included: RunPod's includeClusterPods defaults to false and is not sent."""
     refused = _refuse_remote_caller(request, _list_payload)
     if refused is not None:
         return refused
