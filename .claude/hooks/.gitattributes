@@ -14,3 +14,6 @@ meridian_guard*.ps1 text eol=lf
 # reintroduce this class of bug.
 sprint_guard*.sh text eol=lf
 hitl_guard*.sh text eol=lf
+
+# Every shell hook keeps LF on every checkout: a CRLF bash script fails with a syntax error.
+*.sh text eol=lf
