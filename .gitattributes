@@ -12,3 +12,7 @@ docs/mcp-tools.md text eol=lf
 /tests/test_code_index.py text eol=lf
 /meridian/code_index.py text eol=lf
 /.claude/settings.json text eol=lf
+
+# The fallback-manifest sources are hashed into capability_manifest.json, so every checkout must hold the committed LF bytes.
+tools/meridian_fallbacks/** text eol=lf
+/pixi.toml text eol=lf
