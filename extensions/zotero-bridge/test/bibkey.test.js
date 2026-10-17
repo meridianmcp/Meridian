@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { readBibKey, isSafeBibKey } = require('../lib/bibkey.js');
+const { readBibKey, isSafeBibKey, citationKeyFromImport } = require('../lib/bibkey.js');
 
 test('reads the BibTeX key line from a multi-line Extra field', () => {
   const extra = 'Original Date: 2020-01-01\nBibTeX key: smith2020a\nPMID: 123';
@@ -46,4 +46,27 @@ test('isSafeBibKey rejects traversal, separators, spaces, leading dots and overl
   assert.equal(isSafeBibKey(''), false);
   assert.equal(isSafeBibKey('a'.repeat(201)), false);
   assert.equal(isSafeBibKey(null), false);
+});
+
+test('citationKeyFromImport reads itemID, which is where the BibTeX import translator keeps the key', () => {
+  assert.equal(citationKeyFromImport({ itemID: 'smith2020a', title: 'T' }), 'smith2020a');
+});
+
+test('citationKeyFromImport prefers an explicit citationKey, then a Citation Key line, then itemID', () => {
+  assert.equal(citationKeyFromImport({ citationKey: 'explicit', itemID: 'other' }), 'explicit');
+  assert.equal(citationKeyFromImport({ extra: 'Citation Key: fromextra', itemID: 'other' }), 'fromextra');
+  assert.equal(citationKeyFromImport({ itemID: 'other' }), 'other');
+});
+
+test('citationKeyFromImport refuses unsafe, empty, or non-string keys, and missing input', () => {
+  assert.equal(citationKeyFromImport({ itemID: '../escape' }), null);
+  assert.equal(citationKeyFromImport({ itemID: 42 }), null);
+  assert.equal(citationKeyFromImport({ itemID: '' }), null);
+  assert.equal(citationKeyFromImport({}), null);
+  assert.equal(citationKeyFromImport(null), null);
+});
+
+test('a key read from an import can be written as the plugin line and read back for the PDF step', () => {
+  const key = citationKeyFromImport({ itemID: 'doe2019_x-y' });
+  assert.equal(readBibKey('BibTeX key: ' + key), 'doe2019_x-y');
 });

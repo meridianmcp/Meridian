@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import tomllib
@@ -32,6 +33,33 @@ SERENA_CONTEXTS = {
     "cursor": "ide",
 }
 TOOLS = ("meridian", "serena", "codebase_memory", "docs", "outputs", "latex")
+# A server the user wrote that matches one of these needles already covers that tool, so the managed entry for the
+# tool is not added beside it. Two copies of one server in one client are the duplicates this avoids.
+_TOOL_SIGNATURES: dict[str, tuple[str, ...]] = {
+    # The Meridian MCP endpoint itself. Other usemeridian.us paths are other tools behind the same account.
+    "meridian": ("usemeridian.us/mcp", '"--mcp"'),
+    # The hosted /extract/mcp and /code/mcp endpoints are Meridian's Serena and code-memory tools behind an account.
+    "serena": ("oraios/serena", "/extract/mcp"),
+    "codebase_memory": ("codebase-memory-mcp", "/code/mcp"),
+    "docs": ("meridian-docs",),
+    "outputs": ("meridian-outputs",),
+    "latex": ("meridian-latex", "@meridianmcp/mcp"),
+}
+# A server the user named after a tool covers it too, for example "serena" or "codebase-memory" in Cursor's config.
+_NAME_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "serena": ("serena",),
+    "codebase_memory": ("codebase-memory",),
+    "docs": ("meridian-docs",),
+    "outputs": ("meridian-outputs",),
+    "latex": ("meridian-latex",),
+}
+# The per-session hook: a SessionStart entry that runs setup for the repo the chat opened in. Matches the matcher the
+# Meridian guard hooks use. The marker identifies this entry, so reinstalling replaces it and uninstall removes only it.
+SESSION_HOOK_MATCHER = "startup|resume|clear|compact"
+SESSION_HOOK_MARKER = "python -m meridian setup --repo"
+# An entry is this command's if its command has either form: the inline bash command or the Windows script call.
+SESSION_HOOK_MARKERS = (SESSION_HOOK_MARKER, "session-setup.ps1")
+SESSION_HOOK_BACKUP_SUFFIX = ".meridian-setup.bak"
 
 
 class SetupBundleError(ValueError):
@@ -216,6 +244,34 @@ def _read_json(path: Path) -> tuple[dict[str, Any], str]:
     return data, raw
 
 
+def _tool_of(name: str) -> str | None:
+    """The tool a managed entry name stands for, or None for a name this command did not write."""
+    if not name.startswith(MANAGED_PREFIX):
+        return None
+    rest = name[len(MANAGED_PREFIX):]
+    return next((tool for tool in TOOLS if rest.startswith(tool + "_")), None)
+
+
+def _covered_tools(servers: dict[str, Any]) -> set[str]:
+    """Tools that a server this command did not write already covers. Managed entries never count."""
+    covered: set[str] = set()
+    for name, entry in servers.items():
+        if name.startswith(MANAGED_PREFIX):
+            continue
+        text = json.dumps(entry, sort_keys=True, default=str)
+        lowered = name.lower()
+        for tool, needles in _TOOL_SIGNATURES.items():
+            if any(needle in text for needle in needles) or any(needle in lowered for needle in _NAME_SIGNATURES.get(tool, ())):
+                covered.add(tool)
+    return covered
+
+
+def _without_covered(entries: dict[str, dict[str, Any]], servers: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The managed entries whose tool the existing servers do not already cover."""
+    covered = _covered_tools(servers)
+    return {name: entry for name, entry in entries.items() if _tool_of(name) not in covered}
+
+
 def _plan_json(path: Path, entries: dict[str, dict[str, Any]], *, uninstall: bool) -> PlannedWrite | None:
     data, original = _read_json(path)
     servers = data.get("mcpServers")
@@ -228,6 +284,7 @@ def _plan_json(path: Path, entries: dict[str, dict[str, Any]], *, uninstall: boo
         for name in entries:
             updated.pop(name, None)
     else:
+        entries = _without_covered(entries, servers)
         conflicts = [name for name, entry in entries.items() if name in updated and updated[name] != entry]
         if conflicts:
             joined = ", ".join(conflicts)
@@ -303,6 +360,7 @@ def _plan_toml(path: Path, entries: dict[str, dict[str, Any]], *, uninstall: boo
             return None
         result = _toml_without_servers(original, names)
     else:
+        entries = _without_covered(entries, servers)
         conflicts = [name for name, entry in entries.items() if name in servers and servers[name] != entry]
         if conflicts:
             raise SetupBundleError(f"{path} already has different server config for {', '.join(conflicts)}; it was left untouched")
@@ -393,6 +451,191 @@ def configure_bundle(
     return results
 
 
+def session_hook_command(root: Path, pixi: str, *, windows: bool) -> str:
+    """The SessionStart command: set up the repo the chat opened in, for Claude Code, Codex and Cursor.
+
+    It does nothing unless the folder is a git repo, and it always exits 0, so a failed setup never blocks a session.
+    The Windows form is PowerShell, which this machine's Meridian guard hooks already use.
+    """
+    manifest = (Path(root) / "pixi.toml").as_posix()
+    checkout = Path(root).as_posix()
+    pixi_path = Path(pixi).as_posix()
+    hosts = "--host claude-code --host codex --host cursor"
+    # The command enters the Meridian checkout first. `python -m meridian` imports the package from the current folder,
+    # so running it from the chat's repo would pick up that repo's copy of Meridian, which may not have `setup`.
+    if windows:
+        # The script runs the same setup. A file path needs no quoting across shells, which Claude Code and Codex differ on.
+        script = (Path(root) / "scripts" / "session-setup.ps1").as_posix()
+        return f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}"'
+    return (
+        f'[ -d "$CLAUDE_PROJECT_DIR/.git" ] && (cd "{checkout}" && "{pixi_path}" run --manifest-path "{manifest}" '
+        f'python -m meridian setup --repo "$CLAUDE_PROJECT_DIR" {hosts} >/dev/null 2>&1); true'
+    )
+
+
+def _is_session_hook(hook: Any) -> bool:
+    return isinstance(hook, dict) and any(marker in str(hook.get("command", "")) for marker in SESSION_HOOK_MARKERS)
+
+
+def _with_session_hook(data: dict[str, Any], command: str | None) -> dict[str, Any]:
+    """``data`` with every copy of this command's SessionStart hook removed, and one added when ``command`` is given.
+
+    Nothing else in the file changes. A file with no hooks and no command to add comes back as it was.
+    """
+    updated = json.loads(json.dumps(data))
+    hooks = updated.get("hooks")
+    if hooks is not None and not isinstance(hooks, dict):
+        raise SetupBundleError("hooks in the Claude Code settings must be an object; it was left untouched")
+    if hooks is None and command is None:
+        return updated
+    if hooks is None:
+        hooks = {}
+        updated["hooks"] = hooks
+    groups = hooks.get("SessionStart", [])
+    if not isinstance(groups, list):
+        raise SetupBundleError("hooks.SessionStart in the Claude Code settings must be a list; it was left untouched")
+    kept: list[Any] = []
+    for group in groups:
+        if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+            remaining = [hook for hook in group["hooks"] if not _is_session_hook(hook)]
+            if len(remaining) != len(group["hooks"]):
+                if not remaining:
+                    continue  # the group held only this hook
+                group = {**group, "hooks": remaining}
+        kept.append(group)
+    if command is not None:
+        kept.append({"matcher": SESSION_HOOK_MATCHER, "hooks": [{"type": "command", "command": command}]})
+    if kept or "SessionStart" in hooks:
+        hooks["SessionStart"] = kept
+    return updated
+
+
+def _settings_for_hook(settings: Path) -> dict[str, Any]:
+    if not settings.exists():
+        return {}
+    try:
+        text = settings.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise SetupBundleError(f"Could not read {settings}: {exc}") from exc
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError as exc:
+        raise SetupBundleError(f"{settings} is not valid JSON; it was left untouched") from exc
+    if not isinstance(data, dict):
+        raise SetupBundleError(f"{settings} must contain a JSON object; it was left untouched")
+    return data
+
+
+def _write_settings(settings: Path, data: dict[str, Any]) -> None:
+    """Back the settings file up once, before the first change, then write it atomically."""
+    backup = settings.with_name(settings.name + SESSION_HOOK_BACKUP_SUFFIX)
+    if settings.exists() and not backup.exists():
+        shutil.copy2(settings, backup)
+    _write_atomic(settings, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def install_session_hook(settings: Path, *, root: Path, pixi: str, windows: bool) -> str:
+    """Install the SessionStart hook into Claude Code's user settings. Returns ``written`` or ``unchanged``.
+
+    Other hooks are kept. Reinstalling replaces this hook only. Everything else in the file is left as it is.
+    """
+    if not (Path(root) / "pixi.toml").is_file():
+        raise SetupBundleError(f"No pixi.toml in {root}; the hook must point at a Meridian checkout")
+    data = _settings_for_hook(settings)
+    updated = _with_session_hook(data, session_hook_command(root, pixi, windows=windows))
+    if updated == data:
+        return "unchanged"
+    _write_settings(settings, updated)
+    return "written"
+
+
+def uninstall_session_hook(settings: Path) -> str:
+    """Remove this command's SessionStart hook from Claude Code's user settings. Returns ``removed`` or ``unchanged``."""
+    data = _settings_for_hook(settings)
+    updated = _with_session_hook(data, None)
+    if updated == data:
+        return "unchanged"
+    _write_settings(settings, updated)
+    return "removed"
+
+
+CODEX_HOOK_BEGIN = "# >>> meridian setup SessionStart >>>"
+CODEX_HOOK_END = "# <<< meridian setup SessionStart <<<"
+
+
+def _codex_hook_block(command: str) -> str:
+    """The marked TOML block for Codex's SessionStart hook. The literal string keeps the command free of escaping."""
+    if "'" in command or "\n" in command:
+        raise SetupBundleError("The session hook command cannot contain a single quote or a newline for Codex")
+    return "\n".join(
+        [
+            CODEX_HOOK_BEGIN,
+            "[[hooks.SessionStart]]",
+            f'matcher = "{SESSION_HOOK_MATCHER}"',
+            "",
+            "[[hooks.SessionStart.hooks]]",
+            'type = "command"',
+            f"command = '{command}'",
+            CODEX_HOOK_END,
+            "",
+        ]
+    )
+
+
+def _codex_with_hook(original: str, block: str | None) -> str:
+    """``original`` with this command's marked block replaced by ``block``, or removed when ``block`` is None.
+
+    The result is checked as TOML before it is returned, so a bad block is never written.
+    """
+    lines = original.splitlines(keepends=True)
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == CODEX_HOOK_BEGIN:
+            skipping = True
+            continue
+        if skipping:
+            if stripped == CODEX_HOOK_END:
+                skipping = False
+            continue
+        kept.append(line)
+    text = "".join(kept)
+    if block is not None:
+        separator = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+        text = text + separator + block
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise SetupBundleError(f"The Codex config would not parse with the session hook; it was left untouched ({exc})") from exc
+    return text
+
+
+def install_codex_session_hook(config: Path, *, command: str) -> str:
+    """Write this command's SessionStart hook into Codex's config. Returns ``written`` or ``unchanged``."""
+    original = config.read_text(encoding="utf-8-sig") if config.exists() else ""
+    updated = _codex_with_hook(original, _codex_hook_block(command))
+    if updated == original:
+        return "unchanged"
+    backup = config.with_name(config.name + SESSION_HOOK_BACKUP_SUFFIX)
+    if config.exists() and not backup.exists():
+        shutil.copy2(config, backup)
+    _write_atomic(config, updated)
+    return "written"
+
+
+def uninstall_codex_session_hook(config: Path) -> str:
+    """Remove this command's marked block from Codex's config. Returns ``removed`` or ``unchanged``."""
+    if not config.exists():
+        return "unchanged"
+    original = config.read_text(encoding="utf-8-sig")
+    updated = _codex_with_hook(original, None)
+    if updated == original:
+        return "unchanged"
+    _write_atomic(config, updated)
+    return "removed"
+
+
 def cli_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="meridian setup",
@@ -413,7 +656,41 @@ def cli_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--meridian-url", default=DEFAULT_MERIDIAN_URL, help="Hosted Meridian base URL.")
     parser.add_argument("--dry-run", action="store_true", help="Show config files that would change without writing.")
     parser.add_argument("--uninstall", action="store_true", help=f"Remove this command's {MANAGED_PREFIX} entries.")
+    parser.add_argument(
+        "--install-session-hook", action="store_true",
+        help=(
+            "Install the Claude Code and Codex SessionStart hooks: a chat in a git repo sets up that repo. "
+            "Writes ~/.claude/settings.json and ~/.codex/config.toml."
+        ),
+    )
+    parser.add_argument(
+        "--uninstall-session-hook", action="store_true", help="Remove only this command's SessionStart hook.",
+    )
     args = parser.parse_args(argv)
+    if args.install_session_hook or args.uninstall_session_hook:
+        claude_settings = Path.home() / ".claude" / "settings.json"
+        codex_config = Path.home() / ".codex" / "config.toml"
+        try:
+            if args.uninstall_session_hook:
+                claude = uninstall_session_hook(claude_settings)
+                codex = uninstall_codex_session_hook(codex_config)
+            else:
+                pixi = shutil.which("pixi")
+                if not pixi:
+                    raise SetupBundleError("pixi was not found on PATH; install pixi, then run this again")
+                root = Path(__file__).resolve().parents[1]
+                if not (root / "scripts" / "session-setup.ps1").is_file() and os.name == "nt":
+                    raise SetupBundleError(f"scripts/session-setup.ps1 is missing from {root}")
+                windows = os.name == "nt"
+                claude = install_session_hook(claude_settings, root=root, pixi=pixi, windows=windows)
+                command = session_hook_command(root, pixi, windows=windows)
+                codex = install_codex_session_hook(codex_config, command=command)
+        except (OSError, SetupBundleError, ValueError) as exc:
+            print(f"meridian setup: {exc}", file=sys.stderr)
+            return 1
+        print(f"Claude Code session hook {claude}: {claude_settings}")
+        print(f"Codex session hook {codex}: {codex_config}")
+        return 0
 
     repo_args = [item for group in (args.repo or []) for item in group]
     host_args = [item for group in (args.host or []) for item in group]
