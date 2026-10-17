@@ -990,6 +990,10 @@ from .routes.zotero import router as _zotero_router  # noqa: E402 — Zotero con
 
 app.include_router(_zotero_router)
 
+from .routes.compute import router as _compute_router  # noqa: E402 — RunPod key check and pod list (GET /compute/runpod/*)
+
+app.include_router(_compute_router)
+
 # ---------------------------------------------------------------------------
 # Password gate middleware
 # ---------------------------------------------------------------------------
