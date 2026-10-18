@@ -6,10 +6,11 @@
 var KEY_RE = /^[A-Z0-9]{8}$/;
 var PREDICATE_RE = /^[a-z]+:[A-Za-z]+$/;
 var BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-var FILENAME_BAD_RE = /[\\/\x00-\x1f\x7f]/;
+// A colon in a file name names an alternate data stream on Windows, so it is refused here too.
+var FILENAME_BAD_RE = /[\\/:\x00-\x1f\x7f]/;
 // Windows device names. A file named CON.pdf or nul.txt opens the device, so these stems are refused.
 // The superscript digits are the COM and LPT variants that Windows also reserves.
-var RESERVED_NAME_RE = /^(CON|PRN|AUX|NUL|COM[0-9\u00b9\u00b2\u00b3]|LPT[0-9\u00b9\u00b2\u00b3])$/i;
+var RESERVED_NAME_RE = /^(CON|CONIN\$|CONOUT\$|CLOCK\$|PRN|AUX|NUL|COM[0-9\u00b9\u00b2\u00b3]|LPT[0-9\u00b9\u00b2\u00b3])$/i;
 // Two leading separators name a network share (//host/share) or a device path (the \\?\ and \\.\ forms).
 // Zotero would stat the share over SMB, so these are refused before a path reaches it.
 var UNC_OR_DEVICE_RE = /^[\\/]{2}|^\\[?.]/;
@@ -187,11 +188,12 @@ function isAbsolutePath(path) {
 }
 
 // Extensions a linked file may have. Zotero attachments are documents, figures and media. Keys, configs, scripts,
-// databases and archives are not on the list, so a linked file can never be one of them.
+// databases and archives are not on the list, so a linked file can never be one of them. HTML and SVG are left
+// out on purpose: they can carry active content, and a linked page is a poor fit for a reference library anyway.
 var LINKABLE_EXTENSIONS = [
-  'pdf', 'epub', 'djvu', 'doc', 'docx', 'odt', 'rtf', 'txt', 'md', 'html', 'htm', 'csv', 'tsv',
+  'pdf', 'epub', 'djvu', 'doc', 'docx', 'odt', 'rtf', 'txt', 'md', 'csv', 'tsv',
   'xls', 'xlsx', 'ods', 'ppt', 'pptx', 'odp', 'png', 'jpg', 'jpeg', 'gif', 'tif', 'tiff', 'webp',
-  'bmp', 'svg', 'mp3', 'm4a', 'wav', 'mp4', 'mov',
+  'bmp', 'mp3', 'm4a', 'wav', 'mp4', 'mov',
 ];
 
 // Folders that hold credentials, profiles or app state. A path through any of them is refused.
@@ -200,20 +202,57 @@ var SENSITIVE_SEGMENTS = [
 ];
 
 // Null when the path may be linked, otherwise the reason it may not. It judges the text of the path only.
+// lib/api/link_policy.js runs it twice: on the path as sent, and on the real path the OS resolves it to, so a
+// junction or a short name cannot hide a folder from these rules.
 function linkableFileProblem(path) {
-  var segments = String(path).split(/[\\\/]+/).map(function (s) { return s.toLowerCase(); }).filter(function (s) { return s !== ''; });
+  var text = String(path);
+  // A path that ends in a separator names a folder, not a file.
+  if (/[\\\/]$/.test(text)) {
+    return 'A linked file must name a file, not a folder.';
+  }
+  // A colon after the drive letter starts an alternate data stream, so it is refused.
+  var rest = /^[A-Za-z]:/.test(text) ? text.slice(2) : text;
+  if (rest.indexOf(':') !== -1) {
+    return 'A colon after the drive letter names an alternate data stream, so the file cannot be linked.';
+  }
+  var segments = text.split(/[\\\/]+/).filter(function (s) { return s !== ''; });
   for (var i = 0; i < segments.length; i++) {
-    if (SENSITIVE_SEGMENTS.indexOf(segments[i]) !== -1) {
+    // Win32 drops trailing dots and spaces from a name, so AppData. and AppData name the same folder.
+    var folded = segments[i].toLowerCase().replace(/[. ]+$/, '');
+    if (SENSITIVE_SEGMENTS.indexOf(folded) !== -1) {
       return 'That folder holds credentials, profiles or app data, so it cannot be linked.';
     }
+    // A device name anywhere in the path is refused, because Windows reads CON.pdf as the console.
+    var stem = segments[i].split(/[.:]/)[0].replace(/ +$/, '');
+    if (RESERVED_NAME_RE.test(stem)) {
+      return 'A Windows device name such as CON or NUL cannot be linked.';
+    }
   }
-  var name = segments.length ? segments[segments.length - 1] : '';
+  var name = segments.length ? segments[segments.length - 1].toLowerCase() : '';
   var dot = name.lastIndexOf('.');
   var ext = dot > 0 ? name.slice(dot + 1) : '';
   if (LINKABLE_EXTENSIONS.indexOf(ext) === -1) {
     return 'Only documents, images and media can be linked. Import the file instead.';
   }
   return null;
+}
+
+// The folders the user allows for linked files. The preference separates them with a vertical bar, which Windows
+// forbids in file names, so no folder name can be split in two by mistake. An entry must be a drive path, such as
+// a drive letter, a colon and a folder, so a rooted or drive-relative entry is dropped. A drive root is dropped too,
+// because it would allow the whole drive. Text cannot show every way a path resolves to a root (dot segments, for
+// example), so lib/api/link_policy.js refuses a folder that resolves to a root as well. A dropped entry allows nothing.
+function linkFolderList(text) {
+  if (typeof text !== 'string') return [];
+  // Forward slashes are the same separator on Windows, so they become backslashes here, and the resolver sees one form.
+  return text.split('|').map(function (s) { return s.trim().replace(/\//g, '\\'); }).filter(function (s) {
+    if (s === '' || s.length > LIMITS.path) return false;
+    if (!/^[A-Za-z]:[\\\/]/.test(s) || !isAbsolutePath(s)) return false;
+    var trimmed = s.replace(/[\\\/]+$/, '');
+    return !/^[A-Za-z]:$/.test(trimmed);
+  }).map(function (s) {
+    return s.replace(/[\\\/]+$/, '');
+  });
 }
 function predicateValue(value, name) {
   if (typeof value !== 'string' || !PREDICATE_RE.test(value)) {
@@ -247,6 +286,7 @@ module.exports = {
   safeFilename: safeFilename,
   isAbsolutePath: isAbsolutePath,
   linkableFileProblem: linkableFileProblem,
+  linkFolderList: linkFolderList,
   predicateValue: predicateValue,
   relationObjectValue: relationObjectValue,
 };

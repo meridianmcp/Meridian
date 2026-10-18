@@ -19,18 +19,14 @@ function createItemWrites(deps) {
   var newId = deps.newId;
   var tempDir = deps.tempDir;
   var tracker = deps.tracker;
-  var delay = deps.delay;
+  // lib/api/link_policy.js decides which linked files may be stored. Without one, linking is refused.
+  var linkPolicy = deps.linkPolicy || null;
   var apiError = v.apiError;
   var invalid = v.invalid;
-  var localApiServesFiles = deps.localApiServesFiles || function () { return true; };
 
   if (!tracker) throw new Error('createItemWrites needs deps.tracker');
-  if (typeof delay !== 'function') throw new Error('createItemWrites needs deps.delay');
   if (!Array.isArray(tracker.created)) tracker.created = [];
 
-  // A stalled network share must not hold the write queue, so the file check gives up after this long.
-  var FILE_CHECK_MS = 5000;
-  var TIMED_OUT = {};
   // A body with a long list of bad fields gets a capped reply, with the real count beside it.
   var MAX_LISTED_PROBLEMS = 50;
 
@@ -388,49 +384,16 @@ function createItemWrites(deps) {
     }
   }
 
-  // io.stat() can wait a long time on a network share that does not answer. The race gives up after FILE_CHECK_MS.
-  // A stat that fails counts as no file, as it did before.
-  function statWithin(path) {
-    var check = Promise.resolve()
-      .then(function () {
-        return io.stat(path);
-      })
-      .catch(function () {
-        return null;
-      });
-    var timeout = Promise.resolve(delay(FILE_CHECK_MS)).then(function () {
-      return TIMED_OUT;
-    });
-    return Promise.race([check, timeout]);
-  }
-
+  // The link policy checks the file and returns the real path. Zotero stores that path, not the one the caller sent.
   async function linkAttachmentFile(parent, body, title, contentType) {
     var path = v.requireString(body.path, 'path', v.LIMITS.path);
     if (!v.isAbsolutePath(path)) throw invalid('path', 'must be an absolute path');
-    // Zotero's local API serves a linked file to any local program that asks, with no token, so while that API is on
-    // a linked file would be readable by every account on the machine. Fails closed when no check is wired in.
-    if (localApiServesFiles()) {
-      throw apiError(
-        422,
-        'linking_unavailable',
-        'Zotero\u2019s local API is on, and it serves linked files to any local program. Import the file instead, or turn the local API off.'
-      );
+    if (!linkPolicy) {
+      throw apiError(422, 'linking_unavailable', 'Linking files is not set up in this build. Import the file instead.');
     }
-    var problem = v.linkableFileProblem(path);
-    if (problem) throw apiError(422, 'linking_refused', problem);
-    var info = await statWithin(path);
-    if (info === TIMED_OUT) {
-      throw apiError(
-        422,
-        'file_check_timed_out',
-        'The file could not be checked in time. The drive or network share may be slow or unavailable. Nothing was linked.'
-      );
-    }
-    if (!info || info.type !== 'regular') {
-      throw apiError(422, 'file_not_found', 'No file exists at that path.');
-    }
+    var allowed = await linkPolicy.checkLinkable(path);
     return zotero.Attachments.linkFromFile({
-      file: path,
+      file: allowed.path,
       parentItemID: parent.id,
       title: title,
       contentType: contentType,

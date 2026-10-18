@@ -32,6 +32,7 @@ var MERIDIAN_API_MODULES = [
   'api/http',
   'api/auth',
   'api/validate',
+  'api/link_policy',
   'api/items',
   'api/collections',
   'api/app',
@@ -406,36 +407,67 @@ async function meridianAttachPdfs(context) {
   if (!folder) return;
 
   var link = Zotero.Prefs.get(MERIDIAN_PREF_PREFIX + 'linkPdfs', true) === true;
+  // Linking goes through the same policy as the write API: an allowed folder, the text rules, and the real path.
+  var policy = link ? meridianLinkPolicy(meridianLib['api/validate']) : null;
   var attached = [];
   var skipped = [];
+  // Two selected items whose keys differ only in case name the same <key>.pdf on Windows, so neither may take it.
+  var keyCounts = {};
+  items.forEach(function (item) {
+    var token = meridianLib.bibkey.readBibKeyToken(meridianField(item, 'extra'));
+    if (token) keyCounts[token.toLowerCase()] = (keyCounts[token.toLowerCase()] || 0) + 1;
+  });
   for (var i = 0; i < items.length; i++) {
     var item = items[i];
     var label = meridianField(item, 'title') || 'item ' + item.id;
-    var key = meridianLib.bibkey.readBibKey(meridianField(item, 'extra'));
-    if (!key) {
-      skipped.push(label + ': no BibTeX key line in Extra');
-      continue;
-    }
-    if (await meridianHasPdfAttachment(item)) {
-      skipped.push(label + ': already has a PDF');
-      continue;
-    }
-    var path = PathUtils.join(folder, key + '.pdf');
-    if (!(await IOUtils.exists(path))) {
-      skipped.push(label + ': ' + key + '.pdf not found in folder');
-      continue;
-    }
-    var head = await IOUtils.read(path, { maxBytes: 5 });
-    if (!meridianLib.pdf.isPdfHeader(head)) {
-      skipped.push(label + ': ' + key + '.pdf does not start with %PDF-');
-      continue;
-    }
+    // One item's failure is reported against that item. The loop goes on, so the summary still shows everything.
     try {
-      var file = Zotero.File.pathToFile(path);
+      var token = meridianLib.bibkey.readBibKeyToken(meridianField(item, 'extra'));
+      if (!token) {
+        skipped.push(label + ': no BibTeX key line in Extra');
+        continue;
+      }
+      if (!meridianLib.bibkey.isSafeFileKey(token)) {
+        skipped.push(label + ': the BibTeX key cannot be used as a file name');
+        continue;
+      }
+      var key = token;
+      if (keyCounts[key.toLowerCase()] > 1) {
+        skipped.push(label + ': another selected item has the same key in a different case, so neither is attached');
+        continue;
+      }
+      if (await meridianHasPdfAttachment(item)) {
+        skipped.push(label + ': already has a PDF');
+        continue;
+      }
+      var path = PathUtils.join(folder, key + '.pdf');
+      var target = path;
       if (link) {
-        await Zotero.Attachments.linkFromFile({ file: file, parentItemID: item.id });
+        // The link policy runs before anything touches the disk, so a refused path is never probed. It also returns the
+        // real path, which is the one that gets stored. A file the policy refuses is reported, not copied.
+        try {
+          target = (await policy.checkLinkable(path)).path;
+        } catch (error) {
+          if (!(error && error.isApiError)) throw error;
+          skipped.push(
+            label + ': ' + (error.code === 'file_not_found' ? key + '.pdf not found in folder' : 'not linked. ' + error.message)
+          );
+          continue;
+        }
+      }
+      if (!(await IOUtils.exists(target))) {
+        skipped.push(label + ': ' + key + '.pdf not found in folder');
+        continue;
+      }
+      var head = await IOUtils.read(target, { maxBytes: 5 });
+      if (!meridianLib.pdf.isPdfHeader(head)) {
+        skipped.push(label + ': ' + key + '.pdf does not start with %PDF-');
+        continue;
+      }
+      if (link) {
+        await Zotero.Attachments.linkFromFile({ file: Zotero.File.pathToFile(target), parentItemID: item.id });
       } else {
-        await Zotero.Attachments.importFromFile({ file: file, parentItemID: item.id });
+        await Zotero.Attachments.importFromFile({ file: Zotero.File.pathToFile(target), parentItemID: item.id });
       }
       attached.push(label);
     } catch (error) {
@@ -528,19 +560,14 @@ async function meridianStartApi() {
 function meridianWriteDeps(validate, tracker) {
   return {
     zotero: Zotero,
-    localApiServesFiles: function () {
-      // Read at call time, so a change to the preference takes effect without restarting the add-on.
-      return Services.prefs.getBoolPref('extensions.zotero.httpServer.localAPI.enabled', true);
-    },
+    linkPolicy: meridianLinkPolicy(validate),
     validate: validate,
     tracker: tracker,
-    delay: meridianDelay,
     io: {
       join: PathUtils.join,
       makeDirectory: IOUtils.makeDirectory,
       write: IOUtils.write,
       remove: IOUtils.remove,
-      stat: IOUtils.stat,
     },
     newId: function () {
       return Zotero.Utilities.randomString(16);
@@ -551,9 +578,151 @@ function meridianWriteDeps(validate, tracker) {
   };
 }
 
-// Resolves after the given milliseconds. The file check in lib/api/items.js uses it to stop waiting on a slow share.
-function meridianDelay(ms) {
-  return Zotero.Promise.delay(ms);
+// The link policy for the write API and the F2 menu. See lib/api/link_policy.js for the rules it applies.
+function meridianLinkPolicy(validate) {
+  return meridianLib['api/link_policy'].createLinkPolicy({
+    validate: validate,
+    isWindows: function () {
+      return Zotero.isWin;
+    },
+    linkFolders: function () {
+      return Zotero.Prefs.get(MERIDIAN_PREF_PREFIX + 'linkFolders', true) || '';
+    },
+    resolve: meridianResolveLinkPath,
+  });
+}
+
+// Win32 calls for the real path of a file. Firefox's nsIFile does not follow junctions or symbolic links on
+// Windows: its isSymlink() is always false there, and its target and normalize() do not resolve the path.
+// So the bridge asks the OS directly. Loaded on first use, and only on Windows.
+var meridianWin32Api = null;
+
+function meridianWin32() {
+  if (meridianWin32Api) return meridianWin32Api;
+  var ctypes = ChromeUtils.importESModule('resource://gre/modules/ctypes.sys.mjs').ctypes;
+  var kernel32 = ctypes.open('kernel32.dll');
+  var abi = ctypes.winapi_abi;
+  var FileTime = ctypes.StructType('FILETIME', [
+    { dwLowDateTime: ctypes.uint32_t },
+    { dwHighDateTime: ctypes.uint32_t },
+  ]);
+  var ByHandleInfo = ctypes.StructType('BY_HANDLE_FILE_INFORMATION', [
+    { dwFileAttributes: ctypes.uint32_t },
+    { ftCreationTime: FileTime },
+    { ftLastAccessTime: FileTime },
+    { ftLastWriteTime: FileTime },
+    { dwVolumeSerialNumber: ctypes.uint32_t },
+    { nFileSizeHigh: ctypes.uint32_t },
+    { nFileSizeLow: ctypes.uint32_t },
+    { nNumberOfLinks: ctypes.uint32_t },
+    { nFileIndexHigh: ctypes.uint32_t },
+    { nFileIndexLow: ctypes.uint32_t },
+  ]);
+  meridianWin32Api = {
+    ctypes: ctypes,
+    ByHandleInfo: ByHandleInfo,
+    getFileAttributesW: kernel32.declare('GetFileAttributesW', abi, ctypes.uint32_t, ctypes.char16_t.ptr),
+    getDriveTypeW: kernel32.declare('GetDriveTypeW', abi, ctypes.uint32_t, ctypes.char16_t.ptr),
+    // Access 0 and the share flags are the ones Firefox's own path code uses. BACKUP_SEMANTICS lets a folder open too.
+    // OPEN_REPARSE_POINT is left out on purpose, so the call follows links to their targets.
+    createFileW: kernel32.declare(
+      'CreateFileW',
+      abi,
+      ctypes.intptr_t,
+      ctypes.char16_t.ptr,
+      ctypes.uint32_t,
+      ctypes.uint32_t,
+      ctypes.voidptr_t,
+      ctypes.uint32_t,
+      ctypes.uint32_t,
+      ctypes.intptr_t
+    ),
+    getFinalPathNameByHandleW: kernel32.declare(
+      'GetFinalPathNameByHandleW',
+      abi,
+      ctypes.uint32_t,
+      ctypes.intptr_t,
+      ctypes.char16_t.ptr,
+      ctypes.uint32_t,
+      ctypes.uint32_t
+    ),
+    getFileInformationByHandle: kernel32.declare('GetFileInformationByHandle', abi, ctypes.int, ctypes.intptr_t, ByHandleInfo.ptr),
+    closeHandle: kernel32.declare('CloseHandle', abi, ctypes.int, ctypes.intptr_t),
+  };
+  return meridianWin32Api;
+}
+
+// CreateFileW gives 0 or -1 (INVALID_HANDLE_VALUE) on failure. A ctypes integer may arrive as a number or an object, so both are compared as text.
+function meridianBadHandle(handle) {
+  var value = Number(String(handle));
+  return isNaN(value) || value === 0 || value === -1;
+}
+
+// Resolves a path to the real path the OS sees. Status 'missing' means nothing is there, and 'error' means any other
+// failure. When the status is 'ok', the result gives the real path without its extended-length prefix, whether the
+// requested path is a folder, whether a link or cloud placeholder (a reparse point) sits anywhere on it, how many names
+// the file has, and whether it sits on a network share.
+//
+// A network drive is answered from the drive mapping, before any call touches the path. Then the path is walked one
+// component at a time, and each component is checked for a reparse point before the walk goes below it. Opening a path
+// follows a junction in any folder on it, and a junction can point at a network share, so the check has to come first.
+// A failed hard-link count is an error, not one name, so it cannot slip through. A failed attribute lookup is reported
+// as missing: the bridge cannot read the error code reliably through ctypes, and both outcomes refuse the link.
+async function meridianResolveLinkPath(path) {
+  var w = meridianWin32();
+  if (!/^[A-Za-z]:\\/.test(path)) return { status: 'error' };
+  // GetDriveType reads the drive mapping and does not open the path. 1 is no such drive, and 4 is a network drive.
+  var driveType = w.getDriveTypeW(path.substring(0, 3));
+  if (driveType === 1) return { status: 'missing' };
+  if (driveType === 4) {
+    return { status: 'ok', path: path, leafReparse: false, hardLinks: 1, isDirectory: false, remote: true };
+  }
+  // Each prefix of the path is asked about before the walk goes below it. GetFileAttributes on a prefix reads that
+  // prefix's own attributes and does not enter a junction at its last part, so a junction stops the walk here.
+  var parts = path.split('\\');
+  var prefix = parts[0] + '\\';
+  var attributes = 0;
+  for (var i = 1; i < parts.length; i++) {
+    if (parts[i] === '') continue;
+    prefix = prefix.length === parts[0].length + 1 ? prefix + parts[i] : prefix + '\\' + parts[i];
+    attributes = w.getFileAttributesW(prefix);
+    if (attributes === 0xffffffff) return { status: 'missing' };
+    if (attributes & 0x400) {
+      return { status: 'ok', path: path, leafReparse: true, hardLinks: 1, isDirectory: (attributes & 0x10) !== 0, remote: false };
+    }
+  }
+  // The walk above found no reparse point on any part of the path, so opening it follows nothing that was not checked.
+  var leafReparse = false;
+  var isDirectory = (attributes & 0x10) !== 0;
+  var handle = w.createFileW(path, 0, 0x7, null, 3, 0x02000000, 0);
+  if (meridianBadHandle(handle)) return { status: 'error' };
+  try {
+    var size = 32768;
+    var buffer = new (w.ctypes.ArrayType(w.ctypes.char16_t, size))();
+    var length = w.getFinalPathNameByHandleW(handle, buffer, size, 0);
+    if (length === 0 || length >= size) return { status: 'error' };
+    var real = buffer.readString().substring(0, length);
+    var remote = false;
+    if (real.indexOf('\\\\?\\UNC\\') === 0) {
+      real = '\\\\' + real.substring(8);
+      remote = true;
+    } else if (real.indexOf('\\\\?\\') === 0) {
+      real = real.substring(4);
+    }
+    if (real.indexOf('\\\\') === 0) remote = true;
+    var info = new w.ByHandleInfo();
+    if (!w.getFileInformationByHandle(handle, info.address())) return { status: 'error' };
+    return {
+      status: 'ok',
+      path: real,
+      leafReparse: leafReparse,
+      hardLinks: info.nNumberOfLinks,
+      isDirectory: isDirectory,
+      remote: remote,
+    };
+  } finally {
+    w.closeHandle(handle);
+  }
 }
 
 // Plans a BibTeX import for the API. Dry runs return the plan. Real runs save it.

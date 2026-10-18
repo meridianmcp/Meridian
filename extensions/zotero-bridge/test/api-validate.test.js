@@ -26,7 +26,7 @@ test('decodeBase64 refuses a payload over the byte limit before decoding it', ()
 
 test('safeFilename keeps a plain name and refuses any folder part or control character', () => {
   assert.equal(v.safeFilename('paper v2 (final).pdf'), 'paper v2 (final).pdf');
-  for (const name of ['../x.pdf', 'a/b.pdf', 'a\\b.pdf', '..', '.', ' padded.pdf', 'tab\there.pdf']) {
+  for (const name of ['../x.pdf', 'a/b.pdf', 'a\\b.pdf', '..', '.', ' padded.pdf', 'tab\there.pdf', 'paper.pdf:stream']) {
     assert.throws(() => v.safeFilename(name), (error) => error.code === 'invalid_value', JSON.stringify(name));
   }
 });
@@ -96,7 +96,7 @@ test('optional integers reject negatives and fractions, and booleans reject stri
 });
 
 test('linkableFileProblem allows documents, images and media in ordinary folders, in any letter case', () => {
-  for (const p of ['/var/papers/paper.pdf', 'D:' + '/papers/Paper.PDF', 'D:' + '\\papers\\notes.txt', '/x/figure.SVG', '/x/clip.mp4']) {
+  for (const p of ['/var/papers/paper.pdf', 'D:' + '/papers/Paper.PDF', 'D:' + '\\papers\\notes.txt', '/x/figure.TIF', '/x/clip.mp4']) {
     assert.equal(v.linkableFileProblem(p), null, p);
   }
 });
@@ -105,4 +105,56 @@ test('linkableFileProblem refuses other file types, dot-files, and credentials, 
   for (const p of ['/x/id_rsa', '/x/.env', '/x/tool.exe', '/x/archive.zip', '/x/db.sqlite', '/x/.ssh/config.txt', '/x/AppData/y.pdf', '/x/.git/notes.md', '/x/appdata/a.pdf']) {
     assert.notEqual(v.linkableFileProblem(p), null, p);
   }
+});
+
+test('linkableFileProblem folds trailing dots and spaces in folder names, as Win32 does', () => {
+  // Win32 reads AppData. and AppData  as AppData, so the sensitive-folder rule must see the folded name.
+  for (const p of ['D:' + '\\x\\AppData.\\a.pdf', 'D:' + '\\x\\AppData \\a.pdf', 'D:' + '\\x\\.ssh.\\a.pdf', 'D:' + '\\x\\.SSH \\a.pdf']) {
+    assert.notEqual(v.linkableFileProblem(p), null, p);
+  }
+});
+
+test('linkableFileProblem refuses HTML and SVG, which can carry active content, and a path that names a folder', () => {
+  for (const p of ['/x/page.html', '/x/page.htm', '/x/diagram.svg', 'D:' + '\\x\\diagram.SVG']) {
+    assert.notEqual(v.linkableFileProblem(p), null, p);
+  }
+  assert.notEqual(v.linkableFileProblem('D:' + '\\papers\\'), null);
+  assert.notEqual(v.linkableFileProblem('D:' + '\\papers\\report.pdf\\'), null);
+});
+
+test('linkableFileProblem refuses the console device names that carry a dollar sign', () => {
+  for (const p of ['D:' + '\\x\\CONIN$.txt', 'D:' + '\\x\\CONOUT$.pdf', 'D:' + '\\x\\CLOCK$.pdf']) {
+    assert.notEqual(v.linkableFileProblem(p), null, p);
+  }
+});
+
+test('linkableFileProblem refuses a device name in any folder of the path, and a colon after the drive letter', () => {
+  assert.notEqual(v.linkableFileProblem('D:' + '\\CON\\paper.pdf'), null);
+  assert.notEqual(v.linkableFileProblem('D:' + '\\papers\\NUL.pdf'), null);
+  assert.notEqual(v.linkableFileProblem('D:' + '\\papers\\notes.txt:hidden'), null);
+  assert.notEqual(v.linkableFileProblem('D:' + '\\papers\\paper.pdf:Zone.Identifier'), null);
+  // The drive colon itself is fine, and so is an ordinary name that starts with the letters of a device.
+  assert.equal(v.linkableFileProblem('D:' + '\\papers\\console-notes.pdf'), null);
+});
+
+test('linkFolderList keeps drive folders, and drops empty entries, drive roots, rooted and relative paths, and network paths', () => {
+  const text = ['D:' + '\\papers', ' D:' + '\\notes\\ ', '', 'D:', 'D:' + '\\', '/', '/Users', 'relative\\dir', '\\\\server\\share', 'E:' + '/data/'].join('|');
+  assert.deepEqual(v.linkFolderList(text), ['D:' + '\\papers', 'D:' + '\\notes', 'E:' + '\\data']);
+  assert.deepEqual(v.linkFolderList(''), []);
+  assert.deepEqual(v.linkFolderList(undefined), []);
+  assert.deepEqual(v.linkFolderList(42), []);
+});
+
+test('linkFolderList splits on a vertical bar, so a semicolon is part of a folder name', () => {
+  // Windows forbids the bar in names, but allows a semicolon, so a semicolon must not split a folder in two.
+  assert.deepEqual(v.linkFolderList('D:' + '\\Work;Archive|E:' + '\\papers'), ['D:' + '\\Work;Archive', 'E:' + '\\papers']);
+});
+
+test('linkFolderList takes a forward-slash folder as the same folder as a backslash one', () => {
+  assert.deepEqual(v.linkFolderList('D:/Papers'), ['D:' + '\\Papers']);
+  assert.deepEqual(v.linkFolderList('D:/Papers/'), ['D:' + '\\Papers']);
+});
+
+test('linkFolderList leaves a dot-segment entry for the resolver, which refuses one that ends at a root', () => {
+  assert.deepEqual(v.linkFolderList('D:' + '\\zotero\\..'), ['D:' + '\\zotero\\..']);
 });

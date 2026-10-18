@@ -55,11 +55,6 @@ function createFakeIO() {
       }
       dirs.delete(path);
     },
-    stat: async function (path) {
-      if (files.has(path)) return { type: 'regular' };
-      if (dirs.has(path)) return { type: 'directory' };
-      throw new Error('NotFound: ' + path);
-    },
   };
 }
 

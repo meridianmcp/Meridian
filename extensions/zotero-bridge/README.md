@@ -23,8 +23,17 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
   and BibTeX routes, and error responses. A missing token file left the API off while Zotero ran normally.
   Those checks ran before the limit, collection, restore, linked-file, batch rollback, BibTeX key and creator-role
   changes listed below, so those changes are not live-checked yet.
-- **Verified in node.** The unit tests cover the HTTP parser, admission, validation, the write logic (against a
-  Zotero-shaped fake) and the design-line checks in `test/static-checks.test.js`.
+- **Linking, verified live on the real Windows resolver.** On 2026-10-17, in a throwaway Zotero 10.0.6 profile with
+  the local API on, the link policy gave the expected result for 13 of 13 cases: a plain allowed file, a trailing dot
+  on a folder and an 8.3 alias of the allowed folder (all stored at the real path), an allowed folder written with
+  forward slashes, a junction out of the allowed folder, a junction into a sensitive folder, a hard link, a device
+  name, a file outside the allowed folders, a missing file, an alternate data stream, a folder named like a document,
+  a path that ends in a separator, and an allowed list that also names a folder resolving to the drive root, which
+  must not allow the drive. A linked file's path was also read back through Zotero's local API, which answered with a
+  redirect to the path, not the bytes. Not covered live: a symbolic link (creating one needs an administrator or
+  Developer Mode), a network drive, and the PDF menu, which needs the Zotero window.
+- **Verified in node.** The unit tests cover the HTTP parser, admission, validation, the link policy against a fake
+  resolver, the write logic (against a Zotero-shaped fake) and the design-line checks in `test/static-checks.test.js`.
 - **Not verified in Zotero:** the two menu commands, the preferences pane, and the file pickers. These run only
   through the Zotero window, which the checks above did not drive. The BibTeX import they share with the API was
   verified through the API.
@@ -88,7 +97,8 @@ curl -s -X POST http://127.0.0.1:23125/v1/items \
 
 Reads: use Zotero's own local API (`http://127.0.0.1:23119/api/users/0/...`), which Zotero serves when
 "Allow other applications on this computer to communicate with Zotero" is on. The write API does not serve reads.
-That same switch controls linked attachments: while it is on, the write API refuses to create them (see Limits).
+Linked attachments are allowed only from the folders you choose, with the switch on or off (see Limits). While the switch
+is on, Zotero tells local programs the path of each linked attachment.
 
 ### Endpoints
 
@@ -104,7 +114,7 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | `POST /v1/items/{key}/restore` | precondition fields, optional | Takes the item out of the trash. |
 | `POST /v1/items/{key}/notes` | `html` | Creates a child note of a regular item. Answers 201. |
 | `PATCH /v1/notes/{key}` | `html`, precondition fields | Replaces the note's HTML. |
-| `POST /v1/items/{key}/attachments` | `mode`, and either `filename` plus `data_base64` (`imported_file`) or `path` (`linked_file`), plus optional `title` and `content_type` | Answers 201. A linked file is refused with 422 `linking_unavailable` while Zotero's local API is on, and with 422 `linking_refused` for a file type or folder that is not allowed (see Limits). Not allowed inside a batch. |
+| `POST /v1/items/{key}/attachments` | `mode`, and either `filename` plus `data_base64` (`imported_file`) or `path` (`linked_file`), plus optional `title` and `content_type` | Answers 201. A linked file must lie inside a folder listed in `extensions.zotero.meridianZoteroBridge.linkFolders`, and Zotero stores its real path. Refused with 422 `linking_refused`, `file_not_found` or `file_check_failed`, or `linking_unavailable` off Windows (see Limits). Not allowed inside a batch. |
 | `POST /v1/items/{key}/relations` | `related_key`, or `predicate` plus `object` | Adds a relation. |
 | `DELETE /v1/items/{key}/relations` | the same as the POST | Removes the relation. |
 | `POST /v1/collections` | `name`, optional `parent_key` | Answers 201. |
@@ -148,26 +158,53 @@ needs the `predicate:name` form (for example `dc:replaces`) and an `object` with
   100 KB. BibTeX text 8 MiB. A batch holds at most 200 operations. The body limit leaves room for a 24 MiB attachment,
   which is 32 MiB in base64, plus the rest of the JSON.
 - Writes go to the user library only. Group libraries are not writable through this API.
+- An imported attachment's file name may not contain a colon, a slash, a backslash or a control character, and it may
+  not be a Windows device name such as `CON`. A colon would name an alternate data stream.
 - A creator role that the item type does not allow is refused with 422. The message names the role and the item type.
 - A BibTeX duplicate check counts trashed items as existing, so a re-import does not bring back something the user
   trashed.
-- An imported attachment is copied into Zotero storage. A linked attachment stores the path. Linking is restricted,
-  because Zotero's own local API serves a linked file to any local program that asks, with no token:
-  - While that API is on (the switch in Zotero's Advanced settings, `extensions.zotero.httpServer.localAPI.enabled`),
-    a linked attachment is refused with 422 `linking_unavailable`. Turn the switch off to link files, or import the file.
-  - The file name must end in a document, image or media extension: `pdf`, `epub`, `djvu`, `doc`, `docx`, `odt`, `rtf`,
-    `txt`, `md`, `html`, `htm`, `csv`, `tsv`, `xls`, `xlsx`, `ods`, `ppt`, `pptx`, `odp`, `png`, `jpg`, `jpeg`, `gif`,
-    `tif`, `tiff`, `webp`, `bmp`, `svg`, `mp3`, `m4a`, `wav`, `mp4` or `mov`. Any other name, including a dot-file, is
-    refused with 422 `linking_refused`.
-  - No folder on the path may be named `AppData`, `.meridian`, `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`,
-    `.git` or `.password-store` (any letter case). Such a path is refused with 422 `linking_refused`.
-  - The file must then exist. A missing file returns 422 `file_not_found`, so a reply shows whether a path exists. A
-    check that stalls for more than five seconds returns 422 `file_check_timed_out`. UNC and device paths are refused.
-    The API does not return file contents.
-  - These rules read the text of the path. They do not follow a symbolic link or junction, so a link created outside
-    the API can point at a file the rules would refuse. Create the links yourself only in folders you control.
-  - The check runs when a file is linked. If you turn the local API on later, every linked file becomes readable by
-    local programs, including ones linked earlier. Keep the switch off while such files matter to you.
+- An imported attachment is copied into Zotero storage. A linked attachment stores a path, and linking follows these rules:
+  - **Only folders you allow.** A file can be linked only from a folder listed in
+    `extensions.zotero.meridianZoteroBridge.linkFolders`, separated by vertical bars (`|`), which Windows forbids in
+    names, so a folder name such as `Work;Archive` is kept whole. The list is empty by default, so nothing can be
+    linked until you add a folder. Each entry must be a drive path, such as `D:/Papers`. A drive root cannot be
+    listed, and nor can a folder that resolves to one. Any other file is refused with 422 `linking_refused`. The write
+    API cannot change this list. Only Zotero's preferences can.
+  - **Real paths, not the paths the caller sent.** The bridge asks Windows for the real path of the file and of each
+    allowed folder, and it compares the real paths exactly, as the disk spells them. A short name such as `MERIDI~1`,
+    or a trailing dot or space, resolves to the real name, so it cannot move a file out of an allowed folder. Zotero
+    stores the real path. Containment is checked before the other file checks, so a file outside the folders is
+    refused with the same message whether it exists or not.
+  - **A file, on a local drive, with one name, and with no link on its path.** A folder, a path that ends in a
+    separator, a network share, and a file with a second name (a hard link) are each refused with 422
+    `linking_refused`. So is a link, a junction or a cloud placeholder (an online-only OneDrive file, for example)
+    anywhere on the path, including a folder on it. The bridge checks each folder for a link before it goes below it,
+    and it recognises a network drive from the drive mapping before any call touches the path. A folder you allow must
+    therefore be listed by its real path, not through a link.
+  - **Document, image or media files only.** The file name must end in `pdf`, `epub`, `djvu`, `doc`, `docx`, `odt`,
+    `rtf`, `txt`, `md`, `csv`, `tsv`, `xls`, `xlsx`, `ods`, `ppt`, `pptx`, `odp`, `png`, `jpg`, `jpeg`, `gif`, `tif`,
+    `tiff`, `webp`, `bmp`, `mp3`, `m4a`, `wav`, `mp4` or `mov`. HTML and SVG are left out, because they can carry
+    active content. A dot-file, a colon after the drive letter (an alternate data stream), and a device name such as
+    `CON`, `NUL`, `CONIN$` or `COM1` in any part of the path are refused.
+  - **No credential, profile or app-data folder.** A folder on the path named `AppData`, `.meridian`, `.ssh`,
+    `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.git` or `.password-store` is refused, in any letter case, with
+    trailing dots and spaces ignored as Windows ignores them.
+  - **Errors.** A missing file is 422 `file_not_found`, and so is a file the bridge cannot read, because Windows does not
+    report the reason through the bridge. A check the OS cannot complete is 422 `file_check_failed`. Off Windows, linking
+    is 422 `linking_unavailable`. Nothing is linked on any of these. The checks have no time limit, because the Windows
+    calls cannot be interrupted. A network drive, and a link anywhere on the path, are refused before the bridge goes
+    below them, so a slow share is not entered.
+  - **What an allowed folder exposes.** Zotero's local API, while its switch is on (`extensions.zotero.httpServer.localAPI.enabled`),
+    tells any local program that can reach it the path of every linked attachment. It does not send the file's bytes.
+    The file request gets a redirect to the path (checked against Zotero 10.0.6), so a program then reads the file only
+    if its own operating-system permissions allow it. Linking a file in an allowed folder therefore makes its path
+    visible to local programs while that switch is on. With the switch off, Zotero serves nothing. Keep allowed folders
+    to ones whose paths you are willing to have seen.
+  - **What the checks cannot stop.** They run when a file is linked, and nothing re-checks the stored path afterwards.
+    Someone who can write to an allowed folder can later replace the file, or move the folder and put a junction in its
+    place, so the stored path would then reach another file. Files linked before this version, by this bridge or any
+    other tool, are not re-checked. Only an administrator, or a user with Developer Mode, can create a symbolic link,
+    and the check refuses any link on the path, so a link made that way is refused when a file is linked through it.
 - Errors go to Zotero's error console. Request bodies and the token are never logged.
 
 ### Not in this version
@@ -247,18 +284,26 @@ count changes while the file is parsed, the import is refused with 409 `library_
 ## Attach PDFs (storage)
 
 - **Default: copy.** Each PDF is copied into Zotero storage.
-- **Link instead:** turn on "Link PDFs instead of copying" in the preferences pane. The file stays where it is and
-  Zotero links to it.
+- **Link instead:** turn on "Link PDFs instead of copying" in the preferences pane, and list the folder in "Folders
+  allowed for linked files". The file stays where it is and Zotero links to it. The same rules as the write API apply
+  (see Limits and rules). A PDF outside those folders is not linked and not copied. The summary reports it, so the
+  user can add the folder or copy the file by turning linking off.
 
 **Cloud quota note.** If Zotero file sync is on, copied PDFs count toward the Zotero cloud storage quota. Linked files
 do not. The link option avoids that cost, but linked files break if the source folder moves. The default is copy (the
 link option is off).
 
 A PDF is attached only when the item has no existing PDF attachment, the file exists, and the file starts with `%PDF-`.
+A BibTeX key that cannot be a file name is skipped with a message: a key with a colon (Windows reads it as a stream
+name), or one that names a Windows device, such as `CON`, `AUX` or `COM1`. Two selected items whose keys differ only in
+case are both skipped, because Windows names one file for both. A file that fails is reported against its own item, and
+the run goes on, so the summary always shows every item.
 
 ## Preferences
 
 - `extensions.zotero.meridianZoteroBridge.linkPdfs`, default `false`. Shown in the preferences pane.
+- `extensions.zotero.meridianZoteroBridge.linkFolders`, default empty, which allows no linked files. The folders that
+  linked files may come from, separated by vertical bars (`|`). Shown in the preferences pane. The write API cannot set it.
 - `extensions.zotero.meridianZoteroBridge.apiPort`, default `23125`. Set by the install.
 - `extensions.zotero.meridianZoteroBridge.apiTokenPath`, default empty, which keeps the API off. Set by the install.
 
@@ -318,7 +363,9 @@ Do not use your real library.
    two to be skipped, the third listed as a conflict, and the last imported into the collection.
 5. Item menu: select items with and without `BibTeX key: <key>` in Extra. Run "Attach PDFs from folder..." and check
    that only the valid PDFs attach and the summary lists the rest.
-6. Turn on "Link PDFs instead of copying", repeat step 5, and check that the attachment is a linked file.
+6. Turn on "Link PDFs instead of copying", list the folder in "Folders allowed for linked files", repeat step 5, and
+   check that the attachment is a linked file. Then remove the folder from the list and check that the PDFs in it are
+   reported as not linked, and not copied.
 7. Run "Attach PDFs from folder..." again on the same items. Expect "already has a PDF" for each.
 8. Write API: `GET /v1/status` answers with the token, and a request without the token gets 401.
 9. Disable and re-enable the plugin, then restart Zotero. Menus, the pane and the API still work once, with no duplicate

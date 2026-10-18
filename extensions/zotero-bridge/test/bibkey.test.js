@@ -2,7 +2,19 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { readBibKey, isSafeBibKey, citationKeyFromImport } = require('../lib/bibkey.js');
+const { readBibKey, isSafeBibKey, isSafeFileKey, citationKeyFromImport } = require('../lib/bibkey.js');
+
+test('isSafeFileKey refuses a colon and a Windows device stem, because the key becomes a file name', () => {
+  assert.equal(isSafeFileKey('doe:2019'), false, 'a colon names an alternate data stream');
+  assert.equal(isSafeFileKey('CON'), false);
+  assert.equal(isSafeFileKey('aux'), false);
+  assert.equal(isSafeFileKey('com1'), false);
+  assert.equal(isSafeFileKey('nul.2020'), false, 'the stem before the dot is the device');
+  assert.equal(isSafeFileKey('CONIN$'), false);
+  assert.equal(isSafeFileKey('smith2020a'), true);
+  assert.equal(isSafeFileKey('console2020'), true, 'a device stem must match as a whole');
+  assert.equal(isSafeFileKey('../x'), false, 'everything isSafeBibKey refuses is refused here too');
+});
 
 test('reads the BibTeX key line from a multi-line Extra field', () => {
   const extra = 'Original Date: 2020-01-01\nBibTeX key: smith2020a\nPMID: 123';

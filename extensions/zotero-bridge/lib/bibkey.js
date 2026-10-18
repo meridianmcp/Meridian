@@ -21,15 +21,32 @@ function isSafeBibKey(key) {
   );
 }
 
+// The PDF step turns a key into a file name, and two things go wrong there on Windows. A colon names an alternate
+// data stream, so doe:2019.pdf addresses a stream, not a file. A device stem such as CON, AUX or COM1 opens the
+// device, whatever the extension. The import keeps such keys as data, so this stricter check is for file names only.
+const DEVICE_STEM = /^(CON|CONIN\$|CONOUT\$|CLOCK\$|PRN|AUX|NUL|COM[0-9¹²³]|LPT[0-9¹²³])$/i;
+
+function isSafeFileKey(key) {
+  return isSafeBibKey(key) && key.indexOf(':') === -1 && !DEVICE_STEM.test(key.split('.')[0]);
+}
+
 /**
- * Return the BibTeX key from an Extra field, or null when there is no key line
- * or the key is not safe to use in a file name.
+ * The token after the BibTeX key label, as written, or null when the Extra field has no key line. It is not
+ * checked. A caller that builds a file name from it must use isSafeFileKey first.
  */
-function readBibKey(extra) {
+function readBibKeyToken(extra) {
   if (typeof extra !== 'string') return null;
   const match = extra.match(BIBKEY_LINE);
-  if (!match) return null;
-  return isSafeBibKey(match[1]) ? match[1] : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * Return the BibTeX key from an Extra field, or null when there is no key line or the key fails isSafeBibKey,
+ * which is the import's rule. That does not make the key safe for a file name. Use isSafeFileKey for that.
+ */
+function readBibKey(extra) {
+  const token = readBibKeyToken(extra);
+  return token !== null && isSafeBibKey(token) ? token : null;
 }
 
 // A "Citation Key: <key>" line in Extra, as Zotero's own exports write it.
@@ -57,4 +74,4 @@ function citationKeyFromImport(json) {
   return null;
 }
 
-module.exports = { readBibKey, isSafeBibKey, citationKeyFromImport };
+module.exports = { readBibKey, readBibKeyToken, isSafeBibKey, isSafeFileKey, citationKeyFromImport };

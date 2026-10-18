@@ -13,9 +13,6 @@ const { createFakeZotero, createFakeIO } = require('./support/fake-zotero.js');
 const HOST = '127.0.0.1:23125';
 const TOKEN = 'T'.repeat(40);
 
-// A delay that never fires, so the file check always finishes first in tests that do not set one.
-const neverDelay = () => new Promise(() => {});
-
 function build(overrides) {
   const zotero = createFakeZotero();
   const io = createFakeIO();
@@ -38,7 +35,6 @@ function build(overrides) {
       newId: () => 'ID1',
       tempDir: () => '/tmp/zotero-test',
       tracker,
-      delay: neverDelay,
     }),
     collections: createCollectionWrites({ zotero, validate: v, tracker }),
     importBibtex: async (request) => {

@@ -129,7 +129,8 @@ test('no email address other than the plugin id appears anywhere in the plugin f
 test('no secret-shaped strings or machine-local absolute paths in the plugin folder', () => {
   const files = walk(PLUGIN_ROOT, ['node_modules']);
   const secret = /sk_meridian_|BEARER_TOKEN|api[_-]?key\s*[:=]|-----BEGIN [A-Z ]*PRIVATE KEY/i;
-  const localPath = /[A-Za-z]:\\\\|[A-Za-z]:\/Users\/|\/Users\/[A-Za-z0-9_]+\/|\/home\/[A-Za-z0-9_]+\//;
+  // A drive letter must start a token, so a letter before the colon (as in the regex doi:\s) does not count.
+  const localPath = /(^|[^A-Za-z])[A-Za-z]:\\|[A-Za-z]:\/Users\/|\/Users\/[A-Za-z0-9_]+\/|\/home\/[A-Za-z0-9_]+\//;
   for (const file of files) {
     // This file holds the patterns as literals, so it cannot scan itself.
     if (path.basename(file) === 'static-checks.test.js') continue;

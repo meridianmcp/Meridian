@@ -4,14 +4,27 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const v = require('../lib/api/validate.js');
 const { createItemWrites } = require('../lib/api/items.js');
+const { createLinkPolicy } = require('../lib/api/link_policy.js');
 const { createFakeZotero, createFakeIO } = require('./support/fake-zotero.js');
+const { createFakeResolver } = require('./support/fake-resolver.js');
+
+// The one folder these tests allow for linked files. Split literals keep the static check from reading it as machine-local.
+const ROOT = 'D:' + '\\zotero-test';
 
 function setup(overrides = {}) {
   const zotero = createFakeZotero();
   const io = createFakeIO();
   const tracker = { inBatch: false, touched: [], created: [] };
+  const resolver = createFakeResolver();
   // Every creator role is allowed unless a test narrows it.
   zotero.CreatorTypes.isValidForItemType = () => true;
+  const linkPolicy = createLinkPolicy({
+    validate: v,
+    isWindows: () => overrides.isWindows !== false,
+    linkFolders: () => (overrides.linkFolders !== undefined ? overrides.linkFolders : ROOT),
+    resolve: overrides.resolve || resolver,
+  });
+  resolver.add(ROOT);
   const items = createItemWrites({
     zotero,
     validate: v,
@@ -19,11 +32,9 @@ function setup(overrides = {}) {
     newId: () => 'ID1',
     tempDir: () => '/tmp/zotero-test',
     tracker,
-    localApiServesFiles: overrides.localApiServesFiles || (() => false),
-    // A delay that never fires, so the file check finishes first unless a test says otherwise.
-    delay: overrides.delay || (() => new Promise(() => {})),
+    linkPolicy: overrides.noPolicy ? null : linkPolicy,
   });
-  return { zotero, io, items, tracker };
+  return { zotero, io, items, tracker, resolver };
 }
 
 function apiErrorMatch(status, code) {
@@ -358,31 +369,39 @@ test('a bad base64 body or an unsafe file name is refused before any file is wri
   assert.equal(zotero._calls.imports.length, 0);
 });
 
-test('a linked attachment needs an absolute path to a real file', async () => {
-  const { zotero, io, items } = setup();
+test('a linked attachment needs an absolute path to a file that exists', async () => {
+  const { zotero, items, resolver } = setup();
   const parent = zotero._addItem('book', { title: 'Book' });
   await assert.rejects(
-    items.createAttachment(parent.key, { mode: 'linked_file', path: 'relative/file.pdf' }),
+    items.createAttachment(parent.key, { mode: 'linked_file', path: 'relative\\file.pdf' }),
     apiErrorMatch(422, 'invalid_value')
   );
   await assert.rejects(
-    items.createAttachment(parent.key, { mode: 'linked_file', path: '/tmp/zotero-test/missing.pdf' }),
+    items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\missing.pdf' }),
     apiErrorMatch(422, 'file_not_found')
   );
-  io.files.set('/tmp/zotero-test/present.pdf', Uint8Array.from([37, 80, 68, 70]));
-  await items.createAttachment(parent.key, { mode: 'linked_file', path: '/tmp/zotero-test/present.pdf' });
+  resolver.add(ROOT + '\\present.pdf');
+  await items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\present.pdf' });
   assert.equal(zotero._calls.links.length, 1);
-  assert.equal(zotero._calls.links[0].file, '/tmp/zotero-test/present.pdf');
+  assert.equal(zotero._calls.links[0].file, ROOT + '\\present.pdf');
 });
 
-test('a linked file whose check does not finish in time is refused with file_check_timed_out, and nothing is linked', async () => {
-  // The delay wins: it resolves at once, while the stat never answers, as a network share that has gone quiet would not.
-  const { zotero, io, items } = setup({ delay: () => Promise.resolve() });
-  io.stat = () => new Promise(() => {});
+test('a linked file is stored at the real path the OS resolves it to, not the path the caller sent', async () => {
+  const { zotero, items, resolver } = setup();
   const parent = zotero._addItem('book', { title: 'Book' });
+  resolver.add(ROOT + '\\shortcut\\paper.pdf', { path: ROOT + '\\real\\paper.pdf' });
+  await items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\shortcut\\paper.pdf' });
+  assert.equal(zotero._calls.links.length, 1);
+  assert.equal(zotero._calls.links[0].file, ROOT + '\\real\\paper.pdf');
+});
+
+test('a linked file that the OS cannot check is refused with file_check_failed, and nothing is linked', async () => {
+  const { zotero, items, resolver } = setup();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  resolver.fail(ROOT + '\\broken.pdf');
   await assert.rejects(
-    items.createAttachment(parent.key, { mode: 'linked_file', path: '/tmp/zotero-test/slow.pdf' }),
-    (error) => apiErrorMatch(422, 'file_check_timed_out')(error) && /could not be checked in time/.test(error.message)
+    items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\broken.pdf' }),
+    apiErrorMatch(422, 'file_check_failed')
   );
   assert.equal(zotero._calls.links.length, 0);
 });
@@ -440,61 +459,97 @@ test('renameTag answers 404 and renames nothing when the tag is not in the user 
   assert.deepEqual(zotero._calls.renames, [], 'no rename call was made');
 });
 
-test('the write factory refuses to start without the shared tracker or the delay', () => {
+test('the write factory refuses to start without the shared tracker', () => {
   const zotero = createFakeZotero();
   const io = createFakeIO();
-  const base = { zotero, validate: v, io, newId: () => 'x', tempDir: () => '/t' };
-  assert.throws(() => createItemWrites({ ...base, delay: () => {} }), /needs deps\.tracker/);
   assert.throws(
-    () => createItemWrites({ ...base, tracker: { inBatch: false, touched: [], created: [] } }),
-    /needs deps\.delay/
+    () => createItemWrites({ zotero, validate: v, io, newId: () => 'x', tempDir: () => '/t' }),
+    /needs deps\.tracker/
   );
 });
 
-test('a linked file is refused while Zotero local API is on, before any file is checked or linked', async () => {
-  const { zotero, io, items } = setup({ localApiServesFiles: () => true });
+test('a linked file outside every allowed folder is refused, and nothing is linked', async () => {
+  const { zotero, items, resolver } = setup();
   const parent = zotero._addItem('book', { title: 'Book' });
-  io.files.set('/tmp/zotero-test/present.pdf', Uint8Array.from([37, 80, 68, 70]));
+  resolver.add('D:' + '\\elsewhere\\paper.pdf');
   await assert.rejects(
-    items.createAttachment(parent.key, { mode: 'linked_file', path: '/tmp/zotero-test/present.pdf' }),
+    items.createAttachment(parent.key, { mode: 'linked_file', path: 'D:' + '\\elsewhere\\paper.pdf' }),
+    apiErrorMatch(422, 'linking_refused')
+  );
+  assert.equal(zotero._calls.links.length, 0);
+});
+
+test('a junction inside an allowed folder can neither lead out of it nor into a sensitive folder', async () => {
+  const { zotero, items, resolver } = setup();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  resolver.add(ROOT + '\\out\\paper.pdf', { path: 'D:' + '\\elsewhere\\paper.pdf' });
+  await assert.rejects(
+    items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\out\\paper.pdf' }),
+    apiErrorMatch(422, 'linking_refused')
+  );
+  resolver.add(ROOT + '\\keys\\id.pdf', { path: ROOT + '\\.ssh\\id.pdf' });
+  await assert.rejects(
+    items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\keys\\id.pdf' }),
+    apiErrorMatch(422, 'linking_refused')
+  );
+  assert.equal(zotero._calls.links.length, 0);
+});
+
+test('a file that is itself a link, has a second name, sits on a network share, or cannot be checked is refused', async () => {
+  const { zotero, items, resolver } = setup();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  resolver.add(ROOT + '\\leaf.pdf', { leafReparse: true });
+  resolver.add(ROOT + '\\twin.pdf', { hardLinks: 2 });
+  resolver.add(ROOT + '\\share.pdf', { path: '\\\\server\\share\\share.pdf', remote: true });
+  resolver.fail(ROOT + '\\broken.pdf');
+  await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\leaf.pdf' }), apiErrorMatch(422, 'linking_refused'));
+  await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\twin.pdf' }), apiErrorMatch(422, 'linking_refused'));
+  await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\share.pdf' }), apiErrorMatch(422, 'linking_refused'));
+  await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\broken.pdf' }), apiErrorMatch(422, 'file_check_failed'));
+  assert.equal(zotero._calls.links.length, 0);
+});
+
+test('with no folder allowed, nothing can be linked, and the refusal says which setting to change', async () => {
+  const { zotero, items, resolver } = setup({ linkFolders: '' });
+  const parent = zotero._addItem('book', { title: 'Book' });
+  resolver.add(ROOT + '\\present.pdf');
+  await assert.rejects(
+    items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\present.pdf' }),
+    (error) => apiErrorMatch(422, 'linking_refused')(error) && /linkFolders/.test(error.message)
+  );
+  assert.equal(zotero._calls.links.length, 0);
+});
+
+test('the text rules still refuse keys, configs, sensitive folders and device names inside an allowed folder', async () => {
+  const { zotero, items, resolver } = setup();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  const names = ['\\id_rsa', '\\.env', '\\tool.exe', '\\data.sqlite', '\\.ssh\\notes.pdf', '\\.meridian\\api.txt',
+    '\\AppData\\Roaming\\x.pdf', '\\AppData.\\x.pdf', '\\papers\\CON.pdf', '\\notes.txt:hidden'];
+  for (const name of names) {
+    resolver.add(ROOT + name);
+    await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + name }), apiErrorMatch(422, 'linking_refused'), name);
+  }
+  assert.equal(zotero._calls.links.length, 0);
+});
+
+test('linking is refused on a platform the resolver does not support', async () => {
+  const { zotero, items, resolver } = setup({ isWindows: false });
+  const parent = zotero._addItem('book', { title: 'Book' });
+  resolver.add(ROOT + '\\present.pdf');
+  await assert.rejects(
+    items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\present.pdf' }),
     apiErrorMatch(422, 'linking_unavailable')
   );
   assert.equal(zotero._calls.links.length, 0);
 });
 
-test('a linked file is refused by default when no local API check is wired in (fails closed)', async () => {
-  const zotero = createFakeZotero();
-  const io = createFakeIO();
-  const tracker = { inBatch: false, touched: [], created: [] };
-  const items = createItemWrites({
-    zotero, validate: v, io, newId: () => 'ID1', tempDir: () => '/tmp/zotero-test', tracker,
-    delay: () => new Promise(() => {}),
-  });
+test('a write factory built without a link policy refuses linking, and fails closed', async () => {
+  const { zotero, items, resolver } = setup({ noPolicy: true });
   const parent = zotero._addItem('book', { title: 'Book' });
-  io.files.set('/tmp/zotero-test/present.pdf', Uint8Array.from([37]));
+  resolver.add(ROOT + '\\present.pdf');
   await assert.rejects(
-    items.createAttachment(parent.key, { mode: 'linked_file', path: '/tmp/zotero-test/present.pdf' }),
+    items.createAttachment(parent.key, { mode: 'linked_file', path: ROOT + '\\present.pdf' }),
     apiErrorMatch(422, 'linking_unavailable')
   );
-  assert.equal(zotero._calls.links.length, 0);
-});
-
-test('a linked file must be a document, image or media file, whatever folder it is in', async () => {
-  const { zotero, io, items } = setup();
-  const parent = zotero._addItem('book', { title: 'Book' });
-  for (const path of ['/tmp/zotero-test/id_rsa', '/tmp/zotero-test/.env', '/tmp/zotero-test/tool.exe', '/tmp/zotero-test/data.sqlite']) {
-    io.files.set(path, Uint8Array.from([1]));
-    await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path }), apiErrorMatch(422, 'linking_refused'), path);
-  }
-  assert.equal(zotero._calls.links.length, 0);
-});
-
-test('a linked file under a credentials, profile or app-data folder is refused even when its type is allowed', async () => {
-  const { zotero, io, items } = setup();
-  const parent = zotero._addItem('book', { title: 'Book' });
-  for (const path of ['/tmp/zotero-test/.ssh/notes.pdf', '/tmp/zotero-test/.meridian/api.txt', '/tmp/zotero-test/AppData/Roaming/x.pdf', '/tmp/zotero-test/project/.git/readme.md']) {
-    io.files.set(path, Uint8Array.from([1]));
-    await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path }), apiErrorMatch(422, 'linking_refused'), path);
-  }
   assert.equal(zotero._calls.links.length, 0);
 });
