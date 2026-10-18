@@ -435,6 +435,90 @@ class TestRelocated:
         assert status["provenance_type"] == PS.RELOCATED
         assert status["relocation_evidence"] == "content_hash"
 
+    @duckdb_required
+    def test_fresh_script_content_hash_relocation_is_verified_and_authoritative(
+        self, tmp_path: Path,
+    ) -> None:
+        """A content-hash relocation whose generating script is still unchanged
+        keeps the full VERIFIED/0.75 mapping and stays authoritative. The script
+        check must not demote a relocation it has no reason to doubt."""
+        script = tmp_path / "train.py"
+        script.write_text("print('stable')\n", encoding="utf-8")
+        old = tmp_path / "run_1" / "metrics.csv"
+        old.parent.mkdir()
+        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
+
+        new = tmp_path / "run_1_moved" / "metrics.csv"
+        new.parent.mkdir()
+        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")  # identical content
+        old.unlink()
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED  # sanity
+        assert status["relocation_evidence"] == "content_hash"  # sanity
+        assert status["script_staleness"]["is_stale"] is False  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.VERIFIED
+        assert rec.resolver.confidence == 0.75
+        assert rec.partial is False
+        assert rec.is_authoritative is True
+        assert rec.attributes["provenance_type"] == PS.RELOCATED
+
+    @duckdb_required
+    @pytest.mark.parametrize(
+        ("break_script", "expected_fragment"),
+        [
+            pytest.param(
+                lambda p: p.write_text("print('v2')\n", encoding="utf-8"),
+                "content changed",
+                id="script-changed",
+            ),
+            pytest.param(
+                lambda p: p.unlink(),
+                "no longer readable",
+                id="script-unreadable",
+            ),
+        ],
+    )
+    def test_changed_or_unreadable_script_relocation_is_stale_not_authoritative(
+        self,
+        tmp_path: Path,
+        break_script,
+        expected_fragment: str,
+    ) -> None:
+        """A content-hash relocation whose generating script has changed, or can
+        no longer be read, maps to STALE at the same 0.3 confidence as a changed
+        EXACT record, and is not authoritative. Identity is still confirmed by
+        content, so the record is not partial, and provenance_type stays
+        RELOCATED."""
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        old = tmp_path / "run_1" / "predictions.csv"
+        old.parent.mkdir()
+        old.write_text("id,pred\n1,0.5\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
+
+        new = tmp_path / "run_1_moved" / "predictions.csv"
+        new.parent.mkdir()
+        new.write_text("id,pred\n1,0.5\n", encoding="utf-8")  # identical content
+        old.unlink()
+        break_script(script)
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED  # sanity
+        assert status["script_staleness"]["is_stale"] is True  # sanity
+        assert expected_fragment in status["script_staleness"]["reason"]  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.STALE
+        assert rec.resolver.confidence == 0.3
+        assert "relocated output" in rec.resolver.reason
+        assert script.name in rec.resolver.reason  # names the changed/unreadable script
+        assert rec.is_authoritative is False
+        assert rec.partial is False
+
 
 # ---------------------------------------------------------------------------
 # Basename-fallback relocation routing (sprint item 00c3c3f0)
@@ -489,9 +573,13 @@ class TestBasenameRelocationFallback:
         assert status["staleness_record"]["state"] == "unknown"
 
     @duckdb_required
-    def test_resolver_state_maps_basename_relocation_to_verified(
+    def test_resolver_state_maps_basename_relocation_to_verified_not_authoritative(
         self, tmp_path: Path,
     ) -> None:
+        """Changed from the old basename-to-authoritative expectation. A
+        basename-only relocation is still VERIFIED, but at 0.6 (below the 0.75
+        content-hash match). It is partial, so it is NOT authoritative, because
+        identity rests on the basename alone."""
         outputs_dir = tmp_path / "outputs"
         outputs_dir.mkdir()
         original = outputs_dir / "meridian_reloc_gap_ev01.csv"
@@ -506,6 +594,10 @@ class TestBasenameRelocationFallback:
         assert status["provenance_type"] == PS.RELOCATED  # sanity
         rec = PS.evidence_record_from_provenance_status(status)
         assert rec.resolver.status is RE.ResolverStatus.VERIFIED
+        assert rec.resolver.confidence == 0.6
+        assert rec.partial is True
+        assert rec.partial_reason
+        assert rec.is_authoritative is False
         assert rec.attributes["relocation_evidence"] == "basename"
 
     @duckdb_required
@@ -577,6 +669,79 @@ class TestBasenameRelocationFallback:
 
         status_sibling = PS.get_provenance_status(str(tmp_path), str(sibling))
         assert status_sibling["provenance_type"] == PS.UNKNOWN
+
+    @duckdb_required
+    def test_basename_relocation_is_verified_but_not_authoritative_or_trusted(
+        self, tmp_path: Path,
+    ) -> None:
+        """A basename-only relocation is VERIFIED at 0.6, but it is partial and
+        therefore NOT authoritative. It is absent from trusted_pointers and from
+        the authoritative record count. A content-confirmed exact record in the
+        same envelope is still trusted, so the exclusion is per record."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        exact = outputs_dir / "exact_control.csv"
+        exact.write_text("x\n1\n", encoding="utf-8")
+        AN.record_provenance(str(outputs_dir), str(exact))
+
+        original = outputs_dir / "meridian_reloc_gap_trust1.csv"
+        original.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(original))
+
+        relocated = tmp_path / "elsewhere" / "meridian_reloc_gap_trust1.csv"
+        relocated.parent.mkdir()
+        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
+
+        env = PS.build_provenance_envelope(
+            str(outputs_dir), [str(exact), str(relocated)],
+        )
+        by_id = {r.identity.id: r for r in env.records}
+        basename_rec = by_id[str(relocated)]
+        assert basename_rec.resolver.status is RE.ResolverStatus.VERIFIED
+        assert basename_rec.resolver.confidence == 0.6
+        assert basename_rec.partial is True
+        assert basename_rec.is_authoritative is False
+        assert basename_rec.attributes["relocation_evidence"] == "basename"
+        assert env.partial is True
+
+        assert [p["id"] for p in RE.trusted_pointers(env)] == [str(exact)]
+        summary = RE.evidence_status_summary(env)
+        assert summary["authoritative_record_count"] == 1
+        assert summary["partial_record_count"] == 1
+
+    @duckdb_required
+    def test_basename_relocation_with_changed_script_is_stale_not_authoritative(
+        self, tmp_path: Path,
+    ) -> None:
+        """The changed-script rule applies to the basename tier too. A basename
+        copy whose own generating-script tag reports a changed script is STALE,
+        and it is not authoritative. The copy sits under outputs_dir because
+        tag_output only tags paths inside it. It is never indexed, so the
+        basename tier still resolves it."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        script = outputs_dir / "plot_basename.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        original = outputs_dir / "run_1" / "meridian_reloc_gap_stale2.csv"
+        original.parent.mkdir()
+        original.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(original))
+
+        relocated = outputs_dir / "copied" / "meridian_reloc_gap_stale2.csv"
+        relocated.parent.mkdir()
+        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
+        FP.tag_output(str(relocated), str(outputs_dir), script_path=str(script))
+        script.write_text("print('v2')\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(outputs_dir), str(relocated))
+        assert status["provenance_type"] == PS.RELOCATED  # sanity
+        assert status["relocation_evidence"] == "basename"  # sanity
+        assert status["script_staleness"]["is_stale"] is True  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.STALE
+        assert rec.resolver.confidence == 0.3
+        assert script.name in rec.resolver.reason
+        assert rec.is_authoritative is False
 
 
 # ---------------------------------------------------------------------------

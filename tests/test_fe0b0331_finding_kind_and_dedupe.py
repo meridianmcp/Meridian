@@ -564,24 +564,30 @@ async def test_malformed_doi_arg_is_an_error_and_stores_nothing(db, project, bad
 # A DOI whose dedupe key is not the DOI itself would collide with another DOI
 # (finding_identity cuts a doi.org URL at ? # & and excludes < > and quotes), so
 # the doi argument refuses it and stores nothing. The refusal keeps the existing
-# doi error as its prefix and appends the reason in parentheses.
-_DOI_KEY_ERROR = "capture_research_finding doi must be a DOI such as 10.1145/3292500.3330701"
+# doi error as its prefix. A refused doi.org url keeps the url error as its prefix instead
+# (section 9). Each refusal appends the reason in parentheses. The constants are imported
+# from the handler, so the tests track any change to the messages.
+_DOI_ERROR = nd_mod._DOI_ERROR
+_URL_DOI_ERROR = nd_mod._URL_DOI_ERROR
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", [
-    "10.1000/x?y",                 # ? ends the key: doi:10.1000/x
-    "10.1000/x#y",                 # # ends the key (fragment)
-    "10.1000/x&y",                 # & ends the key (query separator)
-    '10.1000/x"y',                 # quote characters are not part of the key
-    "10.1002/(SICI)1097-4636(199601)30:1<40::AID-JBM4>3.0.CO;2-K",  # legacy SICI: < and >
-    "https://doi.org/10.1000/x?y", # the doi.org-prefixed form is refused the same way
+@pytest.mark.parametrize("bad,reason", [
+    ("10.1000/x?y", "'?' is not an allowed DOI character"),
+    ("10.1000/x#y", "'#' is not an allowed DOI character"),
+    ("10.1000/x&y", "'&' is not an allowed DOI character"),
+    ('10.1000/x"y', "'\"' is not an allowed DOI character"),
+    # Legacy SICI DOIs contain < and >. The first character refused is the <.
+    ("10.1002/(SICI)1097-4636(199601)30:1<40::AID-JBM4>3.0.CO;2-K",
+     "'<' is not an allowed DOI character"),
+    ("https://doi.org/10.1000/x?y", "'?' is not an allowed DOI character"),
 ])
-async def test_doi_arg_whose_dedupe_key_is_not_the_doi_is_refused(db, project, bad):
+async def test_doi_arg_stop_character_is_refused_by_allowlist(db, project, bad, reason):
+    """Rule 3 (the allowlist) refuses these before rule 7 (the identity check) runs. The
+    refusal names the first offending character, so the full reason is asserted."""
     pid = project["id"]
     out = await _capture_args(db, pid, doi=bad)
-    assert set(out) == {"error"}
-    assert out["error"].startswith(_DOI_KEY_ERROR + " (")
+    assert out == {"error": f"{_DOI_ERROR} ({reason})"}
     assert await _finding_notes(db, pid) == []
 
 
@@ -635,14 +641,17 @@ def test_capture_tool_schema_advertises_doi_and_pmid_without_requiring_url():
     assert props["doi"]["type"] == "string"
     assert props["pmid"]["type"] == "string"
     assert schema["inputSchema"]["required"] == ["summary"]
+    assert "arXiv URLs and arXiv-issued DOIs are tagged source_type=arxiv automatically" in schema["description"]
 
 
 # ---------------------------------------------------------------------------
-# 8. fe0b0331: a doi argument stores only a DOI that keys to itself
+# 8. fe0b0331: a doi argument stores only a DOI that keys to itself, except an arXiv-issued
+#    DOI, which is exempt from that check and keys to arxiv:<id>
 #
 # Rules (see _normalise_capture_doi). First the ASCII edge whitespace (space, tab,
 # CR, LF) is trimmed and one doi: or doi.org/ prefix (including its dx. and https://
-# forms) is removed. Then, in order:
+# forms) is removed. A doi.org or dx.doi.org url gets these same rules on the text
+# after its host (section 9). Then, in order:
 #   * a % is refused. No percent escape is decoded;
 #   * the value must start 10.NNNN/ (4 to 9 digits), or it is refused by its shape;
 #   * the suffix may hold only ASCII letters, digits and . _ ; ( ) / : -. The reason
@@ -702,7 +711,7 @@ async def test_doi_refusals_name_the_reason_and_store_nothing(db, project, bad, 
     pid = project["id"]
     out = await _capture_args(db, pid, doi=bad)
     assert set(out) == {"error"}
-    assert out["error"].startswith(_DOI_KEY_ERROR + " (")
+    assert out["error"].startswith(_DOI_ERROR + " (")
     assert reason in out["error"]
     assert await _finding_notes(db, pid) == []
 
@@ -717,7 +726,7 @@ async def test_trailing_punctuation_other_than_a_period_is_refused(db, project, 
     pid = project["id"]
     out = await _capture_args(db, pid, doi=bad)
     assert set(out) == {"error"}
-    assert out["error"].startswith(_DOI_KEY_ERROR + " (")
+    assert out["error"].startswith(_DOI_ERROR + " (")
     assert "ambiguous trailing character" in out["error"]
     assert await _finding_notes(db, pid) == []
 
@@ -774,7 +783,7 @@ async def test_stop_characters_are_refused_and_named(db, project, bad, reason):
     pid = project["id"]
     out = await _capture_args(db, pid, doi=bad)
     assert set(out) == {"error"}
-    assert out["error"].startswith(_DOI_KEY_ERROR + " (")
+    assert out["error"].startswith(_DOI_ERROR + " (")
     assert reason in out["error"]
     assert await _finding_notes(db, pid) == []
 
@@ -787,7 +796,7 @@ async def test_kelvin_sign_doi_is_refused_and_does_not_merge_with_ascii_k(db, pr
     ascii_k = await _capture_args(db, pid, doi="10.1000/k")
     kelvin = await _capture_args(db, pid, doi="10.1000/\u212a")
     assert set(kelvin) == {"error"}
-    assert kelvin["error"] == f"{_DOI_KEY_ERROR} (U+212A is not an allowed DOI character)"
+    assert kelvin["error"] == f"{_DOI_ERROR} (U+212A is not an allowed DOI character)"
     assert len(await _finding_notes(db, pid)) == 1
     assert ascii_k["note"]["source"] == "https://doi.org/10.1000/k"
 
@@ -827,7 +836,7 @@ async def test_percent_is_refused_and_no_escape_is_decoded(db, project, bad):
     any % is refused with a request for the plain DOI, and nothing is stored."""
     pid = project["id"]
     out = await _capture_args(db, pid, doi=bad)
-    expected = f"{_DOI_KEY_ERROR} (percent escapes are not accepted; give the plain DOI)"
+    expected = f"{_DOI_ERROR} (percent escapes are not accepted; give the plain DOI)"
     assert out == {"error": expected}
     assert await _finding_notes(db, pid) == []
 
@@ -852,7 +861,7 @@ async def test_casefold_collision_is_refused_and_does_not_merge(db, project):
     ss = await _capture_args(db, pid, doi="10.1000/ss")
     refused = await _capture_args(db, pid, doi="10.1000/\u00df")
     assert set(refused) == {"error"}
-    assert refused["error"] == f"{_DOI_KEY_ERROR} (U+00DF is not an allowed DOI character)"
+    assert refused["error"] == f"{_DOI_ERROR} (U+00DF is not an allowed DOI character)"
     assert len(await _finding_notes(db, pid)) == 1
     upper = await _capture_args(db, pid, doi="10.1000/SS")
     assert upper["existing_note_id"] == ss["note"]["id"]
@@ -894,7 +903,7 @@ async def test_nbsp_only_doi_arg_is_refused_not_treated_as_absent(db, project):
     pid = project["id"]
     out = await _capture_args(db, pid, doi="\u00a0")
     assert set(out) == {"error"}
-    assert out["error"] == f"{_DOI_KEY_ERROR} (it is not of the form 10.NNNN/suffix)"
+    assert out["error"] == f"{_DOI_ERROR} (it is not of the form 10.NNNN/suffix)"
     assert await _finding_notes(db, pid) == []
 
 
@@ -909,7 +918,7 @@ async def test_lookalike_letters_do_not_match_the_doi_prefix(db, project, bad):
     pid = project["id"]
     out = await _capture_args(db, pid, doi=bad)
     assert set(out) == {"error"}
-    assert out["error"] == f"{_DOI_KEY_ERROR} (it is not of the form 10.NNNN/suffix)"
+    assert out["error"] == f"{_DOI_ERROR} (it is not of the form 10.NNNN/suffix)"
     assert await _finding_notes(db, pid) == []
 
 
@@ -925,7 +934,114 @@ async def test_identity_guard_refuses_a_key_that_differs_and_only_arxiv_skips_it
     pid = project["id"]
     out = await _capture_args(db, pid, doi="10.1000/xyz")
     assert set(out) == {"error"}
-    assert out["error"] == f"{_DOI_KEY_ERROR} (its dedupe key would not be the DOI itself)"
+    assert out["error"] == f"{_DOI_ERROR} (its dedupe key would not be the DOI itself)"
     assert await _finding_notes(db, pid) == []
     arxiv = await _capture_args(db, pid, doi="10.48550/arXiv.2301.12345")
     assert arxiv["note"]["source"] == "https://doi.org/10.48550/arXiv.2301.12345"
+
+
+# ---------------------------------------------------------------------------
+# 9. fe0b0331 follow-up: a doi.org url is read as a DOI, and arXiv-issued DOIs are tagged
+#
+# A url whose host is doi.org or dx.doi.org (any case, with or without https://) takes the
+# text after its host as the DOI and is held to the rules in section 8. It is stored as
+# https://doi.org/<normalised DOI>. Any other url is stored exactly as given. An arXiv-issued
+# DOI is tagged source_type "arxiv", as its arxiv.org URL is.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad,reason", [
+    ("https://doi.org/10.1000/x?y", "'?' is not an allowed DOI character"),
+    ("https://doi.org/10.1000/x#y", "'#' is not an allowed DOI character"),
+    ("https://doi.org/10.1000/../x",
+     'a path segment of "." or ".." would resolve to a different URL'),
+    ("https://doi.org/10.1000/x%2Fy", "percent escapes are not accepted"),
+    ("https://doi.org/10.1000/x y", "U+0020 is not an allowed DOI character"),
+    ("https://doi.org/10.1000/x\ty", "U+0009 is not an allowed DOI character"),
+    ("https://doi.org/", "it is not of the form 10.NNNN/suffix"),
+    ("https://doi.org", "it is not of the form 10.NNNN/suffix"),
+])
+async def test_doi_org_url_is_held_to_the_doi_rules_and_stores_nothing(db, project, bad, reason):
+    pid = project["id"]
+    out = await _capture(db, pid, bad)
+    assert set(out) == {"error"}
+    assert out["error"].startswith(_URL_DOI_ERROR + " (")
+    assert reason in out["error"]
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_refused_doi_org_url_gets_the_url_prefix_and_not_the_doi_prefix(db, project):
+    pid = project["id"]
+    out = await _capture(db, pid, "https://doi.org/10.1000/x?y")
+    assert out == {"error": f"{_URL_DOI_ERROR} ('?' is not an allowed DOI character)"}
+    assert not out["error"].startswith(_DOI_ERROR)
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+async def test_refused_doi_argument_keeps_the_doi_prefix_and_not_the_url_prefix(db, project):
+    pid = project["id"]
+    out = await _capture_args(db, pid, doi="10.1000/x?y")
+    assert out == {"error": f"{_DOI_ERROR} ('?' is not an allowed DOI character)"}
+    assert not out["error"].startswith(_URL_DOI_ERROR)
+    assert await _finding_notes(db, pid) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "https://doi.org/10.1000/xyz",
+    "HTTPS://DOI.ORG/10.1000/xyz",
+    "http://dx.doi.org/10.1000/xyz",
+    "doi.org/10.1000/xyz",
+    "https://doi.org/10.1000/xyz.",
+])
+async def test_doi_org_url_is_accepted_and_stored_as_the_normalised_doi_form(db, project, url):
+    pid = project["id"]
+    out = await _capture(db, pid, url)
+    assert "error" not in out
+    assert out["note"]["source"] == "https://doi.org/10.1000/xyz"
+    assert out["source_type"] == "web"
+    stored = await db_module.get_project_note(db, out["note"]["id"])
+    assert stored["source"] == "https://doi.org/10.1000/xyz"
+    dup = await _capture(db, pid, "https://dl.acm.org/doi/10.1000/XYZ")
+    assert dup["existing_note_id"] == out["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "https://example.com/paper?y=1#top",
+    "https://dl.acm.org/doi/10.1000/x?y",
+    "https://doi.org.example.com/10.1000/x?y",
+    "https://arxiv.org/abs/2301.12345v2",
+    "ftp://doi.org/10.1000/xyz",  # another scheme is not read as a DOI link
+])
+async def test_non_doi_url_is_stored_exactly_as_given(db, project, url):
+    pid = project["id"]
+    out = await _capture(db, pid, url)
+    assert "error" not in out
+    assert out["note"]["source"] == url
+
+
+@pytest.mark.asyncio
+async def test_arxiv_issued_doi_is_tagged_arxiv_by_arg_and_by_url(db, project):
+    pid = project["id"]
+    by_arg = await _capture_args(db, pid, doi="10.48550/arXiv.2301.12345")
+    assert by_arg["source_type"] == "arxiv"
+    by_url = await _capture(db, pid, "https://doi.org/10.48550/ARXIV.2301.12346")
+    assert by_url["source_type"] == "arxiv"
+    assert by_url["note"]["source"] == "https://doi.org/10.48550/ARXIV.2301.12346"
+    # The same arXiv paper as its arxiv.org URL: the dedupe key is arxiv:2301.12345 for both.
+    arxiv_url = await _capture(db, pid, "https://arxiv.org/abs/2301.12345v2")
+    assert arxiv_url["existing_note_id"] == by_arg["note"]["id"]
+    assert len(await _finding_notes(db, pid)) == 2
+
+
+@pytest.mark.asyncio
+async def test_doi_containing_the_text_arxiv_org_is_tagged_web(db, project):
+    """Only the arXiv-issued DOI form is tagged arxiv. A publisher DOI that merely contains
+    the text arxiv.org is still a DOI, so it stays web."""
+    out = await _capture_args(db, project["id"], doi="10.1000/arxiv.org.x")
+    assert out["source_type"] == "web"
+    assert out["note"]["source"] == "https://doi.org/10.1000/arxiv.org.x"
